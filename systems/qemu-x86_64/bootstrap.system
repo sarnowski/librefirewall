@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <protection_domain name="responder" priority="2" stack_size="0x4000">
+        <program_image path="bootstrap-responder.elf" />
+    </protection_domain>
+
+    <protection_domain name="initiator" priority="1" stack_size="0x4000">
+        <program_image path="bootstrap-initiator.elf" />
+    </protection_domain>
+
+    <channel>
+        <end pd="initiator" id="0" />
+        <end pd="responder" id="0" />
+    </channel>
+</system>

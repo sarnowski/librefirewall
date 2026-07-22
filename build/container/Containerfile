@@ -1,0 +1,115 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY third-party/sources.lock /tmp/sources.lock
+
+RUN --mount=type=secret,id=gropyus_ca,required=false \
+    set -eu; \
+    . /tmp/sources.lock; \
+    printf '%s\n' \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y ca-certificates curl; \
+    sed -i 's|http://snapshot.debian.org|https://snapshot.debian.org|g' /etc/apt/sources.list; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/gropyus_ca ]; then \
+      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+      ca_bundle=/tmp/build-ca-bundle.crt; \
+    fi; \
+    apt-get -o Acquire::https::CaInfo="$ca_bundle" update; \
+    DEBIAN_FRONTEND=noninteractive apt-get \
+      -o Acquire::https::CaInfo="$ca_bundle" \
+      --no-install-recommends install -y \
+      binutils \
+      build-essential \
+      clang \
+      cmake \
+      curl \
+      git \
+      grub-common \
+      grub-pc-bin \
+      lld \
+      llvm \
+      make \
+      mtools \
+      ninja-build \
+      pkg-config \
+      python3 \
+      qemu-system-x86 \
+      qemu-utils \
+      xorriso \
+      xz-utils; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/microkit-sdk.tar.gz "$MICROKIT_URL"; \
+    printf '%s  %s\n' "$MICROKIT_SHA256" /tmp/microkit-sdk.tar.gz | sha256sum --check --strict -; \
+    mkdir -p "/opt/microkit-sdk-${MICROKIT_VERSION}"; \
+    tar --extract --gzip --file /tmp/microkit-sdk.tar.gz \
+      --strip-components=1 --directory "/opt/microkit-sdk-${MICROKIT_VERSION}"; \
+    ln -s "/opt/microkit-sdk-${MICROKIT_VERSION}" /opt/microkit; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/rust-sel4.tar.gz "$RUST_SEL4_URL"; \
+    printf '%s  %s\n' "$RUST_SEL4_SHA256" /tmp/rust-sel4.tar.gz | sha256sum --check --strict -; \
+    mkdir -p /opt/rust-sel4; \
+    tar --extract --gzip --file /tmp/rust-sel4.tar.gz \
+      --strip-components=1 --directory /opt/rust-sel4; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/rustup-init "$RUSTUP_INIT_URL"; \
+    printf '%s  %s\n' "$RUSTUP_INIT_SHA256" /tmp/rustup-init | sha256sum --check --strict -; \
+    chmod 0755 /tmp/rustup-init; \
+    SSL_CERT_FILE="$ca_bundle" RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo \
+      /tmp/rustup-init -y --no-modify-path --profile minimal \
+      --default-toolchain "$RUST_TOOLCHAIN" \
+      --component rust-src --component rustfmt --component clippy --component llvm-tools-preview; \
+    rm -rf /var/lib/apt/lists/* /tmp/*
+
+COPY third-party/sources.lock /tmp/syft-sources.lock
+
+RUN --mount=type=secret,id=gropyus_ca,required=false \
+    set -eu; \
+    . /tmp/syft-sources.lock; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/gropyus_ca ]; then \
+      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+      ca_bundle=/tmp/build-ca-bundle.crt; \
+    fi; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/syft.tar.gz "$SYFT_URL"; \
+    printf '%s  %s\n' "$SYFT_SHA256" /tmp/syft.tar.gz | sha256sum --check --strict -; \
+    tar --extract --gzip --file /tmp/syft.tar.gz --directory /usr/local/bin syft; \
+    syft version | grep --fixed-strings "$SYFT_VERSION"; \
+    rm -rf /tmp/*
+
+ENV PATH=/opt/rust/cargo/bin:$PATH \
+    RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    MICROKIT_SDK=/opt/microkit \
+    RUST_SEL4_ROOT=/opt/rust-sel4 \
+    SYFT_CHECK_FOR_APP_UPDATE=false
+
+RUN chmod -R a+rX /opt/microkit-sdk-2.2.0
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml /tmp/workspace/
+COPY pds/initiator/Cargo.toml /tmp/workspace/pds/initiator/Cargo.toml
+COPY pds/initiator/src /tmp/workspace/pds/initiator/src
+COPY pds/responder/Cargo.toml /tmp/workspace/pds/responder/Cargo.toml
+COPY pds/responder/src /tmp/workspace/pds/responder/src
+COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
+COPY tools/xtask/src /tmp/workspace/tools/xtask/src
+
+RUN --mount=type=secret,id=gropyus_ca,required=false \
+    set -eu; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/gropyus_ca ]; then \
+      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+      ca_bundle=/tmp/build-ca-bundle.crt; \
+    fi; \
+    cd /tmp/workspace; \
+    SSL_CERT_FILE="$ca_bundle" cargo fetch --locked; \
+    sysroot="$(rustc --print sysroot)/lib/rustlib/src/rust/library/sysroot/Cargo.toml"; \
+    SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path "$sysroot"; \
+    rm -rf /tmp/*
+
+WORKDIR /workspace

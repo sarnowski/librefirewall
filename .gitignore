@@ -1,0 +1,6 @@
+/build/*
+!/build/container/
+!/build/container/**
+/dist/
+/sdk/
+/target/

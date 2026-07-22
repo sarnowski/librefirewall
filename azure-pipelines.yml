@@ -1,0 +1,29 @@
+trigger:
+  branches:
+    include:
+      - trunk
+
+pr:
+  branches:
+    include:
+      - trunk
+
+pool:
+  vmImage: ubuntu-24.04
+
+jobs:
+  - job: ci
+    displayName: Bootstrap CI
+    timeoutInMinutes: 60
+    steps:
+      - checkout: self
+
+      - script: make ci
+        displayName: Run CI gate
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish distribution artifacts
+        condition: succeededOrFailed()
+        inputs:
+          targetPath: dist
+          artifact: dist

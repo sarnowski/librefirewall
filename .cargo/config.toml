@@ -1,0 +1,8 @@
+[alias]
+xtask = "run --package xtask --"
+
+[build]
+rustflags = ["-Zunstable-options"]
+
+[env]
+RUST_TARGET_PATH = { value = "support/targets", relative = true }
