@@ -2,6 +2,9 @@ include third-party/sources.lock
 
 PODMAN ?= podman
 BUILDER_IMAGE ?= localhost/librefirewall-builder:microkit-$(MICROKIT_VERSION)
+# Expose the KVM device to the sandbox for accelerated QEMU when the host has
+# it; the harness falls back to emulation when it is absent.
+KVM_FLAGS := $(if $(wildcard /dev/kvm),--device /dev/kvm --group-add keep-groups,)
 CONTAINERFILE := build/container/Containerfile
 CONTAINER_IGNORE := build/container/containerignore
 WRITABLE_DIRS := build dist sdk target
@@ -59,6 +62,7 @@ $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--env CARGO_NET_OFFLINE=true \
 	--tmpfs /tmp:rw,nosuid,nodev \
 	--mount type=bind,src=$(CURDIR),dst=/workspace,rw=true \
+	$(KVM_FLAGS) \
 	$(1) $(BUILDER_IMAGE) cargo run --locked --package xtask -- $(2)
 endef
 

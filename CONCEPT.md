@@ -390,3 +390,86 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
+---
+
+## 14. Software Update & Secure Boot
+
+The appliance updates as a **whole signed system image using two A/B slots**, not by patching a
+running system. This suits the static Microkit component model (structural change requires a
+reboot) and gives an automatic, power-fail-safe path back to the last known-good software.
+
+### 14.1 On-disk layout
+
+The deployable artifact is a GPT disk image (`librefirewall-qemu-x86_64.img`) with fixed slots:
+
+| Partition | Purpose |
+|---|---|
+| **ESP** | The boot manager (`EFI/BOOT/BOOTX64.EFI`) |
+| **STATE** | Mutable boot-selection state (`grubenv`) |
+| **SLOT_A** | A complete signed release: seL4 kernel + Microkit system image (+ detached signatures) |
+| **SLOT_B** | The second release slot, identical structure |
+| **DATA** | Reserved for configuration, identity, and secrets (§11, §12); unformatted for now |
+
+Each slot is self-contained because x86 Microkit boots a separate seL4 kernel ELF plus the Microkit
+system image as a Multiboot2 module — both must be present and version-matched in the slot.
+
+### 14.2 Boot manager and slot selection
+
+The boot manager is **GRUB** (built from pinned source as a minimal standalone `x86_64-efi`
+image with an embedded, immutable configuration and a curated module allowlist). GRUB is chosen
+because it is the one common bootloader that natively speaks the x86 Multiboot2 contract seL4
+requires, while also supporting UEFI, signature verification, and a persistent environment.
+
+Selection uses the proven `OK`/`TRY`/`ORDER` scheme (as in RAUC's GRUB integration), which is what
+stock GRUB scripting can express without arithmetic: a confirmed slot (`*_OK`) boots immediately; an
+unconfirmed slot is tried once (its `*_TRY` flag is set before hand-off) and, if it never confirms
+health, the next slot in `ORDER` is used. The single-attempt model is a deliberate limitation of
+in-bootloader logic; a multi-attempt counter and a redundant, generation-numbered state log belong
+to the writable-state owner below, not to GRUB.
+
+Confirming a freshly booted slot as healthy (setting `*_OK`) is done **off the boot path** — today
+by the test harness, later by an in-system update/health protection domain that has capabilities to
+exactly the inactive slot and the STATE partition and nothing else. That component is where staged
+installation, health confirmation, multi-attempt counting, and redundant crash-safe state live.
+
+### 14.3 Payload trust
+
+Every slot's kernel and system image is signed; GRUB carries the corresponding public key embedded
+in its core image and **enforces detached-signature verification** on every file it loads. This
+authenticates the payload independently of the medium it sits on. The boot-selection state is
+loaded unverified (it only *chooses among* already-signed slots and can never inject code).
+
+Development builds generate a local, throwaway signing key under `build/dev-keys/` (never committed,
+removed by `make clean`); the release manifest records `trust_profile: development` and the key
+fingerprint so a development-signed image can never be mistaken for a production one.
+
+### 14.4 Firmware: UEFI is viable; the seL4 hand-off contract
+
+The target is **UEFI** (a prerequisite for the eventual Secure Boot goal). A concrete lesson was
+learned bringing seL4 up under UEFI+GRUB that changes no core assumption but must be respected:
+
+- seL4's x86 Multiboot2 path (`try_boot_sys_mbi2`) takes the **ACPI RSDP from the Multiboot2 ACPI
+  tag** GRUB provides — so ACPI works under UEFI without the legacy BIOS memory scan. This was the
+  initial red herring; it is not a problem.
+- The seL4 boot module (our Microkit system image) must load **above** the kernel image
+  (`assert(mods_end_paddr > ki_p_reg.end)`); GRUB's relocator satisfies this here, but it is a real
+  constraint to watch on memory-constrained targets.
+- **The debug kernel takes its serial console from the kernel command line.** QEMU's builtin
+  `-kernel` loader supplied an equivalent implicitly; GRUB does not, so the kernel must be given
+  `console_port=0x3f8 debug_port=0x3f8` on its Multiboot2 command line or it boots (and can wedge)
+  silently. The **IOMMU is left enabled** (Microkit's x86 default); on a platform without VT-d seL4
+  simply reports zero IOMMUs.
+
+### 14.5 Deliberately deferred
+
+- **UEFI Secure Boot** and its key hierarchy (enrolling a librefirewall platform key; signing the
+  EFI binary). The payload-signing and A/B mechanics above are independent of, and ready for, it.
+- **TPM-backed anti-rollback** (a monotonic security epoch preventing downgrade to a known-vulnerable
+  signed release).
+- **The in-system update/health PD** and the staged, transactional, multi-cluster rollout that
+  builds on the configuration-management workflow of §12.
+- **Redundant, crash-safe boot state.** Stock `grubenv` is a single in-place block; torn-write-safe
+  redundant state is part of the update-PD work, not the bootloader.
+- **Virtualised/cloud targets** (Proxmox, Azure) are expected to use image/generation replacement at
+  the hypervisor or load-balancer level rather than guest-managed A/B, reusing the same signed
+  release and compatibility contract.

@@ -22,9 +22,76 @@ const DIST_REPORT: &str = "librefirewall-microkit-report.txt";
 const DIST_MANIFEST: &str = "librefirewall-manifest.json";
 const DIST_SBOM: &str = "librefirewall-sbom.spdx.json";
 const DIST_CHECKSUMS: &str = "librefirewall-checksums.sha256";
+const DIST_DISK: &str = "librefirewall-qemu-x86_64.img";
 const PASS_MARKER: &str =
     "LIBREFIREWALL_BOOTSTRAP_PASS:initiator-responder-notification-round-trip";
-const QEMU_TIMEOUT: Duration = Duration::from_secs(20);
+const QEMU_TIMEOUT: Duration = Duration::from_secs(40);
+
+const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
+const GRUB_VERSION: &str = "2.14";
+const DEV_KEY_UID: &str = "librefirewall development signing <dev@librefirewall.invalid>";
+
+// UEFI firmware for the OVMF boot path; the first existing candidate is used.
+const OVMF_CODE_CANDIDATES: &[&str] = &[
+    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    "/usr/share/OVMF/OVMF_CODE.fd",
+];
+const OVMF_VARS_CANDIDATES: &[&str] = &[
+    "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    "/usr/share/OVMF/OVMF_VARS.fd",
+];
+
+const SECTORS_PER_MIB: u64 = 2048;
+const DISK_SIZE_MIB: u64 = 128;
+
+/// The GPT layout of the deployable disk. `SLOT_A` and `SLOT_B` are the two
+/// software slots; `STATE` carries the mutable boot-selection env; `DATA` is
+/// reserved for configuration and secrets and is left unformatted for now.
+struct Partition {
+    number: usize,
+    label: &'static str,
+    gpt_type: &'static str,
+    start_mib: u64,
+    size_mib: u64,
+}
+
+const PARTITIONS: &[Partition] = &[
+    Partition {
+        number: 1,
+        label: "ESP",
+        gpt_type: "ef00",
+        start_mib: 1,
+        size_mib: 48,
+    },
+    Partition {
+        number: 2,
+        label: "STATE",
+        gpt_type: "8300",
+        start_mib: 49,
+        size_mib: 8,
+    },
+    Partition {
+        number: 3,
+        label: "SLOTA",
+        gpt_type: "8300",
+        start_mib: 57,
+        size_mib: 16,
+    },
+    Partition {
+        number: 4,
+        label: "SLOTB",
+        gpt_type: "8300",
+        start_mib: 73,
+        size_mib: 16,
+    },
+    Partition {
+        number: 5,
+        label: "DATA",
+        gpt_type: "8300",
+        start_mib: 89,
+        size_mib: 16,
+    },
+];
 
 fn main() -> ExitCode {
     match run() {
@@ -135,14 +202,291 @@ fn image(root: &Path, config: &str) -> Result<(), String> {
         "assemble Microkit image",
     )?;
 
+    // The loose kernel/system pair stays in dist as the update input and as
+    // debugging evidence; the disk below is the deployable artifact. The 32-bit
+    // kernel ELF is the Multiboot2 image GRUB boots (its entry is a 32-bit
+    // trampoline; the 64-bit sel4.elf shares the same entry but the 32-bit image
+    // is what both QEMU and GRUB load).
     copy_file(&build.join("sel4_32.elf"), &dist.join(DIST_KERNEL))?;
     copy_file(&build.join("loader.img"), &dist.join(DIST_SYSTEM))?;
     copy_file(&build.join("report.txt"), &dist.join(DIST_REPORT))?;
-    write_manifest(&dist, config)?;
+
+    let fingerprint = assemble_disk(root, &build, &dist)?;
+
+    write_manifest(&dist, config, &fingerprint)?;
     write_sbom(root, &dist)?;
     write_checksums(&dist)?;
     println!("packaged boot artifacts in {}", dist.display());
     Ok(())
+}
+
+/// Build the signed GPT A/B disk from the kernel and system image already in
+/// `build`, returning the development signing key's fingerprint for the
+/// manifest. Both slots are seeded with the same signed release and A is
+/// marked confirmed, so the base image boots A while B stands ready as a
+/// fallback and update target.
+fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<String, String> {
+    let kernel = build.join("sel4_32.elf");
+    let system = build.join("loader.img");
+
+    let fingerprint = ensure_dev_key(root)?;
+    let pubkey = root.join("build/dev-keys/librefirewall-dev-pub.gpg");
+    sign_file(root, &kernel)?;
+    sign_file(root, &system)?;
+
+    let efi = build.join("BOOTX64.EFI");
+    build_grub_efi(root, &pubkey, &efi)?;
+
+    let parts = build.join("parts");
+    recreate_dir(&parts)?;
+
+    let esp = parts.join("esp.img");
+    make_fat(&esp, part("ESP").size_mib, Some(32), "ESP")?;
+    mmd(&esp, "::/EFI")?;
+    mmd(&esp, "::/EFI/BOOT")?;
+    mcopy(&esp, &efi, "::/EFI/BOOT/BOOTX64.EFI")?;
+
+    let state = parts.join("state.img");
+    make_fat(&state, part("STATE").size_mib, None, "STATE")?;
+    let grubenv = build.join("grubenv");
+    seed_grubenv(root, &grubenv)?;
+    mcopy(&state, &grubenv, "::/grubenv")?;
+
+    let kernel_sig = build.join("sel4_32.elf.sig");
+    let system_sig = build.join("loader.img.sig");
+    let slot_files = [
+        (kernel.as_path(), "::/librefirewall-kernel.elf"),
+        (kernel_sig.as_path(), "::/librefirewall-kernel.elf.sig"),
+        (system.as_path(), "::/librefirewall-system.img"),
+        (system_sig.as_path(), "::/librefirewall-system.img.sig"),
+    ];
+    for label in ["SLOTA", "SLOTB"] {
+        let image = parts.join(format!("{}.img", label.to_lowercase()));
+        make_fat(&image, part(label).size_mib, Some(16), label)?;
+        for (source, destination) in &slot_files {
+            mcopy(&image, source, destination)?;
+        }
+    }
+
+    let data = parts.join("data.img");
+    make_fat(&data, part("DATA").size_mib, None, "DATA")?;
+
+    let disk = dist.join(DIST_DISK);
+    write_disk(&disk, &parts)?;
+    Ok(fingerprint)
+}
+
+fn part(label: &str) -> &'static Partition {
+    PARTITIONS
+        .iter()
+        .find(|partition| partition.label == label)
+        .expect("known partition label")
+}
+
+/// Create (once per checkout) the local development signing key and return its
+/// fingerprint. The private key never leaves `build/dev-keys` and is removed by
+/// `clean`; only detached signatures and the exported public key are consumed
+/// by the build. This is a development trust anchor, not a release key.
+fn ensure_dev_key(root: &Path) -> Result<String, String> {
+    let home = root.join("build/dev-keys");
+    let pubkey = home.join("librefirewall-dev-pub.gpg");
+    if !pubkey.is_file() {
+        fs::create_dir_all(&home).map_err(|error| format!("create {}: {error}", home.display()))?;
+        set_permissions_0700(&home)?;
+        run_command(
+            gpg(&home)
+                .args(["--batch", "--pinentry-mode", "loopback", "--passphrase", ""])
+                .args([
+                    "--quick-generate-key",
+                    DEV_KEY_UID,
+                    "rsa3072",
+                    "sign",
+                    "never",
+                ]),
+            "generate development signing key",
+        )?;
+        let export = Command::new("gpg")
+            .env("GNUPGHOME", &home)
+            .args(["--batch", "--yes", "--output"])
+            .arg(&pubkey)
+            .args(["--export", DEV_KEY_UID])
+            .status()
+            .map_err(|error| format!("export public key: {error}"))?;
+        if !export.success() {
+            return Err(format!("export public key failed with {export}"));
+        }
+    }
+    read_dev_key_fingerprint(&home)
+}
+
+fn read_dev_key_fingerprint(home: &Path) -> Result<String, String> {
+    let output = gpg(home)
+        .args(["--batch", "--with-colons", "--fingerprint", DEV_KEY_UID])
+        .output()
+        .map_err(|error| format!("read key fingerprint: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "read key fingerprint failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix("fpr:")
+                .map(|rest| rest.trim_matches(':').to_owned())
+        })
+        .ok_or_else(|| "no fingerprint in gpg output".to_owned())
+}
+
+fn sign_file(root: &Path, file: &Path) -> Result<(), String> {
+    let home = root.join("build/dev-keys");
+    let signature = PathBuf::from(format!("{}.sig", file.display()));
+    run_command(
+        gpg(&home)
+            .args([
+                "--batch",
+                "--yes",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+            ])
+            .arg("--detach-sign")
+            .arg("--output")
+            .arg(&signature)
+            .arg(file),
+        "sign payload",
+    )
+}
+
+fn build_grub_efi(root: &Path, pubkey: &Path, output: &Path) -> Result<(), String> {
+    let modules = fs::read_to_string(root.join("third-party/grub/modules.txt"))
+        .map_err(|error| format!("read grub modules list: {error}"))?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let config = root.join("third-party/grub/grub.cfg");
+    run_command(
+        Command::new("grub-mkstandalone")
+            .current_dir(root)
+            .arg(format!("--directory={GRUB_MODULES_DIR}"))
+            .arg("--format=x86_64-efi")
+            .arg(format!("--modules={modules}"))
+            .arg("--pubkey")
+            .arg(pubkey)
+            .arg("--output")
+            .arg(output)
+            .arg(format!("boot/grub/grub.cfg={}", config.display())),
+        "build standalone grub EFI image",
+    )
+}
+
+fn seed_grubenv(root: &Path, grubenv: &Path) -> Result<(), String> {
+    run_command(
+        Command::new("grub-editenv").arg(grubenv).arg("create"),
+        "create grubenv",
+    )?;
+    run_command(
+        Command::new("grub-editenv")
+            .arg(grubenv)
+            .arg("set")
+            .arg("ORDER=A B")
+            .arg("A_OK=1")
+            .arg("A_TRY=0")
+            .arg("B_OK=0")
+            .arg("B_TRY=0"),
+        "seed grubenv",
+    )?;
+    let _ = root;
+    Ok(())
+}
+
+fn make_fat(image: &Path, size_mib: u64, fat: Option<u32>, label: &str) -> Result<(), String> {
+    let blocks = size_mib * 1024;
+    let mut command = Command::new("mkfs.vfat");
+    command.args(["-C", "-n", label]);
+    if let Some(bits) = fat {
+        command.args(["-F", &bits.to_string()]);
+    }
+    command.arg(image).arg(blocks.to_string());
+    run_command(&mut command, "create FAT filesystem")
+}
+
+fn mmd(image: &Path, path: &str) -> Result<(), String> {
+    run_command(Command::new("mmd").arg("-i").arg(image).arg(path), "mmd")
+}
+
+fn mcopy(image: &Path, source: &Path, destination: &str) -> Result<(), String> {
+    require_file(source)?;
+    run_command(
+        Command::new("mcopy")
+            .args(["-i"])
+            .arg(image)
+            .arg(source)
+            .arg(destination),
+        "mcopy",
+    )
+}
+
+/// Preallocate the raw disk, lay down a GPT with the fixed layout, and copy
+/// each partition image into place. All offsets are fixed and 1 MiB aligned so
+/// the on-disk positions match the sector ranges handed to sgdisk exactly.
+fn write_disk(disk: &Path, parts: &Path) -> Result<(), String> {
+    run_command(
+        Command::new("truncate")
+            .arg("-s")
+            .arg(format!("{}M", DISK_SIZE_MIB))
+            .arg(disk),
+        "allocate disk image",
+    )?;
+    run_command(Command::new("sgdisk").arg("-Z").arg(disk), "zap disk")?;
+
+    let mut sgdisk = Command::new("sgdisk");
+    sgdisk.args(["-a", &SECTORS_PER_MIB.to_string()]);
+    for partition in PARTITIONS {
+        let start = partition.start_mib * SECTORS_PER_MIB;
+        let end = start + partition.size_mib * SECTORS_PER_MIB - 1;
+        sgdisk
+            .arg("-n")
+            .arg(format!("{}:{start}:{end}", partition.number))
+            .arg("-t")
+            .arg(format!("{}:{}", partition.number, partition.gpt_type))
+            .arg("-c")
+            .arg(format!("{}:{}", partition.number, partition.label));
+    }
+    sgdisk.arg(disk);
+    run_command(&mut sgdisk, "write GPT")?;
+
+    for partition in PARTITIONS {
+        if partition.label == "DATA" {
+            continue;
+        }
+        let image = parts.join(format!("{}.img", partition.label.to_lowercase()));
+        run_command(
+            Command::new("dd")
+                .arg(format!("if={}", image.display()))
+                .arg(format!("of={}", disk.display()))
+                .arg("bs=512")
+                .arg(format!("seek={}", partition.start_mib * SECTORS_PER_MIB))
+                .arg("conv=notrunc")
+                .arg("status=none"),
+            "write partition into disk",
+        )?;
+    }
+    Ok(())
+}
+
+fn gpg(home: &Path) -> Command {
+    let mut command = Command::new("gpg");
+    command.env("GNUPGHOME", home);
+    command
+}
+
+fn set_permissions_0700(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("chmod 0700 {}: {error}", path.display()))
 }
 
 fn verify_inputs(config: &str) -> Result<(), String> {
@@ -201,32 +545,9 @@ fn test_host(root: &Path) -> Result<(), String> {
 }
 
 fn test_system(root: &Path) -> Result<(), String> {
-    let dist = root.join("dist");
-    require_file(&dist.join(DIST_KERNEL))?;
-    require_file(&dist.join(DIST_SYSTEM))?;
-
-    let mut child = Command::new("qemu-system-x86_64")
-        .current_dir(root)
-        .args([
-            "-accel",
-            "tcg",
-            "-cpu",
-            "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave",
-            "-m",
-            "1G",
-            "-display",
-            "none",
-            "-monitor",
-            "none",
-            "-serial",
-            "stdio",
-            "-no-reboot",
-            "-no-shutdown",
-            "-kernel",
-        ])
-        .arg(dist.join(DIST_KERNEL))
-        .arg("-initrd")
-        .arg(dist.join(DIST_SYSTEM))
+    let mut command = qemu_base(root, "stdio")?;
+    command.arg("-monitor").arg("none").arg("-no-shutdown");
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -315,31 +636,78 @@ fn test_system(root: &Path) -> Result<(), String> {
 }
 
 fn run_system(root: &Path) -> Result<(), String> {
-    let dist = root.join("dist");
-    require_file(&dist.join(DIST_KERNEL))?;
-    require_file(&dist.join(DIST_SYSTEM))?;
+    let mut command = qemu_base(root, "mon:stdio")?;
+    run_command(&mut command, "run QEMU")
+}
 
-    run_command(
-        Command::new("qemu-system-x86_64")
-            .current_dir(root)
-            .args([
-                "-accel",
-                "tcg",
-                "-cpu",
-                "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave",
-                "-m",
-                "1G",
-                "-display",
-                "none",
-                "-serial",
-                "mon:stdio",
-                "-kernel",
-            ])
-            .arg(dist.join(DIST_KERNEL))
-            .arg("-initrd")
-            .arg(dist.join(DIST_SYSTEM)),
-        "run QEMU",
-    )
+/// Build the shared QEMU invocation that boots the deployable disk through
+/// OVMF (UEFI) and the signed GRUB image, rather than QEMU's direct multiboot
+/// loader. This exercises the same firmware -> boot-manager -> seL4 chain the
+/// hardware appliance uses. A per-run writable copy of the OVMF variable store
+/// lives in the build directory; the disk itself is writable so GRUB can
+/// persist boot-selection state.
+fn qemu_base(root: &Path, serial: &str) -> Result<Command, String> {
+    let dist = root.join("dist");
+    let disk = dist.join(DIST_DISK);
+    require_file(&disk)?;
+
+    let code = locate(OVMF_CODE_CANDIDATES, "OVMF code firmware")?;
+    let vars_template = locate(OVMF_VARS_CANDIDATES, "OVMF variable store")?;
+    let vars = root.join("build/bootstrap/OVMF_VARS.fd");
+    if let Some(parent) = vars.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    copy_file(&vars_template, &vars)?;
+
+    // Prefer hardware acceleration when the KVM device is present and usable,
+    // falling back to pure emulation so the test runs anywhere.
+    let kvm = Path::new("/dev/kvm");
+    let (accel, cpu) = if kvm.exists() && is_writable(kvm) {
+        ("kvm", "host")
+    } else {
+        ("tcg", "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave")
+    };
+
+    let mut command = Command::new("qemu-system-x86_64");
+    command
+        .current_dir(root)
+        .args(["-machine", "q35", "-accel", accel])
+        .args(["-cpu", cpu])
+        .args(["-m", "1G", "-display", "none"])
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            code.display()
+        ))
+        .arg("-drive")
+        .arg(format!("if=pflash,format=raw,file={}", vars.display()))
+        .arg("-drive")
+        .arg(format!("format=raw,file={}", disk.display()))
+        .args(["-serial", serial, "-no-reboot"]);
+    Ok(command)
+}
+
+fn is_writable(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc_o_cloexec())
+        .open(path)
+        .is_ok()
+}
+
+fn libc_o_cloexec() -> i32 {
+    0o2000000
+}
+
+fn locate(candidates: &[&str], description: &str) -> Result<PathBuf, String> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{description} not found in {candidates:?}"))
 }
 
 fn spawn_reader<R>(
@@ -382,15 +750,18 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-fn write_manifest(dist: &Path, config: &str) -> Result<(), String> {
+fn write_manifest(dist: &Path, config: &str, key_fingerprint: &str) -> Result<(), String> {
     let manifest = format!(
         concat!(
             "{{\n",
-            "  \"format\": 1,\n",
+            "  \"format\": 2,\n",
             "  \"target\": \"{}\",\n",
             "  \"microkit\": {{\"version\": \"{}\", \"board\": \"{}\", \"config\": \"{}\"}},\n",
             "  \"rust_sel4\": {{\"version\": \"{}\"}},\n",
-            "  \"artifacts\": [\"{}\", \"{}\", \"{}\", \"{}\"]\n",
+            "  \"boot\": {{\"manager\": \"grub\", \"grub_version\": \"{}\", \"scheme\": \"ab\", \"secure_boot\": false}},\n",
+            "  \"signing\": {{\"trust_profile\": \"development\", \"key_fingerprint\": \"{}\"}},\n",
+            "  \"disk\": {{\"image\": \"{}\", \"table\": \"gpt\", \"slots\": [\"SLOTA\", \"SLOTB\"]}},\n",
+            "  \"artifacts\": [\"{}\", \"{}\", \"{}\", \"{}\", \"{}\"]\n",
             "}}\n"
         ),
         TARGET,
@@ -398,6 +769,10 @@ fn write_manifest(dist: &Path, config: &str) -> Result<(), String> {
         BOARD,
         config,
         RUST_SEL4_VERSION,
+        GRUB_VERSION,
+        key_fingerprint,
+        DIST_DISK,
+        DIST_DISK,
         DIST_KERNEL,
         DIST_SYSTEM,
         DIST_REPORT,
@@ -447,6 +822,7 @@ fn write_sbom(root: &Path, dist: &Path) -> Result<(), String> {
 
 fn write_checksums(dist: &Path) -> Result<(), String> {
     let artifacts = [
+        DIST_DISK,
         DIST_KERNEL,
         DIST_SYSTEM,
         DIST_MANIFEST,
@@ -471,6 +847,7 @@ fn write_checksums(dist: &Path) -> Result<(), String> {
 fn clean(root: &Path) -> Result<(), String> {
     for path in [
         root.join("build/bootstrap"),
+        root.join("build/dev-keys"),
         root.join("dist"),
         root.join("target"),
     ] {

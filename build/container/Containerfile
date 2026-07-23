@@ -24,18 +24,23 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       -o Acquire::https::CaInfo="$ca_bundle" \
       --no-install-recommends install -y \
       binutils \
+      bison \
       build-essential \
       clang \
       cmake \
       curl \
+      dosfstools \
+      flex \
+      gawk \
+      gdisk \
       git \
-      grub-common \
-      grub-pc-bin \
+      gnupg \
       lld \
       llvm \
       make \
       mtools \
       ninja-build \
+      ovmf \
       pkg-config \
       python3 \
       qemu-system-x86 \
@@ -63,6 +68,18 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       /tmp/rustup-init -y --no-modify-path --profile minimal \
       --default-toolchain "$RUST_TOOLCHAIN" \
       --component rust-src --component rustfmt --component clippy --component llvm-tools-preview; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/grub.tar.xz "$GRUB_URL"; \
+    printf '%s  %s\n' "$GRUB_SHA256" /tmp/grub.tar.xz | sha256sum --check --strict -; \
+    mkdir -p /tmp/grub-src; \
+    tar --extract --xz --file /tmp/grub.tar.xz --strip-components=1 --directory /tmp/grub-src; \
+    cd /tmp/grub-src; \
+    ./configure --target=x86_64 --with-platform=efi --prefix=/opt/grub \
+      --disable-nls --disable-werror --disable-grub-mkfont --disable-grub-themes; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /; \
+    "/opt/grub/bin/grub-mkstandalone" --version | grep --fixed-strings "$GRUB_VERSION"; \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
 COPY third-party/sources.lock /tmp/syft-sources.lock
@@ -82,7 +99,7 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
     syft version | grep --fixed-strings "$SYFT_VERSION"; \
     rm -rf /tmp/*
 
-ENV PATH=/opt/rust/cargo/bin:$PATH \
+ENV PATH=/opt/grub/bin:/opt/rust/cargo/bin:$PATH \
     RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo \
     MICROKIT_SDK=/opt/microkit \

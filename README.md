@@ -31,9 +31,15 @@ and known risks.
 ## Current milestone
 
 The current milestone is the initial vertical slice: build two isolated Rust protection domains,
-connect them with a Microkit channel, boot the x86_64 system in QEMU, and have the automated system
-test verify the interaction marker. This proves the complete build, isolation, boot, and test path;
-it is not yet a network dataplane.
+connect them with a Microkit channel, package them into a signed A/B disk image, boot that image
+through UEFI (OVMF) and the GRUB boot manager, and have the automated system test verify the
+interaction marker. This proves the complete build, signing, isolation, boot-manager, boot, and
+test path; it is not yet a network dataplane.
+
+Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a
+signed seL4 kernel + Microkit system image per slot, a signature-enforcing GRUB image on the ESP,
+and a mutable boot-selection state partition. See [CONCEPT.md](CONCEPT.md) §14 for the full
+software-update and boot architecture.
 
 ## Hermetic build
 
@@ -56,7 +62,16 @@ make image
 The OCI image build is the only network-enabled phase. Project commands run with networking
 disabled, a read-only container filesystem, no Linux capabilities, and only the workspace mounted
 writable. The writable workspace is required because `xtask` recreates `build/`, `dist/`, and
-Cargo's `target/`; no other host path is writable.
+Cargo's `target/`; no other host path is writable. When the host exposes `/dev/kvm`, it is passed
+into the sandbox so QEMU boots with hardware acceleration; the harness falls back to emulation when
+it is absent.
+
+The builder also compiles GRUB from pinned source into a minimal signed `x86_64-efi` boot manager,
+and includes OVMF (UEFI firmware) and the disk/signing tooling. Image builds generate a local
+development signing key under `build/dev-keys/` (never committed; removed by `make clean`) and sign
+each slot's kernel and system image; GRUB enforces those signatures at boot. These are
+development-trust artifacts — the manifest records `trust_profile: development`. UEFI Secure Boot is
+not yet configured (see CONCEPT.md §14.5).
 
 On a GROPYUS development machine, the build automatically detects the installed inspection CA and
 provides it as a Podman build secret. On another inspected network, provide its path explicitly:
@@ -86,12 +101,15 @@ uses its serial output. `make release` first runs that complete gate and only th
 with the production-oriented Microkit release configuration. The release kernel and initialiser do
 not emit serial diagnostics, so release assembly is gated by the tested equivalent debug topology.
 
-The deployable pair is `dist/librefirewall-kernel.elf`, the Multiboot-compatible seL4 kernel, and
-`dist/librefirewall-system.img`, the application-specific Microkit system image. They must be kept
-together with the matching manifest and checksums.
+The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
+through OVMF and GRUB. The loose `dist/librefirewall-kernel.elf` (Multiboot-compatible seL4 kernel)
+and `dist/librefirewall-system.img` (Microkit system image) are retained alongside it as the update
+input and as debugging evidence; they must be kept together with the matching manifest and
+checksums.
 
 The remaining release evidence is also product-prefixed: `librefirewall-manifest.json` identifies
-the target, pinned seL4/Microkit inputs, build configuration, and artifact set;
+the target, pinned seL4/Microkit inputs, build configuration, boot/signing metadata, and artifact
+set;
 `librefirewall-microkit-report.txt` describes Microkit's generated capability and memory layout;
 `librefirewall-sbom.spdx.json` inventories software components; and
 `librefirewall-checksums.sha256` protects every other distribution artifact.
