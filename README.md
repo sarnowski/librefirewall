@@ -41,8 +41,18 @@ automated system test asserts on. The reusable primitives live in host-tested `n
 binaries are thin adapters that map the shared region and drive the exchange from Microkit
 notifications. Packaged into the signed A/B disk image and booted through UEFI (OVMF) and GRUB, this
 proves the build, signing, isolation, boot-manager, boot, and component-interaction path together.
-It is the substrate the next slice plugs a virtio NIC driver and processing stages onto; it is not
-yet a network dataplane — the buffers are produced in-system, not received from a device.
+It is the substrate the virtio NIC driver plugs onto.
+
+Built on that substrate, librefirewall now has **real NIC support**: a first-party virtio-net
+receive driver (`pds/nic-driver`, over the from-scratch split virtqueue and PCI transport in
+`crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU q35 entirely from static seL4
+capabilities — reaching PCI config space through the ECAM window, relocating the device's MMIO BAR
+to a pre-mapped address, negotiating virtio 1.0, and receiving frames by DMA into pinned buffers
+(no interrupt: it polls). Each received frame is forwarded over the SPSC ring to an isolated
+consumer PD. `make test-nic` (part of `make ci`) boots this system via QEMU's multiboot path with a
+`socket`-backed NIC, injects a frame, and asserts it is received and forwarded. Transmit, a second
+port, MSI-X interrupts, and real-hardware bring-up are the next steps — see
+[docs/virtio-net-driver.md](docs/virtio-net-driver.md).
 
 Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a
 signed seL4 kernel + Microkit system image per slot, a signature-enforcing GRUB image on the ESP,

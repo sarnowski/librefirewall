@@ -8,6 +8,8 @@ members = [
     "crates/pd-runtime",
     "pds/initiator",
     "pds/responder",
+    "pds/nic-driver",
+    "pds/nic-consumer",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

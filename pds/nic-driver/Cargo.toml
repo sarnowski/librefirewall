@@ -1,0 +1,10 @@
+[package]
+name = "nic-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sel4-microkit.workspace = true
+virtio = { path = "../../crates/virtio" }
+pd-runtime = { path = "../../crates/pd-runtime" }

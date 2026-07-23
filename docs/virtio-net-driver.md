@@ -2,10 +2,17 @@
 
 ## Status
 
-Planned. This records the plan and the binding constraints for the next vertical slice — a
-first-party virtio-net Rx driver PD — not an implemented component. The step landing now is only
-the host-tested split-virtqueue primitive in `crates/virtio`; the driver PD is built on top of it
-in a subsequent change.
+Implemented (receive path), QEMU q35. `pds/nic-driver` brings up a modern virtio-net-pci device
+from static capabilities and receives real frames; `pds/nic-consumer` verifies a frame forwarded
+over the SPSC ring; `crates/virtio` carries the split virtqueue and the first-party PCI transport
+(`pci.rs`). The `test-nic` system test (in `make ci`) boots the standalone `nic.system` image via
+QEMU's multiboot `-kernel`/`-initrd` path on q35, injects a frame over a `socket` netdev, and
+asserts the forward marker. Transmit, a second port, MSI-X interrupts (this driver polls), and
+real-hardware bring-up (BAR discovery, VT-d) remain future work — see Open decisions below, which
+are kept as the record of what the QEMU slice deliberately does not yet solve.
+
+The constraints and decisions below reflect what the working driver relies on; where the QEMU slice
+resolved a decision, it is marked **[resolved for QEMU]**.
 
 ## Context
 
@@ -68,22 +75,38 @@ No SDK helper exists. Options: (a) map ECAM/MMCONFIG as a `phys_addr` `<memory_r
 config space over MMIO; or (b) grant the legacy `0xCF8`/`0xCFC` config ports via `<ioport>` and
 drive them (requires the port-I/O FFI shim above). The tension is a chicken-and-egg: the modern
 virtio BARs must be known at build time to map them as `phys_addr` regions, but BARs are assigned
-by OVMF at runtime. Because the `.system` model forces static mapping, we must either pin the
-QEMU q35 + OVMF BAR layout (deterministic for a fixed machine definition) or discover-then-map —
-and static pinning is what the model actually permits. This is the central risk of the step and
-ties directly to CONCEPT §13.2.
+by firmware at runtime. Because the `.system` model forces static mapping, we must either pin the
+BAR layout or discover-then-map — and static pinning is what the model actually permits.
+
+**[resolved for QEMU]** The driver maps the q35 ECAM window (base `0xB0000000`) for the pinned
+device `00:02.0` and reads config space over MMIO — option (a), no `<ioport>` shim needed. It then
+sidesteps the chicken-and-egg by **reprogramming** the device's modern MMIO BAR to a fixed address
+this PD pre-maps (`0x50000000`), so the `.system` is self-consistent and independent of what
+SeaBIOS assigned. On real hardware the reprogram target must be a validated free MMIO range (and
+BAR discovery/sizing generalised); that remains open and ties to CONCEPT §13.2.
 
 ### IRQ model
 
 MSI-X (the natural fit for virtio-pci) vs a legacy IOAPIC line. The Microkit `<irq>` MSI form needs
-the device BDF (`pcidev`) and a `handle`; the IOAPIC form needs `pin`/`vector`. The choice
-interacts with how the BDF/BAR layout is pinned above.
+the device BDF (`pcidev`) and a `handle`; the IOAPIC form needs `pin`/`vector`.
+
+**[resolved for QEMU]** The driver takes **no interrupt** — it polls the receive used ring by
+never returning from `init`, throttled by the scheduler, with the consumer at higher priority so
+the busy loop does not starve it (research confirmed Microkit has no periodic wakeup, so this is
+the only interrupt-free option). MSI-X remains the target for a production, latency-sensitive
+driver; it needs the MSI Message-Address encoding, which the SDK does not document (seL4 Reference
+Manual, §x86 interrupts).
 
 ### DMA / IOMMU
 
-Whether to declare an `<io_address_space>` for the virtio device (mapping the DMA regions with
-`<iomap>`) or to run with the default-on IOMMU's effects fully understood. Either way DMA regions
-need fixed `phys_addr`. Aligns with the CONCEPT §7 requirement to confine NIC DMA with VT-d.
+Whether to declare an `<io_address_space>` for the virtio device or to run with the IOMMU's effects
+understood. Either way DMA regions need fixed `phys_addr`.
+
+**[resolved for QEMU]** Plain q35 exposes **no** vIOMMU, so seL4 reports zero IOMMUs and device DMA
+is unrestricted — no `<io_address_space>` is used, and `virtio-net-pci iommu_platform=off` means the
+device DMAs to raw physical addresses. The receive ring and buffers are RAM regions pinned at
+`0x30000000` with `region_paddr`. On real hardware (or with `-device intel-iommu`) VT-d confinement
+per CONCEPT §7 becomes mandatory and this decision reopens.
 
 ### Untrusted-device hardening
 
@@ -101,20 +124,21 @@ would sidestep PCI config-space discovery entirely. It does not fit our OVMF/GRU
 chain (CONCEPT §14), so it is at most a fallback/experiment for isolating the virtqueue/driver
 logic, never the target.
 
-## Target design
+## Design (as built)
 
-Once built, a **virtio-net-driver PD** owns the device MMIO registers and the DMA rings, drives the
-split virtqueue (`crates/virtio`) to receive frames, and hands each received frame **zero-copy**
-over the existing SPSC used/free rings and buffer pool (`crates/queue`, `crates/packet-buffer`;
-Microkit integration in `crates/pd-runtime`) to a downstream PD. It thereby **replaces the synthetic
-producer** in today's two-PD system with a real NIC Rx source, realising the `virtio driver -> Rx
-queue` head of the dataplane above.
+The **`nic-driver` PD** owns the device MMIO (ECAM + relocated BAR) and the DMA rings, drives the
+split virtqueue (`crates/virtio`) to receive frames, and forwards each frame's payload over the
+SPSC used/free rings and buffer pool (`crates/queue`, `crates/packet-buffer`; producer/consumer
+protocol in `crates/pd-runtime`) to the **`nic-consumer` PD**. This is the real `virtio driver ->
+Rx queue` head of the dataplane; the receive frame is copied once from the NIC DMA buffer into an
+SPSC pool buffer (true zero-copy across that boundary is a later optimisation). Buffer *i* is
+permanently bound to descriptor *i*, so recycling a completed descriptor reposts the same buffer.
 
 Two-port forwarding — a second NIC plus a Tx path — is the step after (CONCEPT §6.2; AGENTS
-dev-order step 3). The split virtqueue landing now is the reusable primitive both the Rx driver and
-the later Tx path are built on. Per AGENTS, the PD stays a thin adapter around the reusable
-libraries, with correctness tested on the host and isolation/driver behaviour tested under seL4 in
-QEMU.
+dev-order step 3). The split virtqueue is the reusable primitive both the Rx driver and the later
+Tx path build on. Per AGENTS, the PDs stay thin adapters around the reusable libraries, with the
+transport's pure logic (cap walk, offsets) tested on the host and the whole path tested under seL4
+in QEMU (`make test-nic`).
 
 ## References
 

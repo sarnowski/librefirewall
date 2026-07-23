@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod net;
+pub mod pci;
 pub mod queue;
 
 pub use queue::{QueueLayout, SplitVirtqueue, Token};
