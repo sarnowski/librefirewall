@@ -122,15 +122,21 @@ fn run() -> Result<(), String> {
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)
         }
+        "test-ab" => {
+            image(&root, DEBUG_CONFIG)?;
+            test_ab(&root)
+        }
         "ci" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
-            test_system(&root)
+            test_system(&root)?;
+            test_ab(&root)
         }
         "release" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)?;
+            test_ab(&root)?;
             image(&root, RELEASE_CONFIG)
         }
         "clean" => clean(&root),
@@ -139,7 +145,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|test-system|ci|release|clean>".to_owned()
+    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|ci|release|clean>".to_owned()
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -545,7 +551,27 @@ fn test_host(root: &Path) -> Result<(), String> {
 }
 
 fn test_system(root: &Path) -> Result<(), String> {
-    let mut command = qemu_base(root, "stdio")?;
+    let disk = root.join("dist").join(DIST_DISK);
+    let (output, observed_pass) = boot_for_marker(root, &disk, "qemu.log")?;
+    let log = root.join("build/bootstrap/qemu.log");
+    let pass_count = count_occurrences(&output, PASS_MARKER.as_bytes());
+    if !observed_pass || pass_count != 1 {
+        return Err(format!(
+            "expected exactly one pass marker, observed {pass_count}; output is in {}",
+            log.display()
+        ));
+    }
+    println!("system test passed; QEMU output is in {}", log.display());
+    Ok(())
+}
+
+/// Boot `disk` through OVMF/GRUB and capture serial output until the pass
+/// marker appears or the timeout elapses. Returns the captured output and
+/// whether the marker was seen. Reaching the timeout without the marker is a
+/// valid outcome for callers that assert on the absence of a boot (it is not an
+/// error here); a QEMU launch/exit failure is.
+fn boot_for_marker(root: &Path, disk: &Path, log_name: &str) -> Result<(Vec<u8>, bool), String> {
+    let mut command = qemu_base(root, "stdio", disk)?;
     command.arg("-monitor").arg("none").arg("-no-shutdown");
     let mut child = command
         .stdout(Stdio::piped())
@@ -584,8 +610,10 @@ fn test_system(root: &Path) -> Result<(), String> {
             break terminate(&mut child, "pass marker observed");
         }
         match child.try_wait() {
-            Ok(Some(status)) => {
-                break Err(format!("QEMU exited before the pass marker with {status}"));
+            Ok(Some(_status)) => {
+                // GRUB or seL4 may reset/exit without the marker; that is a
+                // legitimate no-boot outcome, so drain and stop without erroring.
+                break Ok(());
             }
             Ok(None) => {}
             Err(error) => {
@@ -594,12 +622,7 @@ fn test_system(root: &Path) -> Result<(), String> {
             }
         }
         if start.elapsed() >= QEMU_TIMEOUT {
-            break terminate(&mut child, "hard timeout").and_then(|()| {
-                Err(format!(
-                    "QEMU timed out after {} seconds",
-                    QEMU_TIMEOUT.as_secs()
-                ))
-            });
+            break terminate(&mut child, "hard timeout");
         }
         thread::sleep(Duration::from_millis(25));
     };
@@ -616,28 +639,239 @@ fn test_system(root: &Path) -> Result<(), String> {
         output.extend_from_slice(&chunk);
     }
 
-    let log = root.join("build/bootstrap/qemu.log");
+    let log = root.join("build/bootstrap").join(log_name);
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
     fs::write(&log, &output).map_err(|error| format!("write {}: {error}", log.display()))?;
     result?;
-
-    let pass_count = count_occurrences(&output, PASS_MARKER.as_bytes());
-    if !observed_pass || pass_count != 1 {
-        return Err(format!(
-            "expected exactly one pass marker, observed {pass_count}; output is in {}",
-            log.display()
-        ));
-    }
-    println!("system test passed; QEMU output is in {}", log.display());
-    Ok(())
+    Ok((output, observed_pass))
 }
 
 fn run_system(root: &Path) -> Result<(), String> {
-    let mut command = qemu_base(root, "mon:stdio")?;
+    let disk = root.join("dist").join(DIST_DISK);
+    let mut command = qemu_base(root, "mon:stdio", &disk)?;
     run_command(&mut command, "run QEMU")
+}
+
+/// Exercise the A/B boot state machine end to end. Each scenario starts from a
+/// fresh copy of the pristine release disk, sets the boot-selection state (and,
+/// where relevant, breaks a slot) exactly as the real update flow or a failed
+/// boot would leave it, then boots through OVMF/GRUB and asserts on both GRUB's
+/// slot-selection messages and seL4's completion marker. GRUB's single-attempt
+/// model means a slot that fails verification is skipped within the same boot,
+/// while a slot that would hang is represented by its persistent aftermath
+/// (TRY set, OK unset) — exactly what a watchdog reset leaves behind.
+fn test_ab(root: &Path) -> Result<(), String> {
+    let dist_disk = root.join("dist").join(DIST_DISK);
+    require_file(&dist_disk)?;
+    let work = root.join("build/bootstrap/ab-test.img");
+
+    // 1. Confirmed A boots directly.
+    ab_scenario(
+        root,
+        &dist_disk,
+        &work,
+        "confirmed-A",
+        &["ORDER=A B", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"],
+        &[],
+        &["librefirewall: booting confirmed slot A"],
+        &["slot B"],
+        true,
+        None,
+    )?;
+
+    // 2. A staged, unconfirmed B is tried once and boots; the attempt is
+    //    persisted (B_TRY becomes 1) so a later failure would fall back.
+    ab_scenario(
+        root,
+        &dist_disk,
+        &work,
+        "try-pending-B",
+        &["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"],
+        &[],
+        &["librefirewall: trying slot B"],
+        &[],
+        true,
+        Some("B_TRY=1"),
+    )?;
+
+    // 3. A broken (signature-failing) pending B is skipped and the boot falls
+    //    back to confirmed A within the same boot.
+    ab_scenario(
+        root,
+        &dist_disk,
+        &work,
+        "fallback-from-broken-B",
+        &["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"],
+        &["SLOTB"],
+        &[
+            "librefirewall: trying slot B",
+            "librefirewall: booting confirmed slot A",
+        ],
+        &[],
+        true,
+        None,
+    )?;
+
+    // 4. A pending B that was already tried but never confirmed (its aftermath
+    //    of a hang + watchdog reset) is skipped in favour of A.
+    ab_scenario(
+        root,
+        &dist_disk,
+        &work,
+        "skip-exhausted-B",
+        &["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=1"],
+        &[],
+        &["librefirewall: booting confirmed slot A"],
+        &["slot B"],
+        true,
+        None,
+    )?;
+
+    // 5. Once B is confirmed healthy (the update is committed), B boots directly.
+    ab_scenario(
+        root,
+        &dist_disk,
+        &work,
+        "confirmed-B",
+        &["ORDER=B A", "A_OK=0", "A_TRY=0", "B_OK=1", "B_TRY=0"],
+        &[],
+        &["librefirewall: booting confirmed slot B"],
+        &[],
+        true,
+        None,
+    )?;
+
+    println!("A/B fallback tests passed (5 scenarios)");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ab_scenario(
+    root: &Path,
+    dist_disk: &Path,
+    work: &Path,
+    name: &str,
+    grubenv: &[&str],
+    corrupt_slots: &[&str],
+    expect: &[&str],
+    reject: &[&str],
+    expect_marker: bool,
+    expect_grubenv_after: Option<&str>,
+) -> Result<(), String> {
+    copy_file(dist_disk, work)?;
+    set_grubenv(work, grubenv)?;
+    for slot in corrupt_slots {
+        corrupt_slot_signature(root, work, slot)?;
+    }
+
+    let (output, observed_pass) = boot_for_marker(root, work, &format!("ab-{name}.log"))?;
+    let text = String::from_utf8_lossy(&output);
+
+    for needle in expect {
+        if !text.contains(needle) {
+            return Err(format!(
+                "scenario {name}: expected to see {needle:?} in boot output"
+            ));
+        }
+    }
+    for needle in reject {
+        if text.contains(needle) {
+            return Err(format!(
+                "scenario {name}: unexpectedly saw {needle:?} in boot output"
+            ));
+        }
+    }
+    if observed_pass != expect_marker {
+        return Err(format!(
+            "scenario {name}: pass marker observed={observed_pass}, expected={expect_marker}"
+        ));
+    }
+    if let Some(entry) = expect_grubenv_after {
+        let env = read_grubenv(work)?;
+        if !env.lines().any(|line| line == entry) {
+            return Err(format!(
+                "scenario {name}: expected grubenv to contain {entry:?} after boot, got:\n{env}"
+            ));
+        }
+    }
+    println!("  A/B scenario ok: {name}");
+    Ok(())
+}
+
+fn disk_at(disk: &Path, label: &str) -> String {
+    // mtools addresses a partition by byte offset into the image.
+    let bytes = part(label).start_mib * 1024 * 1024;
+    format!("{}@@{}", disk.display(), bytes)
+}
+
+fn set_grubenv(disk: &Path, entries: &[&str]) -> Result<(), String> {
+    let local = disk.with_extension("grubenv");
+    run_command(
+        Command::new("mcopy")
+            .arg("-n")
+            .arg("-i")
+            .arg(disk_at(disk, "STATE"))
+            .arg("::/grubenv")
+            .arg(&local),
+        "extract grubenv",
+    )?;
+    let mut edit = Command::new("grub-editenv");
+    edit.arg(&local).arg("set");
+    for entry in entries {
+        edit.arg(entry);
+    }
+    run_command(&mut edit, "edit grubenv")?;
+    run_command(
+        Command::new("mcopy")
+            .arg("-o")
+            .arg("-i")
+            .arg(disk_at(disk, "STATE"))
+            .arg(&local)
+            .arg("::/grubenv"),
+        "write grubenv",
+    )?;
+    Ok(())
+}
+
+fn read_grubenv(disk: &Path) -> Result<String, String> {
+    let local = disk.with_extension("grubenv.read");
+    run_command(
+        Command::new("mcopy")
+            .arg("-n")
+            .arg("-i")
+            .arg(disk_at(disk, "STATE"))
+            .arg("::/grubenv")
+            .arg(&local),
+        "extract grubenv",
+    )?;
+    let output = Command::new("grub-editenv")
+        .arg(&local)
+        .arg("list")
+        .output()
+        .map_err(|error| format!("list grubenv: {error}"))?;
+    if !output.status.success() {
+        return Err("grub-editenv list failed".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Overwrite a slot's kernel signature with garbage so GRUB's enforced
+/// verification rejects it, simulating a corrupt or tampered release.
+fn corrupt_slot_signature(root: &Path, disk: &Path, label: &str) -> Result<(), String> {
+    let garbage = root.join("build/bootstrap/garbage.sig");
+    fs::write(&garbage, [0xAB_u8; 64]).map_err(|error| format!("write garbage: {error}"))?;
+    run_command(
+        Command::new("mcopy")
+            .arg("-o")
+            .arg("-i")
+            .arg(disk_at(disk, label))
+            .arg(&garbage)
+            .arg("::/librefirewall-kernel.elf.sig"),
+        "corrupt slot signature",
+    )
 }
 
 /// Build the shared QEMU invocation that boots the deployable disk through
@@ -646,10 +880,8 @@ fn run_system(root: &Path) -> Result<(), String> {
 /// hardware appliance uses. A per-run writable copy of the OVMF variable store
 /// lives in the build directory; the disk itself is writable so GRUB can
 /// persist boot-selection state.
-fn qemu_base(root: &Path, serial: &str) -> Result<Command, String> {
-    let dist = root.join("dist");
-    let disk = dist.join(DIST_DISK);
-    require_file(&disk)?;
+fn qemu_base(root: &Path, serial: &str, disk: &Path) -> Result<Command, String> {
+    require_file(disk)?;
 
     let code = locate(OVMF_CODE_CANDIDATES, "OVMF code firmware")?;
     let vars_template = locate(OVMF_VARS_CANDIDATES, "OVMF variable store")?;

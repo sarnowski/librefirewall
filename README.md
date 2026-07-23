@@ -91,6 +91,7 @@ make image        # build the OCI environment, then run `xtask image`
 make run          # run `xtask run` interactively in QEMU
 make test         # run `xtask test`
 make test-system  # run `xtask test-system` and verify QEMU behaviour
+make test-ab      # boot the A/B state-machine scenarios and assert on each
 make ci           # run the complete `xtask ci` gate
 make release      # run CI, then assemble the Microkit release payload in `dist/`
 make clean        # run `xtask clean` for generated output only

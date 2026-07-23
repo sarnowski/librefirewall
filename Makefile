@@ -16,7 +16,7 @@ else
 CA_SECRET := --secret=id=gropyus_ca,src=$(abspath $(GROPYUS_CA_FILE))
 endif
 
-.PHONY: image run test test-system ci release clean builder prepare
+.PHONY: image run test test-system test-ab ci release clean builder prepare
 
 image: builder prepare
 	$(call xtask,image)
@@ -29,6 +29,9 @@ test: builder prepare
 
 test-system: builder prepare
 	$(call xtask,test-system)
+
+test-ab: builder prepare
+	$(call xtask,test-ab)
 
 ci: builder prepare
 	$(call xtask,ci)
