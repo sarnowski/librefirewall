@@ -126,13 +126,17 @@ logic, never the target.
 
 ## Design (as built)
 
-The **`nic-driver` PD** owns the device MMIO (ECAM + relocated BAR) and the DMA rings, drives the
-split virtqueue (`crates/virtio`) to receive frames, and forwards each frame's payload over the
-SPSC used/free rings and buffer pool (`crates/queue`, `crates/packet-buffer`; producer/consumer
-protocol in `crates/pd-runtime`) to the **`nic-consumer` PD**. This is the real `virtio driver ->
-Rx queue` head of the dataplane; the receive frame is copied once from the NIC DMA buffer into an
-SPSC pool buffer (true zero-copy across that boundary is a later optimisation). Buffer *i* is
-permanently bound to descriptor *i*, so recycling a completed descriptor reposts the same buffer.
+The **`nic-driver` PD** owns the device MMIO (ECAM + relocated BAR) and the receive virtqueue, drives
+the split virtqueue (`crates/virtio`) to receive frames, and hands each frame over the SPSC used/free
+rings to the **`nic-consumer` PD**. This is the real `virtio driver -> Rx queue` head of the
+dataplane, and it is **zero-copy**: the receive buffers *are* the shared SPSC pool
+(`crates/packet-buffer`, in the `crates/pd-runtime` region), so the NIC DMAs each frame directly into
+a buffer the consumer reads in place. The driver never touches the frame bytes — on a receive
+completion it publishes a descriptor for the frame span (offset 12, after the virtio-net header;
+`wire::Descriptor` carries the offset) and reposts buffers the consumer returns. A pool buffer thus
+cycles NIC DMA -> driver -> consumer -> driver -> NIC, its ownership moved by the queues, never
+copied. This requires the SPSC region to carry a fixed physical address (the NIC DMA target) — see
+the DMA/IOMMU decision.
 
 Two-port forwarding — a second NIC plus a Tx path — is the step after (CONCEPT §6.2; AGENTS
 dev-order step 3). The split virtqueue is the reusable primitive both the Rx driver and the later

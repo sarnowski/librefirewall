@@ -66,17 +66,17 @@ impl<const N: usize> BufferPool<N> {
         n as u32
     }
 
-    /// Borrow the first `len` bytes of buffer `index`.
+    /// Borrow `len` bytes of buffer `index` starting at `offset`.
     ///
     /// # Safety
-    /// The caller must currently own `index`, `index` must be `< N`, and `len`
-    /// must be `<= BUFFER_SIZE`. The borrow must end before ownership of the
-    /// buffer is released back to the peer.
-    pub unsafe fn read(&self, index: usize, len: u32) -> &[u8] {
+    /// The caller must currently own `index`, `index` must be `< N`, and
+    /// `offset + len` must be `<= BUFFER_SIZE`. The borrow must end before
+    /// ownership of the buffer is released back to the peer.
+    pub unsafe fn read(&self, index: usize, offset: usize, len: u32) -> &[u8] {
         let src = self.buffers[index].get().cast::<u8>();
-        // SAFETY: `src` covers `BUFFER_SIZE` owned, initialised bytes and `len
-        // <= BUFFER_SIZE`; the caller owns the buffer for the borrow's life.
-        unsafe { core::slice::from_raw_parts(src, len as usize) }
+        // SAFETY: `offset + len <= BUFFER_SIZE` of owned, initialised bytes, so
+        // the span is in-bounds; the caller owns the buffer for the borrow.
+        unsafe { core::slice::from_raw_parts(src.add(offset), len as usize) }
     }
 }
 
@@ -160,8 +160,11 @@ mod tests {
         // SAFETY: single-threaded test; we own index 2 for the whole test.
         let len = unsafe { pool.write(2, &payload) };
         assert_eq!(len, 5);
-        let bytes = unsafe { pool.read(2, len) };
+        let bytes = unsafe { pool.read(2, 0, len) };
         assert_eq!(bytes, &payload);
+        // A non-zero offset borrows a later span of the same buffer.
+        let tail = unsafe { pool.read(2, 2, 3) };
+        assert_eq!(tail, &payload[2..5]);
     }
 
     #[test]

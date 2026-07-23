@@ -17,11 +17,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 
 use packet_buffer::{BufferPool, FreeList};
 use queue::SpscRing;
 use wire::Descriptor;
+
+/// Size in bytes of each pool buffer.
+pub use packet_buffer::BUFFER_SIZE;
 
 /// Number of buffers in the shared pool.
 pub const POOL_BUFFERS: usize = 64;
@@ -60,12 +63,30 @@ pub struct Shared {
 // The region is aliased into two protection domains, so its layout is a hard
 // ABI. Pin the ring and pool sizes, keep the region alignment within a page,
 // and guarantee it fits the mapping declared in the system description.
-const _: () = assert!(size_of::<Ring>() == 8 + RING_SLOTS * 8);
-const _: () = assert!(size_of::<Pool>() == POOL_BUFFERS * packet_buffer::BUFFER_SIZE);
+const _: () = assert!(size_of::<Ring>() == 8 + RING_SLOTS * size_of::<Descriptor>());
+const _: () = assert!(size_of::<Pool>() == POOL_BUFFERS * BUFFER_SIZE);
 const _: () = assert!(align_of::<Shared>() <= 0x1000);
 const _: () = assert!(size_of::<Shared>() <= REGION_SIZE);
 
 impl Shared {
+    /// Byte offset of the buffer pool within the region. A driver that also
+    /// hands the pool to a device (NIC DMA) adds this to the region's physical
+    /// address to get each buffer's physical address.
+    pub const POOL_OFFSET: usize = offset_of!(Shared, pool);
+
+    /// Physical address of the buffer pool, given the region's physical
+    /// address (from a `region_paddr` mapping).
+    #[must_use]
+    pub const fn pool_paddr(region_paddr: u64) -> u64 {
+        region_paddr + Self::POOL_OFFSET as u64
+    }
+
+    /// Physical address of pool buffer `index`.
+    #[must_use]
+    pub const fn buffer_paddr(region_paddr: u64, index: u32) -> u64 {
+        Self::pool_paddr(region_paddr) + index as u64 * BUFFER_SIZE as u64
+    }
+
     /// A new, empty region. Const so it can back a static; mainly for host use,
     /// since the mapped region is already zeroed.
     #[must_use]
@@ -98,8 +119,14 @@ impl Default for Shared {
     }
 }
 
-/// Producer side: owns the free buffers, fills them, and publishes them on
+/// Producer side: owns the pool's free buffers and publishes filled ones on
 /// `used`, reclaiming returns from `free`.
+///
+/// Two ways to publish exist. [`produce`](Self::produce) fills a buffer from a
+/// byte slice — for a domain that generates data in-process. A driver whose
+/// buffers are filled by hardware DMA instead uses [`alloc`](Self::alloc) to
+/// take a buffer to hand to the device and [`submit`](Self::submit) to publish
+/// the already-filled span zero-copy, never touching the bytes.
 pub struct Producer {
     free: FreeList<POOL_BUFFERS>,
 }
@@ -113,36 +140,53 @@ impl Producer {
         }
     }
 
+    /// Take ownership of a free buffer index, e.g. to hand to a device for it
+    /// to fill. `None` when the pool is momentarily exhausted.
+    pub fn alloc(&mut self) -> Option<u32> {
+        self.free.pop()
+    }
+
+    /// Return a buffer to the free pool without publishing it (e.g. when a
+    /// submit could not proceed).
+    pub fn release(&mut self, buffer: u32) {
+        let pushed = self.free.push(buffer);
+        assert!(pushed, "free list overflow: buffer accounting is broken");
+    }
+
+    /// Publish `len` bytes at `offset` of an already-filled `buffer` on `used`,
+    /// transferring the buffer to the consumer. No bytes are copied. Returns
+    /// `false` if the ring is momentarily full, leaving the buffer owned by the
+    /// caller (which should [`release`](Self::release) it).
+    #[must_use]
+    pub fn submit(&mut self, shared: &Shared, buffer: u32, offset: u32, len: u32) -> bool {
+        shared
+            .used
+            .try_enqueue(Descriptor::new(buffer, offset, len))
+            .is_ok()
+    }
+
     /// Reclaim every buffer the consumer has returned on `free`.
     pub fn reclaim(&mut self, shared: &Shared) {
         while let Some(descriptor) = shared.free.try_dequeue() {
-            // A buffer returned by the consumer is one we handed out, so it
-            // always fits back into our free list.
-            debug_assert!(descriptor.len <= packet_buffer::BUFFER_SIZE as u32);
-            let pushed = self.free.push(descriptor.buffer);
-            assert!(pushed, "free list overflow: buffer accounting is broken");
+            self.release(descriptor.buffer);
         }
     }
 
-    /// Fill one buffer with `payload` and publish it on `used`.
+    /// Copy `payload` into a fresh buffer at offset 0 and publish it on `used`.
     ///
-    /// Returns `false` when no buffer is currently free, leaving ownership
-    /// unchanged so the caller can retry after reclaiming.
+    /// Returns `false` when no buffer is free or the ring is full, leaving
+    /// ownership unchanged so the caller can retry after reclaiming.
     pub fn produce(&mut self, shared: &Shared, payload: &[u8]) -> bool {
-        let Some(index) = self.free.pop() else {
+        let Some(index) = self.alloc() else {
             return false;
         };
         // SAFETY: `index` came from our free list, so we own it.
         let len = unsafe { shared.pool.write(index as usize, payload) };
-        match shared.used.try_enqueue(Descriptor::new(index, len)) {
-            Ok(()) => true,
-            Err(_) => {
-                // Ring full (cannot happen while the pool bounds outstanding
-                // buffers, but handled rather than assumed): keep the buffer.
-                let pushed = self.free.push(index);
-                assert!(pushed, "free list overflow: buffer accounting is broken");
-                false
-            }
+        if self.submit(shared, index, 0, len) {
+            true
+        } else {
+            self.release(index);
+            false
         }
     }
 
@@ -180,8 +224,15 @@ impl Consumer {
         while let Some(descriptor) = shared.used.try_dequeue() {
             {
                 // SAFETY: we dequeued this descriptor, so we own its buffer
-                // until we return it below; the borrow ends before that.
-                let bytes = unsafe { shared.pool.read(descriptor.buffer as usize, descriptor.len) };
+                // until we return it below; the borrow ends before that. The
+                // data is the `len` bytes at `offset` the producer published.
+                let bytes = unsafe {
+                    shared.pool.read(
+                        descriptor.buffer as usize,
+                        descriptor.offset as usize,
+                        descriptor.len,
+                    )
+                };
                 on_buffer(descriptor.buffer, bytes);
             }
             // The free ring has a slot for every pool buffer, so a correctly

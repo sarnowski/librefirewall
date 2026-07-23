@@ -6,15 +6,21 @@
 //! Brings up the NIC entirely from static capabilities: it reaches PCI config
 //! space through the mapped ECAM window, reprograms the device's MMIO BAR to an
 //! address this PD pre-mapped, negotiates virtio 1.0, sets up the receive
-//! virtqueue in a DMA region, and then polls the used ring — there is no
-//! interrupt (see docs/virtio-net-driver.md for why polling). Each received
-//! frame is forwarded, over the shared SPSC ring, to the consumer PD.
+//! virtqueue in a DMA ring, and then polls the used ring — there is no
+//! interrupt (see docs/virtio-net-driver.md for why polling).
+//!
+//! Receive is **zero-copy**: the receive buffers are the shared SPSC pool
+//! itself, so the NIC DMAs each frame directly into a buffer the consumer PD
+//! reads in place. The driver never touches the frame bytes — on completion it
+//! hands the buffer to the consumer by publishing a descriptor for the frame
+//! span (after the 12-byte virtio-net header) and reposts buffers the consumer
+//! returns.
 //!
 //! Because Microkit has no periodic wakeup, the driver polls by never returning
 //! from `init`; the consumer runs at a higher priority and preempts on
 //! notification, so the busy loop does not starve it.
 
-use pd_runtime::{Producer, Shared};
+use pd_runtime::{BUFFER_SIZE, Producer, Shared};
 use sel4_microkit::{Channel, debug_println, memory_region_symbol, protection_domain, var};
 use virtio::net::{VirtioNetHdr, features};
 use virtio::pci::{
@@ -27,10 +33,8 @@ const CONSUMER: Channel = Channel::new(0);
 
 /// Receive virtqueue index for virtio-net.
 const RX_QUEUE: u16 = 0;
-/// Descriptors in the receive queue (also the number of receive buffers).
+/// Descriptors in the receive virtqueue (buffers posted to the NIC at once).
 const RX_QUEUE_SIZE: usize = 16;
-/// Size of each receive DMA buffer; holds the 12-byte header plus a full frame.
-const RX_BUFFER_SIZE: usize = 2048;
 /// Physical address we relocate the device's MMIO BAR to (matches nic.system).
 const BAR_ADDR: u32 = 0x5000_0000;
 /// Size of the mapped BAR window (matches nic.system); every device-supplied
@@ -45,16 +49,16 @@ fn init() -> NicDriver {
 
     // Mapped windows and DMA physical addresses, all patched by the Microkit
     // tool from nic.system. The pointers are just addresses here; their use
-    // below (config access, ring setup, frame reads) carries the safety.
+    // below (config access, ring setup) carries the safety.
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();
     let ring = memory_region_symbol!(rx_ring_vaddr: *mut u8).as_ptr();
-    let buffers = memory_region_symbol!(rx_buffers_vaddr: *mut u8).as_ptr();
-    // SAFETY: patched to the region shared read-write with the consumer PD.
+    // SAFETY: patched to the region shared read-write with the consumer PD; its
+    // buffer pool doubles as the NIC's receive DMA target.
     let shared =
         unsafe { Shared::attach(memory_region_symbol!(dataplane_vaddr: *mut Shared).as_ptr()) };
     let ring_paddr = *var!(rx_ring_paddr: usize = 0) as u64;
-    let buffers_paddr = *var!(rx_buffers_paddr: usize = 0) as u64;
+    let dataplane_paddr = *var!(dataplane_paddr: usize = 0) as u64;
 
     // --- Stage A: PCI discovery ---
     let config = unsafe { PciConfig::new(ecam) };
@@ -110,24 +114,32 @@ fn init() -> NicDriver {
     );
     debug_println!("LIBREFIREWALL_NIC:features negotiated={negotiated:#x}");
 
-    // Receive virtqueue in the DMA ring region, its buffers in the DMA buffer
-    // region. Buffer i is permanently associated with descriptor i.
+    // The receive virtqueue lives in the DMA ring region; its buffers are the
+    // shared SPSC pool, which the driver owns until it posts them to the NIC.
     let mut rx = unsafe { Rx::new(ring) };
     let notify_off = common.setup_queue(RX_QUEUE, &Rx::LAYOUT, ring_paddr);
-    // The device chose queue_notify_off; bound its resulting slot to the mapped
-    // notify window before we ever write the doorbell.
     assert!(
         caps.notify as usize + pci::notify_offset_bytes(notify_off, caps.notify_multiplier) + 2
             <= BAR_SIZE,
         "queue notify slot outside the mapped BAR window"
     );
     let notify_base = unsafe { bar.add(caps.notify as usize) };
-    for index in 0..RX_QUEUE_SIZE as u64 {
-        rx.add_writable(
-            buffers_paddr + index * RX_BUFFER_SIZE as u64,
-            RX_BUFFER_SIZE as u32,
-        );
-    }
+
+    let mut producer = Producer::new();
+    // Per virtio descriptor: the pool buffer posted in it, and whether it is
+    // currently outstanding at the device. `outstanding` lets the driver reject
+    // a duplicate or forged completion from the untrusted device, which would
+    // otherwise double-own a buffer and corrupt the virtqueue free list.
+    let mut descriptor_buffer = [0u32; RX_QUEUE_SIZE];
+    let mut outstanding = [false; RX_QUEUE_SIZE];
+    refill(
+        &mut rx,
+        &mut producer,
+        &mut descriptor_buffer,
+        &mut outstanding,
+        dataplane_paddr,
+    );
+
     // DRIVER_OK before the first doorbell: a device need not act on
     // notifications until the driver signals it is ready.
     common.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
@@ -136,35 +148,40 @@ fn init() -> NicDriver {
     }
     debug_println!("LIBREFIREWALL_NIC:driver-ok rx-posted={RX_QUEUE_SIZE}");
 
-    // --- Stage C: receive loop (never returns) ---
-    let mut producer = Producer::new();
+    // --- Stage C: zero-copy receive loop (never returns) ---
     loop {
         producer.reclaim(shared);
-        let mut reposted = false;
-        while let Some((token, len)) = rx.poll() {
+        let reposted = refill(
+            &mut rx,
+            &mut producer,
+            &mut descriptor_buffer,
+            &mut outstanding,
+            dataplane_paddr,
+        );
+        while let Some((token, used_len)) = rx.poll() {
             let index = token.0 as usize;
-            let start = index * RX_BUFFER_SIZE + VirtioNetHdr::LEN;
-            // `len` is device-controlled; clamp it to the buffer before slicing
-            // so a device that over-reports its write cannot drive an
-            // out-of-bounds read (frame_len <= RX_BUFFER_SIZE - 12).
-            let frame_len = (len as usize)
-                .min(RX_BUFFER_SIZE)
-                .saturating_sub(VirtioNetHdr::LEN);
-            // SAFETY: `index < 16` (poll bounds the used id) and `frame_len <=
-            // RX_BUFFER_SIZE - 12`, so the slice lies within buffer `index` of
-            // the mapped rx_buffers region.
-            let frame =
-                unsafe { core::slice::from_raw_parts(buffers.add(start) as *const u8, frame_len) };
-            producer.produce(shared, frame);
-            CONSUMER.notify();
-
-            // Return the buffer to the device for reuse.
+            // Reject a completion for a descriptor that is not outstanding: a
+            // duplicate or forged used-ring entry from the untrusted device.
+            // Do not recycle it — recycling a non-outstanding descriptor would
+            // corrupt the virtqueue free list.
+            if !core::mem::replace(&mut outstanding[index], false) {
+                continue;
+            }
+            let buffer = descriptor_buffer[index];
+            // `used_len` is device-controlled; clamp to the buffer so a device
+            // that over-reports cannot make the consumer read out of bounds.
+            let frame_len = (used_len as usize)
+                .min(BUFFER_SIZE)
+                .saturating_sub(VirtioNetHdr::LEN) as u32;
+            // Hand the frame span (after the virtio header) to the consumer with
+            // no copy; the buffer is now owned by the consumer until it returns
+            // it on the free ring.
+            if producer.submit(shared, buffer, VirtioNetHdr::LEN as u32, frame_len) {
+                CONSUMER.notify();
+            } else {
+                producer.release(buffer);
+            }
             rx.recycle(token);
-            rx.add_writable(
-                buffers_paddr + token.0 as u64 * RX_BUFFER_SIZE as u64,
-                RX_BUFFER_SIZE as u32,
-            );
-            reposted = true;
         }
         if reposted {
             unsafe {
@@ -173,6 +190,38 @@ fn init() -> NicDriver {
         }
         core::hint::spin_loop();
     }
+}
+
+/// Post free pool buffers to the NIC's receive queue until either the queue or
+/// the pool runs dry, recording which buffer went in each descriptor. Returns
+/// whether any buffer was posted (so the caller knows to ring the doorbell).
+fn refill(
+    rx: &mut Rx,
+    producer: &mut Producer,
+    descriptor_buffer: &mut [u32; RX_QUEUE_SIZE],
+    outstanding: &mut [bool; RX_QUEUE_SIZE],
+    dataplane_paddr: u64,
+) -> bool {
+    let mut posted = false;
+    loop {
+        let Some(buffer) = producer.alloc() else {
+            break;
+        };
+        let paddr = Shared::buffer_paddr(dataplane_paddr, buffer);
+        match rx.add_writable(paddr, BUFFER_SIZE as u32) {
+            Some(token) => {
+                descriptor_buffer[token.0 as usize] = buffer;
+                outstanding[token.0 as usize] = true;
+                posted = true;
+            }
+            None => {
+                // The receive queue is full; keep the buffer for next time.
+                producer.release(buffer);
+                break;
+            }
+        }
+    }
+    posted
 }
 
 /// The driver never returns from `init`, so this handler is only a type for the

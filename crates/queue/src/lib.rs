@@ -142,22 +142,22 @@ mod tests {
         let ring = SpscRing::<8>::new();
         assert_eq!(ring.capacity(), 7);
         for i in 0..7 {
-            assert!(ring.try_enqueue(Descriptor::new(i, i)).is_ok());
+            assert!(ring.try_enqueue(Descriptor::new(i, 0, i)).is_ok());
         }
         assert_eq!(ring.len(), 7);
         // The eighth enqueue must fail and hand the descriptor back.
-        let rejected = ring.try_enqueue(Descriptor::new(99, 99));
-        assert_eq!(rejected, Err(Descriptor::new(99, 99)));
+        let rejected = ring.try_enqueue(Descriptor::new(99, 0, 99));
+        assert_eq!(rejected, Err(Descriptor::new(99, 0, 99)));
     }
 
     #[test]
     fn fifo_order_is_preserved() {
         let ring = SpscRing::<8>::new();
         for i in 0..5 {
-            ring.try_enqueue(Descriptor::new(i, 0)).unwrap();
+            ring.try_enqueue(Descriptor::new(i, 0, 0)).unwrap();
         }
         for i in 0..5 {
-            assert_eq!(ring.try_dequeue(), Some(Descriptor::new(i, 0)));
+            assert_eq!(ring.try_dequeue(), Some(Descriptor::new(i, 0, 0)));
         }
         assert!(ring.is_empty());
     }
@@ -168,8 +168,8 @@ mod tests {
         // Usable capacity 3; push/pop far more than CAP so head and tail wrap
         // the underlying array many times.
         for i in 0..1000 {
-            ring.try_enqueue(Descriptor::new(i, i)).unwrap();
-            assert_eq!(ring.try_dequeue(), Some(Descriptor::new(i, i)));
+            ring.try_enqueue(Descriptor::new(i, i, i)).unwrap();
+            assert_eq!(ring.try_dequeue(), Some(Descriptor::new(i, i, i)));
             assert!(ring.is_empty());
         }
     }
@@ -179,12 +179,16 @@ mod tests {
         let ring = SpscRing::<4>::new();
         for round in 0..50 {
             for i in 0..3 {
-                ring.try_enqueue(Descriptor::new(round * 3 + i, 0)).unwrap();
+                ring.try_enqueue(Descriptor::new(round * 3 + i, 0, 0))
+                    .unwrap();
             }
             assert!(ring.try_enqueue(Descriptor::ZERO).is_err());
             assert_eq!(ring.len(), 3);
             for i in 0..3 {
-                assert_eq!(ring.try_dequeue(), Some(Descriptor::new(round * 3 + i, 0)));
+                assert_eq!(
+                    ring.try_dequeue(),
+                    Some(Descriptor::new(round * 3 + i, 0, 0))
+                );
             }
             assert_eq!(ring.try_dequeue(), None);
         }
@@ -203,7 +207,7 @@ mod tests {
             thread::spawn(move || {
                 let mut i = 0;
                 while i < COUNT {
-                    if ring.try_enqueue(Descriptor::new(i, i)).is_ok() {
+                    if ring.try_enqueue(Descriptor::new(i, i, i)).is_ok() {
                         i += 1;
                     } else {
                         std::hint::spin_loop();
@@ -217,7 +221,7 @@ mod tests {
             while expected < COUNT {
                 match ring.try_dequeue() {
                     Some(descriptor) => {
-                        assert_eq!(descriptor, Descriptor::new(expected, expected));
+                        assert_eq!(descriptor, Descriptor::new(expected, expected, expected));
                         expected += 1;
                     }
                     None => std::hint::spin_loop(),

@@ -47,11 +47,13 @@ Built on that substrate, librefirewall now has **real NIC support**: a first-par
 receive driver (`pds/nic-driver`, over the from-scratch split virtqueue and PCI transport in
 `crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU q35 entirely from static seL4
 capabilities — reaching PCI config space through the ECAM window, relocating the device's MMIO BAR
-to a pre-mapped address, negotiating virtio 1.0, and receiving frames by DMA into pinned buffers
-(no interrupt: it polls). Each received frame is forwarded over the SPSC ring to an isolated
-consumer PD. `make test-nic` (part of `make ci`) boots this system via QEMU's multiboot path with a
-`socket`-backed NIC, injects a frame, and asserts it is received and forwarded. Transmit, a second
-port, MSI-X interrupts, and real-hardware bring-up are the next steps — see
+to a pre-mapped address, negotiating virtio 1.0, and receiving frames (no interrupt: it polls). The
+path is **zero-copy**: the NIC DMAs each frame directly into the shared SPSC buffer pool, and the
+driver hands the buffer to the isolated consumer PD without touching the bytes — a buffer cycles
+NIC → driver → consumer → driver → NIC by moving ownership through the queues. `make test-nic` (part
+of `make ci`) boots this system via QEMU's multiboot path with a `socket`-backed NIC, injects a
+frame, and asserts it is received and forwarded. Transmit, a second port, MSI-X interrupts, and
+real-hardware bring-up are the next steps — see
 [docs/virtio-net-driver.md](docs/virtio-net-driver.md).
 
 Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a

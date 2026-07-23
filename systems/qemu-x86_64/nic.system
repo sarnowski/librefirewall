@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <system>
-    <!-- Real virtio-net receive dataplane for QEMU q35 (virtio 1.0 PCI).
-         The driver reaches the device through fixed static capabilities; see
-         docs/virtio-net-driver.md and pds/nic-driver. -->
+    <!-- Real virtio-net receive dataplane for QEMU q35 (virtio 1.0 PCI), with
+         true zero-copy receive: the NIC DMAs frames directly into the shared
+         SPSC buffer pool, and the driver hands each buffer to the consumer
+         without copying. See docs/virtio-net-driver.md and pds/nic-driver. -->
 
     <!-- PCI ECAM page for the pinned device 00:02.0 (q35 MMCONFIG base
          0xB0000000 + (dev 2 << 15)). Device MMIO: uncached. -->
@@ -11,13 +12,14 @@
          nic-driver's BAR_ADDR). Device MMIO: uncached. -->
     <memory_region name="virtio_bar" size="0x4000" phys_addr="0x50000000" />
 
-    <!-- DMA regions the device reads/writes: RAM with a fixed physical address
-         (required on x86 for region_paddr), mapped cached. -->
+    <!-- virtio receive virtqueue (driver <-> NIC): RAM with a fixed physical
+         address, mapped cached. -->
     <memory_region name="rx_ring" size="0x1000" phys_addr="0x30000000" />
-    <memory_region name="rx_buffers" size="0x8000" phys_addr="0x30001000" />
 
-    <!-- Shared SPSC dataplane region between driver and consumer (RAM). -->
-    <memory_region name="dataplane" size="0x40000" />
+    <!-- Shared SPSC dataplane region (driver <-> consumer). Its buffer pool is
+         also the NIC's receive DMA target, so it needs a fixed physical address
+         the driver hands to the device (region_paddr, below). -->
+    <memory_region name="dataplane" size="0x40000" phys_addr="0x31000000" />
 
     <protection_domain name="nic_consumer" priority="2" stack_size="0x4000">
         <program_image path="nic-consumer.elf" />
@@ -29,10 +31,9 @@
         <map mr="ecam" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
         <map mr="virtio_bar" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
         <map mr="rx_ring" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="rx_ring_vaddr" />
-        <map mr="rx_buffers" vaddr="0x10_300_000" perms="rw" cached="true" setvar_vaddr="rx_buffers_vaddr" />
         <map mr="dataplane" vaddr="0x2_000_000" perms="rw" setvar_vaddr="dataplane_vaddr" />
         <setvar symbol="rx_ring_paddr" region_paddr="rx_ring" />
-        <setvar symbol="rx_buffers_paddr" region_paddr="rx_buffers" />
+        <setvar symbol="dataplane_paddr" region_paddr="dataplane" />
     </protection_domain>
 
     <channel>
