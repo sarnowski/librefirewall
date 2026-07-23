@@ -23,8 +23,12 @@ const DIST_MANIFEST: &str = "librefirewall-manifest.json";
 const DIST_SBOM: &str = "librefirewall-sbom.spdx.json";
 const DIST_CHECKSUMS: &str = "librefirewall-checksums.sha256";
 const DIST_DISK: &str = "librefirewall-qemu-x86_64.img";
-const PASS_MARKER: &str =
-    "LIBREFIREWALL_BOOTSTRAP_PASS:initiator-responder-notification-round-trip";
+const PASS_MARKER: &str = "LIBREFIREWALL_DATAPLANE_PASS:spsc-zero-copy-descriptor-round-trip";
+
+/// Workspace packages that build and test on the host (no seL4 target). The
+/// protection-domain binaries are excluded: they need the Microkit target and
+/// are exercised by the QEMU system test instead.
+const HOST_TEST_PACKAGES: &[&str] = &["wire", "queue", "packet-buffer", "pd-runtime", "xtask"];
 const QEMU_TIMEOUT: Duration = Duration::from_secs(40);
 
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
@@ -180,6 +184,11 @@ fn image(root: &Path, config: &str) -> Result<(), String> {
                 "--release",
                 "-Z",
                 "build-std=core",
+                // The dataplane copies bytes into pool buffers, which lowers to
+                // the mem* intrinsics; have compiler-builtins provide them since
+                // there is no libc under seL4.
+                "-Z",
+                "build-std-features=compiler-builtins-mem",
                 "--target",
                 TARGET,
                 "-p",
@@ -539,13 +548,16 @@ fn test_host(root: &Path) -> Result<(), String> {
     run_command(
         Command::new("cargo")
             .current_dir(root)
-            .args(["test", "--locked", "-p", "xtask"]),
+            .args(["test", "--locked"])
+            .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "run host tests",
     )?;
     run_command(
         Command::new("cargo")
             .current_dir(root)
-            .args(["clippy", "--locked", "-p", "xtask", "--", "-D", "warnings"]),
+            .args(["clippy", "--locked", "--all-targets"])
+            .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg]))
+            .args(["--", "-D", "warnings"]),
         "run host clippy",
     )
 }

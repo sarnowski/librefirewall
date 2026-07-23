@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/wire",
+    "crates/queue",
+    "crates/packet-buffer",
+    "crates/pd-runtime",
     "pds/initiator",
     "pds/responder",
     "tools/xtask",

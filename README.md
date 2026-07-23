@@ -30,11 +30,19 @@ and known risks.
 
 ## Current milestone
 
-The current milestone is the initial vertical slice: build two isolated Rust protection domains,
-connect them with a Microkit channel, package them into a signed A/B disk image, boot that image
-through UEFI (OVMF) and the GRUB boot manager, and have the automated system test verify the
-interaction marker. This proves the complete build, signing, isolation, boot-manager, boot, and
-test path; it is not yet a network dataplane.
+The current milestone builds the zero-copy dataplane substrate the whole firewall will rest on:
+two isolated Rust protection domains — a producer and a consumer — exchange packet buffers over
+shared memory using a lock-free single-producer/single-consumer ring, with buffer ownership handed
+across on a return ring so every transfer is zero-copy and single-owner. The producer pushes 1024
+sequence-numbered buffers through a 64-buffer pool and 128-slot rings, so both rings wrap many times
+and every buffer is reused; the consumer verifies order and content and emits the success marker the
+automated system test asserts on. The reusable primitives live in host-tested `no_std` crates
+(`crates/wire`, `crates/queue`, `crates/packet-buffer`, `crates/pd-runtime`); the protection-domain
+binaries are thin adapters that map the shared region and drive the exchange from Microkit
+notifications. Packaged into the signed A/B disk image and booted through UEFI (OVMF) and GRUB, this
+proves the build, signing, isolation, boot-manager, boot, and component-interaction path together.
+It is the substrate the next slice plugs a virtio NIC driver and processing stages onto; it is not
+yet a network dataplane — the buffers are produced in-system, not received from a device.
 
 Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a
 signed seL4 kernel + Microkit system image per slot, a signature-enforcing GRUB image on the ESP,

@@ -109,6 +109,14 @@ ENV PATH=/opt/grub/bin:/opt/rust/cargo/bin:$PATH \
 RUN chmod -R a+rX /opt/microkit/
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml /tmp/workspace/
+COPY crates/wire/Cargo.toml /tmp/workspace/crates/wire/Cargo.toml
+COPY crates/wire/src /tmp/workspace/crates/wire/src
+COPY crates/queue/Cargo.toml /tmp/workspace/crates/queue/Cargo.toml
+COPY crates/queue/src /tmp/workspace/crates/queue/src
+COPY crates/packet-buffer/Cargo.toml /tmp/workspace/crates/packet-buffer/Cargo.toml
+COPY crates/packet-buffer/src /tmp/workspace/crates/packet-buffer/src
+COPY crates/pd-runtime/Cargo.toml /tmp/workspace/crates/pd-runtime/Cargo.toml
+COPY crates/pd-runtime/src /tmp/workspace/crates/pd-runtime/src
 COPY pds/initiator/Cargo.toml /tmp/workspace/pds/initiator/Cargo.toml
 COPY pds/initiator/src /tmp/workspace/pds/initiator/src
 COPY pds/responder/Cargo.toml /tmp/workspace/pds/responder/Cargo.toml
