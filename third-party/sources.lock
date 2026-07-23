@@ -2,20 +2,20 @@
 DEBIAN_IMAGE=docker.io/library/debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4
 DEBIAN_SNAPSHOT=20260714T000000Z
 
-# seL4 Microkit SDK
-MICROKIT_VERSION=2.2.0
-MICROKIT_URL=https://github.com/seL4/microkit/releases/download/2.2.0/microkit-sdk-2.2.0-linux-x86-64.tar.gz
-MICROKIT_SHA256=4cac711ad0591f206c77aca6d33067fc06532c8830d1adf71bfddb274fdb10ba
+# seL4 Microkit SDK (ships the seL4 16.0.0 kernel)
+MICROKIT_VERSION=2.3.0
+MICROKIT_URL=https://github.com/seL4/microkit/releases/download/2.3.0/microkit-sdk-2.3.0-linux-x86-64.tar.gz
+MICROKIT_SHA256=e12e507f72c87cbf5c514df9e9b0c66103b42298852f44c045d5729ea3de4f89
 
-# rust-sel4, tag v4.0.0 (commit 7a2321f2d84310ba7a09fe7f5988e6dcecde3566)
-RUST_SEL4_VERSION=v4.0.0
-RUST_SEL4_URL=https://github.com/seL4/rust-sel4/archive/refs/tags/v4.0.0.tar.gz
-RUST_SEL4_SHA256=4c0e8335f3dcf8377d2af50dfba0bbe1e97eee436fb73c43fa7623ddce02767d
+# rust-sel4, tag v5.0.0 (commit d441a880938209f661201704dfbee7b91c5aa905)
+RUST_SEL4_VERSION=v5.0.0
+RUST_SEL4_URL=https://github.com/seL4/rust-sel4/archive/refs/tags/v5.0.0.tar.gz
+RUST_SEL4_SHA256=40bfb63e6fc8be71813f268869fc69d4f44150230ca294b40958617d17471780
 
 # rustup 1.28.2 and the project toolchain
 RUSTUP_INIT_URL=https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
 RUSTUP_INIT_SHA256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
-RUST_TOOLCHAIN=nightly-2026-03-18
+RUST_TOOLCHAIN=nightly-2026-04-04
 
 # Syft SBOM generator
 SYFT_VERSION=1.49.0

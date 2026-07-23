@@ -89,7 +89,7 @@ ENV PATH=/opt/rust/cargo/bin:$PATH \
     RUST_SEL4_ROOT=/opt/rust-sel4 \
     SYFT_CHECK_FOR_APP_UPDATE=false
 
-RUN chmod -R a+rX /opt/microkit-sdk-2.2.0
+RUN chmod -R a+rX /opt/microkit/
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml /tmp/workspace/
 COPY pds/initiator/Cargo.toml /tmp/workspace/pds/initiator/Cargo.toml

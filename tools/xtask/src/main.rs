@@ -8,14 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TARGET: &str = "x86_64-sel4-microkit-minimal";
+const TARGET: &str = "x86_64-sel4-minimal";
 const BOARD: &str = "x86_64_generic";
 const DEBUG_CONFIG: &str = "debug";
 const RELEASE_CONFIG: &str = "release";
 const MICROKIT_SDK: &str = "/opt/microkit";
 const RUST_SEL4: &str = "/opt/rust-sel4";
-const RUST_SEL4_VERSION: &str = "4.0.0";
-const MICROKIT_VERSION: &str = "2.2.0";
+const RUST_SEL4_VERSION: &str = "5.0.0";
+const MICROKIT_VERSION: &str = "2.3.0";
 const DIST_KERNEL: &str = "librefirewall-kernel.elf";
 const DIST_SYSTEM: &str = "librefirewall-system.img";
 const DIST_REPORT: &str = "librefirewall-microkit-report.txt";

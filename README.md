@@ -39,8 +39,8 @@ it is not yet a network dataplane.
 
 The supported developer and CI interface is GNU Make backed by rootless Podman. The builder is based
 on Debian 13 pinned by OCI digest and a dated Debian snapshot. It contains QEMU x86, Microkit SDK
-2.2.0, rust-sel4 v4.0.0 at `/opt/rust-sel4`, and Rust `nightly-2026-03-18` with `rust-src`,
-`rustfmt`, and `clippy`. Download URLs and SHA-256 checksums are recorded in
+2.3.0 (seL4 16.0.0), rust-sel4 v5.0.0 at `/opt/rust-sel4`, and Rust `nightly-2026-04-04` with
+`rust-src`, `rustfmt`, and `clippy`. Download URLs and SHA-256 checksums are recorded in
 [`third-party/sources.lock`](third-party/sources.lock).
 
 Every image build emits `dist/librefirewall-sbom.spdx.json`, a standardized SPDX 2.3 software bill
