@@ -4,6 +4,7 @@ members = [
     "crates/wire",
     "crates/queue",
     "crates/packet-buffer",
+    "crates/virtio",
     "crates/pd-runtime",
     "pds/initiator",
     "pds/responder",

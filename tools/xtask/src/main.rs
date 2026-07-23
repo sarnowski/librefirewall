@@ -28,7 +28,14 @@ const PASS_MARKER: &str = "LIBREFIREWALL_DATAPLANE_PASS:spsc-zero-copy-descripto
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target and
 /// are exercised by the QEMU system test instead.
-const HOST_TEST_PACKAGES: &[&str] = &["wire", "queue", "packet-buffer", "pd-runtime", "xtask"];
+const HOST_TEST_PACKAGES: &[&str] = &[
+    "wire",
+    "queue",
+    "packet-buffer",
+    "virtio",
+    "pd-runtime",
+    "xtask",
+];
 const QEMU_TIMEOUT: Duration = Duration::from_secs(40);
 
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";

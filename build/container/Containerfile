@@ -108,21 +108,21 @@ ENV PATH=/opt/grub/bin:/opt/rust/cargo/bin:$PATH \
 
 RUN chmod -R a+rX /opt/microkit/
 
+# Warm the offline dependency cache from the manifests alone. `cargo fetch`
+# needs every workspace member's Cargo.toml and the lockfile, but not the real
+# sources — empty target stubs (synthesized in the RUN below) are enough to load
+# each manifest. Keeping sources out of this layer means the fetch re-runs only
+# when dependencies actually change, not on every source edit; the sole coupling
+# to the workspace is the member manifest list.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml /tmp/workspace/
 COPY crates/wire/Cargo.toml /tmp/workspace/crates/wire/Cargo.toml
-COPY crates/wire/src /tmp/workspace/crates/wire/src
 COPY crates/queue/Cargo.toml /tmp/workspace/crates/queue/Cargo.toml
-COPY crates/queue/src /tmp/workspace/crates/queue/src
 COPY crates/packet-buffer/Cargo.toml /tmp/workspace/crates/packet-buffer/Cargo.toml
-COPY crates/packet-buffer/src /tmp/workspace/crates/packet-buffer/src
+COPY crates/virtio/Cargo.toml /tmp/workspace/crates/virtio/Cargo.toml
 COPY crates/pd-runtime/Cargo.toml /tmp/workspace/crates/pd-runtime/Cargo.toml
-COPY crates/pd-runtime/src /tmp/workspace/crates/pd-runtime/src
 COPY pds/initiator/Cargo.toml /tmp/workspace/pds/initiator/Cargo.toml
-COPY pds/initiator/src /tmp/workspace/pds/initiator/src
 COPY pds/responder/Cargo.toml /tmp/workspace/pds/responder/Cargo.toml
-COPY pds/responder/src /tmp/workspace/pds/responder/src
 COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
-COPY tools/xtask/src /tmp/workspace/tools/xtask/src
 
 RUN --mount=type=secret,id=gropyus_ca,required=false \
     set -eu; \
@@ -132,6 +132,12 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     cd /tmp/workspace; \
+    for manifest in $(find . -name Cargo.toml); do \
+      stub="$(dirname "$manifest")/src"; \
+      mkdir -p "$stub"; \
+      : > "$stub/lib.rs"; \
+      : > "$stub/main.rs"; \
+    done; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked; \
     sysroot="$(rustc --print sysroot)/lib/rustlib/src/rust/library/sysroot/Cargo.toml"; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path "$sysroot"; \
