@@ -66,6 +66,21 @@ impl<const N: usize> BufferPool<N> {
         n as u32
     }
 
+    /// Copy `data` into buffer `index` starting at `offset`, leaving the rest
+    /// of the buffer untouched. A driver uses this to place a device header in
+    /// front of an already-DMA'd frame without moving the frame bytes.
+    ///
+    /// # Safety
+    /// The caller must currently own `index`, `index` must be `< N`, and
+    /// `offset + data.len()` must be `<= BUFFER_SIZE`.
+    pub unsafe fn write_at(&self, index: usize, offset: usize, data: &[u8]) {
+        let dst = self.buffers[index].get().cast::<u8>();
+        // SAFETY: `offset + data.len() <= BUFFER_SIZE` of owned bytes, so the
+        // span is in-bounds; source and destination do not overlap (distinct
+        // allocations).
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(offset), data.len()) };
+    }
+
     /// Borrow `len` bytes of buffer `index` starting at `offset`.
     ///
     /// # Safety
@@ -165,6 +180,18 @@ mod tests {
         // A non-zero offset borrows a later span of the same buffer.
         let tail = unsafe { pool.read(2, 2, 3) };
         assert_eq!(tail, &payload[2..5]);
+    }
+
+    #[test]
+    fn write_at_places_data_mid_buffer_without_touching_the_rest() {
+        let pool = BufferPool::<1>::new();
+        // SAFETY: single-threaded test; we own index 0 for the whole test.
+        unsafe { pool.write(0, &[0xEEu8; 32]) };
+        unsafe { pool.write_at(0, 12, &[1, 2, 3]) };
+        let bytes = unsafe { pool.read(0, 0, 16) };
+        assert_eq!(&bytes[..12], &[0xEE; 12]);
+        assert_eq!(&bytes[12..15], &[1, 2, 3]);
+        assert_eq!(bytes[15], 0xEE);
     }
 
     #[test]

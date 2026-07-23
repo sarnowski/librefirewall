@@ -123,7 +123,7 @@ COPY crates/pd-runtime/Cargo.toml /tmp/workspace/crates/pd-runtime/Cargo.toml
 COPY pds/initiator/Cargo.toml /tmp/workspace/pds/initiator/Cargo.toml
 COPY pds/responder/Cargo.toml /tmp/workspace/pds/responder/Cargo.toml
 COPY pds/nic-driver/Cargo.toml /tmp/workspace/pds/nic-driver/Cargo.toml
-COPY pds/nic-consumer/Cargo.toml /tmp/workspace/pds/nic-consumer/Cargo.toml
+COPY pds/forwarder/Cargo.toml /tmp/workspace/pds/forwarder/Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
 
 RUN --mount=type=secret,id=gropyus_ca,required=false \

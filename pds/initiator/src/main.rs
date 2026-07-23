@@ -54,7 +54,7 @@ impl Handler for ProducerPd {
 
     fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
         assert!(channels.contains(CONSUMER));
-        self.producer.reclaim(self.shared);
+        self.producer.reclaim(&self.shared.free);
         if self.sent < TOTAL {
             self.sent = produce_batch(&mut self.producer, self.shared, self.sent);
             CONSUMER.notify();
@@ -75,7 +75,7 @@ fn produce_batch(producer: &mut Producer, shared: &Shared, from: u64) -> u64 {
     };
     let mut sequence = from;
     while sequence < end {
-        if !producer.produce(shared, &sequence.to_le_bytes()) {
+        if !producer.produce(&shared.pool, &shared.used, &sequence.to_le_bytes()) {
             break;
         }
         sequence += 1;

@@ -1,15 +1,18 @@
-# ADR: virtio-net Rx driver protection domain
+# ADR: virtio-net driver protection domain
 
 ## Status
 
-Implemented (receive path), QEMU q35. `pds/nic-driver` brings up a modern virtio-net-pci device
-from static capabilities and receives real frames; `pds/nic-consumer` verifies a frame forwarded
-over the SPSC ring; `crates/virtio` carries the split virtqueue and the first-party PCI transport
-(`pci.rs`). The `test-nic` system test (in `make ci`) boots the standalone `nic.system` image via
-QEMU's multiboot `-kernel`/`-initrd` path on q35, injects a frame over a `socket` netdev, and
-asserts the forward marker. Transmit, a second port, MSI-X interrupts (this driver polls), and
-real-hardware bring-up (BAR discovery, VT-d) remain future work — see Open decisions below, which
-are kept as the record of what the QEMU slice deliberately does not yet solve.
+Implemented (two-port zero-copy forwarding), QEMU q35. `pds/nic-driver` brings up a modern
+virtio-net-pci device from static capabilities and drives both its receive and transmit
+virtqueues; the same binary is instantiated once per NIC, each instance patched with its own
+device windows. `pds/forwarder` sits between the two ports and moves frame descriptors from each
+port's receive ring to the other port's transmit ring; `crates/virtio` carries the split virtqueue
+and the first-party PCI transport (`pci.rs`). The `test-forward` system test (in `make ci`) boots
+the standalone `forward.system` image via QEMU's multiboot `-kernel`/`-initrd` path on q35 with
+two `socket` netdevs, injects a distinct frame into each port, and asserts each egresses
+byte-identical on the opposite port. MSI-X interrupts (the drivers poll) and real-hardware
+bring-up (BAR discovery, VT-d) remain future work — see Open decisions below, which are kept as
+the record of what the QEMU slice deliberately does not yet solve.
 
 The constraints and decisions below reflect what the working driver relies on; where the QEMU slice
 resolved a decision, it is marked **[resolved for QEMU]**.
@@ -78,24 +81,26 @@ virtio BARs must be known at build time to map them as `phys_addr` regions, but 
 by firmware at runtime. Because the `.system` model forces static mapping, we must either pin the
 BAR layout or discover-then-map — and static pinning is what the model actually permits.
 
-**[resolved for QEMU]** The driver maps the q35 ECAM window (base `0xB0000000`) for the pinned
-device `00:02.0` and reads config space over MMIO — option (a), no `<ioport>` shim needed. It then
-sidesteps the chicken-and-egg by **reprogramming** the device's modern MMIO BAR to a fixed address
-this PD pre-maps (`0x50000000`), so the `.system` is self-consistent and independent of what
-SeaBIOS assigned. On real hardware the reprogram target must be a validated free MMIO range (and
-BAR discovery/sizing generalised); that remains open and ties to CONCEPT §13.2.
+**[resolved for QEMU]** Each driver instance maps the q35 ECAM page of its pinned device
+(`00:02.0` and `00:03.0`) and reads config space over MMIO — option (a), no `<ioport>` shim
+needed. It then sidesteps the chicken-and-egg by **reprogramming** the device's modern MMIO BAR to
+the fixed address that instance pre-maps (`0x50000000` / `0x50004000`, patched into the binary via
+`region_paddr`), so the `.system` is self-consistent and independent of what SeaBIOS assigned. On
+real hardware the reprogram target must be a validated free MMIO range (and BAR discovery/sizing
+generalised); that remains open and ties to CONCEPT §13.2.
 
 ### IRQ model
 
 MSI-X (the natural fit for virtio-pci) vs a legacy IOAPIC line. The Microkit `<irq>` MSI form needs
 the device BDF (`pcidev`) and a `handle`; the IOAPIC form needs `pin`/`vector`.
 
-**[resolved for QEMU]** The driver takes **no interrupt** — it polls the receive used ring by
-never returning from `init`, throttled by the scheduler, with the consumer at higher priority so
-the busy loop does not starve it (research confirmed Microkit has no periodic wakeup, so this is
-the only interrupt-free option). MSI-X remains the target for a production, latency-sensitive
-driver; it needs the MSI Message-Address encoding, which the SDK does not document (seL4 Reference
-Manual, §x86 interrupts).
+**[resolved for QEMU]** The drivers take **no interrupt** — each polls its receive and transmit
+used rings by never returning from `init`, throttled by the scheduler, with the forwarder at
+higher priority so the busy loops do not starve it (research confirmed Microkit has no periodic
+wakeup, so this is the only interrupt-free option; the two same-priority drivers round-robin on
+timeslice). MSI-X remains the target for a production, latency-sensitive driver; it needs the MSI
+Message-Address encoding, which the SDK does not document (seL4 Reference Manual, §x86
+interrupts).
 
 ### DMA / IOMMU
 
@@ -104,18 +109,21 @@ understood. Either way DMA regions need fixed `phys_addr`.
 
 **[resolved for QEMU]** Plain q35 exposes **no** vIOMMU, so seL4 reports zero IOMMUs and device DMA
 is unrestricted — no `<io_address_space>` is used, and `virtio-net-pci iommu_platform=off` means the
-device DMAs to raw physical addresses. The receive ring and buffers are RAM regions pinned at
-`0x30000000` with `region_paddr`. On real hardware (or with `-device intel-iommu`) VT-d confinement
-per CONCEPT §7 becomes mandatory and this decision reopens.
+device DMAs to raw physical addresses. The virtqueue regions (`0x30000000`/`0x30001000`) and the
+two pipeline regions (`0x31000000`/`0x31040000`) are RAM pinned with `region_paddr`. On real
+hardware (or with `-device intel-iommu`) VT-d confinement per CONCEPT §7 becomes mandatory and this
+decision reopens.
 
 ### Untrusted-device hardening
 
 The device is external input and is not trusted (AGENTS: treat neighbours as untrusted; bound
 externally-driven state). The `crates/virtio` queue already rejects an out-of-range used `id` so a
-malformed completion cannot drive an out-of-bounds recycle. The driver PD must own the rest:
-rejecting completions for descriptors not currently in flight (double-completion), bounding the
-device-reported length against the buffer, accounting for leaked/never-completed descriptors, and
-handling `DEVICE_NEEDS_RESET`. None of these may panic on device-controlled input.
+malformed completion cannot drive an out-of-bounds recycle. The driver PD owns the rest: it
+rejects completions for descriptors not currently in flight (double-completion) on both queues,
+bounds the device-reported receive length against the buffer, and validates every transmit
+descriptor arriving from the neighbouring forwarder PD (index, span, header room) before touching
+the span — none of these panic on device- or neighbour-controlled input. Accounting for
+leaked/never-completed descriptors and handling `DEVICE_NEEDS_RESET` remain open.
 
 ### Alternative considered: QEMU `microvm`
 
@@ -126,23 +134,30 @@ logic, never the target.
 
 ## Design (as built)
 
-The **`nic-driver` PD** owns the device MMIO (ECAM + relocated BAR) and the receive virtqueue, drives
-the split virtqueue (`crates/virtio`) to receive frames, and hands each frame over the SPSC used/free
-rings to the **`nic-consumer` PD**. This is the real `virtio driver -> Rx queue` head of the
-dataplane, and it is **zero-copy**: the receive buffers *are* the shared SPSC pool
-(`crates/packet-buffer`, in the `crates/pd-runtime` region), so the NIC DMAs each frame directly into
-a buffer the consumer reads in place. The driver never touches the frame bytes — on a receive
-completion it publishes a descriptor for the frame span (offset 12, after the virtio-net header;
-`wire::Descriptor` carries the offset) and reposts buffers the consumer returns. A pool buffer thus
-cycles NIC DMA -> driver -> consumer -> driver -> NIC, its ownership moved by the queues, never
-copied. This requires the SPSC region to carry a fixed physical address (the NIC DMA target) — see
-the DMA/IOMMU decision.
+The system is the two-port forwarding dataplane of AGENTS dev-order step 3: two instances of the
+**`nic-driver` PD** (one per NIC) joined through the **`forwarder` PD** by one `Pipeline` region
+per direction (`crates/pd-runtime`). Each driver instance owns its device's MMIO (ECAM page +
+relocated BAR) and both its virtqueues, and plays two roles at once:
 
-Two-port forwarding — a second NIC plus a Tx path — is the step after (CONCEPT §6.2; AGENTS
-dev-order step 3). The split virtqueue is the reusable primitive both the Rx driver and the later
-Tx path build on. Per AGENTS, the PDs stay thin adapters around the reusable libraries, with the
-transport's pure logic (cap walk, offsets) tested on the host and the whole path tested under seL4
-in QEMU (`make test-nic`).
+- **Rx** on the pipeline it owns: the receive buffers *are* that pipeline's buffer pool
+  (`crates/packet-buffer`), so the NIC DMAs each frame directly into a buffer every downstream
+  stage reads in place. On a completion the driver publishes a descriptor for the frame span
+  (offset 12, after the virtio-net header; `wire::Descriptor` carries the offset) on the
+  pipeline's `rx` ring and reposts buffers returned on its `free` ring.
+- **Tx** on the other pipeline: it dequeues descriptors the forwarder queued on that pipeline's
+  `tx` ring, validates each (untrusted neighbour), zeroes the 12 virtio-net header bytes in front
+  of the frame — space the receive side reserved in the same buffer — and hands the device that
+  very buffer to DMA out of. On the transmit completion the buffer returns to its pool-owning
+  peer on the `free` ring.
+
+The forwarder moves descriptors `rx -> tx` per pipeline and is the seat where the classifier and
+filter shards will later sit. A frame thus crosses the whole system — NIC0 DMA in -> driver0 ->
+forwarder -> driver1 -> NIC1 DMA out — with only its descriptor ever moving: **zero-copy end to
+end** over one pool per direction. This requires the pipeline regions to carry fixed physical
+addresses (both NICs' DMA target) — see the DMA/IOMMU decision. Per AGENTS, the PDs stay thin
+adapters around the reusable libraries, with the transport's pure logic (cap walk, offsets) and
+the three-stage ownership chain tested on the host and the whole path tested under seL4 in QEMU
+(`make test-forward`, which asserts byte-identical frame egress in both directions).
 
 ## References
 

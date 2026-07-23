@@ -1,5 +1,5 @@
 [package]
-name = "nic-consumer"
+name = "forwarder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

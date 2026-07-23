@@ -43,17 +43,21 @@ notifications. Packaged into the signed A/B disk image and booted through UEFI (
 proves the build, signing, isolation, boot-manager, boot, and component-interaction path together.
 It is the substrate the virtio NIC driver plugs onto.
 
-Built on that substrate, librefirewall now has **real NIC support**: a first-party virtio-net
-receive driver (`pds/nic-driver`, over the from-scratch split virtqueue and PCI transport in
-`crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU q35 entirely from static seL4
-capabilities — reaching PCI config space through the ECAM window, relocating the device's MMIO BAR
-to a pre-mapped address, negotiating virtio 1.0, and receiving frames (no interrupt: it polls). The
-path is **zero-copy**: the NIC DMAs each frame directly into the shared SPSC buffer pool, and the
-driver hands the buffer to the isolated consumer PD without touching the bytes — a buffer cycles
-NIC → driver → consumer → driver → NIC by moving ownership through the queues. `make test-nic` (part
-of `make ci`) boots this system via QEMU's multiboot path with a `socket`-backed NIC, injects a
-frame, and asserts it is received and forwarded. Transmit, a second port, MSI-X interrupts, and
-real-hardware bring-up are the next steps — see
+Built on that substrate, librefirewall now **forwards real traffic between two NIC ports**: a
+first-party virtio-net driver (`pds/nic-driver`, over the from-scratch split virtqueue and PCI
+transport in `crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU q35 entirely from
+static seL4 capabilities — reaching PCI config space through the ECAM window, relocating the
+device's MMIO BAR to a pre-mapped address, negotiating virtio 1.0, and driving both the receive
+and transmit virtqueues (no interrupt: it polls). The same driver binary is instantiated once per
+port; between the two instances sits an isolated forwarder PD — the seat where the classifier and
+filter shards will later run — joined by one shared pipeline region per direction. The whole path
+is **zero-copy**: the receiving NIC DMAs each frame directly into the pipeline's buffer pool, the
+forwarder moves only its descriptor, and the transmitting NIC DMAs the frame back out of the very
+same buffer — a buffer cycles NIC0 → driver0 → forwarder → driver1 → NIC1 and back by moving
+ownership through the queues, its bytes never copied. `make test-forward` (part of `make ci`)
+boots this system via QEMU's multiboot path with two `socket`-backed NICs, injects a distinct
+frame into each port, and asserts each egresses byte-identical on the opposite port. MSI-X
+interrupts and real-hardware bring-up are the next steps — see
 [docs/virtio-net-driver.md](docs/virtio-net-driver.md).
 
 Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <!-- Two-port zero-copy virtio-net forwarding dataplane for QEMU q35
+         (virtio 1.0 PCI): two instances of the same driver binary, one per
+         NIC, joined through a forwarder PD by one pipeline region per
+         direction. Each pipeline's buffer pool is DMA'd into by the receiving
+         NIC and out of by the transmitting NIC, so a frame crosses the whole
+         system without ever being copied. See docs/virtio-net-driver.md,
+         pds/nic-driver, and pds/forwarder. -->
+
+    <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0 (q35
+         MMCONFIG base 0xB0000000 + (dev << 15)). Device MMIO: uncached. -->
+    <memory_region name="ecam0" size="0x1000" phys_addr="0xB0010000" />
+    <memory_region name="ecam1" size="0x1000" phys_addr="0xB0018000" />
+    <!-- Where each driver relocates its device's modern MMIO BAR (patched into
+         the driver via region_paddr). Device MMIO: uncached. -->
+    <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />
+    <memory_region name="bar1" size="0x4000" phys_addr="0x50004000" />
+
+    <!-- virtio virtqueues (driver <-> NIC), receive and transmit per port:
+         RAM with a fixed physical address, mapped cached. -->
+    <memory_region name="vq0" size="0x1000" phys_addr="0x30000000" />
+    <memory_region name="vq1" size="0x1000" phys_addr="0x30001000" />
+
+    <!-- One pipeline region per forwarding direction (rx driver -> forwarder
+         -> tx driver). Each pool is both NICs' DMA target, so the regions need
+         fixed physical addresses the drivers hand to the devices
+         (region_paddr, below). pipe0: port 0 -> port 1; pipe1: the reverse. -->
+    <memory_region name="pipe0" size="0x40000" phys_addr="0x31000000" />
+    <memory_region name="pipe1" size="0x40000" phys_addr="0x31040000" />
+
+    <protection_domain name="forwarder" priority="2" stack_size="0x4000">
+        <program_image path="forwarder.elf" />
+        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" setvar_vaddr="pipe0_vaddr" />
+        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" setvar_vaddr="pipe1_vaddr" />
+    </protection_domain>
+
+    <protection_domain name="nic_driver0" priority="1" stack_size="0x8000">
+        <program_image path="nic-driver.elf" />
+        <map mr="ecam0" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
+        <map mr="bar0" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
+        <map mr="vq0" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
+        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" setvar_vaddr="rx_pipe_vaddr" />
+        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" setvar_vaddr="tx_pipe_vaddr" />
+        <setvar symbol="bar_paddr" region_paddr="bar0" />
+        <setvar symbol="vq_paddr" region_paddr="vq0" />
+        <setvar symbol="rx_pipe_paddr" region_paddr="pipe0" />
+        <setvar symbol="tx_pipe_paddr" region_paddr="pipe1" />
+    </protection_domain>
+
+    <protection_domain name="nic_driver1" priority="1" stack_size="0x8000">
+        <program_image path="nic-driver.elf" />
+        <map mr="ecam1" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
+        <map mr="bar1" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
+        <map mr="vq1" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
+        <map mr="pipe1" vaddr="0x2_000_000" perms="rw" setvar_vaddr="rx_pipe_vaddr" />
+        <map mr="pipe0" vaddr="0x2_100_000" perms="rw" setvar_vaddr="tx_pipe_vaddr" />
+        <setvar symbol="bar_paddr" region_paddr="bar1" />
+        <setvar symbol="vq_paddr" region_paddr="vq1" />
+        <setvar symbol="rx_pipe_paddr" region_paddr="pipe1" />
+        <setvar symbol="tx_pipe_paddr" region_paddr="pipe0" />
+    </protection_domain>
+
+    <channel>
+        <end pd="nic_driver0" id="0" />
+        <end pd="forwarder" id="0" />
+    </channel>
+    <channel>
+        <end pd="nic_driver1" id="0" />
+        <end pd="forwarder" id="1" />
+    </channel>
+</system>

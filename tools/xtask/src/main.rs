@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod nic_harness;
+mod forward_harness;
 
 const TARGET: &str = "x86_64-sel4-minimal";
 const BOARD: &str = "x86_64_generic";
@@ -40,7 +40,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
 ];
 const QEMU_TIMEOUT: Duration = Duration::from_secs(40);
 
-const NIC_SYSTEM: &str = "systems/qemu-x86_64/nic.system";
+const FORWARD_SYSTEM: &str = "systems/qemu-x86_64/forward.system";
 
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
 const GRUB_VERSION: &str = "2.14";
@@ -141,20 +141,20 @@ fn run() -> Result<(), String> {
             image(&root, DEBUG_CONFIG)?;
             test_ab(&root)
         }
-        "test-nic" => test_nic(&root),
+        "test-forward" => test_forward(&root),
         "ci" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)?;
             test_ab(&root)?;
-            test_nic(&root)
+            test_forward(&root)
         }
         "release" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)?;
             test_ab(&root)?;
-            test_nic(&root)?;
+            test_forward(&root)?;
             image(&root, RELEASE_CONFIG)
         }
         "clean" => clean(&root),
@@ -163,7 +163,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|test-nic|ci|release|clean>"
+    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|test-forward|ci|release|clean>"
         .to_owned()
 }
 
@@ -1103,15 +1103,15 @@ fn write_checksums(dist: &Path) -> Result<(), String> {
         .map_err(|error| format!("write {DIST_CHECKSUMS}: {error}"))
 }
 
-/// Build the standalone virtio-net receive system (driver + consumer PDs and
-/// `nic.system`) into `build/nic`, returning the 32-bit kernel and loader image
-/// to boot. This is a separate Microkit image from the A/B release disk: it
-/// boots via QEMU's multiboot `-kernel`/`-initrd` path on q35 with a real NIC,
-/// not through OVMF/GRUB.
-fn build_nic_image(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+/// Build the standalone two-port forwarding system (two driver PD instances,
+/// the forwarder PD, and `forward.system`) into `build/forward`, returning the
+/// 32-bit kernel and loader image to boot. This is a separate Microkit image
+/// from the A/B release disk: it boots via QEMU's multiboot `-kernel`/`-initrd`
+/// path on q35 with real NICs, not through OVMF/GRUB.
+fn build_forward_image(root: &Path) -> Result<(PathBuf, PathBuf), String> {
     verify_inputs(DEBUG_CONFIG)?;
 
-    let build = root.join("build/nic");
+    let build = root.join("build/forward");
     recreate_dir(&build)?;
 
     let board_dir = Path::new(MICROKIT_SDK)
@@ -1137,47 +1137,47 @@ fn build_nic_image(root: &Path) -> Result<(PathBuf, PathBuf), String> {
                 "-p",
                 "nic-driver",
                 "-p",
-                "nic-consumer",
+                "forwarder",
             ]),
-        "build nic protection domains",
+        "build forwarding protection domains",
     )?;
 
     let target_dir = target_root.join(TARGET).join("release");
-    for pd in ["nic-driver.elf", "nic-consumer.elf"] {
+    for pd in ["nic-driver.elf", "forwarder.elf"] {
         copy_file(&target_dir.join(pd), &build.join(pd))?;
     }
 
     run_command(
         Command::new(Path::new(MICROKIT_SDK).join("bin/microkit"))
             .current_dir(root)
-            .arg(root.join(NIC_SYSTEM))
+            .arg(root.join(FORWARD_SYSTEM))
             .arg("--search-path")
             .arg(&build)
             .args(["--board", BOARD, "--config", DEBUG_CONFIG, "-o"])
             .arg(build.join("loader.img"))
             .arg("-r")
             .arg(build.join("report.txt")),
-        "assemble nic Microkit image",
+        "assemble forwarding Microkit image",
     )?;
 
     Ok((build.join("sel4_32.elf"), build.join("loader.img")))
 }
 
-/// Build the NIC system and boot it in QEMU with a virtio-net device, asserting
-/// that an injected frame is received by the driver and forwarded to the
-/// consumer PD.
-fn test_nic(root: &Path) -> Result<(), String> {
-    let (kernel, system) = build_nic_image(root)?;
-    let log = root.join("build/nic/qemu.log");
-    nic_harness::run_nic_test(root, &kernel, &system, &log)?;
-    println!("nic test passed; QEMU output is in {}", log.display());
+/// Build the forwarding system and boot it in QEMU with two virtio-net
+/// devices, asserting that a frame injected into each port egresses unchanged
+/// on the other.
+fn test_forward(root: &Path) -> Result<(), String> {
+    let (kernel, system) = build_forward_image(root)?;
+    let log = root.join("build/forward/qemu.log");
+    forward_harness::run_forward_test(root, &kernel, &system, &log)?;
+    println!("forward test passed; QEMU output is in {}", log.display());
     Ok(())
 }
 
 fn clean(root: &Path) -> Result<(), String> {
     for path in [
         root.join("build/bootstrap"),
-        root.join("build/nic"),
+        root.join("build/forward"),
         root.join("build/dev-keys"),
         root.join("dist"),
         root.join("target"),

@@ -9,7 +9,7 @@ members = [
     "pds/initiator",
     "pds/responder",
     "pds/nic-driver",
-    "pds/nic-consumer",
+    "pds/forwarder",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

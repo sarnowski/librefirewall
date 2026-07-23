@@ -48,16 +48,22 @@ impl Handler for ConsumerPd {
 
         let consumer = &mut self.consumer;
         let received = &mut self.received;
-        consumer.drain(self.shared, |_buffer, bytes| {
-            let value = u64::from_le_bytes(bytes.try_into().expect("8-byte sequence payload"));
-            assert!(
-                value == *received,
-                "dataplane out of order: got {}, expected {}",
-                value,
-                *received,
-            );
-            *received += 1;
-        });
+        let shared = self.shared;
+        consumer.drain(
+            &shared.used,
+            &shared.free,
+            &shared.pool,
+            |_buffer, bytes| {
+                let value = u64::from_le_bytes(bytes.try_into().expect("8-byte sequence payload"));
+                assert!(
+                    value == *received,
+                    "dataplane out of order: got {}, expected {}",
+                    value,
+                    *received,
+                );
+                *received += 1;
+            },
+        );
 
         if self.received < TOTAL {
             PRODUCER.notify();
