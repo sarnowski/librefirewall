@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 wire = { path = "../wire" }
+
+[lints]
+workspace = true

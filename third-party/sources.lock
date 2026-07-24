@@ -26,3 +26,11 @@ GRUB_SHA256=bc8d3c73535b8838d8c8e2654d73edc4e6ae8c8acdb45d5df5dc9a1547446d43
 SYFT_VERSION=1.49.0
 SYFT_URL=https://github.com/anchore/syft/releases/download/v1.49.0/syft_1.49.0_linux_amd64.tar.gz
 SYFT_SHA256=7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe
+
+# Pinned Rust developer tools, built from crates.io into the builder image
+# during its (network-enabled) build so the offline host gate can run them:
+# coverage (cargo-llvm-cov), dependency/license policy (cargo-deny), and
+# fuzzing (cargo-fuzz, used in a later phase).
+CARGO_LLVM_COV_VERSION=0.8.7
+CARGO_DENY_VERSION=0.20.2
+CARGO_FUZZ_VERSION=0.13.2

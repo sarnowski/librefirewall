@@ -129,6 +129,7 @@ fn run() -> Result<(), String> {
         }
         "test" => test_host(&root),
         "test-host" => test_host(&root),
+        "coverage" => coverage(&root),
         "test-system" => {
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)
@@ -156,7 +157,8 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|ci|release|clean>".to_owned()
+    "usage: cargo xtask <image|run|test|test-host|coverage|test-system|test-ab|ci|release|clean>"
+        .to_owned()
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -564,6 +566,29 @@ fn test_host(root: &Path) -> Result<(), String> {
             .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg]))
             .args(["--", "-D", "warnings"]),
         "run host clippy",
+    )?;
+    // Enforce the dependency/license/source policy (deny.toml). The advisories
+    // check is omitted: it needs the network to fetch the RustSec database,
+    // and the host gate runs offline.
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["deny", "check", "bans", "licenses", "sources"]),
+        "check dependency policy",
+    )
+}
+
+/// Measure line coverage of the host packages and print the per-crate summary.
+/// This mirrors [`HOST_TEST_PACKAGES`] rather than the whole workspace because
+/// the protection-domain binaries only build for the seL4 target. No threshold
+/// is enforced yet; this makes coverage measurable on demand.
+fn coverage(root: &Path) -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["llvm-cov", "--locked", "--summary-only"])
+            .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
+        "measure host coverage",
     )
 }
 

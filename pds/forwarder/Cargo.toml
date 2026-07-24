@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 sel4-microkit.workspace = true
 pd-runtime = { path = "../../crates/pd-runtime" }
+
+[lints]
+workspace = true

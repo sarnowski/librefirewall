@@ -20,6 +20,12 @@ version = "0.1.0"
 [workspace.dependencies]
 sel4-microkit = { path = "/opt/rust-sel4/crates/sel4-microkit" }
 
+# Lints applied to every workspace member via `[lints] workspace = true`. Only
+# lints that already pass everywhere belong here; the gate denies all warnings.
+# `missing_docs` is deliberately absent until every crate is fully documented.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
 [profile.release]
 codegen-units = 1
 lto = true

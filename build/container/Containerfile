@@ -108,6 +108,27 @@ ENV PATH=/opt/grub/bin:/opt/rust/cargo/bin:$PATH \
 
 RUN chmod -R a+rX /opt/microkit/
 
+# Pinned Rust developer tools baked into the image so the offline host gate can
+# run them: coverage (cargo-llvm-cov), dependency/license policy (cargo-deny),
+# and fuzzing (cargo-fuzz, used in a later phase). This is the network phase;
+# --locked builds each tool from its published lockfile for reproducibility.
+COPY third-party/sources.lock /tmp/tools-sources.lock
+RUN --mount=type=secret,id=gropyus_ca,required=false \
+    set -eu; \
+    . /tmp/tools-sources.lock; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/gropyus_ca ]; then \
+      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+      ca_bundle=/tmp/build-ca-bundle.crt; \
+    fi; \
+    SSL_CERT_FILE="$ca_bundle" \
+      cargo install --locked --version "$CARGO_LLVM_COV_VERSION" cargo-llvm-cov; \
+    SSL_CERT_FILE="$ca_bundle" \
+      cargo install --locked --version "$CARGO_DENY_VERSION" cargo-deny; \
+    SSL_CERT_FILE="$ca_bundle" \
+      cargo install --locked --version "$CARGO_FUZZ_VERSION" cargo-fuzz; \
+    rm -rf /tmp/*
+
 # Warm the offline dependency cache from the manifests alone. `cargo fetch`
 # needs every workspace member's Cargo.toml and the lockfile, but not the real
 # sources — empty target stubs (synthesized in the RUN below) are enough to load

@@ -1,0 +1,55 @@
+# cargo-deny policy for librefirewall.
+#
+# The host gate runs `cargo deny check bans licenses sources` offline (see
+# tools/xtask). The `advisories` check is intentionally not run here: it needs
+# network access to fetch the RustSec database, which the offline gate forbids;
+# vulnerability scanning belongs to a networked CI job.
+#
+# Dependency shape: our own crates are AGPL-3.0-or-later; every third-party
+# crate is either the pinned `rust-sel4` (a local path source at
+# /opt/rust-sel4) or a crate resolved from crates.io.
+
+[graph]
+# Evaluate every compilation target so a platform-specific dependency cannot
+# smuggle in an unreviewed license or source.
+all-features = true
+
+[licenses]
+# Explicit allow-list of the SPDX licenses actually present in the graph.
+# AGPL-3.0-or-later covers our first-party crates; the rest are the permissive
+# licenses used across the rust-sel4 tree and its crates.io dependencies.
+allow = [
+    "AGPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+# Require a high-confidence match; a fuzzy license detection is a review signal,
+# not something to wave through.
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of a crate are driven by upstream (e.g. two `syn` majors in
+# the rust-sel4 build-dependency tree) and are not ours to resolve, so warn
+# rather than fail the gate.
+multiple-versions = "warn"
+# Every crate in the tree — ours and the vendored rust-sel4 crates alike —
+# references its siblings by local `path` with no version, which cargo-deny
+# reports as a `*` wildcard. `allow-wildcard-paths` cannot suppress these
+# because it only applies to publish=false crates, and the rust-sel4 tree we
+# vendor is not ours to annotate. No registry dependency uses a wildcard
+# version (every crates.io entry in Cargo.lock is pinned), so this is an
+# artifact of a path-linked source tree, not a real risk: warn, like the
+# upstream-driven duplicates above, rather than fail the offline gate.
+wildcards = "warn"
+
+[sources]
+# Only crates.io and local path sources (the pinned rust-sel4 tree) are
+# permitted; an unknown registry or any git source is a supply-chain change
+# that must be made deliberately, not resolved silently.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
