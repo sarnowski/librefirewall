@@ -4,10 +4,15 @@
 //! names one buffer in the shared pool and how many bytes of it are valid. It
 //! is the element type of the shared-memory queues, so its layout is part of
 //! the cross-protection-domain ABI and is asserted below.
+//!
+//! A descriptor received from a peer is **untrusted**: its `buffer`, `offset`,
+//! and `len` must be range-validated by the receiver before the buffer they
+//! name is touched (see the `packet-buffer` crate). This crate defines the
+//! ABI; it does not enforce that validation.
 
 #![cfg_attr(not(test), no_std)]
 
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 
 /// A reference to a span of one pool buffer moving through a queue.
 ///
@@ -39,6 +44,7 @@ impl Descriptor {
         len: 0,
     };
 
+    /// A descriptor naming `len` valid bytes at `offset` within pool `buffer`.
     #[must_use]
     pub const fn new(buffer: u32, offset: u32, len: u32) -> Self {
         Self {
@@ -55,26 +61,41 @@ impl Default for Descriptor {
     }
 }
 
-// The descriptor is copied verbatim between protection domains, so its size and
-// alignment are a fixed ABI rather than an implementation detail.
-const _: () = assert!(size_of::<Descriptor>() == 12);
-const _: () = assert!(align_of::<Descriptor>() == 4);
+// The descriptor is copied verbatim between protection domains, so its size,
+// alignment, and field offsets are a fixed ABI rather than an implementation
+// detail: a field reorder or width change is a compile error here, not a silent
+// break of the mapping the peer PD reads.
+const _: () = {
+    assert!(size_of::<Descriptor>() == 12);
+    assert!(align_of::<Descriptor>() == 4);
+    assert!(offset_of!(Descriptor, buffer) == 0);
+    assert!(offset_of!(Descriptor, offset) == 4);
+    assert!(offset_of!(Descriptor, len) == 8);
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn zero_is_default() {
+    fn zero_matches_default_and_explicit_zero() {
         assert_eq!(Descriptor::default(), Descriptor::ZERO);
         assert_eq!(Descriptor::ZERO, Descriptor::new(0, 0, 0));
     }
 
     #[test]
-    fn fields_round_trip() {
-        let d = Descriptor::new(7, 12, 42);
-        assert_eq!(d.buffer, 7);
-        assert_eq!(d.offset, 12);
-        assert_eq!(d.len, 42);
+    fn descriptor_has_stable_little_endian_byte_layout() {
+        // The exact on-wire image the peer PD reads: three little-endian u32s in
+        // declaration order. This is the ABI regression test beyond size/align.
+        let d = Descriptor::new(0x1122_3344, 0x5566_7788, 0x99AA_BBCC);
+        // SAFETY: `Descriptor` is `#[repr(C)]`, `Copy`, and asserted to be 12
+        // bytes with no padding, so transmuting it to `[u8; 12]` is sound.
+        let bytes: [u8; 12] = unsafe { core::mem::transmute(d) };
+        assert_eq!(
+            bytes,
+            [
+                0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xCC, 0xBB, 0xAA, 0x99
+            ]
+        );
     }
 }

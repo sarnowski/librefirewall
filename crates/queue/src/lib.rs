@@ -1,17 +1,39 @@
 //! Lock-free single-producer/single-consumer ring, the primitive the whole
 //! dataplane moves descriptors over.
 //!
+//! # Ownership protocol
+//!
+//! A [`Descriptor`] in the ring names a packet buffer, and enqueuing it
+//! **transfers ownership** of that buffer to the consumer; a rejected enqueue
+//! ([`SpscRing::try_enqueue`] returning `Err`) hands ownership back to the
+//! producer. The ring moves descriptors, not bytes — the buffers themselves
+//! live in `packet-buffer`.
+//!
+//! # Concurrency
+//!
 //! The ring lives in memory shared between two protection domains. Exactly one
 //! domain enqueues (the producer) and exactly one dequeues (the consumer); this
-//! is a contract the caller must uphold, not something the types enforce. One
-//! slot is always left unused so a full ring is distinguishable from an empty
-//! one without a separate flag.
+//! is a contract the caller upholds, not something the types enforce. One slot
+//! is always left unused so a full ring is distinguishable from an empty one
+//! without a separate flag. Correctness rests on a release/acquire handshake on
+//! the two cursors: the producer publishes a slot by releasing `tail`, the
+//! consumer observes it by acquiring `tail` (establishing happens-before for the
+//! slot write), and the mirror holds for `head`. On x86 these compile to plain
+//! loads/stores plus compiler fences, so the hot path stays cheap.
 //!
-//! Correctness rests on a release/acquire handshake on the two cursors: the
-//! producer publishes a slot by releasing `tail`, and the consumer observes it
-//! by acquiring `tail`, which establishes happens-before for the slot write.
-//! The mirror holds for `head`. On x86 these are plain loads/stores plus
-//! compiler fences, so the hot path stays cheap.
+//! # Initialisation and peer trust
+//!
+//! The shared region is zero-initialised, which is already a valid empty ring
+//! ([`Descriptor::ZERO`] slots, `head == tail == 0`), so no explicit setup step
+//! is required. The peer shares write access to the whole region, including the
+//! cursors, so it is treated as untrusted: every cursor read back from shared
+//! memory is masked into range before it indexes the slot array, so a peer that
+//! writes a garbage cursor cannot drive this side out of bounds or into an
+//! arithmetic panic. A peer that restarts and re-zeroes its cursor is seen as an
+//! empty (or not-full) ring, never as a memory-safety violation. The one thing a
+//! hostile peer can still cause — reordered or dropped descriptors — is a
+//! protocol error for the owning PD to detect through buffer-ownership
+//! accounting, not a soundness problem of the ring.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -43,6 +65,17 @@ pub struct SpscRing<const CAP: usize> {
 // concurrently for the same index despite the shared `&SpscRing`.
 unsafe impl<const CAP: usize> Sync for SpscRing<CAP> {}
 
+// The ring is a cross-PD shared-memory ABI; pin its layout so a field reorder or
+// size change becomes a compile error rather than a silent corruption of the
+// mapping the peer PD reads.
+const _: () = {
+    assert!(core::mem::offset_of!(SpscRing<2>, head) == 0);
+    assert!(core::mem::offset_of!(SpscRing<2>, tail) == 4);
+    assert!(core::mem::offset_of!(SpscRing<2>, slots) == 8);
+    assert!(core::mem::align_of::<SpscRing<2>>() == 4);
+    assert!(core::mem::size_of::<SpscRing<2>>() == 8 + 2 * core::mem::size_of::<Descriptor>());
+};
+
 impl<const CAP: usize> SpscRing<CAP> {
     const MASK: u32 = {
         assert!(
@@ -50,6 +83,10 @@ impl<const CAP: usize> SpscRing<CAP> {
             "ring capacity must be a power of two"
         );
         assert!(CAP >= 2, "ring capacity must be at least 2");
+        assert!(
+            CAP <= (u32::MAX as usize) + 1,
+            "ring capacity must fit a u32 cursor"
+        );
         (CAP - 1) as u32
     };
 
@@ -57,6 +94,10 @@ impl<const CAP: usize> SpscRing<CAP> {
     /// note that a zeroed region is already a valid empty ring.
     #[must_use]
     pub const fn new() -> Self {
+        // Force the capacity invariants (`MASK`) to be evaluated even for a ring
+        // that is only ever constructed, never enqueued to, so an invalid `CAP`
+        // fails at construction rather than at first use.
+        let _ = Self::MASK;
         Self {
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
@@ -76,13 +117,19 @@ impl<const CAP: usize> SpscRing<CAP> {
     /// caller retains ownership of the buffer it names.
     pub fn try_enqueue(&self, descriptor: Descriptor) -> Result<(), Descriptor> {
         let tail = self.tail.load(Ordering::Relaxed);
-        let next = (tail + 1) & Self::MASK;
+        let next = tail.wrapping_add(1) & Self::MASK;
         if next == self.head.load(Ordering::Acquire) {
             return Err(descriptor);
         }
-        // SAFETY: this slot sits at `tail`, which the consumer cannot observe
-        // until the release store below, so the producer is its sole accessor.
-        unsafe { self.slots[tail as usize].get().write(descriptor) };
+        // SAFETY: `tail` is masked into range before indexing, so the access is
+        // in bounds even if a hostile peer scribbled the shared cursor. This
+        // slot sits at `tail`, which the consumer cannot observe until the
+        // release store below, so the producer is its sole accessor.
+        unsafe {
+            self.slots[(tail & Self::MASK) as usize]
+                .get()
+                .write(descriptor)
+        };
         self.tail.store(next, Ordering::Release);
         Ok(())
     }
@@ -93,12 +140,14 @@ impl<const CAP: usize> SpscRing<CAP> {
         if head == self.tail.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: the producer published this slot with a release store to
-        // `tail` that our acquire load synchronised with, so the write is
-        // visible; and the producer will not reuse the slot until we advance
-        // `head` below, so we are its sole accessor.
-        let descriptor = unsafe { self.slots[head as usize].get().read() };
-        self.head.store((head + 1) & Self::MASK, Ordering::Release);
+        // SAFETY: `head` is masked into range before indexing, so the access is
+        // in bounds even under a hostile peer cursor. The producer published
+        // this slot with a release store to `tail` that our acquire load
+        // synchronised with, so the write is visible; and it will not reuse the
+        // slot until we advance `head` below, so we are its sole accessor.
+        let descriptor = unsafe { self.slots[(head & Self::MASK) as usize].get().read() };
+        self.head
+            .store(head.wrapping_add(1) & Self::MASK, Ordering::Release);
         Some(descriptor)
     }
 
@@ -134,6 +183,21 @@ mod tests {
         let ring = SpscRing::<8>::new();
         assert!(ring.is_empty());
         assert_eq!(ring.len(), 0);
+        assert_eq!(ring.try_dequeue(), None);
+    }
+
+    #[test]
+    fn minimum_ring_holds_exactly_one() {
+        // CAP == 2 is the edge where full and empty are one slot apart.
+        let ring = SpscRing::<2>::new();
+        assert_eq!(ring.capacity(), 1);
+        assert!(ring.try_enqueue(Descriptor::new(1, 2, 3)).is_ok());
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.try_enqueue(Descriptor::new(4, 5, 6)),
+            Err(Descriptor::new(4, 5, 6))
+        );
+        assert_eq!(ring.try_dequeue(), Some(Descriptor::new(1, 2, 3)));
         assert_eq!(ring.try_dequeue(), None);
     }
 
@@ -192,6 +256,19 @@ mod tests {
             }
             assert_eq!(ring.try_dequeue(), None);
         }
+    }
+
+    #[test]
+    fn hostile_peer_cursor_never_indexes_out_of_bounds() {
+        // The peer shares write access to both cursors. Garbage values must be
+        // masked into range, never panic or index past the slot array.
+        let ring = SpscRing::<8>::new();
+        ring.tail.store(u32::MAX, Ordering::Relaxed);
+        let _ = ring.try_enqueue(Descriptor::new(1, 1, 1));
+        ring.head.store(u32::MAX, Ordering::Relaxed);
+        let _ = ring.try_dequeue();
+        // len() is likewise bounded by the mask regardless of cursor values.
+        assert!(ring.len() <= ring.capacity());
     }
 
     #[test]

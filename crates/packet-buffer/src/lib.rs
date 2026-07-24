@@ -11,6 +11,27 @@
 //! [`FreeList`] is the complement: a domain-local record of which buffers a
 //! protection domain currently owns and may hand out. It is ordinary private
 //! memory, not shared.
+//!
+//! # Untrusted indices
+//!
+//! A [`wire::Descriptor`] arriving from a peer PD carries a `buffer` index,
+//! `offset`, and `len` that are **untrusted**. Nothing in this crate validates
+//! them for you: the `unsafe` accessors trust their arguments, so a caller
+//! handling a peer descriptor must range-check it (`buffer < N`,
+//! `offset + len <= BUFFER_SIZE`) before calling in. Feeding an unvalidated
+//! peer index to [`FreeList::push`] likewise breaks the single-owner invariant;
+//! `push` is the point where the caller must already have validated the index.
+//!
+//! # Buffer size and DMA alignment
+//!
+//! [`BUFFER_SIZE`] is 2048 — a power of two large enough for a 1518-byte
+//! Ethernet frame plus the virtio-net header and headroom. Jumbo frames are
+//! deliberately unsupported; an oversized write is truncated, never allowed to
+//! overrun. The pool's own `align_of` is 1, because per-buffer DMA alignment
+//! comes from *placement*, not the struct: the shared region is mapped at a
+//! page-aligned physical address, and the fixed 2048-byte stride keeps every
+//! buffer 2048-aligned from that base — enough for NIC DMA without over-aligning
+//! the type.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -30,6 +51,13 @@ pub struct BufferPool<const N: usize> {
 // currently own the index; ownership is single by the queue protocol, so no
 // two domains ever touch the same buffer concurrently.
 unsafe impl<const N: usize> Sync for BufferPool<N> {}
+
+// The pool is a cross-domain shared-memory ABI: `N` buffers of `BUFFER_SIZE`,
+// tightly packed, byte-aligned as a type (placement supplies DMA alignment).
+const _: () = {
+    assert!(core::mem::size_of::<BufferPool<4>>() == 4 * BUFFER_SIZE);
+    assert!(core::mem::align_of::<BufferPool<4>>() == 1);
+};
 
 impl<const N: usize> BufferPool<N> {
     /// A new, zeroed pool. A zeroed shared region is already a valid pool, so
@@ -51,7 +79,11 @@ impl<const N: usize> BufferPool<N> {
     /// the number of bytes written.
     ///
     /// # Safety
-    /// The caller must currently own `index`, and `index` must be `< N`.
+    /// The caller must currently own `index` (single-owner protocol), and
+    /// `data` must not borrow from this pool (it aliases otherwise — see
+    /// [`read`](Self::read)). `index < N` is checked and panics if violated; it
+    /// is not a soundness precondition.
+    #[must_use = "write truncates to BUFFER_SIZE; a dropped count hides silent truncation"]
     pub unsafe fn write(&self, index: usize, data: &[u8]) -> u32 {
         let n = if data.len() < BUFFER_SIZE {
             data.len()
@@ -60,8 +92,9 @@ impl<const N: usize> BufferPool<N> {
         };
         let dst = self.buffers[index].get().cast::<u8>();
         // SAFETY: `dst` points to `BUFFER_SIZE` owned bytes and `n <=
-        // BUFFER_SIZE`; source and destination do not overlap (distinct
-        // allocations).
+        // BUFFER_SIZE`, so the write is in bounds. The caller's contract
+        // guarantees `data` does not alias this pool, so the ranges are
+        // non-overlapping as `copy_nonoverlapping` requires.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n) };
         n as u32
     }
@@ -71,26 +104,39 @@ impl<const N: usize> BufferPool<N> {
     /// front of an already-DMA'd frame without moving the frame bytes.
     ///
     /// # Safety
-    /// The caller must currently own `index`, `index` must be `< N`, and
-    /// `offset + data.len()` must be `<= BUFFER_SIZE`.
+    /// The caller must currently own `index`, `data` must not borrow from this
+    /// pool, and `offset + data.len()` must be `<= BUFFER_SIZE` (this span bound
+    /// is a genuine soundness precondition — violating it is out-of-bounds).
+    /// `index < N` is checked and panics if violated.
     pub unsafe fn write_at(&self, index: usize, offset: usize, data: &[u8]) {
+        debug_assert!(
+            offset + data.len() <= BUFFER_SIZE,
+            "write_at span exceeds buffer"
+        );
         let dst = self.buffers[index].get().cast::<u8>();
-        // SAFETY: `offset + data.len() <= BUFFER_SIZE` of owned bytes, so the
-        // span is in-bounds; source and destination do not overlap (distinct
-        // allocations).
+        // SAFETY: the caller's contract guarantees `offset + data.len() <=
+        // BUFFER_SIZE` owned bytes, so the destination span is in bounds, and
+        // that `data` does not alias this pool, so the ranges do not overlap.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(offset), data.len()) };
     }
 
     /// Borrow `len` bytes of buffer `index` starting at `offset`.
     ///
     /// # Safety
-    /// The caller must currently own `index`, `index` must be `< N`, and
-    /// `offset + len` must be `<= BUFFER_SIZE`. The borrow must end before
-    /// ownership of the buffer is released back to the peer.
+    /// The caller must currently own `index`, and `offset + len` must be
+    /// `<= BUFFER_SIZE` (a genuine soundness precondition). The returned borrow
+    /// must end before ownership of the buffer is released to the peer, and no
+    /// write to this buffer may occur while the borrow is live. `index < N` is
+    /// checked and panics if violated.
     pub unsafe fn read(&self, index: usize, offset: usize, len: u32) -> &[u8] {
+        debug_assert!(
+            offset + len as usize <= BUFFER_SIZE,
+            "read span exceeds buffer"
+        );
         let src = self.buffers[index].get().cast::<u8>();
-        // SAFETY: `offset + len <= BUFFER_SIZE` of owned, initialised bytes, so
-        // the span is in-bounds; the caller owns the buffer for the borrow.
+        // SAFETY: the caller's contract guarantees `offset + len <= BUFFER_SIZE`
+        // owned, initialised bytes, so the span is in bounds, and that the
+        // buffer is owned and not concurrently written for the borrow's life.
         unsafe { core::slice::from_raw_parts(src.add(offset), len as usize) }
     }
 }
@@ -131,8 +177,14 @@ impl<const N: usize> FreeList<N> {
         list
     }
 
-    /// Record ownership of `index`. Returns `false` if the list is already full,
-    /// which for a correctly accounted pool cannot happen.
+    /// Record ownership of `index`.
+    ///
+    /// The caller must have validated `index` against the pool before calling:
+    /// `push` is the trust boundary for the single-owner invariant, not a
+    /// validator. Returns `false` if the list is already full, which for a
+    /// correctly accounted pool cannot happen and signals an accounting bug the
+    /// caller must surface rather than ignore.
+    #[must_use = "a full free list signals a buffer-accounting bug that must be surfaced"]
     pub fn push(&mut self, index: u32) -> bool {
         if self.top == N {
             return false;
@@ -172,7 +224,8 @@ mod tests {
     fn write_then_read_round_trips_bytes() {
         let pool = BufferPool::<4>::new();
         let payload = [1u8, 2, 3, 4, 5];
-        // SAFETY: single-threaded test; we own index 2 for the whole test.
+        // SAFETY: single-threaded test; we own index 2 for the whole test, and
+        // `payload` is a local that does not borrow from the pool.
         let len = unsafe { pool.write(2, &payload) };
         assert_eq!(len, 5);
         let bytes = unsafe { pool.read(2, 0, len) };
@@ -185,9 +238,11 @@ mod tests {
     #[test]
     fn write_at_places_data_mid_buffer_without_touching_the_rest() {
         let pool = BufferPool::<1>::new();
-        // SAFETY: single-threaded test; we own index 0 for the whole test.
-        unsafe { pool.write(0, &[0xEEu8; 32]) };
-        unsafe { pool.write_at(0, 12, &[1, 2, 3]) };
+        // SAFETY: single-threaded test; we own index 0 throughout; inputs local.
+        unsafe {
+            let _ = pool.write(0, &[0xEEu8; 32]);
+            pool.write_at(0, 12, &[1, 2, 3]);
+        }
         let bytes = unsafe { pool.read(0, 0, 16) };
         assert_eq!(&bytes[..12], &[0xEE; 12]);
         assert_eq!(&bytes[12..15], &[1, 2, 3]);
@@ -198,8 +253,36 @@ mod tests {
     fn write_truncates_to_buffer_size() {
         let pool = BufferPool::<1>::new();
         let oversized = [0xAAu8; BUFFER_SIZE + 100];
+        // SAFETY: own index 0; input is local.
         let len = unsafe { pool.write(0, &oversized) };
         assert_eq!(len as usize, BUFFER_SIZE);
+    }
+
+    #[test]
+    fn write_exactly_buffer_size_is_not_truncated() {
+        let pool = BufferPool::<1>::new();
+        let exact = [0xBBu8; BUFFER_SIZE];
+        // SAFETY: own index 0; input is local.
+        let len = unsafe { pool.write(0, &exact) };
+        assert_eq!(len as usize, BUFFER_SIZE);
+    }
+
+    #[test]
+    fn empty_write_writes_nothing() {
+        let pool = BufferPool::<1>::new();
+        // SAFETY: own index 0; input is local.
+        let len = unsafe { pool.write(0, &[]) };
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn read_and_write_at_span_may_end_exactly_at_buffer_end() {
+        let pool = BufferPool::<1>::new();
+        let tail = [0xCDu8; 8];
+        // SAFETY: own index 0; span ends exactly at BUFFER_SIZE; input local.
+        unsafe { pool.write_at(0, BUFFER_SIZE - 8, &tail) };
+        let bytes = unsafe { pool.read(0, BUFFER_SIZE - 8, 8) };
+        assert_eq!(bytes, &tail);
     }
 
     #[test]
@@ -213,6 +296,23 @@ mod tests {
         }
         assert!(list.is_empty());
         assert!(seen.iter().all(|s| *s));
+    }
+
+    #[test]
+    fn free_list_is_lifo() {
+        let mut list = FreeList::<4>::empty();
+        assert!(list.push(7));
+        assert!(list.push(9));
+        assert_eq!(list.pop(), Some(9));
+        assert_eq!(list.pop(), Some(7));
+        assert_eq!(list.pop(), None);
+    }
+
+    #[test]
+    fn pop_on_empty_is_none() {
+        let mut list = FreeList::<2>::empty();
+        assert_eq!(list.pop(), None);
+        assert!(list.is_empty());
     }
 
     #[test]
