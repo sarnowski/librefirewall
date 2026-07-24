@@ -8,6 +8,7 @@ license.workspace = true
 sel4-microkit.workspace = true
 virtio = { path = "../../crates/virtio" }
 pd-runtime = { path = "../../crates/pd-runtime" }
+nic-driver-core = { path = "../../crates/nic-driver-core" }
 
 [lints]
 workspace = true

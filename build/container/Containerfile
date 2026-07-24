@@ -141,6 +141,7 @@ COPY crates/queue/Cargo.toml /tmp/workspace/crates/queue/Cargo.toml
 COPY crates/packet-buffer/Cargo.toml /tmp/workspace/crates/packet-buffer/Cargo.toml
 COPY crates/virtio/Cargo.toml /tmp/workspace/crates/virtio/Cargo.toml
 COPY crates/pd-runtime/Cargo.toml /tmp/workspace/crates/pd-runtime/Cargo.toml
+COPY crates/nic-driver-core/Cargo.toml /tmp/workspace/crates/nic-driver-core/Cargo.toml
 COPY pds/nic-driver/Cargo.toml /tmp/workspace/pds/nic-driver/Cargo.toml
 COPY pds/forwarder/Cargo.toml /tmp/workspace/pds/forwarder/Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml

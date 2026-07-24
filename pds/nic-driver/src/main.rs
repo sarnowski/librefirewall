@@ -7,39 +7,32 @@
 //! mirror roles of the full port model (CONCEPT §9) are future ports, not part
 //! of this slice.
 //!
-//! The same binary serves both ports: the Microkit tool patches each instance
-//! with its own device windows (ECAM page, relocated BAR), its own virtqueue
-//! DMA region, and the two pipeline regions it participates in. The driver
-//! brings up the NIC entirely from static capabilities: it reaches PCI config
-//! space through the mapped ECAM window, reprograms the device's MMIO BAR to
-//! the address this PD pre-mapped, negotiates virtio 1.0, sets up the receive
-//! and transmit virtqueues in a DMA region, and then polls both used rings —
-//! there is no interrupt (the polling rationale is below).
+//! This binary is a thin adapter. It owns the unsafe, seL4-only device bring-up
+//! and the poll loop, and delegates the steady-state dataplane — the
+//! device-distrust and peer-distrust logic — to the host-tested
+//! `nic-driver-core` crate ([`RxPath`], [`TxPath`], [`Counters`]). The same
+//! binary serves both ports: the Microkit tool patches each instance with its
+//! own device windows (ECAM page, relocated BAR), its own virtqueue DMA region,
+//! and the two pipeline regions it participates in.
 //!
-//! Both directions are **zero-copy** over one buffer pool per pipeline:
+//! Bring-up reaches PCI config space through the mapped ECAM window, reprograms
+//! the device's MMIO BAR to the address this PD pre-mapped, negotiates virtio
+//! 1.0, and sets up the receive and transmit virtqueues in a DMA region. Both
+//! directions are then **zero-copy** over one buffer pool per pipeline: the
+//! receive buffers are the rx pipeline's pool itself (the NIC DMAs each frame
+//! into a buffer the forwarder and peer driver read in place), and transmit
+//! frames are DMA'd straight out of the tx pipeline's pool after the driver
+//! zeroes the 12-byte virtio-net header in front of the frame.
 //!
-//! - **Receive**: the receive buffers are the `rx` pipeline's pool itself, so
-//!   the NIC DMAs each frame directly into a buffer the forwarder and the
-//!   peer driver read in place. On completion the driver publishes a
-//!   descriptor for the frame span (after the 12-byte virtio-net header) and
-//!   reposts buffers returned on the pipeline's free ring.
-//! - **Transmit**: frames arrive as descriptors on the `tx` pipeline's tx
-//!   ring, pointing into that pipeline's pool (owned by the peer driver). The
-//!   driver zeroes the 12 header bytes in front of the frame — space the
-//!   receiving side reserved — and hands the device the same buffer to DMA
-//!   out of. On completion the buffer goes back to its owner on the free
-//!   ring. Descriptors come from a neighbouring PD and are validated before
-//!   any byte of the span is touched.
-//!
-//! Because Microkit has no periodic wakeup, the driver polls by never
-//! returning from `init`; the forwarder runs at a higher priority and
-//! preempts on notification, so the busy loop does not starve it.
+//! Because Microkit has no periodic wakeup, the driver polls by never returning
+//! from `init`; the forwarder runs at a higher priority and preempts on
+//! notification, so the busy loop does not starve it. There is no interrupt
+//! (no MSI-X, no INTx) by design.
 
-use pd_runtime::{
-    BUFFER_SIZE, Descriptor, POOL_BUFFERS, Pipeline, Producer, Ring, descriptor_in_bounds,
-};
+use nic_driver_core::{Counters, RxPath, TxPath};
+use pd_runtime::{Pipeline, Producer};
 use sel4_microkit::{Channel, debug_println, memory_region_symbol, protection_domain, var};
-use virtio::net::{VirtioNetHdr, features};
+use virtio::net::features;
 use virtio::pci::{
     self, CommonCfg, PciConfig, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
     STATUS_FEATURES_OK, VIRTIO_NET_DEVICE_ID, VIRTIO_VENDOR_ID,
@@ -170,23 +163,15 @@ fn init() -> NicDriver {
     }
     let notify_base = unsafe { bar.add(caps.notify as usize) };
 
+    // Steady-state bookkeeping lives in the host-tested core; this adapter owns
+    // only the device MMIO and the poll loop.
     let mut producer = Producer::new();
-    // Per virtio descriptor: what was posted in it, and whether it is
-    // currently outstanding at the device. `outstanding` lets the driver
-    // reject a duplicate or forged completion from the untrusted device,
-    // which would otherwise double-own a buffer and corrupt the virtqueue
-    // free list.
-    let mut rx_buffer = [0u32; QUEUE_SIZE];
-    let mut rx_outstanding = [false; QUEUE_SIZE];
-    let mut tx_descriptor = [Descriptor::ZERO; QUEUE_SIZE];
-    let mut tx_outstanding = [false; QUEUE_SIZE];
-    refill(
-        &mut rx,
-        &mut producer,
-        &mut rx_buffer,
-        &mut rx_outstanding,
-        rx_pipe_paddr,
-    );
+    let mut rx_path = RxPath::<QUEUE_SIZE>::new();
+    let mut tx_path = TxPath::<QUEUE_SIZE>::new();
+    let mut counters = Counters::default();
+    let rx_pool_paddr = Pipeline::pool_paddr(rx_pipe_paddr);
+
+    rx_path.refill(&mut rx, &mut producer, rx_pool_paddr);
 
     // DRIVER_OK before the first doorbell: a device need not act on
     // notifications until the driver signals it is ready.
@@ -205,40 +190,8 @@ fn init() -> NicDriver {
         // Receive: reclaim returned buffers, repost them to the NIC, and hand
         // completed frames to the forwarder.
         producer.reclaim(&rx_pipe.free);
-        let reposted = refill(
-            &mut rx,
-            &mut producer,
-            &mut rx_buffer,
-            &mut rx_outstanding,
-            rx_pipe_paddr,
-        );
-        let mut received = false;
-        while let Some((token, used_len)) = rx.poll() {
-            let index = token.index() as usize;
-            // Reject a completion for a descriptor that is not outstanding: a
-            // duplicate or forged used-ring entry from the untrusted device.
-            // Do not recycle it — recycling a non-outstanding descriptor would
-            // corrupt the virtqueue free list.
-            if !core::mem::replace(&mut rx_outstanding[index], false) {
-                continue;
-            }
-            let buffer = rx_buffer[index];
-            // `used_len` is device-controlled; clamp to the buffer so a device
-            // that over-reports cannot make a downstream PD read out of bounds.
-            let frame_len = (used_len as usize)
-                .min(BUFFER_SIZE)
-                .saturating_sub(VirtioNetHdr::LEN) as u32;
-            // Hand the frame span (after the virtio header) to the forwarder
-            // with no copy; the buffer is owned downstream until it comes back
-            // on the free ring.
-            if producer.submit(&rx_pipe.rx, buffer, VirtioNetHdr::LEN as u32, frame_len) {
-                received = true;
-            } else {
-                producer.release(buffer);
-            }
-            rx.recycle(token);
-        }
-        if received {
+        let reposted = rx_path.refill(&mut rx, &mut producer, rx_pool_paddr);
+        if rx_path.drain(&mut rx, &mut producer, rx_pipe, &mut counters) {
             FORWARDER.notify();
         }
         if reposted {
@@ -249,108 +202,21 @@ fn init() -> NicDriver {
 
         // Transmit: reap completions first (returning each buffer to its
         // pool-owning peer), then post frames the forwarder queued.
-        while let Some((token, _written)) = tx.poll() {
-            let index = token.index() as usize;
-            if !core::mem::replace(&mut tx_outstanding[index], false) {
-                continue;
-            }
-            return_buffer(&tx_pipe.free, tx_descriptor[index]);
-            tx.recycle(token);
-        }
-        let mut sent = false;
-        while tx.free_count() > 0 {
-            let Some(descriptor) = tx_pipe.tx.try_dequeue() else {
-                break;
-            };
-            // The descriptor crossed a protection-domain boundary and is not
-            // trusted: the span must lie within one pool buffer and leave room
-            // for the virtio-net header in front of the frame.
-            if !descriptor_in_bounds(&descriptor)
-                || (descriptor.offset as usize) < VirtioNetHdr::LEN
-            {
-                if !reported_malformed {
-                    reported_malformed = true;
-                    debug_println!("LIBREFIREWALL_NIC:malformed-tx-descriptor(s) dropped");
-                }
-                // Return the buffer when the index at least names a real pool
-                // buffer, so a bad span does not leak it; a forged index has
-                // no owner to return to and is dropped.
-                if (descriptor.buffer as usize) < POOL_BUFFERS {
-                    return_buffer(&tx_pipe.free, descriptor);
-                }
-                continue;
-            }
-            let header_offset = descriptor.offset as usize - VirtioNetHdr::LEN;
-            // The 12 bytes in front of the frame are reserved header space in
-            // the same buffer (on the receive side the device's own header
-            // occupied them). Zero them: no offloads are negotiated, so the
-            // transmit header is all zeroes (gso NONE, no checksum request).
-            // SAFETY: we own the buffer between dequeue and completion, the
-            // index and span were validated above.
-            unsafe {
-                tx_pipe.pool.write_at(
-                    descriptor.buffer as usize,
-                    header_offset,
-                    &[0u8; VirtioNetHdr::LEN],
-                );
-            }
-            let paddr =
-                Pipeline::buffer_paddr(tx_pipe_paddr, descriptor.buffer) + header_offset as u64;
-            let token = tx
-                .add_readable(paddr, descriptor.len + VirtioNetHdr::LEN as u32)
-                .expect("a free transmit descriptor was checked before dequeue");
-            tx_descriptor[token.index() as usize] = descriptor;
-            tx_outstanding[token.index() as usize] = true;
-            sent = true;
-        }
-        if sent {
+        tx_path.reap(&mut tx, tx_pipe);
+        if tx_path.post(&mut tx, tx_pipe, tx_pipe_paddr, &mut counters) {
             unsafe {
                 pci::notify_queue(notify_base, tx_notify_off, caps.notify_multiplier, TX_QUEUE);
             }
         }
 
-        core::hint::spin_loop();
-    }
-}
-
-/// Post free pool buffers to the NIC's receive queue until either the queue or
-/// the pool runs dry, recording which buffer went in each descriptor. Returns
-/// whether any buffer was posted (so the caller knows to ring the doorbell).
-fn refill(
-    rx: &mut Vq,
-    producer: &mut Producer,
-    rx_buffer: &mut [u32; QUEUE_SIZE],
-    rx_outstanding: &mut [bool; QUEUE_SIZE],
-    rx_pipe_paddr: u64,
-) -> bool {
-    let mut posted = false;
-    loop {
-        let Some(buffer) = producer.alloc() else {
-            break;
-        };
-        let paddr = Pipeline::buffer_paddr(rx_pipe_paddr, buffer);
-        match rx.add_writable(paddr, BUFFER_SIZE as u32) {
-            Some(token) => {
-                rx_buffer[token.index() as usize] = buffer;
-                rx_outstanding[token.index() as usize] = true;
-                posted = true;
-            }
-            None => {
-                // The receive queue is full; keep the buffer for next time.
-                producer.release(buffer);
-                break;
-            }
+        // Emit the malformed-descriptor diagnostic once, off the counter going
+        // non-zero, so a hostile neighbour cannot flood the console.
+        if counters.tx_malformed > 0 && !reported_malformed {
+            reported_malformed = true;
+            debug_println!("LIBREFIREWALL_NIC:malformed-tx-descriptor(s) dropped");
         }
-    }
-    posted
-}
 
-/// Return a transmitted (or rejected) buffer to the pipeline's pool owner. The
-/// free ring is sized above the pool, so a correctly accounted return cannot
-/// fail; a failure means the single-ownership invariant broke.
-fn return_buffer(free: &Ring, descriptor: Descriptor) {
-    if free.try_enqueue(descriptor).is_err() {
-        panic!("free ring overflow: buffer accounting is broken");
+        core::hint::spin_loop();
     }
 }
 

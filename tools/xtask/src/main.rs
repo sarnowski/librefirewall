@@ -31,6 +31,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "packet-buffer",
     "virtio",
     "pd-runtime",
+    "nic-driver-core",
     "xtask",
 ];
 
