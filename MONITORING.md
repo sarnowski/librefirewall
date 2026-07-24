@@ -1,0 +1,110 @@
+# librefirewall monitoring contract
+
+This document is the **operator's interface to librefirewall**. Because the appliance has no shell
+and no CLI (CONCEPT.md §11), the console, the OpenTelemetry log stream, and the Prometheus metrics
+endpoint are the *only* windows into a running node — together they are the complete, sufficient
+surface for building dashboards, alerts, and analysis, and for debugging an incident. This file
+defines what that surface contains and how to interpret it, so an operator can rely on it as a
+stable contract.
+
+> **Status.** This document defines the monitoring contract and its conventions. The conventions
+> below are settled and binding. The concrete inventories — the exact console events, log records,
+> and metric names — are **populated as each signal is implemented**; a section marked *“None
+> implemented yet”* states the current truth, not a gap in this contract. Any change to an exposed
+> signal updates this document in the same change (AGENTS.md).
+
+## The three surfaces, and the complete-state principle
+
+- **Console** — a last-resort, human-readable channel carrying **system state only**. It exists so a
+  node whose log streaming is down can still be diagnosed. It never carries traffic or per-request
+  data.
+- **OpenTelemetry logs** — the structured log stream to an external receiver. Everything the console
+  says is also emitted here, plus audit, traffic, and per-subsystem logs. This is the only log
+  transport; there is no syslog. There is no distributed tracing.
+- **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
+  measurable moving part at bounded cardinality and no measurable dataplane cost.
+
+**Complete-state principle.** Scraping `GET /metrics` and reading `GET /config` **once** yields the
+entire observable state of a node: the exact configuration in force plus every metric around it.
+That pair *is* the debug dump — there is deliberately no other mechanism to extract state, so the
+two endpoints together are designed to be sufficient to diagnose the system.
+
+## Conventions (binding)
+
+These apply to every signal and are the rules an operator can depend on.
+
+### Identity and context
+
+Every signal is attributable to a node and a configuration. The common context carried across all
+three surfaces (as OTEL resource/log attributes, Prometheus labels, and console prefixes) is
+finalized with the first implementation and documented here; at minimum it identifies the **node
+identity**, the **software build and trust profile**, and the **configuration generation** in force.
+
+### Naming
+
+- Prometheus metric and label names, OTEL attribute keys, and console event identifiers follow one
+  consistent, documented scheme (to be fixed with the first metrics/logs implementation), namespaced
+  to the product.
+- Labels and attributes are **low, bounded cardinality**: aggregate dimensions (interface, core,
+  queue, subsystem, verdict class), never per-flow, per-connection, or per-packet identifiers.
+- No signal — on any surface — carries packet payloads, secrets, keys, or personal data.
+
+## Console (system state)
+
+**Purpose:** confirm the node's own state — did startup succeed, and if not, what failed — and
+record runtime configuration changes.
+
+**Content:** the startup sequence and its success/failure (each stage reporting healthy or the
+specific fault), and runtime system-state changes such as an interface brought up or down, a MAC
+address reconfigured, or a configuration version applied. It is about firewall *system* state, not
+traffic or user interactions except where those trigger a system-state change.
+
+**Event inventory:** *None finalized yet.* The current build emits ad-hoc bring-up markers on the
+serial console; these are pre-contract diagnostics and are superseded by the structured system-state
+events defined here as the observability implementation lands.
+
+## OpenTelemetry logs
+
+**Purpose:** the primary, structured, streamed record of everything worth logging.
+
+**Structure:** resource attributes (node/build/config identity, per *Conventions*), a severity
+mapped from the level scheme below, a stable event/category identifier, and the curated context
+attributes relevant to the event. Record schema and the required-attribute set per category are
+fixed with the implementation and documented here.
+
+**Severity levels** (used deliberately, matching the platform-wide scheme):
+
+- **ERROR** — a system-level failure an operator must act on now.
+- **WARN** — a recoverable or single-request-scoped failure.
+- **INFO** — significant, low-frequency lifecycle or configuration events.
+- **DEBUG / TRACE** — step-level and fine-grained detail, off in production.
+
+**Log categories:**
+
+- **System** — the console system-state events, mirrored here in structured form.
+- **Audit** — management and user actions (who did what, when, to which configuration).
+- **Traffic** — connection- and verdict-level events from the dataplane.
+- **Subsystem** — per-component operational logs (drivers, proxies, inspection engines, HA).
+
+**Record inventory:** *None implemented yet* — populated per category as logging is implemented.
+
+## Prometheus metrics
+
+**Purpose:** expose every moving part of the firewall for monitoring and for the state half of the
+debug dump, scrapably and without degrading the dataplane.
+
+**Endpoint:** `GET /metrics`, Prometheus exposition format, on the management interface.
+
+**Coverage intent:** every internal queue, buffer pool, and ring; per-NIC and per-core counters;
+dataplane verdict and throughput counters; connection/flow-table occupancy and limits; and the
+applied-configuration state reflected as metrics. Instrumentation is bounded-cardinality and
+allocation-free on the hot path.
+
+**Metric inventory:** *None implemented yet* — populated per subsystem as metrics are implemented,
+each with its type, unit, labels, and meaning.
+
+## Configuration read endpoint
+
+`GET /config` returns the exact running configuration (XML; CONCEPT.md §11–§12). It is the other
+half of the debug dump: paired with a `/metrics` scrape it gives the complete picture of *what the
+node is configured to do* alongside *what it is doing*.

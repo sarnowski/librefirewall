@@ -1,262 +1,238 @@
-# librefirewall Engineering Guide
+# Working in librefirewall
 
-This file defines how to build, test, and evolve librefirewall. Read `CONCEPT.md` first: it is the
-source of truth for the product target and security architecture. This guide translates that target
-into repository and development practices.
+This guide is how to work in this repository. It assumes you have read the two documents it builds
+on and treats them as authoritative:
 
-## Current Milestone
+- **[README.md](README.md)** — what the project is, the current feature status, and how to build and
+  test it. README is the single source of truth for **status**.
+- **[CONCEPT.md](CONCEPT.md)** — the target architecture, threat model, and critical design
+  decisions. CONCEPT is the single source of truth for **intent**. It is stable: it changes only
+  when a core aspect of the project changes, never to record progress.
 
-The bootstrap vertical slice is complete: a clean checkout creates a pinned build environment,
-compiles Rust protection domains, assembles an x86_64 seL4/Microkit system, packages it into the
-signed A/B disk, boots it through OVMF and GRUB in QEMU, and tests its observable behaviour with
-one command.
+Everything below is a rule, not an aspiration. When code and these rules disagree, that is a defect
+to fix, not a precedent to follow.
 
-The deployable system is the two-port zero-copy forwarding dataplane (dev-order step 3): one
-virtio-net driver PD instance per NIC, joined through a forwarder PD by one shared pipeline region
-per direction, with the QEMU gate asserting byte-identical frame egress between the ports through
-the booted disk. The forwarder is where the next slice inserts the processing stages:
+## Collaboration with the user
 
-```text
-virtio driver -> Rx queue -> classifier -> filter shard -> Tx queue
+- Align before large or ambiguous work. Reflect the request back, name the tensions and the
+  decisions worth making, and settle scope before mutating many files. Small, unambiguous changes
+  need no ceremony.
+- Be direct and brief. State results and decisions plainly; acknowledge mistakes and fix them.
+  Do not pad answers with what the diff already shows. Size changes in lines added/changed/deleted,
+  never in time.
+- Surface a change that turns out larger than expected *before* finishing, rather than shipping a
+  partial result framed as complete.
+- Safety-relevant decisions (anything that could affect the security posture of a deployed
+  firewall) are reviewed and owned by a human. Reason about them freely; do not make the final
+  call alone.
+
+## Source control
+
+- **Commit directly to `trunk`.** This repository uses no feature branches or pull requests. Do the
+  work in a git worktree so parallel sessions do not collide, and remove the worktree once its
+  commits have landed.
+- **Every commit on `trunk` builds and passes the full gate**, so `git bisect` is always meaningful.
+  This is enforced by the hooks below, not left to discipline.
+- **Conventional Commits** for subjects (`type(scope): description`). Commit *messages* explain the
+  intent, constraints, and semantic consequences of a change — the *why* — not a narration of the
+  file edits, which the diff already shows.
+- Never commit secrets or the inspection CA. Treat any secret you encounter as compromised.
+
+## The commit gate (mandatory)
+
+Install the hooks once per worktree:
+
+```sh
+make hooks
 ```
 
-Before that breadth, dev-order step 3 still owes its performance evidence: microbenchmarks, a
-QEMU/KVM forwarding regression check behind `make bench`, and the written numeric performance
-contract. Do not add protocol breadth before those and the build, boot, test, and release path are
-reliable.
+- **pre-commit** runs `make test` — the fast host gate: formatting, Clippy (warnings denied),
+  `missing_docs`, the dependency/license policy, and all unit and property tests with the coverage
+  threshold enforced. It does not boot QEMU, so it stays fast.
+- **pre-push** runs `make ci` — the complete gate: the host gate plus image assembly and the QEMU
+  system and A/B scenarios.
 
-## Product Decomposition
+The point is to catch a violation at the earliest, cheapest moment and to guarantee that what
+reaches `trunk` is green and bisectable. Do not bypass the hooks (`--no-verify`) to land work; fix
+the violation instead. CI runs the identical commands, so a local green is a CI green.
 
-Treat the repository as three related products:
+## Documentation
 
-1. Portable `no_std` Rust libraries containing firewall and dataplane logic.
-2. seL4/Microkit protection-domain binaries and their static capability topology.
-3. Platform-specific boot images and deployment metadata, initially for QEMU x86_64.
+Documentation earns its place by carrying what the code cannot: the goal a piece of code serves,
+the constraint that shaped it, the non-obvious reason behind a choice. A comment that restates the
+code is worse than none — it drifts and misleads. When in doubt, leave it out and sharpen the name.
 
-Protection-domain binaries should be thin adapters around reusable libraries. Most correctness
-tests must run on the host without booting seL4. Isolation, capability, driver, shared-memory, and
-whole-system behaviour must additionally be tested under seL4.
+**There are exactly four standalone Markdown documents, and no others are to be created:**
 
-## Intended Repository Structure
+- **README.md** — overview, status, build/test instructions, license.
+- **CONCEPT.md** — target architecture, threat model, critical decisions.
+- **AGENTS.md** — this guide.
+- **MONITORING.md** — the operator contract for logs and metrics (see *Observability*).
 
-Grow toward this structure as real functionality is added; do not create empty placeholders.
+Everything else lives **in the source**:
 
-```text
-Cargo.toml                  Rust workspace
-Cargo.lock                  exact Rust dependency resolution
-rust-toolchain.toml         exact Rust nightly and required components
-Makefile                    stable developer and CI interface
-crates/                     portable no_std libraries
-  wire/                     packet and descriptor types
-  queue/                    lock-free SPSC queue
-  packet-buffer/            packet ownership and pools
-  policy/                   policy model and evaluation
-  conntrack/                connection tracking
-  routing/                  routing, ARP, and ICMP logic
-  stream-inspection/        streaming DPI
-  config-model/             configuration model and validation
-  pd-runtime/               common Microkit integration
-pds/                        thin protection-domain binaries
-systems/qemu-x86_64/        Microkit system description and QEMU machine definition
-tools/xtask/                Rust build, test, and packaging orchestration
-tools/qemu-harness/         QEMU lifecycle and system assertions
-tests/                      fixtures and cross-component/system scenarios
-fuzz/                       persistent parser and state-machine fuzz targets
-benches/                    microbenchmarks and performance workloads
-build/container/            pinned hermetic build environment
-third-party/                pinned upstream source metadata
-docs/                       architecture, threat model, and performance contract
-```
+- **Self-documenting code first.** Precise names for types, functions, parameters, and variables
+  remove the need for most comments. Reach for a better name before a comment.
+- **Comments state *why*, not *what*.** Invariants, constraints, non-obvious consequences, and the
+  reason a thing is done a particular way. Never annotate what the next line plainly does, and never
+  let a comment contradict the code.
+- **Every crate carries a crate-level `//!` header** that explains its concepts, architecture,
+  design, and invariants, so a reader understands the crate fully from its source alone. A module
+  with non-obvious design carries a module `//!` header too. Architectural documentation that would
+  otherwise become a standalone Markdown file (how a driver works, what a protocol's core concepts
+  are, why an ABI is laid out a certain way) belongs in these headers, living with the code it
+  describes.
+- **Public items carry rustdoc** documenting what a caller may rely on: inputs, outputs, errors,
+  side effects, and — for `unsafe` — the safety contract the caller must uphold. `missing_docs` is
+  denied, so this is enforced. Do not restate type signatures or framework defaults.
+- **`unsafe` blocks carry a truthful `SAFETY:` comment** stating the invariant that makes the block
+  sound. A safety comment that the surrounding API does not actually guarantee is a defect.
 
-## Build Interface
+Documentation is part of the change: if a change makes a doc, header, or comment wrong, correct it
+in the same change. Code is the source of truth — when docs and code disagree, fix the docs (or the
+code, if the doc captured the real intent).
 
-The root `Makefile` is the stable user and CI interface. Keep it small; implement non-trivial
-orchestration in a Rust `xtask` rather than shell. The intended commands are:
+## Testing
 
-```text
-make image                  build the deployable QEMU image and release bundle
-make run                    boot the image interactively in QEMU
-make test                   run fast host tests
-make test-system            boot QEMU and assert system behaviour
-make bench                  run performance tests appropriate to the current target
-make ci                     execute the complete pull-request gate
-make release                run CI, then assemble the release configuration in dist/
-make verify-reproducible    build twice in isolation and compare artifacts
-make clean                  remove generated output only
-```
+We invest heavily in tests and hold coverage high, because this codebase will grow complex and we
+value correctness over development speed. The seL4 kernel, Microkit, and `rust-sel4` are the trusted
+base (CONCEPT §7) and are assumed correct — we do **not** test them. Every piece of first-party
+logic is tested exhaustively, including edge cases.
 
-`make image` must work from a clean checkout. It must:
+The testing pyramid, from broad base to narrow top:
 
-1. Enter or create the pinned build environment.
-2. acquire pinned upstream inputs and verify their checksums;
-3. build every Rust library and PD with locked dependencies;
-4. validate and assemble the Microkit system description;
-5. produce the x86_64 Multiboot2 kernel and initialiser/system images;
-6. package only deployable outputs and metadata in `dist/`; and
-7. emit checksums, an SBOM, and provenance for a production release.
+- **Host unit and property tests** — the bulk of the suite. Core crates compile `no_std` and are
+  tested on the host (a `std` test build where useful). Cover parsing, serialization, queue and
+  ownership protocols, policy, connection tracking, routing, proxy and inspection state machines,
+  and configuration validation. Property tests assert the invariants — arbitrary input never
+  panics; work and memory are bounded; parse/serialize round-trips; chunked and contiguous
+  inspection agree; a buffer has exactly one owner; invalid state transitions cannot occur. Every
+  shared-memory ABI has static layout assertions.
+- **Integration tests** — assemble larger parts of the system with fakes/mocks for the pieces not
+  under test, to exercise complex interactions quickly. Every neighbouring protection domain is
+  treated as untrusted: malformed descriptors, backpressure, stale ownership, exhausted pools, peer
+  restart, and resource limits.
+- **Fuzzing** — every externally driven parser (traffic *and* an untrusted device or peer) has a
+  persistent fuzz target, seeded from valid samples and corpora. Fuzz for panics, resource
+  exhaustion, unbounded work, and semantic inconsistency — not only memory corruption. Every
+  finding becomes a regression test.
+- **Performance tests** — many mechanisms are performance-critical, so writing a benchmark is a
+  normal part of the change, not a special event. Criterion microbenchmarks live beside the code
+  they measure; a controlled QEMU/KVM forwarding regression guards the end-to-end path. QEMU
+  performance is regression evidence, never proof of the physical 10 Gbit/s target — that requires
+  dedicated hardware and an external traffic generator, and gates a release that claims the target.
+- **End-to-end (QEMU) tests** — boot a fully assembled, signed image and assert machine-observable
+  contracts as a black box: the A/B update mechanism, and network forwarding/routing across virtual
+  networks. These grow toward a full virtual network of multiple endpoints and redundant HA nodes.
+  Tests assert an observable contract or a structured test channel — never timing-sensitive human
+  log text.
 
-`make release` must run the complete debug/QEMU acceptance gate before replacing `dist/` with the
-Microkit release configuration. Release assembly without the acceptance gate is not a release.
+Coverage and lint gates fail the build, locally (via the hooks) and in CI. A change that lowers
+coverage below the threshold does not land. If a genuine reason excludes code from coverage (e.g. a
+protection-domain adapter whose behaviour is only observable under seL4), state it explicitly rather
+than weakening the gate.
 
-The build container is a tool, not the product artifact. The deployable output is the Microkit boot
-payload and its versioned machine contract. Caches may accelerate a build but must never be required
-for correctness.
+## Observability
 
-Every image build emits `librefirewall-sbom.spdx.json` in SPDX 2.3 JSON, lists it in the
-product-prefixed release manifest, and covers it with the product-prefixed release checksums.
-Provenance may land after the bootstrap milestone, but `make image`,
-`make test-system`, and `make ci` must remain honest and complete for everything they claim.
+Observability is a product feature of a firewall, not an afterthought, and it is the *only* window
+into a running node: there is no shell and no CLI (CONCEPT §11). The exact contract — the console
+system-state events, the OpenTelemetry log structure and required context fields, and the Prometheus
+metric names and labels — is specified in **[MONITORING.md](MONITORING.md)**, which is the operator's
+interface definition. Keep it true: any change to an exposed signal updates MONITORING.md in the same
+change.
 
-## Dependency and Toolchain Policy
+The decisions that constrain all observability code:
 
-Pin all build-critical inputs:
+- **Console** carries system state only — the startup sequence and its outcome, and runtime
+  configuration changes — never traffic or per-request data. It is the last-resort channel when log
+  streaming is down.
+- **Logs** are **structured OpenTelemetry logs only** (no syslog). The same events written to the
+  console are also emitted as OTEL logs; audit, traffic, and per-subsystem logs are OTEL-only.
+- **Metrics** are exposed in **Prometheus format only**, with bounded cardinality (no per-flow
+  labels) and no measurable dataplane cost. `/metrics` plus the configuration read endpoint are the
+  complete debug surface.
+- **No distributed tracing** — deliberately out of scope.
+- Observability surfaces never carry packet payloads, secrets, or personal data.
 
-- seL4 and Microkit SDK version and checksum;
-- `rust-sel4` release or commit;
-- exact Rust nightly toolchain;
-- Cargo dependencies through `Cargo.lock`;
-- QEMU and LLVM/binutils versions in the builder; and
-- the builder OCI image by digest once it is published.
+## Build interface
 
-Use Cargo with `--locked`; release builds should also be supportable offline from mirrored or
-vendored dependencies. Never track a floating branch. Upstream updates are explicit changes that
-must pass the full QEMU test before merge.
+The root `Makefile` is the stable interface for developers and CI; keep it thin and implement
+orchestration in the Rust `xtask`, not shell. The commands are listed in README.md's *Build and
+test* section and are the frozen surface. `make image` must work from a clean checkout: enter or
+build the pinned environment, acquire and checksum-verify pinned inputs, build every crate and PD
+with locked dependencies, validate and assemble the Microkit system description, produce the
+x86_64 Multiboot2 kernel and system image, package only deployable outputs into `dist/`, and emit
+checksums and an SBOM. `make release` runs the full acceptance gate before assembling the release
+configuration.
 
-Microkit x86_64 differs from Arm and RISC-V: the kernel and initialiser/system ELF are separate and
-must be loaded by a Multiboot2-compliant bootloader. Do not copy an Arm `loader.img` build or QEMU
-recipe. Use the x86_64 BSP examples from the pinned SDK as the executable reference.
+The build container is a tool, not the product. The deployable output is the signed Microkit boot
+payload and its versioned machine contract. A cache may accelerate a build but must never be
+required for correctness.
+
+## Repository layout
+
+Directories have fixed purposes; grow them as real functionality lands, and do not create empty
+placeholders.
+
+- `crates/` — portable `no_std` libraries holding the firewall and dataplane logic. This is where
+  most code and almost all tests live.
+- `pds/` — protection-domain binaries: thin adapters that map shared regions and drive a library
+  crate's logic. Correctness logic belongs in a crate, not here, so it can be host-tested.
+- `systems/` — the Microkit system description(s): the static capability topology. A capability
+  change is a security change (see *Engineering rules*).
+- `tools/` — the `xtask` build/test/packaging orchestrator and the QEMU harness.
+- `benches/`, `fuzz/` — performance workloads and persistent fuzz targets.
+- `build/`, `third-party/`, `support/` — the pinned hermetic builder, pinned upstream inputs, and
+  target specifications.
+
+## Dependency and toolchain policy
+
+Pin every build-critical input: the seL4/Microkit SDK, `rust-sel4`, the exact Rust nightly, Cargo
+dependencies through `Cargo.lock`, the builder's QEMU/LLVM/GRUB/tool versions, and the builder OCI
+image by digest. Build with `--locked`; a release build must be supportable offline from the pinned
+inputs. Never track a floating branch — an upstream update is an explicit change that must pass the
+full gate.
 
 First-party userspace is pure Rust. Audit transitive dependencies for native code, unexpected
-linking, and build scripts. Keep `unsafe` confined to small crates with documented safety invariants.
+linking, and build scripts; the dependency/license policy is enforced by `cargo-deny` in the gate.
+Keep `unsafe` confined to the crates that genuinely need it (MMIO, DMA, shared-memory ABIs), each
+occurrence carrying a documented, truthful safety invariant.
 
-## Build Profiles
+Microkit x86_64 differs from Arm and RISC-V: the kernel and system image are separate ELFs loaded by
+a Multiboot2 bootloader. Use the pinned SDK's x86_64 BSP examples as the executable reference; do
+not copy an Arm loader recipe.
 
-- `debug`: functional development with serial diagnostics and assertions.
-- `release`: production-oriented kernel and optimized PDs; no dependence on debug output.
-- `benchmark`: PMU-enabled kernel and performance instrumentation.
-- `smp-*`: multicore variants used as soon as the first dataplane exists.
+## Build profiles
 
-System tests initially use `debug` because they need an observable serial success contract. Release
-artifacts must eventually have a non-console health/attestation mechanism and their own boot test.
+- `debug` — functional development with serial diagnostics and assertions. System tests use it so
+  diagnostics survive a failure; success is still the machine-observable contract, not console text.
+- `release` — production-oriented kernel and optimized PDs, with no dependence on debug output.
+  The release configuration needs its own boot test and a production health/attestation mechanism.
+- `benchmark` — PMU-enabled kernel and performance instrumentation.
+- `smp-*` — multicore variants, used as the multicore dataplane develops.
 
-## Test Strategy
+## Engineering rules
 
-### Host Unit and Property Tests
-
-Run these on every change. Compile core libraries as `no_std`, with a host-only `std` test feature
-where useful. Cover packet parsing, serialization, policy evaluation, connection tracking, routing,
-proxy state machines, streaming inspection, and configuration validation.
-
-Important properties include:
-
-- arbitrary external input never panics;
-- processing work and memory use are bounded;
-- parse/serialize round trips preserve valid input;
-- chunked and contiguous stream inspection produce the same verdict;
-- a packet buffer has exactly one owner; and
-- invalid state transitions cannot occur.
-
-### Queue and Memory-Safety Tests
-
-The SPSC queue and packet-buffer ownership model are foundational. Test randomized scheduling, ring
-wrap-around, full/empty transitions, notification races, and peer restart. Use host concurrency
-models, Miri, sanitizers, and bounded model checking where they apply. Add static layout assertions
-for every shared-memory ABI.
-
-### Fuzzing
-
-Every externally controlled parser needs a persistent fuzz target. Seed fuzzers with valid protocol
-samples and PCAP-derived corpora. Preserve every finding as a regression test. Fuzz for panics,
-resource exhaustion, unbounded work, and semantic inconsistencies, not only memory corruption.
-
-### Component Contract Tests
-
-Exercise PD logic through simulated queue and message endpoints. Treat every neighbouring PD as
-untrusted. Cover malformed descriptors, backpressure, stale ownership, notification coalescing,
-exhausted pools, peer restart, and resource limits.
-
-### QEMU System Tests
-
-The QEMU harness owns process startup, timeout, output capture, assertions, and reliable shutdown.
-Tests must use machine-readable unique markers or a structured test channel, not timing-sensitive
-human log text.
-
-As the system grows, QEMU scenarios cover boot, forwarding, drops, routing, bidirectional flow
-affinity, proxying, DPI across packet boundaries, malformed traffic, configuration transactions,
-PD faults and restart, queue saturation, resource exhaustion, and denied capability access.
-
-The eventual QEMU machine has two virtio dataplane NICs, an isolated management NIC, multiple CPUs,
-serial capture, and QMP control. Prefer socket-based network backends for unprivileged deterministic
-tests; use KVM runners for realistic system regression tests.
-
-### Performance Tests
-
-Write a numeric performance contract before claiming the product target. It must define packet-size
-distribution, directionality, loss, p50/p99/p99.99 latency, ruleset size, flow count, connection
-rate, TLS handshake rate, proxy/cut-through mix, CPU allocation, and memory limits.
-
-Use three layers:
-
-1. Microbenchmarks for queues, parsers, policy lookup, conntrack, DPI, checksums, crypto, and TLS.
-2. Controlled QEMU/KVM benchmarks for end-to-end regressions, batching, multicore scaling, and flow
-   churn.
-3. Dedicated physical x86_64 hardware and an external traffic generator for the actual 10 Gbit/s
-   release gate.
-
-QEMU performance is regression evidence, never proof of physical 10 Gbit/s throughput or tail
-latency.
-
-## Continuous Integration
-
-Pull-request gates should contain formatting, Clippy with warnings denied, dependency/license/native
-code policy, host tests, `no_std` builds, debug and release Microkit builds, QEMU smoke/system tests,
-short fuzz runs, and stable microbenchmark checks.
-
-Nightly jobs add the full QEMU suite, long fuzzing, Miri/sanitizers/model checking, multicore stress,
-fault injection, resource exhaustion, QEMU/KVM performance runs, and reproducibility checks.
-
-Release jobs build from a clean offline environment, run all functional and security tests, produce
-and sign checksums/provenance/SBOM data, and execute the QEMU acceptance suite. Physical throughput
-and latency acceptance becomes mandatory before a release can claim the 10 Gbit/s target.
-
-## Development Order
-
-1. Hermetic builder, pinned dependencies, x86_64 image assembly, and automated QEMU boot test.
-2. Packet buffers, Rust SPSC queues, notification batching, and ownership tests.
-3. Two-port virtio forwarding with measurable zero-copy behaviour.
-4. Symmetric RSS, multicore ownership, and shared-nothing flow shards.
-5. Stateful L2-L4 filtering and routing.
-6. Early realistic DPI and crypto-provider benchmarks.
-7. Incremental TCP, TLS, QUIC, and L7 proxy paths.
-8. Final parser and sensitive-service PD decomposition.
-9. Management, configuration transactions, observability, and fault recovery.
-10. HA after single-node state machines are deterministic.
-
-## Engineering Rules
-
-- Preserve least privilege in the Microkit system description; capability changes are security
-  changes and require review.
-- Keep hot-path state per core and avoid shared locks.
+- Preserve least privilege in the Microkit system description; a capability change is a security
+  change and requires review.
+- Keep hot-path state per core; avoid shared locks.
 - Make ownership transfer explicit in types and queue protocols.
 - Bound all externally driven memory, state, and processing.
-- Fail visibly on invalid internal assumptions; do not silently recover from corruption.
-- Distinguish malformed/untrusted input, which is rejected safely, from internal invariant failure.
-- Do not add compatibility paths without a real deployed consumer or persisted format requiring one.
-- Add observability with bounded cardinality and no packet payloads, secrets, or personal data.
-- Update tests and architecture documentation in the same change when behaviour or topology changes.
-- Exercise changes through the same root commands users and CI run before declaring them complete.
+- Reject malformed or untrusted input safely; fail visibly on an internal invariant violation. Keep
+  those two responses distinct — never paper over a real failure with a silent fallback, default,
+  or swallowed error. Surface an error by logging it with full technical detail, marking the active
+  trace/span (once tracing exists) or the relevant signal, and returning an actionable, typed error.
+- Do not add a compatibility path without a real deployed consumer or a persisted format that needs
+  it.
+- Target state only: after a change the code looks like the new design — old paths removed, callers
+  updated, no dead code kept "just in case", no `TODO`/stub/placeholder left behind.
+- Trust the framework and the pinned runtime; do not reimplement what they already provide.
+- Exercise a change through the same root commands users and CI run before declaring it done.
 
-## Source Control
+## Definition of Done
 
-Commit directly to `trunk`; this repository does not use feature branches or pull requests. Commit
-subjects follow Conventional Commits (`type(scope): description`). Commit messages explain the
-intent, constraints, concepts, and semantic consequences behind a change rather than narrating file
-edits or other mechanical details already evident from the diff.
-
-## Definition of Done for the Bootstrap Milestone
-
-From a clean checkout on a supported Linux host, one documented command builds all inputs and emits
-the QEMU x86_64 release bundle. Another root command boots the debug image, observes the complete
-two-PD interaction, exits automatically, and fails clearly on timeout, crash, or missing output.
-`make ci` runs host checks, image assembly, and that system test without manual preparation. CI uses
-the same commands and build environment as developers.
+A change is done when, from a clean checkout, the full gate is green through the same commands users
+and CI run: formatting, Clippy, `missing_docs`, dependency policy, unit and property tests at or
+above the coverage threshold, image assembly, and the QEMU system and A/B scenarios — with the
+documentation, tests, and (where behaviour or an exposed signal changed) MONITORING.md updated in
+the same change.

@@ -56,29 +56,36 @@ appliance for the operator's own infrastructure, spanning use cases from **opera
 
 ## 4. Performance Target
 
-The target is to **saturate two SFP+ 10 Gbit/s ports (uplink and downlink) inline, with full deep
-packet inspection and negligible added latency.** The scope is deliberately this level of
-sustained, fully-inspected throughput — not higher (e.g. 100 Gbit/s) classes.
+The target is **10 Gbit/s of sustained, fully-inspected, inline throughput per dataplane port
+pair, in each direction, with low and predictable added latency**, on a single modern multi-core
+x86_64 machine. The scope is deliberately this class of throughput — not higher (e.g. 100 Gbit/s)
+classes. A deployment may carry more than one dataplane port pair (§9); the per-pair figure is the
+unit the architecture is sized against.
 
-This is achieved on a single modern multi-core x86_64 machine through:
+**Inline TLS threat prevention is the costliest path, and it is what sizes the system.**
+Terminating TLS (and QUIC), re-originating it, and scanning the plaintext inline dominates the
+compute budget — far above L2–L4 forwarding — so the crypto provider, the proxy TCP/TLS stacks, and
+the streaming inspection engines are chosen and laid out around sustaining *that* path at the
+target rate. Every architectural decision below is made in that light.
 
-- a **multicore dataplane**,
+This is achieved through:
+
+- a **multicore dataplane**;
 - **RSS (symmetric hashing)** that steers each flow to a fixed core; both directions of a flow, and
   **both legs of a proxied connection**, are kept on the same core (the re-originated leg's tuple
-  is chosen so that RSS maps it to the core that owns the flow),
-- **per-core, shared-nothing flow shards** (no cross-core locking on the hot path),
+  is chosen so that RSS maps it to the core that owns the flow);
+- **per-core, shared-nothing flow shards** (no cross-core locking on the hot path);
 - a **zero-copy dataplane** with **batched notifications** that keeps the hot path out of the
-  kernel, and
+  kernel; and
 - **streaming inspection** on the inline inspection path, so line-rate-inspected traffic is not
   buffered end-to-end. (Full-object content scanning, which necessarily buffers, is handled
   separately and selectively — see §5.)
 
-Latency is kept low and predictable: traffic that is forwarded/cut-through (including OT and
-pass-through traffic) incurs minimal, predictable added latency suitable for soft-real-time OT;
-traffic that is TLS/L7-inspected is proxied (terminated and re-originated) and incurs only the
-small additional latency inherent to termination. The proportion of total throughput that
-traverses the proxy path versus the cut-through path — which drives core sizing — is an open item
-(§13.1).
+Latency is kept low and predictable: forwarded/cut-through traffic (including OT and pass-through
+traffic) incurs minimal, predictable added latency suitable for soft-real-time OT; TLS/L7-inspected
+traffic is proxied (terminated and re-originated) and incurs only the small additional latency
+inherent to termination. The proportion of total throughput that traverses the proxy path versus
+the cut-through path — which drives core sizing — is an open item (§13.1).
 
 ---
 
@@ -120,6 +127,12 @@ demonstrated by the LionsOS firewall example). librefirewall does **not reuse th
 implemented from scratch in Rust, including a Rust implementation of the sDDF lock-free
 single-producer/single-consumer queue protocol.
 
+Because Microkit's component model is **static**, the system's structure — every PD, memory
+region, capability, and hardware address (MMIO windows, DMA regions) — is fixed at build time in
+the system description rather than discovered at runtime. Hardware addressing is therefore a
+build-time pinning problem, not a runtime probing one, and adding structure (an interface, a zone)
+is a rebuild, not a live reconfiguration (§12.3).
+
 ### 6.2 Two data paths
 
 A **classifier** steers each flow to one of two paths:
@@ -158,7 +171,47 @@ mechanism and HA-link split-brain handling — are open (§13.1).
 
 ---
 
-## 7. Isolation & Security Model
+## 7. Threat Model & Isolation
+
+### 7.1 Assets, adversaries, and trust boundaries
+
+The design starts from what must be protected, who the attacker is, and where the trust boundaries
+lie.
+
+**Assets**, in rough order of value: the TLS-interception **CA signing key**; the **running
+configuration** and management credentials; **flow and connection state** (including per-connection
+TLS material on the proxy path); and the **packet buffers** in flight.
+
+**Adversaries the design assumes:**
+
+- **Untrusted network traffic** on every dataplane port — arbitrary, adversarial bytes at line
+  rate. This is the primary attack surface and the reason every parser is memory-safe and isolated.
+- **A hostile or malfunctioning NIC device.** A driver treats everything the device writes
+  (descriptors, used rings, config space) as untrusted input and must never be driven to
+  out-of-bounds access, unbounded work, or a panic by device behaviour.
+- **A compromised parser or inspection PD.** Because parsers are the most-exposed code, each runs
+  in its own least-privilege PD; a full compromise of one must not reach flows, memory, or keys it
+  holds no capability for.
+- **A byzantine neighbour PD.** Every PD treats the queues and messages from adjacent PDs as
+  untrusted: malformed descriptors, stale or forged ownership, and backpressure are rejected
+  safely, never allowed to corrupt state or crash a well-behaved PD.
+- **A management-plane attacker** reaching the API, and a **connection-flood / state-exhaustion
+  attacker** targeting the proxy (§7.2).
+
+**Trust boundaries.** The **seL4 kernel and its boot/loader chain are the trusted computing base**;
+runtime capability isolation is enforced by the kernel and is relied upon. The **`rust-sel4` /
+Microkit runtime** is likewise trusted. Everything above — every first-party PD — is mutually
+distrustful across the queue and channel boundaries fixed by the static system description. A
+physical attacker with arbitrary hardware access is out of scope for the software design; Secure
+Boot and TPM measures (§14) raise that bar separately.
+
+**Consequence for verification.** Because the kernel and runtime are the trusted base, the project
+does not test them — it assumes seL4, Microkit, and `rust-sel4` are correct — and instead
+exhaustively tests and fuzzes all first-party logic: parsers, queues, ownership, policy, and state
+machines. "Reject untrusted input safely; fail visibly on internal invariant violation" is the
+dividing line those tests enforce (see AGENTS.md).
+
+### 7.2 Isolation model
 
 - **Least-privilege PDs.** Every component holds only the capabilities it needs. A compromise of
   one component cannot reach flows, memory, or keys it has no capability for.
@@ -205,9 +258,42 @@ base). The TLS crypto provider choice (pure-Rust vs. an external provider) is op
 
 ---
 
-## 9. Deployment Targets & Form Factors
+## 9. Deployment Targets, Ports & Form Factors
 
 **Architecture: x86_64 only.**
+
+### 9.1 Port roles
+
+Interfaces are assigned **roles**, and the role — not a fixed port count — is the architectural
+unit. Four roles exist:
+
+- **Management port** — the *only* surface that exposes the management API (§11). It is isolated
+  from the dataplane and carries no forwarded traffic.
+- **Session-replication port** — the dedicated HA link (§10) carrying heartbeat and batched
+  flow-state synchronization between the two nodes of a pair.
+- **Dataplane ports** — the inspected-traffic ports, handled in **pairs**. The common labels
+  "uplink" and "internal" describe a typical north-south deployment, but the role is semantically
+  neutral: a pair may equally carry east-west traffic between two internal zones. A deployment has
+  one or more dataplane pairs.
+- **Mirror port** — an optional, egress-only port that emits a copy of selected traffic to an
+  external capture/IDS system.
+
+### 9.2 NIC configurations
+
+The role model yields the supported hardware configurations:
+
+| Configuration | NICs | Ports |
+|---|---|---|
+| **Single node** | 3 | management; one dataplane pair |
+| **HA pair** | 4 | management; session-replication; one dataplane pair |
+| **HA + redundant dataplane** | 6 | management; session-replication; two dataplane pairs |
+| **HA appliance, full** | 7 | management; session-replication; two dataplane pairs; mirror |
+
+The **4-NIC HA configuration is the primary Azure target**; the **7-NIC configuration is the
+hardware-appliance build**, which populates every role and simply leaves ports unused when a site
+needs fewer (no redundant pair, no mirror). A node without HA uses the 3-NIC configuration.
+
+### 9.3 Targets and form factors
 
 **Targets:**
 
@@ -218,13 +304,13 @@ base). The TLS crypto provider choice (pure-Rust vs. an external provider) is op
 
 **Form factors:**
 
-- **Bare-metal appliance** — inline, with two SFP+ 10 Gbit/s ports (uplink/downlink).
+- **Bare-metal appliance** — inline, with SFP+ 10 Gbit/s dataplane ports (§9.1).
 - **Virtual machine** — on Proxmox and Azure.
 - **Cloud (Azure)** — deployed as a routed **Network Virtual Appliance (NVA) behind a Gateway Load
   Balancer**. The dataplane terminates the load balancer's **VXLAN tunnels** (internal and
   external), encapsulating and decapsulating that traffic.
 
-**NIC drivers** (all Rust):
+### 9.4 NIC drivers (all Rust)
 
 - **virtio-net** — the first/foundational driver; covers QEMU, Proxmox, and development.
 - **x86 10 Gbit/s NIC** — for the bare-metal appliance, using a register-programmable **SFP+** NIC
@@ -275,11 +361,25 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   **mTLS certificate pair issued during onboarding** (the onboarding process is defined later —
   §13.1). The management API runs in an isolated PD, on a dedicated management interface, and is
   rate-limited.
-- **Metrics:** exposed in Prometheus format via `GET /metrics`, with disciplined cardinality
-  (aggregate metrics rather than per-flow labels).
-- **Logs:** streamed to an external receiver via **syslog or OpenTelemetry** (the choice is
-  deferred — §13.1). Configuration-change logs are additionally echoed to the **console** as a
-  debugging/survivability fallback in case remote logging is unavailable.
+- **Metrics:** exposed in **Prometheus exposition format** via `GET /metrics` — the *only* metrics
+  interface — with disciplined, bounded cardinality (aggregate metrics, never per-flow labels).
+  Every moving part (queues, buffer pools, per-NIC and per-core counters) is observable there
+  without measurable dataplane cost, and the endpoint also reflects applied-configuration state.
+- **Logs:** emitted as **structured OpenTelemetry logs** to an external receiver — the single log
+  transport; syslog is not used. Audit logs (management/user actions), traffic logs, and
+  per-subsystem logs are OTEL-only. System-state events (see *Console*) are additionally written to
+  the console.
+- **Console:** carries **system state only** — the startup sequence and its success/failure, and
+  runtime configuration changes (an interface brought up, a MAC reconfigured, a config version
+  applied). It never carries traffic or per-request data. It is the last-resort survivability
+  channel that lets an operator diagnose a node whose log streaming is unavailable.
+- **No distributed tracing.** OpenTelemetry is used for structured logs only; tracing — including
+  of the management API — is deliberately out of scope.
+- **The exposed interfaces are the complete debug surface.** There is no shell, no CLI, and no
+  other introspection mechanism. Scraping `GET /metrics` and reading `GET /config` once yields the
+  entire observable state of a node — applied configuration plus every metric around it — which is,
+  by design, all that is available to debug it. The externalized logs and metrics are therefore a
+  first-class operator contract, specified in **MONITORING.md**.
 - **Management application:** configuration management, log analysis, and metric analysis are
   handled by a separate management application, developed later.
 
@@ -355,7 +455,6 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 
 ### 13.1 Open decisions
 
-- **Log transport:** syslog vs. OpenTelemetry.
 - **Onboarding process** for issuing the management mTLS certificate pair.
 - **TLS crypto provider** for rustls (pure-Rust vs. an external provider), to be resolved by
   benchmarking.
@@ -390,6 +489,10 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
+- **FPU/SIMD in protection domains.** Dataplane PDs currently run without FPU/SSE state.
+  Sustaining checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU
+  context for the relevant PDs or staying scalar — a design constraint to resolve when performance
+  work begins.
 ---
 
 ## 14. Software Update & Secure Boot
@@ -408,7 +511,7 @@ The deployable artifact is a GPT disk image (`librefirewall-qemu-x86_64.img`) wi
 | **STATE** | Mutable boot-selection state (`grubenv`) |
 | **SLOT_A** | A complete signed release: seL4 kernel + Microkit system image (+ detached signatures) |
 | **SLOT_B** | The second release slot, identical structure |
-| **DATA** | Reserved for configuration, identity, and secrets (§11, §12); unformatted for now |
+| **DATA** | Reserved for configuration, identity, and secrets (§11, §12) |
 
 Each slot is self-contained because x86 Microkit boots a separate seL4 kernel ELF plus the Microkit
 system image as a Multiboot2 module — both must be present and version-matched in the slot.
@@ -427,10 +530,10 @@ health, the next slot in `ORDER` is used. The single-attempt model is a delibera
 in-bootloader logic; a multi-attempt counter and a redundant, generation-numbered state log belong
 to the writable-state owner below, not to GRUB.
 
-Confirming a freshly booted slot as healthy (setting `*_OK`) is done **off the boot path** — today
-by the test harness, later by an in-system update/health protection domain that has capabilities to
-exactly the inactive slot and the STATE partition and nothing else. That component is where staged
-installation, health confirmation, multi-attempt counting, and redundant crash-safe state live.
+Confirming a freshly booted slot as healthy (setting `*_OK`) is done **off the boot path**, by an
+in-system update/health protection domain holding capabilities to exactly the inactive slot and
+the STATE partition and nothing else. That component is where staged installation, health
+confirmation, multi-attempt counting, and redundant crash-safe state live.
 
 ### 14.3 Payload trust
 
@@ -443,22 +546,19 @@ Development builds generate a local, throwaway signing key under `build/dev-keys
 removed by `make clean`); the release manifest records `trust_profile: development` and the key
 fingerprint so a development-signed image can never be mistaken for a production one.
 
-### 14.4 Firmware: UEFI is viable; the seL4 hand-off contract
+### 14.4 Firmware and the seL4 hand-off contract
 
-The target is **UEFI** (a prerequisite for the eventual Secure Boot goal). A concrete lesson was
-learned bringing seL4 up under UEFI+GRUB that changes no core assumption but must be respected:
+The target is **UEFI** (a prerequisite for the eventual Secure Boot goal). Booting seL4 under
+UEFI+GRUB imposes hand-off constraints that shape the boot chain:
 
-- seL4's x86 Multiboot2 path (`try_boot_sys_mbi2`) takes the **ACPI RSDP from the Multiboot2 ACPI
-  tag** GRUB provides — so ACPI works under UEFI without the legacy BIOS memory scan. This was the
-  initial red herring; it is not a problem.
-- The seL4 boot module (our Microkit system image) must load **above** the kernel image
-  (`assert(mods_end_paddr > ki_p_reg.end)`); GRUB's relocator satisfies this here, but it is a real
-  constraint to watch on memory-constrained targets.
-- **The debug kernel takes its serial console from the kernel command line.** QEMU's builtin
-  `-kernel` loader supplied an equivalent implicitly; GRUB does not, so the kernel must be given
-  `console_port=0x3f8 debug_port=0x3f8` on its Multiboot2 command line or it boots (and can wedge)
-  silently. The **IOMMU is left enabled** (Microkit's x86 default); on a platform without VT-d seL4
-  simply reports zero IOMMUs.
+- seL4's x86 Multiboot2 path takes the **ACPI RSDP from the Multiboot2 ACPI tag** GRUB provides, so
+  ACPI works under UEFI without the legacy BIOS memory scan.
+- The seL4 boot module (the Microkit system image) must load **above** the kernel image; GRUB's
+  relocator satisfies this, but it remains a real constraint on memory-constrained targets.
+- **The debug kernel takes its serial console from the kernel command line**, so the kernel must be
+  given its `console_port`/`debug_port` on the Multiboot2 command line or it boots silently. The
+  **IOMMU is left enabled** (Microkit's x86 default); on a platform without VT-d seL4 reports zero
+  IOMMUs.
 
 ### 14.5 Deliberately deferred
 
