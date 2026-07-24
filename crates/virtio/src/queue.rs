@@ -11,10 +11,16 @@
 //!
 //! The region is DMA memory the device also touches, so field access is
 //! volatile and ordered with explicit fences at the publish/reap boundaries,
-//! exactly where a real device observes or produces the indices. Only
-//! single-descriptor buffers are used (virtio-net needs no chaining per
-//! buffer), so the free list is a simple index stack and no `NEXT` chain is
-//! walked.
+//! exactly where a real device observes or produces the indices. The fences
+//! order CPU-visible memory only; that suffices because x86 DMA is
+//! cache-coherent and the region is mapped cached — a non-coherent platform
+//! would additionally need cache maintenance here. Only single-descriptor
+//! buffers are used (virtio-net needs no chaining per buffer), so the free list
+//! is a simple index stack and no `NEXT` chain is walked.
+//!
+//! The device is untrusted: everything it writes (the used ring and its
+//! indices) is validated before use, and no device-supplied value is turned
+//! into an out-of-range access or an unbounded loop (see [`SplitVirtqueue::poll`]).
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -30,8 +36,23 @@ const fn align_up(value: usize, align: usize) -> usize {
 
 /// A buffer in flight: the head descriptor index the device echoes back in its
 /// used-ring completion.
+///
+/// A `Token` is proof of ownership of one in-flight descriptor. It is produced
+/// only by [`SplitVirtqueue::add_writable`], [`add_readable`](SplitVirtqueue::add_readable),
+/// and [`poll`](SplitVirtqueue::poll), and must be surrendered exactly once via
+/// [`recycle`](SplitVirtqueue::recycle). The wrapped index is private so safe
+/// code cannot forge an out-of-range token and drive an out-of-bounds volatile
+/// write; read it with [`index`](Token::index).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Token(pub u16);
+pub struct Token(u16);
+
+impl Token {
+    /// The head descriptor index this token names (always `< SIZE`).
+    #[must_use]
+    pub const fn index(self) -> u16 {
+        self.0
+    }
+}
 
 /// The byte layout of a split virtqueue within its region: the offset of each
 /// sub-area from the region base and the total size. A transport adds these to
@@ -65,6 +86,12 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         assert!(SIZE.is_power_of_two(), "queue size must be a power of two");
         assert!(SIZE >= 2, "queue size must be at least 2");
         assert!(SIZE <= 32768, "queue size must fit a u16 ring index");
+        // The associated offset constants and the free helper functions compute
+        // the same virtqueue ABI two different ways; assert they agree so the
+        // two computations can never silently drift apart.
+        assert!(Self::AVAIL_OFF + 4 == avail_ring_off::<SIZE>(0));
+        assert!(Self::USED_OFF == used_area_off::<SIZE>());
+        assert!(Self::USED_IDX_OFF == used_area_off::<SIZE>() + 2);
     };
     const MASK: u16 = (SIZE as u16).wrapping_sub(1);
 
@@ -149,6 +176,8 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
             self.free_head = self.read_u16(desc_next_off(head));
             self.write_u64(desc_addr_off(head), paddr);
             self.write_u32(desc_len_off(head), len);
+            // Single-descriptor buffers never chain, so strip any NEXT flag
+            // defensively rather than trust the caller not to pass one.
             self.write_u16(desc_flags_off(head), flags & !VIRTQ_DESC_F_NEXT);
             self.write_u16(desc_next_off(head), 0);
         }
@@ -170,7 +199,12 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     /// of bytes the device wrote, or `None` when none have completed. The
     /// descriptor stays allocated until [`recycle`](Self::recycle).
     pub fn poll(&mut self) -> Option<(Token, u32)> {
-        loop {
+        // Bound the work per call. A conformant device never has more than SIZE
+        // buffers outstanding, so processing at most SIZE used entries here caps
+        // a hostile device that floods the used ring with invalid ids while
+        // continuously bumping its index: `poll` returns `None` after SIZE skips
+        // instead of spinning forever, and the caller's drain loop then exits.
+        for _ in 0..SIZE {
             // SAFETY: the used index lies within the region.
             let device_idx = unsafe { self.read_u16(Self::USED_IDX_OFF) };
             if device_idx == self.last_used {
@@ -191,18 +225,27 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
             // echoes a head index we posted (< SIZE). Reject an out-of-range id
             // and keep draining, so a malformed completion can never drive an
             // out-of-bounds recycle. Deeper untrusted-device handling
-            // (double-completion, leak accounting) is the driver PD's job — see
-            // docs/virtio-net-driver.md.
+            // (double-completion, leak accounting) is the driver PD's job (see
+            // `pds/nic-driver`).
             if (id as usize) < SIZE {
                 return Some((Token(id as u16), len));
             }
         }
+        None
     }
 
     /// Return a reaped descriptor to the free list, making it available again.
     pub fn recycle(&mut self, token: Token) {
         let head = token.0;
-        // SAFETY: `head` was a valid descriptor index handed out by `add`.
+        // `head` came from `add`/`poll`, so the private-field invariant makes it
+        // a valid descriptor index. These assertions catch an internal
+        // bookkeeping bug (a double-recycle, a token from another queue) in
+        // debug builds rather than silently corrupting the free list — a bad
+        // token here is an internal invariant failure, never device input.
+        debug_assert!((head as usize) < SIZE, "recycled token index out of range");
+        debug_assert!(self.num_free < SIZE as u16, "descriptor recycled twice");
+        // SAFETY: `head < SIZE` by the private-field invariant, so the `next`
+        // field lies within the region.
         unsafe { self.write_u16(desc_next_off(head), self.free_head) };
         self.free_head = head;
         self.num_free += 1;
@@ -461,5 +504,90 @@ mod tests {
         assert!(queue.poll().is_none());
         queue.recycle(got);
         assert_eq!(queue.free_count(), SIZE);
+    }
+
+    #[test]
+    fn add_readable_posts_a_non_writable_descriptor() {
+        let mut region = Box::new(Region([0; 4096]));
+        let region_ptr = region.0.as_mut_ptr();
+        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+        let token = queue.add_readable(0x4000, 64).unwrap();
+        // A transmit (device-readable) descriptor must not carry the
+        // device-writable flag.
+        let flags = unsafe {
+            region_ptr
+                .add(desc_flags_off(token.index()))
+                .cast::<u16>()
+                .read_volatile()
+        };
+        assert_eq!(flags & VIRTQ_DESC_F_WRITE, 0);
+        assert_eq!(queue.free_count(), SIZE - 1);
+    }
+
+    #[test]
+    fn ring_indices_wrap_through_the_u16_boundary() {
+        let mut region = Box::new(Region([0; 4096]));
+        let region_ptr = region.0.as_mut_ptr();
+        let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
+        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+
+        // Force both ring positions to just below the u16 wrap so the cycles
+        // below cross 0xFFFF -> 0x0000, where modular index bugs would live.
+        queue.avail_idx = u16::MAX - 1;
+        queue.last_used = u16::MAX - 1;
+        unsafe {
+            region_ptr
+                .add(used_area_off::<SIZE>() + 2)
+                .cast::<u16>()
+                .write_volatile(u16::MAX - 1);
+        }
+        let mut device = TestDevice {
+            region: region_ptr,
+            last_avail: u16::MAX - 1,
+            used_idx: u16::MAX - 1,
+        };
+
+        for sequence in 0..8u64 {
+            let index = sequence as usize % SIZE;
+            let token = queue
+                .add_writable(buffers[index].as_mut_ptr() as u64, BUF as u32)
+                .unwrap();
+            assert!(device.service_writable(&sequence.to_le_bytes()));
+            let (got, len) = queue.poll().expect("a completion is pending");
+            assert_eq!(got, token);
+            assert_eq!(len, 8);
+            let value = u64::from_le_bytes(buffers[index][..8].try_into().unwrap());
+            assert_eq!(value, sequence, "payload corrupted across the u16 wrap");
+            queue.recycle(got);
+        }
+    }
+
+    #[test]
+    fn poll_is_bounded_when_a_hostile_device_floods_invalid_ids() {
+        let mut region = Box::new(Region([0; 4096]));
+        let region_ptr = region.0.as_mut_ptr();
+        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+
+        // The device claims a huge number of completions, every used entry
+        // carrying an out-of-range id. `poll` must skip at most SIZE of them and
+        // return None rather than spin proportionally to the device's claim.
+        unsafe {
+            for slot in 0..SIZE {
+                region_ptr
+                    .add(used_elem_id_off::<SIZE>(slot as u16))
+                    .cast::<u32>()
+                    .write_volatile(0xDEAD_BEEF);
+                region_ptr
+                    .add(used_elem_len_off::<SIZE>(slot as u16))
+                    .cast::<u32>()
+                    .write_volatile(0);
+            }
+            fence(Ordering::Release);
+            region_ptr
+                .add(used_area_off::<SIZE>() + 2)
+                .cast::<u16>()
+                .write_volatile(60_000);
+        }
+        assert_eq!(queue.poll(), None);
     }
 }

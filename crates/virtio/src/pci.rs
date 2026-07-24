@@ -2,11 +2,12 @@
 //!
 //! Two mapped windows drive a virtio-pci device: its PCI **configuration
 //! space** (reached here through the q35 ECAM/MMCONFIG window) and a memory
-//! **BAR** holding the virtio structures. This module is the first-party
-//! equivalent of the `virtio-drivers` PCI transport (CONCEPT §8): it walks the
-//! virtio PCI capabilities, reprograms the BAR to an address the driver PD
-//! pre-mapped, runs the device-init handshake, and programs a virtqueue
-//! ([`crate::queue`]) into the device's common configuration.
+//! **BAR** holding the virtio structures. It walks the virtio PCI
+//! capabilities, reprograms the BAR to an address the driver PD pre-mapped,
+//! runs the device-init handshake, and programs a virtqueue ([`crate::queue`])
+//! into the device's common configuration. It is written from scratch rather
+//! than reusing `virtio-drivers`, whose rust-sel4 integration ships only an ARM
+//! virtio-MMIO transport — there is no x86 PCI transport to reuse (CONCEPT §8).
 //!
 //! All device access is volatile MMIO. The transport holds raw pointers into
 //! the two mapped windows; the driver PD establishes those mappings (static
@@ -168,25 +169,43 @@ pub struct VirtioCaps {
     pub device: u32,
 }
 
+/// Minimum byte extent the driver accesses in each virtio structure, used to
+/// bounds-check the device-supplied offsets against the mapped BAR window so a
+/// structure placed near the window's end cannot let a field access run past it.
+const COMMON_CFG_MIN_LEN: usize = 56; // through queue_device (offset 48) + 8 bytes
+const NOTIFY_MIN_LEN: usize = 2; // at least one doorbell u16
+const ISR_MIN_LEN: usize = 1;
+const DEVICE_CFG_MIN_LEN: usize = 1;
+
 impl VirtioCaps {
-    /// Whether every structure offset lies within a BAR window of `bar_size`
-    /// bytes. The offsets come from the (untrusted) device, so the driver
-    /// bounds them against the window it actually mapped before dereferencing.
+    /// Whether every structure fits within a BAR window of `bar_size` bytes,
+    /// accounting for the minimum extent the driver accesses in each. The
+    /// offsets come from the (untrusted) device, so they are bounds-checked
+    /// against the window actually mapped before any structure is dereferenced.
     #[must_use]
     pub fn within(&self, bar_size: usize) -> bool {
-        [self.common, self.notify, self.isr, self.device]
-            .iter()
-            .all(|&offset| (offset as usize) < bar_size)
+        let fits = |offset: u32, needed: usize| {
+            (offset as usize)
+                .checked_add(needed)
+                .is_some_and(|end| end <= bar_size)
+        };
+        fits(self.common, COMMON_CFG_MIN_LEN)
+            && fits(self.notify, NOTIFY_MIN_LEN)
+            && fits(self.isr, ISR_MIN_LEN)
+            && fits(self.device, DEVICE_CFG_MIN_LEN)
     }
 }
 
 /// Walk the PCI capability list and locate the virtio configuration
-/// structures. Returns `None` if the device exposes no capability list or is
-/// missing the common/notify structures, or `Some` with an error kind if the
-/// capabilities are inconsistent.
+/// structures. All four (common, notify, ISR, device) must be present and share
+/// one BAR. Returns a [`CapError`] if the device exposes no capability list, the
+/// chain is malformed, a capability names an invalid BAR, the structures span
+/// multiple BARs, or a required structure is absent.
 pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
-    // SAFETY: the walk only touches fixed config registers and capability
-    // structures the device advertises within its 256-byte config space.
+    // SAFETY: the walk only touches capability structures the device advertises,
+    // reached at masked (aligned) pointers that stay within the mapped 4 KiB
+    // ECAM page — a capability may sit near the top of the 256-byte conventional
+    // space and read a few bytes past it, still inside the mapped page.
     unsafe {
         if config.read16(PCI_STATUS) & PCI_STATUS_CAP_LIST == 0 {
             return Err(CapError::NoCapabilities);
@@ -258,6 +277,12 @@ pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
 /// Record the BAR index a used virtio structure lives in, rejecting a mix of
 /// BARs across the structures the transport maps together.
 fn record_bar(bar: &mut Option<u8>, cap_bar: u8) -> Result<(), CapError> {
+    // A PCI function has at most six BARs (0..=5); a capability naming anything
+    // else is a malformed, untrusted device descriptor and is rejected here,
+    // before the index could ever reach BAR programming.
+    if cap_bar > 5 {
+        return Err(CapError::InvalidBar);
+    }
     match *bar {
         Some(existing) if existing != cap_bar => Err(CapError::MultipleBars),
         _ => {
@@ -276,7 +301,9 @@ pub enum CapError {
     Malformed,
     /// virtio structures are split across BARs (unsupported here).
     MultipleBars,
-    /// A required (common or notify) structure was absent.
+    /// A capability named a BAR index outside the valid range 0..=5.
+    InvalidBar,
+    /// A required structure (common, notify, ISR, or device) was absent.
     MissingStructure,
 }
 
@@ -294,6 +321,9 @@ const CFG_QUEUE_NOTIFY_OFF: usize = 30;
 const CFG_QUEUE_DESC: usize = 32;
 const CFG_QUEUE_DRIVER: usize = 40;
 const CFG_QUEUE_DEVICE: usize = 48;
+
+/// Upper bound on reset-acknowledge polling before declaring the device dead.
+const RESET_TIMEOUT_SPINS: u32 = 1_000_000;
 
 /// The virtio common configuration structure, mapped in the device BAR.
 pub struct CommonCfg {
@@ -355,7 +385,16 @@ impl CommonCfg {
     /// Reset the device and spin until it acknowledges by reading back 0.
     pub fn reset(&self) {
         self.set_status(0);
+        // A device that never acknowledges the reset is a hardware/deployment
+        // fault; bound the wait and fail visibly at init rather than hang the
+        // driver PD forever.
+        let mut spins: u32 = 0;
         while self.status() != 0 {
+            spins += 1;
+            assert!(
+                spins < RESET_TIMEOUT_SPINS,
+                "virtio device did not acknowledge reset"
+            );
             core::hint::spin_loop();
         }
     }
@@ -399,6 +438,16 @@ impl CommonCfg {
         // order (select, size, addresses, enable) follows the virtio spec.
         unsafe {
             self.w16(CFG_QUEUE_SELECT, index);
+            // The device initialises queue_size to its maximum for this queue;
+            // the driver must not program a larger size, and a max of 0 means
+            // the queue does not exist. Both are device faults at bring-up, so
+            // fail visibly rather than program an out-of-contract size.
+            let device_max = self.r16(CFG_QUEUE_SIZE);
+            assert!(device_max != 0, "device has no virtqueue at this index");
+            assert!(
+                device_max as usize >= layout.size,
+                "device virtqueue smaller than the required layout"
+            );
             self.w16(CFG_QUEUE_SIZE, layout.size as u16);
             self.w64(CFG_QUEUE_DESC, ring_paddr + layout.descriptor_offset as u64);
             self.w64(CFG_QUEUE_DRIVER, ring_paddr + layout.driver_offset as u64);
@@ -539,6 +588,57 @@ mod tests {
         assert!(caps.within(0x4000));
         // notify at 0x3000 is not within a 0x3000 window.
         assert!(!caps.within(0x3000));
+    }
+
+    #[test]
+    fn caps_within_rejects_a_structure_that_would_overrun_the_window() {
+        // The common structure needs 56 bytes; starting it 32 bytes below the
+        // window end must be rejected even though its start offset is in range.
+        let caps = VirtioCaps {
+            bar: 4,
+            common: 0x4000 - 32,
+            notify: 0,
+            notify_multiplier: 4,
+            isr: 0,
+            device: 0,
+        };
+        assert!(!caps.within(0x4000));
+    }
+
+    #[test]
+    fn rejects_missing_required_structures() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // Only common and notify are present; ISR and device are absent.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
+        fake.put_cap(0x50, 0x00, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
+        fake.w32(0x50 + 16, 4);
+        assert_eq!(
+            find_virtio_caps(&fake.config()),
+            Err(CapError::MissingStructure)
+        );
+    }
+
+    #[test]
+    fn rejects_a_looping_capability_chain() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // A -> B -> A never terminates; the iteration guard must trip.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
+        fake.put_cap(0x50, 0x40, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
+        assert_eq!(find_virtio_caps(&fake.config()), Err(CapError::Malformed));
+    }
+
+    #[test]
+    fn rejects_a_capability_naming_an_invalid_bar() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // BAR 6 is outside the valid 0..=5 range.
+        fake.put_cap(0x40, 0x00, VIRTIO_PCI_CAP_COMMON_CFG, 6, 0, 16);
+        assert_eq!(find_virtio_caps(&fake.config()), Err(CapError::InvalidBar));
     }
 
     #[test]

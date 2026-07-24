@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <system>
-    <!-- The librefirewall system: the two-port zero-copy virtio-net
-         forwarding dataplane for QEMU q35 (virtio 1.0 PCI). Two instances of
-         the same driver binary, one per NIC, joined through a forwarder PD by
-         one pipeline region per direction. Each pipeline's buffer pool is
-         DMA'd into by the receiving NIC and out of by the transmitting NIC,
-         so a frame crosses the whole system without ever being copied. See
-         docs/virtio-net-driver.md, pds/nic-driver, and pds/forwarder. -->
+    <!-- The librefirewall system description for the current QEMU q35
+         bring-up: the two-dataplane-port zero-copy virtio-net forwarding slice
+         (virtio 1.0 PCI). Two instances of the same driver binary, one per
+         dataplane port, joined through a forwarder PD by one pipeline region
+         per direction. Each pipeline's buffer pool is DMA'd into by the
+         receiving NIC and out of by the transmitting NIC, so a frame crosses
+         the whole system without ever being copied. The management,
+         session-replication, and mirror ports of the full port model
+         (CONCEPT.md §9) are not part of this slice. The protection domains are
+         documented in pds/nic-driver and pds/forwarder. -->
 
     <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0. The
          deployable image boots through OVMF, which programs the q35 PCIEXBAR

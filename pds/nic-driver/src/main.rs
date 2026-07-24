@@ -1,8 +1,11 @@
 #![no_main]
 #![no_std]
 
-//! virtio-net driver protection domain — one port of the two-port zero-copy
-//! forwarding dataplane (QEMU q35, virtio 1.0 PCI).
+//! virtio-net driver protection domain: it drives one dataplane port (QEMU
+//! q35, virtio 1.0 PCI). One instance runs per dataplane port of the current
+//! two-port forwarding bring-up; the management, session-replication, and
+//! mirror roles of the full port model (CONCEPT §9) are future ports, not part
+//! of this slice.
 //!
 //! The same binary serves both ports: the Microkit tool patches each instance
 //! with its own device windows (ECAM page, relocated BAR), its own virtqueue
@@ -11,7 +14,7 @@
 //! space through the mapped ECAM window, reprograms the device's MMIO BAR to
 //! the address this PD pre-mapped, negotiates virtio 1.0, sets up the receive
 //! and transmit virtqueues in a DMA region, and then polls both used rings —
-//! there is no interrupt (see docs/virtio-net-driver.md for why polling).
+//! there is no interrupt (the polling rationale is below).
 //!
 //! Both directions are **zero-copy** over one buffer pool per pipeline:
 //!
@@ -211,7 +214,7 @@ fn init() -> NicDriver {
         );
         let mut received = false;
         while let Some((token, used_len)) = rx.poll() {
-            let index = token.0 as usize;
+            let index = token.index() as usize;
             // Reject a completion for a descriptor that is not outstanding: a
             // duplicate or forged used-ring entry from the untrusted device.
             // Do not recycle it — recycling a non-outstanding descriptor would
@@ -247,7 +250,7 @@ fn init() -> NicDriver {
         // Transmit: reap completions first (returning each buffer to its
         // pool-owning peer), then post frames the forwarder queued.
         while let Some((token, _written)) = tx.poll() {
-            let index = token.0 as usize;
+            let index = token.index() as usize;
             if !core::mem::replace(&mut tx_outstanding[index], false) {
                 continue;
             }
@@ -296,8 +299,8 @@ fn init() -> NicDriver {
             let token = tx
                 .add_readable(paddr, descriptor.len + VirtioNetHdr::LEN as u32)
                 .expect("a free transmit descriptor was checked before dequeue");
-            tx_descriptor[token.0 as usize] = descriptor;
-            tx_outstanding[token.0 as usize] = true;
+            tx_descriptor[token.index() as usize] = descriptor;
+            tx_outstanding[token.index() as usize] = true;
             sent = true;
         }
         if sent {
@@ -328,8 +331,8 @@ fn refill(
         let paddr = Pipeline::buffer_paddr(rx_pipe_paddr, buffer);
         match rx.add_writable(paddr, BUFFER_SIZE as u32) {
             Some(token) => {
-                rx_buffer[token.0 as usize] = buffer;
-                rx_outstanding[token.0 as usize] = true;
+                rx_buffer[token.index() as usize] = buffer;
+                rx_outstanding[token.index() as usize] = true;
                 posted = true;
             }
             None => {

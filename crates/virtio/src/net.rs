@@ -1,15 +1,20 @@
 //! virtio-net data types and constants (virtio 1.0).
 //!
-//! These are the on-the-wire/in-DMA structures and negotiation constants a
-//! driver parses and programs; the logic that uses them lives in the driver
-//! protection domain. Only the pieces the Rx path needs are defined here;
-//! offload/control-queue fields are added when their feature is implemented.
+//! These are the in-DMA structures and negotiation constants a driver programs
+//! and parses; the logic that uses them lives in the driver protection domain.
+//! Only the pieces the current Rx/Tx path needs are defined here; offload and
+//! control-queue fields are added when their feature is implemented.
+//!
+//! Multi-byte fields are little-endian per virtio 1.0. This crate targets
+//! x86_64 only, where the native integer layout already equals the wire layout,
+//! so the fields are declared as plain integers without byte-swapping. The
+//! device-status bits live with the transport that writes them, in [`crate::pci`].
 
-use core::mem::size_of;
+use core::mem::{align_of, offset_of, size_of};
 
 /// The per-buffer header virtio-net prepends to every packet in both
-/// directions. With virtio 1.0 (or `VIRTIO_NET_F_MRG_RXBUF`) the `num_buffers`
-/// field is always present, fixing the header at 12 bytes.
+/// directions. With virtio 1.0 the `num_buffers` field is always present,
+/// fixing the header at 12 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtioNetHdr {
@@ -35,61 +40,25 @@ impl VirtioNetHdr {
 }
 
 // The header is DMA'd verbatim to and from the device, so its layout is a fixed
-// ABI and must be exactly the 12-byte virtio 1.0 form.
-const _: () = assert!(size_of::<VirtioNetHdr>() == 12);
+// ABI: exactly the 12-byte virtio 1.0 form, with every field pinned at its wire
+// offset so a field reorder or width change is a compile error.
+const _: () = {
+    assert!(size_of::<VirtioNetHdr>() == 12);
+    assert!(align_of::<VirtioNetHdr>() == 2);
+    assert!(offset_of!(VirtioNetHdr, flags) == 0);
+    assert!(offset_of!(VirtioNetHdr, gso_type) == 1);
+    assert!(offset_of!(VirtioNetHdr, hdr_len) == 2);
+    assert!(offset_of!(VirtioNetHdr, gso_size) == 4);
+    assert!(offset_of!(VirtioNetHdr, csum_start) == 6);
+    assert!(offset_of!(VirtioNetHdr, csum_offset) == 8);
+    assert!(offset_of!(VirtioNetHdr, num_buffers) == 10);
+};
 
-// `flags`
-pub const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
-pub const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
-
-// `gso_type`
-pub const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
-
-/// Feature bits negotiated with a virtio-net device (subset the driver uses).
+/// Feature bits negotiated with a virtio-net device (the subset the driver
+/// negotiates today).
 pub mod features {
     /// Device provides a MAC address in config space.
     pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
-    /// Receive buffers may be merged; also forces the 12-byte header.
-    pub const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
-    /// Device exposes a link-status/announce config field.
-    pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
     /// virtio 1.0 (non-legacy) device. Mandatory for the modern layout.
     pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-}
-
-/// Device status bits written during initialisation, in order.
-pub mod status {
-    pub const ACKNOWLEDGE: u8 = 1;
-    pub const DRIVER: u8 = 2;
-    pub const DRIVER_OK: u8 = 4;
-    pub const FEATURES_OK: u8 = 8;
-    pub const DEVICE_NEEDS_RESET: u8 = 0x40;
-    pub const FAILED: u8 = 0x80;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn header_is_twelve_bytes() {
-        assert_eq!(VirtioNetHdr::LEN, 12);
-    }
-
-    #[test]
-    fn default_header_is_zeroed() {
-        let hdr = VirtioNetHdr::default();
-        assert_eq!(
-            hdr,
-            VirtioNetHdr {
-                flags: 0,
-                gso_type: 0,
-                hdr_len: 0,
-                gso_size: 0,
-                csum_start: 0,
-                csum_offset: 0,
-                num_buffers: 0,
-            }
-        );
-    }
 }
