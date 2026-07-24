@@ -1,17 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <system>
-    <!-- Two-port zero-copy virtio-net forwarding dataplane for QEMU q35
-         (virtio 1.0 PCI): two instances of the same driver binary, one per
-         NIC, joined through a forwarder PD by one pipeline region per
-         direction. Each pipeline's buffer pool is DMA'd into by the receiving
-         NIC and out of by the transmitting NIC, so a frame crosses the whole
-         system without ever being copied. See docs/virtio-net-driver.md,
-         pds/nic-driver, and pds/forwarder. -->
+    <!-- The librefirewall system: the two-port zero-copy virtio-net
+         forwarding dataplane for QEMU q35 (virtio 1.0 PCI). Two instances of
+         the same driver binary, one per NIC, joined through a forwarder PD by
+         one pipeline region per direction. Each pipeline's buffer pool is
+         DMA'd into by the receiving NIC and out of by the transmitting NIC,
+         so a frame crosses the whole system without ever being copied. See
+         docs/virtio-net-driver.md, pds/nic-driver, and pds/forwarder. -->
 
-    <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0 (q35
-         MMCONFIG base 0xB0000000 + (dev << 15)). Device MMIO: uncached. -->
-    <memory_region name="ecam0" size="0x1000" phys_addr="0xB0010000" />
-    <memory_region name="ecam1" size="0x1000" phys_addr="0xB0018000" />
+    <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0. The
+         deployable image boots through OVMF, which programs the q35 PCIEXBAR
+         (MMCONFIG base) to 0xE0000000; the page of device D is at
+         base + (D << 15). Device MMIO: uncached. -->
+    <memory_region name="ecam0" size="0x1000" phys_addr="0xE0010000" />
+    <memory_region name="ecam1" size="0x1000" phys_addr="0xE0018000" />
     <!-- Where each driver relocates its device's modern MMIO BAR (patched into
          the driver via region_paddr). Device MMIO: uncached. -->
     <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />

@@ -53,9 +53,9 @@ const QUEUE_SIZE: usize = 16;
 /// Byte offset of the transmit virtqueue within the virtqueue DMA region; the
 /// receive virtqueue sits at offset 0.
 const TX_VQ_OFFSET: usize = 0x800;
-/// Size of the virtqueue DMA region (matches forward.system).
+/// Size of the virtqueue DMA region (matches librefirewall.system).
 const VQ_REGION_SIZE: usize = 0x1000;
-/// Size of the mapped BAR window (matches forward.system); every
+/// Size of the mapped BAR window (matches librefirewall.system); every
 /// device-supplied BAR offset is bounded against this before use.
 const BAR_SIZE: usize = 0x4000;
 
@@ -72,7 +72,7 @@ fn init() -> NicDriver {
     debug_println!("LIBREFIREWALL_NIC:driver:start");
 
     // Mapped windows and DMA physical addresses, all patched by the Microkit
-    // tool from forward.system. The pointers are just addresses here; their
+    // tool from librefirewall.system. The pointers are just addresses here; their
     // use below (config access, ring setup) carries the safety.
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();

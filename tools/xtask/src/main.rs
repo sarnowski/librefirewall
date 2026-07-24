@@ -1,11 +1,7 @@
 use std::{
     env, fs,
-    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
+    process::{Command, ExitCode},
 };
 
 mod forward_harness;
@@ -25,7 +21,6 @@ const DIST_MANIFEST: &str = "librefirewall-manifest.json";
 const DIST_SBOM: &str = "librefirewall-sbom.spdx.json";
 const DIST_CHECKSUMS: &str = "librefirewall-checksums.sha256";
 const DIST_DISK: &str = "librefirewall-qemu-x86_64.img";
-const PASS_MARKER: &str = "LIBREFIREWALL_DATAPLANE_PASS:spsc-zero-copy-descriptor-round-trip";
 
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target and
@@ -38,9 +33,10 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "pd-runtime",
     "xtask",
 ];
-const QEMU_TIMEOUT: Duration = Duration::from_secs(40);
 
-const FORWARD_SYSTEM: &str = "systems/qemu-x86_64/forward.system";
+const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
+/// Protection-domain binaries the system image is assembled from.
+const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder"];
 
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
 const GRUB_VERSION: &str = "2.14";
@@ -141,20 +137,17 @@ fn run() -> Result<(), String> {
             image(&root, DEBUG_CONFIG)?;
             test_ab(&root)
         }
-        "test-forward" => test_forward(&root),
         "ci" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)?;
-            test_ab(&root)?;
-            test_forward(&root)
+            test_ab(&root)
         }
         "release" => {
             test_host(&root)?;
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)?;
             test_ab(&root)?;
-            test_forward(&root)?;
             image(&root, RELEASE_CONFIG)
         }
         "clean" => clean(&root),
@@ -163,8 +156,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|test-forward|ci|release|clean>"
-        .to_owned()
+    "usage: cargo xtask <image|run|test|test-host|test-system|test-ab|ci|release|clean>".to_owned()
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -178,7 +170,7 @@ fn workspace_root() -> Result<PathBuf, String> {
 fn image(root: &Path, config: &str) -> Result<(), String> {
     verify_inputs(config)?;
 
-    let build = root.join("build/bootstrap").join(config);
+    let build = root.join("build/image").join(config);
     let dist = root.join("dist");
     recreate_dir(&build)?;
     recreate_dir(&dist)?;
@@ -206,23 +198,21 @@ fn image(root: &Path, config: &str) -> Result<(), String> {
                 "build-std-features=compiler-builtins-mem",
                 "--target",
                 TARGET,
-                "-p",
-                "bootstrap-initiator",
-                "-p",
-                "bootstrap-responder",
-            ]),
+            ])
+            .args(SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd])),
         "build protection domains",
     )?;
 
     let target_dir = target_root.join(TARGET).join("release");
-    for pd in ["bootstrap-initiator.elf", "bootstrap-responder.elf"] {
-        copy_file(&target_dir.join(pd), &build.join(pd))?;
+    for pd in SYSTEM_PDS {
+        let elf = format!("{pd}.elf");
+        copy_file(&target_dir.join(&elf), &build.join(&elf))?;
     }
 
     run_command(
         Command::new(Path::new(MICROKIT_SDK).join("bin/microkit"))
             .current_dir(root)
-            .arg(root.join("systems/qemu-x86_64/bootstrap.system"))
+            .arg(root.join(SYSTEM_DESCRIPTION))
             .arg("--search-path")
             .arg(&build)
             .args(["--board", BOARD, "--config", config, "-o"])
@@ -577,108 +567,48 @@ fn test_host(root: &Path) -> Result<(), String> {
     )
 }
 
+/// Boot the deployable disk through OVMF/GRUB and prove the complete system
+/// behaviour: a frame injected into each NIC port must egress byte-identical
+/// on the opposite port.
 fn test_system(root: &Path) -> Result<(), String> {
     let disk = root.join("dist").join(DIST_DISK);
-    let (output, observed_pass) = boot_for_marker(root, &disk, "qemu.log")?;
-    let log = root.join("build/bootstrap/qemu.log");
-    let pass_count = count_occurrences(&output, PASS_MARKER.as_bytes());
-    if !observed_pass || pass_count != 1 {
-        return Err(format!(
-            "expected exactly one pass marker, observed {pass_count}; output is in {}",
-            log.display()
-        ));
-    }
-    println!("system test passed; QEMU output is in {}", log.display());
+    boot_and_forward(root, &disk, "qemu.log")?;
+    println!(
+        "system test passed; QEMU output is in {}",
+        root.join("build/image/qemu.log").display()
+    );
     Ok(())
 }
 
-/// Boot `disk` through OVMF/GRUB and capture serial output until the pass
-/// marker appears or the timeout elapses. Returns the captured output and
-/// whether the marker was seen. Reaching the timeout without the marker is a
-/// valid outcome for callers that assert on the absence of a boot (it is not an
-/// error here); a QEMU launch/exit failure is.
-fn boot_for_marker(root: &Path, disk: &Path, log_name: &str) -> Result<(Vec<u8>, bool), String> {
+/// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the
+/// bidirectional forwarding contract, returning the captured serial output
+/// (always also written to `build/image/<log_name>`) for callers that
+/// additionally assert on boot messages.
+fn boot_and_forward(root: &Path, disk: &Path, log_name: &str) -> Result<Vec<u8>, String> {
+    let backends = forward_harness::NicBackends::new()?;
     let mut command = qemu_base(root, "stdio", disk)?;
     command.arg("-monitor").arg("none").arg("-no-shutdown");
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("start QEMU: {error}"))?;
-
-    let (sender, receiver) = mpsc::channel();
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate(&mut child, "stdout capture failure")?;
-            return Err("capture QEMU stdout".to_owned());
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate(&mut child, "stderr capture failure")?;
-            return Err("capture QEMU stderr".to_owned());
-        }
-    };
-    let stdout_reader = spawn_reader(stdout, sender.clone());
-    let stderr_reader = spawn_reader(stderr, sender);
-
-    let start = Instant::now();
-    let mut output = Vec::new();
-    let mut observed_pass = false;
-    let result = loop {
-        while let Ok(chunk) = receiver.try_recv() {
-            output.extend_from_slice(&chunk);
-        }
-
-        if count_occurrences(&output, PASS_MARKER.as_bytes()) > 0 {
-            observed_pass = true;
-            break terminate(&mut child, "pass marker observed");
-        }
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                // GRUB or seL4 may reset/exit without the marker; that is a
-                // legitimate no-boot outcome, so drain and stop without erroring.
-                break Ok(());
-            }
-            Ok(None) => {}
-            Err(error) => {
-                break terminate(&mut child, "poll failure")
-                    .and_then(|()| Err(format!("poll QEMU: {error}")));
-            }
-        }
-        if start.elapsed() >= QEMU_TIMEOUT {
-            break terminate(&mut child, "hard timeout");
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-
-    stdout_reader
-        .join()
-        .map_err(|_| "QEMU stdout reader panicked".to_owned())?
-        .map_err(|error| format!("read QEMU stdout: {error}"))?;
-    stderr_reader
-        .join()
-        .map_err(|_| "QEMU stderr reader panicked".to_owned())?
-        .map_err(|error| format!("read QEMU stderr: {error}"))?;
-    while let Ok(chunk) = receiver.try_recv() {
-        output.extend_from_slice(&chunk);
-    }
-
-    let log = root.join("build/bootstrap").join(log_name);
-    if let Some(parent) = log.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create {}: {error}", parent.display()))?;
-    }
-    fs::write(&log, &output).map_err(|error| format!("write {}: {error}", log.display()))?;
-    result?;
-    Ok((output, observed_pass))
+    backends.apply(&mut command)?;
+    let log = root.join("build/image").join(log_name);
+    forward_harness::run_forward_test(command, backends, &log)
 }
 
 fn run_system(root: &Path) -> Result<(), String> {
     let disk = root.join("dist").join(DIST_DISK);
     let mut command = qemu_base(root, "mon:stdio", &disk)?;
+    // Interactive runs have no harness peer to dial into, so back the two NIC
+    // ports with QEMU's self-contained user-mode stack instead.
+    for port in 0..2 {
+        command
+            .arg("-netdev")
+            .arg(format!("user,id=n{port}"))
+            .arg("-device")
+            .arg(format!(
+                "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
+                 mac=52:54:00:12:34:5{port},bus=pcie.0,addr=0{}.0,romfile=",
+                port + 2
+            ));
+    }
     run_command(&mut command, "run QEMU")
 }
 
@@ -689,11 +619,14 @@ fn run_system(root: &Path) -> Result<(), String> {
 /// slot-selection messages and seL4's completion marker. GRUB's single-attempt
 /// model means a slot that fails verification is skipped within the same boot,
 /// while a slot that would hang is represented by its persistent aftermath
-/// (TRY set, OK unset) — exactly what a watchdog reset leaves behind.
+/// (TRY set, OK unset) — exactly what a watchdog reset leaves behind. Every
+/// scenario is expected to reach a healthy slot, and a healthy boot is proven
+/// by the system's real observable contract: frames forwarded between the two
+/// NIC ports.
 fn test_ab(root: &Path) -> Result<(), String> {
     let dist_disk = root.join("dist").join(DIST_DISK);
     require_file(&dist_disk)?;
-    let work = root.join("build/bootstrap/ab-test.img");
+    let work = root.join("build/image/ab-test.img");
 
     // 1. Confirmed A boots directly.
     ab_scenario(
@@ -705,7 +638,6 @@ fn test_ab(root: &Path) -> Result<(), String> {
         &[],
         &["librefirewall: booting confirmed slot A"],
         &["slot B"],
-        true,
         None,
     )?;
 
@@ -720,7 +652,6 @@ fn test_ab(root: &Path) -> Result<(), String> {
         &[],
         &["librefirewall: trying slot B"],
         &[],
-        true,
         Some("B_TRY=1"),
     )?;
 
@@ -738,7 +669,6 @@ fn test_ab(root: &Path) -> Result<(), String> {
             "librefirewall: booting confirmed slot A",
         ],
         &[],
-        true,
         None,
     )?;
 
@@ -753,7 +683,6 @@ fn test_ab(root: &Path) -> Result<(), String> {
         &[],
         &["librefirewall: booting confirmed slot A"],
         &["slot B"],
-        true,
         None,
     )?;
 
@@ -767,7 +696,6 @@ fn test_ab(root: &Path) -> Result<(), String> {
         &[],
         &["librefirewall: booting confirmed slot B"],
         &[],
-        true,
         None,
     )?;
 
@@ -785,7 +713,6 @@ fn ab_scenario(
     corrupt_slots: &[&str],
     expect: &[&str],
     reject: &[&str],
-    expect_marker: bool,
     expect_grubenv_after: Option<&str>,
 ) -> Result<(), String> {
     copy_file(dist_disk, work)?;
@@ -794,7 +721,8 @@ fn ab_scenario(
         corrupt_slot_signature(root, work, slot)?;
     }
 
-    let (output, observed_pass) = boot_for_marker(root, work, &format!("ab-{name}.log"))?;
+    let output = boot_and_forward(root, work, &format!("ab-{name}.log"))
+        .map_err(|error| format!("scenario {name}: {error}"))?;
     let text = String::from_utf8_lossy(&output);
 
     for needle in expect {
@@ -810,11 +738,6 @@ fn ab_scenario(
                 "scenario {name}: unexpectedly saw {needle:?} in boot output"
             ));
         }
-    }
-    if observed_pass != expect_marker {
-        return Err(format!(
-            "scenario {name}: pass marker observed={observed_pass}, expected={expect_marker}"
-        ));
     }
     if let Some(entry) = expect_grubenv_after {
         let env = read_grubenv(work)?;
@@ -888,7 +811,7 @@ fn read_grubenv(disk: &Path) -> Result<String, String> {
 /// Overwrite a slot's kernel signature with garbage so GRUB's enforced
 /// verification rejects it, simulating a corrupt or tampered release.
 fn corrupt_slot_signature(root: &Path, disk: &Path, label: &str) -> Result<(), String> {
-    let garbage = root.join("build/bootstrap/garbage.sig");
+    let garbage = root.join("build/image/garbage.sig");
     fs::write(&garbage, [0xAB_u8; 64]).map_err(|error| format!("write garbage: {error}"))?;
     run_command(
         Command::new("mcopy")
@@ -912,7 +835,7 @@ fn qemu_base(root: &Path, serial: &str, disk: &Path) -> Result<Command, String> 
 
     let code = locate(OVMF_CODE_CANDIDATES, "OVMF code firmware")?;
     let vars_template = locate(OVMF_VARS_CANDIDATES, "OVMF variable store")?;
-    let vars = root.join("build/bootstrap/OVMF_VARS.fd");
+    let vars = root.join("build/image/OVMF_VARS.fd");
     if let Some(parent) = vars.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
@@ -941,8 +864,15 @@ fn qemu_base(root: &Path, serial: &str, disk: &Path) -> Result<Command, String> 
         ))
         .arg("-drive")
         .arg(format!("if=pflash,format=raw,file={}", vars.display()))
+        // Attach the disk as an explicit device with bootindex=0 so OVMF's
+        // boot order starts at GRUB on the disk rather than at the firmware's
+        // own network-boot options for the virtio NICs.
         .arg("-drive")
-        .arg(format!("format=raw,file={}", disk.display()))
+        .arg(format!(
+            "if=none,id=boot,format=raw,file={}",
+            disk.display()
+        ))
+        .args(["-device", "ide-hd,drive=boot,bootindex=0"])
         .args(["-serial", serial, "-no-reboot"]);
     Ok(command)
 }
@@ -967,46 +897,6 @@ fn locate(candidates: &[&str], description: &str) -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .find(|path| path.is_file())
         .ok_or_else(|| format!("{description} not found in {candidates:?}"))
-}
-
-fn spawn_reader<R>(
-    mut reader: R,
-    sender: mpsc::Sender<Vec<u8>>,
-) -> thread::JoinHandle<io::Result<()>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                return Ok(());
-            }
-            if sender.send(buffer[..count].to_vec()).is_err() {
-                return Ok(());
-            }
-        }
-    })
-}
-
-fn terminate(child: &mut Child, reason: &str) -> Result<(), String> {
-    match child.kill() {
-        Ok(()) => {}
-        Err(_error) if child.try_wait().ok().flatten().is_some() => {}
-        Err(error) => return Err(format!("kill QEMU after {reason}: {error}")),
-    }
-    child
-        .wait()
-        .map_err(|error| format!("reap QEMU after {reason}: {error}"))?;
-    Ok(())
-}
-
-fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
 }
 
 fn write_manifest(dist: &Path, config: &str, key_fingerprint: &str) -> Result<(), String> {
@@ -1103,81 +993,9 @@ fn write_checksums(dist: &Path) -> Result<(), String> {
         .map_err(|error| format!("write {DIST_CHECKSUMS}: {error}"))
 }
 
-/// Build the standalone two-port forwarding system (two driver PD instances,
-/// the forwarder PD, and `forward.system`) into `build/forward`, returning the
-/// 32-bit kernel and loader image to boot. This is a separate Microkit image
-/// from the A/B release disk: it boots via QEMU's multiboot `-kernel`/`-initrd`
-/// path on q35 with real NICs, not through OVMF/GRUB.
-fn build_forward_image(root: &Path) -> Result<(PathBuf, PathBuf), String> {
-    verify_inputs(DEBUG_CONFIG)?;
-
-    let build = root.join("build/forward");
-    recreate_dir(&build)?;
-
-    let board_dir = Path::new(MICROKIT_SDK)
-        .join("board")
-        .join(BOARD)
-        .join(DEBUG_CONFIG);
-    let target_root = root.join("target").join(DEBUG_CONFIG);
-    run_command(
-        Command::new("cargo")
-            .current_dir(root)
-            .env("SEL4_INCLUDE_DIRS", board_dir.join("include"))
-            .env("CARGO_TARGET_DIR", &target_root)
-            .args([
-                "build",
-                "--locked",
-                "--release",
-                "-Z",
-                "build-std=core",
-                "-Z",
-                "build-std-features=compiler-builtins-mem",
-                "--target",
-                TARGET,
-                "-p",
-                "nic-driver",
-                "-p",
-                "forwarder",
-            ]),
-        "build forwarding protection domains",
-    )?;
-
-    let target_dir = target_root.join(TARGET).join("release");
-    for pd in ["nic-driver.elf", "forwarder.elf"] {
-        copy_file(&target_dir.join(pd), &build.join(pd))?;
-    }
-
-    run_command(
-        Command::new(Path::new(MICROKIT_SDK).join("bin/microkit"))
-            .current_dir(root)
-            .arg(root.join(FORWARD_SYSTEM))
-            .arg("--search-path")
-            .arg(&build)
-            .args(["--board", BOARD, "--config", DEBUG_CONFIG, "-o"])
-            .arg(build.join("loader.img"))
-            .arg("-r")
-            .arg(build.join("report.txt")),
-        "assemble forwarding Microkit image",
-    )?;
-
-    Ok((build.join("sel4_32.elf"), build.join("loader.img")))
-}
-
-/// Build the forwarding system and boot it in QEMU with two virtio-net
-/// devices, asserting that a frame injected into each port egresses unchanged
-/// on the other.
-fn test_forward(root: &Path) -> Result<(), String> {
-    let (kernel, system) = build_forward_image(root)?;
-    let log = root.join("build/forward/qemu.log");
-    forward_harness::run_forward_test(root, &kernel, &system, &log)?;
-    println!("forward test passed; QEMU output is in {}", log.display());
-    Ok(())
-}
-
 fn clean(root: &Path) -> Result<(), String> {
     for path in [
-        root.join("build/bootstrap"),
-        root.join("build/forward"),
+        root.join("build/image"),
         root.join("build/dev-keys"),
         root.join("dist"),
         root.join("target"),
@@ -1225,24 +1043,5 @@ fn run_command(command: &mut Command, description: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{description} failed with {status}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn marker_count_requires_an_exact_unique_marker() {
-        let output = format!("prefix{PASS_MARKER}middle{PASS_MARKER}suffix");
-        assert_eq!(
-            count_occurrences(output.as_bytes(), PASS_MARKER.as_bytes()),
-            2
-        );
-        assert_eq!(
-            count_occurrences(PASS_MARKER.as_bytes(), PASS_MARKER.as_bytes()),
-            1
-        );
-        assert_eq!(count_occurrences(b"unrelated", PASS_MARKER.as_bytes()), 0);
     }
 }

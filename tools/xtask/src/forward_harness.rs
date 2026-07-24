@@ -1,11 +1,12 @@
 //! QEMU two-port virtio-net forwarding harness.
 //!
-//! Boots the seL4/Microkit x86_64 forwarding image in QEMU with two
-//! `virtio-net-pci` NICs whose backends are host-controlled TCP sockets,
-//! injects one Ethernet frame into each port, and asserts that each frame
-//! egresses — byte-identical — on the *other* port before a timeout. The
-//! observable contract is the frames themselves on the sockets, not serial
-//! text; the guest serial output is captured to a log for diagnostics only.
+//! Attaches two `virtio-net-pci` NICs whose backends are host-controlled TCP
+//! sockets to a caller-built QEMU invocation (the OVMF/GRUB boot of the
+//! deployable disk), injects one Ethernet frame into each port, and asserts
+//! that each frame egresses — byte-identical — on the *other* port before a
+//! timeout. The observable contract is the frames themselves on the sockets,
+//! not serial text; the guest serial output is captured to a log and returned
+//! for callers that additionally assert on boot-manager messages.
 //!
 //! This module is intentionally self-contained: it duplicates the small
 //! process and capture helpers from `main.rs` rather than depending on its
@@ -23,12 +24,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Total wall-clock budget from QEMU launch to both frames observed. TCG (no
-/// KVM) boot of seL4 plus two polling virtio drivers is slow, hence the
-/// generous ceiling.
-const FORWARD_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Total wall-clock budget from QEMU launch to both frames observed. A TCG
+/// (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
+/// two polling virtio drivers is slow, hence the generous ceiling.
+const FORWARD_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How long to wait for QEMU to dial back into both listeners before giving up.
+/// How long to wait for QEMU to dial back into both listeners before giving
+/// up. The netdev sockets connect when QEMU starts, well before guest boot.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cadence of re-injection. virtio-net silently drops received frames while
@@ -43,59 +45,61 @@ const MIN_ETHERNET_FRAME: usize = 60;
 /// larger means a corrupt stream, not a jumbo frame.
 const MAX_WIRE_FRAME: usize = 65535;
 
-/// Boot the image in QEMU with two socket-backed NICs, inject a distinct
-/// broadcast frame into each port, and assert each frame comes back out of the
-/// opposite port unchanged — the two-port zero-copy forwarding contract, in
-/// both directions at once.
-///
-/// `kernel` is the 32-bit seL4 kernel ELF (`sel4_32.elf`) loaded as the
-/// Multiboot2 payload; `system` is the Microkit loader image (`loader.img`)
-/// loaded as the initrd. The captured serial output is always written to
-/// `log_path` (whose parent directories are created), whether the test passes
-/// or fails, and QEMU is always killed and reaped on every exit path.
-pub fn run_forward_test(
-    root: &Path,
-    kernel: &Path,
-    system: &Path,
-    log_path: &Path,
-) -> Result<(), String> {
-    require_file(kernel)?;
-    require_file(system)?;
+/// The host side of the two NIC ports: one loopback listener per port that
+/// QEMU's `socket` netdevs dial into, so the port identity of each accepted
+/// stream is unambiguous.
+pub struct NicBackends {
+    listeners: [TcpListener; 2],
+}
 
-    // One ephemeral loopback listener per port; QEMU's `connect=` backends
-    // dial in to us, each netdev to its own listener, so the port identity of
-    // each accepted stream is unambiguous.
-    let listeners = [bind_listener()?, bind_listener()?];
-
-    let mut command = Command::new("qemu-system-x86_64");
-    command
-        .current_dir(root)
-        .args(["-machine", "q35", "-accel", "tcg"])
-        .args(["-cpu", "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave"])
-        .args(["-m", "1G", "-display", "none", "-serial", "stdio"])
-        .arg("-kernel")
-        .arg(kernel)
-        .arg("-initrd")
-        .arg(system)
-        .arg("-no-reboot")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (port, (listener, pci_device)) in listeners.iter().zip(["02.0", "03.0"]).enumerate() {
-        let tcp = listener
-            .local_addr()
-            .map_err(|error| format!("read listener port: {error}"))?
-            .port();
-        command
-            .arg("-netdev")
-            .arg(format!("socket,id=n{port},connect=127.0.0.1:{tcp}"))
-            .arg("-device")
-            .arg(format!(
-                "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
-                 mac=52:54:00:12:34:5{port},bus=pcie.0,addr={pci_device}",
-            ));
+impl NicBackends {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            listeners: [bind_listener()?, bind_listener()?],
+        })
     }
 
+    /// Append the two socket-backed virtio NICs to a QEMU invocation, at the
+    /// PCI addresses the system description pins (00:02.0 and 00:03.0). The
+    /// devices carry no option ROM (`romfile=`), so the firmware gains no
+    /// PXE boot payload from them.
+    pub fn apply(&self, command: &mut Command) -> Result<(), String> {
+        for (port, (listener, pci_device)) in
+            self.listeners.iter().zip(["02.0", "03.0"]).enumerate()
+        {
+            let tcp = listener
+                .local_addr()
+                .map_err(|error| format!("read listener port: {error}"))?
+                .port();
+            command
+                .arg("-netdev")
+                .arg(format!("socket,id=n{port},connect=127.0.0.1:{tcp}"))
+                .arg("-device")
+                .arg(format!(
+                    "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
+                     mac=52:54:00:12:34:5{port},bus=pcie.0,addr={pci_device},romfile=",
+                ));
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the prepared QEMU `command` (which must carry this harness's NIC
+/// backends and serial on stdio), inject a distinct broadcast frame into each
+/// port, and assert each frame comes back out of the opposite port unchanged —
+/// the two-port zero-copy forwarding contract, in both directions at once.
+///
+/// The captured serial output is always written to `log_path` (whose parent
+/// directories are created), whether the test passes or fails, and is returned
+/// on success; QEMU is always killed and reaped on every exit path.
+pub fn run_forward_test(
+    mut command: Command,
+    backends: NicBackends,
+    log_path: &Path,
+) -> Result<Vec<u8>, String> {
     let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("start QEMU: {error}"))?;
 
@@ -129,7 +133,7 @@ pub fn run_forward_test(
         let mut streams: [Option<TcpStream>; 2] = [None, None];
         while streams.iter().any(Option::is_none) {
             drain(&serial_receiver, &mut output);
-            for (port, listener) in listeners.iter().enumerate() {
+            for (port, listener) in backends.listeners.iter().enumerate() {
                 if streams[port].is_some() {
                     continue;
                 }
@@ -162,7 +166,7 @@ pub fn run_forward_test(
         // directions: a 4-byte big-endian length header followed by the raw L2
         // bytes (no FCS). A decoder thread per port parses the guest's egress
         // frames into one channel; draining continuously also keeps QEMU's TX
-        // ring from blocking on a full host socket buffer.
+        // path from blocking on a full host socket buffer.
         let (frame_sender, frame_receiver) = mpsc::channel();
         let mut writers = Vec::new();
         for (port, stream) in streams.into_iter().enumerate() {
@@ -268,7 +272,7 @@ pub fn run_forward_test(
     stdout_result?;
     stderr_result?;
     frame_reader_result?;
-    Ok(())
+    Ok(output)
 }
 
 fn bind_listener() -> Result<TcpListener, String> {
@@ -407,14 +411,6 @@ fn write_capture(path: &Path, output: &[u8]) -> Result<(), String> {
     fs::write(path, output).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
-fn require_file(path: &Path) -> Result<(), String> {
-    if path.is_file() {
-        Ok(())
-    } else {
-        Err(format!("required file is missing: {}", path.display()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +447,31 @@ mod tests {
         let wire = encode_wire(&frame);
         assert_eq!(&wire[0..4], (frame.len() as u32).to_be_bytes().as_slice());
         assert_eq!(&wire[4..], frame.as_slice());
+    }
+
+    #[test]
+    fn nic_backends_produce_per_port_socket_and_device_arguments() {
+        let backends = NicBackends::new().unwrap();
+        let mut command = Command::new("qemu-system-x86_64");
+        backends.apply(&mut command).unwrap();
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let devices: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("virtio-net-pci"))
+            .collect();
+        assert_eq!(devices.len(), 2);
+        assert!(devices[0].contains("addr=02.0") && devices[0].contains("romfile="));
+        assert!(devices[1].contains("addr=03.0") && devices[1].contains("romfile="));
+        let netdevs: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("socket,id="))
+            .collect();
+        assert_eq!(netdevs.len(), 2);
+        assert_ne!(netdevs[0], netdevs[1], "each port needs its own listener");
     }
 
     #[test]

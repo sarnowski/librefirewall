@@ -2,17 +2,19 @@
 
 ## Status
 
-Implemented (two-port zero-copy forwarding), QEMU q35. `pds/nic-driver` brings up a modern
-virtio-net-pci device from static capabilities and drives both its receive and transmit
-virtqueues; the same binary is instantiated once per NIC, each instance patched with its own
-device windows. `pds/forwarder` sits between the two ports and moves frame descriptors from each
-port's receive ring to the other port's transmit ring; `crates/virtio` carries the split virtqueue
-and the first-party PCI transport (`pci.rs`). The `test-forward` system test (in `make ci`) boots
-the standalone `forward.system` image via QEMU's multiboot `-kernel`/`-initrd` path on q35 with
-two `socket` netdevs, injects a distinct frame into each port, and asserts each egresses
-byte-identical on the opposite port. MSI-X interrupts (the drivers poll) and real-hardware
-bring-up (BAR discovery, VT-d) remain future work — see Open decisions below, which are kept as
-the record of what the QEMU slice deliberately does not yet solve.
+Implemented (two-port zero-copy forwarding), QEMU q35, and shipped as **the** deployable system:
+`systems/qemu-x86_64/librefirewall.system` is what `make image` assembles into the signed A/B
+disk. `pds/nic-driver` brings up a modern virtio-net-pci device from static capabilities and
+drives both its receive and transmit virtqueues; the same binary is instantiated once per NIC,
+each instance patched with its own device windows. `pds/forwarder` sits between the two ports and
+moves frame descriptors from each port's receive ring to the other port's transmit ring;
+`crates/virtio` carries the split virtqueue and the first-party PCI transport (`pci.rs`). The
+`test-system` gate (in `make ci`) boots the disk through OVMF and GRUB with two `socket` netdevs,
+injects a distinct frame into each port, and asserts each egresses byte-identical on the opposite
+port; the A/B fallback scenarios use the same forwarding contract as their boot-health proof.
+MSI-X interrupts (the drivers poll) and real-hardware bring-up (BAR discovery, VT-d) remain future
+work — see Open decisions below, which are kept as the record of what the QEMU slice deliberately
+does not yet solve.
 
 The constraints and decisions below reflect what the working driver relies on; where the QEMU slice
 resolved a decision, it is marked **[resolved for QEMU]**.
@@ -83,11 +85,14 @@ BAR layout or discover-then-map — and static pinning is what the model actuall
 
 **[resolved for QEMU]** Each driver instance maps the q35 ECAM page of its pinned device
 (`00:02.0` and `00:03.0`) and reads config space over MMIO — option (a), no `<ioport>` shim
-needed. It then sidesteps the chicken-and-egg by **reprogramming** the device's modern MMIO BAR to
-the fixed address that instance pre-maps (`0x50000000` / `0x50004000`, patched into the binary via
-`region_paddr`), so the `.system` is self-consistent and independent of what SeaBIOS assigned. On
-real hardware the reprogram target must be a validated free MMIO range (and BAR discovery/sizing
-generalised); that remains open and ties to CONCEPT §13.2.
+needed. The ECAM base is firmware-programmed (PCIEXBAR) and therefore part of the boot contract:
+OVMF places it at `0xE0000000`, which is what the `.system` pins (SeaBIOS would use `0xB0000000`,
+but the deployable image boots only through OVMF). The driver then sidesteps the chicken-and-egg
+by **reprogramming** the device's modern MMIO BAR to the fixed address that instance pre-maps
+(`0x50000000` / `0x50004000`, patched into the binary via `region_paddr`), so the `.system` is
+self-consistent and independent of what the firmware assigned. On real hardware the reprogram
+target must be a validated free MMIO range (and BAR discovery/sizing generalised); that remains
+open and ties to CONCEPT §13.2.
 
 ### IRQ model
 
@@ -157,7 +162,8 @@ end** over one pool per direction. This requires the pipeline regions to carry f
 addresses (both NICs' DMA target) — see the DMA/IOMMU decision. Per AGENTS, the PDs stay thin
 adapters around the reusable libraries, with the transport's pure logic (cap walk, offsets) and
 the three-stage ownership chain tested on the host and the whole path tested under seL4 in QEMU
-(`make test-forward`, which asserts byte-identical frame egress in both directions).
+(`make test-system`, which boots the signed A/B disk through OVMF/GRUB and asserts byte-identical
+frame egress in both directions).
 
 ## References
 

@@ -16,7 +16,7 @@ else
 CA_SECRET := --secret=id=gropyus_ca,src=$(abspath $(GROPYUS_CA_FILE))
 endif
 
-.PHONY: image run test test-system test-ab test-forward ci release clean builder prepare
+.PHONY: image run test test-system test-ab ci release clean builder prepare
 
 image: builder prepare
 	$(call xtask,image)
@@ -33,9 +33,6 @@ test-system: builder prepare
 test-ab: builder prepare
 	$(call xtask,test-ab)
 
-test-forward: builder prepare
-	$(call xtask,test-forward)
-
 ci: builder prepare
 	$(call xtask,ci)
 
@@ -43,7 +40,7 @@ release: builder prepare
 	$(call xtask,release)
 
 clean:
-	rm -rf build/bootstrap dist sdk target
+	rm -rf build/image build/dev-keys dist sdk target
 
 builder:
 	$(PODMAN) --cgroup-manager=cgroupfs build \

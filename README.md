@@ -30,34 +30,28 @@ and known risks.
 
 ## Current milestone
 
-The current milestone builds the zero-copy dataplane substrate the whole firewall will rest on:
-two isolated Rust protection domains — a producer and a consumer — exchange packet buffers over
-shared memory using a lock-free single-producer/single-consumer ring, with buffer ownership handed
-across on a return ring so every transfer is zero-copy and single-owner. The producer pushes 1024
-sequence-numbered buffers through a 64-buffer pool and 128-slot rings, so both rings wrap many times
-and every buffer is reused; the consumer verifies order and content and emits the success marker the
-automated system test asserts on. The reusable primitives live in host-tested `no_std` crates
-(`crates/wire`, `crates/queue`, `crates/packet-buffer`, `crates/pd-runtime`); the protection-domain
-binaries are thin adapters that map the shared region and drive the exchange from Microkit
-notifications. Packaged into the signed A/B disk image and booted through UEFI (OVMF) and GRUB, this
-proves the build, signing, isolation, boot-manager, boot, and component-interaction path together.
-It is the substrate the virtio NIC driver plugs onto.
-
-Built on that substrate, librefirewall now **forwards real traffic between two NIC ports**: a
-first-party virtio-net driver (`pds/nic-driver`, over the from-scratch split virtqueue and PCI
-transport in `crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU q35 entirely from
-static seL4 capabilities — reaching PCI config space through the ECAM window, relocating the
-device's MMIO BAR to a pre-mapped address, negotiating virtio 1.0, and driving both the receive
-and transmit virtqueues (no interrupt: it polls). The same driver binary is instantiated once per
-port; between the two instances sits an isolated forwarder PD — the seat where the classifier and
-filter shards will later run — joined by one shared pipeline region per direction. The whole path
-is **zero-copy**: the receiving NIC DMAs each frame directly into the pipeline's buffer pool, the
+librefirewall **forwards real traffic between two NIC ports**, and that dataplane *is* the
+deployable system: a first-party virtio-net driver (`pds/nic-driver`, over the from-scratch split
+virtqueue and PCI transport in `crates/virtio`) brings up a modern `virtio-net-pci` device on QEMU
+q35 entirely from static seL4 capabilities — reaching PCI config space through the ECAM window,
+relocating the device's MMIO BAR to a pre-mapped address, negotiating virtio 1.0, and driving both
+the receive and transmit virtqueues (no interrupt: it polls). The same driver binary is
+instantiated once per port; between the two instances sits an isolated forwarder PD — the seat
+where the classifier and filter shards will later run — joined by one shared pipeline region per
+direction. The whole path is **zero-copy**: the receiving NIC DMAs each frame directly into the
+pipeline's buffer pool over a lock-free single-producer/single-consumer ring protocol, the
 forwarder moves only its descriptor, and the transmitting NIC DMAs the frame back out of the very
 same buffer — a buffer cycles NIC0 → driver0 → forwarder → driver1 → NIC1 and back by moving
-ownership through the queues, its bytes never copied. `make test-forward` (part of `make ci`)
-boots this system via QEMU's multiboot path with two `socket`-backed NICs, injects a distinct
-frame into each port, and asserts each egresses byte-identical on the opposite port. MSI-X
-interrupts and real-hardware bring-up are the next steps — see
+ownership through the queues, its bytes never copied, always owned by exactly one side. The
+reusable primitives live in host-tested `no_std` crates (`crates/wire`, `crates/queue`,
+`crates/packet-buffer`, `crates/pd-runtime`, `crates/virtio`); the protection-domain binaries are
+thin adapters that map the shared regions and drive the protocol.
+
+`make test-system` (part of `make ci`) boots the signed A/B disk through UEFI (OVMF) and GRUB with
+two `socket`-backed NICs, injects a distinct frame into each port, and asserts each egresses
+byte-identical on the opposite port — proving build, signing, boot-manager, boot, isolation, and
+the complete dataplane together; the A/B fallback scenarios use the same forwarding contract as
+their boot-health proof. MSI-X interrupts and real-hardware bring-up are the next steps — see
 [docs/virtio-net-driver.md](docs/virtio-net-driver.md).
 
 Boot and update model: the deployable artifact is a GPT disk with two software slots (A/B), a
@@ -121,10 +115,11 @@ make release      # run CI, then assemble the Microkit release payload in `dist/
 make clean        # run `xtask clean` for generated output only
 ```
 
-`make ci` produces and boots the Microkit debug configuration because automated success detection
-uses its serial output. `make release` first runs that complete gate and only then replaces `dist/`
-with the production-oriented Microkit release configuration. The release kernel and initialiser do
-not emit serial diagnostics, so release assembly is gated by the tested equivalent debug topology.
+`make ci` produces and boots the Microkit debug configuration, whose serial diagnostics are
+captured for failure analysis; success detection itself is the forwarded frames on the NIC
+sockets, not serial text. `make release` first runs that complete gate and only then replaces
+`dist/` with the production-oriented Microkit release configuration. The release configuration is
+assembled from the same tested topology but does not yet have its own automated boot test.
 
 The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
 through OVMF and GRUB. The loose `dist/librefirewall-kernel.elf` (Multiboot-compatible seL4 kernel)

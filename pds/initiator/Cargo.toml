@@ -1,9 +1,0 @@
-[package]
-name = "bootstrap-initiator"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-sel4-microkit.workspace = true
-pd-runtime = { path = "../../crates/pd-runtime" }

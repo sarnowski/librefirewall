@@ -6,22 +6,24 @@ into repository and development practices.
 
 ## Current Milestone
 
-Build the smallest complete vertical slice before implementing firewall features. A clean checkout
-must be able to create a pinned build environment, compile Rust protection domains, assemble an
-x86_64 seL4/Microkit system, boot it in QEMU, test its observable behaviour, and package release
-artifacts with one command.
+The bootstrap vertical slice is complete: a clean checkout creates a pinned build environment,
+compiles Rust protection domains, assembles an x86_64 seL4/Microkit system, packages it into the
+signed A/B disk, boots it through OVMF and GRUB in QEMU, and tests its observable behaviour with
+one command.
 
-The initial system contains two isolated Rust protection domains connected by a Microkit channel.
-One PD initiates an interaction and the other responds; the serial output exposes a unique success
-marker that the automated QEMU harness verifies. This is intentionally not yet a network dataplane.
-It proves the complete toolchain and the component interaction model on which the dataplane will be
-built. The next vertical slice is:
+The deployable system is the two-port zero-copy forwarding dataplane (dev-order step 3): one
+virtio-net driver PD instance per NIC, joined through a forwarder PD by one shared pipeline region
+per direction, with the QEMU gate asserting byte-identical frame egress between the ports through
+the booted disk. The forwarder is where the next slice inserts the processing stages:
 
 ```text
 virtio driver -> Rx queue -> classifier -> filter shard -> Tx queue
 ```
 
-Do not add protocol breadth before the build, boot, test, and release path is reliable.
+Before that breadth, dev-order step 3 still owes its performance evidence: microbenchmarks, a
+QEMU/KVM forwarding regression check behind `make bench`, and the written numeric performance
+contract. Do not add protocol breadth before those and the build, boot, test, and release path are
+reliable.
 
 ## Product Decomposition
 

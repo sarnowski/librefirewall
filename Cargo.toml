@@ -6,8 +6,6 @@ members = [
     "crates/packet-buffer",
     "crates/virtio",
     "crates/pd-runtime",
-    "pds/initiator",
-    "pds/responder",
     "pds/nic-driver",
     "pds/forwarder",
     "tools/xtask",
