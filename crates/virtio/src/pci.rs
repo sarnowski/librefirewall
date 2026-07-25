@@ -45,11 +45,23 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-// virtio device-status bits.
+// virtio device-status bits, written to the common-config `device_status`
+// register to step the device through the initialization handshake (virtio 1.x
+// §2.1). The driver ORs these in cumulatively; the device latches them.
+/// The driver has noticed the device. First bit set in the handshake.
 pub const STATUS_ACKNOWLEDGE: u8 = 1;
+/// The driver knows how to drive this device type. Set together with
+/// [`STATUS_ACKNOWLEDGE`] before feature negotiation begins.
 pub const STATUS_DRIVER: u8 = 2;
+/// The driver is set up and ready to drive the device. Set last, after the
+/// virtqueues are configured, to bring the device live.
 pub const STATUS_DRIVER_OK: u8 = 4;
+/// The driver has written the feature bits it accepts. Set after
+/// `set_driver_features`; if the device then clears it, the negotiated feature
+/// set is unacceptable and initialization must not continue.
 pub const STATUS_FEATURES_OK: u8 = 8;
+/// The device signals an unrecoverable internal error, or the driver sets it to
+/// give up on the device. Terminal: the device must be reset to recover.
 pub const STATUS_FAILED: u8 = 0x80;
 
 /// Access to one PCI function's 4 KiB configuration space, as mapped through
@@ -161,11 +173,22 @@ impl PciConfig {
 /// live in the same BAR (true for QEMU's modern virtio-net-pci).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VirtioCaps {
+    /// Index of the BAR that holds every virtio structure below. All the
+    /// offsets are relative to the mapped base of this one BAR.
     pub bar: u8,
+    /// Byte offset of the common configuration structure (device/driver status,
+    /// feature negotiation, and per-queue setup registers) within the BAR.
     pub common: u32,
+    /// Byte offset of the notification structure within the BAR. A queue's
+    /// doorbell sits at `notify + queue_notify_off * notify_multiplier`.
     pub notify: u32,
+    /// Multiplier that scales a queue's `notify_off` into a byte offset within
+    /// the notification structure (see [`notify_offset_bytes`]).
     pub notify_multiplier: u32,
+    /// Byte offset of the ISR status structure within the BAR.
     pub isr: u32,
+    /// Byte offset of the device-specific configuration structure within the
+    /// BAR (for virtio-net, the MAC address and status fields).
     pub device: u32,
 }
 
