@@ -130,8 +130,9 @@ single-producer/single-consumer queue protocol.
 Because Microkit's component model is **static**, the system's structure — every PD, memory
 region, capability, and hardware address (MMIO windows, DMA regions) — is fixed at build time in
 the system description rather than discovered at runtime. Hardware addressing is therefore a
-build-time pinning problem, not a runtime probing one, and adding structure (an interface, a zone)
-is a rebuild, not a live reconfiguration (§12.3).
+build-time pinning problem, not a runtime probing one, and adding *hardware* (another NIC) is a
+rebuild. Everything above the hardware — including whether a present interface is used at all — is
+runtime configuration (§12.3).
 
 ### 6.2 Two data paths
 
@@ -163,11 +164,42 @@ connected by zero-copy queues. Representative components:
 
 ### 6.4 Operating posture
 
-The appliance provides **routed-gateway operation**: it terminates the proxy path as an endpoint,
-provides routing/ARP/ICMP (§6.3), is placed as an upstream IT/OT gateway in OT contexts, and
-deploys as a routed Network Virtual Appliance on Azure (§9). Whether the on-premises inline
-appliance *also* operates as a transparent L2 bridge — and the resulting on-premises HA failover
-mechanism and HA-link split-brain handling — are open (§13.1).
+A dataplane port pair operates in one of **two modes**, selected by configuration:
+
+- **Routed gateway.** The appliance is an L3 hop: it holds addresses, provides routing/ARP/ICMP
+  (§6.3), performs address translation (§6.5), terminates the proxy path as an endpoint, and is
+  placed as an upstream IT/OT gateway in OT contexts. This is the mode Azure requires, where the
+  appliance is a routed Network Virtual Appliance (§9).
+- **Virtual wire (bump-in-the-wire).** The two ports of a pair are strictly bound to each other: the
+  appliance holds no address on the path and makes no forwarding decision, so everything arriving on
+  one port leaves on the other unless policy drops it. VLAN tags pass through untouched.
+
+Virtual wire exists because it is frequently the *only* deployable mode, above all in OT. An
+industrial network usually cannot be re-addressed, and inserting a routed hop splits the L2
+broadcast domain, which breaks the link-local discovery and control protocols those environments
+depend on (PROFINET DCP, LLDP, and similar). A bump-in-the-wire requires no change to any PLC, HMI,
+or engineering station. The same property makes it the way to retrofit inspection into an existing
+IT network without renumbering it.
+
+**A transparent learning bridge is deliberately out of scope.** MAC learning turns the appliance
+into a switch and brings loop, STP, and BPDU handling with it — switch concerns that add
+significant risk in an inline security device and, in an HA pair, a loop hazard. The strict
+port-pair binding of virtual wire delivers the transparency that matters without any of it.
+
+### 6.5 Address translation
+
+The appliance performs **NAT** on the routed path: source NAT (including masquerading behind an
+interface address), destination NAT (port forwarding), and static 1:1 mappings. NAT is not an
+independent stage but a property of a tracked flow, which imposes three couplings:
+
+- The translation binding **lives in the connection-tracking entry** (§6.3); creating a flow and
+  choosing its translation are one decision.
+- NAT bindings are part of the state **replicated for High Availability** (§10) — without them,
+  every translated session breaks on failover even though its flow state survived.
+- On the proxy path, the re-originated leg's tuple is already constrained so that RSS maps it to the
+  core owning the flow (§4). Translation must respect that constraint rather than compete with it.
+
+Virtual-wire mode performs no translation, by construction.
 
 ---
 
@@ -293,6 +325,11 @@ The **4-NIC HA configuration is the primary Azure target**; the **7-NIC configur
 hardware-appliance build**, which populates every role and simply leaves ports unused when a site
 needs fewer (no redundant pair, no mirror). A node without HA uses the 3-NIC configuration.
 
+Because hardware topology is static (§12.3), **each row is a build-time image variant**: the number
+of NICs a system drives is fixed in its system description. Which of those present ports a
+deployment actually uses, and in which role, is runtime configuration — an unused port is
+administratively disabled, not built out.
+
 ### 9.3 Targets and form factors
 
 **Targets:**
@@ -331,15 +368,23 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   failover. This is accepted as standard behavior.
 - A **dedicated HA link** carries heartbeat and delta/batched state synchronization.
 - The **HA state-sync component is its own isolated PD**.
-- **Each node holds its own isolated signing capability** (§7). How the pair shares signing trust
-  across nodes (e.g. per-node intermediate CAs under a common trusted root) is open (§13.1).
+- **Each node holds its own isolated signing capability** (§7). Sharing signing trust across the
+  pair is required; its form (e.g. per-node intermediate CAs under a common trusted root) is open
+  (§13.1).
 - **Configuration is applied in a staggered/canary order** across the pair (standby first, verified
   healthy, then active) — see §12.
-- Because the static component model requires a reboot for structural changes, **the HA pair also
-  serves as the mechanism for rolling structural/configuration changes** without downtime (§12.3).
-- The **on-premises HA failover mechanism and HA-link split-brain handling** are open (§13.1).
-- **Azure HA is platform-specific and constrained** (no L2 takeover; failover via load-balancer
-  health probes / route reprogramming); its specifics are deferred (§13.1).
+- Because hardware topology is static, a hardware change is an *image* change; **the HA pair is the
+  mechanism for rolling image updates** without downtime (§12.3, §14).
+- **Failover is mechanism-specific per environment**, because the takeover primitive differs:
+  - **Routed, on-premises** — the pair shares a virtual IP and virtual MAC; the promoted node takes
+    them over and announces the move with gratuitous ARP / unsolicited neighbour advertisements.
+  - **Virtual wire, on-premises** — there is no address to take over, so failover is by **link
+    state**: the standby holds its dataplane ports down and raises them on promotion, and loss of
+    one port of a pair is propagated to the other so the neighbouring devices reconverge.
+  - **Azure** — L2 takeover is impossible on the platform; failover is by withdrawing the node's
+    Gateway Load Balancer health probe and letting the platform reprogram routing to the survivor.
+- **Split-brain is arbitrated over the dedicated HA link.** The arbitration scheme (witness, quorum,
+  or fencing) is open (§13.1).
 
 ---
 
@@ -352,6 +397,7 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   |---|---|
   | `GET /metrics` | Metrics in Prometheus format |
   | `GET /config` | Read the current running configuration (XML) |
+  | `GET /logs` | Read the most recent structured log records held in the node's local buffer |
   | Configuration change | The candidate/commit-confirmed workflow of §12: submit a candidate, validate, commit (with commit-confirmed), confirm, and roll back to a previous version |
 
   Configuration is never changed by a single unqualified write; every change goes through the
@@ -369,6 +415,13 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   transport; syslog is not used. Audit logs (management/user actions), traffic logs, and
   per-subsystem logs are OTEL-only. System-state events (see *Console*) are additionally written to
   the console.
+- **Local log buffer:** the node retains a **bounded ring of its most recent structured log
+  records** and exposes it via `GET /logs`. External OTEL collection is routinely delayed by minutes
+  and can be unavailable outright, and there is no shell — so without this ring there is no way to
+  observe what a node is doing *now*, which is precisely what live debugging requires. It is a
+  debugging surface, not a log archive: bounded, deliberately lossy (overflow is dropped and
+  counted, and the drop count is exposed), and bound by the same rule as every other surface — no
+  payloads, secrets, or personal data.
 - **Console:** carries **system state only** — the startup sequence and its success/failure, and
   runtime configuration changes (an interface brought up, a MAC reconfigured, a config version
   applied). It never carries traffic or per-request data. It is the last-resort survivability
@@ -376,10 +429,11 @@ Azure support is a substantial platform effort rather than a single NIC driver �
 - **No distributed tracing.** OpenTelemetry is used for structured logs only; tracing — including
   of the management API — is deliberately out of scope.
 - **The exposed interfaces are the complete debug surface.** There is no shell, no CLI, and no
-  other introspection mechanism. Scraping `GET /metrics` and reading `GET /config` once yields the
-  entire observable state of a node — applied configuration plus every metric around it — which is,
-  by design, all that is available to debug it. The externalized logs and metrics are therefore a
-  first-class operator contract, specified in **MONITORING.md**.
+  other introspection mechanism. Scraping `GET /metrics`, reading `GET /config`, and tailing
+  `GET /logs` once yields the entire observable state of a node — applied configuration, every
+  metric around it, and what it has just been doing — which is, by design, all that is available to
+  debug it. The externalized logs and metrics are therefore a first-class operator contract,
+  specified in **MONITORING.md**.
 - **Management application:** configuration management, log analysis, and metric analysis are
   handled by a separate management application, developed later.
 
@@ -438,13 +492,33 @@ rollout is a **two-phase "stage & validate" → "commit"** process:
 
 **Central configuration management** for multiple clusters is developed later.
 
-### 12.3 Structural vs. runtime changes
+### 12.3 Static hardware, dynamic configuration
 
-Runtime-mutable policy (e.g. filtering rules and routes) is changed through the commit workflow
-without a restart. Structural changes (e.g. adding network interfaces or zones, which change the
-static component layout) require a reboot, performed as a rolling reboot across the HA pair (§10).
-The precise boundary between runtime-mutable and structural changes, and how commit-confirmed
-rollback applies to a reboot-requiring change, are open (§13.1).
+The line between what needs a new image and what is applied at runtime is drawn at **hardware**:
+
+- **Hardware topology is static.** The set of physical devices the system drives — the NICs and
+  their PCI addressing, and the protection domains, memory regions, and capabilities that follow
+  from them — is fixed in the Microkit system description at build time (§6.1). Changing it (adding
+  a NIC, moving to a different NIC count) is a **different image**, delivered through the A/B update
+  mechanism (§14). Hardware reconfiguration of a running system is not supported; each hardware
+  configuration of §9.2 is a build-time image variant.
+- **Everything above the hardware is dynamic.** Interface configuration and upwards is applied
+  through the commit workflow without a restart: whether a present interface is used at all, its
+  role, mode (§6.4) and addressing, zones, filtering rules, routes, NAT bindings, inspection policy,
+  and every other policy object. A port a deployment does not need is administratively disabled by
+  configuration, not omitted from a build.
+
+Two consequences follow, and both simplify the design:
+
+- **A configuration change never requires a reboot.** Commit-confirmed (§12.1) therefore always
+  operates within one running system, and its rollback timer never has to survive a restart.
+- **A hardware change is an image change**, so it is governed by the A/B slot mechanism's own
+  try/confirm/fallback semantics (§14.2) rather than by the configuration workflow. The two
+  mechanisms stay separate and each keeps its own safety property intact.
+
+The dataplane components are built to be **data-driven at runtime** to make this hold: the
+classifier, filter, routing, and NAT stages carry no compiled-in topology or policy, so one image
+built for a given hardware configuration serves every deployment sharing that hardware.
 
 ---
 
@@ -455,22 +529,16 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 
 ### 13.1 Open decisions
 
-- **Onboarding process** for issuing the management mTLS certificate pair.
+- **Onboarding process** for issuing the management mTLS certificate pair — required; its design is
+  open.
 - **TLS crypto provider** for rustls (pure-Rust vs. an external provider), to be resolved by
   benchmarking.
-- **CA signing-trust sharing across HA nodes** — e.g. per-node intermediate CAs under a common
-  trusted root.
-- **On-premises HA failover mechanism**, and **HA-link split-brain handling**.
-- **Azure HA specifics** (platform-specific failover mechanism).
-- **Transparent L2 bridge operation** — whether the on-premises inline appliance operates as a
-  transparent bridge in addition to routed-gateway operation.
+- **CA signing-trust sharing across HA nodes** — required; the form (e.g. per-node intermediate CAs
+  under a common trusted root) is open.
+- **HA-link split-brain arbitration** — witness, quorum, or fencing (§10).
 - **Trusted time source mechanism** (§7).
-- **NAT** — whether it is provided.
-- **Local log persistence/buffering** when the external log receiver is unavailable.
 - **Proxy vs. cut-through throughput split** — the proportion of traffic on the terminating proxy
   path, which drives core sizing (§4).
-- **Structural vs. runtime change boundary** — the precise set of changes that require a reboot,
-  and commit-confirmed behavior across a reboot-requiring change (§12.3).
 - **Central configuration management application** (multi-cluster) — built later.
 
 ### 13.2 Known risks
@@ -497,8 +565,9 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 ## 14. Software Update & Secure Boot
 
 The appliance updates as a **whole signed system image using two A/B slots**, not by patching a
-running system. This suits the static Microkit component model (structural change requires a
-reboot) and gives an automatic, power-fail-safe path back to the last known-good software.
+running system. This suits the static Microkit component model — where the hardware topology is
+fixed at build time, so a hardware change is a new image (§12.3) — and gives an automatic,
+power-fail-safe path back to the last known-good software.
 
 ### 14.1 On-disk layout
 

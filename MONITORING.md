@@ -13,7 +13,7 @@ stable contract.
 > implemented yet”* states the current truth, not a gap in this contract. Any change to an exposed
 > signal updates this document in the same change (AGENTS.md).
 
-## The three surfaces, and the complete-state principle
+## The four surfaces, and the complete-state principle
 
 - **Console** — a last-resort, human-readable channel carrying **system state only**. It exists so a
   node whose log streaming is down can still be diagnosed. It never carries traffic or per-request
@@ -21,13 +21,18 @@ stable contract.
 - **OpenTelemetry logs** — the structured log stream to an external receiver. Everything the console
   says is also emitted here, plus audit, traffic, and per-subsystem logs. This is the only log
   transport; there is no syslog. There is no distributed tracing.
+- **Local log buffer** — a bounded, on-node ring of the most recent structured log records, read
+  through `GET /logs`. It is the *live* view: external OTEL collection is routinely delayed by
+  minutes and can be down entirely, and there is no shell, so this is the only way to see what a
+  node is doing right now.
 - **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
   measurable moving part at bounded cardinality and no measurable dataplane cost.
 
-**Complete-state principle.** Scraping `GET /metrics` and reading `GET /config` **once** yields the
-entire observable state of a node: the exact configuration in force plus every metric around it.
-That pair *is* the debug dump — there is deliberately no other mechanism to extract state, so the
-two endpoints together are designed to be sufficient to diagnose the system.
+**Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, and tailing
+`GET /logs` **once** yields the entire observable state of a node: the exact configuration in force,
+every metric around it, and what it has just been doing. That triple *is* the debug dump — there is
+deliberately no other mechanism to extract state, so those endpoints together are designed to be
+sufficient to diagnose the system.
 
 ## Conventions (binding)
 
@@ -36,7 +41,7 @@ These apply to every signal and are the rules an operator can depend on.
 ### Identity and context
 
 Every signal is attributable to a node and a configuration. The common context carried across all
-three surfaces (as OTEL resource/log attributes, Prometheus labels, and console prefixes) is
+four surfaces (as OTEL resource/log attributes, Prometheus labels, and console prefixes) is
 finalized with the first implementation and documented here; at minimum it identifies the **node
 identity**, the **software build and trust profile**, and the **configuration generation** in force.
 
@@ -88,6 +93,28 @@ fixed with the implementation and documented here.
 
 **Record inventory:** *None implemented yet* — populated per category as logging is implemented.
 
+## Local log buffer
+
+**Purpose:** answer "what is this node doing *right now*" without waiting on the external log
+pipeline, and keep a node diagnosable when that pipeline is unavailable.
+
+**Endpoint:** `GET /logs` on the management interface, returning the retained records in the same
+structured form as the OTEL stream.
+
+**Semantics — a debugging surface, not a log archive:**
+
+- **Bounded.** The buffer holds a fixed number of records in a fixed amount of memory; retention is
+  whatever that bound yields, never a duration guarantee.
+- **Lossy by design.** When it wraps, the oldest records are dropped. Drops are **counted and
+  exposed as a metric**, so a reader can always tell whether it is seeing a complete window.
+- **Not the system of record.** The OTEL stream remains the durable, complete log; this ring is a
+  recent-history cache and may legitimately hold less.
+- **Same content rules as every other surface.** No packet payloads, no secrets or keys, no personal
+  data — being local is not a licence to retain more.
+
+**Record and retention inventory:** *None implemented yet* — the buffer size, retention bound, and
+query semantics are fixed with the implementation and documented here.
+
 ## Prometheus metrics
 
 **Purpose:** expose every moving part of the firewall for monitoring and for the state half of the
@@ -96,15 +123,16 @@ debug dump, scrapably and without degrading the dataplane.
 **Endpoint:** `GET /metrics`, Prometheus exposition format, on the management interface.
 
 **Coverage intent:** every internal queue, buffer pool, and ring; per-NIC and per-core counters;
-dataplane verdict and throughput counters; connection/flow-table occupancy and limits; and the
-applied-configuration state reflected as metrics. Instrumentation is bounded-cardinality and
-allocation-free on the hot path.
+dataplane verdict and throughput counters; connection/flow-table occupancy and limits; the local log
+buffer's occupancy and drop count; and the applied-configuration state reflected as metrics.
+Instrumentation is bounded-cardinality and allocation-free on the hot path.
 
 **Metric inventory:** *None implemented yet* — populated per subsystem as metrics are implemented,
 each with its type, unit, labels, and meaning.
 
 ## Configuration read endpoint
 
-`GET /config` returns the exact running configuration (XML; CONCEPT.md §11–§12). It is the other
-half of the debug dump: paired with a `/metrics` scrape it gives the complete picture of *what the
-node is configured to do* alongside *what it is doing*.
+`GET /config` returns the exact running configuration (XML; CONCEPT.md §11–§12). It supplies the
+intent half of the debug dump: paired with a `/metrics` scrape and a `/logs` read it gives the
+complete picture of *what the node is configured to do* alongside *what it is doing* and *what it
+has just done*.
