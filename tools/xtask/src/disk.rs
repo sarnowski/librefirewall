@@ -23,9 +23,12 @@ use crate::{
 const SECTORS_PER_MIB: u64 = 2048;
 const DISK_SIZE_MIB: u64 = 128;
 
-/// The GPT layout of the deployable disk. `SLOT_A` and `SLOT_B` are the two
+/// The GPT layout of the deployable disk. `SLOTA` and `SLOTB` are the two
 /// software slots; `STATE` carries the mutable boot-selection env; `DATA` is
-/// reserved for configuration and secrets and is left unformatted for now.
+/// reserved for configuration and secrets (CONCEPT §14.1) and is deliberately
+/// left as a bare GPT partition with no filesystem — no in-system component
+/// maps it yet, so [`write_disk`] lays down its partition entry but writes no
+/// image into it.
 struct Partition {
     number: usize,
     label: &'static str,
@@ -101,7 +104,7 @@ pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<St
     let state = parts.join("state.img");
     make_fat(&state, part("STATE").size_mib, None, "STATE")?;
     let grubenv = build.join("grubenv");
-    grub::seed_grubenv(root, &grubenv)?;
+    grub::seed_grubenv(&grubenv)?;
     mcopy(&state, &grubenv, "::/grubenv")?;
 
     let kernel_sig = build.join("sel4_32.elf.sig");
@@ -120,8 +123,8 @@ pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<St
         }
     }
 
-    let data = parts.join("data.img");
-    make_fat(&data, part("DATA").size_mib, None, "DATA")?;
+    // DATA gets a GPT entry (in write_disk) but no filesystem: it is reserved
+    // and stays unformatted until an in-system consumer owns it.
 
     let disk = dist.join(DIST_DISK);
     write_disk(&disk, &parts)?;
@@ -192,6 +195,7 @@ fn write_disk(disk: &Path, parts: &Path) -> Result<(), String> {
     run_command(&mut sgdisk, "write GPT")?;
 
     for partition in PARTITIONS {
+        // DATA is reserved and unformatted: it has a GPT entry but no image.
         if partition.label == "DATA" {
             continue;
         }

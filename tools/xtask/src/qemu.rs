@@ -133,16 +133,17 @@ pub(crate) fn qemu_base(root: &Path, serial: &str, disk: &Path) -> Result<Comman
     Ok(command)
 }
 
+/// Linux `O_CLOEXEC`, defined here rather than depending on the `libc` crate so
+/// xtask stays zero-dependency. Used only to probe `/dev/kvm`; the flag keeps
+/// the probe's file descriptor from leaking into the QEMU child across exec.
+const O_CLOEXEC: i32 = 0o2000000;
+
 fn is_writable(path: &Path) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc_o_cloexec())
+        .custom_flags(O_CLOEXEC)
         .open(path)
         .is_ok()
-}
-
-fn libc_o_cloexec() -> i32 {
-    0o2000000
 }

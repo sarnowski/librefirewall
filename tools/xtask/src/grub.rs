@@ -40,7 +40,7 @@ pub(crate) fn build_grub_efi(root: &Path, pubkey: &Path, output: &Path) -> Resul
 /// Seed the initial boot-selection env: slot A confirmed, B staged but
 /// unconfirmed, A tried first. This is the state the freshly built base image
 /// ships with; the A/B harness and (later) the update PD rewrite it.
-pub(crate) fn seed_grubenv(root: &Path, grubenv: &Path) -> Result<(), String> {
+pub(crate) fn seed_grubenv(grubenv: &Path) -> Result<(), String> {
     run_command(
         Command::new("grub-editenv").arg(grubenv).arg("create"),
         "create grubenv",
@@ -55,7 +55,5 @@ pub(crate) fn seed_grubenv(root: &Path, grubenv: &Path) -> Result<(), String> {
             .arg("B_OK=0")
             .arg("B_TRY=0"),
         "seed grubenv",
-    )?;
-    let _ = root;
-    Ok(())
+    )
 }
