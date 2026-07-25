@@ -145,6 +145,9 @@ COPY crates/nic-driver-core/Cargo.toml /tmp/workspace/crates/nic-driver-core/Car
 COPY pds/nic-driver/Cargo.toml /tmp/workspace/pds/nic-driver/Cargo.toml
 COPY pds/forwarder/Cargo.toml /tmp/workspace/pds/forwarder/Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
+# The out-of-workspace fuzz crate (its own `[workspace]`) resolves separately;
+# its manifest and lockfile warm its libFuzzer/arbitrary dependency tree.
+COPY fuzz/Cargo.toml fuzz/Cargo.lock /tmp/workspace/fuzz/
 
 RUN --mount=type=secret,id=gropyus_ca,required=false \
     set -eu; \
@@ -166,7 +169,11 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       mkdir -p "$(dirname "$bench")"; \
       : > "$bench.rs"; \
     done; \
+    mkdir -p fuzz/fuzz_targets; \
+    : > fuzz/fuzz_targets/find_virtio_caps.rs; \
+    : > fuzz/fuzz_targets/virtqueue_poll.rs; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked; \
+    SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path fuzz/Cargo.toml; \
     sysroot="$(rustc --print sysroot)/lib/rustlib/src/rust/library/sysroot/Cargo.toml"; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path "$sysroot"; \
     chmod -R a+rX /opt/rust/cargo/registry; \

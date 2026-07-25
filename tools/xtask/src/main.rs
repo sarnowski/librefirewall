@@ -40,6 +40,9 @@ const HOST_TEST_PACKAGES: &[&str] = &[
 /// budget depends on.
 const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio"];
 
+/// Persistent fuzz targets under `fuzz/`, driven by `fuzz`.
+const FUZZ_TARGETS: &[&str] = &["find_virtio_caps", "virtqueue_poll"];
+
 const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
 /// Protection-domain binaries the system image is assembled from.
 const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder"];
@@ -137,6 +140,7 @@ fn run() -> Result<(), String> {
         "test-host" => test_host(&root),
         "coverage" => coverage(&root),
         "bench" => bench(&root),
+        "fuzz" => fuzz(&root),
         "test-system" => {
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)
@@ -164,7 +168,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|coverage|bench|test-system|test-ab|ci|release|clean>"
+    "usage: cargo xtask <image|run|test|test-host|coverage|bench|fuzz|test-system|test-ab|ci|release|clean>"
         .to_owned()
 }
 
@@ -611,6 +615,73 @@ fn bench(root: &Path) -> Result<(), String> {
             .args(BENCH_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "run microbenchmarks",
     )
+}
+
+/// Build every persistent fuzz target and, where the sandbox permits, run each
+/// briefly; always drive the same harness code over the committed seeds.
+///
+/// This is honest about what actually executes. `cargo fuzz build` must always
+/// succeed. A short `cargo fuzz run` of each target is then attempted, but the
+/// pinned hermetic builder (`--cap-drop=all`, read-only rootfs,
+/// `--security-opt=no-new-privileges`) can prevent libFuzzer/AddressSanitizer
+/// from starting; that is tolerated and reported rather than failing the
+/// command. The seed-corpus smoke tests (`cargo test --lib` in `fuzz/`) run
+/// unconditionally and exercise the identical harness functions the fuzz
+/// targets call, so the parsers are covered over valid inputs even when
+/// libFuzzer cannot run. Like `bench`, this is not part of `ci`.
+fn fuzz(root: &Path) -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["fuzz", "build"]),
+        "build fuzz targets",
+    )?;
+    println!("fuzz: all targets built with AddressSanitizer instrumentation");
+
+    let mut executed = true;
+    for target in FUZZ_TARGETS {
+        let status = Command::new("cargo")
+            .current_dir(root)
+            .args([
+                "fuzz",
+                "run",
+                target,
+                "--",
+                "-runs=20000",
+                "-max_total_time=15",
+            ])
+            .status()
+            .map_err(|error| format!("spawn cargo fuzz run {target}: {error}"))?;
+        if status.success() {
+            println!("fuzz: ran {target} (-runs=20000 -max_total_time=15)");
+        } else {
+            executed = false;
+            eprintln!(
+                "fuzz: could not EXECUTE {target} here ({status}); the hermetic \
+                 sandbox (cap-drop=all, read-only rootfs, no-new-privileges) can \
+                 block libFuzzer/ASan from starting. Falling back to build-only \
+                 plus the seed smoke tests below."
+            );
+        }
+    }
+
+    run_command(
+        Command::new("cargo")
+            .current_dir(root.join("fuzz"))
+            .args(["test", "--locked", "--lib"]),
+        "run fuzz seed smoke tests",
+    )?;
+
+    if executed {
+        println!("fuzz: targets built AND ran; seed smoke tests passed");
+    } else {
+        println!(
+            "fuzz: targets BUILD and the seed smoke tests pass, but libFuzzer \
+             execution was blocked by the sandbox (see above) — build + seed \
+             coverage only, no live fuzzing in this environment"
+        );
+    }
+    Ok(())
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system

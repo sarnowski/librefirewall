@@ -1,0 +1,39 @@
+[package]
+name = "librefirewall-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A standalone workspace: the fuzz crate is deliberately NOT a member of the
+# main workspace, so its libFuzzer/ASan build settings and its dependency tree
+# (libfuzzer-sys and its bundled runtime) never affect the `no_std` PD builds.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.9"
+arbitrary = "1.4.1"
+virtio = { path = "../crates/virtio" }
+
+# The harness bodies live in a small library so the same code is exercised both
+# by the libFuzzer binaries below and by the seed-corpus smoke tests (run with
+# `cargo test --lib`) where the sandbox cannot execute libFuzzer.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "find_virtio_caps"
+path = "fuzz_targets/find_virtio_caps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtqueue_poll"
+path = "fuzz_targets/virtqueue_poll.rs"
+test = false
+doc = false
+bench = false
