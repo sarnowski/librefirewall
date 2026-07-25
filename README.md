@@ -38,35 +38,231 @@ authority, and operational resilience without compromising dataplane performance
 ## Project status
 
 This section is the single source of truth for what works today. The target picture in CONCEPT.md
-is deliberately larger than the current implementation.
+is deliberately larger than the current implementation. Statuses are **done**, **partial**, or
+**open**; every *partial* capability is broken down further below into what exists and what remains,
+so the work can be picked up without re-deriving it from the code.
+
+**The current deployable system** is a two-dataplane-port zero-copy forwarding slice — the milestone
+the build actually produces today, not a synthetic demo: one virtio-net driver protection domain per
+port brings up a modern `virtio-net-pci` device on QEMU q35 from static seL4 capabilities alone, and
+an isolated forwarder protection domain — the seat where the classifier and filter shards will later
+run — moves frames between the two ports without copying. A frame cycles
+`NIC0 → driver0 → forwarder → driver1 → NIC1` by transferring buffer *ownership* through lock-free
+single-producer/single-consumer queues; its bytes are never copied and are owned by exactly one side
+at a time. The reusable logic lives in host-tested `no_std` crates (`crates/`); the
+protection-domain binaries (`pds/`) are thin adapters.
+
+There is, as yet, **no packet parsing of any kind** — not even Ethernet. Frames are opaque
+`(buffer, offset, length)` spans that are never interpreted; the only header the code understands is
+virtio-net's 12-byte device transport header, and only as a length to skip. What exists is a
+transport substrate for a firewall, not yet a firewall.
+
+### Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
-| Hermetic, pinned build → signed A/B disk image | **done** | reproducibility check available (`make verify-reproducible`); not yet a CI gate |
-| Signature-enforced UEFI boot (OVMF → GRUB → Multiboot2 → seL4/Microkit) | **done** | development signing keys; UEFI Secure Boot not yet enrolled (CONCEPT §14.5) |
-| A/B slot selection state machine (`OK`/`TRY`/`ORDER`) with fallback | **done** | in-system health-confirmation PD not built; the test harness seeds `grubenv` |
-| First-party virtio-net driver (virtio 1.0 PCI bring-up, Rx + Tx) | **partial** | polls (no MSI-X/INTx); no real-hardware BAR discovery; no VT-d DMA confinement; no MAC read-out; no offloads |
-| Zero-copy forwarding dataplane (SPSC queues, packet-buffer ownership) | **partial** | one dataplane pair on QEMU; no management / session-replication / mirror ports; the forwarder has no classifier or filter stages yet |
-| Untrusted device / peer hardening | **partial** | device-distrust in the driver; peer-distrust (byzantine-neighbour containment) is incomplete and tracked |
-| SBOM (SPDX 2.3), release manifest, checksums | **done** | build provenance planned |
-| QEMU end-to-end gate (byte-identical forwarding, A/B scenarios) | **done** | single vCPU; no management-NIC / multi-core machine yet |
-| Test framework (unit · property · fuzz · bench · QEMU E2E) | **done** | unit + property tests, an enforced library coverage floor, lint (`clippy -D warnings`, `missing_docs`) and dependency (`cargo-deny`) gates, criterion benches, and the QEMU E2E gate are all in place; fuzz targets are built and briefly exercised in `make ci`; the virtual multi-node network E2E is still planned |
-| Stateful L2–L4 filtering, routing, connection tracking | **planned** | |
-| TLS/QUIC termination proxy, L7 parsing, DPI, content scanning | **planned** | |
-| Management API, XML config, candidate/commit-confirm transactions | **planned** | |
-| Observability: console system-state, OTEL logs, Prometheus metrics | **planned** | conventions fixed in MONITORING.md; only ad-hoc serial markers exist today |
-| High availability, session replication, multi-core / RSS flow shards | **planned** | |
-| Release-config boot test, UEFI Secure Boot, TPM anti-rollback | **planned** | |
-| Additional NIC drivers (ixgbe SFP+, Azure netvsc/MANA) | **planned** | |
+| Stateful L2–L4 filtering and connection tracking | **open** | |
+| Routing, ARP, ICMP | **open** | |
+| Virtual-wire (bump-in-the-wire) operation | **open** | CONCEPT §6.4; maps directly onto today's port-pair relay |
+| NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | CONCEPT §6.5; binding lives in the conntrack entry |
+| Flow classifier (cut-through vs. proxy path) | **open** | the forwarder PD is the seat reserved for it |
+| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **open** | |
+| OT/industrial protocol inspection | **open** | |
+| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
+| Mirror port | **open** | |
+| TLS termination and re-origination | **open** | |
+| QUIC / HTTP-3 termination | **open** | |
+| Isolated sign-only CA protection domain | **open** | |
+| Trusted time source | **open** | |
+| Streaming DPI / signature matching | **open** | |
+| Full-object content scanning (YARA-X) | **open** | |
+| Web filtering | **open** | |
 
-**The current deployable system** is a two-dataplane-port zero-copy forwarding slice — the milestone
-the build actually produces today, not a synthetic demo: one virtio-net driver protection domain per port brings up a modern
-`virtio-net-pci` device on QEMU q35 from static seL4 capabilities alone, and an isolated forwarder
-protection domain — the seat where the classifier and filter shards will later run — moves frames
-between the two ports without copying. A frame cycles `NIC0 → driver0 → forwarder → driver1 → NIC1`
-by transferring buffer *ownership* through lock-free single-producer/single-consumer queues; its
-bytes are never copied and are owned by exactly one side at a time. The reusable logic lives in
-host-tested `no_std` crates (`crates/`); the protection-domain binaries (`pds/`) are thin adapters.
+### Dataplane, platform and hardware
+
+| Capability | Status | Notes |
+|---|---|---|
+| Zero-copy shared-memory dataplane | **partial** | [detail](#zero-copy-dataplane) |
+| First-party virtio-net driver | **partial** | [detail](#virtio-net-driver) |
+| Multicore dataplane, RSS, per-core flow shards | **open** | single vCPU today |
+| Proxy TCP stack (smoltcp, SACK) | **open** | |
+| 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
+| IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
+| Full port role model (management, session-replication, mirror, multiple pairs) | **open** | two dataplane ports exist; no other role |
+| Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
+| ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
+| Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
+| Proxmox and bare-metal targets | **open** | QEMU only |
+
+### High availability
+
+| Capability | Status | Notes |
+|---|---|---|
+| Active/passive pair, failover | **open** | per-environment mechanisms settled in CONCEPT §10 |
+| Batched session-state replication | **open** | |
+| Isolated HA state-sync protection domain | **open** | |
+
+### Management, configuration and observability
+
+| Capability | Status | Notes |
+|---|---|---|
+| Management HTTP API over mTLS | **open** | |
+| Schema-validated XML configuration, hardened validator PD | **open** | |
+| Candidate/commit-confirm transactions, versioning, rollback | **open** | |
+| Distributed staged rollout across the pair | **open** | |
+| Console system-state events | **open** | 8 ad-hoc serial markers exist; not the MONITORING.md contract |
+| OpenTelemetry structured logs | **open** | |
+| Prometheus `/metrics` | **open** | groundwork only: three drop counters in `nic-driver-core` |
+| Local log buffer (`GET /logs`) | **open** | |
+
+### Lifecycle, boot and trust
+
+| Capability | Status | Notes |
+|---|---|---|
+| Signed A/B disk image and slot selection | **partial** | [detail](#ab-image-update) |
+| Signature-enforced boot chain (OVMF → GRUB → Multiboot2 → seL4) | **partial** | [detail](#signed-boot-chain) |
+| In-system update/health protection domain | **open** | nothing inside seL4 can write boot state |
+| UEFI Secure Boot enrolment | **open** | manifest records `secure_boot: false` |
+| TPM-backed anti-rollback | **open** | no TPM anywhere, including the QEMU harness |
+
+### Architecture and assurance
+
+| Capability | Status | Notes |
+|---|---|---|
+| Pure-Rust userspace | **done** | the only C is the seL4 kernel and its boot chain |
+| Least-privilege PD decomposition | **partial** | [detail](#protection-domain-decomposition) |
+| Untrusted-device hardening | **done** | adversarial device fixtures and two fuzz targets |
+| Untrusted-peer (byzantine neighbour) containment | **partial** | [detail](#untrusted-peer-containment) |
+| PD fault handling and restart | **open** | every failure path is a panic |
+
+## Partial capabilities in detail
+
+What each partial capability already has, and what specifically remains to finish it.
+
+### Zero-copy dataplane
+
+**Done.** `crates/queue` provides the lock-free SPSC ring, with every cursor read back from shared
+memory masked into range so a hostile peer cannot index out of bounds. `crates/packet-buffer`
+provides the shared pool and the owner-side LIFO free list; `crates/wire` fixes the 12-byte
+`Descriptor` ABI with static layout assertions; `crates/pd-runtime` composes them into the
+`Pipeline` (rx/tx/free rings plus pool in one 256 KiB region) and the buffer-ownership protocol.
+Correctness is held by model-based property tests and a 500,000-frame three-thread pipeline test,
+and end-to-end by byte-identical bidirectional forwarding in QEMU.
+
+**Missing.**
+
+- No batching API — one descriptor per call, and one notification per drain. CONCEPT §6.1's
+  batched notifications are incidental today, not designed.
+- Pool is 64 buffers of 2048 bytes; orders of magnitude short of a 10 Gbit/s working set.
+- Fixed 2048-byte buffers: no jumbo frames, no scatter-gather, no descriptor chaining.
+- Exactly two pipelines, hard-coded in the forwarder PD. No per-core sharding, no multi-queue.
+- No backpressure policy beyond releasing the buffer, and over-return panics rather than dropping.
+
+### virtio-net driver
+
+**Done.** A from-scratch modern virtio 1.0 PCI transport in `crates/virtio`: capability-list walk
+with a loop guard, BAR relocation, feature negotiation, queue programming and doorbells, covered by
+27 unit tests of which 11 are malformed-configuration-space cases. A split-virtqueue driver half
+with a bounded poll loop and rejection of out-of-range completions. Steady-state Rx/Tx in
+`crates/nic-driver-core` with device-reported length clamping, runt-frame drop, rejection of
+not-outstanding completions, and validation of every peer transmit descriptor. Two persistent fuzz
+targets, both aimed at the untrusted device.
+
+**Missing.**
+
+- **Interrupts.** Busy-poll only — no MSI-X, no INTx (deliberate for this milestone). The ISR
+  structure is discovered and bounds-checked but never read. This burns a core per port.
+- **Real hardware.** No PCI enumeration: the BDF and the BAR physical address are pinned in the
+  system description, so the driver cannot bind a device it was not built for.
+- **DMA confinement.** Bus-master DMA is enabled unconditionally against fixed physical addresses;
+  no VT-d.
+- **Offloads.** No checksum offload, TSO/GSO, or mergeable receive buffers — prerequisites for
+  10 Gbit/s.
+- No control virtqueue, no multi-queue, no link-status handling, no MAC read-out despite
+  negotiating `VIRTIO_NET_F_MAC`.
+- No packed virtqueue and no MMIO transport (PCI only).
+- Every bring-up failure is an `assert!`; `STATUS_FAILED` is defined but never used, so there is no
+  graceful failure path back to the device and no restart.
+
+### Protection-domain decomposition
+
+**Done.** Three protection domains (one forwarder, two driver instances of one binary) with real,
+verifiable least privilege: the forwarder holds no device capability at all, and each driver sees
+only its own ECAM page, BAR, virtqueue region, and its two pipelines. Two notification channels,
+zero IRQs. The capability grant is machine-checkable in the generated Microkit report shipped with
+every build.
+
+**Missing.** Roughly one of the fourteen component classes in CONCEPT §6.3 exists. Absent: Rx/Tx
+virtualisers, classifier, filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7
+parsers, DPI engine, content scanner, CA signing PD, management API PD, configuration validator PD,
+HA state-sync PD, and the update/health PD. There is no fault handler and no PD restart, one system
+description, and no SMP variant.
+
+### Untrusted-peer containment
+
+**Done.** Descriptors from a peer are range-validated before use (`descriptor_in_bounds`, plus the
+transmit-header room check); ring cursors are masked so a hostile peer cannot drive an out-of-bounds
+slot access; a forged buffer index is dropped without being returned to the pool.
+
+**Missing — and this is a stated deviation from CONCEPT §7.1**, documented in the `pd-runtime` crate
+header. Buffer ownership is accounted **by count, not against an outstanding set**, so a peer that
+returns more descriptors than it was handed — duplicates or forged indices — is not contained. The
+pool owner currently fails visibly: `Producer::release`, `forward`, and `return_buffer` **panic** on
+the resulting overflow, and short of overflow a duplicate return silently double-owns a buffer. A
+byzantine neighbour can therefore crash a well-behaved PD, which the threat model says it must not.
+Closing it needs a per-buffer outstanding-set ledger, drop-and-count in place of the panics, and a
+PD fault/restart story to land alongside.
+
+### A/B image update
+
+**Done.** A GPT disk with ESP, STATE, SLOT_A, SLOT_B and DATA partitions; both slots carry a signed
+kernel and system image. GRUB is built from pinned source as a standalone EFI binary with an
+embedded public key, so it *enforces* detached-signature verification on everything it loads. The
+`OK`/`TRY`/`ORDER` selection scheme is implemented and covered by five QEMU scenarios —
+confirmed-A, try-pending-B, fallback-from-broken-B, skip-exhausted-B, confirmed-B — each of which
+also runs the full forwarding assertion, so "booted healthy" means real frames moved.
+
+**Missing.**
+
+- **The in-system update/health PD.** No component inside seL4 holds a disk capability, so the
+  health flag (`*_OK`) is only ever set by the build seed or the test harness. The confirm half of
+  the try/confirm cycle does not exist at runtime.
+- No staged installation into the inactive slot.
+- No multi-attempt counter (GRUB is single-attempt by design; the counter belongs to the missing PD).
+- No redundant, torn-write-safe boot state — a single `grubenv` block.
+- The DATA partition, where configuration, identity and secrets are meant to live, is an empty
+  unformatted GPT entry with no consumer and no encryption.
+- The release-configuration image is assembled but never booted or tested.
+
+### Signed boot chain
+
+**Done.** OVMF → GRUB → Multiboot2 → seL4/Microkit with enforced payload signature verification;
+the corrupt-signature fallback path is proven by test. A throwaway development key is generated per
+checkout and never committed, and the release manifest records `trust_profile: development` with the
+key fingerprint so a development-signed image cannot be mistaken for a production one.
+
+**Missing.** UEFI Secure Boot is not enrolled — the manifest hard-codes `secure_boot: false`, and
+`BOOTX64.EFI` itself is unsigned in the Authenticode sense (no shim, MOK, or PK/KEK/db hierarchy).
+There is no TPM anywhere: no vTPM in the QEMU harness, no measured boot, no PCR policy, and no
+anti-rollback epoch. Production key management (HSM-backed signing) does not exist.
+
+## Engineering foundations
+
+Not product features, but the machinery every feature above lands through — and where most of what
+is *done* currently sits.
+
+| Foundation | Status | Notes |
+|---|---|---|
+| Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
+| Host gate: format, Clippy `-D warnings`, `missing_docs`, unit + property tests | **done** | run by the pre-commit hook |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured ~98% |
+| QEMU end-to-end gate (byte-identical forwarding, A/B scenarios) | **partial** | single vCPU, two ports, debug configuration only; the multi-node virtual-network E2E is open |
+| Criterion benchmarks | **done** | present as a layer beside the code they measure |
+| Fuzzing | **partial** | two persistent targets, both device-facing; no traffic-facing target exists because no traffic parser does |
+| SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation |
+| Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image; not a CI gate |
+| Dependency and license policy (`cargo-deny`) | **partial** | `bans licenses sources` are gated; `advisories` runs nowhere, so there is no vulnerability scanning |
+| Build input pinning | **partial** | apt packages — including QEMU and OVMF — are constrained only by snapshot date, not by checksum |
 
 ## Build and test
 
