@@ -43,6 +43,14 @@ const LIBRARY_PACKAGES: &[&str] = &[
 /// flaky. Raise it as coverage rises; never lower it to land a change.
 const LIBRARY_COVERAGE_FLOOR_PCT: u32 = 94;
 
+/// Minimum line coverage EACH library crate must hold on its own. The combined
+/// floor alone lets one crate regress heavily while the high-coverage crates
+/// keep the total above [`LIBRARY_COVERAGE_FLOOR_PCT`]; this per-crate floor
+/// closes that gap. Set a few points below the current per-crate minimum
+/// (pd-runtime ~94%) so it is a real, non-flaky floor; raise it as the weakest
+/// crate rises, never lower it to land a change.
+const LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT: u32 = 90;
+
 /// Crates carrying criterion microbenchmarks, run by `bench`. These are the
 /// perf-sensitive dataplane substrate crates whose hot operations the 10 Gbit/s
 /// budget depends on.
@@ -82,18 +90,46 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .args(["deny", "check", "bans", "licenses", "sources"]),
         "check dependency policy",
     )?;
-    // Enforce the library-crate coverage floor: re-run the library tests under
-    // instrumentation and fail if combined line coverage drops below the floor,
-    // so a coverage regression is caught here and in CI, not merely measurable.
+    enforce_coverage(root)
+}
+
+/// Enforce the library coverage floors: the combined floor across all six
+/// [`LIBRARY_PACKAGES`] AND a per-crate floor on each one, so a regression
+/// concentrated in a single crate cannot hide behind the high-coverage crates.
+///
+/// The library tests are instrumented once with `--no-report`; the combined and
+/// per-crate reports then read that one profile, so the extra checks add report
+/// generation, not extra test runs. `--fail-under-lines` makes each report exit
+/// non-zero below its floor, so a regression fails here and identically in CI.
+fn enforce_coverage(root: &Path) -> Result<(), String> {
     run_command(
         Command::new("cargo")
             .current_dir(root)
-            .args(["llvm-cov", "--locked", "--summary-only"])
+            .args(["llvm-cov", "--no-report", "--locked"])
+            .args(LIBRARY_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
+        "instrument library tests for coverage",
+    )?;
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["llvm-cov", "report", "--locked", "--summary-only"])
             .arg("--fail-under-lines")
             .arg(LIBRARY_COVERAGE_FLOOR_PCT.to_string())
             .args(LIBRARY_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
-        "enforce library coverage floor",
-    )
+        "enforce combined library coverage floor",
+    )?;
+    for pkg in LIBRARY_PACKAGES {
+        run_command(
+            Command::new("cargo")
+                .current_dir(root)
+                .args(["llvm-cov", "report", "--locked", "--summary-only"])
+                .arg("--fail-under-lines")
+                .arg(LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT.to_string())
+                .args(["-p", pkg]),
+            &format!("enforce {pkg} per-crate coverage floor"),
+        )?;
+    }
+    Ok(())
 }
 
 /// Measure line coverage of the host packages and print the per-crate summary.
