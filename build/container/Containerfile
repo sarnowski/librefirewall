@@ -10,14 +10,14 @@
 # Makefile `container` recipe) runs --network=none against the warmed offline
 # caches. Contract with the Makefile: BASE_IMAGE arrives as a build-arg (from
 # sources.lock's DEBIAN_IMAGE) and the corporate TLS-inspection CA arrives as
-# the optional build secret `gropyus_ca`, folded into a temporary bundle for
+# the optional build secret `enterprise_ca`, folded into a temporary bundle for
 # the network phase and never written into a layer.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 COPY third-party/sources.lock /tmp/sources.lock
 
-RUN --mount=type=secret,id=gropyus_ca,required=false \
+RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
     . /tmp/sources.lock; \
     printf '%s\n' \
@@ -31,8 +31,8 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
     DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y ca-certificates curl; \
     sed -i 's|http://snapshot.debian.org|https://snapshot.debian.org|g' /etc/apt/sources.list; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
-    if [ -s /run/secrets/gropyus_ca ]; then \
-      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     apt-get -o Acquire::https::CaInfo="$ca_bundle" update; \
@@ -103,12 +103,12 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
 
 COPY third-party/sources.lock /tmp/syft-sources.lock
 
-RUN --mount=type=secret,id=gropyus_ca,required=false \
+RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
     . /tmp/syft-sources.lock; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
-    if [ -s /run/secrets/gropyus_ca ]; then \
-      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
@@ -132,12 +132,12 @@ RUN chmod -R a+rX /opt/microkit/
 # and fuzzing (cargo-fuzz, used in a later phase). This is the network phase;
 # --locked builds each tool from its published lockfile for reproducibility.
 COPY third-party/sources.lock /tmp/tools-sources.lock
-RUN --mount=type=secret,id=gropyus_ca,required=false \
+RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
     . /tmp/tools-sources.lock; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
-    if [ -s /run/secrets/gropyus_ca ]; then \
-      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     SSL_CERT_FILE="$ca_bundle" \
@@ -168,11 +168,11 @@ COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
 # its manifest and lockfile warm its libFuzzer/arbitrary dependency tree.
 COPY fuzz/Cargo.toml fuzz/Cargo.lock /tmp/workspace/fuzz/
 
-RUN --mount=type=secret,id=gropyus_ca,required=false \
+RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
-    if [ -s /run/secrets/gropyus_ca ]; then \
-      cat "$ca_bundle" /run/secrets/gropyus_ca > /tmp/build-ca-bundle.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     cd /tmp/workspace; \

@@ -113,11 +113,13 @@ runs the fast host gate (`make test`) and the pre-push hook runs the full `make 
 that reaches `trunk` has passed formatting, lints, tests, coverage, dependency policy, image
 assembly, and the QEMU system and A/B gates. See [AGENTS.md](AGENTS.md) for the workflow in full.
 
-On a GROPYUS development machine the build automatically detects the installed inspection CA and
-provides it as a Podman build secret. On another inspected network, pass its path explicitly:
+On a development machine behind a TLS-inspecting proxy, the build automatically detects an installed
+inspection CA (a `*-dpi-ca.crt` under `/usr/local/share/ca-certificates/`) and provides it as a
+Podman build secret. On another inspected network, or to select a specific certificate, pass its
+path explicitly:
 
 ```sh
-make image GROPYUS_CA_FILE=/path/to/gropyus-ca.pem
+make image ENTERPRISE_CA_FILE=/path/to/enterprise-ca.pem
 ```
 
 The CA is available only to the dependency-installation build step; it is never copied into an

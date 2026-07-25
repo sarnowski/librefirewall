@@ -8,12 +8,12 @@ KVM_FLAGS := $(if $(wildcard /dev/kvm),--device /dev/kvm --group-add keep-groups
 CONTAINERFILE := build/container/Containerfile
 CONTAINER_IGNORE := build/container/containerignore
 WRITABLE_DIRS := build dist sdk target
-GROPYUS_CA_FILE ?= $(wildcard /usr/local/share/ca-certificates/gropyus-dpi-ca.crt)
+ENTERPRISE_CA_FILE ?= $(firstword $(wildcard /usr/local/share/ca-certificates/*-dpi-ca.crt))
 
-ifeq ($(strip $(GROPYUS_CA_FILE)),)
+ifeq ($(strip $(ENTERPRISE_CA_FILE)),)
 CA_SECRET :=
 else
-CA_SECRET := --secret=id=gropyus_ca,src=$(abspath $(GROPYUS_CA_FILE))
+CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
 endif
 
 .PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean builder prepare
