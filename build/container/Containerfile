@@ -1,3 +1,17 @@
+# librefirewall hermetic build environment.
+#
+# The pinned, reproducible builder: every input is version- and checksum-pinned
+# from third-party/sources.lock (BASE_IMAGE by digest, a dated Debian snapshot
+# for apt, and sha256-verified downloads for the Microkit SDK, rust-sel4,
+# rustup, GRUB, and syft). This image is a TOOL, not the product — the
+# deployable artifact is the signed boot payload xtask builds inside it.
+#
+# Network is available only while building THIS image; the build itself (the
+# Makefile `container` recipe) runs --network=none against the warmed offline
+# caches. Contract with the Makefile: BASE_IMAGE arrives as a build-arg (from
+# sources.lock's DEBIAN_IMAGE) and the corporate TLS-inspection CA arrives as
+# the optional build secret `gropyus_ca`, folded into a temporary bundle for
+# the network phase and never written into a layer.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -11,6 +25,8 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
+    # ca-certificates is not installed yet, so this first apt runs over plain
+    # http; apt's own repository signatures still authenticate the archive.
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y ca-certificates curl; \
     sed -i 's|http://snapshot.debian.org|https://snapshot.debian.org|g' /etc/apt/sources.list; \
@@ -27,7 +43,6 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       bison \
       build-essential \
       clang \
-      cmake \
       curl \
       dosfstools \
       flex \
@@ -39,13 +54,10 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
       llvm \
       make \
       mtools \
-      ninja-build \
       ovmf \
       pkg-config \
       python3 \
       qemu-system-x86 \
-      qemu-utils \
-      xorriso \
       xz-utils; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
       --output /tmp/microkit-sdk.tar.gz "$MICROKIT_URL"; \
@@ -54,12 +66,19 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
     tar --extract --gzip --file /tmp/microkit-sdk.tar.gz \
       --strip-components=1 --directory "/opt/microkit-sdk-${MICROKIT_VERSION}"; \
     ln -s "/opt/microkit-sdk-${MICROKIT_VERSION}" /opt/microkit; \
+    # Write the VERSION file xtask's verify_inputs reads from the pinned value,
+    # rather than relying on the tarball happening to ship it; this makes the
+    # SDK/version contract explicit and independent of upstream packaging.
+    printf '%s\n' "$MICROKIT_VERSION" > /opt/microkit/VERSION; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
       --output /tmp/rust-sel4.tar.gz "$RUST_SEL4_URL"; \
     printf '%s  %s\n' "$RUST_SEL4_SHA256" /tmp/rust-sel4.tar.gz | sha256sum --check --strict -; \
     mkdir -p /opt/rust-sel4; \
     tar --extract --gzip --file /tmp/rust-sel4.tar.gz \
       --strip-components=1 --directory /opt/rust-sel4; \
+    # Same explicit contract; the source tag carries a leading `v` that the
+    # on-disk VERSION and xtask's comparison do not, so strip it.
+    printf '%s\n' "${RUST_SEL4_VERSION#v}" > /opt/rust-sel4/VERSION; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
       --output /tmp/rustup-init "$RUSTUP_INIT_URL"; \
     printf '%s  %s\n' "$RUSTUP_INIT_SHA256" /tmp/rustup-init | sha256sum --check --strict -; \
@@ -102,10 +121,10 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
 ENV PATH=/opt/grub/bin:/opt/rust/cargo/bin:$PATH \
     RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo \
-    MICROKIT_SDK=/opt/microkit \
-    RUST_SEL4_ROOT=/opt/rust-sel4 \
     SYFT_CHECK_FOR_APP_UPDATE=false
 
+# The build runs as the keep-id host user, not root; make the SDK world-readable
+# so that user can read the board files and the microkit tool.
 RUN chmod -R a+rX /opt/microkit/
 
 # Pinned Rust developer tools baked into the image so the offline host gate can
