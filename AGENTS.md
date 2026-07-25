@@ -181,7 +181,9 @@ placeholders.
 - `systems/` — the Microkit system description(s): the static capability topology. A capability
   change is a security change (see *Engineering rules*).
 - `tools/` — the `xtask` build/test/packaging orchestrator and the QEMU harness.
-- `benches/`, `fuzz/` — performance workloads and persistent fuzz targets.
+- `fuzz/` — the persistent `cargo-fuzz` targets for the untrusted parsers, in their own workspace so
+  the ASan/libFuzzer instrumentation never enters a PD build. Criterion microbenchmarks are *not* a
+  top-level directory: each lives in its crate's own `benches/`, beside the code it measures.
 - `build/`, `third-party/`, `support/` — the pinned hermetic builder, pinned upstream inputs, and
   target specifications.
 

@@ -59,8 +59,8 @@ is deliberately larger than the current implementation.
 | Release-config boot test, UEFI Secure Boot, TPM anti-rollback | **planned** | |
 | Additional NIC drivers (ixgbe SFP+, Azure netvsc/MANA) | **planned** | |
 
-**The current deployable system** is a two-port zero-copy forwarding dataplane, and that dataplane
-*is* the product artifact: one virtio-net driver protection domain per port brings up a modern
+**The current deployable system** is a two-dataplane-port zero-copy forwarding slice — the milestone
+the build actually produces today, not a synthetic demo: one virtio-net driver protection domain per port brings up a modern
 `virtio-net-pci` device on QEMU q35 from static seL4 capabilities alone, and an isolated forwarder
 protection domain — the seat where the classifier and filter shards will later run — moves frames
 between the two ports without copying. A frame cycles `NIC0 → driver0 → forwarder → driver1 → NIC1`
@@ -142,7 +142,7 @@ executable; Docker is not a supported build interface.
 ## License
 
 librefirewall is free software, licensed under the **GNU Affero General Public License, version 3 or
-later (AGPL-3.0-or-later)**. The full text is in [LICENSE.md](LICENSE.md).
+later (AGPL-3.0-or-later)**. The full text is in [LICENSE](LICENSE).
 
 Copyright (C) 2026 Tobias Sarnowski
 

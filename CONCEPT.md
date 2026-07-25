@@ -476,7 +476,7 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 ### 13.2 Known risks
 
 - **x86_64 seL4/Microkit maturity.** x86_64 on Microkit is recent (added in 2.1.0, November 2025)
-  and currently exposes only generic/QEMU platforms (no dedicated x86 hardware board); x86_64 with
+  and exposes only generic/QEMU platforms (no dedicated x86 hardware board); x86_64 with
   SMP is the least-exercised seL4 configuration.
 - **No existing 10 Gbit/s or x86 NIC driver.** The public sDDF tree contains only virtio and
   Arm-SoC drivers; all NIC drivers (virtio, SFP+ 10G, netvsc, MANA) are implemented from scratch in
@@ -489,10 +489,9 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
-- **FPU/SIMD in protection domains.** Dataplane PDs currently run without FPU/SSE state.
-  Sustaining checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU
-  context for the relevant PDs or staying scalar — a design constraint to resolve when performance
-  work begins.
+- **FPU/SIMD in protection domains.** Dataplane PDs run without FPU/SSE state. Sustaining
+  checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU context for the
+  relevant PDs or staying scalar — a design constraint to resolve when performance work begins.
 ---
 
 ## 14. Software Update & Secure Boot
@@ -542,9 +541,9 @@ in its core image and **enforces detached-signature verification** on every file
 authenticates the payload independently of the medium it sits on. The boot-selection state is
 loaded unverified (it only *chooses among* already-signed slots and can never inject code).
 
-Development builds generate a local, throwaway signing key under `build/dev-keys/` (never committed,
-removed by `make clean`); the release manifest records `trust_profile: development` and the key
-fingerprint so a development-signed image can never be mistaken for a production one.
+Development builds generate a local, throwaway signing key (never committed); the release manifest
+records `trust_profile: development` and the key fingerprint so a development-signed image can never
+be mistaken for a production one.
 
 ### 14.4 Firmware and the seL4 hand-off contract
 
