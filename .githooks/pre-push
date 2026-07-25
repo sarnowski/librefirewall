@@ -1,0 +1,7 @@
+#!/bin/sh
+# Full CI gate: the host gate plus image assembly and the QEMU system and A/B
+# scenarios. Runs before every push so trunk stays green through the same
+# commands CI runs. See AGENTS.md "The commit gate".
+set -e
+echo "pre-push: running 'make ci' (full gate: host + QEMU system + A/B)"
+exec make ci

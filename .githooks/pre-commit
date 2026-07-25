@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fast host gate. Runs before every commit so what lands on trunk is green and
+# bisectable at the cheapest moment. See AGENTS.md "The commit gate".
+set -e
+echo "pre-commit: running 'make test' (fast host gate)"
+exec make test

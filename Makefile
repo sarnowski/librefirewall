@@ -16,7 +16,7 @@ else
 CA_SECRET := --secret=id=gropyus_ca,src=$(abspath $(GROPYUS_CA_FILE))
 endif
 
-.PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release clean builder prepare
+.PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean builder prepare
 
 image: builder prepare
 	$(call xtask,image)
@@ -50,6 +50,13 @@ ci: builder prepare
 
 release: builder prepare
 	$(call xtask,release)
+
+# Point git at the tracked hooks: pre-commit runs the fast gate (`make test`),
+# pre-push the full gate (`make ci`). Run once per worktree; git resolves the
+# path per worktree, so this does not touch other checkouts.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "git hooks path set to .githooks (pre-commit=make test, pre-push=make ci)"
 
 clean: builder
 	$(call xtask,clean)
