@@ -9,5 +9,8 @@ wire = { path = "../wire" }
 queue = { path = "../queue" }
 packet-buffer = { path = "../packet-buffer" }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

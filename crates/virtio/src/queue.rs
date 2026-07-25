@@ -299,6 +299,8 @@ const fn used_elem_len_off<const SIZE: usize>(slot: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
 
     const SIZE: usize = 16;
     const BUF: usize = 2048;
@@ -589,5 +591,139 @@ mod tests {
                 .write_volatile(60_000);
         }
         assert_eq!(queue.poll(), None);
+    }
+
+    #[test]
+    fn layout_is_correct_for_a_second_queue_size() {
+        // A non-trivial second size guards the size-parametric ABI arithmetic
+        // beyond the SIZE=16 case above.
+        let layout = SplitVirtqueue::<64>::LAYOUT;
+        // desc: 64*16 = 1024; avail at 1024, bytes 4+128+2 = 134, ends 1158;
+        // used aligned up to 1160, bytes 4+512+2 = 518, total 1678.
+        assert_eq!(layout.size, 64);
+        assert_eq!(layout.descriptor_offset, 0);
+        assert_eq!(layout.driver_offset, 1024);
+        assert_eq!(layout.device_offset, 1160);
+        assert_eq!(layout.total_bytes, 1678);
+    }
+
+    /// Publish a device used-ring completion for descriptor `head` at the next
+    /// used slot, as the device would. Kept as a free helper so the property
+    /// test can complete descriptors in an arbitrary (out-of-posting) order.
+    fn device_complete(region: *mut u8, used_idx: &mut u16, head: u16) {
+        const N: usize = 8;
+        let slot = (*used_idx as usize) & (N - 1);
+        unsafe {
+            region
+                .add(used_elem_id_off::<N>(slot as u16))
+                .cast::<u32>()
+                .write_volatile(head as u32);
+            region
+                .add(used_elem_len_off::<N>(slot as u16))
+                .cast::<u32>()
+                .write_volatile(0);
+        }
+        fence(Ordering::Release);
+        *used_idx = used_idx.wrapping_add(1);
+        unsafe {
+            region
+                .add(used_area_off::<N>() + 2)
+                .cast::<u16>()
+                .write_volatile(*used_idx);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// Random add/complete/poll/recycle sequences, with the device
+        /// completing descriptors in and out of posting order, must never panic,
+        /// never hand out a token index that is already in flight, and conserve
+        /// the descriptor count: `free_count` equals the queue size minus every
+        /// descriptor currently posted, completed-but-unpolled, or polled-but-
+        /// unrecycled, and returns to full once all are recycled.
+        #[test]
+        fn split_virtqueue_accounting_holds_under_random_operations(
+            ops in prop::collection::vec((0u8..4, any::<u16>()), 0..200),
+        ) {
+            const N: usize = 8;
+            let mut region = Box::new(Region([0; 4096]));
+            let mut queue = unsafe { SplitVirtqueue::<N>::new(region.0.as_mut_ptr()) };
+            let region_ptr = region.0.as_mut_ptr();
+
+            let mut outstanding: Vec<Token> = Vec::new(); // posted, device not done
+            let mut completed: VecDeque<Token> = VecDeque::new(); // device done, unpolled
+            let mut inflight: Vec<Token> = Vec::new(); // polled, unrecycled
+            let mut used_idx: u16 = 0;
+
+            let check_invariants =
+                |q: &SplitVirtqueue<N>,
+                 outstanding: &[Token],
+                 completed: &VecDeque<Token>,
+                 inflight: &[Token]|
+                 -> Result<(), TestCaseError> {
+                    let allocated = outstanding.len() + completed.len() + inflight.len();
+                    prop_assert_eq!(q.free_count(), N - allocated);
+                    // A descriptor index is in exactly one state at a time.
+                    let mut seen = [false; N];
+                    for t in outstanding
+                        .iter()
+                        .chain(completed.iter())
+                        .chain(inflight.iter())
+                    {
+                        let i = t.index() as usize;
+                        prop_assert!(!seen[i], "descriptor {} held in two states", i);
+                        seen[i] = true;
+                    }
+                    Ok(())
+                };
+
+            for (action, sel) in ops {
+                match action {
+                    0 => {
+                        if queue.free_count() > 0 {
+                            let token = queue.add_writable(0x1000, 64).unwrap();
+                            outstanding.push(token);
+                        }
+                    }
+                    1 => {
+                        if !outstanding.is_empty() {
+                            let i = (sel as usize) % outstanding.len();
+                            let token = outstanding.remove(i);
+                            device_complete(region_ptr, &mut used_idx, token.index());
+                            completed.push_back(token);
+                        }
+                    }
+                    2 => match queue.poll() {
+                        Some((got, _)) => {
+                            let expected = completed.pop_front();
+                            prop_assert_eq!(Some(got), expected);
+                            inflight.push(got);
+                        }
+                        None => prop_assert!(completed.is_empty()),
+                    },
+                    _ => {
+                        if !inflight.is_empty() {
+                            let i = (sel as usize) % inflight.len();
+                            queue.recycle(inflight.remove(i));
+                        }
+                    }
+                }
+                check_invariants(&queue, &outstanding, &completed, &inflight)?;
+            }
+
+            // Drain everything and confirm the free list is whole again.
+            for token in inflight.drain(..) {
+                queue.recycle(token);
+            }
+            while let Some(token) = outstanding.pop() {
+                device_complete(region_ptr, &mut used_idx, token.index());
+                completed.push_back(token);
+            }
+            while let Some((got, _)) = queue.poll() {
+                queue.recycle(got);
+            }
+            prop_assert_eq!(queue.free_count(), N);
+        }
     }
 }

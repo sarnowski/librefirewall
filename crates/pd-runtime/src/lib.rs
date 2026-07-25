@@ -262,6 +262,7 @@ pub fn forward(from: &Ring, to: &Ring) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::boxed::Box;
     use std::sync::Arc;
     use std::thread;
@@ -479,5 +480,33 @@ mod tests {
         rx_driver.join().unwrap();
         forwarder.join().unwrap();
         tx_driver.join().unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// The untrusted-descriptor validator accepts exactly the triples that
+        /// name a span within one pool buffer and rejects the rest, computed
+        /// against a widened-arithmetic reference so it never disagrees and never
+        /// overflows — including at the `u32` extremes where `offset + len`
+        /// would wrap a 32-bit sum. `any::<u32>()` biases toward those edges;
+        /// the explicit boundary strategies pin the exact pool/buffer limits.
+        #[test]
+        fn descriptor_in_bounds_matches_a_widened_reference(
+            buffer in prop_oneof![
+                any::<u32>(),
+                (POOL_BUFFERS as u32 - 2)..=(POOL_BUFFERS as u32 + 2),
+            ],
+            offset in prop_oneof![any::<u32>(), (BUFFER_SIZE as u32 - 2)..=(BUFFER_SIZE as u32 + 2)],
+            len in prop_oneof![any::<u32>(), 0u32..=(BUFFER_SIZE as u32 + 2)],
+        ) {
+            let descriptor = Descriptor::new(buffer, offset, len);
+            // Reference in `usize`, which cannot overflow for two `u32`s on a
+            // 64-bit host — the authority the checked-arithmetic implementation
+            // must match exactly.
+            let expected = (buffer as usize) < POOL_BUFFERS
+                && (offset as usize) + (len as usize) <= BUFFER_SIZE;
+            prop_assert_eq!(descriptor_in_bounds(&descriptor), expected);
+        }
     }
 }

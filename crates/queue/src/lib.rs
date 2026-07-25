@@ -175,6 +175,8 @@ impl<const CAP: usize> Default for SpscRing<CAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::thread;
 
@@ -308,5 +310,67 @@ mod tests {
 
         producer.join().unwrap();
         consumer.join().unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Random interleavings of `try_enqueue`/`try_dequeue` against a model
+        /// FIFO queue: every dequeue returns exactly what the model expects
+        /// (FIFO order preserved), a rejected enqueue means the ring is at
+        /// capacity, and `len()` never exceeds `capacity()`.
+        #[test]
+        fn spsc_ring_matches_a_model_fifo(ops in prop::collection::vec(any::<bool>(), 0..300)) {
+            const CAP: usize = 8;
+            let ring = SpscRing::<CAP>::new();
+            let mut model: VecDeque<u32> = VecDeque::new();
+            let mut next: u32 = 0;
+
+            for enqueue in ops {
+                if enqueue {
+                    match ring.try_enqueue(Descriptor::new(next, next, next)) {
+                        Ok(()) => {
+                            model.push_back(next);
+                            next = next.wrapping_add(1);
+                        }
+                        Err(returned) => {
+                            // A rejection hands the descriptor back unchanged and
+                            // happens only when the ring is at usable capacity.
+                            prop_assert_eq!(returned, Descriptor::new(next, next, next));
+                            prop_assert_eq!(model.len(), ring.capacity());
+                        }
+                    }
+                } else {
+                    let expected = model.pop_front().map(|v| Descriptor::new(v, v, v));
+                    prop_assert_eq!(ring.try_dequeue(), expected);
+                }
+                prop_assert_eq!(ring.len(), model.len());
+                prop_assert!(ring.len() <= ring.capacity());
+            }
+        }
+
+        /// A hostile peer may scribble either shared cursor with an arbitrary
+        /// value. Masking must keep every operation in bounds: no panic, no
+        /// out-of-range index, and `len()` stays within capacity.
+        #[test]
+        fn spsc_ring_survives_arbitrary_cursor_values(
+            head in any::<u32>(),
+            tail in any::<u32>(),
+            enqueue_first in any::<bool>(),
+        ) {
+            let ring = SpscRing::<8>::new();
+            ring.head.store(head, Ordering::Relaxed);
+            ring.tail.store(tail, Ordering::Relaxed);
+            // Exercise both operations regardless of the garbage cursors.
+            if enqueue_first {
+                let _ = ring.try_enqueue(Descriptor::new(1, 2, 3));
+                let _ = ring.try_dequeue();
+            } else {
+                let _ = ring.try_dequeue();
+                let _ = ring.try_enqueue(Descriptor::new(1, 2, 3));
+            }
+            prop_assert!(ring.len() <= ring.capacity());
+            let _ = ring.is_empty();
+        }
     }
 }

@@ -76,6 +76,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn zero_matches_default_and_explicit_zero() {
@@ -97,5 +98,36 @@ mod tests {
                 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xCC, 0xBB, 0xAA, 0x99
             ]
         );
+    }
+
+    proptest! {
+        /// For any field values, a descriptor round-trips through its wire image:
+        /// its fields are exactly the constructor arguments, and its 12-byte
+        /// `#[repr(C)]` image is the three fields as little-endian `u32`s in
+        /// declaration order — and reconstructing a descriptor from those bytes
+        /// yields the original.
+        #[test]
+        fn descriptor_round_trips_through_its_byte_image(
+            buffer in any::<u32>(),
+            offset in any::<u32>(),
+            len in any::<u32>(),
+        ) {
+            let descriptor = Descriptor::new(buffer, offset, len);
+            prop_assert_eq!(descriptor.buffer, buffer);
+            prop_assert_eq!(descriptor.offset, offset);
+            prop_assert_eq!(descriptor.len, len);
+
+            // SAFETY: `Descriptor` is `#[repr(C)]`, `Copy`, and asserted to be 12
+            // bytes with no padding, so it transmutes to and from `[u8; 12]`.
+            let bytes: [u8; 12] = unsafe { core::mem::transmute(descriptor) };
+            let mut expected = [0u8; 12];
+            expected[0..4].copy_from_slice(&buffer.to_le_bytes());
+            expected[4..8].copy_from_slice(&offset.to_le_bytes());
+            expected[8..12].copy_from_slice(&len.to_le_bytes());
+            prop_assert_eq!(bytes, expected);
+
+            let recovered: Descriptor = unsafe { core::mem::transmute(bytes) };
+            prop_assert_eq!(recovered, descriptor);
+        }
     }
 }

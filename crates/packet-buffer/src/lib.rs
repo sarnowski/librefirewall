@@ -219,6 +219,7 @@ impl<const N: usize> FreeList<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn write_then_read_round_trips_bytes() {
@@ -322,5 +323,65 @@ mod tests {
         assert!(list.push(1));
         assert!(!list.push(2));
         assert_eq!(list.len(), 2);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// The single-owner invariant under random pop/return sequences: driving
+        /// the free list the way the pool protocol does — only ever returning an
+        /// index that was previously taken out — the count of owned-plus-out
+        /// indices is conserved at `N`, the list stays a faithful LIFO of a model
+        /// stack, and no index is ever handed out while already out (no buffer is
+        /// double-owned).
+        #[test]
+        fn free_list_conserves_single_ownership(ops in prop::collection::vec(any::<bool>(), 0..300)) {
+            const N: usize = 8;
+            let mut list = FreeList::<N>::full();
+            let mut owned: Vec<u32> = (0..N as u32).collect(); // model LIFO stack
+            let mut out: Vec<u32> = Vec::new(); // taken out, not yet returned
+
+            for take in ops {
+                if take {
+                    match list.pop() {
+                        Some(index) => {
+                            prop_assert!((index as usize) < N);
+                            prop_assert_eq!(owned.pop(), Some(index)); // LIFO matches model
+                            prop_assert!(!out.contains(&index)); // not already out: single owner
+                            out.push(index);
+                        }
+                        None => prop_assert!(owned.is_empty()),
+                    }
+                } else if let Some(index) = out.pop() {
+                    // Returning an index we hold exclusively can never overflow,
+                    // since owned + out always totals N.
+                    prop_assert!(list.push(index));
+                    owned.push(index);
+                }
+                prop_assert_eq!(list.len(), owned.len());
+                prop_assert_eq!(owned.len() + out.len(), N);
+                // The owned set carries each index at most once.
+                let mut seen = [false; N];
+                for &i in &owned {
+                    prop_assert!(!seen[i as usize], "index {} owned twice", i);
+                    seen[i as usize] = true;
+                }
+            }
+        }
+
+        /// Pushing distinct indices onto an empty list never exceeds capacity:
+        /// the first `N` succeed and every further push is rejected.
+        #[test]
+        fn free_list_push_is_bounded_by_capacity(extra in 0usize..8) {
+            const N: usize = 4;
+            let mut list = FreeList::<N>::empty();
+            for i in 0..N {
+                prop_assert!(list.push(i as u32));
+            }
+            for i in 0..extra {
+                prop_assert!(!list.push((N + i) as u32));
+            }
+            prop_assert_eq!(list.len(), N);
+        }
     }
 }
