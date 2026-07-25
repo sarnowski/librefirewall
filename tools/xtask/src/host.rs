@@ -147,18 +147,25 @@ pub(crate) fn fuzz(root: &Path) -> Result<(), String> {
     )?;
     println!("fuzz: all targets built with AddressSanitizer instrumentation");
 
+    // libFuzzer writes coverage-increasing inputs into the first corpus dir it
+    // is given. Point that at a throwaway dir under the tmpfs and pass the
+    // committed corpus as a read-only seed source, so this bounded smoke run —
+    // in `ci` on every commit — never grows or dirties the tracked
+    // `fuzz/corpus/` tree. Curated regression seeds are added there deliberately.
+    let scratch_root = std::env::temp_dir().join("librefirewall-fuzz-corpus");
     let mut executed = true;
     for target in FUZZ_TARGETS {
+        let scratch = scratch_root.join(target);
+        fs::create_dir_all(&scratch).map_err(|error| {
+            format!("create fuzz scratch corpus {}: {error}", scratch.display())
+        })?;
+        let seeds = root.join("fuzz").join("corpus").join(target);
         let status = Command::new("cargo")
             .current_dir(root)
-            .args([
-                "fuzz",
-                "run",
-                target,
-                "--",
-                "-runs=20000",
-                "-max_total_time=15",
-            ])
+            .args(["fuzz", "run", target])
+            .arg(&scratch)
+            .arg(&seeds)
+            .args(["--", "-runs=20000", "-max_total_time=15"])
             .status()
             .map_err(|error| format!("spawn cargo fuzz run {target}: {error}"))?;
         if status.success() {
