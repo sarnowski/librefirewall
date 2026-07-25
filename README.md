@@ -142,7 +142,7 @@ executable; Docker is not a supported build interface.
 ## License
 
 librefirewall is free software, licensed under the **GNU Affero General Public License, version 3 or
-later (AGPL-3.0-or-later)**. The full text is in [LICENSE](LICENSE).
+later (AGPL-3.0-or-later)**. The full text is in [LICENSE.md](LICENSE.md).
 
 Copyright (C) 2026 Tobias Sarnowski
 

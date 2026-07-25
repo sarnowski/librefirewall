@@ -62,12 +62,15 @@ Documentation earns its place by carrying what the code cannot: the goal a piece
 the constraint that shaped it, the non-obvious reason behind a choice. A comment that restates the
 code is worse than none — it drifts and misleads. When in doubt, leave it out and sharpen the name.
 
-**There are exactly four standalone Markdown documents, and no others are to be created:**
+**Project documentation lives in exactly four standalone Markdown documents, and no further
+documentation files are to be created:**
 
 - **README.md** — overview, status, build/test instructions, license.
 - **CONCEPT.md** — target architecture, threat model, critical decisions.
 - **AGENTS.md** — this guide.
 - **MONITORING.md** — the operator contract for logs and metrics (see *Observability*).
+
+(`LICENSE.md` is the verbatim license text, not project documentation, and is exempt from this rule.)
 
 Everything else lives **in the source**:
 
