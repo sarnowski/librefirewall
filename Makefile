@@ -48,8 +48,8 @@ ci: builder prepare
 release: builder prepare
 	$(call xtask,release)
 
-clean:
-	rm -rf build/image build/dev-keys dist sdk target
+clean: builder
+	$(call xtask,clean)
 
 builder:
 	$(PODMAN) --cgroup-manager=cgroupfs build \

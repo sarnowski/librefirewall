@@ -158,11 +158,16 @@ pub(crate) fn fuzz(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove every generated directory, leaving only source-controlled inputs
+/// (`build/` keeps `build/container`; only its generated `image`/`dev-keys`
+/// subtrees go). This is the single owner of the clean list; `make clean`
+/// delegates here so the two never diverge.
 pub(crate) fn clean(root: &Path) -> Result<(), String> {
     for path in [
         root.join("build/image"),
         root.join("build/dev-keys"),
         root.join("dist"),
+        root.join("sdk"),
         root.join("target"),
     ] {
         if path.exists() {
