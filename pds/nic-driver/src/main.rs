@@ -70,16 +70,19 @@ fn init() -> NicDriver {
     debug_println!("LIBREFIREWALL_NIC:driver:start");
 
     // Mapped windows and DMA physical addresses, all patched by the Microkit
-    // tool from librefirewall.system. The pointers are just addresses here; their
-    // use below (config access, ring setup) carries the safety.
+    // tool from librefirewall.system: `ecam` is the device's 4 KiB ECAM page,
+    // `bar` the BAR_SIZE MMIO window, `vq` the zeroed VQ_REGION_SIZE virtqueue
+    // DMA region. Each `unsafe` use below states the precondition it upholds.
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();
     let vq = memory_region_symbol!(vq_vaddr: *mut u8).as_ptr();
-    // SAFETY: patched to the pipeline regions shared read-write with the
-    // forwarder and the peer driver PD. `rx_pipe`'s buffer pool doubles as
-    // this NIC's receive DMA source; `tx_pipe`'s as its transmit DMA source.
+    // SAFETY: patched to the rx pipeline region shared read-write with the
+    // forwarder and the peer driver PD; its buffer pool doubles as this NIC's
+    // receive DMA source — `Pipeline::attach`'s contract.
     let rx_pipe =
         unsafe { Pipeline::attach(memory_region_symbol!(rx_pipe_vaddr: *mut Pipeline).as_ptr()) };
+    // SAFETY: as above, for the tx pipeline region, whose pool is this NIC's
+    // transmit DMA source.
     let tx_pipe =
         unsafe { Pipeline::attach(memory_region_symbol!(tx_pipe_vaddr: *mut Pipeline).as_ptr()) };
     let bar_paddr = *var!(bar_paddr: usize = 0);
@@ -92,6 +95,9 @@ fn init() -> NicDriver {
     );
 
     // --- Stage A: PCI discovery ---
+    // SAFETY: `ecam` is the mapped 4 KiB ECAM page of the pinned device
+    // function (patched from librefirewall.system) and stays mapped for the
+    // PD's whole life — exactly `PciConfig::new`'s contract.
     let config = unsafe { PciConfig::new(ecam) };
     let (vendor, device) = config.ids();
     debug_println!("LIBREFIREWALL_NIC:pci vendor={vendor:#06x} device={device:#06x}");
@@ -126,6 +132,9 @@ fn init() -> NicDriver {
     config.reprogram_bar64(caps.bar, bar_paddr as u32);
     config.enable_memory_and_bus_master();
 
+    // SAFETY: `caps.within(BAR_SIZE)` was asserted above, so `caps.common` plus
+    // the common-cfg extent lies inside the mapped `bar` window; the resulting
+    // pointer is the device's `virtio_pci_common_cfg` within that mapping.
     let common = unsafe { CommonCfg::new(bar.add(caps.common as usize)) };
     common.reset();
     common.set_status(STATUS_ACKNOWLEDGE);
@@ -152,7 +161,14 @@ fn init() -> NicDriver {
     // Both virtqueues live in the DMA region: receive at offset 0, transmit at
     // TX_VQ_OFFSET. The receive buffers are the rx pipeline's pool; the
     // transmit buffers are the tx pipeline's pool.
+    // SAFETY: `vq` is the mapped, zeroed, page-aligned (so 16-byte-aligned)
+    // virtqueue DMA region, shared only with this device; the
+    // `total_bytes <= TX_VQ_OFFSET` const-assert proves it fits — `Vq::new`'s
+    // contract.
     let mut rx = unsafe { Vq::new(vq) };
+    // SAFETY: same region; the `TX_VQ_OFFSET % 16 == 0` and
+    // `TX_VQ_OFFSET + total_bytes <= VQ_REGION_SIZE` const-asserts keep the tx
+    // queue a disjoint, 16-byte-aligned, sole-owned window inside the region.
     let mut tx = unsafe { Vq::new(vq.add(TX_VQ_OFFSET)) };
     let rx_notify_off = common.setup_queue(RX_QUEUE, &Vq::LAYOUT, vq_paddr);
     let tx_notify_off = common.setup_queue(TX_QUEUE, &Vq::LAYOUT, vq_paddr + TX_VQ_OFFSET as u64);
@@ -163,6 +179,9 @@ fn init() -> NicDriver {
             "queue notify slot outside the mapped BAR window"
         );
     }
+    // SAFETY: `caps.within(BAR_SIZE)` (asserted above) bounds `caps.notify`
+    // inside the mapped `bar` window, so the notify base stays within it; the
+    // per-queue slot offset is bounded separately just above before each write.
     let notify_base = unsafe { bar.add(caps.notify as usize) };
 
     // Steady-state bookkeeping lives in the host-tested core; this adapter owns
@@ -178,6 +197,9 @@ fn init() -> NicDriver {
     // DRIVER_OK before the first doorbell: a device need not act on
     // notifications until the driver signals it is ready.
     common.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    // SAFETY: `notify_base` is within the mapped BAR (above) and the notify-slot
+    // loop above asserted `notify + notify_off*multiplier + 2 <= BAR_SIZE` for
+    // `rx_notify_off`, so this doorbell write lands inside the mapping.
     unsafe {
         pci::notify_queue(notify_base, rx_notify_off, caps.notify_multiplier, RX_QUEUE);
     }
@@ -197,6 +219,8 @@ fn init() -> NicDriver {
             FORWARDER.notify();
         }
         if reposted {
+            // SAFETY: as at the DRIVER_OK doorbell — `notify_base` is in-BAR and
+            // the `rx_notify_off` slot was bounded against BAR_SIZE by the loop.
             unsafe {
                 pci::notify_queue(notify_base, rx_notify_off, caps.notify_multiplier, RX_QUEUE);
             }
@@ -206,6 +230,8 @@ fn init() -> NicDriver {
         // pool-owning peer), then post frames the forwarder queued.
         tx_path.reap(&mut tx, tx_pipe);
         if tx_path.post(&mut tx, tx_pipe, tx_pipe_paddr, &mut counters) {
+            // SAFETY: `notify_base` is in-BAR and the `tx_notify_off` slot was
+            // bounded against BAR_SIZE by the same notify-slot loop as the rx slot.
             unsafe {
                 pci::notify_queue(notify_base, tx_notify_off, caps.notify_multiplier, TX_QUEUE);
             }

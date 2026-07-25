@@ -229,9 +229,10 @@ mod tests {
         // `payload` is a local that does not borrow from the pool.
         let len = unsafe { pool.write(2, &payload) };
         assert_eq!(len, 5);
+        // SAFETY: own index 2; no live borrow into it while we read.
         let bytes = unsafe { pool.read(2, 0, len) };
         assert_eq!(bytes, &payload);
-        // A non-zero offset borrows a later span of the same buffer.
+        // SAFETY: as above; a non-zero offset just borrows a later span.
         let tail = unsafe { pool.read(2, 2, 3) };
         assert_eq!(tail, &payload[2..5]);
     }
@@ -244,6 +245,7 @@ mod tests {
             let _ = pool.write(0, &[0xEEu8; 32]);
             pool.write_at(0, 12, &[1, 2, 3]);
         }
+        // SAFETY: own index 0; no live borrow into it while we read.
         let bytes = unsafe { pool.read(0, 0, 16) };
         assert_eq!(&bytes[..12], &[0xEE; 12]);
         assert_eq!(&bytes[12..15], &[1, 2, 3]);
@@ -282,6 +284,7 @@ mod tests {
         let tail = [0xCDu8; 8];
         // SAFETY: own index 0; span ends exactly at BUFFER_SIZE; input local.
         unsafe { pool.write_at(0, BUFFER_SIZE - 8, &tail) };
+        // SAFETY: own index 0; span ends exactly at BUFFER_SIZE; no live borrow.
         let bytes = unsafe { pool.read(0, BUFFER_SIZE - 8, 8) };
         assert_eq!(bytes, &tail);
     }

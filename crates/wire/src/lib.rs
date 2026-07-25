@@ -126,6 +126,8 @@ mod tests {
             expected[8..12].copy_from_slice(&len.to_le_bytes());
             prop_assert_eq!(bytes, expected);
 
+            // SAFETY: same `repr(C)`, 12-byte, no-padding guarantee in reverse;
+            // any bit pattern is a valid `Descriptor` (three `u32` fields).
             let recovered: Descriptor = unsafe { core::mem::transmute(bytes) };
             prop_assert_eq!(recovered, descriptor);
         }

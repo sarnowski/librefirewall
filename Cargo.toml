@@ -39,6 +39,12 @@ unsafe_op_in_unsafe_fn = "deny"
 # `#![allow(missing_docs)]`.
 missing_docs = "deny"
 
+[workspace.lints.clippy]
+# Every `unsafe` block carries a truthful `// SAFETY:` comment stating the
+# invariant that makes it sound (AGENTS.md rule). Denied here so a bare block
+# fails the build instead of relying on review to catch it.
+undocumented_unsafe_blocks = "deny"
+
 [profile.release]
 codegen-units = 1
 lto = true

@@ -331,18 +331,23 @@ mod tests {
         }
 
         unsafe fn r16(&self, off: usize) -> u16 {
+            // SAFETY: `off` is within the live, test-owned region (this fn's contract), aligned for its width.
             unsafe { self.region.add(off).cast::<u16>().read_volatile() }
         }
         unsafe fn w16(&self, off: usize, v: u16) {
+            // SAFETY: `off` is within the live, test-owned region (this fn's contract), aligned for its width.
             unsafe { self.region.add(off).cast::<u16>().write_volatile(v) }
         }
         unsafe fn w32(&self, off: usize, v: u32) {
+            // SAFETY: `off` is within the live, test-owned region (this fn's contract), aligned for its width.
             unsafe { self.region.add(off).cast::<u32>().write_volatile(v) }
         }
         unsafe fn r32(&self, off: usize) -> u32 {
+            // SAFETY: `off` is within the live, test-owned region (this fn's contract), aligned for its width.
             unsafe { self.region.add(off).cast::<u32>().read_volatile() }
         }
         unsafe fn r64(&self, off: usize) -> u64 {
+            // SAFETY: `off` is within the live, test-owned region (this fn's contract), aligned for its width.
             unsafe { self.region.add(off).cast::<u64>().read_volatile() }
         }
 
@@ -356,21 +361,25 @@ mod tests {
         /// The next head index the driver made available, or `None`.
         fn next_avail(&mut self) -> Option<u16> {
             let d = Self::driver_off();
+            // SAFETY: single-threaded test; the offset lies within the live, test-owned virtqueue region.
             let avail_idx = unsafe { self.r16(d + 2) };
             if avail_idx == self.last_avail {
                 return None;
             }
             fence(Ordering::Acquire);
             let slot = (self.last_avail as usize) & (Q - 1);
+            // SAFETY: single-threaded test; the offset lies within the live, test-owned virtqueue region.
             let head = unsafe { self.r16(d + 4 + slot * 2) };
             self.last_avail = self.last_avail.wrapping_add(1);
             Some(head)
         }
 
         fn desc_addr(&self, head: u16) -> u64 {
+            // SAFETY: `head < Q` (a posted descriptor), so the descriptor fields lie within the owned region.
             unsafe { self.r64(head as usize * 16) }
         }
         fn desc_len(&self, head: u16) -> u32 {
+            // SAFETY: `head < Q` (a posted descriptor), so the descriptor fields lie within the owned region.
             unsafe { self.r32(head as usize * 16 + 8) }
         }
 
@@ -378,12 +387,14 @@ mod tests {
         fn complete(&mut self, head: u16, used_len: u32) {
             let u = Self::device_off();
             let slot = (self.used_idx as usize) & (Q - 1);
+            // SAFETY: single-threaded test; the offset lies within the live, test-owned virtqueue region.
             unsafe {
                 self.w32(u + 4 + slot * 8, head as u32);
                 self.w32(u + 4 + slot * 8 + 4, used_len);
             }
             fence(Ordering::Release);
             self.used_idx = self.used_idx.wrapping_add(1);
+            // SAFETY: single-threaded test; the offset lies within the live, test-owned virtqueue region.
             unsafe { self.w16(u + 2, self.used_idx) };
         }
 
@@ -395,6 +406,7 @@ mod tests {
             let addr = self.desc_addr(head) as *mut u8;
             let cap = self.desc_len(head) as usize;
             let n = frame.len().min(cap);
+            // SAFETY: `addr` is the real backing buffer the descriptor names and `n = min(frame, cap)` stays within it.
             unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), addr, n) };
             self.complete(head, used_len);
             head
@@ -406,6 +418,7 @@ mod tests {
             let head = self.next_avail().expect("a frame was posted");
             let addr = self.desc_addr(head) as *const u8;
             let len = self.desc_len(head) as usize;
+            // SAFETY: `addr`/`len` come from the descriptor the driver posted, naming a live buffer of that length.
             let bytes = unsafe { core::slice::from_raw_parts(addr, len) }.to_vec();
             self.complete(head, len as u32);
             bytes
@@ -427,6 +440,7 @@ mod tests {
             let pipeline = Box::new(Pipeline::new());
             let mut region = VqRegion::boxed();
             let ptr = region.0.as_mut_ptr();
+            // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned solely by this test — `Vq::new`'s contract.
             let vq = unsafe { Vq::new(ptr) };
             let device = FakeDevice::new(ptr);
             // The device writes to the descriptor address as a real pointer, so
@@ -457,6 +471,7 @@ mod tests {
             let pipeline = Box::new(Pipeline::new());
             let mut region = VqRegion::boxed();
             let ptr = region.0.as_mut_ptr();
+            // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned solely by this test — `Vq::new`'s contract.
             let vq = unsafe { Vq::new(ptr) };
             let device = FakeDevice::new(ptr);
             // `post` computes buffer addresses via `Pipeline::buffer_paddr`

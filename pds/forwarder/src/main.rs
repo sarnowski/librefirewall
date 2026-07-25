@@ -24,10 +24,11 @@ use sel4_microkit::{
 
 #[protection_domain]
 fn init() -> Forwarder {
-    // SAFETY: patched to the pipeline regions shared read-write with the two
-    // driver PDs.
+    // SAFETY: patched to the pipeline region shared read-write with driver 0 —
+    // `Pipeline::attach`'s contract.
     let pipe0 =
         unsafe { Pipeline::attach(memory_region_symbol!(pipe0_vaddr: *mut Pipeline).as_ptr()) };
+    // SAFETY: as above, for the pipeline region shared with driver 1.
     let pipe1 =
         unsafe { Pipeline::attach(memory_region_symbol!(pipe1_vaddr: *mut Pipeline).as_ptr()) };
     debug_println!("LIBREFIREWALL_FWD:start");
