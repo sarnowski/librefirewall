@@ -1,0 +1,84 @@
+//! `verify-reproducible`: build the image twice from scratch and prove the
+//! deployable boot payload is byte-identical.
+//!
+//! Only the loose boot payload — the seL4 kernel and the Microkit system image
+//! — is compared. It carries no signature, key, or SBOM timestamp, so it must
+//! reproduce exactly from the same pinned inputs (and empirically does, even
+//! across a wiped build tree). The signed disk, manifest, SBOM, and checksums
+//! are deliberately excluded: the development signatures embed a per-build GPG
+//! creation time and syft stamps each SBOM with a fresh document id, so those
+//! artifacts differ between builds by design of the dev trust anchor and the
+//! SBOM tool, not because the build is non-deterministic. Once deterministic
+//! release signing exists, the signed disk can join the compared set.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    artifacts::{DIST_KERNEL, DIST_SYSTEM},
+    image::{self, DEBUG_CONFIG},
+    util::{copy_file, recreate_dir},
+};
+
+/// The artifacts compared for byte-identity: the loose boot payload only.
+const REPRODUCIBLE_ARTIFACTS: &[&str] = &[DIST_KERNEL, DIST_SYSTEM];
+
+pub(crate) fn verify_reproducible(root: &Path) -> Result<(), String> {
+    let scratch = root.join("build/image/reproducible");
+    recreate_dir(&scratch)?;
+
+    let first = build_and_capture(root, &scratch, "a")?;
+    let second = build_and_capture(root, &scratch, "b")?;
+
+    let mut diffs = Vec::new();
+    for name in REPRODUCIBLE_ARTIFACTS {
+        let a = fs::read(first.join(name))
+            .map_err(|error| format!("read {name} (build a): {error}"))?;
+        let b = fs::read(second.join(name))
+            .map_err(|error| format!("read {name} (build b): {error}"))?;
+        if a == b {
+            println!(
+                "verify-reproducible: {name} reproduced byte-for-byte ({} bytes)",
+                a.len()
+            );
+        } else {
+            diffs.push(format!(
+                "  {name}: build a is {} bytes, build b is {} bytes",
+                a.len(),
+                b.len()
+            ));
+        }
+    }
+
+    if diffs.is_empty() {
+        println!(
+            "verify-reproducible: all {} deployable payload artifact(s) are byte-identical \
+             across two isolated builds",
+            REPRODUCIBLE_ARTIFACTS.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "verify-reproducible: {} artifact(s) did not reproduce:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        ))
+    }
+}
+
+/// Build the image from a wiped per-config target tree (forcing a genuine
+/// recompile and repackage rather than reusing cached outputs) and copy the
+/// compared artifacts out of `dist/` into `scratch/<tag>`.
+fn build_and_capture(root: &Path, scratch: &Path, tag: &str) -> Result<PathBuf, String> {
+    recreate_dir(&root.join("target").join(DEBUG_CONFIG))?;
+    image::image(root, DEBUG_CONFIG)?;
+
+    let out = scratch.join(tag);
+    recreate_dir(&out)?;
+    for name in REPRODUCIBLE_ARTIFACTS {
+        copy_file(&root.join("dist").join(name), &out.join(name))?;
+    }
+    Ok(out)
+}

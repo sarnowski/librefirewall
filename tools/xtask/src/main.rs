@@ -34,6 +34,7 @@ mod host;
 mod image;
 mod pins;
 mod qemu;
+mod reproducible;
 mod signing;
 mod util;
 
@@ -65,6 +66,7 @@ fn run() -> Result<(), String> {
         "coverage" => host::coverage(&root),
         "bench" => host::bench(&root),
         "fuzz" => host::fuzz(&root),
+        "verify-reproducible" => reproducible::verify_reproducible(&root),
         "test-system" => {
             image::image(&root, image::DEBUG_CONFIG)?;
             qemu::test_system(&root)
@@ -93,6 +95,6 @@ fn run() -> Result<(), String> {
 
 fn usage() -> String {
     // `test` and `test-host` are aliases for the same fast host gate.
-    "usage: cargo xtask <image|run|test|test-host|coverage|bench|fuzz|test-system|test-ab|ci|release|clean>"
+    "usage: cargo xtask <image|run|test|test-host|coverage|bench|fuzz|verify-reproducible|test-system|test-ab|ci|release|clean>"
         .to_owned()
 }
