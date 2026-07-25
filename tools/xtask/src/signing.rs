@@ -103,3 +103,39 @@ fn gpg(home: &Path) -> Command {
     command.env("GNUPGHOME", home);
     command
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fingerprint;
+
+    // gpg `--with-colons` output: the fingerprint is the tenth colon field of
+    // the `fpr:` record (all leading fields empty).
+    const FPR: &str = "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333";
+
+    #[test]
+    fn extracts_the_fingerprint_from_colon_output() {
+        let output = format!(
+            "tru::1:1700000000:0:3:1:5\n\
+             pub:-:3072:1:0011223344556677:1700000000:::-:::scESC::::::23::0:\n\
+             fpr:::::::::{FPR}:\n\
+             uid:-::::1700000000::0011::librefirewall development signing::::::::::0:\n"
+        );
+        assert_eq!(parse_fingerprint(&output).unwrap(), FPR);
+    }
+
+    #[test]
+    fn absent_fingerprint_is_an_error() {
+        let output = "tru::1:1700000000:0:3:1:5\npub:-:3072:1:0011223344556677:\n";
+        let error = parse_fingerprint(output).unwrap_err();
+        assert!(error.contains("no fingerprint"), "got: {error}");
+    }
+
+    #[test]
+    fn a_keyring_with_several_keys_yields_the_first_fingerprint() {
+        // Two keys (e.g. an interrupted regeneration): the first fpr wins, so
+        // the manifest fingerprint is deterministic given the keyring order.
+        let second = "9999888877776666555544443333222211110000";
+        let output = format!("fpr:::::::::{FPR}:\nfpr:::::::::{second}:\n");
+        assert_eq!(parse_fingerprint(&output).unwrap(), FPR);
+    }
+}

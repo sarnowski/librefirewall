@@ -75,6 +75,31 @@ const PARTITIONS: &[Partition] = &[
     },
 ];
 
+// Compile-time layout invariants the `dd` seek math in `write_disk` relies on:
+// partition numbers run 1..N in order, no two partitions overlap, and the whole
+// layout fits within the disk. A mis-edit that broke any of these would produce
+// overlapping writes, so it must fail the build rather than corrupt a disk.
+const _: () = {
+    let mut index = 0;
+    let mut cursor = 0;
+    while index < PARTITIONS.len() {
+        assert!(
+            PARTITIONS[index].number == index + 1,
+            "partition numbers must run 1..N in slice order"
+        );
+        assert!(
+            PARTITIONS[index].start_mib >= cursor,
+            "partitions must not overlap"
+        );
+        cursor = PARTITIONS[index].start_mib + PARTITIONS[index].size_mib;
+        index += 1;
+    }
+    assert!(
+        cursor <= DISK_SIZE_MIB,
+        "partitions must fit within the disk"
+    );
+};
+
 /// Build the signed GPT A/B disk from the kernel and system image already in
 /// `build`, returning the development signing key's fingerprint for the
 /// manifest. Both slots are seeded with the same signed release and A is
@@ -219,4 +244,31 @@ fn write_disk(disk: &Path, parts: &Path) -> Result<(), String> {
 pub(crate) fn disk_at(disk: &Path, label: &str) -> String {
     let bytes = part(label).start_mib * 1024 * 1024;
     format!("{}@@{}", disk.display(), bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DISK_SIZE_MIB, PARTITIONS, part};
+
+    #[test]
+    fn partitions_are_ordered_non_overlapping_and_fit_the_disk() {
+        let mut cursor = 0;
+        for (index, partition) in PARTITIONS.iter().enumerate() {
+            assert_eq!(partition.number, index + 1, "numbers run 1..N in order");
+            assert!(
+                partition.start_mib >= cursor,
+                "{} overlaps the previous partition",
+                partition.label
+            );
+            cursor = partition.start_mib + partition.size_mib;
+        }
+        assert!(cursor <= DISK_SIZE_MIB, "layout exceeds the disk size");
+    }
+
+    #[test]
+    fn part_resolves_every_declared_label() {
+        for partition in PARTITIONS {
+            assert_eq!(part(partition.label).number, partition.number);
+        }
+    }
 }

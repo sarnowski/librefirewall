@@ -7,11 +7,6 @@
 //! timeout. The observable contract is the frames themselves on the sockets,
 //! not serial text; the guest serial output is captured to a log and returned
 //! for callers that additionally assert on boot-manager messages.
-//!
-//! This module is intentionally self-contained: it duplicates the small
-//! process and capture helpers from `main.rs` rather than depending on its
-//! private items, so it can be dropped into the `xtask` binary with a single
-//! `mod forward_harness;`.
 
 use std::{
     fs,
@@ -88,9 +83,28 @@ impl NicBackends {
 /// directories are created), whether the test passes or fails, and is returned
 /// on success; QEMU is always killed and reaped on every exit path.
 pub fn run_forward_test(
+    command: Command,
+    backends: NicBackends,
+    log_path: &Path,
+) -> Result<Vec<u8>, String> {
+    run_forward(
+        command,
+        backends,
+        log_path,
+        ACCEPT_TIMEOUT,
+        FORWARD_TEST_TIMEOUT,
+    )
+}
+
+/// The forwarding-test engine with the two timeout budgets injected, so the
+/// timeout and early-exit paths can be exercised in tests without the
+/// production 20 s / 180 s waits.
+fn run_forward(
     mut command: Command,
     backends: NicBackends,
     log_path: &Path,
+    accept_timeout: Duration,
+    total_timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -147,10 +161,10 @@ pub fn run_forward_test(
                 Ok(None) => {}
                 Err(error) => break 'run Err(format!("poll QEMU: {error}")),
             }
-            if start.elapsed() >= ACCEPT_TIMEOUT {
+            if start.elapsed() >= accept_timeout {
                 break 'run Err(format!(
                     "QEMU did not connect both NIC sockets within {}s",
-                    ACCEPT_TIMEOUT.as_secs()
+                    accept_timeout.as_secs()
                 ));
             }
             thread::sleep(Duration::from_millis(25));
@@ -219,11 +233,11 @@ pub fn run_forward_test(
                 Ok(None) => {}
                 Err(error) => break 'run Err(format!("poll QEMU: {error}")),
             }
-            if start.elapsed() >= FORWARD_TEST_TIMEOUT {
+            if start.elapsed() >= total_timeout {
                 break 'run Err(format!(
                     "timed out after {}s waiting for forwarded frames \
                      (port0->port1 seen: {}, port1->port0 seen: {}); see {}",
-                    FORWARD_TEST_TIMEOUT.as_secs(),
+                    total_timeout.as_secs(),
                     forwarded[0],
                     forwarded[1],
                     log_path.display()
@@ -494,5 +508,103 @@ mod tests {
         assert_eq!(receiver.recv().unwrap(), (1, second));
         assert!(receiver.recv().is_err(), "decoder must close after EOF");
         decoder.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn frame_decoder_rejects_an_implausible_length() {
+        // A length header beyond MAX_WIRE_FRAME is a corrupt stream, not a
+        // jumbo frame: the decoder must fail with InvalidData and emit nothing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut writer = TcpStream::connect(address).unwrap();
+        let (stream, _peer) = listener.accept().unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let decoder = spawn_frame_decoder(0, stream, sender);
+
+        writer
+            .write_all(&((MAX_WIRE_FRAME as u32) + 1).to_be_bytes())
+            .unwrap();
+
+        let error = decoder.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(receiver.recv().is_err(), "no frame may be emitted");
+        drop(writer);
+    }
+
+    #[test]
+    fn frame_decoder_decodes_a_zero_length_frame_as_empty() {
+        // A zero-length frame is accepted (not rejected) and surfaces as an
+        // empty vec; it can never equal an injected frame, so it is harmless.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut writer = TcpStream::connect(address).unwrap();
+        let (stream, _peer) = listener.accept().unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let decoder = spawn_frame_decoder(2, stream, sender);
+
+        writer.write_all(&0u32.to_be_bytes()).unwrap();
+        drop(writer);
+
+        assert_eq!(receiver.recv().unwrap(), (2, Vec::new()));
+        assert!(receiver.recv().is_err(), "decoder closes after EOF");
+        decoder.join().unwrap().unwrap();
+    }
+
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lf-fwd-{}-{name}.log", std::process::id()))
+    }
+
+    #[test]
+    fn run_forward_reports_a_child_that_exits_before_connecting() {
+        // `true` exits immediately without ever dialing the NIC listeners, so
+        // the accept phase must fail fast — and still persist the serial log.
+        let log = temp_log("early-exit");
+        let _ = fs::remove_file(&log);
+        let backends = NicBackends::new().unwrap();
+
+        let error = run_forward(
+            Command::new("true"),
+            backends,
+            &log,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("exited before connecting"),
+            "unexpected error: {error}"
+        );
+        assert!(log.is_file(), "the serial log must be written on failure");
+        let _ = fs::remove_file(&log);
+    }
+
+    #[test]
+    fn run_forward_times_out_when_the_child_never_connects() {
+        // A live child that never dials the listeners must trip the accept
+        // timeout rather than hang, and the child must be reaped.
+        let log = temp_log("accept-timeout");
+        let _ = fs::remove_file(&log);
+        let backends = NicBackends::new().unwrap();
+        let mut child = Command::new("sleep");
+        child.arg("30");
+
+        let error = run_forward(
+            child,
+            backends,
+            &log,
+            Duration::from_millis(300),
+            Duration::from_millis(600),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("did not connect both NIC sockets"),
+            "unexpected error: {error}"
+        );
+        assert!(log.is_file(), "the serial log must be written on failure");
+        let _ = fs::remove_file(&log);
     }
 }
