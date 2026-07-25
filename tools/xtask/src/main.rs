@@ -32,6 +32,7 @@ mod forward_harness;
 mod grub;
 mod host;
 mod image;
+mod pins;
 mod qemu;
 mod signing;
 mod util;

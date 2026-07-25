@@ -13,7 +13,6 @@ use std::{fs, path::Path, process::Command};
 use crate::util::run_command;
 
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
-pub(crate) const GRUB_VERSION: &str = "2.14";
 
 pub(crate) fn build_grub_efi(root: &Path, pubkey: &Path, output: &Path) -> Result<(), String> {
     let modules = fs::read_to_string(root.join("third-party/grub/modules.txt"))

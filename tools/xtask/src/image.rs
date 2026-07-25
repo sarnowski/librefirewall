@@ -13,6 +13,7 @@ use std::{path::Path, process::Command};
 use crate::{
     artifacts::{DIST_KERNEL, DIST_REPORT, DIST_SYSTEM},
     disk, evidence,
+    pins::{self, Pins},
     util::{copy_file, recreate_dir, run_command},
 };
 
@@ -22,15 +23,14 @@ pub(crate) const DEBUG_CONFIG: &str = "debug";
 pub(crate) const RELEASE_CONFIG: &str = "release";
 const MICROKIT_SDK: &str = "/opt/microkit";
 const RUST_SEL4: &str = "/opt/rust-sel4";
-pub(crate) const RUST_SEL4_VERSION: &str = "5.0.0";
-pub(crate) const MICROKIT_VERSION: &str = "2.3.0";
 
 const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
 /// Protection-domain binaries the system image is assembled from.
 const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder"];
 
 pub(crate) fn image(root: &Path, config: &str) -> Result<(), String> {
-    verify_inputs(config)?;
+    let pins = pins::read(root)?;
+    verify_inputs(config, &pins)?;
 
     let build = root.join("build/image").join(config);
     let dist = root.join("dist");
@@ -95,22 +95,22 @@ pub(crate) fn image(root: &Path, config: &str) -> Result<(), String> {
 
     let fingerprint = disk::assemble_disk(root, &build, &dist)?;
 
-    evidence::write_manifest(&dist, config, &fingerprint)?;
+    evidence::write_manifest(&dist, config, &fingerprint, &pins)?;
     evidence::write_sbom(root, &dist)?;
     evidence::write_checksums(&dist)?;
     println!("packaged boot artifacts in {}", dist.display());
     Ok(())
 }
 
-fn verify_inputs(config: &str) -> Result<(), String> {
+fn verify_inputs(config: &str, pins: &Pins) -> Result<(), String> {
     verify_version(
         &Path::new(RUST_SEL4).join("VERSION"),
-        RUST_SEL4_VERSION,
+        &pins.rust_sel4_version,
         "rust-sel4",
     )?;
     verify_version(
         &Path::new(MICROKIT_SDK).join("VERSION"),
-        MICROKIT_VERSION,
+        &pins.microkit_version,
         "Microkit SDK",
     )?;
     crate::util::require_file(&Path::new(MICROKIT_SDK).join("bin/microkit"))?;

@@ -59,14 +59,12 @@ impl NicBackends {
         })
     }
 
-    /// Append the two socket-backed virtio NICs to a QEMU invocation, at the
-    /// PCI addresses the system description pins (00:02.0 and 00:03.0). The
-    /// devices carry no option ROM (`romfile=`), so the firmware gains no
-    /// PXE boot payload from them.
+    /// Append the two socket-backed virtio NICs to a QEMU invocation. Each
+    /// port's `socket` netdev dials the corresponding host listener; the
+    /// `-device` string (PCI address, MAC, no option ROM) is the single
+    /// definition shared with interactive runs via [`crate::qemu::nic_device`].
     pub fn apply(&self, command: &mut Command) -> Result<(), String> {
-        for (port, (listener, pci_device)) in
-            self.listeners.iter().zip(["02.0", "03.0"]).enumerate()
-        {
+        for (port, listener) in self.listeners.iter().enumerate() {
             let tcp = listener
                 .local_addr()
                 .map_err(|error| format!("read listener port: {error}"))?
@@ -75,10 +73,7 @@ impl NicBackends {
                 .arg("-netdev")
                 .arg(format!("socket,id=n{port},connect=127.0.0.1:{tcp}"))
                 .arg("-device")
-                .arg(format!(
-                    "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
-                     mac=52:54:00:12:34:5{port},bus=pcie.0,addr={pci_device},romfile=",
-                ));
+                .arg(crate::qemu::nic_device(port));
         }
         Ok(())
     }

@@ -12,8 +12,8 @@ use crate::{
     artifacts::{
         DIST_CHECKSUMS, DIST_DISK, DIST_KERNEL, DIST_MANIFEST, DIST_REPORT, DIST_SBOM, DIST_SYSTEM,
     },
-    grub::GRUB_VERSION,
-    image::{BOARD, MICROKIT_VERSION, RUST_SEL4_VERSION, TARGET},
+    image::{BOARD, TARGET},
+    pins::Pins,
     util::run_command,
 };
 
@@ -21,6 +21,7 @@ pub(crate) fn write_manifest(
     dist: &Path,
     config: &str,
     key_fingerprint: &str,
+    pins: &Pins,
 ) -> Result<(), String> {
     let manifest = format!(
         concat!(
@@ -36,11 +37,11 @@ pub(crate) fn write_manifest(
             "}}\n"
         ),
         TARGET,
-        MICROKIT_VERSION,
+        pins.microkit_version,
         BOARD,
         config,
-        RUST_SEL4_VERSION,
-        GRUB_VERSION,
+        pins.rust_sel4_version,
+        pins.grub_version,
         key_fingerprint,
         DIST_DISK,
         DIST_DISK,
