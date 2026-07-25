@@ -15,9 +15,14 @@ use crate::util::run_command;
 const GRUB_MODULES_DIR: &str = "/opt/grub/lib/grub/x86_64-efi";
 
 pub(crate) fn build_grub_efi(root: &Path, pubkey: &Path, output: &Path) -> Result<(), String> {
-    let modules = fs::read_to_string(root.join("third-party/grub/modules.txt"))
-        .map_err(|error| format!("read grub modules list: {error}"))?
-        .split_whitespace()
+    let modules_file = fs::read_to_string(root.join("third-party/grub/modules.txt"))
+        .map_err(|error| format!("read grub modules list: {error}"))?;
+    // One module per line; `#` comments (the header documenting the allowlist)
+    // and blank lines are ignored.
+    let modules = modules_file
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>()
         .join(" ");
     let config = root.join("third-party/grub/grub.cfg");

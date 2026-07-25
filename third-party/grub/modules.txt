@@ -1,18 +1,26 @@
+# Modules baked into the signed standalone GRUB core image (consumed by
+# grub-mkstandalone --modules, see tools/xtask/src/grub.rs). This list IS the
+# verified-boot base's attack surface: every module here is code inside the
+# signed EFI binary, so it stays minimal and every entry must be load-bearing
+# for grub.cfg. Non-obvious entries, and why they are needed:
+#
+#   part_gpt      read the GPT partition table (the disk is GPT)
+#   fat           read the FAT filesystems on ESP/STATE/slot partitions
+#   normal        GRUB's normal mode; runs the embedded grub.cfg
+#   multiboot2    the multiboot2/module2 loader seL4's x86 boot path requires
+#   test          the `[ ... ]` conditionals in grub.cfg's slot logic
+#   echo          the slot-selection messages (also asserted by the A/B test)
+#   halt          halt on the no-bootable-slot recovery path
+#   loadenv       load_env/save_env for the grubenv boot-selection state
+#   pgp           enforce detached-signature verification on loaded files
+#   gcry_rsa      RSA verification backend for pgp
+#   gcry_sha256   SHA-256 digest backend for pgp
 part_gpt
 fat
 normal
-multiboot
 multiboot2
-all_video
-efi_gop
-video
-video_fb
-search
-search_label
-search_fs_uuid
 test
 echo
-sleep
 halt
 loadenv
 pgp
