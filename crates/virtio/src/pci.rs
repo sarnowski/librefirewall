@@ -498,14 +498,35 @@ mod tests {
                 bytes: Box::new([0u8; 4096]),
             }
         }
+        fn w8(&mut self, off: usize, v: u8) {
+            self.bytes[off] = v;
+        }
         fn w16(&mut self, off: usize, v: u16) {
             self.bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
         }
         fn w32(&mut self, off: usize, v: u32) {
             self.bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
+        fn r8(&self, off: usize) -> u8 {
+            self.bytes[off]
+        }
+        fn r16(&self, off: usize) -> u16 {
+            u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+        }
+        fn r32(&self, off: usize) -> u32 {
+            u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap())
+        }
+        fn r64(&self, off: usize) -> u64 {
+            u64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap())
+        }
         fn config(&mut self) -> PciConfig {
             unsafe { PciConfig::new(self.bytes.as_mut_ptr()) }
+        }
+        // A `CommonCfg` mapped over this buffer's base, so its register methods
+        // can be driven against plain backing memory the test seeds and reads
+        // back — the same pointer-into-a-Box pattern the queue tests use.
+        fn common(&mut self) -> CommonCfg {
+            unsafe { CommonCfg::new(self.bytes.as_mut_ptr()) }
         }
         // Write a virtio cap at `at`, chaining to `next`.
         fn put_cap(&mut self, at: usize, next: u8, cfg_type: u8, bar: u8, offset: u32, len: u8) {
@@ -651,5 +672,268 @@ mod tests {
         let config = fake.config();
         assert!(config.bar_is_64bit(4));
         assert!(!config.bar_is_64bit(2));
+    }
+
+    #[test]
+    fn bar_type_rejects_an_io_space_bar() {
+        let mut fake = FakeConfig::new();
+        // Bit 0 set marks an I/O-space BAR, which is never a 64-bit memory pair.
+        fake.w32(PCI_BAR0 as usize + 3 * 4, 0x0000_0001);
+        assert!(!fake.config().bar_is_64bit(3));
+    }
+
+    #[test]
+    fn enable_memory_and_bus_master_sets_only_those_command_bits() {
+        let mut fake = FakeConfig::new();
+        // A device whose command register already has I/O decode (bit 0) on:
+        // the call must OR in memory + bus-master and disturb nothing else.
+        fake.w16(PCI_COMMAND as usize, 0x0001);
+        fake.config().enable_memory_and_bus_master();
+        assert_eq!(
+            fake.r16(PCI_COMMAND as usize),
+            0x0001 | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER
+        );
+    }
+
+    #[test]
+    fn reprogram_bar64_writes_low_and_high_with_memory_decode_disabled() {
+        let mut fake = FakeConfig::new();
+        // Memory + bus-master + I/O all enabled going in; the high half of the
+        // BAR pair holds stale bits that must be cleared to zero.
+        fake.w16(
+            PCI_COMMAND as usize,
+            PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER | 0x0001,
+        );
+        fake.w32(PCI_BAR0 as usize + 4 * 4 + 4, 0xFFFF_FFFF);
+        fake.config().reprogram_bar64(4, 0x5000_0000);
+        // Low half receives the address; high half is zeroed (address < 4 GiB).
+        assert_eq!(fake.r32(PCI_BAR0 as usize + 4 * 4), 0x5000_0000);
+        assert_eq!(fake.r32(PCI_BAR0 as usize + 4 * 4 + 4), 0);
+        // Memory decode was disabled across the change and not re-enabled here;
+        // the untouched bus-master and I/O bits remain.
+        let command = fake.r16(PCI_COMMAND as usize);
+        assert_eq!(command & PCI_COMMAND_MEMORY, 0);
+        assert_eq!(command & PCI_COMMAND_BUS_MASTER, PCI_COMMAND_BUS_MASTER);
+        assert_eq!(command & 0x0001, 0x0001);
+    }
+
+    #[test]
+    fn common_cfg_reads_and_writes_status() {
+        let mut fake = FakeConfig::new();
+        let cfg = fake.common();
+        cfg.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+        assert_eq!(cfg.status(), STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+        assert_eq!(
+            fake.r8(CFG_DEVICE_STATUS),
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER
+        );
+    }
+
+    #[test]
+    fn common_cfg_reads_num_queues() {
+        let mut fake = FakeConfig::new();
+        fake.w16(CFG_NUM_QUEUES, 2);
+        assert_eq!(fake.common().num_queues(), 2);
+    }
+
+    #[test]
+    fn common_cfg_device_features_reads_across_both_selector_windows() {
+        let mut fake = FakeConfig::new();
+        // The device-feature register is one 32-bit window multiplexed by the
+        // select field; a plain buffer presents the same value in both windows,
+        // so the assembled result is `low | (low << 32)`. The point of the test
+        // is that the read targets CFG_DEVICE_FEATURE, assembles the halves with
+        // the high word shifted, and leaves the selector advanced to window 1.
+        fake.w32(CFG_DEVICE_FEATURE, 0xDEAD_BEEF);
+        let features = fake.common().device_features();
+        assert_eq!(features, 0xDEAD_BEEF | (0xDEAD_BEEF << 32));
+        assert_eq!(fake.r32(CFG_DEVICE_FEATURE_SELECT), 1);
+    }
+
+    #[test]
+    fn common_cfg_set_driver_features_writes_the_high_half_last() {
+        let mut fake = FakeConfig::new();
+        fake.common().set_driver_features(0x1122_3344_5566_7788);
+        // The write sequence ends with the high window selected and the high
+        // 32 bits in the feature register; a swapped half-order or a wrong
+        // offset changes this observable final state.
+        assert_eq!(fake.r32(CFG_DRIVER_FEATURE_SELECT), 1);
+        assert_eq!(fake.r32(CFG_DRIVER_FEATURE), 0x1122_3344);
+    }
+
+    #[test]
+    fn setup_queue_programs_the_areas_and_returns_the_notify_offset() {
+        let mut fake = FakeConfig::new();
+        // The device advertises a queue max at least as large as our layout and
+        // a notify offset the driver must return unchanged.
+        fake.w16(CFG_QUEUE_SIZE, 32);
+        fake.w16(CFG_QUEUE_NOTIFY_OFF, 7);
+        let layout = QueueLayout {
+            size: 16,
+            descriptor_offset: 0,
+            driver_offset: 256,
+            device_offset: 296,
+            total_bytes: 430,
+        };
+        let ring_paddr = 0x5000_0000u64;
+        let notify_off = fake.common().setup_queue(1, &layout, ring_paddr);
+
+        assert_eq!(notify_off, 7);
+        assert_eq!(fake.r16(CFG_QUEUE_SELECT), 1);
+        // The driver clamps the programmed size to its own layout, not the
+        // device's larger maximum.
+        assert_eq!(fake.r16(CFG_QUEUE_SIZE), 16);
+        // The three area addresses are written as 64-bit values, low half first,
+        // at their contiguous offsets from the ring base.
+        assert_eq!(
+            fake.r64(CFG_QUEUE_DESC),
+            ring_paddr + layout.descriptor_offset as u64
+        );
+        assert_eq!(
+            fake.r64(CFG_QUEUE_DRIVER),
+            ring_paddr + layout.driver_offset as u64
+        );
+        assert_eq!(
+            fake.r64(CFG_QUEUE_DEVICE),
+            ring_paddr + layout.device_offset as u64
+        );
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "device has no virtqueue at this index")]
+    fn setup_queue_rejects_a_zero_device_queue_size() {
+        let mut fake = FakeConfig::new();
+        // A device-reported max of 0 means the queue does not exist.
+        fake.w16(CFG_QUEUE_SIZE, 0);
+        let layout = QueueLayout {
+            size: 16,
+            descriptor_offset: 0,
+            driver_offset: 256,
+            device_offset: 296,
+            total_bytes: 430,
+        };
+        let _ = fake.common().setup_queue(0, &layout, 0x5000_0000);
+    }
+
+    #[test]
+    #[should_panic(expected = "device virtqueue smaller than the required layout")]
+    fn setup_queue_rejects_a_device_queue_smaller_than_the_layout() {
+        let mut fake = FakeConfig::new();
+        // The device offers only 8 descriptors; programming 16 is a protocol
+        // violation the driver must refuse.
+        fake.w16(CFG_QUEUE_SIZE, 8);
+        let layout = QueueLayout {
+            size: 16,
+            descriptor_offset: 0,
+            driver_offset: 256,
+            device_offset: 296,
+            total_bytes: 430,
+        };
+        let _ = fake.common().setup_queue(0, &layout, 0x5000_0000);
+    }
+
+    #[test]
+    fn reset_returns_once_status_reads_zero() {
+        let mut fake = FakeConfig::new();
+        // The status byte is already zero (a fresh device), so the reset writes
+        // zero and observes the acknowledgement immediately without spinning.
+        fake.w8(CFG_DEVICE_STATUS, 0);
+        fake.common().reset();
+        assert_eq!(fake.r8(CFG_DEVICE_STATUS), 0);
+    }
+
+    #[test]
+    fn notify_queue_writes_the_index_at_the_computed_slot() {
+        // A dedicated notify window (separate from config space) large enough to
+        // hold the doorbell at offset notify_off * multiplier.
+        let mut notify = Box::new([0u8; 256]);
+        // SAFETY: the pointer names the whole boxed window, valid for the call,
+        // and `3 * 4 = 12` leaves room for a u16 within 256 bytes.
+        unsafe { notify_queue(notify.as_mut_ptr(), 3, 4, 1) };
+        assert_eq!(u16::from_le_bytes([notify[12], notify[13]]), 1);
+        // Nothing was written at the base slot.
+        assert_eq!(u16::from_le_bytes([notify[0], notify[1]]), 0);
+    }
+
+    #[test]
+    fn skips_a_short_vendor_capability() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // The four real structures live in BAR 4; a trailing vendor cap shorter
+        // than 16 bytes names BAR 2. It must be ignored on its length alone: if
+        // the short cap were not skipped, recording its BAR would trip
+        // MultipleBars instead of resolving cleanly.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x0000, 16);
+        fake.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
+        fake.w32(0x50 + 16, 4);
+        fake.put_cap(0x64, 0x74, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
+        fake.put_cap(0x74, 0x88, VIRTIO_PCI_CAP_DEVICE_CFG, 4, 0x2000, 16);
+        fake.put_cap(0x88, 0x00, VIRTIO_PCI_CAP_COMMON_CFG, 2, 0x9999, 8);
+        let caps = find_virtio_caps(&fake.config()).unwrap();
+        assert_eq!(caps.common, 0x0000);
+        assert_eq!(caps.bar, 4);
+    }
+
+    #[test]
+    fn ignores_a_notify_capability_that_is_too_short() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // A notify cap needs at least 20 bytes (it carries the multiplier); a
+        // 16-byte one is not accepted, leaving notify absent.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
+        fake.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 16);
+        fake.put_cap(0x64, 0x74, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
+        fake.put_cap(0x74, 0x00, VIRTIO_PCI_CAP_DEVICE_CFG, 4, 0x2000, 16);
+        assert_eq!(
+            find_virtio_caps(&fake.config()),
+            Err(CapError::MissingStructure)
+        );
+    }
+
+    #[test]
+    fn keeps_the_first_of_a_duplicated_capability_type() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // Two common caps: `get_or_insert` keeps the first offset seen.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x1111, 16);
+        fake.put_cap(0x50, 0x60, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x2222, 16);
+        fake.put_cap(0x60, 0x74, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
+        fake.w32(0x60 + 16, 4);
+        fake.put_cap(0x74, 0x84, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
+        fake.put_cap(0x84, 0x00, VIRTIO_PCI_CAP_DEVICE_CFG, 4, 0x2000, 16);
+        assert_eq!(find_virtio_caps(&fake.config()).unwrap().common, 0x1111);
+    }
+
+    #[test]
+    fn ignores_a_pci_cfg_capability_in_a_different_bar() {
+        let mut fake = FakeConfig::new();
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        // A type-5 (PCI_CFG) cap legitimately references another BAR; it is not
+        // one of the four mapped structures, so it must not trip MultipleBars.
+        fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
+        fake.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
+        fake.w32(0x50 + 16, 4);
+        fake.put_cap(0x64, 0x74, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
+        fake.put_cap(0x74, 0x84, VIRTIO_PCI_CAP_DEVICE_CFG, 4, 0x2000, 16);
+        fake.put_cap(0x84, 0x00, 5, 2, 0x5000, 16);
+        assert_eq!(find_virtio_caps(&fake.config()).unwrap().bar, 4);
+    }
+
+    #[test]
+    fn rejects_a_cap_list_whose_pointer_is_zero() {
+        let mut fake = FakeConfig::new();
+        // The status bit claims a capability list, but the pointer is null: the
+        // walk visits nothing and every required structure is absent.
+        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
+        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x00;
+        assert_eq!(
+            find_virtio_caps(&fake.config()),
+            Err(CapError::MissingStructure)
+        );
     }
 }

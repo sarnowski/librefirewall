@@ -163,6 +163,7 @@ RUN --mount=type=secret,id=gropyus_ca,required=false \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked; \
     sysroot="$(rustc --print sysroot)/lib/rustlib/src/rust/library/sysroot/Cargo.toml"; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path "$sysroot"; \
+    chmod -R a+rX /opt/rust/cargo/registry; \
     rm -rf /tmp/*
 
 WORKDIR /workspace

@@ -20,6 +20,10 @@ version = "0.1.0"
 
 [workspace.dependencies]
 sel4-microkit = { path = "/opt/rust-sel4/crates/sel4-microkit" }
+# Property-testing framework, dev-dependency only (host test builds are `std`;
+# it never enters a `no_std`/PD build). Pinned here and resolved exactly through
+# Cargo.lock so the offline builder can fetch it.
+proptest = "1.11.0"
 
 # Lints applied to every workspace member via `[lints] workspace = true`. Only
 # lints that already pass everywhere belong here; the gate denies all warnings.
