@@ -1,9 +1,11 @@
 //! The host-side commands: the fast gate, coverage, benchmarks, fuzzing, clean.
 //!
 //! These run without booting seL4. [`test_host`] is the fast gate the pre-commit
-//! hook and CI share (format, host tests, Clippy with warnings denied, and the
-//! `cargo-deny` dependency/license/source policy). [`coverage`], [`bench`], and
-//! [`fuzz`] are measurement/discovery commands deliberately outside `ci`.
+//! hook and CI share (format, host tests, Clippy with warnings denied, the
+//! `cargo-deny` dependency/license/source policy, and the library coverage
+//! floor). [`fuzz`] additionally runs in the full `ci` gate (build every fuzz
+//! target and briefly exercise it). [`coverage`] and [`bench`] are
+//! measurement/discovery commands deliberately outside any gate.
 
 use std::{fs, path::Path, process::Command};
 
@@ -134,7 +136,8 @@ pub(crate) fn bench(root: &Path) -> Result<(), String> {
 /// command. The seed-corpus smoke tests (`cargo test --lib` in `fuzz/`) run
 /// unconditionally and exercise the identical harness functions the fuzz
 /// targets call, so the parsers are covered over valid inputs even when
-/// libFuzzer cannot run. Like `bench`, this is not part of `ci`.
+/// libFuzzer cannot run. This runs in the full `ci` gate (bounded per target);
+/// unlike `bench`, which stays measurement-only.
 pub(crate) fn fuzz(root: &Path) -> Result<(), String> {
     run_command(
         Command::new("cargo")

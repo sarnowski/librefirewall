@@ -80,12 +80,14 @@ fn run() -> Result<(), String> {
         }
         "ci" => {
             host::test_host(&root)?;
+            host::fuzz(&root)?;
             image::image(&root, image::DEBUG_CONFIG)?;
             qemu::test_system(&root)?;
             ab_test::test_ab(&root)
         }
         "release" => {
             host::test_host(&root)?;
+            host::fuzz(&root)?;
             image::image(&root, image::DEBUG_CONFIG)?;
             qemu::test_system(&root)?;
             ab_test::test_ab(&root)?;
