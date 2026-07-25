@@ -7,6 +7,10 @@
 //! the region (via the public [`QueueLayout`] offsets), so it measures the real
 //! reap path rather than `poll` returning `None`.
 
+// Benchmark target: no public API to document (the `criterion_group!` macro
+// expands to public items).
+#![allow(missing_docs)]
+
 use std::hint::black_box;
 use std::sync::atomic::{Ordering, fence};
 

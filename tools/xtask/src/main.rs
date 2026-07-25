@@ -22,6 +22,9 @@
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage.
 
+// Binary crate: no library API to document.
+#![allow(missing_docs)]
+
 use std::{env, process::ExitCode};
 
 mod ab_test;

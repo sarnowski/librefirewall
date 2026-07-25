@@ -1,5 +1,7 @@
 #![no_main]
 #![no_std]
+// Binary crate: no library API to document.
+#![allow(missing_docs)]
 
 //! virtio-net driver protection domain: it drives one dataplane port (QEMU
 //! q35, virtio 1.0 PCI). One instance runs per dataplane port of the current

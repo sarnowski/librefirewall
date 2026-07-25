@@ -7,6 +7,10 @@
 //! measurements; cross-core throughput against the 10 Gbit/s budget belongs in
 //! the QEMU/KVM forwarding regression, not here.
 
+// Benchmark target: no public API to document (the `criterion_group!` macro
+// expands to public items).
+#![allow(missing_docs)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

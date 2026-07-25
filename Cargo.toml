@@ -31,9 +31,13 @@ criterion = "0.7.0"
 
 # Lints applied to every workspace member via `[lints] workspace = true`. Only
 # lints that already pass everywhere belong here; the gate denies all warnings.
-# `missing_docs` is deliberately absent until every crate is fully documented.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# Every public item across the library crates carries rustdoc; enforced here so
+# an undocumented public API fails the build. The binary/tool crates (xtask, the
+# PD adapters) have no library API to document and opt out with a crate-root
+# `#![allow(missing_docs)]`.
+missing_docs = "deny"
 
 [profile.release]
 codegen-units = 1

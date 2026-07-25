@@ -1,5 +1,7 @@
 #![no_main]
 #![no_std]
+// Binary crate: no library API to document.
+#![allow(missing_docs)]
 
 //! Forwarder protection domain — the software stage between the two NIC
 //! ports.

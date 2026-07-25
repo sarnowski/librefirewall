@@ -22,6 +22,25 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "xtask",
 ];
 
+/// The six library crates held to the coverage floor: the portable `no_std`
+/// logic the firewall is built from. The binary/tool crates are excluded — the
+/// PD adapters are only observable under seL4, and `xtask` is host-tested for
+/// correctness but not held to the coverage bar (CONCEPT trust boundary).
+const LIBRARY_PACKAGES: &[&str] = &[
+    "wire",
+    "queue",
+    "packet-buffer",
+    "virtio",
+    "pd-runtime",
+    "nic-driver-core",
+];
+
+/// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced
+/// by the fast gate so a coverage regression fails locally and in CI. Set a few
+/// points below the measured ~98% combined coverage: a real floor that is not
+/// flaky. Raise it as coverage rises; never lower it to land a change.
+const LIBRARY_COVERAGE_FLOOR_PCT: u32 = 94;
+
 /// Crates carrying criterion microbenchmarks, run by `bench`. These are the
 /// perf-sensitive dataplane substrate crates whose hot operations the 10 Gbit/s
 /// budget depends on.
@@ -60,13 +79,26 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .current_dir(root)
             .args(["deny", "check", "bans", "licenses", "sources"]),
         "check dependency policy",
+    )?;
+    // Enforce the library-crate coverage floor: re-run the library tests under
+    // instrumentation and fail if combined line coverage drops below the floor,
+    // so a coverage regression is caught here and in CI, not merely measurable.
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["llvm-cov", "--locked", "--summary-only"])
+            .arg("--fail-under-lines")
+            .arg(LIBRARY_COVERAGE_FLOOR_PCT.to_string())
+            .args(LIBRARY_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
+        "enforce library coverage floor",
     )
 }
 
 /// Measure line coverage of the host packages and print the per-crate summary.
 /// This mirrors [`HOST_TEST_PACKAGES`] rather than the whole workspace because
-/// the protection-domain binaries only build for the seL4 target. No threshold
-/// is enforced yet; this makes coverage measurable on demand.
+/// the protection-domain binaries only build for the seL4 target. The gate's
+/// enforced floor is on [`LIBRARY_PACKAGES`] (see [`test_host`]); this command
+/// reports every host crate's number so the headroom above the floor is visible.
 pub(crate) fn coverage(root: &Path) -> Result<(), String> {
     run_command(
         Command::new("cargo")

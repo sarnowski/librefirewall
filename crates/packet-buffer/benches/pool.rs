@@ -7,6 +7,10 @@
 //! expected to be near-free; the bench exists to catch a regression if
 //! validation logic is ever added.
 
+// Benchmark target: no public API to document (the `criterion_group!` macro
+// expands to public items).
+#![allow(missing_docs)]
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
