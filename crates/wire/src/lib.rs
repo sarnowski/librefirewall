@@ -7,8 +7,25 @@
 //!
 //! A descriptor received from a peer is **untrusted**: its `buffer`, `offset`,
 //! and `len` must be range-validated by the receiver before the buffer they
-//! name is touched (see the `packet-buffer` crate). This crate defines the
-//! ABI; it does not enforce that validation.
+//! name is touched (`pd_runtime::descriptor_in_bounds`, backstopped by the
+//! `packet-buffer` accessors' own span checks). This crate defines the ABI; it
+//! does not enforce that validation, and it does not account ownership either
+//! — see [`Descriptor`].
+//!
+//! # Byte order
+//!
+//! Every field is a **little-endian** `u32`, and the type carries no
+//! byte-swapping code because none is needed: the project targets x86_64
+//! exclusively (CONCEPT §3), so the native representation of a `#[repr(C)]`
+//! struct of `u32`s already *is* the wire image. That is a deliberate
+//! consequence of the single-architecture decision rather than an oversight, and
+//! it is pinned by the byte-image tests below, so a future port to a big-endian
+//! target would fail them rather than silently ship swapped descriptors.
+//!
+//! The rule applies to the descriptor as it sits in a shared region, which is
+//! also how a peer protection domain reads it. It says nothing about network
+//! byte order in packet *payloads*: those are parsed by the protocol crates,
+//! which convert explicitly.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -20,10 +37,20 @@ use core::mem::{align_of, offset_of, size_of};
 /// bytes starting at `offset` within that buffer. The offset lets a producer
 /// hand over data that does not start at the buffer's front — for a NIC
 /// receive that is the frame after the device's header, published zero-copy
-/// without moving the bytes. Holding a descriptor is what "owning" the buffer
-/// means. The value is deliberately `Copy`: the ring moves it by value, and
-/// single ownership is enforced by the queue protocol, not by the borrow
-/// checker, which cannot reach across the shared-memory boundary.
+/// without moving the bytes. Handing a descriptor on is what transferring the
+/// buffer means.
+///
+/// The value is deliberately `Copy`, which means **holding one proves nothing
+/// about ownership**: enqueuing a descriptor leaves the producer with an
+/// identical value, and a descriptor in a ring is bytes on shared memory that a
+/// byzantine peer can write, so neither the borrow checker nor the queue
+/// protocol can make single ownership a property of this type — the `queue`
+/// crate explicitly disclaims it. What actually accounts ownership is the
+/// pool owner's ledger, `packet_buffer::FreeList`, which tracks buffers by
+/// identity and refuses to reclaim an index that is out of range or not
+/// outstanding, together with `pd_runtime::PoolOwner`, which additionally
+/// refuses an index it never lent out. This type is the message; those two are
+/// the accounting.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Descriptor {

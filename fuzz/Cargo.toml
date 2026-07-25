@@ -13,10 +13,45 @@ cargo-fuzz = true
 # (libfuzzer-sys and its bundled runtime) never affect the `no_std` PD builds.
 [workspace]
 
+# Every workspace crate that parses or interprets bytes it did not write is a
+# dependency here, and each has a target below. That is the reviewable form of
+# AGENTS.md TEST-7: this list is diffed against `crates/` whenever a crate is
+# added, and a crate on an untrusted-input path without an entry is a finding.
+#
+#   wire            the descriptor ABI a peer PD writes
+#   queue           the shared ring whose cursors and slots a peer PD owns
+#   packet-buffer   the ownership ledger a peer PD's buffer returns cross
+#   virtio          the device's PCI config space and virtqueue
+#   pd-runtime      the inter-PD pool-ownership protocol
+#   nic-driver-core the driver paths facing both the device and the peer
 [dependencies]
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
+wire = { path = "../crates/wire" }
+queue = { path = "../crates/queue" }
+packet-buffer = { path = "../crates/packet-buffer" }
 virtio = { path = "../crates/virtio" }
+pd-runtime = { path = "../crates/pd-runtime" }
+nic-driver-core = { path = "../crates/nic-driver-core" }
+
+# This workspace is standalone, so the root workspace's `[workspace.lints]` does
+# not reach it and its lint policy has to be stated here. `unused_must_use` is
+# the one that earned its place: the harness dropped a `#[must_use]`
+# `Result<(), RecycleError>` from `SplitVirtqueue::recycle` and nothing failed,
+# because a warning in a workspace no lint policy covered is a warning nobody
+# reads. In a harness a refusal *is* the finding — the opposite of the
+# dataplane's drop-and-count choice — so ignoring one must not compile.
+#
+# These are enforced by the gate through `cargo test --locked --lib` in this
+# directory (`xtask fuzz` runs it first), which compiles the harness library.
+[lints.rust]
+unused_must_use = "deny"
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
 
 # The harness bodies live in a small library so the same code is exercised both
 # by the libFuzzer binaries below and by the seed-corpus smoke tests (run with
@@ -34,6 +69,34 @@ bench = false
 [[bin]]
 name = "virtqueue_poll"
 path = "fuzz_targets/virtqueue_poll.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "free_list_ownership"
+path = "fuzz_targets/free_list_ownership.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spsc_ring_peer"
+path = "fuzz_targets/spsc_ring_peer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pd_runtime_pipeline"
+path = "fuzz_targets/pd_runtime_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nic_driver_paths"
+path = "fuzz_targets/nic_driver_paths.rs"
 test = false
 doc = false
 bench = false

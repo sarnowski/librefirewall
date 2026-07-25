@@ -1,9 +1,16 @@
 # cargo-deny policy for librefirewall.
 #
-# The host gate runs `cargo deny check bans licenses sources` offline (see
-# tools/xtask). The `advisories` check is intentionally not run here: it needs
-# network access to fetch the RustSec database, which the offline gate forbids;
-# vulnerability scanning belongs to a networked CI job.
+# Two gates read this file:
+#
+# - the offline host gate (`make test`, see tools/xtask) runs
+#   `cargo deny check bans licenses sources`;
+# - a dedicated networked CI step (azure-pipelines.yml) runs
+#   `cargo deny check advisories`, because that check must fetch the RustSec
+#   database and the host gate's container runs `--network=none`.
+#
+# Splitting them this way is what keeps vulnerability scanning real: the
+# offline gate cannot fetch an advisory database, so pretending otherwise
+# would leave the repository with no scanning at all.
 #
 # Dependency shape: our own crates are AGPL-3.0-or-later; every third-party
 # crate is either the pinned `rust-sel4` (a local path source at
@@ -13,6 +20,30 @@
 # Evaluate every compilation target so a platform-specific dependency cannot
 # smuggle in an unreviewed license or source.
 all-features = true
+
+[advisories]
+# The container rootfs is read-only and `$CARGO_HOME` lives in it, so the
+# default `$CARGO_HOME/advisory-dbs` is unwritable. `~` resolves to the
+# container's `HOME=/tmp` tmpfs, which is writable and discarded with the run —
+# the advisory database is cache, never an input we depend on being present.
+db-path = "~/.cargo/advisory-dbs"
+# A yanked crate is a supply-chain signal (withdrawn release, compromised
+# publish) even when no advisory has been filed yet, so it fails rather than
+# warns.
+yanked = "deny"
+# `all` covers the workspace and the whole transitive graph, including the
+# build- and dev-only crates: a compromised build script runs on the machine
+# that produces the signed boot payload, so its risk is not lower than a
+# runtime dependency's.
+unmaintained = "all"
+unsound = "all"
+# Fail if the fetched database is older than a week: a stale database reports
+# "ok" while carrying none of the recent advisories, which is worse than a
+# visible failure.
+maximum-db-staleness = "P7D"
+# Empty by design. An entry here silences a real, published advisory, so each
+# one needs a written justification and a removal condition next to it.
+ignore = []
 
 [licenses]
 # Explicit allow-list of the SPDX licenses actually present in the graph.
@@ -32,24 +63,147 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-# Duplicate versions of a crate are driven by upstream (e.g. two `syn` majors in
-# the rust-sel4 build-dependency tree) and are not ours to resolve, so warn
-# rather than fail the gate.
-multiple-versions = "warn"
-# Every crate in the tree — ours and the vendored rust-sel4 crates alike —
-# references its siblings by local `path` with no version, which cargo-deny
-# reports as a `*` wildcard. `allow-wildcard-paths` cannot suppress these
-# because it only applies to publish=false crates, and the rust-sel4 tree we
-# vendor is not ours to annotate. No registry dependency uses a wildcard
-# version (every crates.io entry in Cargo.lock is pinned), so this is an
-# artifact of a path-linked source tree, not a real risk: warn, like the
-# upstream-driven duplicates above, rather than fail the offline gate.
+# Deny by default: a new duplicate version is an unreviewed change to what gets
+# compiled into the boot payload, and must be either resolved or justified in
+# `skip` below.
+multiple-versions = "deny"
+skip = [
+    # The proc-macro ecosystem is mid-migration between syn 2 and syn 3:
+    # serde_derive has moved to 3.x while every other derive crate in the graph
+    # is still on 2.x. Both are host-only compile-time dependencies that never
+    # link into a protection domain, and neither major is ours to move. Remove
+    # this skip once the graph converges on syn 3.
+    { crate = "syn", reason = "upstream mid-migration between syn 2 and syn 3; host-only compile-time dependency" },
+]
+# The crates that exist to compile or link native code into a Rust binary.
+# `cc` and `cmake` invoke a C/C++ toolchain; `pkg-config` and `vcpkg` resolve
+# and link a system library. Banning the mechanism rather than enumerating
+# `*-sys` crate names is what actually enforces "first-party userspace is pure
+# Rust": any `*-sys` crate that would build or link C has to reach for one of
+# these four. None is in the graph today, so each entry is a tripwire, not a
+# workaround. The `[bans.build]` allow-list below is the second half of the
+# same rule — a native dependency that avoided these crates would still have to
+# run an unlisted build script.
+deny = [
+    { crate = "cc", reason = "invokes a C/C++ compiler; first-party userspace is pure Rust" },
+    { crate = "cmake", reason = "drives a native build system; first-party userspace is pure Rust" },
+    { crate = "pkg-config", reason = "links against a system C library discovered at build time" },
+    { crate = "vcpkg", reason = "links against a system C library discovered at build time" },
+]
+# Every crate in the tree — ours and the rust-sel4 crates alike — references its
+# siblings by local `path` with no version, which cargo-deny reports as a `*`
+# wildcard. This CANNOT be escalated to "deny": `allow-wildcard-paths` only
+# suppresses path wildcards for crates marked `publish = false`, and the
+# rust-sel4 tree we consume as a pinned tarball sets no such marker and is not
+# ours to annotate. No registry dependency uses a wildcard version (every
+# crates.io entry in Cargo.lock is pinned to an exact version), so what remains
+# is an artifact of a path-linked source tree rather than an unpinned
+# dependency. Escalate this the day the graph carries no foreign path crates.
 wildcards = "warn"
+
+# Build scripts and shipped binaries are the two ways native code enters a
+# build, so both are deny-by-default and every exception below is a recorded
+# audit decision. A crate that gains a build script, or a new build-script
+# crate entering the graph, fails the gate until it is reviewed and listed.
+#
+# The list carries crate names, not versions: Cargo.lock is the single source
+# of version truth and duplicating the pins here would create a hand-sync
+# burden that drifts. What this list pins is the *set* of crates permitted to
+# execute code at build time.
+[bans.build]
+include-dependencies = true
+include-workspace = true
+executables = "deny"
+interpreted = "deny"
+allow-build-scripts = [
+    # The rust-sel4 trusted base (CONCEPT §7). These build scripts generate the
+    # seL4 syscall bindings and kernel configuration from the pinned,
+    # sha256-verified SDK; they are the mechanism by which the kernel ABI
+    # reaches Rust and cannot be removed.
+    { crate = "sel4-sys", reason = "generates seL4 syscall bindings from the pinned SDK" },
+    { crate = "sel4-config", reason = "reads the pinned kernel configuration" },
+    { crate = "sel4-config-data", reason = "reads the pinned kernel configuration" },
+    { crate = "sel4-bitfield-ops", reason = "generates seL4 bitfield accessors" },
+
+    # The binding generator behind `sel4-sys`, reachable only as its
+    # build-dependency: verified absent from the protection domains' normal
+    # dependency graph, so none of this links into a deployed binary.
+    # `clang-sys` dlopens libclang at build time (hence `clang`/`llvm` in the
+    # builder image); it does not compile C into our output.
+    { crate = "bindgen", reason = "build-dependency of sel4-sys only" },
+    { crate = "clang-sys", reason = "build-dependency of sel4-sys only; dlopens libclang to parse seL4 headers" },
+    { crate = "prettyplease", reason = "build-dependency of sel4-sys only; formats generated bindings" },
+    { crate = "rustix", reason = "build-dependency of sel4-sys only, via bindgen" },
+    { crate = "libc", reason = "syscall declarations for host build-time crates; the seL4 target builds no_std without it" },
+
+    # Pure-Rust codegen and proc-macro infrastructure. Their build scripts
+    # probe rustc version/cfg to select feature paths; none reaches a C
+    # toolchain, which the `deny` list above independently enforces.
+    { crate = "proc-macro2", reason = "rustc feature probe" },
+    { crate = "quote", reason = "rustc feature probe" },
+    { crate = "rustversion", reason = "rustc version probe" },
+    { crate = "serde", reason = "rustc feature probe" },
+    { crate = "serde_core", reason = "rustc feature probe" },
+    { crate = "serde_json", reason = "rustc feature probe" },
+    { crate = "zerocopy", reason = "rustc feature probe" },
+    { crate = "zmij", reason = "rustc feature probe" },
+
+    # Host-only test and benchmark dependencies (criterion, proptest). They are
+    # dev-dependencies: they build for the host gate and never enter a
+    # protection domain.
+    { crate = "crossbeam-deque", reason = "dev-dependency (criterion) build probe" },
+    { crate = "crossbeam-epoch", reason = "dev-dependency (criterion) build probe" },
+    { crate = "crossbeam-utils", reason = "dev-dependency (criterion) build probe" },
+    { crate = "rayon-core", reason = "dev-dependency (criterion) build probe" },
+    { crate = "num-traits", reason = "dev-dependency (criterion) build probe" },
+    { crate = "crunchy", reason = "dev-dependency (criterion) build probe" },
+    { crate = "getrandom", reason = "dev-dependency (proptest) build probe" },
+
+    # Reachable only because `all-features = true` resolves every target: these
+    # are wasm/WASI shims that no librefirewall target ever builds. They are
+    # listed rather than hidden so the graph stays honest about what the
+    # resolver pulled in.
+    { crate = "wasm-bindgen", reason = "wasm-only target, never built here" },
+    { crate = "wasm-bindgen-shared", reason = "wasm-only target, never built here" },
+    { crate = "wit-bindgen", reason = "wasm-only target, never built here" },
+]
+
+# Every bypass below is scoped to the exact directory the inert files live in,
+# so a binary or script appearing anywhere else in the same crate still fails
+# the gate. Cargo executes only `build.rs`, so a shipped script is harmless
+# unless an allow-listed build script invokes it — which is why these
+# exceptions are safe and the `allow-build-scripts` list above is the real
+# control.
+
+# Two Windows test fixtures shipped inside libloading's `tests/` directory.
+# Never compiled, linked, or executed by any build we run; libloading itself is
+# only a build-dependency of bindgen.
+[[bans.build.bypass]]
+crate = "libloading"
+allow-globs = ["tests/*.dll"]
+
+# zerocopy ships its own maintainer CI scripts in the published crate. They run
+# in zerocopy's repository, never in ours.
+[[bans.build.bypass]]
+crate = "zerocopy"
+allow-globs = ["cargo.sh", "ci/*.sh"]
+
+# libc ships a codegen helper used to regenerate its own bindings upstream.
+[[bans.build.bypass]]
+crate = "libc"
+allow-globs = ["etc/*.py"]
 
 [sources]
 # Only crates.io and local path sources (the pinned rust-sel4 tree) are
 # permitted; an unknown registry or any git source is a supply-chain change
 # that must be made deliberately, not resolved silently.
+#
+# Known limitation: the largest third-party surface in this graph — the whole
+# rust-sel4 tree — enters as a local `path` source at /opt/rust-sel4, and
+# cargo-deny does not check path sources at all. What covers it instead is
+# third-party/sources.lock: RUST_SEL4_URL pins the exact release tarball and
+# RUST_SEL4_SHA256 is verified in the builder before extraction, so the
+# provenance guarantee for that subtree is the checksum, not this section.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

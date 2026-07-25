@@ -1,139 +1,172 @@
-//! Fuzz harness bodies for librefirewall's untrusted-device parsers.
+//! Persistent fuzz harnesses for every librefirewall surface that parses or
+//! interprets untrusted input.
 //!
-//! Each externally driven parser gets a persistent fuzz target (charter /
-//! AGENTS.md). The device on the far side of a virtqueue is untrusted input:
-//! its PCI configuration space and its used ring are attacker-controllable
-//! bytes, so both must be driven to prove no panic, no out-of-bounds access,
-//! and bounded work over arbitrary input.
+//! # Which adversary each harness models
 //!
-//! The actual harness logic lives here rather than inside the `fuzz_targets/`
-//! binaries so that the identical code path can be driven two ways:
+//! CONCEPT §7.1 enumerates the adversaries; three of them reach code in this
+//! workspace, and every module below states which one it drives:
 //!
-//! - by the libFuzzer binaries ([`find_virtio_caps_harness`],
-//!   [`virtqueue_poll_harness`] wrapped in `fuzz_target!`), when libFuzzer can
-//!   execute; and
-//! - by the seed-corpus smoke tests (`cargo test --lib`), which exercise the
-//!   same harnesses on the committed seeds plus a few synthetic edge inputs.
+//! | module | surface under test | adversary |
+//! |---|---|---|
+//! | [`virtio_pci`] | `virtio::pci` capability walk and BAR bounds | a hostile or malfunctioning device |
+//! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
+//! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
+//! | [`spsc_ring`] | `queue::SpscRing` cursors and slots | a byzantine neighbour PD |
+//! | [`pipeline`] | `pd_runtime` pool ownership and forwarding | a byzantine neighbour PD |
+//! | [`driver`] | `nic_driver_core` rx/tx paths | a hostile device **and** a byzantine neighbour PD |
+//!
+//! Every crate in the workspace that interprets bytes it did not write appears
+//! in that table, which is the reviewable form of AGENTS.md TEST-7: the
+//! dependency list in `fuzz/Cargo.toml` is the workspace's crate list, and each
+//! dependency has a target.
+//!
+//! # What a harness here asserts
+//!
+//! A target whose body is a bare call proves only that one input did not crash
+//! (TEST-9). Each harness below therefore carries a **model** of the surface it
+//! drives and asserts the code against it after every operation. Three kinds of
+//! claim recur, and they are the claims the dataplane's safety rests on:
+//!
+//! * **Conservation.** Buffer indices and virtqueue descriptors are neither
+//!   invented nor lost: what is free plus what is outstanding is the whole set,
+//!   at every instant, and no identity is in both.
+//! * **Boundedness.** A call driven by an untrusted producer performs work
+//!   bounded by a quantity the adversary does not control, and the harness
+//!   asserts the *bound* rather than imposing one of its own. Where a harness
+//!   loop needs a cap it also asserts the loop exited by exhausting the queue
+//!   and not by hitting that cap, so a regression that deletes a drain bound
+//!   fails instead of being silently truncated.
+//! * **Containment.** No address handed to a device, and no span handed to a
+//!   peer, falls outside the region it must stay inside. This is the
+//!   arbitrary-physical-write invariant, and it is asserted explicitly rather
+//!   than inferred from the absence of a crash.
+//!
+//! # Modelling authority, not politeness
+//!
+//! TEST-8 is the rule these harnesses are shaped by: a guard that keeps a
+//! harness "sane" deletes precisely the region where the bug lives. The
+//! adversary's *authority* is therefore reproduced in full — duplicate and
+//! out-of-range indices, returns of buffers never lent, completions for
+//! descriptors never posted, cursors rewound and forged, arbitrary bytes over
+//! any shared word the adversary can reach — and the assertion is that the code
+//! **rejects** it, not that the harness never produced it.
+//!
+//! Two limits are deliberate and are not capability filters, and each is
+//! justified where it appears: an operation-count budget per input (a libFuzzer
+//! timeout budget, unrelated to what any single operation may contain), and, in
+//! [`driver`], suspending one *audit* — never an adversary action — once the
+//! device has scribbled the region the audit reads its evidence from.
+//!
+//! # Two ways to run
+//!
+//! The harness bodies live here rather than inside the `fuzz_targets/` binaries
+//! so the identical code path can be driven two ways:
+//!
+//! - by the libFuzzer binaries (each wrapping one function in `fuzz_target!`),
+//!   when libFuzzer can execute; and
+//! - by the seed-corpus smoke tests (`cargo test --lib`), which exercise every
+//!   harness on the committed seeds plus synthetic edge inputs.
 //!
 //! The second path exists because the pinned hermetic builder runs the gate in
 //! a locked-down sandbox (`--cap-drop=all`, read-only rootfs,
 //! `--security-opt=no-new-privileges`). libFuzzer with AddressSanitizer may be
 //! unable to start under those restrictions; when it cannot, `make fuzz`
-//! guarantees every target still *builds* and the smoke tests still drive the
-//! parsers over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
+//! guarantees every target still *builds* and the smoke tests still drive every
+//! harness over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
 
-use std::sync::atomic::{Ordering, fence};
+pub mod driver;
+pub mod free_list;
+pub mod pipeline;
+pub mod region;
+pub mod ring_abi;
+pub mod spsc_ring;
+pub mod virtio_pci;
+pub mod virtqueue;
 
 use arbitrary::{Arbitrary, Unstructured};
-use virtio::pci::{PciConfig, find_virtio_caps};
-use virtio::queue::SplitVirtqueue;
 
-/// Interpret `data` as a 4 KiB PCI configuration space (padded or truncated to
-/// exactly 4096 bytes) and run the virtio capability walk over it.
+/// How many operations one input may drive.
 ///
-/// The device controls every byte, so `find_virtio_caps` must never panic and
-/// must never read outside the 4 KiB page. The one invariant it guarantees for
-/// a successful parse is asserted: the resolved BAR index is a valid PCI BAR
-/// (`0..=5`). The structure *offsets* are the device's own and are not bounded
-/// here — that is [`virtio::pci::VirtioCaps::within`]'s job, which is also
-/// exercised so its arithmetic sees fuzzer input.
-pub fn find_virtio_caps_harness(data: &[u8]) {
-    let mut config_space = [0u8; 4096];
-    let n = data.len().min(4096);
-    config_space[..n].copy_from_slice(&data[..n]);
-    // SAFETY: `config_space` is a live 4096-byte buffer that outlives `config`;
-    // the capability walk only reads config registers within it.
-    let config = unsafe { PciConfig::new(config_space.as_mut_ptr()) };
-    if let Ok(caps) = find_virtio_caps(&config) {
-        assert!(
-            caps.bar <= 5,
-            "find_virtio_caps accepted an invalid BAR index {}",
-            caps.bar
-        );
-        // Drive the offset bounds-check too; the result is data-dependent and
-        // intentionally unasserted.
-        let _ = caps.within(0x4000);
+/// A libFuzzer *time* budget, not a bound on what any operation may express: a
+/// single operation still carries a fully arbitrary index, cursor, or byte, so
+/// no adversarial shape is unreachable (TEST-8). It exists because an input can
+/// otherwise encode an arbitrarily long op stream and spend the whole run in
+/// one execution, which starves coverage rather than finding anything.
+///
+/// The distinction matters, because the bound this replaces did the opposite:
+/// it capped a *drain* loop and never asserted the loop had exited by
+/// exhausting the queue, so a regression deleting the code's own drain bound
+/// would have been truncated into a pass. Every drain loop below asserts its
+/// exit condition instead of relying on a cap.
+pub const MAX_OPERATIONS: usize = 512;
+
+/// Pull the next operation selector, or `None` once the input is spent.
+///
+/// Returning `None` on exhaustion rather than padding with zeros keeps a short
+/// input from driving 512 copies of operation zero, which is both wasted time
+/// and a misleading corpus entry.
+pub(crate) fn next_op(unstructured: &mut Unstructured<'_>) -> Option<u8> {
+    if unstructured.is_empty() {
+        return None;
     }
+    u8::arbitrary(unstructured).ok()
 }
 
-/// Queue size the poll harness drives. 16 matches the driver PD's virtqueues
-/// and keeps the region well under the 4 KiB backing buffer.
-const QSIZE: usize = 16;
+/// Pull an arbitrary `u32` the adversary controls, defaulting to zero once the
+/// input is spent so an operation already selected still runs to completion.
+pub(crate) fn any_u32(unstructured: &mut Unstructured<'_>) -> u32 {
+    u32::arbitrary(unstructured).unwrap_or(0)
+}
 
-/// A 16-byte-aligned backing region, as [`SplitVirtqueue::new`] requires.
-#[repr(C, align(16))]
-struct Region([u8; 4096]);
+/// Pull an arbitrary `u16` the adversary controls; see [`any_u32`].
+pub(crate) fn any_u16(unstructured: &mut Unstructured<'_>) -> u16 {
+    u16::arbitrary(unstructured).unwrap_or(0)
+}
 
-/// Drive `poll`/`recycle` against a fuzzer-controlled used ring.
+/// Pull an arbitrary `usize` in `0..modulus`, or 0 when `modulus` is 0.
 ///
-/// The first input byte chooses how many receive descriptors to post; the rest
-/// becomes the device (used-ring) region — wholly untrusted bytes. A bounded
-/// sequence of `poll`/`recycle` calls must never panic, must terminate (`poll`
-/// is internally capped at `QSIZE` skips per call), and must keep the
-/// descriptor free count in range. Single-owner discipline is the driver PD's
-/// responsibility, not the queue's — the queue does not deduplicate device
-/// completions (see `crates/virtio/src/queue.rs`) — so the harness recycles
-/// each posted descriptor at most once and leaves a duplicate completion
-/// un-recycled, exactly as the driver PD must.
-pub fn virtqueue_poll_harness(data: &[u8]) {
-    let mut unstructured = Unstructured::new(data);
-    let posts = (u8::arbitrary(&mut unstructured).unwrap_or(0) as usize) % (QSIZE + 1);
-    let device = unstructured.take_rest();
-
-    let mut region = Region([0u8; 4096]);
-    let ptr = region.0.as_mut_ptr();
-    // SAFETY: `region` is 16-byte aligned, zeroed, and larger than the queue's
-    // total_bytes for QSIZE=16; it is the sole owner of this queue.
-    let mut queue = unsafe { SplitVirtqueue::<QSIZE>::new(ptr) };
-
-    // Post receive descriptors. Each decrements the free count, so a later
-    // recycle of that descriptor is legitimate. Descriptor indices are handed
-    // out from the free list, so track which we currently hold.
-    let mut held = [false; QSIZE];
-    for _ in 0..posts {
-        match queue.add_writable(0x1000, 64) {
-            Some(token) => held[token.index() as usize] = true,
-            None => break,
-        }
+/// Used only to pick *which* of the harness's own held objects an operation
+/// acts on. Never used to constrain a value that crosses a trust boundary —
+/// those are taken with [`any_u32`] and friends, unreduced.
+pub(crate) fn any_index(unstructured: &mut Unstructured<'_>, modulus: usize) -> usize {
+    if modulus == 0 {
+        return 0;
     }
-
-    // Overwrite the device (used) region with fuzzer bytes; it is the untrusted
-    // half of the shared ring. Only [device_offset, total_bytes) is touched, so
-    // the descriptor table and available ring the driver owns stay intact.
-    let used_base = SplitVirtqueue::<QSIZE>::LAYOUT.device_offset;
-    let used_len = SplitVirtqueue::<QSIZE>::LAYOUT.total_bytes - used_base;
-    for offset in 0..used_len {
-        let byte = device.get(offset).copied().unwrap_or(0);
-        // SAFETY: `used_base + offset < total_bytes <= region length`.
-        unsafe { ptr.add(used_base + offset).write_volatile(byte) };
-    }
-    fence(Ordering::Release);
-
-    for _ in 0..(4 * QSIZE) {
-        match queue.poll() {
-            Some((token, _len)) => {
-                let index = token.index() as usize;
-                assert!(index < QSIZE, "poll returned out-of-range descriptor {index}");
-                if held[index] {
-                    held[index] = false;
-                    queue.recycle(token);
-                }
-            }
-            None => break,
-        }
-        assert!(
-            queue.free_count() <= QSIZE,
-            "free count {} exceeds queue size",
-            queue.free_count()
-        );
-    }
+    (any_u32(unstructured) as usize) % modulus
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Every harness, paired with the corpus directory holding its seeds. One
+    /// list so a target added without a seed corpus fails the smoke test
+    /// instead of shipping an unseeded target.
+    ///
+    /// Ordered from the smallest, most self-contained surface to the deepest
+    /// composite one, and `tools/xtask`'s `FUZZ_TARGETS` matches. A defect in
+    /// the ledger shows up in `free_list_ownership`, in `pd_runtime_pipeline`,
+    /// and in `nic_driver_paths` alike, and the narrowest of those is the one
+    /// worth reading — so it is the one that fails first. It also means a
+    /// harness whose failure aborts the process (a violated `unsafe`
+    /// precondition does, being non-unwinding) takes the fewest other harnesses
+    /// down with it.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a table of (target name, harness fn) pairs is clearer inline than behind an alias"
+    )]
+    const HARNESSES: &[(&str, fn(&[u8]))] = &[
+        ("free_list_ownership", crate::free_list::free_list_harness),
+        ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
+        ("virtqueue_poll", crate::virtqueue::virtqueue_poll_harness),
+        ("pd_runtime_pipeline", crate::pipeline::pipeline_harness),
+        ("nic_driver_paths", crate::driver::driver_paths_harness),
+        (
+            "find_virtio_caps",
+            crate::virtio_pci::find_virtio_caps_harness,
+        ),
+    ];
 
     /// Read every committed seed for a target so the smoke tests drive the
     /// harnesses over the same corpus libFuzzer would start from.
@@ -145,7 +178,9 @@ mod tests {
         for entry in fs::read_dir(&dir).expect("seed corpus directory exists") {
             let path = entry.expect("readable dir entry").path();
             if path.is_file() {
-                inputs.push(fs::read(&path).expect("readable seed file"));
+                let seed = fs::read(&path).expect("readable seed file");
+                assert!(!seed.is_empty(), "empty seed {}", path.display());
+                inputs.push(seed);
             }
         }
         assert!(!inputs.is_empty(), "no seeds for target {target}");
@@ -159,20 +194,31 @@ mod tests {
             vec![0u8; 1],
             vec![0xFFu8; 4096],
             vec![0xABu8; 40],
+            (0..=255u8).collect(),
+            (0..=255u8).rev().collect(),
         ]
     }
 
     #[test]
-    fn find_virtio_caps_harness_survives_seeds_and_edges() {
-        for input in seeds("find_virtio_caps").into_iter().chain(edge_inputs()) {
-            find_virtio_caps_harness(&input);
+    fn every_harness_survives_its_seeds_and_the_shared_edges() {
+        for (target, harness) in HARNESSES {
+            for input in seeds(target).into_iter().chain(edge_inputs()) {
+                harness(&input);
+            }
         }
     }
 
+    /// The seed corpus is what a cold fuzz run starts from, so a target with no
+    /// directory at all would silently start from nothing. Asserted separately
+    /// from the run above so the failure names the missing corpus rather than
+    /// surfacing as a panic inside a harness.
     #[test]
-    fn virtqueue_poll_harness_survives_seeds_and_edges() {
-        for input in seeds("virtqueue_poll").into_iter().chain(edge_inputs()) {
-            virtqueue_poll_harness(&input);
+    fn every_harness_has_a_committed_seed_corpus() {
+        for (target, _) in HARNESSES {
+            assert!(
+                !seeds(target).is_empty(),
+                "target {target} has no committed seeds"
+            );
         }
     }
 }

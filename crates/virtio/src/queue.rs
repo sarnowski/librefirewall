@@ -18,9 +18,56 @@
 //! buffers are used (virtio-net needs no chaining per buffer), so the free list
 //! is a simple index stack and no `NEXT` chain is walked.
 //!
-//! The device is untrusted: everything it writes (the used ring and its
-//! indices) is validated before use, and no device-supplied value is turned
-//! into an out-of-range access or an unbounded loop (see [`SplitVirtqueue::poll`]).
+//! # The device is untrusted
+//!
+//! The device can write **every byte of the region** — not only the used ring
+//! it owns by protocol, but the descriptor table and the driver ring as well
+//! (CONCEPT §7.1). The governing rule here is therefore stronger than "validate
+//! the used ring": *no value read back from the region is ever used to index
+//! it*. Concretely:
+//!
+//! - **Descriptor identity is validated against driver-owned state, not
+//!   against the shared region.** Every descriptor's lifecycle position
+//!   (free → posted → reaped → free) lives in this struct's private
+//!   `state` array, which the device cannot reach. A completion is accepted
+//!   only when it names a descriptor this driver posted and the device has not
+//!   already completed, so a forged id, an out-of-range id, and a replayed
+//!   completion are all rejected before a [`Token`] exists for them.
+//! - **The free list is private.** Its successor links live in the private
+//!   `free_next` array rather than in each descriptor's shared `next` field.
+//!   Reading that field back would hand the device the allocator: a scribbled
+//!   `next` becomes `free_head`, and the very next `add` writes a descriptor at
+//!   `free_head * 16` — anywhere in a `u16`, far outside the region. The `next`
+//!   field is still *written* (zeroed) because it is part of the ABI the device
+//!   reads, but it is never read.
+//! - **Work is bounded by a driver-owned quantity.** A single [`poll`] examines
+//!   at most `SIZE` used entries whatever index the device publishes. Across
+//!   calls, it can hand out at most [`posted_count`] completions before the
+//!   driver posts again, because each accepted completion moves its descriptor
+//!   out of the posted state and nothing but [`add_writable`]/[`add_readable`]
+//!   moves one back in. A `while let Some(..) = queue.poll()` drain therefore
+//!   terminates against any device.
+//! - **The reported length is clamped to the length this driver programmed**
+//!   for that descriptor, held privately in `posted_len` for the same reason
+//!   the state array is private: the copy in the shared descriptor table is
+//!   within the device's reach.
+//!
+//! Taken together those four make every offset this type computes a function of
+//! private state alone, so no device value can drive an out-of-bounds access,
+//! unbounded work, or a panic.
+//!
+//! What is **not** checked, because it is not checkable from this side: the
+//! device may complete a descriptor it never read, report fewer bytes than it
+//! wrote, or never complete a descriptor at all. The first two are
+//! indistinguishable from a short frame and are the parser's problem; the third
+//! is a stall, which costs the driver the buffer and is visible as a
+//! [`posted_count`] that stops falling. Whether a frame's *contents* make sense
+//! is the business of whatever parses them.
+//!
+//! [`poll`]: SplitVirtqueue::poll
+//! [`posted_count`]: SplitVirtqueue::posted_count
+//! [`add_writable`]: SplitVirtqueue::add_writable
+//! [`add_readable`]: SplitVirtqueue::add_readable
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -34,22 +81,70 @@ const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
+/// Increment a device-fault counter, saturating rather than wrapping; see
+/// [`DeviceFaults`].
+fn bump(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
+/// Where one descriptor sits in its lifecycle. Kept in driver-private memory
+/// rather than derived from the shared region, because the device can write
+/// every byte of the region and would otherwise be answering the question
+/// "may this completion be accepted?" itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorState {
+    /// On the free list; may be allocated by `add`.
+    Free,
+    /// Published to the device, which owns the buffer until it completes.
+    Posted,
+    /// Completed by the device and handed to the driver as a [`Token`]; the
+    /// descriptor stays allocated until the token is surrendered.
+    Reaped,
+}
+
+/// Counts of the used-ring completions this queue refused, which are otherwise
+/// invisible: a device replaying or forging completions at line rate looks
+/// exactly like an idle link.
+///
+/// Every field is **monotonic** for the queue's life and **saturates** at
+/// [`u64::MAX`] rather than wrapping, matching every other counter set in the
+/// dataplane: a metrics endpoint (CONCEPT §11) derives a rate by differencing
+/// successive scrapes, so a reset would forge a negative rate and a wrap would
+/// turn a sustained flood back into a small number.
+///
+/// A non-zero value here is evidence about the *device*, never about this
+/// driver: neither field is reachable by any code path that does not read the
+/// shared used ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceFaults {
+    /// Completions whose `id` was not a descriptor index of this queue.
+    pub completion_out_of_range: u64,
+    /// Completions naming a descriptor that was not posted to the device: a
+    /// replay of one already reaped, or an echo of one never published.
+    pub completion_not_posted: u64,
+}
+
 /// A buffer in flight: the head descriptor index the device echoes back in its
 /// used-ring completion.
 ///
-/// A `Token` is proof of ownership of one in-flight descriptor. It is produced
-/// only by [`SplitVirtqueue::add_writable`], [`add_readable`](SplitVirtqueue::add_readable),
-/// and [`poll`](SplitVirtqueue::poll), and must be surrendered exactly once via
-/// [`recycle`](SplitVirtqueue::recycle). The wrapped index is private so safe
-/// code cannot forge an out-of-range token and drive an out-of-bounds volatile
-/// write; read it with [`index`](Token::index).
+/// A `Token` is a claim on one descriptor, and only this queue can mint one.
+/// [`add_writable`](SplitVirtqueue::add_writable) and
+/// [`add_readable`](SplitVirtqueue::add_readable) mint one for the descriptor
+/// they just published; [`poll`](SplitVirtqueue::poll) mints one only *after*
+/// checking that the id the device echoed names a descriptor this driver
+/// posted and has not already reaped. The device therefore cannot forge a
+/// token, drive one out of range, or obtain two tokens for one descriptor —
+/// and the wrapped index is private so safe code cannot forge one either. Read
+/// it with [`index`](Token::index).
 ///
-/// `Token` is deliberately **not** `Copy`: a token names one in-flight
-/// descriptor, so surrendering it must consume it. Recycling a token moves it,
-/// which makes "surrender exactly once" a type invariant — a double-recycle
-/// (which would push the same descriptor onto the free list twice and later
-/// hand out two live tokens for it) is a move error, not a silent corruption.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Token` is deliberately neither `Copy` nor `Clone`, so surrendering one
+/// consumes it and a token cannot be duplicated. That alone does not make
+/// recycling safe, which is why it is not claimed: a token minted by `add_*`
+/// names a descriptor the *device* still owns, and a token can outlive the
+/// queue it came from. [`recycle`](SplitVirtqueue::recycle) therefore re-checks
+/// the descriptor's own state and rejects anything that is not a reaped
+/// descriptor of that queue.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Token(u16);
 
 impl Token {
@@ -59,6 +154,26 @@ impl Token {
     pub const fn index(&self) -> u16 {
         self.0
     }
+}
+
+/// Why [`SplitVirtqueue::recycle`] refused a token.
+///
+/// Both variants mean the queue's descriptor is not in the reaped state the
+/// token claims, which no token obtained from [`poll`](SplitVirtqueue::poll)
+/// and surrendered once to its own queue can produce. They are therefore a
+/// driver-side bookkeeping error, not device input — the device's own
+/// misbehaviour is already rejected inside `poll` and counted in
+/// [`DeviceFaults`]. They are returned rather than asserted so a caller can
+/// fail visibly on its own terms instead of inheriting a panic from a library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecycleError {
+    /// The descriptor is already on the free list: the token was surrendered
+    /// twice, or it belongs to a different queue.
+    AlreadyFree(u16),
+    /// The descriptor is still published to the device, which may write to its
+    /// buffer at any moment. Reclaiming it would hand a live DMA target to the
+    /// next allocation.
+    StillPosted(u16),
 }
 
 /// The byte layout of a split virtqueue within its region: the offset of each
@@ -79,13 +194,30 @@ pub struct QueueLayout {
 }
 
 /// The driver side of a split virtqueue of `SIZE` descriptors. `SIZE` must be a
-/// power of two of at least 2 and at most 32768 (the ring index is a `u16`).
+/// power of two of at least 2 and at most 32768 (the ring index is a `u16`);
+/// naming either [`LAYOUT`](Self::LAYOUT) or [`new`](Self::new) for a `SIZE`
+/// outside that is a compile error.
 pub struct SplitVirtqueue<const SIZE: usize> {
     region: *mut u8,
+    /// Each descriptor's lifecycle position. Private, and never read back from
+    /// the shared region — see the module header.
+    state: [DescriptorState; SIZE],
+    /// The buffer length this driver programmed into each descriptor, kept for
+    /// clamping the device's reported completion length.
+    posted_len: [u32; SIZE],
+    /// The free list's successor links. Private rather than the descriptor's
+    /// shared `next` field, which the device can rewrite — see the module
+    /// header. Only entries of free descriptors are meaningful.
+    free_next: [u16; SIZE],
     free_head: u16,
     num_free: u16,
+    /// How many descriptors are published to the device right now. This is the
+    /// driver-owned quantity that bounds how many completions `poll` can hand
+    /// out before the driver posts again.
+    num_posted: u16,
     avail_idx: u16,
     last_used: u16,
+    faults: DeviceFaults,
 }
 
 impl<const SIZE: usize> SplitVirtqueue<SIZE> {
@@ -113,12 +245,20 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     const USED_IDX_OFF: usize = Self::USED_OFF + 2;
 
     /// The layout of this queue, for a transport to program into the device.
-    pub const LAYOUT: QueueLayout = QueueLayout {
-        size: SIZE,
-        descriptor_offset: 0,
-        driver_offset: Self::AVAIL_OFF,
-        device_offset: Self::USED_OFF,
-        total_bytes: Self::TOTAL,
+    ///
+    /// Naming this constant forces the `SIZE` invariants below, so a layout for
+    /// an impossible queue size cannot be computed and handed to a live device:
+    /// the transport programs these offsets into the device's queue registers,
+    /// where a garbage value would point the hardware's DMA at the wrong bytes.
+    pub const LAYOUT: QueueLayout = {
+        let () = Self::_CHECK;
+        QueueLayout {
+            size: SIZE,
+            descriptor_offset: 0,
+            driver_offset: Self::AVAIL_OFF,
+            device_offset: Self::USED_OFF,
+            total_bytes: Self::TOTAL,
+        }
     };
 
     /// Initialise the driver's view over a region and seed the descriptor free
@@ -130,23 +270,25 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     /// owns this queue, and must outlive the returned value.
     pub unsafe fn new(region: *mut u8) -> Self {
         let () = Self::_CHECK;
+        // Chain every descriptor into the free list, in driver-private memory.
+        // The last entry wraps to 0 and is never followed: taking it empties
+        // the list, and `add` stops at `num_free == 0`.
+        let mut free_next = [0u16; SIZE];
+        for (index, next) in free_next.iter_mut().enumerate() {
+            *next = (index as u16 + 1) % SIZE as u16;
+        }
         let queue = Self {
             region,
+            state: [DescriptorState::Free; SIZE],
+            posted_len: [0; SIZE],
+            free_next,
             free_head: 0,
             num_free: SIZE as u16,
+            num_posted: 0,
             avail_idx: 0,
             last_used: 0,
+            faults: DeviceFaults::default(),
         };
-        // Chain every descriptor into the free list via its `next` field.
-        for index in 0..SIZE as u16 {
-            let next = if index + 1 < SIZE as u16 {
-                index + 1
-            } else {
-                0
-            };
-            // SAFETY: `index < SIZE`, so the descriptor lies within the region.
-            unsafe { queue.write_u16(desc_next_off(index), next) };
-        }
         // SAFETY: the available header lies within the region.
         unsafe {
             queue.write_u16(Self::AVAIL_OFF, 0);
@@ -159,6 +301,21 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     #[must_use]
     pub fn free_count(&self) -> usize {
         self.num_free as usize
+    }
+
+    /// Descriptors published to the device and not yet completed. This is the
+    /// only quantity a completion can legitimately consume, so it is also the
+    /// bound on how many completions [`poll`](Self::poll) can hand out before
+    /// the driver posts again.
+    #[must_use]
+    pub fn posted_count(&self) -> usize {
+        self.num_posted as usize
+    }
+
+    /// The used-ring completions this queue has refused; see [`DeviceFaults`].
+    #[must_use]
+    pub fn device_faults(&self) -> DeviceFaults {
+        self.faults
     }
 
     /// Publish a device-writable (receive) buffer at physical address `paddr`.
@@ -177,18 +334,30 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
             return None;
         }
         let head = self.free_head;
-        // SAFETY: `head` is a valid free descriptor index (invariant of the
-        // free list); all offsets derived from it lie within the region.
+        // The successor comes from the private free list. Taking it *before*
+        // the writes below is deliberate: this is a bounds-checked index, so
+        // even a broken free-list invariant faults here rather than after the
+        // unchecked writes have already landed outside the region.
+        self.free_head = self.free_next[head as usize];
+        // SAFETY: `free_head` is only ever assigned a descriptor index — 0 in
+        // `new`, a `free_next` entry (all `< SIZE`), or a `Token`'s index in
+        // `recycle` — and never a value read back from the region, so
+        // `head < SIZE` and every offset derived from it lies within it.
         unsafe {
-            self.free_head = self.read_u16(desc_next_off(head));
             self.write_u64(desc_addr_off(head), paddr);
             self.write_u32(desc_len_off(head), len);
             // Single-descriptor buffers never chain, so strip any NEXT flag
-            // defensively rather than trust the caller not to pass one.
+            // defensively rather than trust the caller not to pass one, and
+            // publish a `next` the device would find inert if it followed one
+            // anyway. This field is write-only to us: the free list it used to
+            // double as lives in `free_next` now, out of the device's reach.
             self.write_u16(desc_flags_off(head), flags & !VIRTQ_DESC_F_NEXT);
             self.write_u16(desc_next_off(head), 0);
         }
+        self.state[head as usize] = DescriptorState::Posted;
+        self.posted_len[head as usize] = len;
         self.num_free -= 1;
+        self.num_posted += 1;
 
         let slot = self.avail_idx & Self::MASK;
         // SAFETY: `slot < SIZE`, so the ring entry lies within the region.
@@ -202,15 +371,24 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         Some(Token(head))
     }
 
-    /// Reap the next completed buffer, returning its [`Token`] and the number
-    /// of bytes the device wrote, or `None` when none have completed. The
-    /// descriptor stays allocated until [`recycle`](Self::recycle).
+    /// Reap the next completed buffer, returning its [`Token`] and how many
+    /// bytes the device reported writing, **clamped** to the length this driver
+    /// programmed for that descriptor. The descriptor stays allocated until
+    /// [`recycle`](Self::recycle).
+    ///
+    /// `None` means no further completion is available to hand out from this
+    /// call. That covers three cases, which a caller distinguishes — if it
+    /// needs to — through [`device_faults`](Self::device_faults): the used ring
+    /// is caught up; every entry examined was refused as malformed; or the
+    /// per-call scan budget ran out. All three end a drain loop, which is the
+    /// only decision the caller has to make.
+    ///
+    /// Untrusted-device handling is the module header's subject; in short, a
+    /// completion is accepted only for a descriptor this driver posted and the
+    /// device has not already completed, at most `SIZE` used entries are
+    /// examined per call, and at most [`posted_count`](Self::posted_count)
+    /// completions can be handed out before the driver posts again.
     pub fn poll(&mut self) -> Option<(Token, u32)> {
-        // Bound the work per call. A conformant device never has more than SIZE
-        // buffers outstanding, so processing at most SIZE used entries here caps
-        // a hostile device that floods the used ring with invalid ids while
-        // continuously bumping its index: `poll` returns `None` after SIZE skips
-        // instead of spinning forever, and the caller's drain loop then exits.
         for _ in 0..SIZE {
             // SAFETY: the used index lies within the region.
             let device_idx = unsafe { self.read_u16(Self::USED_IDX_OFF) };
@@ -228,34 +406,46 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
                 )
             };
             self.last_used = self.last_used.wrapping_add(1);
-            // The used-ring `id` is device-controlled; a conformant device
-            // echoes a head index we posted (< SIZE). Reject an out-of-range id
-            // and keep draining, so a malformed completion can never drive an
-            // out-of-bounds recycle. Deeper untrusted-device handling
-            // (double-completion, leak accounting) is the driver PD's job (see
-            // `pds/nic-driver`).
-            if (id as usize) < SIZE {
-                return Some((Token(id as u16), len));
+            if (id as usize) >= SIZE {
+                bump(&mut self.faults.completion_out_of_range);
+                continue;
             }
+            let index = id as u16;
+            if self.state[index as usize] != DescriptorState::Posted {
+                // A replayed completion, or an echo of a descriptor never
+                // published. Accepting it would mint a second live token for
+                // one descriptor and let the free list take it twice.
+                bump(&mut self.faults.completion_not_posted);
+                continue;
+            }
+            self.state[index as usize] = DescriptorState::Reaped;
+            self.num_posted -= 1;
+            return Some((Token(index), len.min(self.posted_len[index as usize])));
         }
         None
     }
 
     /// Return a reaped descriptor to the free list, making it available again.
-    pub fn recycle(&mut self, token: Token) {
+    ///
+    /// # Errors
+    /// [`RecycleError`] when the token does not name a reaped descriptor of
+    /// this queue — a token still posted to the device, or one already
+    /// surrendered. The free list is left untouched, so a caller that ignores
+    /// the error loses the descriptor rather than corrupting the queue.
+    pub fn recycle(&mut self, token: Token) -> Result<(), RecycleError> {
+        // `head < SIZE` because `Token`'s field is private and every mint site
+        // bounds it, so this indexes in range whatever the caller does.
         let head = token.0;
-        // `head` came from `add`/`poll`, so the private-field invariant makes it
-        // a valid descriptor index. These assertions catch an internal
-        // bookkeeping bug (a double-recycle, a token from another queue) in
-        // debug builds rather than silently corrupting the free list — a bad
-        // token here is an internal invariant failure, never device input.
-        debug_assert!((head as usize) < SIZE, "recycled token index out of range");
-        debug_assert!(self.num_free < SIZE as u16, "descriptor recycled twice");
-        // SAFETY: `head < SIZE` by the private-field invariant, so the `next`
-        // field lies within the region.
-        unsafe { self.write_u16(desc_next_off(head), self.free_head) };
+        match self.state[head as usize] {
+            DescriptorState::Free => return Err(RecycleError::AlreadyFree(head)),
+            DescriptorState::Posted => return Err(RecycleError::StillPosted(head)),
+            DescriptorState::Reaped => {}
+        }
+        self.state[head as usize] = DescriptorState::Free;
+        self.free_next[head as usize] = self.free_head;
         self.free_head = head;
         self.num_free += 1;
+        Ok(())
     }
 
     // Volatile field accessors over the DMA region.
@@ -331,11 +521,39 @@ mod tests {
     }
 
     impl TestDevice {
-        fn service_writable(&mut self, payload: &[u8]) -> bool {
+        /// Publish a used-ring completion for `head` reporting `len` bytes,
+        /// exactly as the device would — including for a head it was never
+        /// given, which is how the hostile cases are driven.
+        fn complete(&mut self, head: u32, len: u32) {
+            let uslot = (self.used_idx as usize) & (SIZE - 1);
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
+            unsafe {
+                self.region
+                    .add(used_elem_id_off::<SIZE>(uslot as u16))
+                    .cast::<u32>()
+                    .write_volatile(head);
+                self.region
+                    .add(used_elem_len_off::<SIZE>(uslot as u16))
+                    .cast::<u32>()
+                    .write_volatile(len);
+            }
+            fence(Ordering::Release);
+            self.used_idx = self.used_idx.wrapping_add(1);
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
+            unsafe {
+                self.region
+                    .add(used_area_off::<SIZE>() + 2)
+                    .cast::<u16>()
+                    .write_volatile(self.used_idx);
+            }
+        }
+
+        /// The next head index the driver made available, or `None`.
+        fn next_avail(&mut self) -> Option<u16> {
             // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let avail_idx = unsafe { self.region.add(SIZE * 16 + 2).cast::<u16>().read_volatile() };
             if avail_idx == self.last_avail {
-                return false;
+                return None;
             }
             fence(Ordering::Acquire);
             let slot = (self.last_avail as usize) & (SIZE - 1);
@@ -347,7 +565,13 @@ mod tests {
                     .read_volatile()
             };
             self.last_avail = self.last_avail.wrapping_add(1);
+            Some(head)
+        }
 
+        fn service_writable(&mut self, payload: &[u8]) -> bool {
+            let Some(head) = self.next_avail() else {
+                return false;
+            };
             // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let addr = unsafe {
                 self.region
@@ -376,28 +600,34 @@ mod tests {
             // SAFETY: `buffer` is the real backing buffer the descriptor addresses and `n = min(payload, len)` stays within it.
             unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), buffer, n) };
 
-            let uslot = (self.used_idx as usize) & (SIZE - 1);
-            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
-            unsafe {
-                self.region
-                    .add(used_elem_id_off::<SIZE>(uslot as u16))
-                    .cast::<u32>()
-                    .write_volatile(head as u32);
-                self.region
-                    .add(used_elem_len_off::<SIZE>(uslot as u16))
-                    .cast::<u32>()
-                    .write_volatile(n as u32);
-            }
-            fence(Ordering::Release);
-            self.used_idx = self.used_idx.wrapping_add(1);
-            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
-            unsafe {
-                self.region
-                    .add(used_area_off::<SIZE>() + 2)
-                    .cast::<u16>()
-                    .write_volatile(self.used_idx);
-            }
+            self.complete(head as u32, n as u32);
             true
+        }
+    }
+
+    /// A queue over a fresh region plus the device on its far side, which is
+    /// what nearly every case below needs.
+    struct Fixture {
+        _region: Box<Region>,
+        queue: SplitVirtqueue<SIZE>,
+        device: TestDevice,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut region = Box::new(Region([0; 4096]));
+            let ptr = region.0.as_mut_ptr();
+            // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `SplitVirtqueue::new`'s contract.
+            let queue = unsafe { SplitVirtqueue::<SIZE>::new(ptr) };
+            Self {
+                _region: region,
+                queue,
+                device: TestDevice {
+                    region: ptr,
+                    last_avail: 0,
+                    used_idx: 0,
+                },
+            }
         }
     }
 
@@ -413,23 +643,31 @@ mod tests {
     }
 
     #[test]
-    fn add_consumes_and_recycle_restores_descriptors() {
-        let mut region = Box::new(Region([0; 4096]));
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region.0.as_mut_ptr()) };
-        assert_eq!(queue.free_count(), SIZE);
+    fn add_consumes_descriptors_and_recycle_restores_them_after_completion() {
+        let mut fx = Fixture::new();
+        assert_eq!(fx.queue.free_count(), SIZE);
+        assert_eq!(fx.queue.posted_count(), 0);
 
-        let mut tokens = Vec::new();
         for i in 0..SIZE {
-            tokens.push(queue.add_writable(0x1000 + i as u64, BUF as u32).unwrap());
+            fx.queue
+                .add_writable(0x1000 + i as u64, BUF as u32)
+                .expect("a descriptor is free");
         }
-        assert_eq!(queue.free_count(), 0);
-        assert!(queue.add_writable(0x9999, BUF as u32).is_none());
+        assert_eq!(fx.queue.free_count(), 0);
+        assert_eq!(fx.queue.posted_count(), SIZE);
+        assert!(fx.queue.add_writable(0x9999, BUF as u32).is_none());
 
-        for token in tokens {
-            queue.recycle(token);
+        // A descriptor is reclaimable only once the device has given it back.
+        for head in 0..SIZE as u32 {
+            fx.device.complete(head, 0);
         }
-        assert_eq!(queue.free_count(), SIZE);
+        for _ in 0..SIZE {
+            let (token, _) = fx.queue.poll().expect("a completion is pending");
+            assert_eq!(fx.queue.recycle(token), Ok(()));
+        }
+        assert_eq!(fx.queue.free_count(), SIZE);
+        assert_eq!(fx.queue.posted_count(), 0);
+        assert_eq!(fx.queue.device_faults(), DeviceFaults::default());
     }
 
     #[test]
@@ -438,58 +676,49 @@ mod tests {
         // ring positions wrap many times and every descriptor is reused,
         // mirroring a sustained receive path.
         const ROUNDS: u64 = 10_000;
-        let mut region = Box::new(Region([0; 4096]));
-        let region_ptr = region.0.as_mut_ptr();
+        let mut fx = Fixture::new();
 
         // A pool of real buffers; their host addresses double as the "paddr"
         // the device writes into.
         let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
         let addr_of = |b: &mut Box<[u8; BUF]>| b.as_mut_ptr() as u64;
 
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
-        let mut device = TestDevice {
-            region: region_ptr,
-            last_avail: 0,
-            used_idx: 0,
-        };
-
-        // Map a descriptor token back to the buffer index it carries.
+        // Map a descriptor index back to the buffer it carries.
         let mut token_buffer = std::collections::HashMap::new();
         for (index, buffer) in buffers.iter_mut().enumerate() {
-            let token = queue.add_writable(addr_of(buffer), BUF as u32).unwrap();
-            token_buffer.insert(token.0, index);
+            let token = fx.queue.add_writable(addr_of(buffer), BUF as u32).unwrap();
+            token_buffer.insert(token.index(), index);
         }
 
         for sequence in 0..ROUNDS {
             // Device fills exactly one posted buffer with the sequence number.
-            assert!(device.service_writable(&sequence.to_le_bytes()));
+            assert!(fx.device.service_writable(&sequence.to_le_bytes()));
 
-            let (token, len) = queue.poll().expect("a completion is pending");
+            let (token, len) = fx.queue.poll().expect("a completion is pending");
             assert_eq!(len, 8);
-            let index = token_buffer[&token.0];
+            let index = token_buffer[&token.index()];
             let value = u64::from_le_bytes(buffers[index][..8].try_into().unwrap());
             assert_eq!(value, sequence, "payload corrupted or out of order");
 
             // Return the descriptor and immediately repost the same buffer.
-            queue.recycle(token);
-            let token = queue
+            assert_eq!(fx.queue.recycle(token), Ok(()));
+            let token = fx
+                .queue
                 .add_writable(addr_of(&mut buffers[index]), BUF as u32)
                 .unwrap();
-            token_buffer.insert(token.0, index);
+            token_buffer.insert(token.index(), index);
         }
 
-        assert!(queue.poll().is_none());
+        assert!(fx.queue.poll().is_none());
+        assert_eq!(fx.queue.device_faults(), DeviceFaults::default());
     }
 
     #[test]
     fn poll_drops_out_of_range_completions_from_a_bad_device() {
-        let mut region = Box::new(Region([0; 4096]));
-        let region_ptr = region.0.as_mut_ptr();
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+        let mut fx = Fixture::new();
         let mut buffer = Box::new([0u8; BUF]);
-        let token = queue
+        let token = fx
+            .queue
             .add_writable(buffer.as_mut_ptr() as u64, BUF as u32)
             .unwrap();
 
@@ -497,47 +726,110 @@ mod tests {
         // the descriptor table, followed by a valid completion for the real
         // descriptor. The bogus id must never reach recycle (which would write
         // out of bounds).
-        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
-        unsafe {
-            region_ptr
-                .add(used_elem_id_off::<SIZE>(0))
-                .cast::<u32>()
-                .write_volatile(9999);
-            region_ptr
-                .add(used_elem_len_off::<SIZE>(0))
-                .cast::<u32>()
-                .write_volatile(0);
-            region_ptr
-                .add(used_elem_id_off::<SIZE>(1))
-                .cast::<u32>()
-                .write_volatile(token.0 as u32);
-            region_ptr
-                .add(used_elem_len_off::<SIZE>(1))
-                .cast::<u32>()
-                .write_volatile(BUF as u32);
-            fence(Ordering::Release);
-            region_ptr
-                .add(used_area_off::<SIZE>() + 2)
-                .cast::<u16>()
-                .write_volatile(2);
-        }
+        fx.device.complete(9999, 0);
+        fx.device.complete(u32::from(token.index()), BUF as u32);
 
-        // The bogus entry is dropped safely; the valid one is returned.
-        let (got, len) = queue.poll().expect("valid completion after the bogus one");
+        // The bogus entry is dropped safely and counted; the valid one is
+        // returned.
+        let (got, len) = fx
+            .queue
+            .poll()
+            .expect("valid completion after the bogus one");
         assert_eq!(got, token);
         assert_eq!(len, BUF as u32);
-        assert!(queue.poll().is_none());
-        queue.recycle(got);
-        assert_eq!(queue.free_count(), SIZE);
+        assert!(fx.queue.poll().is_none());
+        assert_eq!(
+            fx.queue.device_faults(),
+            DeviceFaults {
+                completion_out_of_range: 1,
+                completion_not_posted: 0,
+            }
+        );
+        assert_eq!(fx.queue.recycle(got), Ok(()));
+        assert_eq!(fx.queue.free_count(), SIZE);
+    }
+
+    #[test]
+    fn poll_refuses_a_replayed_completion() {
+        // The free-list corruption this prevents: two tokens for one descriptor
+        // let `recycle` link that descriptor's `next` to itself, after which
+        // `add` re-issues the same descriptor forever and `free_count` climbs
+        // past the queue size.
+        let mut fx = Fixture::new();
+        let token = fx.queue.add_writable(0x1000, BUF as u32).unwrap();
+        let head = u32::from(token.index());
+
+        fx.device.complete(head, 64);
+        fx.device.complete(head, 64);
+
+        let (got, _) = fx.queue.poll().expect("the first completion is valid");
+        assert_eq!(got, token);
+        assert!(
+            fx.queue.poll().is_none(),
+            "the replayed completion must not mint a second token"
+        );
+        assert_eq!(fx.queue.device_faults().completion_not_posted, 1);
+        assert_eq!(fx.queue.recycle(got), Ok(()));
+        assert_eq!(fx.queue.free_count(), SIZE);
+
+        // And a third replay after the descriptor is free is refused too.
+        fx.device.complete(head, 64);
+        assert!(fx.queue.poll().is_none());
+        assert_eq!(fx.queue.device_faults().completion_not_posted, 2);
+        assert_eq!(fx.queue.free_count(), SIZE);
+    }
+
+    #[test]
+    fn recycle_refuses_a_token_that_is_still_posted() {
+        let mut fx = Fixture::new();
+        let token = fx.queue.add_writable(0x1000, 64).unwrap();
+        let index = token.index();
+        assert_eq!(
+            fx.queue.recycle(token),
+            Err(RecycleError::StillPosted(index))
+        );
+        // The free list is untouched: the descriptor is still the device's.
+        assert_eq!(fx.queue.free_count(), SIZE - 1);
+        assert_eq!(fx.queue.posted_count(), 1);
+    }
+
+    #[test]
+    fn recycle_refuses_a_token_from_another_queue() {
+        // A token naming a descriptor that is free in *this* queue: the only
+        // way to hold one is to have taken it from a different queue, which is
+        // a driver bookkeeping error rather than device input.
+        let mut fx = Fixture::new();
+        let mut other = Fixture::new();
+        let token = other.queue.add_writable(0x2000, 64).unwrap();
+        other.device.complete(u32::from(token.index()), 64);
+        let (reaped, _) = other.queue.poll().unwrap();
+        let index = reaped.index();
+
+        assert_eq!(
+            fx.queue.recycle(reaped),
+            Err(RecycleError::AlreadyFree(index))
+        );
+        assert_eq!(fx.queue.free_count(), SIZE);
+    }
+
+    #[test]
+    fn poll_clamps_the_device_reported_length_to_the_posted_length() {
+        let mut fx = Fixture::new();
+        let token = fx.queue.add_writable(0x1000, 128).unwrap();
+        // The device claims it wrote far more than the buffer it was given.
+        fx.device.complete(u32::from(token.index()), u32::MAX);
+        let (_, len) = fx.queue.poll().expect("a completion is pending");
+        assert_eq!(
+            len, 128,
+            "an over-reported length must not escape the queue"
+        );
     }
 
     #[test]
     fn add_readable_posts_a_non_writable_descriptor() {
-        let mut region = Box::new(Region([0; 4096]));
-        let region_ptr = region.0.as_mut_ptr();
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
-        let token = queue.add_readable(0x4000, 64).unwrap();
+        let mut fx = Fixture::new();
+        let region_ptr = fx.device.region;
+        let token = fx.queue.add_readable(0x4000, 64).unwrap();
         // A transmit (device-readable) descriptor must not carry the
         // device-writable flag.
         // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
@@ -548,21 +840,19 @@ mod tests {
                 .read_volatile()
         };
         assert_eq!(flags & VIRTQ_DESC_F_WRITE, 0);
-        assert_eq!(queue.free_count(), SIZE - 1);
+        assert_eq!(fx.queue.free_count(), SIZE - 1);
     }
 
     #[test]
     fn ring_indices_wrap_through_the_u16_boundary() {
-        let mut region = Box::new(Region([0; 4096]));
-        let region_ptr = region.0.as_mut_ptr();
+        let mut fx = Fixture::new();
         let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+        let region_ptr = fx.device.region;
 
         // Force both ring positions to just below the u16 wrap so the cycles
         // below cross 0xFFFF -> 0x0000, where modular index bugs would live.
-        queue.avail_idx = u16::MAX - 1;
-        queue.last_used = u16::MAX - 1;
+        fx.queue.avail_idx = u16::MAX - 1;
+        fx.queue.last_used = u16::MAX - 1;
         // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             region_ptr
@@ -570,33 +860,29 @@ mod tests {
                 .cast::<u16>()
                 .write_volatile(u16::MAX - 1);
         }
-        let mut device = TestDevice {
-            region: region_ptr,
-            last_avail: u16::MAX - 1,
-            used_idx: u16::MAX - 1,
-        };
+        fx.device.last_avail = u16::MAX - 1;
+        fx.device.used_idx = u16::MAX - 1;
 
         for sequence in 0..8u64 {
             let index = sequence as usize % SIZE;
-            let token = queue
+            let token = fx
+                .queue
                 .add_writable(buffers[index].as_mut_ptr() as u64, BUF as u32)
                 .unwrap();
-            assert!(device.service_writable(&sequence.to_le_bytes()));
-            let (got, len) = queue.poll().expect("a completion is pending");
+            assert!(fx.device.service_writable(&sequence.to_le_bytes()));
+            let (got, len) = fx.queue.poll().expect("a completion is pending");
             assert_eq!(got, token);
             assert_eq!(len, 8);
             let value = u64::from_le_bytes(buffers[index][..8].try_into().unwrap());
             assert_eq!(value, sequence, "payload corrupted across the u16 wrap");
-            queue.recycle(got);
+            assert_eq!(fx.queue.recycle(got), Ok(()));
         }
     }
 
     #[test]
     fn poll_is_bounded_when_a_hostile_device_floods_invalid_ids() {
-        let mut region = Box::new(Region([0; 4096]));
-        let region_ptr = region.0.as_mut_ptr();
-        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
-        let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
+        let mut fx = Fixture::new();
+        let region_ptr = fx.device.region;
 
         // The device claims a huge number of completions, every used entry
         // carrying an out-of-range id. `poll` must skip at most SIZE of them and
@@ -619,7 +905,76 @@ mod tests {
                 .cast::<u16>()
                 .write_volatile(60_000);
         }
-        assert_eq!(queue.poll(), None);
+        assert_eq!(fx.queue.poll(), None);
+        assert_eq!(
+            fx.queue.device_faults().completion_out_of_range,
+            SIZE as u64
+        );
+    }
+
+    #[test]
+    fn a_drain_loop_terminates_against_a_device_replaying_valid_completions() {
+        // The livelock this closes: `poll` used to return `Some` for any
+        // in-range id, so a device republishing one valid id while advancing
+        // its used index made `while let Some(..) = poll()` run forever.
+        let mut fx = Fixture::new();
+        let head = u32::from(fx.queue.add_writable(0x1000, 64).unwrap().index());
+        fx.device.complete(head, 64);
+
+        let mut handed_out = 0usize;
+        let mut guard = 0usize;
+        // The reaped token is deliberately never recycled, so the descriptor
+        // cannot return to the posted state and re-arm the loop from this side.
+        while let Some((_reaped, _)) = fx.queue.poll() {
+            handed_out += 1;
+            guard += 1;
+            assert!(guard < 1000, "the drain loop did not terminate");
+            // The device keeps replaying the same completion mid-drain.
+            fx.device.complete(head, 64);
+        }
+        // Exactly one descriptor was posted, so exactly one completion could
+        // ever be handed out, however many the device published.
+        assert_eq!(handed_out, 1);
+        assert_eq!(fx.queue.posted_count(), 0);
+    }
+
+    #[test]
+    fn a_scribbled_descriptor_table_cannot_steer_the_free_list() {
+        // The out-of-bounds write this closes: the free list used to chain
+        // through each descriptor's shared `next` field, so a device that
+        // rewrote it owned `free_head` — and the next `add` wrote a descriptor
+        // at `free_head * 16`, anywhere in a u16 and far outside the region.
+        let mut fx = Fixture::new();
+        let region_ptr = fx.device.region;
+
+        // The device rewrites every byte of the descriptor table, which it can
+        // reach at any time, with a value that would drive `free_head` out of
+        // range if any of it were believed.
+        // SAFETY: single-threaded test driving the ring's far side; the whole
+        // descriptor table lies within the live, test-owned region.
+        unsafe {
+            for byte in 0..SIZE * 16 {
+                region_ptr.add(byte).write_volatile(0xFF);
+            }
+        }
+        fence(Ordering::Release);
+
+        // Allocation still walks the driver's own free list: every descriptor
+        // is handed out exactly once, in range.
+        let mut seen = [false; SIZE];
+        for _ in 0..SIZE {
+            let token = fx
+                .queue
+                .add_writable(0x1000, BUF as u32)
+                .expect("a descriptor is free");
+            let index = token.index() as usize;
+            assert!(index < SIZE, "the device steered an index out of range");
+            assert!(!seen[index], "descriptor {index} was handed out twice");
+            seen[index] = true;
+        }
+        assert!(fx.queue.add_writable(0x2000, BUF as u32).is_none());
+        assert_eq!(fx.queue.free_count(), 0);
+        assert_eq!(fx.queue.posted_count(), SIZE);
     }
 
     #[test]
@@ -679,7 +1034,7 @@ mod tests {
         ) {
             const N: usize = 8;
             let mut region = Box::new(Region([0; 4096]));
-            // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
+            // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `SplitVirtqueue::new`'s contract.
             let mut queue = unsafe { SplitVirtqueue::<N>::new(region.0.as_mut_ptr()) };
             let region_ptr = region.0.as_mut_ptr();
 
@@ -696,6 +1051,8 @@ mod tests {
                  -> Result<(), TestCaseError> {
                     let allocated = outstanding.len() + completed.len() + inflight.len();
                     prop_assert_eq!(q.free_count(), N - allocated);
+                    // Only descriptors the device has not completed are posted.
+                    prop_assert_eq!(q.posted_count(), outstanding.len() + completed.len());
                     // A descriptor index is in exactly one state at a time.
                     let mut seen = [false; N];
                     for t in outstanding
@@ -730,7 +1087,7 @@ mod tests {
                         Some((got, _)) => {
                             let expected = completed.pop_front();
                             // Compare by reference so the token is not consumed;
-                            // `Token` is non-`Copy`, and it is stored below.
+                            // `Token` is move-only, and it is stored below.
                             prop_assert_eq!(Some(&got), expected.as_ref());
                             inflight.push(got);
                         }
@@ -739,7 +1096,7 @@ mod tests {
                     _ => {
                         if !inflight.is_empty() {
                             let i = (sel as usize) % inflight.len();
-                            queue.recycle(inflight.remove(i));
+                            prop_assert_eq!(queue.recycle(inflight.remove(i)), Ok(()));
                         }
                     }
                 }
@@ -748,16 +1105,88 @@ mod tests {
 
             // Drain everything and confirm the free list is whole again.
             for token in inflight.drain(..) {
-                queue.recycle(token);
+                prop_assert_eq!(queue.recycle(token), Ok(()));
             }
             while let Some(token) = outstanding.pop() {
                 device_complete(region_ptr, &mut used_idx, token.index());
                 completed.push_back(token);
             }
             while let Some((got, _)) = queue.poll() {
-                queue.recycle(got);
+                prop_assert_eq!(queue.recycle(got), Ok(()));
             }
             prop_assert_eq!(queue.free_count(), N);
+            prop_assert_eq!(queue.posted_count(), 0);
+            // Every completion in this run named a posted descriptor exactly
+            // once, so a fault here would mean the queue refused a legitimate
+            // completion.
+            prop_assert_eq!(queue.device_faults(), DeviceFaults::default());
+        }
+
+        /// Arbitrary device bytes across the **whole** region — descriptor
+        /// table, driver ring and device ring alike, all of which the device
+        /// can write: `poll` must terminate, never mint a token outside the
+        /// descriptor table, never hand out more completions than were posted,
+        /// and never report more bytes than were programmed; and the free list
+        /// must still be intact enough to re-post afterwards.
+        #[test]
+        fn poll_survives_an_arbitrary_used_ring(
+            posts in 0usize..=8,
+            bytes in prop::collection::vec(any::<u8>(), 0..256),
+            used_idx in any::<u16>(),
+        ) {
+            const N: usize = 8;
+            const POSTED_LEN: u32 = 512;
+            let mut region = Box::new(Region([0; 4096]));
+            let ptr = region.0.as_mut_ptr();
+            // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `SplitVirtqueue::new`'s contract.
+            let mut queue = unsafe { SplitVirtqueue::<N>::new(ptr) };
+            for _ in 0..posts {
+                if queue.add_writable(0x1000, POSTED_LEN).is_none() {
+                    break;
+                }
+            }
+            let posted = queue.posted_count();
+
+            // Overwrite every byte of the region with fuzzer-chosen bytes, then
+            // claim an arbitrary used index. The device can write all of it,
+            // not merely the used ring it owns by protocol, so a driver that
+            // believed any of it — a descriptor's `next`, an available entry —
+            // would be steered from here.
+            let used_base = SplitVirtqueue::<N>::LAYOUT.device_offset;
+            let total = SplitVirtqueue::<N>::LAYOUT.total_bytes;
+            for offset in 0..total {
+                let byte = bytes.get(offset % bytes.len().max(1)).copied().unwrap_or(0);
+                // SAFETY: `offset < total_bytes`, which is inside the test-owned region.
+                unsafe { ptr.add(offset).write_volatile(byte) };
+            }
+            fence(Ordering::Release);
+            // SAFETY: the used index lies within the test-owned region.
+            unsafe { ptr.add(used_base + 2).cast::<u16>().write_volatile(used_idx) };
+
+            let mut handed_out = 0usize;
+            let mut guard = 0usize;
+            while let Some((token, len)) = queue.poll() {
+                prop_assert!((token.index() as usize) < N);
+                prop_assert!(len <= POSTED_LEN, "a device length escaped the clamp");
+                handed_out += 1;
+                guard += 1;
+                prop_assert!(guard <= N, "the drain loop outran the posted descriptors");
+                prop_assert_eq!(queue.recycle(token), Ok(()));
+            }
+            prop_assert!(handed_out <= posted);
+            prop_assert!(queue.free_count() <= N);
+
+            // The free list is driver-private, so the scribble cannot have
+            // reached it: every descriptor it still holds allocates in range
+            // and exactly once.
+            let mut seen = [false; N];
+            while let Some(token) = queue.add_writable(0x2000, POSTED_LEN) {
+                let index = token.index() as usize;
+                prop_assert!(index < N);
+                prop_assert!(!seen[index], "descriptor {} handed out twice", index);
+                seen[index] = true;
+            }
+            prop_assert_eq!(queue.free_count(), 0);
         }
     }
 }

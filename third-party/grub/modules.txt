@@ -9,7 +9,7 @@
 #   normal        GRUB's normal mode; runs the embedded grub.cfg
 #   multiboot2    the multiboot2/module2 loader seL4's x86 boot path requires
 #   test          the `[ ... ]` conditionals in grub.cfg's slot logic
-#   echo          the slot-selection messages (also asserted by the A/B test)
+#   echo          the `LFW-BOOT slot=… state=…` records the A/B test asserts on
 #   halt          halt on the no-bootable-slot recovery path
 #   loadenv       load_env/save_env for the grubenv boot-selection state
 #   pgp           enforce detached-signature verification on loaded files

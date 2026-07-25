@@ -1,11 +1,16 @@
-//! Microbenchmarks for the packet buffer pool and the owner-side free list.
+//! Microbenchmarks for the packet buffer pool and the owner-side ownership
+//! ledger.
 //!
 //! `write`/`write_at`/`read` are the only byte copies on the "zero-copy"
 //! dataplane, so their cost is benched across representative frame sizes (64,
 //! 512, 1500 bytes) to confirm they scale with payload and stay header-cheap.
-//! `FreeList::push`/`pop` are the per-buffer ownership bookkeeping and are
-//! expected to be near-free; the bench exists to catch a regression if
-//! validation logic is ever added.
+//!
+//! The ledger runs once per buffer per packet, so its two return paths are
+//! benched separately: `push` takes an ownership token back from within the
+//! domain, while `reclaim` is the trust boundary a peer's bare index crosses and
+//! pays for the range and outstanding-set checks. Both are expected to stay in
+//! the handful-of-cycles range; the point of the bench is to catch a regression
+//! that makes validation cost real time on the per-packet path.
 
 // Benchmark target: no public API to document (the `criterion_group!` macro
 // expands to public items).
@@ -55,9 +60,7 @@ fn buffer_pool_write_at(c: &mut Criterion) {
 fn buffer_pool_read(c: &mut Criterion) {
     let pool = BufferPool::<4>::new();
     // SAFETY: own index 0; the payload fits in BUFFER_SIZE.
-    unsafe {
-        let _ = pool.write(0, &[0xEFu8; 1500]);
-    }
+    unsafe { pool.write(0, &[0xEFu8; 1500]) }.expect("1500 bytes fit a buffer");
     let mut group = c.benchmark_group("buffer_pool_read");
     for &size in &SIZES {
         group.throughput(Throughput::Bytes(size as u64));
@@ -69,12 +72,29 @@ fn buffer_pool_read(c: &mut Criterion) {
     group.finish();
 }
 
-fn free_list_push_pop(c: &mut Criterion) {
-    let mut list = FreeList::<64>::empty();
-    c.bench_function("free_list_push_pop", |b| {
+fn free_list_pop_push(c: &mut Criterion) {
+    // The in-domain cycle: take a buffer and give the same token straight back,
+    // leaving the ledger exactly as it started for the next iteration.
+    let mut list = FreeList::<64>::full();
+    c.bench_function("free_list_pop_push", |b| {
         b.iter(|| {
-            black_box(list.push(black_box(7)));
-            black_box(list.pop());
+            let buffer = list.pop().expect("the ledger is restored every iteration");
+            black_box(list.push(black_box(buffer))).expect("the buffer was just taken out");
+        });
+    });
+}
+
+fn free_list_pop_reclaim(c: &mut Criterion) {
+    // The cross-domain cycle: the index leaves as a token, comes back as a bare
+    // number, and pays the trust boundary's validation on the way in.
+    let mut list = FreeList::<64>::full();
+    c.bench_function("free_list_pop_reclaim", |b| {
+        b.iter(|| {
+            let index = list
+                .pop()
+                .expect("the ledger is restored every iteration")
+                .index();
+            black_box(list.reclaim(black_box(index))).expect("the buffer is outstanding");
         });
     });
 }
@@ -84,6 +104,7 @@ criterion_group!(
     buffer_pool_write,
     buffer_pool_write_at,
     buffer_pool_read,
-    free_list_push_pop
+    free_list_pop_push,
+    free_list_pop_reclaim
 );
 criterion_main!(benches);

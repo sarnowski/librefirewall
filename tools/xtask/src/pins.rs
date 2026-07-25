@@ -8,8 +8,16 @@
 //!
 //! The file is a flat `KEY=value` list (valid as both make and shell), with
 //! `#` comments and blank lines.
+//!
+//! Because three different readers interpret this file, a key that appears
+//! twice would not mean the same thing to all of them — make and shell both
+//! take the *last* assignment, and any parser that took the first would
+//! silently build against a different pin than the container was built with.
+//! A duplicate is therefore rejected rather than resolved.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
+
+use crate::util::Error;
 
 /// The pinned versions xtask needs: to gate the builder in
 /// [`crate::image`]'s `verify_inputs` and to record provenance in the manifest.
@@ -19,30 +27,47 @@ pub(crate) struct Pins {
     /// is `v5.0.0` but the SDK's on-disk `VERSION` file and the manifest carry
     /// the bare `5.0.0`, so this is the form both compare against.
     pub(crate) rust_sel4_version: String,
+    /// Microkit SDK version, compared against the SDK's on-disk `VERSION`.
     pub(crate) microkit_version: String,
+    /// GRUB version, compared against the version the installed
+    /// `grub-mkstandalone` reports for itself.
     pub(crate) grub_version: String,
 }
 
-pub(crate) fn read(root: &Path) -> Result<Pins, String> {
+/// Read and validate the pinned upstream versions from
+/// `third-party/sources.lock`.
+///
+/// Errors if the file cannot be read, a required key is missing, or any key is
+/// assigned more than once.
+pub(crate) fn read(root: &Path) -> Result<Pins, Error> {
     let path = root.join("third-party/sources.lock");
-    let text =
-        fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|error| Error::io("read", &path, error))?;
     parse(&text)
 }
 
-fn parse(text: &str) -> Result<Pins, String> {
-    let value = |key: &str| -> Result<String, String> {
-        text.lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.starts_with('#') {
-                    return None;
-                }
-                line.split_once('=')
-            })
-            .find(|(name, _)| name.trim() == key)
-            .map(|(_, value)| value.trim().to_owned())
-            .ok_or_else(|| format!("sources.lock is missing {key}"))
+fn parse(text: &str) -> Result<Pins, Error> {
+    let mut pins: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if pins.insert(key, value.trim()).is_some() {
+            return Err(Error::invalid(format!(
+                "sources.lock assigns {key} more than once; make, the builder shell, \
+                 and xtask would not all resolve it to the same value"
+            )));
+        }
+    }
+
+    let value = |key: &str| -> Result<String, Error> {
+        pins.get(key)
+            .map(|value| (*value).to_owned())
+            .ok_or_else(|| Error::invalid(format!("sources.lock is missing {key}")))
     };
     let rust_sel4 = value("RUST_SEL4_VERSION")?;
     Ok(Pins {
@@ -76,7 +101,9 @@ GRUB_VERSION=2.14
 
     #[test]
     fn a_missing_key_is_a_named_error() {
-        let error = parse("MICROKIT_VERSION=2.3.0\nGRUB_VERSION=2.14\n").unwrap_err();
+        let error = parse("MICROKIT_VERSION=2.3.0\nGRUB_VERSION=2.14\n")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("RUST_SEL4_VERSION"), "got: {error}");
     }
 
@@ -85,5 +112,28 @@ GRUB_VERSION=2.14
         let pins =
             parse("RUST_SEL4_VERSION=5.0.0\nMICROKIT_VERSION=2.3.0\nGRUB_VERSION=2.14\n").unwrap();
         assert_eq!(pins.rust_sel4_version, "5.0.0");
+    }
+
+    #[test]
+    fn a_duplicated_key_is_a_named_error() {
+        // make and the builder shell take the last assignment; a parser that
+        // took the first would pin xtask to a different value than the
+        // container was built against. Refuse the file instead.
+        let error = parse(&format!("{SAMPLE}GRUB_VERSION=2.15\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GRUB_VERSION"), "got: {error}");
+        assert!(error.contains("more than once"), "got: {error}");
+    }
+
+    #[test]
+    fn the_real_lock_file_parses() {
+        // The committed lock file is an input to every build; a malformed or
+        // duplicated pin must fail here, not deep inside the toolchain.
+        let root = crate::util::workspace_root().unwrap();
+        let pins = read(&root).unwrap();
+        assert!(!pins.microkit_version.is_empty());
+        assert!(!pins.rust_sel4_version.starts_with('v'));
+        assert!(!pins.grub_version.is_empty());
     }
 }

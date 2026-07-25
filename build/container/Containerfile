@@ -1,10 +1,11 @@
 # librefirewall hermetic build environment.
 #
 # The pinned, reproducible builder: every input is version- and checksum-pinned
-# from third-party/sources.lock (BASE_IMAGE by digest, a dated Debian snapshot
-# for apt, and sha256-verified downloads for the Microkit SDK, rust-sel4,
-# rustup, GRUB, and syft). This image is a TOOL, not the product — the
-# deployable artifact is the signed boot payload xtask builds inside it.
+# (BASE_IMAGE by digest, a dated Debian snapshot plus an exact version for each
+# apt package, and sha256-verified downloads for the Microkit SDK, rust-sel4,
+# rustup, the Rust channel manifest, GRUB, and syft). This image is a TOOL, not
+# the product — the deployable artifact is the signed boot payload xtask builds
+# inside it.
 #
 # Network is available only while building THIS image; the build itself (the
 # Makefile `container` recipe) runs --network=none against the warmed offline
@@ -12,6 +13,12 @@
 # sources.lock's DEBIAN_IMAGE) and the corporate TLS-inspection CA arrives as
 # the optional build secret `enterprise_ca`, folded into a temporary bundle for
 # the network phase and never written into a layer.
+#
+# Apt package versions are pinned inline below rather than in sources.lock:
+# a version is only meaningful next to the package name it belongs to, and
+# sources.lock pins DEBIAN_SNAPSHOT, the frozen archive they all resolve
+# against. Transitive dependencies are not listed individually — the snapshot
+# freezes them, so the resolution is deterministic without restating it.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -25,10 +32,17 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
-    # ca-certificates is not installed yet, so this first apt runs over plain
-    # http; apt's own repository signatures still authenticate the archive.
+    # ca-certificates is not installed yet, so this first apt necessarily runs
+    # over plain http and its integrity rests entirely on apt's own Release
+    # signatures, verified against the Debian archive keyring baked into the
+    # digest-pinned BASE_IMAGE. That keyring is therefore a trust root of this
+    # build, on the same footing as the base image digest itself: an attacker
+    # who could substitute it could substitute anything in the image. Every
+    # later download is https with a pinned sha256 on top.
     apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y ca-certificates curl; \
+    DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y \
+      ca-certificates=20250419 \
+      curl=8.14.1-2+deb13u4; \
     sed -i 's|http://snapshot.debian.org|https://snapshot.debian.org|g' /etc/apt/sources.list; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
     if [ -s /run/secrets/enterprise_ca ]; then \
@@ -36,29 +50,31 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     apt-get -o Acquire::https::CaInfo="$ca_bundle" update; \
+    # clang is here for libclang, which bindgen dlopens to parse the seL4
+    # headers in sel4-sys's build script; without it the protection-domain
+    # build fails outright. git is required by `cargo deny check advisories`
+    # (the networked CI job), which clones the RustSec database with the git
+    # CLI. Neither is used to compile any first-party code.
     DEBIAN_FRONTEND=noninteractive apt-get \
       -o Acquire::https::CaInfo="$ca_bundle" \
       --no-install-recommends install -y \
-      binutils \
-      bison \
-      build-essential \
-      clang \
-      curl \
-      dosfstools \
-      flex \
-      gawk \
-      gdisk \
-      git \
-      gnupg \
-      lld \
-      llvm \
-      make \
-      mtools \
-      ovmf \
-      pkg-config \
-      python3 \
-      qemu-system-x86 \
-      xz-utils; \
+      binutils=2.44-3 \
+      bison=2:3.8.2+dfsg-1+b2 \
+      build-essential=12.12 \
+      clang=1:19.0-63 \
+      dosfstools=4.2-1.2 \
+      flex=2.6.4-8.2+b4 \
+      gawk=1:5.2.1-2+b1 \
+      gdisk=1.0.10-2 \
+      git=1:2.47.3-0+deb13u1 \
+      gnupg=2.4.7-21+deb13u1 \
+      make=4.4.1-2 \
+      mtools=4.0.48-1 \
+      ovmf=2025.02-8+deb13u1 \
+      pkg-config=1.8.1-4 \
+      python3=3.13.5-1 \
+      qemu-system-x86=1:10.0.11+ds-0+deb13u1 \
+      xz-utils=5.8.1-1+deb13u1; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
       --output /tmp/microkit-sdk.tar.gz "$MICROKIT_URL"; \
     printf '%s  %s\n' "$MICROKIT_SHA256" /tmp/microkit-sdk.tar.gz | sha256sum --check --strict -; \
@@ -83,6 +99,22 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
       --output /tmp/rustup-init "$RUSTUP_INIT_URL"; \
     printf '%s  %s\n' "$RUSTUP_INIT_SHA256" /tmp/rustup-init | sha256sum --check --strict -; \
     chmod 0755 /tmp/rustup-init; \
+    # The toolchain archives rustup fetches are hash-verified by rustup against
+    # the channel manifest, so pinning that one manifest pins the whole
+    # toolchain. Verify it here so a silently republished nightly — the real
+    # reproducibility risk for a dated channel — fails the build loudly.
+    # A mismatched pin would make the check vacuous (we would verify one date's
+    # manifest while rustup installed another), so the two are cross-checked
+    # before either is used.
+    manifest_date="${RUST_TOOLCHAIN#nightly-}"; \
+    case "$RUST_CHANNEL_MANIFEST_URL" in \
+      *"/dist/${manifest_date}/"*) ;; \
+      *) echo "sources.lock: RUST_CHANNEL_MANIFEST_URL is not the manifest for ${RUST_TOOLCHAIN}" >&2; exit 1;; \
+    esac; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/channel-rust-nightly.toml "$RUST_CHANNEL_MANIFEST_URL"; \
+    printf '%s  %s\n' "$RUST_CHANNEL_MANIFEST_SHA256" /tmp/channel-rust-nightly.toml \
+      | sha256sum --check --strict -; \
     SSL_CERT_FILE="$ca_bundle" RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo \
       /tmp/rustup-init -y --no-modify-path --profile minimal \
       --default-toolchain "$RUST_TOOLCHAIN" \
@@ -151,22 +183,11 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
 # Warm the offline dependency cache from the manifests alone. `cargo fetch`
 # needs every workspace member's Cargo.toml and the lockfile, but not the real
 # sources — empty target stubs (synthesized in the RUN below) are enough to load
-# each manifest. Keeping sources out of this layer means the fetch re-runs only
-# when dependencies actually change, not on every source edit; the sole coupling
-# to the workspace is the member manifest list.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml /tmp/workspace/
-COPY crates/wire/Cargo.toml /tmp/workspace/crates/wire/Cargo.toml
-COPY crates/queue/Cargo.toml /tmp/workspace/crates/queue/Cargo.toml
-COPY crates/packet-buffer/Cargo.toml /tmp/workspace/crates/packet-buffer/Cargo.toml
-COPY crates/virtio/Cargo.toml /tmp/workspace/crates/virtio/Cargo.toml
-COPY crates/pd-runtime/Cargo.toml /tmp/workspace/crates/pd-runtime/Cargo.toml
-COPY crates/nic-driver-core/Cargo.toml /tmp/workspace/crates/nic-driver-core/Cargo.toml
-COPY pds/nic-driver/Cargo.toml /tmp/workspace/pds/nic-driver/Cargo.toml
-COPY pds/forwarder/Cargo.toml /tmp/workspace/pds/forwarder/Cargo.toml
-COPY tools/xtask/Cargo.toml /tmp/workspace/tools/xtask/Cargo.toml
-# The out-of-workspace fuzz crate (its own `[workspace]`) resolves separately;
-# its manifest and lockfile warm its libFuzzer/arbitrary dependency tree.
-COPY fuzz/Cargo.toml fuzz/Cargo.lock /tmp/workspace/fuzz/
+# each manifest. The build context is restricted to exactly those manifests by
+# build/container/containerignore, so this single `COPY .` needs no list of
+# workspace members to keep in step, and the layer is invalidated only when a
+# manifest or lockfile actually changes.
+COPY . /tmp/workspace/
 
 RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
@@ -176,12 +197,16 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
       ca_bundle=/tmp/build-ca-bundle.crt; \
     fi; \
     cd /tmp/workspace; \
-    for manifest in $(find . -name Cargo.toml); do \
+    # Materialize the manifest list first: inside `$(...)` a failing find would
+    # be swallowed into an empty word list and silently skip every stub, so the
+    # build would only fall over later with a confusing cargo error.
+    find . -name Cargo.toml -type f > /tmp/manifests.list; \
+    while IFS= read -r manifest; do \
       stub="$(dirname "$manifest")/src"; \
       mkdir -p "$stub"; \
       : > "$stub/lib.rs"; \
       : > "$stub/main.rs"; \
-    done; \
+    done < /tmp/manifests.list; \
     # Explicit bench and fuzz-target files so target validation during fetch
     # sees them (the manifests declare `[[bench]]`/`[[bin]]` paths).
     for bench in crates/queue/benches/ring crates/packet-buffer/benches/pool crates/virtio/benches/virtio; do \

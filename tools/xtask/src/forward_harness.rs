@@ -2,11 +2,21 @@
 //!
 //! Attaches two `virtio-net-pci` NICs whose backends are host-controlled TCP
 //! sockets to a caller-built QEMU invocation (the OVMF/GRUB boot of the
-//! deployable disk), injects one Ethernet frame into each port, and asserts
-//! that each frame egresses — byte-identical — on the *other* port before a
-//! timeout. The observable contract is the frames themselves on the sockets,
-//! not serial text; the guest serial output is captured to a log and returned
-//! for callers that additionally assert on boot-manager messages.
+//! deployable disk), injects one Ethernet frame into each port, and judges the
+//! boot against a [`BootContract`].
+//!
+//! The primary contract, [`BootContract::Forwarding`], is the system's real
+//! observable behaviour: each injected frame must egress — byte-identical — on
+//! the *other* port. Nothing about it involves serial text. Its negative,
+//! [`BootContract::Halted`], proves the opposite for a disk with no bootable
+//! slot: the same frames are injected and *none* may come back, while the boot
+//! manager's structured halt record must appear on the serial channel.
+//!
+//! The captured serial output is always written to the run log — behind a
+//! harness-generated header describing how QEMU was configured — and returned
+//! to the caller. The returned bytes are the guest's output alone, never the
+//! header, so a caller asserting on the guest's structured records can never
+//! match something the harness itself wrote.
 
 use std::{
     fs,
@@ -19,10 +29,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Total wall-clock budget from QEMU launch to both frames observed. A TCG
-/// (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
+/// Total wall-clock budget from QEMU launch to the contract being decided. A
+/// TCG (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
 /// two polling virtio drivers is slow, hence the generous ceiling.
-const FORWARD_TEST_TIMEOUT: Duration = Duration::from_secs(180);
+const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long to wait for QEMU to dial back into both listeners before giving
 /// up. The netdev sockets connect when QEMU starts, well before guest boot.
@@ -39,6 +49,35 @@ const MIN_ETHERNET_FRAME: usize = 60;
 /// Upper bound on a frame length announced by QEMU's socket framing; anything
 /// larger means a corrupt stream, not a jumbo frame.
 const MAX_WIRE_FRAME: usize = 65535;
+
+/// What a boot must prove. Both variants inject the same frame into each port;
+/// they differ in which observation is success.
+pub enum BootContract<'a> {
+    /// Both injected frames must egress byte-identical on the opposite port —
+    /// the two-port zero-copy forwarding contract, in both directions at once.
+    Forwarding,
+    /// No injected frame may be forwarded (nothing bootable may have started)
+    /// and the guest must emit `marker` on the serial channel. Used for the
+    /// boot manager's halt path, where the absence of forwarding is the point.
+    Halted {
+        /// The structured record whose presence proves the halt path was
+        /// reached. It is matched as an exact byte substring, never as prose.
+        marker: &'a str,
+    },
+}
+
+/// The non-QEMU inputs of one boot test: what it must prove and where its run
+/// log goes.
+pub struct BootTest<'a> {
+    /// The contract the boot is judged against.
+    pub contract: BootContract<'a>,
+    /// Path of the run log, whose parent directories are created.
+    pub log_path: &'a Path,
+    /// Harness-generated header written ahead of the captured serial output,
+    /// recording how QEMU was configured. Reading a failure log must never
+    /// require guessing whether the run was accelerated.
+    pub log_header: &'a str,
+}
 
 /// The host side of the two NIC ports: one loopback listener per port that
 /// QEMU's `socket` netdevs dial into, so the port identity of each accepted
@@ -75,37 +114,30 @@ impl NicBackends {
 }
 
 /// Spawn the prepared QEMU `command` (which must carry this harness's NIC
-/// backends and serial on stdio), inject a distinct broadcast frame into each
-/// port, and assert each frame comes back out of the opposite port unchanged —
-/// the two-port zero-copy forwarding contract, in both directions at once.
+/// backends and serial on stdio) and judge the boot against `test`'s contract.
 ///
-/// The captured serial output is always written to `log_path` (whose parent
-/// directories are created), whether the test passes or fails, and is returned
-/// on success; QEMU is always killed and reaped on every exit path.
-pub fn run_forward_test(
+/// The captured serial output is always written to the run log, whether the
+/// test passes or fails, and is returned on success; QEMU is always killed and
+/// reaped on every exit path.
+pub fn run_boot_test(
     command: Command,
     backends: NicBackends,
-    log_path: &Path,
+    test: BootTest,
 ) -> Result<Vec<u8>, String> {
-    run_forward(
-        command,
-        backends,
-        log_path,
-        ACCEPT_TIMEOUT,
-        FORWARD_TEST_TIMEOUT,
-    )
+    run_boot(command, backends, test, ACCEPT_TIMEOUT, BOOT_TEST_TIMEOUT)
 }
 
-/// The forwarding-test engine with the two timeout budgets injected, so the
-/// timeout and early-exit paths can be exercised in tests without the
-/// production 20 s / 180 s waits.
-fn run_forward(
+/// The boot-test engine with the two timeout budgets injected, so the timeout
+/// and early-exit paths can be exercised in tests without the production
+/// 20 s / 180 s waits.
+fn run_boot(
     mut command: Command,
     backends: NicBackends,
-    log_path: &Path,
+    test: BootTest,
     accept_timeout: Duration,
     total_timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    let log_path = test.log_path;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -200,15 +232,16 @@ fn run_forward(
 
         // Inject immediately; the drivers may not be ready yet, which is
         // exactly why we also re-inject on a fixed cadence below.
-        let mut injecting = true;
         let mut last_injection = Instant::now();
+        let mut injection_failures: [Option<io::Error>; 2] = [None, None];
         for (writer, wire) in writers.iter_mut().zip(&wires) {
             if let Err(error) = writer.write_all(wire) {
                 break 'run Err(format!("inject first frames: {error}"));
             }
         }
 
-        // Phase 2: watch for both forwarded frames, re-injecting periodically.
+        // Phase 2: watch the ports and the serial channel, re-injecting
+        // periodically, until the contract is decided.
         let mut forwarded = [false, false];
         loop {
             drain(&serial_receiver, &mut output);
@@ -220,40 +253,78 @@ fn run_forward(
                     forwarded[ingress_port] = true;
                 }
             }
-            if forwarded.iter().all(|seen| *seen) {
-                break 'run Ok(());
+            match &test.contract {
+                BootContract::Forwarding => {
+                    if forwarded.iter().all(|seen| *seen) {
+                        break 'run Ok(());
+                    }
+                }
+                BootContract::Halted { marker } => {
+                    // A forwarded frame means something booted and is moving
+                    // traffic, which is precisely what must not happen. No
+                    // amount of further draining can undo that, so fail now.
+                    if let Some(port) = forwarded.iter().position(|seen| *seen) {
+                        break 'run Err(format!(
+                            "a frame injected into port{port} was forwarded, so a slot booted \
+                             where none may be bootable; see {}",
+                            log_path.display()
+                        ));
+                    }
+                    if contains(&output, marker.as_bytes()) {
+                        break 'run Ok(());
+                    }
+                }
             }
             match child.try_wait() {
-                Ok(Some(status)) => {
-                    break 'run Err(format!(
-                        "QEMU exited before both frames were forwarded ({status}); see {}",
-                        log_path.display()
-                    ));
-                }
+                Ok(Some(status)) => match &test.contract {
+                    BootContract::Forwarding => {
+                        break 'run Err(format!(
+                            "QEMU exited before both frames were forwarded ({status}){}; see {}",
+                            describe_injection_failures(&injection_failures),
+                            log_path.display()
+                        ));
+                    }
+                    // Halting the guest powers the machine off, so an exit is
+                    // the expected end of this contract — but serial bytes may
+                    // still be in flight. Leave the verdict to the post-drain
+                    // check below, which sees every byte QEMU wrote.
+                    BootContract::Halted { .. } => break 'run Ok(()),
+                },
                 Ok(None) => {}
                 Err(error) => break 'run Err(format!("poll QEMU: {error}")),
             }
             if start.elapsed() >= total_timeout {
-                break 'run Err(format!(
-                    "timed out after {}s waiting for forwarded frames \
-                     (port0->port1 seen: {}, port1->port0 seen: {}); see {}",
-                    total_timeout.as_secs(),
-                    forwarded[0],
-                    forwarded[1],
-                    log_path.display()
-                ));
+                break 'run Err(match &test.contract {
+                    BootContract::Forwarding => format!(
+                        "timed out after {}s waiting for forwarded frames \
+                         (port0->port1 seen: {}, port1->port0 seen: {}){}; see {}",
+                        total_timeout.as_secs(),
+                        forwarded[0],
+                        forwarded[1],
+                        describe_injection_failures(&injection_failures),
+                        log_path.display()
+                    ),
+                    BootContract::Halted { marker } => format!(
+                        "timed out after {}s waiting for {marker:?} on the serial channel{}; \
+                         see {}",
+                        total_timeout.as_secs(),
+                        describe_injection_failures(&injection_failures),
+                        log_path.display()
+                    ),
+                });
             }
-            if injecting && last_injection.elapsed() >= REINJECT_INTERVAL {
+            if last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 for (port, writer) in writers.iter_mut().enumerate() {
-                    if forwarded[port] {
+                    if forwarded[port] || injection_failures[port].is_some() {
                         continue;
                     }
-                    // A write failure means QEMU closed the socket (it is
-                    // exiting); stop injecting and let the exit/timeout checks
-                    // above decide the outcome.
-                    if writer.write_all(&wires[port]).is_err() {
-                        injecting = false;
+                    if let Err(error) = writer.write_all(&wires[port]) {
+                        // Losing one port's socket says nothing about the
+                        // other direction, so retire only this port and keep
+                        // the reason: it is reported with whatever verdict the
+                        // exit and timeout checks above eventually reach.
+                        injection_failures[port] = Some(error);
                     }
                 }
             }
@@ -264,24 +335,84 @@ fn run_forward(
 
     // Reliable shutdown: kill and reap QEMU on every path before joining the
     // reader threads (which unblock once the pipes and sockets close).
-    let terminate_result = terminate(&mut child, "forward test finished");
+    let terminate_result = terminate(&mut child, "boot test finished");
     let stdout_result = join_reader(stdout_reader, "stdout");
     let stderr_result = join_reader(stderr_reader, "stderr");
     let mut frame_reader_result = Ok(());
     for handle in frame_readers {
         frame_reader_result = frame_reader_result.and(join_reader(handle, "NIC socket"));
     }
+    // Killing QEMU does not discard what it already wrote: the pipes still hold
+    // every byte, the reader threads have now read them to EOF, and this drain
+    // moves the last of them into `output`. Any assertion on the capture is
+    // therefore made against the complete serial record, not a snapshot taken
+    // at whatever instant the contract happened to be decided.
     drain(&serial_receiver, &mut output);
 
-    // Always persist the captured serial output before propagating any error.
-    write_capture(log_path, &output)?;
+    let outcome = decide(outcome, &test.contract, &output, log_path);
 
-    outcome?;
+    // Persisting the log must never destroy the verdict that produced it, so
+    // the two are reported together rather than one replacing the other.
+    let capture_result = write_capture(log_path, test.log_header, &output);
+    match (outcome, capture_result) {
+        (Err(verdict), Err(capture)) => return Err(format!("{verdict}; additionally, {capture}")),
+        (Err(verdict), Ok(())) => return Err(verdict),
+        (Ok(()), Err(capture)) => return Err(capture),
+        (Ok(()), Ok(())) => {}
+    }
+
     terminate_result?;
     stdout_result?;
     stderr_result?;
     frame_reader_result?;
     Ok(output)
+}
+
+/// Apply the parts of a contract that can only be judged once the serial
+/// capture is complete. [`BootContract::Forwarding`] is decided entirely by
+/// frames on the sockets, so its loop verdict already stands; a halt is decided
+/// by a record the guest may have emitted in the same breath as powering off.
+fn decide(
+    loop_outcome: Result<(), String>,
+    contract: &BootContract,
+    output: &[u8],
+    log_path: &Path,
+) -> Result<(), String> {
+    match (contract, loop_outcome) {
+        (BootContract::Halted { marker }, Ok(())) if !contains(output, marker.as_bytes()) => {
+            Err(format!(
+                "QEMU exited without emitting {marker:?}, so the boot manager's halt path was \
+                 never reached; see {}",
+                log_path.display()
+            ))
+        }
+        (_, outcome) => outcome,
+    }
+}
+
+/// Whether `haystack` contains `needle` as a byte substring.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Render the per-port injection failures as a clause to append to a verdict,
+/// or the empty string when injection ran cleanly. A test that timed out
+/// because it silently stopped feeding one port must say so.
+fn describe_injection_failures(failures: &[Option<io::Error>; 2]) -> String {
+    let reasons: Vec<String> = failures
+        .iter()
+        .enumerate()
+        .filter_map(|(port, failure)| failure.as_ref().map(|error| format!("port{port}: {error}")))
+        .collect();
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!("; frame injection stopped on {}", reasons.join(", "))
+    }
 }
 
 fn bind_listener() -> Result<TcpListener, String> {
@@ -411,18 +542,32 @@ fn terminate(child: &mut Child, reason: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Write the captured serial output to `path`, creating parent directories.
-fn write_capture(path: &Path, output: &[u8]) -> Result<(), String> {
+/// Write the run log — the harness `header` followed by the captured serial
+/// output — to `path`, creating parent directories.
+fn write_capture(path: &Path, header: &str, output: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
-    fs::write(path, output).map_err(|error| format!("write {}: {error}", path.display()))
+    let mut bytes = Vec::with_capacity(header.len() + output.len());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(output);
+    fs::write(path, &bytes).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HEADER: &str = "# test header\n";
+
+    fn forwarding(log: &Path) -> BootTest<'_> {
+        BootTest {
+            contract: BootContract::Forwarding,
+            log_path: log,
+            log_header: HEADER,
+        }
+    }
 
     #[test]
     fn injection_frames_and_wire_encoding_are_well_formed() {
@@ -552,22 +697,96 @@ mod tests {
         decoder.join().unwrap().unwrap();
     }
 
+    #[test]
+    fn marker_search_matches_only_an_exact_byte_substring() {
+        let capture = b"noise\r\nLFW-BOOT slot=none state=halted\r\nmore".as_slice();
+        assert!(contains(capture, b"LFW-BOOT slot=none state=halted"));
+        assert!(!contains(capture, b"LFW-BOOT slot=A state=halted"));
+        // A marker longer than the capture, and an empty marker, must never
+        // read as a match: an empty needle would make every halt test pass.
+        assert!(!contains(b"short", b"a much longer needle"));
+        assert!(!contains(capture, b""));
+    }
+
+    #[test]
+    fn injection_failures_are_named_per_port_in_a_verdict() {
+        assert_eq!(describe_injection_failures(&[None, None]), "");
+
+        let only_port1 = [
+            None,
+            Some(io::Error::new(io::ErrorKind::BrokenPipe, "gone")),
+        ];
+        let described = describe_injection_failures(&only_port1);
+        assert!(described.contains("port1"), "unexpected: {described}");
+        assert!(!described.contains("port0"), "unexpected: {described}");
+        assert!(described.contains("gone"), "the cause must survive");
+
+        let both = [
+            Some(io::Error::new(io::ErrorKind::BrokenPipe, "left")),
+            Some(io::Error::new(io::ErrorKind::BrokenPipe, "right")),
+        ];
+        let described = describe_injection_failures(&both);
+        assert!(described.contains("port0") && described.contains("port1"));
+    }
+
+    #[test]
+    fn a_halt_contract_is_only_satisfied_by_the_marker_after_the_final_drain() {
+        let log = Path::new("/nonexistent/never-written.log");
+        let contract = BootContract::Halted {
+            marker: "LFW-BOOT slot=none state=halted",
+        };
+
+        // QEMU exiting is not on its own proof of a halt: without the record
+        // the verdict must flip to a failure naming what was missing.
+        let error = decide(Ok(()), &contract, b"booting...", log).unwrap_err();
+        assert!(error.contains("halt path was never reached"), "{error}");
+
+        // The same exit with the record present is the success it claims to be.
+        decide(
+            Ok(()),
+            &contract,
+            b"x\r\nLFW-BOOT slot=none state=halted\r\n",
+            log,
+        )
+        .unwrap();
+
+        // A verdict the loop already reached is never overridden.
+        let error = decide(Err("real failure".to_owned()), &contract, b"", log).unwrap_err();
+        assert_eq!(error, "real failure");
+
+        // The forwarding contract is decided by frames alone, so serial text
+        // must not enter into it either way.
+        decide(Ok(()), &BootContract::Forwarding, b"", log).unwrap();
+    }
+
+    #[test]
+    fn the_run_log_carries_the_harness_header_ahead_of_the_guest_output() {
+        let log = temp_log("capture-header");
+        let _ = fs::remove_file(&log);
+
+        write_capture(&log, "# accel=tcg\n", b"guest says hello").unwrap();
+
+        let written = fs::read_to_string(&log).unwrap();
+        assert_eq!(written, "# accel=tcg\nguest says hello");
+        let _ = fs::remove_file(&log);
+    }
+
     fn temp_log(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("lf-fwd-{}-{name}.log", std::process::id()))
     }
 
     #[test]
-    fn run_forward_reports_a_child_that_exits_before_connecting() {
+    fn run_boot_reports_a_child_that_exits_before_connecting() {
         // `true` exits immediately without ever dialing the NIC listeners, so
-        // the accept phase must fail fast — and still persist the serial log.
+        // the accept phase must fail fast — and still persist the run log.
         let log = temp_log("early-exit");
         let _ = fs::remove_file(&log);
         let backends = NicBackends::new().unwrap();
 
-        let error = run_forward(
+        let error = run_boot(
             Command::new("true"),
             backends,
-            &log,
+            forwarding(&log),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )
@@ -577,12 +796,12 @@ mod tests {
             error.contains("exited before connecting"),
             "unexpected error: {error}"
         );
-        assert!(log.is_file(), "the serial log must be written on failure");
+        assert!(log.is_file(), "the run log must be written on failure");
         let _ = fs::remove_file(&log);
     }
 
     #[test]
-    fn run_forward_times_out_when_the_child_never_connects() {
+    fn run_boot_times_out_when_the_child_never_connects() {
         // A live child that never dials the listeners must trip the accept
         // timeout rather than hang, and the child must be reaped.
         let log = temp_log("accept-timeout");
@@ -591,10 +810,10 @@ mod tests {
         let mut child = Command::new("sleep");
         child.arg("30");
 
-        let error = run_forward(
+        let error = run_boot(
             child,
             backends,
-            &log,
+            forwarding(&log),
             Duration::from_millis(300),
             Duration::from_millis(600),
         )
@@ -604,7 +823,33 @@ mod tests {
             error.contains("did not connect both NIC sockets"),
             "unexpected error: {error}"
         );
-        assert!(log.is_file(), "the serial log must be written on failure");
+        assert!(log.is_file(), "the run log must be written on failure");
         let _ = fs::remove_file(&log);
+    }
+
+    #[test]
+    fn a_failure_to_persist_the_run_log_never_replaces_the_run_verdict() {
+        // An unwritable log path must not swallow the real diagnostic: both
+        // the verdict and the persistence failure have to reach the caller.
+        let log = Path::new("/proc/self/librefirewall-unwritable/qemu.log");
+        let backends = NicBackends::new().unwrap();
+
+        let error = run_boot(
+            Command::new("true"),
+            backends,
+            forwarding(log),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("exited before connecting"),
+            "the run verdict must survive: {error}"
+        );
+        assert!(
+            error.contains("additionally"),
+            "the persistence failure must be reported too: {error}"
+        );
     }
 }

@@ -1,7 +1,5 @@
 #![no_main]
 #![no_std]
-// Binary crate: no library API to document.
-#![allow(missing_docs)]
 
 //! virtio-net driver protection domain: it drives one dataplane port (QEMU
 //! q35, virtio 1.0 PCI). One instance runs per dataplane port of the current
@@ -9,252 +7,238 @@
 //! mirror roles of the full port model (CONCEPT §9) are future ports, not part
 //! of this slice.
 //!
-//! This binary is a thin adapter. It owns the unsafe, seL4-only device bring-up
-//! and the poll loop, and delegates the steady-state dataplane — the
-//! device-distrust and peer-distrust logic — to the host-tested
-//! `nic-driver-core` crate ([`RxPath`], [`TxPath`], [`Counters`]). The same
-//! binary serves both ports: the Microkit tool patches each instance with its
-//! own device windows (ECAM page, relocated BAR), its own virtqueue DMA region,
-//! and the two pipeline regions it participates in.
+//! # This binary is an adapter and nothing else
 //!
-//! Bring-up reaches PCI config space through the mapped ECAM window, reprograms
-//! the device's MMIO BAR to the address this PD pre-mapped, negotiates virtio
-//! 1.0, and sets up the receive and transmit virtqueues in a DMA region. Both
-//! directions are then **zero-copy** over one buffer pool per pipeline: the
+//! It does exactly three things: it turns the addresses the Microkit tool
+//! patched into it into `nic_driver_core` types, it runs the poll loop, and it
+//! reports a rejected bring-up on the console. Every decision — what makes a
+//! device acceptable, what order the handshake runs in, what a poll pass does
+//! and which step rings which doorbell — lives in `nic_driver_core`
+//! ([`bringup`](nic_driver_core::bringup), [`port`](nic_driver_core::port)),
+//! where a host test can drive it against a stand-in device. Nothing that can
+//! be wrong in a logic sense is decided in this file, because nothing in this
+//! file can be tested off seL4.
+//!
+//! Both directions are **zero-copy** over one buffer pool per pipeline: the
 //! receive buffers are the rx pipeline's pool itself (the NIC DMAs each frame
 //! into a buffer the forwarder and peer driver read in place), and transmit
 //! frames are DMA'd straight out of the tx pipeline's pool after the driver
 //! zeroes the 12-byte virtio-net header in front of the frame.
 //!
-//! Because Microkit has no periodic wakeup, the driver polls by never returning
-//! from `init`; the forwarder runs at a higher priority and preempts on
-//! notification, so the busy loop does not starve it. There is no interrupt
-//! (no MSI-X, no INTx) by design.
+//! # Everything this domain touches is patched in at build time
+//!
+//! Hardware topology is static (CONCEPT §12.3): this driver performs **no PCI
+//! enumeration**. It never scans a bus, never reads a device it was not given,
+//! and holds capabilities for exactly one function's ECAM page. The Microkit
+//! tool patches each instance from `systems/qemu-x86_64/librefirewall.system`:
+//!
+//! | symbol | what it names |
+//! |---|---|
+//! | `ecam_vaddr` | the 4 KiB ECAM page of this instance's pinned PCI function |
+//! | `bar_vaddr` | the `BAR_WINDOW_SIZE` MMIO window the device's BAR is relocated to |
+//! | `vq_vaddr` | the zeroed `VQ_REGION_SIZE` virtqueue DMA region |
+//! | `rx_pipe_vaddr` / `tx_pipe_vaddr` | the two pipeline regions this port joins |
+//! | `bar_paddr`, `vq_paddr`, `rx_pipe_paddr`, `tx_pipe_paddr` | the physical addresses of those regions, for programming the device |
+//!
+//! Two instances of this one binary therefore drive two different devices with
+//! no code difference between them. The consequence worth stating plainly:
+//! **this driver cannot bind a device it was not built for.** The ids at the
+//! pinned function are checked and a mismatch is a rejection
+//! ([`BringUpError::NotVirtioNet`]) — there is no fallback scan, so a machine
+//! whose PCI topology differs from the one the image was built for produces a
+//! parked driver, never a driver bound to the wrong device.
+//!
+//! The window *sizes* are `nic_driver_core`'s constants rather than this
+//! file's, so the bound a device offset is checked against and the window
+//! actually mapped cannot be edited apart. That they in turn match the `size=`
+//! attributes in the system description has no enforcer; see
+//! [`BAR_WINDOW_SIZE`](nic_driver_core::bringup::BAR_WINDOW_SIZE).
+//!
+//! # Scheduling: two drivers busy-loop at equal priority
+//!
+//! Microkit has no periodic wakeup and this driver takes no interrupt (no
+//! MSI-X, no INTx) by design, so it polls by never returning from `init`. Two
+//! consequences follow from the system description, and neither is obvious from
+//! this file alone:
+//!
+//! - The forwarder runs at **priority 2** against this domain's **1**, so it
+//!   preempts on notification and the busy loop cannot starve it.
+//! - The **two driver instances run at the same priority 1 and both loop
+//!   forever**, so neither ever yields and neither ever blocks. Their mutual
+//!   progress rests entirely on seL4's round-robin scheduling of equal-priority
+//!   threads within a timeslice, and each instance occupies a core for as long
+//!   as the system runs. On the single-core bring-up this is why a driver must
+//!   not spin on a device-controlled condition — a device that withholds an
+//!   answer would deny the timeslice to the other port, not merely to itself —
+//!   and it is why every wait in `nic_driver_core` and `virtio::pci` is bounded
+//!   by a driver-owned count. Interrupt-driven operation and the multicore
+//!   dataplane both change this picture and are open (README status).
+//!
+//! # Channel 0 is used in one direction only, and the capability says so
+//!
+//! This domain holds one channel to the forwarder and only ever sends on it.
+//! [`NicDriver::notified`] is unreachable, and unreachable by *capability*
+//! rather than merely by control flow — which is the difference between a
+//! property of this file and a property of the system.
+//!
+//! Microkit expresses the narrow grant on the `<channel>`'s `<end>`: the
+//! optional `notify` attribute "indicates that the protection domain for this
+//! end can send a notification to the other end; defaults to **true**"
+//! (Microkit 2.3.0 user manual §7.6). Both `<end pd="forwarder" …>` elements
+//! in `systems/qemu-x86_64/librefirewall.system` are marked `notify="false"`,
+//! so each driver keeps its send capability on the forwarder while the
+//! forwarder holds none on either driver. Nothing can arrive at this
+//! entrypoint even if `pds/forwarder` grew code that tried; today it has none
+//! (it implements `notified` and constructs no `Channel` to send on).
+//!
+//! Control flow agrees, which is why the narrowing costs this domain nothing:
+//! on a healthy bring-up `init` never returns, and on a rejected one the
+//! domain parks with the poll loop never entered, so it never reaches the
+//! Microkit event loop at all. The entrypoint exists solely to satisfy
+//! `sel4_microkit::Handler`.
 
-use nic_driver_core::{Counters, RxPath, TxPath};
-use pd_runtime::{Pipeline, Producer};
-use sel4_microkit::{Channel, debug_println, memory_region_symbol, protection_domain, var};
-use virtio::net::features;
-use virtio::pci::{
-    self, CommonCfg, PciConfig, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
-    STATUS_FEATURES_OK, VIRTIO_NET_DEVICE_ID, VIRTIO_VENDOR_ID,
+use nic_driver_core::bringup::{
+    self, BringUpError, DriverVirtqueue, Live, MappedDevice, QUEUE_SIZE, TX_VQ_OFFSET,
 };
-use virtio::queue::SplitVirtqueue;
+use nic_driver_core::port::{DataplanePort, ForwarderSignal};
+use pd_runtime::{Pipeline, attach_pipeline};
+use sel4_microkit::{Channel, debug_println, memory_region_symbol, protection_domain, var};
+use virtio::pci::PciConfig;
 
+/// The forwarder, which this domain notifies when frames are waiting on the
+/// receive pipeline. See the crate header on why nothing arrives back.
 const FORWARDER: Channel = Channel::new(0);
 
-/// virtio-net virtqueue indices: queue 0 receives, queue 1 transmits.
-const RX_QUEUE: u16 = 0;
-const TX_QUEUE: u16 = 1;
-/// Descriptors per virtqueue (buffers posted to the NIC at once).
-const QUEUE_SIZE: usize = 16;
-/// Byte offset of the transmit virtqueue within the virtqueue DMA region; the
-/// receive virtqueue sits at offset 0.
-const TX_VQ_OFFSET: usize = 0x800;
-/// Size of the virtqueue DMA region (matches librefirewall.system).
-const VQ_REGION_SIZE: usize = 0x1000;
-/// Size of the mapped BAR window (matches librefirewall.system); every
-/// device-supplied BAR offset is bounded against this before use.
-const BAR_SIZE: usize = 0x4000;
+/// The poll pass's outward signal, bound to the channel above.
+struct ForwarderChannel;
 
-type Vq = SplitVirtqueue<QUEUE_SIZE>;
-
-// Both virtqueues must fit their DMA region, with the transmit queue's
-// 16-byte descriptor-table alignment preserved.
-const _: () = assert!(Vq::LAYOUT.total_bytes <= TX_VQ_OFFSET);
-const _: () = assert!(TX_VQ_OFFSET % 16 == 0);
-const _: () = assert!(TX_VQ_OFFSET + Vq::LAYOUT.total_bytes <= VQ_REGION_SIZE);
+impl ForwarderSignal for ForwarderChannel {
+    fn notify(&self) {
+        FORWARDER.notify();
+    }
+}
 
 #[protection_domain]
 fn init() -> NicDriver {
     debug_println!("LIBREFIREWALL_NIC:driver:start");
+    match bring_up() {
+        Ok((device, mut port)) => {
+            debug_println!("LIBREFIREWALL_NIC:driver-ok rx-posted={QUEUE_SIZE}");
+            loop {
+                port.poll_once(&device, &ForwarderChannel);
+                core::hint::spin_loop();
+            }
+        }
+        Err(error) => {
+            // The whole reason, not a summary: with no shell and no CLI
+            // (CONCEPT §11) this line is all an operator gets, and every
+            // `BringUpError` variant carries the value that caused it.
+            // `signalled` says whether the device was told to stop or was left
+            // decoding nothing, which depends on whether its BAR had been
+            // placed when the rejection happened.
+            debug_println!(
+                "LIBREFIREWALL_NIC:fail error={error:?} signalled={}",
+                error.signalled_to_device()
+            );
+            NicDriver
+        }
+    }
+}
 
+/// Map this domain's regions and bring its device up, leaving it live with its
+/// receive queue primed.
+///
+/// Every step is `nic_driver_core`'s; what happens here is the mapping and the
+/// order, and the order is not this function's to choose — each state is
+/// produced only by the transition before it (see
+/// [`bringup`](nic_driver_core::bringup)), so this reads as a sequence because
+/// it is the only sequence expressible.
+fn bring_up() -> Result<(Live<MappedDevice>, DataplanePort<'static>), BringUpError> {
     // Mapped windows and DMA physical addresses, all patched by the Microkit
-    // tool from librefirewall.system: `ecam` is the device's 4 KiB ECAM page,
-    // `bar` the BAR_SIZE MMIO window, `vq` the zeroed VQ_REGION_SIZE virtqueue
-    // DMA region. Each `unsafe` use below states the precondition it upholds.
+    // tool from librefirewall.system; see the crate header's table. Each
+    // `unsafe` use below states the precondition it upholds.
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();
     let vq = memory_region_symbol!(vq_vaddr: *mut u8).as_ptr();
-    // SAFETY: patched to the rx pipeline region shared read-write with the
-    // forwarder and the peer driver PD; its buffer pool doubles as this NIC's
-    // receive DMA source — `Pipeline::attach`'s contract.
-    let rx_pipe =
-        unsafe { Pipeline::attach(memory_region_symbol!(rx_pipe_vaddr: *mut Pipeline).as_ptr()) };
-    // SAFETY: as above, for the tx pipeline region, whose pool is this NIC's
-    // transmit DMA source.
-    let tx_pipe =
-        unsafe { Pipeline::attach(memory_region_symbol!(tx_pipe_vaddr: *mut Pipeline).as_ptr()) };
+    // The pipeline this NIC receives into (its pool is this NIC's receive DMA
+    // target) and the one it transmits out of. The aliasing invariant both
+    // share is stated once, in `attach_pipeline!`.
+    let rx_pipe: &'static Pipeline = attach_pipeline!(rx_pipe_vaddr);
+    let tx_pipe: &'static Pipeline = attach_pipeline!(tx_pipe_vaddr);
     let bar_paddr = *var!(bar_paddr: usize = 0);
     let vq_paddr = *var!(vq_paddr: usize = 0) as u64;
     let rx_pipe_paddr = *var!(rx_pipe_paddr: usize = 0) as u64;
     let tx_pipe_paddr = *var!(tx_pipe_paddr: usize = 0) as u64;
-    assert!(
-        bar_paddr != 0 && bar_paddr <= u32::MAX as usize && bar_paddr % BAR_SIZE == 0,
-        "BAR relocation target must be a BAR-size-aligned 32-bit address"
-    );
 
-    // --- Stage A: PCI discovery ---
     // SAFETY: `ecam` is the mapped 4 KiB ECAM page of the pinned device
-    // function (patched from librefirewall.system) and stays mapped for the
-    // PD's whole life — exactly `PciConfig::new`'s contract.
+    // function (patched from librefirewall.system, which maps `ecam0`/`ecam1`
+    // at `ecam_vaddr` into this PD) and stays mapped for the PD's whole life —
+    // exactly `PciConfig::new`'s contract.
     let config = unsafe { PciConfig::new(ecam) };
-    let (vendor, device) = config.ids();
-    debug_println!("LIBREFIREWALL_NIC:pci vendor={vendor:#06x} device={device:#06x}");
-    assert!(
-        vendor == VIRTIO_VENDOR_ID && device == VIRTIO_NET_DEVICE_ID,
-        "expected a modern virtio-net device at the pinned BDF"
-    );
 
-    let caps = pci::find_virtio_caps(&config).expect("virtio PCI capabilities");
+    let placed = bringup::identify(&config)?.place_bar(&config, bar_paddr)?;
+    // SAFETY: `bar` is the mapped BAR window patched from librefirewall.system,
+    // whose `bar0`/`bar1` region is `BAR_WINDOW_SIZE` bytes at the physical
+    // address `place_bar` just programmed, page-aligned (so far more than the
+    // `virtio::pci::COMMON_CFG_ALIGN` the window must carry) and mapped for the
+    // PD's whole life — `PlacedBar::map`'s contract. Nothing is required of the
+    // device's own offsets here: `identify` bounded them against the same
+    // constant and refused any common-configuration offset the registers behind
+    // it could not be addressed at.
+    let negotiated = unsafe { placed.map(bar) }
+        .acknowledge()?
+        .negotiate_features()?;
     debug_println!(
-        "LIBREFIREWALL_NIC:caps bar={} common={:#x} notify={:#x} mult={} device={:#x}",
-        caps.bar,
-        caps.common,
-        caps.notify,
-        caps.notify_multiplier,
-        caps.device
+        "LIBREFIREWALL_NIC:features negotiated={:#x}",
+        negotiated.features()
     );
+    let configured = negotiated.configure_queues(vq_paddr)?;
 
-    // The structure offsets come from the untrusted device; refuse to proceed
-    // unless they fit the BAR window we mapped, and unless the BAR is the
-    // 64-bit kind we relocate.
-    assert!(
-        caps.within(BAR_SIZE),
-        "virtio structures outside the mapped BAR window"
-    );
-    assert!(
-        config.bar_is_64bit(caps.bar),
-        "expected a 64-bit virtio BAR"
-    );
-
-    // --- Stage B: relocate the BAR, enable the device, negotiate virtio 1.0 ---
-    config.reprogram_bar64(caps.bar, bar_paddr as u32);
-    config.enable_memory_and_bus_master();
-
-    // SAFETY: `caps.within(BAR_SIZE)` was asserted above, so `caps.common` plus
-    // the common-cfg extent lies inside the mapped `bar` window; the resulting
-    // pointer is the device's `virtio_pci_common_cfg` within that mapping.
-    let common = unsafe { CommonCfg::new(bar.add(caps.common as usize)) };
-    common.reset();
-    common.set_status(STATUS_ACKNOWLEDGE);
-    common.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-
-    let offered = common.device_features();
-    let negotiated = offered & (features::VIRTIO_F_VERSION_1 | features::VIRTIO_NET_F_MAC);
-    assert!(
-        negotiated & features::VIRTIO_F_VERSION_1 != 0,
-        "device does not offer virtio 1.0"
-    );
-    common.set_driver_features(negotiated);
-    common.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-    assert!(
-        common.status() & STATUS_FEATURES_OK != 0,
-        "device rejected the negotiated features"
-    );
-    assert!(
-        common.num_queues() > TX_QUEUE,
-        "device offers no transmit virtqueue"
-    );
-    debug_println!("LIBREFIREWALL_NIC:features negotiated={negotiated:#x}");
-
-    // Both virtqueues live in the DMA region: receive at offset 0, transmit at
-    // TX_VQ_OFFSET. The receive buffers are the rx pipeline's pool; the
-    // transmit buffers are the tx pipeline's pool.
+    // Both virtqueues live in the one DMA region: receive at offset 0, transmit
+    // at TX_VQ_OFFSET, the same placement `configure_queues` programmed into
+    // the device from the same constants.
     // SAFETY: `vq` is the mapped, zeroed, page-aligned (so 16-byte-aligned)
-    // virtqueue DMA region, shared only with this device; the
-    // `total_bytes <= TX_VQ_OFFSET` const-assert proves it fits — `Vq::new`'s
+    // virtqueue DMA region, shared only with this device; `bringup`'s
+    // `total_bytes <= TX_VQ_OFFSET` const-assertion proves the receive queue
+    // fits before the transmit queue's offset — `SplitVirtqueue::new`'s
     // contract.
-    let mut rx = unsafe { Vq::new(vq) };
-    // SAFETY: same region; the `TX_VQ_OFFSET % 16 == 0` and
-    // `TX_VQ_OFFSET + total_bytes <= VQ_REGION_SIZE` const-asserts keep the tx
-    // queue a disjoint, 16-byte-aligned, sole-owned window inside the region.
-    let mut tx = unsafe { Vq::new(vq.add(TX_VQ_OFFSET)) };
-    let rx_notify_off = common.setup_queue(RX_QUEUE, &Vq::LAYOUT, vq_paddr);
-    let tx_notify_off = common.setup_queue(TX_QUEUE, &Vq::LAYOUT, vq_paddr + TX_VQ_OFFSET as u64);
-    for notify_off in [rx_notify_off, tx_notify_off] {
-        assert!(
-            caps.notify as usize + pci::notify_offset_bytes(notify_off, caps.notify_multiplier) + 2
-                <= BAR_SIZE,
-            "queue notify slot outside the mapped BAR window"
-        );
-    }
-    // SAFETY: `caps.within(BAR_SIZE)` (asserted above) bounds `caps.notify`
-    // inside the mapped `bar` window, so the notify base stays within it; the
-    // per-queue slot offset is bounded separately just above before each write.
-    let notify_base = unsafe { bar.add(caps.notify as usize) };
+    let receive_queue = unsafe { DriverVirtqueue::new(vq) };
+    // SAFETY: the same region; `bringup`'s `TX_VQ_OFFSET.is_multiple_of(16)`
+    // and `TX_VQ_OFFSET + total_bytes <= VQ_REGION_SIZE` const-assertions keep
+    // the transmit queue a disjoint, 16-byte-aligned, sole-owned window inside
+    // it.
+    let transmit_queue = unsafe { DriverVirtqueue::new(vq.add(TX_VQ_OFFSET)) };
 
-    // Steady-state bookkeeping lives in the host-tested core; this adapter owns
-    // only the device MMIO and the poll loop.
-    let mut producer = Producer::new();
-    let mut rx_path = RxPath::<QUEUE_SIZE>::new();
-    let mut tx_path = TxPath::<QUEUE_SIZE>::new();
-    let mut counters = Counters::default();
-    let rx_pool_paddr = Pipeline::pool_paddr(rx_pipe_paddr);
-
-    rx_path.refill(&mut rx, &mut producer, rx_pool_paddr);
-
-    // DRIVER_OK before the first doorbell: a device need not act on
-    // notifications until the driver signals it is ready.
-    common.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-    // SAFETY: `notify_base` is within the mapped BAR (above) and the notify-slot
-    // loop above asserted `notify + notify_off*multiplier + 2 <= BAR_SIZE` for
-    // `rx_notify_off`, so this doorbell write lands inside the mapping.
-    unsafe {
-        pci::notify_queue(notify_base, rx_notify_off, caps.notify_multiplier, RX_QUEUE);
-    }
-    debug_println!("LIBREFIREWALL_NIC:driver-ok rx-posted={QUEUE_SIZE}");
-
-    // Latch for the malformed-descriptor diagnostic: a hostile neighbour must
-    // not be able to drive unbounded serial output.
-    let mut reported_malformed = false;
-
-    // --- Stage C: zero-copy receive + transmit loop (never returns) ---
-    loop {
-        // Receive: reclaim returned buffers, repost them to the NIC, and hand
-        // completed frames to the forwarder.
-        producer.reclaim(&rx_pipe.free);
-        let reposted = rx_path.refill(&mut rx, &mut producer, rx_pool_paddr);
-        if rx_path.drain(&mut rx, &mut producer, rx_pipe, &mut counters) {
-            FORWARDER.notify();
-        }
-        if reposted {
-            // SAFETY: as at the DRIVER_OK doorbell — `notify_base` is in-BAR and
-            // the `rx_notify_off` slot was bounded against BAR_SIZE by the loop.
-            unsafe {
-                pci::notify_queue(notify_base, rx_notify_off, caps.notify_multiplier, RX_QUEUE);
-            }
-        }
-
-        // Transmit: reap completions first (returning each buffer to its
-        // pool-owning peer), then post frames the forwarder queued.
-        tx_path.reap(&mut tx, tx_pipe);
-        if tx_path.post(&mut tx, tx_pipe, tx_pipe_paddr, &mut counters) {
-            // SAFETY: `notify_base` is in-BAR and the `tx_notify_off` slot was
-            // bounded against BAR_SIZE by the same notify-slot loop as the rx slot.
-            unsafe {
-                pci::notify_queue(notify_base, tx_notify_off, caps.notify_multiplier, TX_QUEUE);
-            }
-        }
-
-        // Emit the malformed-descriptor diagnostic once, off the counter going
-        // non-zero, so a hostile neighbour cannot flood the console.
-        if counters.tx_malformed > 0 && !reported_malformed {
-            reported_malformed = true;
-            debug_println!("LIBREFIREWALL_NIC:malformed-tx-descriptor(s) dropped");
-        }
-
-        core::hint::spin_loop();
-    }
+    let mut port = DataplanePort::attach(
+        rx_pipe,
+        rx_pipe_paddr,
+        tx_pipe,
+        tx_pipe_paddr,
+        receive_queue,
+        transmit_queue,
+    );
+    // Buffers are posted while the device is still `Configured`, and
+    // `go_live` is what sets DRIVER_OK and only then rings the receive
+    // doorbell — the ordering is the type's, not this call site's.
+    port.prime();
+    Ok((configured.go_live(), port))
 }
 
-/// The driver never returns from `init`, so this handler is only a type for the
-/// Microkit entrypoint signature; its methods are never invoked.
+/// Carries no state: on a healthy bring-up the driver never returns from
+/// `init`, so this exists only to satisfy the Microkit entrypoint's return
+/// type.
+///
+/// It is also what a rejected bring-up returns. Returning parks the protection
+/// domain in the Microkit event loop with the poll loop never entered and, past
+/// the point the device is reachable, `STATUS_FAILED` written to it — an idle,
+/// harmless domain rather than a faulted one. Restarting it is the PD
+/// fault-handling milestone (README status), not this domain's job.
 struct NicDriver;
 
 impl sel4_microkit::Handler for NicDriver {
     type Error = sel4_microkit::Infallible;
 
+    /// Unreachable; see the crate header's note on channel 0.
     fn notified(&mut self, _channels: sel4_microkit::ChannelSet) -> Result<(), Self::Error> {
         Ok(())
     }

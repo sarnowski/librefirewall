@@ -7,7 +7,6 @@ BUILDER_IMAGE ?= localhost/librefirewall-builder:microkit-$(MICROKIT_VERSION)
 KVM_FLAGS := $(if $(wildcard /dev/kvm),--device /dev/kvm --group-add keep-groups,)
 CONTAINERFILE := build/container/Containerfile
 CONTAINER_IGNORE := build/container/containerignore
-WRITABLE_DIRS := build dist sdk target
 ENTERPRISE_CA_FILE ?= $(firstword $(wildcard /usr/local/share/ca-certificates/*-dpi-ca.crt))
 
 ifeq ($(strip $(ENTERPRISE_CA_FILE)),)
@@ -16,39 +15,55 @@ else
 CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
 endif
 
-.PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean builder prepare
+.PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean
 
-image: builder prepare
+# `image` provisions the pinned builder and is therefore the ONLY target that
+# reaches the network. Every other target requires that image to already exist
+# and refuses to build it, so no gate command can quietly turn into an OCI
+# build — and the offline guarantee is enforced here rather than asserted in
+# prose.
+image:
+	$(provision_builder)
 	$(call xtask,image)
 
-run: builder prepare
+run:
+	$(require_builder)
 	$(call xtask_interactive,run)
 
-test: builder prepare
+test:
+	$(require_builder)
 	$(call xtask,test)
 
-coverage: builder prepare
+coverage:
+	$(require_builder)
 	$(call xtask,coverage)
 
-bench: builder prepare
+bench:
+	$(require_builder)
 	$(call xtask,bench)
 
-fuzz: builder prepare
+fuzz:
+	$(require_builder)
 	$(call xtask,fuzz)
 
-verify-reproducible: builder prepare
+verify-reproducible:
+	$(require_builder)
 	$(call xtask,verify-reproducible)
 
-test-system: builder prepare
+test-system:
+	$(require_builder)
 	$(call xtask,test-system)
 
-test-ab: builder prepare
+test-ab:
+	$(require_builder)
 	$(call xtask,test-ab)
 
-ci: builder prepare
+ci:
+	$(require_builder)
 	$(call xtask,ci)
 
-release: builder prepare
+release:
+	$(require_builder)
 	$(call xtask,release)
 
 # Point git at the tracked hooks: pre-commit runs the fast gate (`make test`),
@@ -58,19 +73,29 @@ hooks:
 	git config core.hooksPath .githooks
 	@echo "git hooks path set to .githooks (pre-commit=make test, pre-push=make ci)"
 
-clean: builder
+# xtask owns the list of generated directories (tools/xtask host::clean), so
+# clean runs in the container like every other command rather than restating
+# that list here where the two would drift.
+clean:
+	$(require_builder)
 	$(call xtask,clean)
 
-builder:
-	$(PODMAN) --cgroup-manager=cgroupfs build \
-		--file $(CONTAINERFILE) \
-		--ignorefile $(CONTAINER_IGNORE) \
-		--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
-		$(CA_SECRET) \
-		--tag $(BUILDER_IMAGE) .
+define provision_builder
+$(PODMAN) --cgroup-manager=cgroupfs build \
+	--file $(CONTAINERFILE) \
+	--ignorefile $(CONTAINER_IGNORE) \
+	--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
+	$(CA_SECRET) \
+	--tag $(BUILDER_IMAGE) .
+endef
 
-prepare:
-	mkdir -p $(WRITABLE_DIRS)
+define require_builder
+@$(PODMAN) image exists $(BUILDER_IMAGE) || { \
+	echo "make: builder image $(BUILDER_IMAGE) is not present."; \
+	echo "make: run 'make image' first — it is the only network-enabled phase and provisions the pinned builder."; \
+	exit 1; \
+}
+endef
 
 define container
 $(PODMAN) --cgroup-manager=cgroupfs run --rm \
@@ -85,7 +110,7 @@ $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--tmpfs /tmp:rw,nosuid,nodev \
 	--mount type=bind,src=$(CURDIR),dst=/workspace,rw=true \
 	$(KVM_FLAGS) \
-	$(1) $(BUILDER_IMAGE) cargo run --locked --package xtask -- $(2)
+	$(1) $(BUILDER_IMAGE) cargo xtask $(2)
 endef
 
 define xtask

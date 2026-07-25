@@ -2,5 +2,15 @@
 !/build/container/
 !/build/container/**
 /dist/
-/sdk/
 /target/
+
+# Key material must never reach a commit, whatever path it is dropped at: the
+# development signing keys under build/dev-keys, and any TLS-inspection CA or
+# private key an operator points the build at. These are catch-all patterns
+# rather than specific paths precisely because the paths are configurable.
+*.pem
+*.key
+*.p12
+*.pfx
+*.gpg
+*-ca.crt

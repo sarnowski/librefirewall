@@ -33,10 +33,12 @@ criterion = "0.7.0"
 # lints that already pass everywhere belong here; the gate denies all warnings.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# Every public item across the library crates carries rustdoc; enforced here so
-# an undocumented public API fails the build. The binary/tool crates (xtask, the
-# PD adapters) have no library API to document and opt out with a crate-root
-# `#![allow(missing_docs)]`.
+# Every public item carries rustdoc; enforced here so an undocumented public API
+# fails the build. The deny is absolute — the library crates, the PD adapters and
+# xtask all carry it, and no crate opts out. The sole exception is a Criterion
+# bench harness under `benches/`, which is neither a public API nor shipped and
+# whose `criterion_group!` expansion is public; each states that reason on the
+# line above its `#![allow(missing_docs)]`.
 missing_docs = "deny"
 
 [workspace.lints.clippy]
@@ -45,6 +47,18 @@ missing_docs = "deny"
 # fails the build instead of relying on review to catch it.
 undocumented_unsafe_blocks = "deny"
 
+# The one profile the protection domains are ever compiled with: `xtask image`
+# passes `--release` in both the `debug` and the `release` seL4 kernel
+# configuration, because the PDs are the dataplane and a forwarding test is only
+# meaningful against optimized code. That is deliberate, and it has a
+# consequence worth stating where it would otherwise be rediscovered the hard
+# way: `debug-assertions` is off here, so a `debug_assert!` anywhere in the
+# workspace is absent from every image that ever boots, including the one the
+# QEMU system tests exercise. No check may therefore be conditional on it
+# (AGENTS.md ENG-10); the shipped profile is the tested profile (BLD-3).
+#
+# `panic = "abort"` is load-bearing rather than a size tweak: the PDs are
+# `no_std` binaries and there is no unwinder under seL4.
 [profile.release]
 codegen-units = 1
 lto = true

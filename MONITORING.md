@@ -68,6 +68,40 @@ traffic or user interactions except where those trigger a system-state change.
 serial console; these are pre-contract diagnostics and are superseded by the structured system-state
 events defined here as the observability implementation lands.
 
+The pre-contract markers are listed so an operator reading a serial console today knows exactly what
+the five of them are, and so their eventual replacement is a visible change rather than a silent
+one. All are system state; none is traffic. The two that were per-frame — a first-frame-forwarded
+announcement and a dropped-transmit-descriptor notice — have been removed, because a per-packet
+event on the console violates the surface's contract. Dropped frames are counted in memory instead,
+awaiting the metrics endpoint.
+
+| marker | protection domain | when |
+|---|---|---|
+| `LIBREFIREWALL_FWD:start` | forwarder | the domain has attached to both pipelines |
+| `LIBREFIREWALL_NIC:driver:start` | nic-driver (once per port) | bring-up begins |
+| `LIBREFIREWALL_NIC:features negotiated=<mask>` | nic-driver | the device accepted the feature set |
+| `LIBREFIREWALL_NIC:driver-ok rx-posted=<n>` | nic-driver | the device is live with its receive queue primed |
+| `LIBREFIREWALL_NIC:fail error=<BringUpError> signalled=<bool>` | nic-driver | bring-up was refused; the domain parks |
+
+The failure marker carries the whole reason rather than a summary — every `BringUpError` variant
+carries the value that caused it — because with no shell and no CLI this line is all an operator
+gets. `signalled` says whether the device was told to stop (`STATUS_FAILED` written) or was left
+decoding nothing, which depends on whether its BAR had been placed when the rejection happened.
+
+### Boot-manager records (pre-kernel)
+
+Before seL4 starts, the boot manager writes its slot-selection decisions to the same serial console
+in a **structured, closed-vocabulary** form. This is a contract, not a diagnostic: it is the only
+signal that says which slot is running, and it is what the A/B system tests assert against.
+
+```
+LFW-BOOT slot=<A|B|none> state=<confirmed|trying|rejected|exhausted|unpersisted|bad-order|halted>
+```
+
+One record per decision, in decision order. The state set is closed; adding, renaming or reordering
+one is a contract change. The human-readable `librefirewall: …` lines printed beside each record are
+prose and carry no contract — a reader (or a test) must key on the `LFW-BOOT ` prefix alone.
+
 ## OpenTelemetry logs
 
 **Purpose:** the primary, structured, streamed record of everything worth logging.
@@ -127,8 +161,22 @@ dataplane verdict and throughput counters; connection/flow-table occupancy and l
 buffer's occupancy and drop count; and the applied-configuration state reflected as metrics.
 Instrumentation is bounded-cardinality and allocation-free on the hot path.
 
+**Counter semantics (binding).** Every counter is **monotonic for the protection domain's life** and
+**saturates** rather than wrapping. There is no reset: a scraper derives a rate by differencing
+successive scrapes, so a reset would forge a negative rate, and a wrap would turn a sustained flood
+back into a small number — which is exactly the signal a counter of attacker-driven events exists to
+carry. A domain restart is therefore the only discontinuity, and it is one a scraper can see.
+
+**Attribution (binding).** A drop counter names *who* misbehaved, because a number that does not is
+not actionable. Three classes stay separate and never merge: what a **device** got wrong about its
+own protocol, what a **device or peer sent** that a layer refused, and what **we** got wrong —
+a violation of a domain's own invariant, which is expected to read zero forever and is an alert, not
+a traffic statistic.
+
 **Metric inventory:** *None implemented yet* — populated per subsystem as metrics are implemented,
-each with its type, unit, labels, and meaning.
+each with its type, unit, labels, and meaning. The dataplane's counter groundwork exists in memory
+today (drop and fault tallies in the driver, virtqueue, and pool-ownership layers) but nothing reads
+or exposes it, so there is no metric on this surface yet.
 
 ## Configuration read endpoint
 

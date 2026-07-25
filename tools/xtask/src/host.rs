@@ -1,19 +1,39 @@
 //! The host-side commands: the fast gate, coverage, benchmarks, fuzzing, clean.
 //!
 //! These run without booting seL4. [`test_host`] is the fast gate the pre-commit
-//! hook and CI share (format, host tests, Clippy with warnings denied, the
-//! `cargo-deny` dependency/license/source policy, and the library coverage
-//! floor). [`fuzz`] additionally runs in the full `ci` gate (build every fuzz
-//! target and briefly exercise it). [`coverage`] and [`bench`] are
-//! measurement/discovery commands deliberately outside any gate.
+//! hook and CI share (format, host tests, Clippy with warnings denied over
+//! *every* workspace member, the `cargo-deny` dependency/license/source policy,
+//! and the library coverage floor). [`fuzz`] additionally runs in the full `ci`
+//! gate (build every fuzz target and briefly exercise it). [`coverage`] and
+//! [`bench`] are measurement/discovery commands deliberately outside any gate.
+//!
+//! # Why the lint step is two commands, not one
+//!
+//! A `-D warnings` policy is only worth what it covers, and cargo's package
+//! selection makes that easy to get silently wrong here in two independent
+//! ways, both of which this module exists to close:
+//!
+//! * The root `Cargo.toml` sets `default-members = ["tools/xtask"]`, so a bare
+//!   `cargo clippy --all-targets -- -D warnings` selects `xtask` alone and
+//!   reports clean while never looking at a single library crate. Every lint
+//!   invocation below therefore names its packages explicitly, and
+//!   [`tests::every_workspace_member_is_linted`] fails the build if a member is
+//!   missing from a list rather than leaving that to review.
+//! * The protection domains do not build for the host at all, so no host
+//!   command can lint them however the packages are selected. They are linted
+//!   by [`lint_protection_domains`] for the seL4 target instead.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-use crate::util::run_command;
+use crate::{image, util::run_command};
 
 /// Workspace packages that build and test on the host (no seL4 target). The
-/// protection-domain binaries are excluded: they need the Microkit target and
-/// are exercised by the QEMU system test instead.
+/// protection-domain binaries are excluded: they need the Microkit target, and
+/// [`lint_protection_domains`] lints them there.
 const HOST_TEST_PACKAGES: &[&str] = &[
     "wire",
     "queue",
@@ -25,9 +45,12 @@ const HOST_TEST_PACKAGES: &[&str] = &[
 ];
 
 /// The six library crates held to the coverage floor: the portable `no_std`
-/// logic the firewall is built from. The binary/tool crates are excluded — the
-/// PD adapters are only observable under seL4, and `xtask` is host-tested for
-/// correctness but not held to the coverage bar (CONCEPT trust boundary).
+/// logic the firewall is built from. The binary/tool crates are excluded for
+/// two different reasons. The PD adapters are thin and only observable under
+/// seL4, so the QEMU gate covers them instead. `xtask` is build orchestration
+/// rather than shipped firewall logic — none of it runs on a deployed
+/// appliance — so it is host-tested to keep the build honest, not held to a
+/// coverage number defending the product.
 const LIBRARY_PACKAGES: &[&str] = &[
     "wire",
     "queue",
@@ -38,17 +61,17 @@ const LIBRARY_PACKAGES: &[&str] = &[
 ];
 
 /// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced
-/// by the fast gate so a coverage regression fails locally and in CI. Set a few
-/// points below the measured ~98% combined coverage: a real floor that is not
+/// by the fast gate so a coverage regression fails locally and in CI. Set well
+/// below the measured ~99.7% combined coverage: a real floor that is not
 /// flaky. Raise it as coverage rises; never lower it to land a change.
 const LIBRARY_COVERAGE_FLOOR_PCT: u32 = 94;
 
 /// Minimum line coverage EACH library crate must hold on its own. The combined
 /// floor alone lets one crate regress heavily while the high-coverage crates
 /// keep the total above [`LIBRARY_COVERAGE_FLOOR_PCT`]; this per-crate floor
-/// closes that gap. Set a few points below the current per-crate minimum
-/// (pd-runtime ~94%) so it is a real, non-flaky floor; raise it as the weakest
-/// crate rises, never lower it to land a change.
+/// closes that gap. Set well below the current per-crate minimum (pd-runtime
+/// ~98.6%) so it is a real, non-flaky floor; raise it as the weakest crate
+/// rises, never lower it to land a change.
 const LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT: u32 = 90;
 
 /// Crates carrying criterion microbenchmarks, run by `bench`. These are the
@@ -56,8 +79,38 @@ const LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT: u32 = 90;
 /// budget depends on.
 const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio"];
 
+/// The seL4 kernel configurations the protection domains are linted in.
+///
+/// Both, because they are two different compilations of the same source rather
+/// than two optimisation levels of one. `sel4-config` derives its `sel4_cfg`
+/// flags from the board's generated kernel headers, and the two boards differ:
+/// `CONFIG_PRINTING` is set in `debug` and cleared in `release`, which selects
+/// a different `sel4_microkit::debug_println!` — the real one, or a no-op —
+/// and every PD uses it.
+///
+/// What makes the second run worth its third of a second is where the release
+/// configuration is otherwise compiled at all: [`crate::ci`] assembles the
+/// debug image only, so before this step the release-configuration PD build
+/// happened for the first time inside `release`, after the whole gate had
+/// passed. A PD change that does not compile, or does not lint, against the
+/// shipped kernel configuration was therefore discoverable only at release
+/// time. Both configurations are now checked at every commit, which is BLD-3's
+/// "the shipped profile is the tested profile" applied one stage earlier.
+const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFIG];
+
 /// Persistent fuzz targets under `fuzz/`, driven by `fuzz`.
-const FUZZ_TARGETS: &[&str] = &["find_virtio_caps", "virtqueue_poll"];
+/// The persistent fuzz targets, ordered from the smallest, most self-contained
+/// untrusted-input surface to the deepest composite one, matching the harness
+/// list in `fuzz/src/lib.rs`. One defect often reaches several targets, and the
+/// narrowest one that reproduces it is the one worth reading, so it runs first.
+const FUZZ_TARGETS: &[&str] = &[
+    "free_list_ownership",
+    "spsc_ring_peer",
+    "virtqueue_poll",
+    "pd_runtime_pipeline",
+    "nic_driver_paths",
+    "find_virtio_caps",
+];
 
 pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     run_command(
@@ -73,6 +126,11 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "run host tests",
     )?;
+    // The explicit `-p` list is load-bearing, not verbosity: `default-members`
+    // in the root `Cargo.toml` is `["tools/xtask"]`, so dropping it would lint
+    // xtask alone and pass while every library crate went unexamined. See this
+    // module's header; `tests::every_workspace_member_is_linted` is what keeps
+    // the list complete.
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -81,9 +139,16 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .args(["--", "-D", "warnings"]),
         "run host clippy",
     )?;
-    // Enforce the dependency/license/source policy (deny.toml). The advisories
-    // check is omitted: it needs the network to fetch the RustSec database,
-    // and the host gate runs offline.
+    lint_protection_domains(root)?;
+    // Enforce the dependency/license/source policy (deny.toml). `advisories`
+    // is deliberately not among the three: it must fetch the RustSec database
+    // and this gate runs offline (`--network=none`), so adding the flag here
+    // would fail rather than scan. It is moved, not skipped —
+    // `azure-pipelines.yml` runs `cargo deny check advisories` in the same
+    // pinned builder with the network left on, and `deny.toml`'s `[advisories]`
+    // section configures it. The consequence to keep straight: a green run here
+    // is a dependency-policy pass and not a vulnerability scan; the scan is a
+    // CI stage, and only there.
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -91,6 +156,89 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
         "check dependency policy",
     )?;
     enforce_coverage(root)
+}
+
+/// Lint the protection domains for the seL4 target, in every kernel
+/// configuration, with warnings denied.
+///
+/// # Why this is in the fast gate rather than in `ci`
+///
+/// The PDs are the two crates that map raw hardware and shared memory, and
+/// until this step existed they were the two crates a `-D warnings` policy did
+/// not reach: no host command can select them (they do not build for the host),
+/// and `image` only ever *compiles* them, which denies nothing. Two binaries
+/// exempt from the workspace lint policy is not a workspace lint policy.
+///
+/// It needs the cross toolchain and the pinned SDK, which sounds like a reason
+/// to defer it to `ci`, and is not: `make test` runs inside the pinned builder
+/// exactly as `make ci` does (the `Makefile`'s `require_builder` refuses
+/// otherwise), so both gates have the SDK and neither has more of it. What the
+/// stages really differ in is latency, and a lint is worth nothing discovered
+/// late — a PD lint error is detectable here in well under a second warm, or
+/// after a QEMU boot and an A/B run if it waits for pre-push. `ci` calls
+/// [`test_host`] first, so putting it here puts it in `ci` and `release` too;
+/// the reverse would not hold.
+///
+/// # Two deviations from the host clippy step, both deliberate
+///
+/// * **No `--all-targets`.** It would add each bin's implicit test target,
+///   which needs the `test` crate; the PDs are `no_std` and `build-std=core`
+///   supplies `core` alone, so the lint would fail to *compile* rather than
+///   report anything. Without it cargo still selects both binaries, which is
+///   every target these crates have.
+/// * **A lint-only `CARGO_TARGET_DIR`.** `image` points cargo at
+///   `target/<config>`, which for `debug` is also where the host dev profile
+///   writes; keeping this step in its own tree means it can neither perturb
+///   nor be perturbed by an artifact the image build or the coverage run
+///   depends on (BLD-4).
+///
+/// Everything else mirrors `image`'s PD build exactly — the same `--release`
+/// profile (so `debug_assertions` is off here as it is in every booted image),
+/// the same `build-std` flags, the same target, and the same headers — because
+/// a lint of a different compilation than the one that ships proves nothing
+/// about the one that ships. `RUST_TARGET_PATH` is not set here for the same
+/// reason `image` does not set it: `.cargo/config.toml` supplies it workspace-
+/// wide.
+fn lint_protection_domains(root: &Path) -> Result<(), String> {
+    for config in SEL4_KERNEL_CONFIGS {
+        let include_dir = image::board_include_dir(config);
+        // Fail by name rather than as a bindgen error a thousand lines deep:
+        // the one way to reach this step without the headers is running xtask
+        // outside the pinned builder, and that is what the operator must be
+        // told (ENG-12).
+        if !include_dir.is_dir() {
+            return Err(format!(
+                "cannot lint the protection domains: the pinned Microkit SDK's {config} headers \
+                 are missing at {}. This step cross-compiles for seL4, so it runs inside the \
+                 pinned builder — use `make test`, which enters it.",
+                include_dir.display()
+            ));
+        }
+        run_command(
+            Command::new("cargo")
+                .current_dir(root)
+                .env("SEL4_INCLUDE_DIRS", &include_dir)
+                .env(
+                    "CARGO_TARGET_DIR",
+                    root.join("target/lint-sel4").join(config),
+                )
+                .args([
+                    "clippy",
+                    "--locked",
+                    "--release",
+                    "-Z",
+                    "build-std=core",
+                    "-Z",
+                    "build-std-features=compiler-builtins-mem",
+                    "--target",
+                    image::TARGET,
+                ])
+                .args(image::SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd]))
+                .args(["--", "-D", "warnings"]),
+            &format!("lint protection domains for seL4 ({config} kernel configuration)"),
+        )?;
+    }
+    Ok(())
 }
 
 /// Enforce the library coverage floors: the combined floor across all six
@@ -144,7 +292,8 @@ pub(crate) fn coverage(root: &Path) -> Result<(), String> {
             .args(["llvm-cov", "--locked", "--summary-only"])
             .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "measure host coverage",
-    )
+    )?;
+    Ok(())
 }
 
 /// Run the criterion microbenchmarks for the perf-sensitive substrate crates.
@@ -158,23 +307,41 @@ pub(crate) fn bench(root: &Path) -> Result<(), String> {
             .args(["bench", "--locked"])
             .args(BENCH_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "run microbenchmarks",
-    )
+    )?;
+    Ok(())
 }
 
-/// Build every persistent fuzz target and, where the sandbox permits, run each
-/// briefly; always drive the same harness code over the committed seeds.
+/// Build every persistent fuzz target and, where this environment permits,
+/// run each briefly; always drive the same harness code over the committed
+/// seeds. This runs inside the full `ci` gate (bounded per target), unlike
+/// `bench`, which stays measurement-only.
 ///
-/// This is honest about what actually executes. `cargo fuzz build` must always
-/// succeed. A short `cargo fuzz run` of each target is then attempted, but the
-/// pinned hermetic builder (`--cap-drop=all`, read-only rootfs,
-/// `--security-opt=no-new-privileges`) can prevent libFuzzer/AddressSanitizer
-/// from starting; that is tolerated and reported rather than failing the
-/// command. The seed-corpus smoke tests (`cargo test --lib` in `fuzz/`) run
+/// The command distinguishes the two things a non-zero `cargo fuzz run` can
+/// mean, because conflating them would make the gate blind to its own subject:
+/// the pinned hermetic builder (`--cap-drop=all`, read-only rootfs,
+/// `--security-opt=no-new-privileges`) can stop libFuzzer/AddressSanitizer from
+/// starting at all, whereas a target that starts and then exits non-zero has
+/// found a crash, an OOM, or a timeout. The first is established ONCE by an
+/// explicit probe and is tolerated with a loud report; after it passes, every
+/// non-zero exit is a finding and fails the gate.
+///
+/// The seed-corpus smoke tests (`cargo test --lib` in `fuzz/`) run
 /// unconditionally and exercise the identical harness functions the fuzz
-/// targets call, so the parsers are covered over valid inputs even when
-/// libFuzzer cannot run. This runs in the full `ci` gate (bounded per target);
-/// unlike `bench`, which stays measurement-only.
+/// targets call, so the parsers stay covered over valid inputs even where
+/// libFuzzer cannot run.
 pub(crate) fn fuzz(root: &Path) -> Result<(), String> {
+    // Deliberately first: this is the only fuzz-workspace command that accepts
+    // `--locked` (see `read_fuzz_lockfile`), so running it before anything else
+    // resolves the committed lockfile while it is still untouched, and it fails
+    // fast on a stale one.
+    run_command(
+        Command::new("cargo")
+            .current_dir(root.join("fuzz"))
+            .args(["test", "--locked", "--lib"]),
+        "run fuzz seed smoke tests",
+    )?;
+    let pinned_lockfile = read_fuzz_lockfile(root)?;
+
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -183,57 +350,133 @@ pub(crate) fn fuzz(root: &Path) -> Result<(), String> {
     )?;
     println!("fuzz: all targets built with AddressSanitizer instrumentation");
 
-    // libFuzzer writes coverage-increasing inputs into the first corpus dir it
-    // is given. Point that at a throwaway dir under the tmpfs and pass the
-    // committed corpus as a read-only seed source, so this bounded smoke run —
-    // in `ci` on every commit — never grows or dirties the tracked
-    // `fuzz/corpus/` tree. Curated regression seeds are added there deliberately.
-    let scratch_root = std::env::temp_dir().join("librefirewall-fuzz-corpus");
-    let mut executed = true;
+    let mut targets = Vec::new();
     for target in FUZZ_TARGETS {
-        let scratch = scratch_root.join(target);
-        fs::create_dir_all(&scratch).map_err(|error| {
-            format!("create fuzz scratch corpus {}: {error}", scratch.display())
-        })?;
-        let seeds = root.join("fuzz").join("corpus").join(target);
-        let status = Command::new("cargo")
-            .current_dir(root)
-            .args(["fuzz", "run", target])
-            .arg(&scratch)
-            .arg(&seeds)
-            .args(["--", "-runs=20000", "-max_total_time=15"])
-            .status()
-            .map_err(|error| format!("spawn cargo fuzz run {target}: {error}"))?;
-        if status.success() {
-            println!("fuzz: ran {target} (-runs=20000 -max_total_time=15)");
-        } else {
-            executed = false;
-            eprintln!(
-                "fuzz: could not EXECUTE {target} here ({status}); the hermetic \
-                 sandbox (cap-drop=all, read-only rootfs, no-new-privileges) can \
-                 block libFuzzer/ASan from starting. Falling back to build-only \
-                 plus the seed smoke tests below."
-            );
+        targets.push((*target, scratch_corpus(target)?));
+    }
+    let (probe_target, probe_scratch) = targets
+        .first()
+        .ok_or_else(|| "no fuzz targets are declared, so `fuzz` would prove nothing".to_owned())?;
+    let blocked = probe_fuzz_execution(root, probe_target, probe_scratch)?;
+
+    match &blocked {
+        Some(reason) => eprintln!(
+            "fuzz: this environment cannot EXECUTE an instrumented target ({reason}); the \
+             hermetic builder (cap-drop=all, read-only rootfs, no-new-privileges) can stop \
+             libFuzzer/ASan before main. Building targets and running the seed smoke tests only."
+        ),
+        None => {
+            for (target, scratch) in &targets {
+                let seeds = root.join("fuzz").join("corpus").join(target);
+                // The probe proved an instrumented target can start here, so a
+                // non-zero exit now is libFuzzer reporting a crash, OOM or
+                // timeout. That is a finding, and it must fail the gate.
+                run_command(
+                    Command::new("cargo")
+                        .current_dir(root)
+                        .args(["fuzz", "run", target])
+                        .arg(scratch)
+                        .arg(&seeds)
+                        .args(["--", "-runs=20000", "-max_total_time=15"]),
+                    &format!("fuzz {target}"),
+                )?;
+                println!("fuzz: ran {target} (-runs=20000 -max_total_time=15)");
+            }
         }
     }
 
-    run_command(
-        Command::new("cargo")
-            .current_dir(root.join("fuzz"))
-            .args(["test", "--locked", "--lib"]),
-        "run fuzz seed smoke tests",
-    )?;
+    if read_fuzz_lockfile(root)? != pinned_lockfile {
+        return Err(LOCKFILE_REWRITTEN.to_owned());
+    }
 
-    if executed {
-        println!("fuzz: targets built AND ran; seed smoke tests passed");
-    } else {
-        println!(
-            "fuzz: targets BUILD and the seed smoke tests pass, but libFuzzer \
-             execution was blocked by the sandbox (see above) — build + seed \
-             coverage only, no live fuzzing in this environment"
-        );
+    match blocked {
+        None => println!("fuzz: targets built AND ran; seed smoke tests passed"),
+        Some(_) => println!(
+            "fuzz: targets BUILD and the seed smoke tests pass, but libFuzzer execution was \
+             blocked by this environment (see above) — build + seed coverage only, no live \
+             fuzzing here"
+        ),
     }
     Ok(())
+}
+
+/// What to tell the operator when the fuzz build re-resolved the committed
+/// lockfile — the failure `--locked` would report if `cargo-fuzz` accepted it.
+const LOCKFILE_REWRITTEN: &str = "fuzz/Cargo.lock was rewritten by the fuzz build; the committed lockfile is authoritative. \
+     Re-resolve it deliberately in fuzz/ and commit the result, or fix the dependency edit that \
+     forced the re-resolve.";
+
+/// The committed lockfile of the standalone `fuzz/` workspace, read so it can
+/// be compared before and after the fuzz build.
+///
+/// `cargo-fuzz` 0.13.2 takes no `--locked`: its clap parser rejects the flag
+/// outright, so it cannot be passed to `cargo fuzz build`/`run` the way the
+/// rest of the build passes it to cargo. The guarantee is reconstructed from
+/// outside instead — the `--locked` seed smoke test resolves the committed
+/// lockfile first, and this comparison proves the fuzz build did not then
+/// rewrite it.
+fn read_fuzz_lockfile(root: &Path) -> Result<Vec<u8>, String> {
+    let lockfile = root.join("fuzz").join("Cargo.lock");
+    fs::read(&lockfile).map_err(|error| format!("read {}: {error}", lockfile.display()))
+}
+
+/// A throwaway corpus directory under the tmpfs for one target.
+///
+/// libFuzzer writes coverage-increasing inputs into the FIRST corpus directory
+/// it is given, so this one goes first and the committed corpus follows as a
+/// read-only seed source. That keeps the bounded smoke run — which `ci`
+/// performs on every commit — from growing or dirtying the tracked
+/// `fuzz/corpus/` tree; curated regression seeds are added there deliberately.
+fn scratch_corpus(target: &str) -> Result<PathBuf, String> {
+    let scratch = std::env::temp_dir()
+        .join("librefirewall-fuzz-corpus")
+        .join(target);
+    fs::create_dir_all(&scratch)
+        .map_err(|error| format!("create fuzz scratch corpus {}: {error}", scratch.display()))?;
+    Ok(scratch)
+}
+
+/// Establish once whether this environment can execute an instrumented fuzz
+/// binary at all, returning `None` when it can and the reason when it cannot.
+///
+/// `-help=1` makes libFuzzer print its options and exit successfully without
+/// running a single input, yet still exercises the entire instrumented startup
+/// — AddressSanitizer establishes its shadow mapping before `main`, which is
+/// exactly what a locked-down sandbox refuses. The probe therefore cannot
+/// report a fuzz finding, which is what licenses treating every later non-zero
+/// exit as one.
+fn probe_fuzz_execution(
+    root: &Path,
+    target: &str,
+    scratch: &Path,
+) -> Result<Option<String>, String> {
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args(["fuzz", "run", target])
+        .arg(scratch)
+        .args(["--", "-help=1"])
+        .output()
+        .map_err(|error| format!("spawn fuzz execution probe for {target}: {error}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{target} exited {} — {}",
+        output.status,
+        tail(&output.stderr, 5)
+    )))
+}
+
+/// The last `count` non-blank lines of a captured stderr, joined for a
+/// single-line diagnostic: enough of the tool's own words to act on, without
+/// pasting a whole build log into an error message.
+fn tail(stderr: &[u8], count: usize) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].join(" | ")
 }
 
 /// Remove every generated directory, leaving only source-controlled inputs
@@ -254,4 +497,152 @@ pub(crate) fn clean(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `(package name, directory)` of every member the root workspace
+    /// manifest declares. The name is read from the member's own manifest
+    /// rather than taken from its directory, because the package lists in this
+    /// module are package names and the two are free to differ.
+    fn workspace_members(root: &Path) -> Vec<(String, String)> {
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest");
+        let members = manifest
+            .split_once("members = [")
+            .expect("the root manifest declares workspace members")
+            .1
+            .split_once(']')
+            .expect("the members list is terminated")
+            .0;
+        // Odd fields of a split on the quote character are the quoted strings.
+        members
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|directory| {
+                let path = root.join(directory).join("Cargo.toml");
+                let member = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                let name = member
+                    .split_once("name = \"")
+                    .unwrap_or_else(|| panic!("{directory} declares no package name"))
+                    .1
+                    .split_once('"')
+                    .expect("the package name is terminated")
+                    .0
+                    .to_owned();
+                (name, directory.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_workspace_member_is_linted() {
+        // What this closes: the gate's lint coverage is exactly these lists,
+        // because `default-members` makes an unqualified cargo invocation see
+        // almost nothing (see the module header). A crate added to the
+        // workspace and forgotten here would be unlinted — and, under
+        // `crates/`, also untested and unmeasured — while the gate stayed
+        // green. Reviewing a list against a manifest is precisely the kind of
+        // check that gets skipped, so it is a build failure instead.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        let members = workspace_members(&root);
+        assert!(
+            members.len() >= 3,
+            "the manifest parse produced {members:?}, which cannot be the whole workspace"
+        );
+
+        for (name, directory) in &members {
+            let package = name.as_str();
+            if directory.starts_with("crates/") {
+                assert!(
+                    HOST_TEST_PACKAGES.contains(&package),
+                    "{directory} is not in HOST_TEST_PACKAGES, so it is never built, tested or \
+                     linted by the gate"
+                );
+                assert!(
+                    LIBRARY_PACKAGES.contains(&package),
+                    "{directory} is not in LIBRARY_PACKAGES, so no coverage floor defends it"
+                );
+            } else if directory.starts_with("pds/") {
+                assert!(
+                    image::SYSTEM_PDS.contains(&package),
+                    "{directory} is not in SYSTEM_PDS, so it is neither assembled into the image \
+                     nor linted for the seL4 target"
+                );
+                assert!(
+                    !HOST_TEST_PACKAGES.contains(&package),
+                    "{directory} is a protection domain and does not build for the host"
+                );
+            } else {
+                assert!(
+                    HOST_TEST_PACKAGES.contains(&package),
+                    "{directory} is in the workspace but in no lint list"
+                );
+            }
+        }
+
+        // The reverse direction, so a package removed from the workspace but
+        // left in a list fails here rather than as a confusing cargo error in
+        // the middle of the gate.
+        let declared: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
+        for package in HOST_TEST_PACKAGES
+            .iter()
+            .chain(LIBRARY_PACKAGES)
+            .chain(image::SYSTEM_PDS)
+        {
+            assert!(
+                declared.contains(package),
+                "{package} is listed in this module but is not a workspace member"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_members_trap_the_lint_lists_exist_for_is_still_real() {
+        // The module header and the lint step both justify their explicit `-p`
+        // lists by this one line in the root manifest. If it ever goes away the
+        // justification is stale, and a stale justification is how the next
+        // reader concludes the lists are redundant and deletes them.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest");
+        assert!(
+            manifest.contains("default-members = [\"tools/xtask\"]"),
+            "the root manifest no longer narrows default-members to xtask; the explanation on \
+             the lint steps in this module now describes something that is not true"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_keeps_the_tools_last_words_and_survives_empty_output() {
+        // A tool's actionable line is at the END of its output, so the tail is
+        // what a probe failure must carry.
+        let stderr = b"configuring\n\nlinking\nASan: failed to map shadow\naborted\n";
+        assert_eq!(tail(stderr, 2), "ASan: failed to map shadow | aborted");
+
+        // Fewer lines than asked for, and none at all, must not panic: a tool
+        // that dies before writing anything is exactly the case being reported.
+        assert_eq!(tail(b"only one\n", 5), "only one");
+        assert_eq!(tail(b"", 5), "");
+        assert_eq!(tail(b"\n  \n\n", 3), "");
+    }
+
+    #[test]
+    fn every_fuzz_target_has_its_own_scratch_corpus_outside_the_tracked_tree() {
+        // libFuzzer writes into the first corpus dir it is given, so the
+        // scratch dirs must be distinct AND must not be under fuzz/corpus.
+        let first = scratch_corpus(FUZZ_TARGETS[0]).unwrap();
+        let second = scratch_corpus(FUZZ_TARGETS[1]).unwrap();
+        assert_ne!(first, second);
+        for scratch in [&first, &second] {
+            assert!(scratch.is_dir());
+            assert!(
+                !scratch.to_string_lossy().contains("fuzz/corpus"),
+                "the tracked corpus must never be the writable one: {}",
+                scratch.display()
+            );
+        }
+    }
 }

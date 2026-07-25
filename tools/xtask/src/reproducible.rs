@@ -19,13 +19,15 @@ use std::{
 use crate::{
     artifacts::{DIST_KERNEL, DIST_SYSTEM},
     image::{self, DEBUG_CONFIG},
-    util::{copy_file, recreate_dir},
+    util::{Error, copy_file, recreate_dir},
 };
 
 /// The artifacts compared for byte-identity: the loose boot payload only.
 const REPRODUCIBLE_ARTIFACTS: &[&str] = &[DIST_KERNEL, DIST_SYSTEM];
 
-pub(crate) fn verify_reproducible(root: &Path) -> Result<(), String> {
+/// Build the image twice from scratch and prove the boot payload is
+/// byte-identical across the two builds.
+pub(crate) fn verify_reproducible(root: &Path) -> Result<(), Error> {
     let scratch = root.join("build/image/reproducible");
     recreate_dir(&scratch)?;
 
@@ -35,9 +37,9 @@ pub(crate) fn verify_reproducible(root: &Path) -> Result<(), String> {
     let mut diffs = Vec::new();
     for name in REPRODUCIBLE_ARTIFACTS {
         let a = fs::read(first.join(name))
-            .map_err(|error| format!("read {name} (build a): {error}"))?;
+            .map_err(|error| Error::io("read build a's", &first.join(name), error))?;
         let b = fs::read(second.join(name))
-            .map_err(|error| format!("read {name} (build b): {error}"))?;
+            .map_err(|error| Error::io("read build b's", &second.join(name), error))?;
         if a == b {
             println!(
                 "verify-reproducible: {name} reproduced byte-for-byte ({} bytes)",
@@ -60,18 +62,18 @@ pub(crate) fn verify_reproducible(root: &Path) -> Result<(), String> {
         );
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::invalid(format!(
             "verify-reproducible: {} artifact(s) did not reproduce:\n{}",
             diffs.len(),
             diffs.join("\n")
-        ))
+        )))
     }
 }
 
 /// Build the image from a wiped per-config target tree (forcing a genuine
 /// recompile and repackage rather than reusing cached outputs) and copy the
 /// compared artifacts out of `dist/` into `scratch/<tag>`.
-fn build_and_capture(root: &Path, scratch: &Path, tag: &str) -> Result<PathBuf, String> {
+fn build_and_capture(root: &Path, scratch: &Path, tag: &str) -> Result<PathBuf, Error> {
     recreate_dir(&root.join("target").join(DEBUG_CONFIG))?;
     image::image(root, DEBUG_CONFIG)?;
 

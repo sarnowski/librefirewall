@@ -2,10 +2,16 @@
 //!
 //! Two operations dominate the driver's per-frame cost: the split-virtqueue
 //! post/reap/reclaim cycle (`add_writable` + `poll` + `recycle`) and, at
-//! bring-up, the PCI capability walk (`find_virtio_caps`). The virtqueue bench
-//! plays the device side itself by writing a used-ring completion directly into
-//! the region (via the public [`QueueLayout`] offsets), so it measures the real
-//! reap path rather than `poll` returning `None`.
+//! bring-up, the PCI capability walk (`find_virtio_caps`).
+//!
+//! The virtqueue bench has to play the device side itself — otherwise `poll`
+//! would only ever return `None` and the reap path would never run — but the
+//! device's writes are not the driver's cost, so they are kept **outside** the
+//! timed region: each round posts a full ring (timed), lets the device complete
+//! every descriptor (untimed), then reaps and reclaims the ring (timed). A full
+//! ring per round also amortises the two `Instant::now()` pairs over `QSIZE`
+//! descriptors, which a per-descriptor timing could not do without measuring
+//! mostly the clock.
 
 // Benchmark target: no public API to document (the `criterion_group!` macro
 // expands to public items).
@@ -13,6 +19,7 @@
 
 use std::hint::black_box;
 use std::sync::atomic::{Ordering, fence};
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use virtio::pci::{PciConfig, find_virtio_caps};
@@ -50,7 +57,7 @@ unsafe fn device_complete(region: *mut u8, used_idx: &mut u16, head: u16, len: u
     }
 }
 
-fn virtqueue_add_poll_recycle(c: &mut Criterion) {
+fn virtqueue_post_and_reap_a_full_ring(c: &mut Criterion) {
     let mut region = Box::new(Region([0u8; 4096]));
     let ptr = region.0.as_mut_ptr();
     // SAFETY: `region` is 16-byte aligned, zeroed, and larger than the queue's
@@ -58,17 +65,35 @@ fn virtqueue_add_poll_recycle(c: &mut Criterion) {
     let mut queue = unsafe { SplitVirtqueue::<QSIZE>::new(ptr) };
     let mut used_idx: u16 = 0;
 
-    c.bench_function("virtqueue_add_poll_recycle", |b| {
-        b.iter(|| {
-            let token = queue
-                .add_writable(black_box(0x1000), black_box(64))
-                .expect("a descriptor is free");
-            // SAFETY: `ptr` is the live region and `used_idx` tracks the device
-            // index; `token.index() < QSIZE`.
-            unsafe { device_complete(ptr, &mut used_idx, token.index(), 64) };
-            let (got, len) = queue.poll().expect("the completion we just posted");
-            black_box(len);
-            queue.recycle(got);
+    c.bench_function("virtqueue_post_and_reap_a_full_ring", |b| {
+        b.iter_custom(|rounds| {
+            let mut driver_time = Duration::ZERO;
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..QSIZE {
+                    queue
+                        .add_writable(black_box(0x1000), black_box(64))
+                        .expect("a descriptor is free");
+                }
+                driver_time += start.elapsed();
+
+                // The device's side of the ring: three volatile writes and a
+                // release fence per completion, none of it driver cost.
+                for head in 0..QSIZE as u16 {
+                    // SAFETY: `ptr` is the live region, `used_idx` tracks the
+                    // device index, and `head < QSIZE` names a posted
+                    // descriptor.
+                    unsafe { device_complete(ptr, &mut used_idx, head, 64) };
+                }
+
+                let start = Instant::now();
+                while let Some((token, len)) = queue.poll() {
+                    black_box(len);
+                    queue.recycle(token).expect("a just-reaped descriptor");
+                }
+                driver_time += start.elapsed();
+            }
+            driver_time
         });
     });
 }
@@ -118,5 +143,5 @@ fn find_caps(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, virtqueue_add_poll_recycle, find_caps);
+criterion_group!(benches, virtqueue_post_and_reap_a_full_ring, find_caps);
 criterion_main!(benches);

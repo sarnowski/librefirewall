@@ -1,8 +1,22 @@
 [alias]
-xtask = "run --package xtask --"
+# The single entry point behind every Makefile target; `--locked` belongs here
+# rather than at each call site so no invocation can silently resolve a
+# dependency outside Cargo.lock.
+xtask = "run --locked --package xtask --"
 
-[build]
+# Loading a target from a JSON specification is itself an unstable rustc
+# feature, so building for the seL4 target is impossible without this flag.
+# Scoped to that target rather than set in `[build]`: host test, clippy, and
+# xtask builds have no custom target to load and must not have unstable rustc
+# CLI options unlocked for them.
+[target.x86_64-sel4-minimal]
 rustflags = ["-Zunstable-options"]
 
 [env]
+# Where `--target x86_64-sel4-minimal` is resolved from. The specification in
+# support/targets is rust-sel4 v5.0.0's own x86_64 seL4 target: its generator
+# derives it from rustc's built-in `x86_64-unknown-none`, overriding only the
+# relocation model and RELRO level. Keep it in step with the pinned rust-sel4
+# rather than tuning it here — the PDs link against crates compiled by that
+# same specification.
 RUST_TARGET_PATH = { value = "support/targets", relative = true }

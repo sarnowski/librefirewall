@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-wire = { path = "../wire" }
 virtio = { path = "../virtio" }
 pd-runtime = { path = "../pd-runtime" }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

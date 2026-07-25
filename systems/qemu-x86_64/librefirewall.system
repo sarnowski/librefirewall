@@ -11,6 +11,44 @@
          (CONCEPT.md §9) are not part of this slice. The protection domains are
          documented in pds/nic-driver and pds/forwarder. -->
 
+    <!-- ===================================================================
+         The physical address map is a contract, and this is where it is
+         stated. Every region below fixes phys_addr, and none of them may stop
+         doing so: each is named by a `setvar region_paddr` further down (a
+         driver hands the address to its device), and the Microkit tool refuses
+         that pairing without a fixed address — "setvar with 'region_paddr' for
+         MR without a specified paddr is unsupported on x86-64", because the
+         x86-64 physical memory layout is not known at build time (Microkit
+         2.3.0 manual, SDF `setvar`). Microkit therefore cannot place these
+         regions for us; the addresses are chosen here, so what makes each one
+         correct belongs here too.
+
+         Two opposite requirements, both satisfied today by one unstated
+         quantity — the QEMU memory size:
+
+         * vq0/vq1 and pipe0/pipe1 (0x30000000..0x31080000) must lie INSIDE
+           RAM. They are ordinary memory, and seL4 zeroes a frame retyped from
+           a general-purpose untyped but not one retyped from a device untyped
+           — which is what an address outside RAM yields. That kernel behaviour
+           is the whole of what establishes the zero-initialised precondition
+           `virtio::queue::SplitVirtqueue::new` and `pd_runtime::attach_pipeline!`
+           both require of their mapping; no first-party code re-checks it, and
+           a region placed outside RAM would fail as unbacked reads at run time
+           rather than as a build or boot error.
+         * bar0/bar1 (0x50000000..0x50008000) must lie OUTSIDE RAM, in the q35
+           32-bit PCI hole: each driver reprograms its device's 64-bit MMIO BAR
+           to that address, so RAM underneath it would be shadowed by the
+           device's decode.
+
+         Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
+         which puts the first group inside it and the second above it. The
+         window either side is narrow and nothing checks it: below ~785 MiB RAM
+         ends short of 0x31080000 and the DMA regions leave RAM, while at
+         1280 MiB or more RAM reaches 0x50000000 and swallows the BAR window.
+         Changing `-m`, or targeting hardware with a different memory map,
+         means re-deriving this map.
+         =================================================================== -->
+
     <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0. The
          deployable image boots through OVMF, which programs the q35 PCIEXBAR
          (MMCONFIG base) to 0xE0000000; the page of device D is at
@@ -22,22 +60,35 @@
     <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />
     <memory_region name="bar1" size="0x4000" phys_addr="0x50004000" />
 
-    <!-- virtio virtqueues (driver <-> NIC), receive and transmit per port:
-         RAM with a fixed physical address, mapped cached. -->
+    <!-- virtio virtqueues (driver <-> NIC), receive and transmit per port.
+
+         Every map of a virtqueue or a pipeline below states cached="true"
+         rather than leaning on the default, because both are DMA memory and
+         `virtio::queue` names a cached mapping as a premise of its correctness
+         argument: its fences order CPU-visible memory only, which suffices
+         because x86 DMA is cache-coherent and the region is cached. A premise a
+         crate reasons from is declared where the mapping is granted, not
+         inherited from a default that can move. -->
     <memory_region name="vq0" size="0x1000" phys_addr="0x30000000" />
     <memory_region name="vq1" size="0x1000" phys_addr="0x30001000" />
 
     <!-- One pipeline region per forwarding direction (rx driver -> forwarder
          -> tx driver). Each pool is both NICs' DMA target, so the regions need
          fixed physical addresses the drivers hand to the devices
-         (region_paddr, below). pipe0: port 0 -> port 1; pipe1: the reverse. -->
+         (region_paddr, below). pipe0: port 0 -> port 1; pipe1: the reverse.
+
+         The size is `pd_runtime::REGION_SIZE`, and the two are one value in two
+         places: that constant is what the Rust layout assertions hold
+         `size_of::<Pipeline>()` against, and nothing re-reads this file, so
+         shrinking either alone silently either truncates the mapping or
+         re-widens the grant. They move together or not at all. -->
     <memory_region name="pipe0" size="0x40000" phys_addr="0x31000000" />
     <memory_region name="pipe1" size="0x40000" phys_addr="0x31040000" />
 
     <protection_domain name="forwarder" priority="2" stack_size="0x4000">
         <program_image path="forwarder.elf" />
-        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" setvar_vaddr="pipe0_vaddr" />
-        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" setvar_vaddr="pipe1_vaddr" />
+        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="pipe0_vaddr" />
+        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="pipe1_vaddr" />
     </protection_domain>
 
     <protection_domain name="nic_driver0" priority="1" stack_size="0x8000">
@@ -45,8 +96,8 @@
         <map mr="ecam0" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
         <map mr="bar0" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
         <map mr="vq0" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
-        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" setvar_vaddr="rx_pipe_vaddr" />
-        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" setvar_vaddr="tx_pipe_vaddr" />
+        <map mr="pipe0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="rx_pipe_vaddr" />
+        <map mr="pipe1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_pipe_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar0" />
         <setvar symbol="vq_paddr" region_paddr="vq0" />
         <setvar symbol="rx_pipe_paddr" region_paddr="pipe0" />
@@ -58,20 +109,29 @@
         <map mr="ecam1" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
         <map mr="bar1" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
         <map mr="vq1" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
-        <map mr="pipe1" vaddr="0x2_000_000" perms="rw" setvar_vaddr="rx_pipe_vaddr" />
-        <map mr="pipe0" vaddr="0x2_100_000" perms="rw" setvar_vaddr="tx_pipe_vaddr" />
+        <map mr="pipe1" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="rx_pipe_vaddr" />
+        <map mr="pipe0" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_pipe_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar1" />
         <setvar symbol="vq_paddr" region_paddr="vq1" />
         <setvar symbol="rx_pipe_paddr" region_paddr="pipe1" />
         <setvar symbol="tx_pipe_paddr" region_paddr="pipe0" />
     </protection_domain>
 
+    <!-- Both channels carry notifications in one direction only, so only that
+         direction is granted: a driver signals the forwarder that frames are
+         queued (pds/nic-driver, `FORWARDER.notify()`), and the forwarder
+         answers nothing back — it drains both pipelines on any wakeup and
+         returns, and the drivers could not receive a notification anyway, since
+         they never leave `init` and so never reach the Microkit event loop.
+         `notify` defaults to true on an `<end>`, which would leave the
+         forwarder holding a send capability on each driver's notification that
+         no code path uses. -->
     <channel>
         <end pd="nic_driver0" id="0" />
-        <end pd="forwarder" id="0" />
+        <end pd="forwarder" id="0" notify="false" />
     </channel>
     <channel>
         <end pd="nic_driver1" id="0" />
-        <end pd="forwarder" id="1" />
+        <end pd="forwarder" id="1" notify="false" />
     </channel>
 </system>

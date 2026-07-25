@@ -1,5 +1,41 @@
-.git
-build
-dist
-sdk
-target
+# The builder image needs only the pinned-input file and the workspace
+# manifests. Sources are never copied into the image: they arrive at run time
+# through the Makefile's `/workspace` bind mount. Restricting the build context
+# to manifests here is what lets the Containerfile copy them with a single
+# `COPY .` instead of a hand-maintained list of workspace members that goes
+# stale the moment a crate is added — and it keeps the dependency-cache layer
+# invalidated only by a manifest or lockfile change, never by a source edit.
+#
+# Reading the rules: the last matching pattern wins, and a `!` negation can
+# only match inside a directory that is itself re-included first. That is why
+# each workspace tree needs its directory levels opened up (`!crates/`,
+# `!crates/*`), its member contents closed again (`crates/*/*`), and finally
+# the manifest re-included (`!crates/*/Cargo.toml`). The member wildcard is the
+# point: a new crate is picked up with no edit here.
+**
+
+# Root manifests, the toolchain pin, and the pinned-input file.
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!third-party/sources.lock
+
+!crates/
+!crates/*
+crates/*/*
+!crates/*/Cargo.toml
+
+!pds/
+!pds/*
+pds/*/*
+!pds/*/Cargo.toml
+
+!tools/
+!tools/*
+tools/*/*
+!tools/*/Cargo.toml
+
+# The fuzz crate is its own workspace and carries its own lockfile; both sit
+# one level down, so a plain negation reaches them.
+!fuzz/Cargo.toml
+!fuzz/Cargo.lock

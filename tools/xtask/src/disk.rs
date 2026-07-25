@@ -2,24 +2,44 @@
 //!
 //! The deployable artifact is a fixed-layout GPT image (see CONCEPT §14.1). The
 //! partitions are placed at fixed, 1 MiB-aligned offsets so the byte offsets the
-//! `dd` writes seek to match the sector ranges handed to `sgdisk` exactly — the
-//! layout is const data, not discovered at runtime, which is what lets mtools
-//! address a partition purely by its start offset ([`disk_at`]).
+//! partition writes seek to match the sector ranges handed to `sgdisk` exactly —
+//! the layout is const data, not discovered at runtime, which is what lets
+//! mtools address a partition purely by its start offset ([`disk_at`]).
 //!
 //! Both software slots are seeded with the same signed release and slot A is
 //! marked confirmed, so the base image boots A while B stands ready as a
 //! fallback and update target. Signing is delegated to [`crate::signing`] and
 //! the embedded-key GRUB image to [`crate::grub`]; this module owns only the
 //! partition geometry and the FAT/GPT assembly.
+//!
+//! Two properties are enforced here rather than assumed, because both fail
+//! silently otherwise and both produce a disk that is wrong in a way no later
+//! stage looks at:
+//!
+//! - **Every signature this build produces is verified before it is copied into
+//!   a slot**, against a scratch keyring holding nothing but the public key
+//!   embedded into GRUB. An unverifiable or wrongly-keyed payload would
+//!   otherwise reach *both* slots — leaving no fallback — and only surface as a
+//!   boot failure on the appliance.
+//! - **Every partition image is checked to fit its partition before it is
+//!   written.** The raw writes are positional; an oversized image would run on
+//!   into the next partition. The const layout assertions below constrain the
+//!   *layout*, which is a different thing from the size of what goes into it.
 
-use std::{path::Path, process::Command};
-
-use crate::{
-    artifacts::DIST_DISK,
-    grub, signing,
-    util::{recreate_dir, require_file, run_command},
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Seek, SeekFrom},
+    path::Path,
+    process::Command,
 };
 
+use crate::{
+    artifacts::{BUILD_KERNEL_IMAGE, BUILD_SYSTEM_IMAGE, DIST_DISK, DIST_KERNEL, DIST_SYSTEM},
+    grub, signing,
+    util::{Error, recreate_dir, require_file, run_command},
+};
+
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 const SECTORS_PER_MIB: u64 = 2048;
 const DISK_SIZE_MIB: u64 = 128;
 
@@ -35,6 +55,16 @@ struct Partition {
     gpt_type: &'static str,
     start_mib: u64,
     size_mib: u64,
+}
+
+impl Partition {
+    fn start_bytes(&self) -> u64 {
+        self.start_mib * BYTES_PER_MIB
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.size_mib * BYTES_PER_MIB
+    }
 }
 
 const PARTITIONS: &[Partition] = &[
@@ -75,7 +105,7 @@ const PARTITIONS: &[Partition] = &[
     },
 ];
 
-// Compile-time layout invariants the `dd` seek math in `write_disk` relies on:
+// Compile-time layout invariants the positional writes in `write_disk` rely on:
 // partition numbers run 1..N in order, no two partitions overlap, and the whole
 // layout fits within the disk. A mis-edit that broke any of these would produce
 // overlapping writes, so it must fail the build rather than corrupt a disk.
@@ -100,19 +130,38 @@ const _: () = {
     );
 };
 
+/// The payload each slot carries: the kernel and system image with their
+/// detached signatures, under the names GRUB's configuration loads.
+const SLOT_PAYLOAD: &[(&str, &str)] = &[
+    (BUILD_KERNEL_IMAGE, DIST_KERNEL),
+    (BUILD_SYSTEM_IMAGE, DIST_SYSTEM),
+];
+
 /// Build the signed GPT A/B disk from the kernel and system image already in
 /// `build`, returning the development signing key's fingerprint for the
 /// manifest. Both slots are seeded with the same signed release and A is
 /// marked confirmed, so the base image boots A while B stands ready as a
 /// fallback and update target.
-pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<String, String> {
-    let kernel = build.join("sel4_32.elf");
-    let system = build.join("loader.img");
-
+pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<String, Error> {
     let fingerprint = signing::ensure_dev_key(root)?;
-    let pubkey = root.join("build/dev-keys/librefirewall-dev-pub.gpg");
-    signing::sign_file(root, &kernel)?;
-    signing::sign_file(root, &system)?;
+    let pubkey = signing::dev_public_key(root);
+
+    let payload: Vec<_> = SLOT_PAYLOAD
+        .iter()
+        .map(|(source, _)| build.join(source))
+        .collect();
+    for file in &payload {
+        signing::sign_file(root, file, &fingerprint)?;
+    }
+
+    // Prove the chain before anything is committed to a slot: the key that
+    // verifies here is the same file that is embedded into GRUB below, so a
+    // pass means the boot manager will accept exactly these payloads.
+    let verification_keyring = build.join("verify-keyring");
+    signing::import_verification_key(&verification_keyring, &pubkey)?;
+    for file in &payload {
+        signing::verify_payload_signature(&verification_keyring, file, &fingerprint)?;
+    }
 
     let efi = build.join("BOOTX64.EFI");
     grub::build_grub_efi(root, &pubkey, &efi)?;
@@ -132,19 +181,17 @@ pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<St
     grub::seed_grubenv(&grubenv)?;
     mcopy(&state, &grubenv, "::/grubenv")?;
 
-    let kernel_sig = build.join("sel4_32.elf.sig");
-    let system_sig = build.join("loader.img.sig");
-    let slot_files = [
-        (kernel.as_path(), "::/librefirewall-kernel.elf"),
-        (kernel_sig.as_path(), "::/librefirewall-kernel.elf.sig"),
-        (system.as_path(), "::/librefirewall-system.img"),
-        (system_sig.as_path(), "::/librefirewall-system.img.sig"),
-    ];
     for label in ["SLOTA", "SLOTB"] {
         let image = parts.join(format!("{}.img", label.to_lowercase()));
         make_fat(&image, part(label).size_mib, Some(16), label)?;
-        for (source, destination) in &slot_files {
-            mcopy(&image, source, destination)?;
+        for (source, slot_name) in SLOT_PAYLOAD {
+            let file = build.join(source);
+            mcopy(&image, &file, &format!("::/{slot_name}"))?;
+            mcopy(
+                &image,
+                &signing::signature_path(&file),
+                &format!("::/{slot_name}.sig"),
+            )?;
         }
     }
 
@@ -163,7 +210,7 @@ fn part(label: &str) -> &'static Partition {
         .expect("known partition label")
 }
 
-fn make_fat(image: &Path, size_mib: u64, fat: Option<u32>, label: &str) -> Result<(), String> {
+fn make_fat(image: &Path, size_mib: u64, fat: Option<u32>, label: &str) -> Result<(), Error> {
     let blocks = size_mib * 1024;
     let mut command = Command::new("mkfs.vfat");
     command.args(["-C", "-n", label]);
@@ -174,11 +221,11 @@ fn make_fat(image: &Path, size_mib: u64, fat: Option<u32>, label: &str) -> Resul
     run_command(&mut command, "create FAT filesystem")
 }
 
-fn mmd(image: &Path, path: &str) -> Result<(), String> {
+fn mmd(image: &Path, path: &str) -> Result<(), Error> {
     run_command(Command::new("mmd").arg("-i").arg(image).arg(path), "mmd")
 }
 
-fn mcopy(image: &Path, source: &Path, destination: &str) -> Result<(), String> {
+fn mcopy(image: &Path, source: &Path, destination: &str) -> Result<(), Error> {
     require_file(source)?;
     run_command(
         Command::new("mcopy")
@@ -193,14 +240,17 @@ fn mcopy(image: &Path, source: &Path, destination: &str) -> Result<(), String> {
 /// Preallocate the raw disk, lay down a GPT with the fixed layout, and copy
 /// each partition image into place. All offsets are fixed and 1 MiB aligned so
 /// the on-disk positions match the sector ranges handed to sgdisk exactly.
-fn write_disk(disk: &Path, parts: &Path) -> Result<(), String> {
-    run_command(
-        Command::new("truncate")
-            .arg("-s")
-            .arg(format!("{}M", DISK_SIZE_MIB))
-            .arg(disk),
-        "allocate disk image",
-    )?;
+///
+/// Preallocation and the partition writes are done directly rather than through
+/// `truncate`/`dd`: those add two more external tools to the path that produces
+/// the deployable disk, and `dd`'s positional write has no idea how large the
+/// partition it is landing in is.
+fn write_disk(disk: &Path, parts: &Path) -> Result<(), Error> {
+    let file = File::create(disk).map_err(|error| Error::io("create", disk, error))?;
+    file.set_len(DISK_SIZE_MIB * BYTES_PER_MIB)
+        .map_err(|error| Error::io("preallocate", disk, error))?;
+    drop(file);
+
     run_command(Command::new("sgdisk").arg("-Z").arg(disk), "zap disk")?;
 
     let mut sgdisk = Command::new("sgdisk");
@@ -225,30 +275,54 @@ fn write_disk(disk: &Path, parts: &Path) -> Result<(), String> {
             continue;
         }
         let image = parts.join(format!("{}.img", partition.label.to_lowercase()));
-        run_command(
-            Command::new("dd")
-                .arg(format!("if={}", image.display()))
-                .arg(format!("of={}", disk.display()))
-                .arg("bs=512")
-                .arg(format!("seek={}", partition.start_mib * SECTORS_PER_MIB))
-                .arg("conv=notrunc")
-                .arg("status=none"),
-            "write partition into disk",
-        )?;
+        write_partition(disk, partition, &image)?;
     }
+    Ok(())
+}
+
+/// Copy one partition image into its slot in the raw disk, refusing an image
+/// that does not fit.
+///
+/// The write is positional and does not truncate the disk, so an image larger
+/// than its partition would silently overwrite the start of the next one — for
+/// SLOTA that means corrupting the fallback slot SLOTB, destroying the very
+/// redundancy the A/B scheme exists for.
+fn write_partition(disk: &Path, partition: &Partition, image: &Path) -> Result<(), Error> {
+    let length = image
+        .metadata()
+        .map_err(|error| Error::io("stat", image, error))?
+        .len();
+    let capacity = partition.size_bytes();
+    if length > capacity {
+        return Err(Error::invalid(format!(
+            "partition image {} is {length} bytes but partition {} holds only {capacity}; \
+             writing it would overrun into the next partition",
+            image.display(),
+            partition.label
+        )));
+    }
+
+    let mut source = File::open(image).map_err(|error| Error::io("open", image, error))?;
+    let mut target = OpenOptions::new()
+        .write(true)
+        .open(disk)
+        .map_err(|error| Error::io("open for writing", disk, error))?;
+    target
+        .seek(SeekFrom::Start(partition.start_bytes()))
+        .map_err(|error| Error::io("seek in", disk, error))?;
+    io::copy(&mut source, &mut target).map_err(|error| Error::io("write into", disk, error))?;
     Ok(())
 }
 
 /// mtools addresses a partition by byte offset into the whole-disk image; this
 /// renders the `image@@offset` form for the partition with `label`.
 pub(crate) fn disk_at(disk: &Path, label: &str) -> String {
-    let bytes = part(label).start_mib * 1024 * 1024;
-    format!("{}@@{}", disk.display(), bytes)
+    format!("{}@@{}", disk.display(), part(label).start_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DISK_SIZE_MIB, PARTITIONS, part};
+    use super::*;
 
     #[test]
     fn partitions_are_ordered_non_overlapping_and_fit_the_disk() {
@@ -270,5 +344,119 @@ mod tests {
         for partition in PARTITIONS {
             assert_eq!(part(partition.label).number, partition.number);
         }
+    }
+
+    #[test]
+    fn disk_at_renders_the_partition_byte_offset() {
+        let rendered = disk_at(Path::new("/tmp/disk.img"), "SLOTB");
+        assert_eq!(
+            rendered,
+            format!("/tmp/disk.img@@{}", 73 * 1024 * 1024_u64),
+            "mtools addresses SLOTB by its 1 MiB-aligned byte offset"
+        );
+    }
+
+    /// A scratch disk with the layout's real geometry but no GPT: enough to
+    /// prove the positional-write guard, which is what stands between an
+    /// oversized image and a silently corrupted neighbouring partition.
+    fn scratch_disk(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("librefirewall-disk-test-{name}"));
+        let file = File::create(&path).unwrap();
+        file.set_len(DISK_SIZE_MIB * BYTES_PER_MIB).unwrap();
+        path
+    }
+
+    /// Read one window out of the scratch disk. The disk is 128 MiB, so the
+    /// assertions read the bytes they care about rather than the whole image.
+    fn window(disk: &Path, offset: u64, length: usize) -> Vec<u8> {
+        use std::io::Read;
+        let mut file = File::open(disk).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buffer = vec![0_u8; length];
+        file.read_exact(&mut buffer).unwrap();
+        buffer
+    }
+
+    fn cleanup(disk: &Path, image: &Path) {
+        std::fs::remove_file(disk).ok();
+        std::fs::remove_file(image).ok();
+    }
+
+    #[test]
+    fn an_oversized_partition_image_is_refused() {
+        let disk = scratch_disk("oversized");
+        let image = disk.with_extension("part");
+        let slot_a = part("SLOTA");
+        std::fs::write(&image, vec![0xAB_u8; (slot_a.size_bytes() + 1) as usize]).unwrap();
+
+        let error = write_partition(&disk, slot_a, &image)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SLOTA"), "got: {error}");
+        assert!(error.contains("overrun"), "got: {error}");
+
+        // Nothing was written, so the fallback slot the whole A/B scheme rests
+        // on is still intact.
+        assert!(
+            window(&disk, part("SLOTB").start_bytes(), 512)
+                .iter()
+                .all(|byte| *byte == 0),
+            "a refused write must not have touched SLOTB"
+        );
+        cleanup(&disk, &image);
+    }
+
+    #[test]
+    fn a_fitting_partition_image_lands_at_its_offset_and_leaves_neighbours_alone() {
+        let disk = scratch_disk("fitting");
+        let image = disk.with_extension("part");
+        let slot_a = part("SLOTA");
+        let content = vec![0xCD_u8; 4096];
+        std::fs::write(&image, &content).unwrap();
+
+        write_partition(&disk, slot_a, &image).unwrap();
+
+        assert_eq!(window(&disk, slot_a.start_bytes(), content.len()), content);
+        assert!(
+            window(&disk, slot_a.start_bytes() - 512, 512)
+                .iter()
+                .all(|byte| *byte == 0),
+            "the write must not reach back before its partition"
+        );
+        assert!(
+            window(&disk, part("SLOTB").start_bytes(), 512)
+                .iter()
+                .all(|byte| *byte == 0),
+            "the write must not reach into SLOTB"
+        );
+        assert_eq!(
+            disk.metadata().unwrap().len(),
+            DISK_SIZE_MIB * BYTES_PER_MIB,
+            "the positional write must not truncate the disk"
+        );
+        cleanup(&disk, &image);
+    }
+
+    #[test]
+    fn an_exactly_full_partition_image_is_accepted() {
+        let disk = scratch_disk("exact");
+        let image = disk.with_extension("part");
+        let state = part("STATE");
+        std::fs::write(&image, vec![0x5A_u8; state.size_bytes() as usize]).unwrap();
+
+        write_partition(&disk, state, &image).unwrap();
+
+        assert_eq!(
+            window(&disk, state.start_bytes() + state.size_bytes() - 1, 1),
+            vec![0x5A],
+            "the last byte of an exactly-sized image is written"
+        );
+        assert!(
+            window(&disk, part("SLOTA").start_bytes(), 512)
+                .iter()
+                .all(|byte| *byte == 0),
+            "an exactly-sized image must stop at the partition boundary"
+        );
+        cleanup(&disk, &image);
     }
 }

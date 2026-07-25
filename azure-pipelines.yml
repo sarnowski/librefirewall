@@ -9,17 +9,56 @@ pr:
       - trunk
 
 pool:
+  # Azure's hosted images are rebuilt continuously and cannot be pinned by
+  # digest, so this is the one build-critical input the repository does not
+  # control. What limits the blast radius is that nothing shipped is produced
+  # by the agent: every compiler, library, and tool that touches an artifact
+  # lives in the digest-pinned builder image, and `make ci` runs it with
+  # --network=none. The agent still contributes its container engine, and that
+  # is not cosmetic — podman/buildah versions differ in build-context and
+  # `COPY` semantics — so an agent-image bump that changes the produced payload
+  # is possible and is what `make verify-reproducible` exists to catch.
   vmImage: ubuntu-24.04
 
 jobs:
   - job: ci
     displayName: CI
-    timeoutInMinutes: 60
+    timeoutInMinutes: 90
     steps:
       - checkout: self
 
+      # The only step permitted to reach the network on behalf of the build:
+      # it provisions the pinned builder image and assembles the boot payload.
+      # Every later step runs offline inside that image.
+      - script: make image
+        displayName: Provision pinned builder and assemble image
+
       - script: make ci
-        displayName: Run CI gate
+        displayName: Run CI gate (offline)
+
+      # `cargo deny check advisories` must fetch the RustSec database, which
+      # the offline gate cannot do — so vulnerability scanning lives here, and
+      # only here. It runs in the same pinned builder (with the network left
+      # on) rather than as its own job, because a separate Azure job gets a
+      # fresh agent and would rebuild the whole builder image to run one check.
+      # `succeededOrFailed` keeps it independent of the gate's outcome: a newly
+      # published advisory must surface even on a red build.
+      - script: |
+          set -eu
+          . third-party/sources.lock
+          podman --cgroup-manager=cgroupfs run --rm \
+            --read-only \
+            --cap-drop=all \
+            --security-opt=no-new-privileges \
+            --userns=keep-id \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --tmpfs /tmp:rw,nosuid,nodev \
+            --mount type=bind,src="$PWD",dst=/workspace,rw=true \
+            "localhost/librefirewall-builder:microkit-${MICROKIT_VERSION}" \
+            cargo deny check advisories
+        displayName: Scan dependencies for advisories (networked)
+        condition: succeededOrFailed()
 
       - task: PublishPipelineArtifact@1
         displayName: Publish distribution artifacts
