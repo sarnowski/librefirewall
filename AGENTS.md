@@ -227,8 +227,14 @@ not copy an Arm loader recipe.
   those two responses distinct — never paper over a real failure with a silent fallback, default,
   or swallowed error. Surface an error by logging it with full technical detail, marking the active
   trace/span (once tracing exists) or the relevant signal, and returning an actionable, typed error.
-- Do not add a compatibility path without a real deployed consumer or a persisted format that needs
-  it.
+- **No backwards compatibility.** This project is in early development with no deployed consumers and
+  no committed-to external interfaces. Every change implements the target picture directly and
+  refactors everything cleanly to fit it. There is nothing to stay compatible with, so a
+  compatibility path — a renamed thing kept reachable under its old name, a deprecated alias, a
+  legacy branch, a format shim, a "removed but left in case" fallback — is not a courtesy but a
+  defect: it is a clear sign the refactoring was done incorrectly. Rename and update every caller in
+  the same change; do not preserve the old surface. (The sole exception is a genuinely persisted
+  on-disk/on-wire format that real data already exists in — and today none does.)
 - Target state only: after a change the code looks like the new design — old paths removed, callers
   updated, no dead code kept "just in case", no `TODO`/stub/placeholder left behind.
 - Trust the framework and the pinned runtime; do not reimplement what they already provide.
