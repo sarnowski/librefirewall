@@ -9,6 +9,11 @@ wire = { path = "../wire" }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "ring"
+harness = false

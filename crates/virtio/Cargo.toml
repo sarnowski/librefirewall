@@ -6,6 +6,11 @@ license.workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "virtio"
+harness = false

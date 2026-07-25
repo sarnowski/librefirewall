@@ -35,6 +35,11 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "xtask",
 ];
 
+/// Crates carrying criterion microbenchmarks, run by `bench`. These are the
+/// perf-sensitive dataplane substrate crates whose hot operations the 10 Gbit/s
+/// budget depends on.
+const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio"];
+
 const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
 /// Protection-domain binaries the system image is assembled from.
 const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder"];
@@ -131,6 +136,7 @@ fn run() -> Result<(), String> {
         "test" => test_host(&root),
         "test-host" => test_host(&root),
         "coverage" => coverage(&root),
+        "bench" => bench(&root),
         "test-system" => {
             image(&root, DEBUG_CONFIG)?;
             test_system(&root)
@@ -158,7 +164,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <image|run|test|test-host|coverage|test-system|test-ab|ci|release|clean>"
+    "usage: cargo xtask <image|run|test|test-host|coverage|bench|test-system|test-ab|ci|release|clean>"
         .to_owned()
 }
 
@@ -590,6 +596,20 @@ fn coverage(root: &Path) -> Result<(), String> {
             .args(["llvm-cov", "--locked", "--summary-only"])
             .args(HOST_TEST_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
         "measure host coverage",
+    )
+}
+
+/// Run the criterion microbenchmarks for the perf-sensitive substrate crates.
+/// Measurement only: there is deliberately no numeric regression gate here, so
+/// `bench` is not part of `ci`. End-to-end throughput and tail-latency gating
+/// belongs to QEMU/KVM and physical-hardware runs, not these host micros.
+fn bench(root: &Path) -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["bench", "--locked"])
+            .args(BENCH_PACKAGES.iter().flat_map(|pkg| ["-p", pkg])),
+        "run microbenchmarks",
     )
 }
 

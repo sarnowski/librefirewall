@@ -24,6 +24,10 @@ sel4-microkit = { path = "/opt/rust-sel4/crates/sel4-microkit" }
 # it never enters a `no_std`/PD build). Pinned here and resolved exactly through
 # Cargo.lock so the offline builder can fetch it.
 proptest = "1.11.0"
+# Microbenchmark harness, dev-dependency only (benches build with `std` on the
+# host and never enter a `no_std`/PD build). Pinned here and resolved exactly
+# through Cargo.lock so the offline builder can fetch it.
+criterion = "0.7.0"
 
 # Lints applied to every workspace member via `[lints] workspace = true`. Only
 # lints that already pass everywhere belong here; the gate denies all warnings.
