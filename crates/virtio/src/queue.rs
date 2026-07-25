@@ -43,13 +43,20 @@ const fn align_up(value: usize, align: usize) -> usize {
 /// [`recycle`](SplitVirtqueue::recycle). The wrapped index is private so safe
 /// code cannot forge an out-of-range token and drive an out-of-bounds volatile
 /// write; read it with [`index`](Token::index).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Token` is deliberately **not** `Copy`: a token names one in-flight
+/// descriptor, so surrendering it must consume it. Recycling a token moves it,
+/// which makes "surrender exactly once" a type invariant — a double-recycle
+/// (which would push the same descriptor onto the free list twice and later
+/// hand out two live tokens for it) is a move error, not a silent corruption.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token(u16);
 
 impl Token {
-    /// The head descriptor index this token names (always `< SIZE`).
+    /// The head descriptor index this token names (always `< SIZE`). Borrows,
+    /// so reading the index does not surrender the token.
     #[must_use]
-    pub const fn index(self) -> u16 {
+    pub const fn index(&self) -> u16 {
         self.0
     }
 }
@@ -251,22 +258,26 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         self.num_free += 1;
     }
 
-    // Volatile field accessors. Every offset is derived from a validated index,
-    // so the effective pointer is in-bounds and aligned for its type.
+    // Volatile field accessors over the DMA region.
 
     unsafe fn read_u16(&self, off: usize) -> u16 {
+        // SAFETY: `off` is derived from a validated index (this fn's contract), so the pointer is in-bounds and aligned for its width.
         unsafe { self.region.add(off).cast::<u16>().read_volatile() }
     }
     unsafe fn write_u16(&self, off: usize, value: u16) {
+        // SAFETY: `off` is derived from a validated index (this fn's contract), so the pointer is in-bounds and aligned for its width.
         unsafe { self.region.add(off).cast::<u16>().write_volatile(value) }
     }
     unsafe fn read_u32(&self, off: usize) -> u32 {
+        // SAFETY: `off` is derived from a validated index (this fn's contract), so the pointer is in-bounds and aligned for its width.
         unsafe { self.region.add(off).cast::<u32>().read_volatile() }
     }
     unsafe fn write_u32(&self, off: usize, value: u32) {
+        // SAFETY: `off` is derived from a validated index (this fn's contract), so the pointer is in-bounds and aligned for its width.
         unsafe { self.region.add(off).cast::<u32>().write_volatile(value) }
     }
     unsafe fn write_u64(&self, off: usize, value: u64) {
+        // SAFETY: `off` is derived from a validated index (this fn's contract), so the pointer is in-bounds and aligned for its width.
         unsafe { self.region.add(off).cast::<u64>().write_volatile(value) }
     }
 }
@@ -321,12 +332,14 @@ mod tests {
 
     impl TestDevice {
         fn service_writable(&mut self, payload: &[u8]) -> bool {
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let avail_idx = unsafe { self.region.add(SIZE * 16 + 2).cast::<u16>().read_volatile() };
             if avail_idx == self.last_avail {
                 return false;
             }
             fence(Ordering::Acquire);
             let slot = (self.last_avail as usize) & (SIZE - 1);
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let head = unsafe {
                 self.region
                     .add(avail_ring_off::<SIZE>(slot as u16))
@@ -335,18 +348,21 @@ mod tests {
             };
             self.last_avail = self.last_avail.wrapping_add(1);
 
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let addr = unsafe {
                 self.region
                     .add(desc_addr_off(head))
                     .cast::<u64>()
                     .read_volatile()
             };
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let len = unsafe {
                 self.region
                     .add(desc_len_off(head))
                     .cast::<u32>()
                     .read_volatile()
             } as usize;
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             let flags = unsafe {
                 self.region
                     .add(desc_flags_off(head))
@@ -357,9 +373,11 @@ mod tests {
 
             let n = payload.len().min(len);
             let buffer = addr as *mut u8;
+            // SAFETY: `buffer` is the real backing buffer the descriptor addresses and `n = min(payload, len)` stays within it.
             unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), buffer, n) };
 
             let uslot = (self.used_idx as usize) & (SIZE - 1);
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             unsafe {
                 self.region
                     .add(used_elem_id_off::<SIZE>(uslot as u16))
@@ -372,6 +390,7 @@ mod tests {
             }
             fence(Ordering::Release);
             self.used_idx = self.used_idx.wrapping_add(1);
+            // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
             unsafe {
                 self.region
                     .add(used_area_off::<SIZE>() + 2)
@@ -396,6 +415,7 @@ mod tests {
     #[test]
     fn add_consumes_and_recycle_restores_descriptors() {
         let mut region = Box::new(Region([0; 4096]));
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region.0.as_mut_ptr()) };
         assert_eq!(queue.free_count(), SIZE);
 
@@ -426,6 +446,7 @@ mod tests {
         let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
         let addr_of = |b: &mut Box<[u8; BUF]>| b.as_mut_ptr() as u64;
 
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
         let mut device = TestDevice {
             region: region_ptr,
@@ -465,6 +486,7 @@ mod tests {
     fn poll_drops_out_of_range_completions_from_a_bad_device() {
         let mut region = Box::new(Region([0; 4096]));
         let region_ptr = region.0.as_mut_ptr();
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
         let mut buffer = Box::new([0u8; BUF]);
         let token = queue
@@ -475,6 +497,7 @@ mod tests {
         // the descriptor table, followed by a valid completion for the real
         // descriptor. The bogus id must never reach recycle (which would write
         // out of bounds).
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             region_ptr
                 .add(used_elem_id_off::<SIZE>(0))
@@ -512,10 +535,12 @@ mod tests {
     fn add_readable_posts_a_non_writable_descriptor() {
         let mut region = Box::new(Region([0; 4096]));
         let region_ptr = region.0.as_mut_ptr();
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
         let token = queue.add_readable(0x4000, 64).unwrap();
         // A transmit (device-readable) descriptor must not carry the
         // device-writable flag.
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         let flags = unsafe {
             region_ptr
                 .add(desc_flags_off(token.index()))
@@ -531,12 +556,14 @@ mod tests {
         let mut region = Box::new(Region([0; 4096]));
         let region_ptr = region.0.as_mut_ptr();
         let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
 
         // Force both ring positions to just below the u16 wrap so the cycles
         // below cross 0xFFFF -> 0x0000, where modular index bugs would live.
         queue.avail_idx = u16::MAX - 1;
         queue.last_used = u16::MAX - 1;
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             region_ptr
                 .add(used_area_off::<SIZE>() + 2)
@@ -568,11 +595,13 @@ mod tests {
     fn poll_is_bounded_when_a_hostile_device_floods_invalid_ids() {
         let mut region = Box::new(Region([0; 4096]));
         let region_ptr = region.0.as_mut_ptr();
+        // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
         let mut queue = unsafe { SplitVirtqueue::<SIZE>::new(region_ptr) };
 
         // The device claims a huge number of completions, every used entry
         // carrying an out-of-range id. `poll` must skip at most SIZE of them and
         // return None rather than spin proportionally to the device's claim.
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             for slot in 0..SIZE {
                 region_ptr
@@ -613,6 +642,7 @@ mod tests {
     fn device_complete(region: *mut u8, used_idx: &mut u16, head: u16) {
         const N: usize = 8;
         let slot = (*used_idx as usize) & (N - 1);
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             region
                 .add(used_elem_id_off::<N>(slot as u16))
@@ -625,6 +655,7 @@ mod tests {
         }
         fence(Ordering::Release);
         *used_idx = used_idx.wrapping_add(1);
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
         unsafe {
             region
                 .add(used_area_off::<N>() + 2)
@@ -648,6 +679,7 @@ mod tests {
         ) {
             const N: usize = 8;
             let mut region = Box::new(Region([0; 4096]));
+            // SAFETY: the region is 16-byte-aligned, zeroed, larger than the queue layout, and owned solely by this test — `Vq::new`'s contract.
             let mut queue = unsafe { SplitVirtqueue::<N>::new(region.0.as_mut_ptr()) };
             let region_ptr = region.0.as_mut_ptr();
 
@@ -697,7 +729,9 @@ mod tests {
                     2 => match queue.poll() {
                         Some((got, _)) => {
                             let expected = completed.pop_front();
-                            prop_assert_eq!(Some(got), expected);
+                            // Compare by reference so the token is not consumed;
+                            // `Token` is non-`Copy`, and it is stored below.
+                            prop_assert_eq!(Some(&got), expected.as_ref());
                             inflight.push(got);
                         }
                         None => prop_assert!(completed.is_empty()),

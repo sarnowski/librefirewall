@@ -85,15 +85,19 @@ impl PciConfig {
     /// `offset` must be within the 4 KiB configuration space and aligned for
     /// the accessed width (the private callers below all satisfy this).
     unsafe fn read8(&self, offset: u16) -> u8 {
+        // SAFETY: `offset` is within config space and aligned for its width per this fn's contract.
         unsafe { self.base.add(offset as usize).read_volatile() }
     }
     unsafe fn read16(&self, offset: u16) -> u16 {
+        // SAFETY: `offset` is within config space and aligned for its width per this fn's contract.
         unsafe { self.base.add(offset as usize).cast::<u16>().read_volatile() }
     }
     unsafe fn read32(&self, offset: u16) -> u32 {
+        // SAFETY: `offset` is within config space and aligned for its width per this fn's contract.
         unsafe { self.base.add(offset as usize).cast::<u32>().read_volatile() }
     }
     unsafe fn write16(&self, offset: u16, value: u16) {
+        // SAFETY: `offset` is within config space and aligned for its width per this fn's contract.
         unsafe {
             self.base
                 .add(offset as usize)
@@ -102,6 +106,7 @@ impl PciConfig {
         }
     }
     unsafe fn write32(&self, offset: u16, value: u32) {
+        // SAFETY: `offset` is within config space and aligned for its width per this fn's contract.
         unsafe {
             self.base
                 .add(offset as usize)
@@ -154,6 +159,11 @@ impl PciConfig {
     /// decoding disabled across the change. `bar_index` is the low half of the
     /// 64-bit BAR pair.
     pub fn reprogram_bar64(&self, bar_index: u8, address: u32) {
+        // A 64-bit BAR pair spans this register and the next, so the low half
+        // can only be BAR 0..=4; BAR 5's "high half" would be the CardBus-CIS
+        // pointer register. A device advertising a 64-bit BAR5 is malformed;
+        // fault at bring-up rather than write a non-BAR config register.
+        assert!(bar_index <= 4, "64-bit BAR low half must be BAR 0..=4");
         let low = PCI_BAR0 + (bar_index as u16) * 4;
         let high = low + 4;
         self.disable_memory();
@@ -363,26 +373,33 @@ impl CommonCfg {
     }
 
     unsafe fn r8(&self, off: usize) -> u8 {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).read_volatile() }
     }
     unsafe fn w8(&self, off: usize, v: u8) {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).write_volatile(v) }
     }
     unsafe fn r16(&self, off: usize) -> u16 {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).cast::<u16>().read_volatile() }
     }
     unsafe fn w16(&self, off: usize, v: u16) {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).cast::<u16>().write_volatile(v) }
     }
     unsafe fn r32(&self, off: usize) -> u32 {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).cast::<u32>().read_volatile() }
     }
     unsafe fn w32(&self, off: usize, v: u32) {
+        // SAFETY: `off` is a valid, width-aligned register offset in the common-cfg structure (this fn's contract).
         unsafe { self.base.add(off).cast::<u32>().write_volatile(v) }
     }
     unsafe fn w64(&self, off: usize, v: u64) {
         // Written as two 32-bit halves, low first, matching the virtio spec's
         // 64-bit register access rules.
+        // SAFETY: `off` and `off + 4` are the valid 4-byte-aligned halves of the 64-bit register (this fn's contract).
         unsafe {
             self.base.add(off).cast::<u32>().write_volatile(v as u32);
             self.base
@@ -497,11 +514,13 @@ pub fn notify_offset_bytes(notify_off: u16, multiplier: u32) -> usize {
 pub unsafe fn notify_queue(notify_base: *mut u8, notify_off: u16, multiplier: u32, queue: u16) {
     // Ensure prior descriptor/avail publication is visible before the doorbell.
     fence(Ordering::Release);
+    // SAFETY: the fn's contract bounds `notify_off`/`multiplier` from the device's notify cap, so the slot lies within the mapped notify region.
     let slot = unsafe {
         notify_base
             .add(notify_offset_bytes(notify_off, multiplier))
             .cast::<u16>()
     };
+    // SAFETY: `slot` is the in-region doorbell pointer computed just above.
     unsafe { slot.write_volatile(queue) };
 }
 
@@ -543,12 +562,14 @@ mod tests {
             u64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap())
         }
         fn config(&mut self) -> PciConfig {
+            // SAFETY: `self.bytes` is a live, config-space-sized buffer owned by this test — `PciConfig::new`'s contract over plain memory.
             unsafe { PciConfig::new(self.bytes.as_mut_ptr()) }
         }
         // A `CommonCfg` mapped over this buffer's base, so its register methods
         // can be driven against plain backing memory the test seeds and reads
         // back — the same pointer-into-a-Box pattern the queue tests use.
         fn common(&mut self) -> CommonCfg {
+            // SAFETY: `self.bytes` backs the common-cfg registers for this test and outlives the value — `CommonCfg::new`'s contract.
             unsafe { CommonCfg::new(self.bytes.as_mut_ptr()) }
         }
         // Write a virtio cap at `at`, chaining to `next`.

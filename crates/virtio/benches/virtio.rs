@@ -35,6 +35,9 @@ unsafe fn device_complete(region: *mut u8, used_idx: &mut u16, head: u16, len: u
     let used_base = SplitVirtqueue::<QSIZE>::LAYOUT.device_offset;
     let slot = (*used_idx as usize) & (QSIZE - 1);
     let elem = used_base + 4 + slot * 8;
+    // SAFETY: `region` is the live virtqueue region (this fn's contract) and
+    // `elem`/`used_base + 2` are computed from the public layout, so both lie
+    // within its `total_bytes`.
     unsafe {
         region.add(elem).cast::<u32>().write_volatile(head as u32);
         region.add(elem + 4).cast::<u32>().write_volatile(len);
