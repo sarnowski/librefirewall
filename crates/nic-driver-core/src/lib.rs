@@ -91,7 +91,9 @@ pub struct InputDrops {
     /// The buffer is returned to the pool, so nothing is lost but the frame —
     /// the forwarder is not keeping up, or is stalled deliberately.
     pub rx_forwarder_ring_full: u64,
-    /// Transmit descriptors that failed span or header-room validation.
+    /// Transmit descriptors that failed span or header-room validation, or
+    /// whose header the pool refused to place. All three name somewhere this
+    /// driver may not write, which is one misbehaviour and so one counter.
     pub tx_malformed: u64,
     /// Transmit descriptors naming a buffer already in flight at the device.
     /// Dropped without a return, because the in-flight instance still owes that
@@ -174,7 +176,7 @@ fn bump(counter: &mut u64) {
 /// cannot be handed onward twice even by a coding error here.
 pub struct RxPath<'ring, const Q: usize> {
     /// The buffer handed to the device in each descriptor slot.
-    posted: [Option<OwnedBuffer>; Q],
+    posted: [Option<OwnedBuffer<POOL_BUFFERS>>; Q],
     rx: RingProducer<'ring, RING_SLOTS>,
     /// Physical address of the pool region this NIC receives into, for deriving
     /// each posted buffer's DMA address. An address and no reference, because
@@ -414,37 +416,47 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
                 bump(&mut counters.input.tx_duplicate);
                 continue;
             }
-            if !descriptor_in_bounds(&descriptor)
-                || (descriptor.offset as usize) < VirtioNetHdr::LEN
-            {
-                bump(&mut counters.input.tx_malformed);
-                if in_pool {
-                    self.return_buffer(descriptor, counters);
-                }
-                continue;
-            }
-            let header_offset = descriptor.offset as usize - VirtioNetHdr::LEN;
             // The 12 bytes in front of the frame are reserved header space in
             // the same buffer; on the receive side the device's own header
             // occupied them. `TX_NO_OFFLOAD` is a header requesting nothing,
             // which is all this driver may ask for while it negotiates no
             // offload feature.
-            // SAFETY: `descriptor_in_bounds` bounded `descriptor.buffer` to the
-            // pool and `offset + len` to one buffer, and the header-room check
-            // above bounds `header_offset = offset - 12`, so the 12 bytes at
-            // `header_offset` lie inside buffer `descriptor.buffer`. The source
-            // is a local constant, so it cannot alias the pool. Exclusive
-            // ownership has no guarantor inside this domain: `self.in_flight`
-            // rules out this driver holding the buffer twice, and the residual
-            // race against the pool owner's own rx DMA is stated in the crate
-            // header and is not closable here.
-            unsafe {
-                self.pool.write_at(
-                    descriptor.buffer as usize,
-                    header_offset,
-                    &VirtioNetHdr::TX_NO_OFFLOAD,
-                );
-            }
+            //
+            // The pool's span check has the last word, so no frame is posted
+            // whose header was never written; `InputDrops::tx_malformed` says
+            // why a refusal is that counter and not a new one.
+            let placed = match (
+                descriptor_in_bounds(&descriptor),
+                (descriptor.offset as usize).checked_sub(VirtioNetHdr::LEN),
+            ) {
+                (true, Some(header_offset)) => {
+                    // SAFETY: the source is a local constant, so it cannot alias
+                    // the pool, and the span is `write_at`'s own business — it
+                    // bounds the write unconditionally and answers in its
+                    // return value rather than faulting. Exclusive ownership has
+                    // no guarantor inside this domain: `self.in_flight` rules
+                    // out this driver holding the buffer twice, and the residual
+                    // race against the pool owner's own rx DMA is stated in the
+                    // crate header and is not closable here.
+                    unsafe {
+                        self.pool.write_at(
+                            descriptor.buffer as usize,
+                            header_offset,
+                            &VirtioNetHdr::TX_NO_OFFLOAD,
+                        )
+                    }
+                    .ok()
+                    .map(|()| header_offset)
+                }
+                _ => None,
+            };
+            let Some(header_offset) = placed else {
+                bump(&mut counters.input.tx_malformed);
+                if in_pool {
+                    self.return_buffer(descriptor, counters);
+                }
+                continue;
+            };
             let paddr = buffer_paddr(self.pool_paddr, descriptor.buffer) + header_offset as u64;
             // A first-party invariant, not device or peer input, so it fails
             // visibly rather than being counted (ENG-5). The guarantor is
@@ -675,6 +687,7 @@ mod tests {
     struct RxFixture {
         pool: &'static Pool,
         rings: &'static ForwardRings,
+        returns: &'static ReturnRing,
         _region: Box<VqRegion>,
         vq: Vq,
         device: FakeDevice,
@@ -684,6 +697,10 @@ mod tests {
         /// life — a fresh handle per assertion would restart at slot zero and
         /// re-deliver descriptors already consumed.
         forwarder: RingConsumer<'static, RING_SLOTS>,
+        /// The far transmitting driver's end of the `free` ring, taken once for
+        /// the same reason as `forwarder`. It is how a peer's returns reach
+        /// this domain, legitimate or forged.
+        peer_returns: RingProducer<'static, RING_SLOTS>,
         counters: Counters,
     }
 
@@ -705,14 +722,55 @@ mod tests {
             Self {
                 pool,
                 rings,
+                returns,
                 _region: region,
                 vq,
                 device,
                 owner: PoolOwner::attach(returns),
                 rx: RxPath::attach(rings, pool_paddr),
                 forwarder: rings.rx.consumer(),
+                peer_returns: returns.free.producer(),
                 counters: Counters::default(),
             }
+        }
+
+        /// The pool indices this driver currently has posted to its own NIC as
+        /// receive DMA targets. Read out of the path's own slot map, which is
+        /// the only record of them.
+        fn posted_buffers(&self) -> Vec<u32> {
+            self.rx
+                .posted
+                .iter()
+                .flatten()
+                .map(OwnedBuffer::<POOL_BUFFERS>::index)
+                .collect()
+        }
+
+        /// Queue a return on the `free` ring as the far driver would, naming
+        /// whatever buffer the peer chooses.
+        fn peer_returns_buffer(&mut self, buffer: u32) {
+            self.peer_returns
+                .try_enqueue(Descriptor::new(buffer, 0, 0))
+                .expect("the free ring has room");
+        }
+
+        fn reclaim(&mut self) -> usize {
+            self.owner.reclaim()
+        }
+
+        /// Drain the ledger, proving what it holds is a set of real, pairwise
+        /// distinct pool indices — a repeat here is one buffer with two owners.
+        fn drain_ledger_distinctly(&mut self) -> usize {
+            let mut seen = [false; POOL_BUFFERS];
+            let mut count = 0;
+            while let Some(buffer) = self.owner.alloc() {
+                let index = buffer.index() as usize;
+                assert!(index < POOL_BUFFERS, "the ledger held index {index}");
+                assert!(!seen[index], "index {index} was handed out twice");
+                seen[index] = true;
+                count += 1;
+            }
+            count
         }
 
         fn refill(&mut self) -> bool {
@@ -818,12 +876,16 @@ mod tests {
             // SAFETY: single-threaded test; the buffer is not otherwise in use,
             // and both spans lie within it.
             unsafe {
-                self.pool.write_at(
-                    buffer as usize,
-                    offset - VirtioNetHdr::LEN,
-                    &[0xFFu8; VirtioNetHdr::LEN],
-                );
-                self.pool.write_at(buffer as usize, offset, payload);
+                self.pool
+                    .write_at(
+                        buffer as usize,
+                        offset - VirtioNetHdr::LEN,
+                        &[0xFFu8; VirtioNetHdr::LEN],
+                    )
+                    .expect("the header span lies within the buffer");
+                self.pool
+                    .write_at(buffer as usize, offset, payload)
+                    .expect("the payload span lies within the buffer");
             }
             self.queue(Descriptor::new(buffer, offset as u32, payload.len() as u32));
         }
@@ -1011,6 +1073,98 @@ mod tests {
         // The buffer came back to the owner and the descriptor was recycled.
         assert_eq!(fx.owner.owned(), owned_before + 1);
         assert_eq!(fx.vq.free_count(), free_before + 1);
+    }
+
+    #[test]
+    fn a_peer_return_of_a_live_rx_dma_target_is_refused_and_the_buffer_stays_posted() {
+        // The gap the *lent* set exists for, driven end to end rather than
+        // asserted on a bare `PoolOwner`: `refill` hands these buffers to this
+        // domain's own NIC as receive DMA targets, so the ledger sees them as
+        // outstanding exactly as a lent one is. They never crossed `lend`, so a
+        // peer naming one on the free ring is claiming to return something it
+        // was never given. Accepting it would put a buffer the NIC is actively
+        // writing back on the free stack for `alloc` to hand to a second owner.
+        let mut fx = RxFixture::new();
+        assert!(fx.refill());
+        let posted = fx.posted_buffers();
+        assert_eq!(posted.len(), Q, "refill fills the whole queue");
+        let owned_before = fx.owner.owned();
+
+        for buffer in &posted {
+            fx.peer_returns_buffer(*buffer);
+        }
+
+        // Refused, every one, and counted as a peer that named a buffer it was
+        // never lent — not as this driver's own bookkeeping fault.
+        assert_eq!(fx.reclaim(), 0);
+        assert_eq!(fx.owner.counters().reclaim_not_lent, posted.len() as u64);
+        assert_eq!(fx.owner.counters().reclaim_refused, 0);
+        assert_eq!(fx.counters.invariant, InvariantFaults::default());
+
+        // The buffers stayed this driver's: the ledger did not grow, and the
+        // slot map still holds exactly the same tokens.
+        assert_eq!(fx.owner.owned(), owned_before);
+        assert_eq!(fx.posted_buffers(), posted);
+
+        // The decisive check: not one of them can be handed out again while it
+        // is still a live DMA target. Draining the whole ledger must yield only
+        // buffers that are not posted, and never a duplicate.
+        let free = fx.drain_ledger_distinctly();
+        assert_eq!(free, POOL_BUFFERS - Q);
+        assert_eq!(fx.posted_buffers(), posted, "a posted buffer was re-issued");
+    }
+
+    #[test]
+    fn a_peer_restart_with_buffers_in_flight_never_double_owns_one() {
+        // The peer crashes and comes back with every shared cursor re-zeroed
+        // while this driver has buffers posted at its NIC *and* frames lent to
+        // the forwarder. Both of this domain's positions and both halves of its
+        // ownership record are private, so the restart can replay and lose
+        // descriptors but must never make one buffer answer to two owners.
+        let mut fx = RxFixture::new();
+        assert!(fx.refill());
+        let frame = std::vec![0u8; VirtioNetHdr::LEN + 32];
+        for _ in 0..4 {
+            fx.device.deliver(&frame, frame.len() as u32);
+        }
+        assert!(fx.drain());
+        let lent: Vec<Descriptor> = core::iter::from_fn(|| fx.forwarded()).collect();
+        assert_eq!(lent.len(), 4, "four frames reached the forwarder");
+
+        // The restart: every cursor of both rings back to zero, mid-stream.
+        forge_cursors(&fx.rings.rx, 0, 0);
+        forge_cursors(&fx.returns.free, 0, 0);
+
+        // The far driver, also restarted, returns the frames it still had.
+        for descriptor in &lent {
+            fx.peer_returns_buffer(descriptor.buffer);
+        }
+        let reclaimed = fx.reclaim();
+        assert!(
+            reclaimed <= lent.len(),
+            "more returns accepted than were lent"
+        );
+
+        // Keep driving both paths across the restart; nothing may fault, and
+        // this driver may never look like it has a bug of its own.
+        for _ in 0..4 {
+            fx.refill();
+            fx.device.deliver(&frame, frame.len() as u32);
+            fx.drain();
+            fx.reclaim();
+            assert_eq!(fx.counters.invariant, InvariantFaults::default());
+        }
+
+        // Conservation, read out of the ledger and the slot map together: every
+        // buffer this domain can still name is a real, distinct pool index, and
+        // free plus posted never exceeds the pool.
+        let posted = fx.posted_buffers();
+        let free = fx.drain_ledger_distinctly();
+        assert!(
+            free + posted.len() <= POOL_BUFFERS,
+            "free plus posted exceeds the pool, so a buffer was invented"
+        );
+        assert_eq!(fx.counters.invariant, InvariantFaults::default());
     }
 
     #[test]

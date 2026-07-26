@@ -126,7 +126,7 @@ pub fn pipeline_harness(data: &[u8]) {
     let pool_base = POOL_PADDR;
     let pool_end = pool_base + (POOL_BUFFERS * BUFFER_SIZE) as u64;
 
-    let mut held: Vec<OwnedBuffer> = Vec::new();
+    let mut held: Vec<OwnedBuffer<POOL_BUFFERS>> = Vec::new();
     let mut holding = [false; POOL_BUFFERS];
     let mut previous_pool = owner.counters();
     let mut previous_forward = stage.counters();

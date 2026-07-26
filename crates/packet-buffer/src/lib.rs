@@ -87,20 +87,23 @@ const _: () = {
     assert!(core::mem::align_of::<BufferPool<4>>() == 1);
 };
 
-/// A write was refused because the data does not fit one pool buffer.
-/// Truncating would silently ship a corrupted frame.
+/// A write was refused because the span it named is not within one pool
+/// buffer. Carries what was refused, so a rejected write is attributable
+/// instead of merely absent, and the buffer is left untouched rather than
+/// shortened into a corrupt frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteTooLarge {
-    /// The rejected length; always greater than [`BUFFER_SIZE`].
+pub struct WriteOutsideBuffer {
+    pub index: usize,
+    pub offset: usize,
     pub len: usize,
 }
 
-impl fmt::Display for WriteTooLarge {
+impl fmt::Display for WriteOutsideBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "write of {} bytes exceeds the {BUFFER_SIZE}-byte buffer",
-            self.len
+            "span {}..+{} of buffer {} is not within one {BUFFER_SIZE}-byte buffer",
+            self.offset, self.len, self.index
         )
     }
 }
@@ -120,40 +123,31 @@ impl<const N: usize> BufferPool<N> {
         N
     }
 
-    /// # Panics
-    /// If `index` is not a pool index.
-    fn buffer(&self, index: usize) -> *mut u8 {
-        match self.buffers.get(index) {
-            Some(cell) => cell.get().cast::<u8>(),
-            None => panic!("buffer index is outside the pool"),
-        }
+    /// The one bounds check behind every accessor: the base of buffer `index`
+    /// when `offset + len` lies within that buffer, `None` otherwise. Being the
+    /// single enforcer is what lets a reader check the bound once instead of
+    /// per accessor, and it runs in every build profile — a check absent from
+    /// the shipped image is not a check (ENG-10).
+    fn span(&self, index: usize, offset: usize, len: usize) -> Option<*mut u8> {
+        let cell = self.buffers.get(index)?;
+        span_fits(offset, len).then(|| cell.get().cast::<u8>())
     }
 
     /// Copy `data` into buffer `index`, returning `data.len()` in the `u32` a
     /// descriptor's length field takes.
     ///
     /// # Errors
-    /// [`WriteTooLarge`] if `data` is longer than [`BUFFER_SIZE`]; the buffer is
-    /// left untouched rather than shortened into a corrupt frame.
-    ///
-    /// # Panics
-    /// If `index` is not a pool index — the recorded defect on
-    /// [`write_at`](Self::write_at) applies here too.
+    /// [`WriteOutsideBuffer`] if `index` is not a pool index or `data` is
+    /// longer than [`BUFFER_SIZE`]. Nothing is written.
     ///
     /// # Safety
     /// The caller must currently own `index`, and `data` must not borrow from
     /// this pool.
-    pub unsafe fn write(&self, index: usize, data: &[u8]) -> Result<u32, WriteTooLarge> {
-        if data.len() > BUFFER_SIZE {
-            return Err(WriteTooLarge { len: data.len() });
-        }
-        let dst = self.buffer(index);
-        // SAFETY: `buffer` bounded `index` to the pool, so `dst` points to
-        // `BUFFER_SIZE` bytes, and the length was just checked against that.
-        // The caller's contract guarantees `data` does not alias this pool, so
-        // the ranges are non-overlapping as `copy_nonoverlapping` requires.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
-        // Lossless: the length is at most `BUFFER_SIZE`.
+    pub unsafe fn write(&self, index: usize, data: &[u8]) -> Result<u32, WriteOutsideBuffer> {
+        // SAFETY: forwards this function's own two obligations unchanged; a
+        // whole-buffer write is the `offset == 0` case of a placed one.
+        unsafe { self.write_at(index, 0, data) }?;
+        // Lossless: an accepted length is at most `BUFFER_SIZE`.
         Ok(data.len() as u32)
     }
 
@@ -161,31 +155,31 @@ impl<const N: usize> BufferPool<N> {
     /// the buffer untouched — how a device header is placed in front of an
     /// already-DMA'd frame without moving the frame bytes.
     ///
-    /// # Panics
-    /// If `index` is not a pool index, or if `offset + data.len()` exceeds
-    /// [`BUFFER_SIZE`] (computed without overflow). Both fault in every build
-    /// profile, an unchecked span here being an out-of-bounds write.
-    ///
-    /// Those faults are a recorded ENG-5 defect rather than a contract: neither
-    /// value is bounded by this function, so fed peer-derived bytes it crashes
-    /// on untrusted input. No comment closes it — an unreachability proof would
-    /// have to name a caller, the claim DOC-10 forbids. The fix is a typed
-    /// `Result`, which changes this signature and every call site with it.
+    /// # Errors
+    /// [`WriteOutsideBuffer`] if `index` is not a pool index or
+    /// `offset + data.len()` leaves the buffer (computed without overflow).
+    /// Nothing is written, so a refused span is indistinguishable from one
+    /// never attempted.
     ///
     /// # Safety
     /// The caller must currently own `index`, and `data` must not borrow from
     /// this pool.
-    pub unsafe fn write_at(&self, index: usize, offset: usize, data: &[u8]) {
-        assert!(
-            span_fits(offset, data.len()),
-            "write_at span exceeds the buffer"
-        );
-        let dst = self.buffer(index);
-        // SAFETY: `buffer` bounded `index` to the pool and `span_fits` bounded
-        // `offset + data.len()` to one buffer's `BUFFER_SIZE` bytes, so the
-        // destination is in bounds. The caller's contract guarantees `data`
-        // does not alias this pool, so the ranges do not overlap.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(offset), data.len()) };
+    pub unsafe fn write_at(
+        &self,
+        index: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), WriteOutsideBuffer> {
+        let len = data.len();
+        let Some(base) = self.span(index, offset, len) else {
+            return Err(WriteOutsideBuffer { index, offset, len });
+        };
+        // SAFETY: `span` bounded `index` to the pool and `offset + len` to that
+        // buffer's `BUFFER_SIZE` bytes, so the destination is in bounds. The
+        // caller's contract guarantees `data` does not alias this pool, so the
+        // ranges are non-overlapping as `copy_nonoverlapping` requires.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(offset), len) };
+        Ok(())
     }
 
     /// Snapshot `len` bytes of buffer `index` starting at `offset` into `into`,
@@ -212,25 +206,20 @@ impl<const N: usize> BufferPool<N> {
         into: &'dst mut [u8],
     ) -> Result<&'dst [u8], CopyOutError> {
         let len = len as usize;
-        let outside = CopyOutError::SpanOutsideBuffer { index, offset, len };
-        let Some(buffer) = self.buffers.get(index) else {
-            return Err(outside);
+        let Some(base) = self.span(index, offset, len) else {
+            return Err(CopyOutError::SpanOutsideBuffer { index, offset, len });
         };
-        if !span_fits(offset, len) {
-            return Err(outside);
-        }
         let capacity = into.len();
         let Some(snapshot) = into.get_mut(..len) else {
             return Err(CopyOutError::DestinationTooSmall { len, capacity });
         };
-        let src = buffer.get().cast::<u8>();
-        // SAFETY: `buffers.get` returned this cell, so `index` is in range, and
-        // `span_fits` bounded `offset + len` to the cell's `BUFFER_SIZE` bytes,
-        // which are initialised (the pool is created zeroed and never
-        // deinitialised). `snapshot` is exactly `len` bytes of the caller's own
-        // storage, which cannot overlap a pool the caller has no reference into,
-        // so the ranges are disjoint as `copy_nonoverlapping` requires.
-        unsafe { core::ptr::copy_nonoverlapping(src.add(offset), snapshot.as_mut_ptr(), len) };
+        // SAFETY: `span` bounded `index` to the pool and `offset + len` to that
+        // buffer's `BUFFER_SIZE` bytes, which are initialised (the pool is
+        // created zeroed and never deinitialised). `snapshot` is exactly `len`
+        // bytes of the caller's own storage, which cannot overlap a pool the
+        // caller has no reference into, so the ranges are disjoint as
+        // `copy_nonoverlapping` requires.
+        unsafe { core::ptr::copy_nonoverlapping(base.add(offset), snapshot.as_mut_ptr(), len) };
         Ok(snapshot)
     }
 }
@@ -282,9 +271,12 @@ impl<const N: usize> Default for BufferPool<N> {
     }
 }
 
-/// Proof of exclusive ownership of one pool buffer. Neither `Copy` nor `Clone`,
-/// so the compiler rather than a runtime check makes a local double return
-/// unrepresentable.
+/// Proof of exclusive ownership of one buffer of an `N`-buffer pool.
+///
+/// `N` is the brand. A token exists only where [`FreeList::pop`] minted it, so
+/// its index is below `N` by construction and one from a differently sized pool
+/// is a type error rather than a runtime rejection. Neither `Copy` nor `Clone`,
+/// so a local double return is unrepresentable too.
 ///
 /// Dropping a token does **not** return the buffer; the index stays outstanding
 /// until it comes back through [`FreeList::reclaim`]. That is deliberate —
@@ -293,9 +285,9 @@ impl<const N: usize> Default for BufferPool<N> {
 /// token dropped with no matching `reclaim` leaks its buffer permanently.
 #[must_use]
 #[derive(Debug)]
-pub struct OwnedBuffer(u32);
+pub struct OwnedBuffer<const N: usize>(u32);
 
-impl OwnedBuffer {
+impl<const N: usize> OwnedBuffer<N> {
     #[must_use]
     pub const fn index(&self) -> u32 {
         self.0
@@ -373,7 +365,7 @@ impl<const N: usize> FreeList<N> {
     /// outstanding until it comes back through [`push`](Self::push) or
     /// [`reclaim`](Self::reclaim).
     #[must_use = "dropping the token leaves its buffer outstanding forever unless it is reclaimed"]
-    pub fn pop(&mut self) -> Option<OwnedBuffer> {
+    pub fn pop(&mut self) -> Option<OwnedBuffer<N>> {
         if self.top == 0 {
             return None;
         }
@@ -385,18 +377,11 @@ impl<const N: usize> FreeList<N> {
 
     /// Return a buffer this domain still holds, consuming its token.
     ///
-    /// The index is still checked: an `OwnedBuffer` is not branded with the
-    /// ledger that minted it, so holding one does not prove *this* ledger
-    /// handed it out — it may come from a ledger over a differently sized pool,
-    /// or its index may have been taken back through
-    /// [`reclaim`](Self::reclaim) from under it. Branding the token is the
-    /// recorded DOC-9 fix.
-    ///
     /// # Errors
     /// The ledger is unchanged and the token is consumed on any error, so
     /// unless the caller kept the index the buffer stays outstanding for good —
     /// count the error rather than discard it.
-    pub fn push(&mut self, buffer: OwnedBuffer) -> Result<(), ReturnError> {
+    pub fn push(&mut self, buffer: OwnedBuffer<N>) -> Result<(), ReturnError> {
         self.accept(buffer.index())
     }
 
@@ -524,7 +509,7 @@ mod tests {
         // SAFETY: single-threaded test; we own index 0 throughout; inputs local.
         unsafe {
             pool.write(0, &[0xEEu8; 32]).expect("32 bytes fit a buffer");
-            pool.write_at(0, 12, &[1, 2, 3]);
+            pool.write_at(0, 12, &[1, 2, 3]).expect("the span fits");
         }
         let bytes = snapshot(&pool, 0, 0, 16);
         assert_eq!(&bytes[..12], &[0xEE; 12]);
@@ -541,7 +526,9 @@ mod tests {
             let oversized = [0xAAu8; BUFFER_SIZE + 1];
             assert_eq!(
                 pool.write(0, &oversized),
-                Err(WriteTooLarge {
+                Err(WriteOutsideBuffer {
+                    index: 0,
+                    offset: 0,
                     len: BUFFER_SIZE + 1
                 })
             );
@@ -572,27 +559,38 @@ mod tests {
         let pool = BufferPool::<1>::new();
         let tail = [0xCDu8; 8];
         // SAFETY: own index 0; span ends exactly at BUFFER_SIZE; input local.
-        unsafe { pool.write_at(0, BUFFER_SIZE - 8, &tail) };
+        unsafe { pool.write_at(0, BUFFER_SIZE - 8, &tail) }.expect("the span ends at the end");
         assert_eq!(snapshot(&pool, 0, BUFFER_SIZE - 8, 8), &tail);
     }
 
     #[test]
-    #[should_panic(expected = "write_at span exceeds the buffer")]
-    fn write_at_past_the_buffer_end_panics_in_every_profile() {
-        let pool = BufferPool::<1>::new();
-        // SAFETY: own index 0; the call is expected to fault on the span check
-        // before it writes anything, which is what this test asserts.
-        unsafe { pool.write_at(0, BUFFER_SIZE - 1, &[1, 2]) };
-    }
-
-    #[test]
-    #[should_panic(expected = "write_at span exceeds the buffer")]
-    fn write_at_offset_that_overflows_the_span_sum_panics() {
-        let pool = BufferPool::<1>::new();
-        // A peer-shaped offset whose `offset + len` wraps: the checked sum must
-        // reject it rather than wrap into a span that looks small enough.
-        // SAFETY: own index 0; expected to fault on the span check.
-        unsafe { pool.write_at(0, usize::MAX, &[1, 2]) };
+    fn write_at_refuses_every_span_that_leaves_the_buffer() {
+        let pool = BufferPool::<2>::new();
+        // SAFETY: own every index of this pool; the fill establishes what an
+        // untouched buffer looks like below.
+        unsafe { pool.write(0, &[0x5Au8; BUFFER_SIZE]) }.expect("a whole buffer fits");
+        // Past the end, an offset whose `offset + len` sum wraps, and an index
+        // outside the pool: each a shape a peer descriptor can carry, each a
+        // typed rejection rather than the fault this used to be (ENG-5).
+        for (index, offset, len) in [
+            (0, BUFFER_SIZE - 1, 2),
+            (0, usize::MAX, 2),
+            (0, BUFFER_SIZE, 1),
+            (2, 0, 1),
+            (usize::MAX, 0, 1),
+        ] {
+            let data = std::vec![0xFFu8; len];
+            // SAFETY: single-threaded test owning its own pool; every call is
+            // expected to reject before it writes anything, and `data` is a
+            // local that cannot alias the pool.
+            let outcome = unsafe { pool.write_at(index, offset, &data) };
+            assert_eq!(outcome, Err(WriteOutsideBuffer { index, offset, len }));
+        }
+        // Refused, never partially applied: buffer 0 is exactly as it was.
+        assert_eq!(
+            snapshot(&pool, 0, 0, BUFFER_SIZE as u32),
+            &[0x5Au8; BUFFER_SIZE]
+        );
     }
 
     #[test]
@@ -685,11 +683,15 @@ mod tests {
     }
 
     #[test]
-    fn write_too_large_reports_the_rejected_length() {
-        let error = WriteTooLarge { len: 4096 };
+    fn a_refused_write_names_the_span_it_refused() {
+        let error = WriteOutsideBuffer {
+            index: 3,
+            offset: 2040,
+            len: 16,
+        };
         assert_eq!(
             std::format!("{error}"),
-            "write of 4096 bytes exceeds the 2048-byte buffer"
+            "span 2040..+16 of buffer 3 is not within one 2048-byte buffer"
         );
     }
 
@@ -809,17 +811,6 @@ mod tests {
         assert_eq!(list.reclaim(extra), Err(ReturnError::NotOutstanding(extra)));
         assert_eq!(list.len(), 2);
         assert_partitions_the_pool(&list);
-    }
-
-    #[test]
-    fn a_token_from_a_larger_pool_is_refused_as_out_of_range() {
-        let mut small = FreeList::<4>::full();
-        let mut large = FreeList::<8>::full();
-        let stray = large.pop().expect("a full ledger has buffers");
-        assert_eq!(stray.index(), 7, "the LIFO hands out the last index first");
-        assert_eq!(small.push(stray), Err(ReturnError::OutOfRange(7)));
-        assert_eq!(small.len(), 4);
-        assert_partitions_the_pool(&small);
     }
 
     #[test]
@@ -943,6 +934,68 @@ mod tests {
         }
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The write accessor under a byzantine peer, mirroring the `copy_out`
+        /// property above: arbitrary index, offset and length. Nothing may
+        /// panic, acceptance must match the bounds exactly, and a refusal must
+        /// leave every byte of the pool as it was — which is what makes a
+        /// rejected write indistinguishable from one never attempted.
+        #[test]
+        fn arbitrary_write_spans_are_refused_or_written_exactly(
+            (index, offset, len, _capacity) in any_span(),
+        ) {
+            const N: usize = 4;
+            const UNTOUCHED: u8 = 0x5A;
+            let pool = BufferPool::<N>::new();
+            for buffer in 0..N {
+                // SAFETY: single-threaded test that owns every index of its own
+                // pool; the source is a local array.
+                unsafe { pool.write(buffer, &[UNTOUCHED; BUFFER_SIZE]) }
+                    .expect("a whole buffer fits exactly");
+            }
+
+            // Bounded so an arbitrary `len` cannot turn the case budget into a
+            // multi-gigabyte allocation budget; the out-of-bounds lengths that
+            // matter are still reached, `BUFFER_SIZE + 1` being past the end.
+            let len = len as usize % (BUFFER_SIZE + 2);
+            let data = std::vec![0xC3u8; len];
+            // SAFETY: single-threaded test owning every index of its own pool;
+            // `data` is a separate allocation that cannot alias it.
+            let outcome = unsafe { pool.write_at(index, offset, &data) };
+
+            let in_bounds = index < N
+                && offset.checked_add(len).is_some_and(|end| end <= BUFFER_SIZE);
+            prop_assert_eq!(outcome.is_ok(), in_bounds);
+
+            match outcome {
+                Ok(()) => {
+                    prop_assert_eq!(snapshot(&pool, index, offset, len as u32), data);
+                    // Only the span moved: the byte after it is untouched.
+                    if offset + len < BUFFER_SIZE {
+                        prop_assert_eq!(
+                            snapshot(&pool, index, offset + len, 1),
+                            std::vec![UNTOUCHED]
+                        );
+                    }
+                }
+                Err(error) => {
+                    prop_assert_eq!(error, WriteOutsideBuffer { index, offset, len });
+                    // Not one byte of any buffer changed.
+                    for buffer in 0..N {
+                        prop_assert!(
+                            snapshot(&pool, buffer, 0, BUFFER_SIZE as u32)
+                                .iter()
+                                .all(|byte| *byte == UNTOUCHED),
+                            "a refused write reached the pool"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// One step of the untrusted-peer model: take a buffer, return one we hold,
     /// or feed the trust boundary a bare index of the peer's choosing.
     #[derive(Clone, Debug)]
@@ -985,7 +1038,7 @@ mod tests {
             let mut outstanding = [false; N];
             // Tokens physically in hand. A token stays here after its index is
             // reclaimed from under it, so returning it later must be refused.
-            let mut held: std::vec::Vec<OwnedBuffer> = std::vec::Vec::new();
+            let mut held: std::vec::Vec<OwnedBuffer<N>> = std::vec::Vec::new();
 
             for step in steps {
                 match step {

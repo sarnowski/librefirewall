@@ -17,10 +17,10 @@
 
 [comment-ratio]
 "crates/nic-driver-core/src/bringup.rs" = 0.3697
-"crates/nic-driver-core/src/lib.rs" = 0.4969
+"crates/nic-driver-core/src/lib.rs" = 0.4950
 "crates/nic-driver-core/src/port.rs" = 0.4575
-"crates/packet-buffer/src/lib.rs" = 0.4622
-"crates/pd-runtime/src/lib.rs" = 0.5450
+"crates/packet-buffer/src/lib.rs" = 0.4529
+"crates/pd-runtime/src/lib.rs" = 0.5373
 "crates/queue/src/lib.rs" = 0.4271
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638

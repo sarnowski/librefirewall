@@ -40,12 +40,14 @@
 //!   exactly the model's free set. That is the "no buffer invented, none lost,
 //!   no index free twice" claim checked against the code rather than the model.
 //! * **The write boundary.** `write` returns `Ok(len)` exactly when the data
-//!   fits and `WriteTooLarge` otherwise, and never truncates.
+//!   fits and `WriteOutsideBuffer` otherwise, and never truncates.
 
 use std::collections::BTreeSet;
 
 use arbitrary::Unstructured;
-use packet_buffer::{BUFFER_SIZE, BufferPool, FreeList, OwnedBuffer, ReturnError, WriteTooLarge};
+use packet_buffer::{
+    BUFFER_SIZE, BufferPool, FreeList, OwnedBuffer, ReturnError, WriteOutsideBuffer,
+};
 
 use crate::{MAX_OPERATIONS, any_index, any_u32, next_op};
 
@@ -103,7 +105,7 @@ pub fn free_list_harness(data: &[u8]) {
     let mut outstanding = [false; POOL];
     // Tokens physically in hand. A token stays here after its index is
     // reclaimed from under it, so returning it later must be refused.
-    let mut held: Vec<OwnedBuffer> = Vec::new();
+    let mut held: Vec<OwnedBuffer<POOL>> = Vec::new();
     // One allocation for every write, sliced to the length under test: the
     // lengths vary, the allocation does not, so the operation budget cannot
     // turn into a quadratic allocation budget.
@@ -188,7 +190,11 @@ pub fn free_list_harness(data: &[u8]) {
                 if len > BUFFER_SIZE {
                     assert_eq!(
                         written,
-                        Err(WriteTooLarge { len }),
+                        Err(WriteOutsideBuffer {
+                            index: buffer.index() as usize,
+                            offset: 0,
+                            len
+                        }),
                         "an oversized write must be refused, never truncated"
                     );
                 } else {

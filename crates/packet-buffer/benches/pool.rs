@@ -49,9 +49,8 @@ fn buffer_pool_write_at(c: &mut Criterion) {
             // SAFETY: `write_at`'s two clauses. `pool` is constructed in this
             // function and handed to nothing else, so index 0 is owned here;
             // `data` is a separate `Vec` and so cannot borrow from the pool.
-            // (`HEADER + size` stays inside `BUFFER_SIZE` for every benched
-            // size, which keeps the `# Panics` assert quiet — not a soundness
-            // clause: `write_at` checks that span itself.)
+            // The span is not a soundness clause — `write_at` bounds it itself
+            // and answers in its return value.
             b.iter(|| unsafe { pool.write_at(0, HEADER, black_box(data)) });
         });
     }

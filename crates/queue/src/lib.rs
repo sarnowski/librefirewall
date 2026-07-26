@@ -587,6 +587,51 @@ mod tests {
     }
 
     #[test]
+    fn a_forged_tail_that_laps_the_ring_does_redeliver_and_this_layer_permits_it() {
+        // The residue the header calls advisory flow control, made explicit
+        // rather than left as prose. The two rewind tests above stop before the
+        // cursor laps: they rewind `head`, which this side never reads back, or
+        // rewind `tail` to a value the consumer has already passed. Neither
+        // reaches the case that matters.
+        //
+        // Here the consumer has drained the ring and its private `head` sits at
+        // 3. A peer that publishes `tail = 2` makes the emptiness test
+        // (`head == peer_tail`) false, and it stays false while `head` walks
+        // 3 -> 0 -> 1 — so slots 0 and 1 are handed over a *second* time.
+        //
+        // That is not a defect in this crate and is deliberately not defended
+        // here: a slot is peer-writable memory, `Descriptor` is `Copy`, and
+        // nothing at this layer can tell a first hand-over from a second. What
+        // this layer does guarantee is that the walk stays in bounds and stays
+        // finite. Refusing the redelivered *buffer* is `pd_runtime::PoolOwner`'s
+        // lent set, one layer up, and its
+        // `a_lapping_peer_cursor_redelivers_returns_that_the_lent_set_refuses`
+        // asserts the other half of this division of responsibility.
+        let ring = SpscRing::<4>::new();
+        let mut producer = ring.producer();
+        let mut consumer = ring.consumer();
+        for i in 0..3 {
+            producer.try_enqueue(tagged(i)).unwrap();
+        }
+        for i in 0..3 {
+            assert_eq!(consumer.try_dequeue(), Some(tagged(i)));
+        }
+        assert_eq!(consumer.try_dequeue(), None, "the ring is drained");
+
+        ring.tail.store(2, Ordering::Relaxed);
+
+        // Slot 3 was never published, so it reads as the zeroed descriptor a
+        // fresh region holds — in bounds, never out of it.
+        assert_eq!(consumer.try_dequeue(), Some(Descriptor::ZERO));
+        // The lap: these two are the redelivery, verbatim.
+        assert_eq!(consumer.try_dequeue(), Some(tagged(0)));
+        assert_eq!(consumer.try_dequeue(), Some(tagged(1)));
+        // And it terminates: the walk meets the forged cursor and stops.
+        assert_eq!(consumer.try_dequeue(), None);
+        assert!(consumer.len() <= consumer.capacity());
+    }
+
+    #[test]
     fn a_peer_restart_mid_stream_does_not_redeliver_or_panic() {
         // The scenario the crate header names: the peer crashes and restarts,
         // re-zeroing the shared cursors while descriptors are in flight. Both

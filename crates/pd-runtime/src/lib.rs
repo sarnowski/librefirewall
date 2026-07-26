@@ -266,10 +266,8 @@ impl Default for ReturnRing {
 /// A first-party invariant break rather than untrusted input, because `index`
 /// is bounded before every call by one of two enforcers:
 ///
-/// * an [`OwnedBuffer`] index, which exists only if [`PoolOwner::alloc`] minted
-///   it from a `FreeList<POOL_BUFFERS>` — proven by this crate's
-///   `a_forged_out_of_range_return_is_dropped_and_counted`, which asserts every
-///   minted index is below `POOL_BUFFERS`;
+/// * an `OwnedBuffer<POOL_BUFFERS>` index, which the token's own type bounds
+///   below `POOL_BUFFERS`;
 /// * a peer-supplied [`Descriptor`]`::buffer` past an unconditional
 ///   [`descriptor_in_bounds`] rejection — proven by
 ///   `descriptor_in_bounds_matches_a_widened_reference`.
@@ -422,7 +420,7 @@ impl<'ring> PoolOwner<'ring> {
 
     /// Take exclusive ownership of a free buffer, e.g. to hand to a device for
     /// it to fill. `None` when the pool is momentarily exhausted.
-    pub fn alloc(&mut self) -> Option<OwnedBuffer> {
+    pub fn alloc(&mut self) -> Option<OwnedBuffer<POOL_BUFFERS>> {
         self.ledger.pop()
     }
 
@@ -437,7 +435,7 @@ impl<'ring> PoolOwner<'ring> {
     /// which accepts an index only if it is in the lent set — which a held
     /// token's index never is. Proven by this crate's
     /// `a_return_of_a_buffer_still_held_by_this_domain_is_refused`.
-    pub fn release(&mut self, buffer: OwnedBuffer) {
+    pub fn release(&mut self, buffer: OwnedBuffer<POOL_BUFFERS>) {
         self.ledger
             .push(buffer)
             .expect("a held token names an outstanding, unlent buffer");
@@ -452,11 +450,6 @@ impl<'ring> PoolOwner<'ring> {
     /// [`reclaim`](Self::reclaim) tell a legitimate return from a peer naming a
     /// buffer it was never given.
     ///
-    /// `buffer` must have been minted by *this* owner's [`alloc`](Self::alloc):
-    /// an [`OwnedBuffer`] is not branded with its ledger, so one from a
-    /// differently sized pool would index the lent set out of range. Branding
-    /// the token with its pool size is the recorded DOC-9 fix.
-    ///
     /// # Errors
     /// Returns the token unchanged when the ring is momentarily full, so the
     /// caller still owns the buffer and can [`release`](Self::release) it. The
@@ -464,10 +457,10 @@ impl<'ring> PoolOwner<'ring> {
     pub fn lend(
         &mut self,
         ring: &mut RingProducer<'_, RING_SLOTS>,
-        buffer: OwnedBuffer,
+        buffer: OwnedBuffer<POOL_BUFFERS>,
         offset: u32,
         len: u32,
-    ) -> Result<(), OwnedBuffer> {
+    ) -> Result<(), OwnedBuffer<POOL_BUFFERS>> {
         let index = buffer.index();
         if ring
             .try_enqueue(Descriptor::new(index, offset, len))
@@ -475,9 +468,6 @@ impl<'ring> PoolOwner<'ring> {
         {
             return Err(buffer);
         }
-        // In range because `alloc` mints only from this owner's
-        // `FreeList<POOL_BUFFERS>`, so no peer value reaches this index;
-        // asserted by `a_forged_out_of_range_return_is_dropped_and_counted`.
         self.lent[index as usize] = true;
         Ok(())
     }
@@ -1113,6 +1103,66 @@ mod tests {
     }
 
     #[test]
+    fn a_lapping_peer_cursor_redelivers_returns_that_the_lent_set_refuses() {
+        // The upper half of the division of responsibility `queue`'s
+        // `a_forged_tail_that_laps_the_ring_does_redeliver_and_this_layer_permits_it`
+        // states the lower half of. That test proves the ring *will* hand a
+        // descriptor over twice when a peer rewinds its published cursor far
+        // enough to lap the consumer; this one proves the second delivery buys
+        // the peer nothing, because a return is accepted only for an index that
+        // is currently lent, and the first delivery cleared that bit.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut free_in = r.returns.free.producer();
+
+        // Lend three buffers and let the transmitting peer return them
+        // legitimately, which is what advances the owner's private `head` to 3
+        // and clears the three lent bits.
+        let mut lent = Vec::new();
+        for _ in 0..3 {
+            let buffer = owner.alloc().expect("a full pool has buffers");
+            lent.push(buffer.index());
+            owner
+                .lend(&mut rx_in, buffer, 0, 0)
+                .expect("the ring is empty");
+        }
+        for index in &lent {
+            free_in
+                .try_enqueue(Descriptor::new(*index, 0, 0))
+                .expect("the free ring has room");
+        }
+        assert_eq!(owner.reclaim(), 3, "the legitimate returns are accepted");
+        assert_eq!(owner.owned(), POOL_BUFFERS);
+        assert_eq!(owner.counters(), PoolCounters::default());
+
+        // Now the lap. The owner's private head is 3; a published tail of 2
+        // keeps the ring looking non-empty until head walks all the way round
+        // to it, replaying every slot on the way — the three real returns
+        // included.
+        forge_cursors(&r.returns.free, 0, 2);
+
+        // Not one is accepted a second time, and each refusal is attributed to
+        // the peer rather than to this domain's own bookkeeping.
+        assert_eq!(owner.reclaim(), 0, "a redelivered return was accepted");
+        assert_eq!(
+            owner.counters().reclaim_not_lent,
+            (RING_SLOTS - 1) as u64,
+            "every slot the lap replayed must be refused as not lent"
+        );
+        assert_eq!(owner.counters().reclaim_refused, 0);
+
+        // The pool is whole and still hands out each index exactly once, which
+        // is what a doubly accepted return would have broken.
+        assert_eq!(owner.owned(), POOL_BUFFERS);
+        let mut seen = BTreeSet::new();
+        while let Some(buffer) = owner.alloc() {
+            assert!(seen.insert(buffer.index()), "an index was handed out twice");
+        }
+        assert_eq!(seen.len(), POOL_BUFFERS);
+    }
+
+    #[test]
     fn a_peer_restart_that_rezeroes_the_cursors_does_not_double_own_a_buffer() {
         // The peer crashes mid-stream and comes back with both shared cursors
         // zeroed while buffers are in flight. The owner's ledger and lent set
@@ -1279,7 +1329,7 @@ mod tests {
             let mut tx_out = r.rings.tx.consumer();
             let mut free_in = r.returns.free.producer();
             // Tokens this domain holds, standing in for buffers posted to a NIC.
-            let mut held: Vec<OwnedBuffer> = Vec::new();
+            let mut held: Vec<OwnedBuffer<POOL_BUFFERS>> = Vec::new();
 
             for step in steps {
                 match step {
@@ -1326,7 +1376,8 @@ mod tests {
 
             // The ledger still hands out only real, distinct indices, and never
             // one this domain is still holding — the conserved owner set.
-            let still_held: BTreeSet<u32> = held.iter().map(OwnedBuffer::index).collect();
+            let still_held: BTreeSet<u32> =
+                held.iter().map(OwnedBuffer::<POOL_BUFFERS>::index).collect();
             let mut handed_out: BTreeSet<u32> = BTreeSet::new();
             while let Some(buffer) = owner.alloc() {
                 let index = buffer.index();
