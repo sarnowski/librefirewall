@@ -11,7 +11,8 @@
 //! inside the toolchain — and so the versions the manifest records as provenance
 //! are the versions that actually produced the image. Every pinned input the
 //! manifest names is checked: an unverified provenance field is a claim, not
-//! evidence.
+//! evidence. [`crate::sysdesc`] runs beside it against the other input this
+//! stage consumes and never validated: the system description itself.
 
 use std::{
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ use crate::{
     },
     disk, evidence, grub,
     pins::{self, Pins},
+    sysdesc,
     util::{Error, copy_file, recreate_dir, run_command},
 };
 
@@ -34,7 +36,9 @@ pub(crate) const RELEASE_CONFIG: &str = "release";
 const MICROKIT_SDK: &str = "/opt/microkit";
 const RUST_SEL4: &str = "/opt/rust-sel4";
 
-const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
+/// The static capability topology, assembled below and cross-checked against
+/// the constants the protection domains map it with by [`crate::sysdesc`].
+pub(crate) const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.system";
 /// Protection-domain binaries the system image is assembled from.
 ///
 /// The single owner of that list: [`crate::host::test_host`] lints exactly these
@@ -65,6 +69,11 @@ pub(crate) fn board_include_dir(config: &str) -> PathBuf {
 pub(crate) fn image(root: &Path, config: &str) -> Result<(), Error> {
     let pins = pins::read(root)?;
     verify_inputs(config, &pins)?;
+    // Before the protection domains are compiled, not merely before the
+    // Microkit tool consumes the description: the disagreement this catches is
+    // between that file and the constants those binaries are built from, so
+    // there is nothing to gain from compiling them first and minutes to lose.
+    sysdesc::check(root)?;
 
     let build = root.join("build/image").join(config);
     let dist = root.join("dist");

@@ -110,12 +110,12 @@ pub type Ring = SpscRing<RING_SLOTS>;
 /// offset to add and none to get wrong.
 pub type Pool = BufferPool<POOL_BUFFERS>;
 
-/// Bytes the system description reserves for each region
-/// (`systems/qemu-x86_64/librefirewall.system:99-104`), derived rather than
+/// Bytes the system description reserves for each region, derived rather than
 /// chosen: the fewest [`MAPPING_ALIGN`] pages that hold the region's type. As a
 /// literal the single-region size drifted to 1.93x its type, mapping bytes no
-/// field names into three domains. Nothing here re-reads that XML, so a smaller
-/// `size=` still surfaces only at boot, as a truncated mapping.
+/// field names into three domains. `xtask::sysdesc` reads that file back and
+/// holds every `size=` to the constant here, proved by its
+/// `a_short_region_is_reported_against_the_constant_it_must_equal`.
 pub const POOL_REGION_SIZE: usize = size_of::<Pool>().next_multiple_of(MAPPING_ALIGN);
 
 /// As [`POOL_REGION_SIZE`], for the forwarder's region.
@@ -192,9 +192,8 @@ const _: () = {
     assert!(align_of::<ReturnRing>() == 4);
 };
 
-// The three grants, pinned as tightly as the fields: each `size=` in the system
-// description is one of these literals, and each region exceeds its type by less
-// than one page, so no unaddressed slack can return unnoticed.
+// The three grants, pinned as tightly as the fields: each region exceeds its
+// type by less than one page, so no unaddressed slack can return unnoticed.
 const _: () = {
     assert!(POOL_REGION_SIZE == 0x20000);
     assert!(FORWARD_REGION_SIZE == 0x1000);
@@ -323,11 +322,11 @@ pub unsafe fn attach_region<'a, T: Sync>(ptr: *mut T) -> &'a T {
 ///
 /// A [`ForwardRings`] region is mapped read-write into three protection domains
 /// at once and a [`ReturnRing`] into two; a [`Pool`] is mapped into the
-/// transmitting driver alone and is additionally a DMA target of both NICs
-/// (`systems/qemu-x86_64/librefirewall.system:113-161`). Sharing any of them as
-/// a `&` is sound in the face of that because none exposes a safe path to those
-/// bytes; whether the peers behave is the protocol question the crate header
-/// answers, not a soundness one.
+/// transmitting driver alone and is additionally a DMA target of both NICs —
+/// the exact aliasing set `xtask::sysdesc` holds the description to, per region
+/// and per domain. Sharing any of them as a `&` is sound in the face of it
+/// because none exposes a safe path to those bytes; whether the peers behave is
+/// the protocol question the crate header answers, not a soundness one.
 ///
 /// The calling crate must depend on `sel4-microkit`; this crate deliberately
 /// does not, so the protocol stays host-testable.
@@ -339,21 +338,20 @@ macro_rules! attach_region {
         //
         // * Address, page alignment, lifetime — the Microkit tool, which
         //   patches `$vaddr_symbol` from the matching `<map ... setvar_vaddr>`
-        //   in `systems/qemu-x86_64/librefirewall.system:113-161`, maps at page
+        //   in `systems/qemu-x86_64/librefirewall.system`, maps at page
         //   granularity (far beyond any region type's 4 bytes), and makes the
         //   mapping static, so it outlives the protection domain.
         // * Zero-initialisation — the seL4 kernel, which zeroes a frame
         //   retyped from a general-purpose untyped but not one retyped from a
         //   device untyped. Which it is follows from the region's `phys_addr`
-        //   lying inside RAM (`librefirewall.system:30-39,99-104`), and that
-        //   from QEMU's `-m 1G` (`tools/xtask/src/qemu.rs:245`). Nothing
-        //   first-party re-checks it; a region outside RAM surfaces as unbacked
+        //   lying inside RAM, and that from QEMU's `-m 1G`
+        //   (`tools/xtask/src/qemu.rs`). This is the one precondition here that
+        //   no build step checks; a region outside RAM surfaces as unbacked
         //   reads at run time rather than as a build or boot error.
-        // * Minimum size — the `size=` attribute on that region, which must
-        //   equal the matching `POOL_REGION_SIZE` / `FORWARD_REGION_SIZE` /
-        //   `RETURN_REGION_SIZE`. Those are derived from the region types, but
-        //   nothing here re-reads that XML, so the two move together or not at
-        //   all.
+        // * Minimum size — the `size=` attribute on that region, which
+        //   `xtask::sysdesc` reads back and holds to the matching
+        //   `POOL_REGION_SIZE` / `FORWARD_REGION_SIZE` / `RETURN_REGION_SIZE`
+        //   in the fast gate and again before the image is assembled.
         // * No safe path to the bytes — this crate's region types, whose fields
         //   are atomics (`Ring`) or an `UnsafeCell` reachable only through an
         //   `unsafe` accessor (`Pool`).

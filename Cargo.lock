@@ -1264,6 +1264,10 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "nic-driver-core",
+ "pd-runtime",
+]
 
 [[package]]
 name = "zerocopy"

@@ -1,11 +1,12 @@
 //! The host-side commands: the fast gate, coverage, benchmarks, fuzzing, clean.
 //!
 //! These run without booting seL4. [`test_host`] is the fast gate the pre-commit
-//! hook and CI share (format, host tests, Clippy with warnings denied over
-//! *every* workspace member, the `cargo-deny` dependency/license/source policy,
-//! and the library coverage floor). [`fuzz`] additionally runs in the full `ci`
-//! gate (build every fuzz target and briefly exercise it). [`coverage`] and
-//! [`bench`] are measurement/discovery commands deliberately outside any gate.
+//! hook and CI share (format, the DOC-11/ENG-13 budgets, the system-description
+//! cross-check, host tests, Clippy with warnings denied over *every* workspace
+//! member, the `cargo-deny` dependency/license/source policy, and the library
+//! coverage floor). [`fuzz`] additionally runs in the full `ci` gate (build
+//! every fuzz target and briefly exercise it). [`coverage`] and [`bench`] are
+//! measurement/discovery commands deliberately outside any gate.
 //!
 //! # Why the lint step is two commands, not one
 //!
@@ -29,7 +30,7 @@ use std::{
     process::Command,
 };
 
-use crate::{budgets, image, util::run_command};
+use crate::{budgets, image, sysdesc, util::run_command};
 
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target, and
@@ -122,6 +123,13 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
         "check formatting",
     )?;
     enforce_budgets(root)?;
+    // Beside the budgets and for the same reason: it reads two files and
+    // compares numbers, so it costs milliseconds against the minutes below it,
+    // and a truncated memory region is exactly the finding that is worthless
+    // discovered late. Putting it here rather than only in `image` is what
+    // makes `make test` catch a divergence with no image build at all — and
+    // `ci` and `release` reach it through this function anyway.
+    sysdesc::check(root)?;
     run_command(
         Command::new("cargo")
             .current_dir(root)

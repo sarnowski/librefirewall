@@ -3,12 +3,16 @@
 //! `xtask` is the single Rust entry point behind the `Makefile`: it builds the
 //! protection-domain binaries for the seL4 target, assembles them into the
 //! Microkit kernel/system pair, packages a signed A/B GPT disk, and boots that
-//! disk in QEMU to assert the system's observable contracts. It is a
-//! zero-dependency `std` binary so the bootstrap tooling stays auditable and
-//! builds offline inside the pinned container.
+//! disk in QEMU to assert the system's observable contracts. It is a `std`
+//! binary with no third-party dependency — so the bootstrap tooling stays
+//! auditable and builds offline inside the pinned container — and two
+//! first-party ones, the crates whose constants [`sysdesc`] holds the system
+//! description to.
 //!
 //! The orchestration is split by concern, each stage in its own module:
 //!
+//! - [`sysdesc`] — the system description held to the constants the PDs map it
+//!   with.
 //! - [`image`] — build the PDs and assemble the Microkit image.
 //! - [`disk`] — the signed A/B GPT disk: partition geometry and assembly.
 //! - [`signing`] — the development payload-signing trust anchor.
@@ -40,6 +44,7 @@ mod pins;
 mod qemu;
 mod reproducible;
 mod signing;
+mod sysdesc;
 mod util;
 
 fn main() -> ExitCode {
