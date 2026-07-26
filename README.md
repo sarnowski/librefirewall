@@ -123,7 +123,7 @@ SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership led
 (the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
 (the pipeline, pool owner and forwarding stage the protection domains are assembled from).
 
-Correctness is held by 69 unit and property tests across those four crates — including hostile-peer
+Correctness is held by 73 unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
 500,000-frame three-thread pipeline test that cycles every buffer through `rx → forward → tx → free`
 far more times than the pool holds, and end-to-end by byte-identical bidirectional forwarding in
@@ -149,9 +149,9 @@ QEMU.
 
 **Done.** A from-scratch modern virtio 1.0 PCI transport in `crates/virtio` — capability-list walk,
 BAR relocation, feature negotiation, queue programming, doorbells, and a split-virtqueue driver half
-— covered by 67 unit and property tests. Every transport entry point the device drives returns a
-typed error (`BarError`, `ResetError`, `QueueSetupError`, `NotifyError`, `CapError`) instead of
-panicking.
+— covered by 67 unit and property tests and one compile-fail doctest. Every transport entry point
+the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupError`, `NotifyError`,
+`CapError`) instead of panicking.
 
 `crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 60 further tests.
 Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
@@ -199,17 +199,16 @@ description, and no SMP variant.
 
 Two grants are also wider than the code needs, and neither is closed:
 
-- **The forwarder is over-granted.** It maps each 256 KiB pipeline read-write although
+- **The forwarder is over-granted.** It maps each 136 KiB pipeline read-write although
   `ForwardStage` touches only that pipeline's rx and tx rings — roughly 3 KiB. The 128 KiB buffer
   pool in the same region is never read or written by the forwarder, and it is the part a
   compromised forwarder could corrupt. Splitting the pool from the rings into separate memory
-  regions is designed and costed but not done.
-- **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what places the virtqueue
-  and pipeline regions inside RAM — which is what establishes the zero-initialised precondition both
-  `SplitVirtqueue::new` and `attach_pipeline!` require — while leaving the BAR window above RAM in
-  the q35 PCI hole. The window either side is narrow: below roughly 785 MiB the DMA regions leave
-  RAM, at 1280 MiB or more RAM swallows the BAR window. Nothing checks it; the reasoning is recorded
-  in the system description, and no code enforces it.
+  regions is not done.
+- **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what keeps the virtqueue
+  and pipeline regions inside RAM while leaving the BAR window above RAM in the q35 PCI hole. The
+  window either side is narrow: below roughly 785 MiB the DMA regions leave RAM, at 1280 MiB or more
+  RAM swallows the BAR window. The reasoning is recorded in the system description; no code enforces
+  it.
 
 ### Untrusted-device hardening
 
@@ -221,9 +220,8 @@ queue's `queue_notify_off`, and every used-ring completion — is treated as hos
 What remains of `assert!` and `expect` on these paths is a different thing and stays deliberately:
 checks of a domain's *own* invariant, each stating the proof that no device value reaches it and
 naming the component that establishes that. Every one of them is unconditional in every build
-profile rather than a `debug_assert!` — the protection domains are compiled with the optimized Cargo
-profile in both kernel configurations, so a `debug_assert!` would be absent from every image that
-ever boots and would therefore be no check at all.
+profile rather than a `debug_assert!`, and `overflow-checks` is on in the shipped profile, so the
+arithmetic the property tests prove panic-free is the arithmetic that ships.
 
 Held by the hostile-device cases in `crates/virtio` and `crates/nic-driver-core`, plus two
 device-facing persistent fuzz targets (`find_virtio_caps`, `virtqueue_poll`) and a third
@@ -239,24 +237,13 @@ device's full authority over the shared region rather than a well-behaved subset
   substitute for VT-d.
 - **No restart.** A device that fails bring-up leaves its port permanently down (see
   *[virtio-net driver](#virtio-net-driver)*).
-- `overflow-checks` is off in the shipped profile. The property tests prove "no panic on arbitrary
-  input" while running *with* overflow checking; the binary that ships wraps silently instead. The
-  arithmetic on these paths is bounded by construction, so no wrap is currently reachable — but the
-  proof and the artifact are not the same build. Turning it on for the protection domains is
-  undecided and human-owned.
 
 ### Untrusted-peer containment
 
 **Done.** Buffer ownership is accounted **by identity**, not by count: `packet_buffer::FreeList`
 refuses to reclaim an index that is out of range or not outstanding, and `pd_runtime::PoolOwner`
-adds a per-index *lent* set so that only an index this domain actually put on a ring is taken back.
-A *local* double return is not representable, because `pop` mints a non-`Copy`, non-`Clone`
-`OwnedBuffer` token.
-
-That ledger and that lent set are what supply buffer non-duplication — **not** the rings. A peer
-that forges its published cursor can make a ring re-present a stale slot; what the ring alone
-guarantees is that no peer write makes a single slot deliver twice *in a row*, and what refuses the
-resulting duplicate buffer is the identity check on reclaim.
+refuses one this domain never lent. A *local* double return is not representable, `pop` minting a
+non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
 Every rejection is a **counted drop**, never a fault: `PoolCounters` and `ForwardCounters` record
 them. Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit
@@ -267,16 +254,14 @@ peer-fed loop is bounded by `DRAIN_LIMIT`.
 
 - **A byzantine forwarder can still corrupt a frame in the shared pool.** It may name a buffer whose
   pool owner has it posted as that NIC's receive DMA target; the transmitting driver's 12-byte
-  virtio-net header write then races the DMA. The damage is bounded — the address is always inside
-  the region, because it is derived from an index that passed the pool bounds check — but exclusive
-  ownership across domains is a protocol claim no single domain can verify. Closing it needs an
-  IOMMU (CONCEPT §7.2) or a cross-domain per-buffer ownership epoch; neither exists.
+  virtio-net header write then races the DMA. The damage stays inside the shared region, but
+  exclusive ownership across domains is a protocol claim no single domain can verify. Closing it
+  needs an IOMMU (CONCEPT §7.2) or a cross-domain per-buffer ownership epoch; neither exists.
 - **Buffer loss is not recovered.** A peer that stalls a destination ring costs the pool one buffer
   per dropped descriptor, permanently (see *[Zero-copy dataplane](#zero-copy-dataplane)*). It is
   counted, and nothing reclaims it.
 - **A peer can still write pool bytes at any time.** No Rust type stops a domain mapping the region
-  from scribbling a buffer it does not own; that is why the pool never hands out a safe reference to
-  those bytes, and why an IOMMU is what finally confines a NIC's DMA.
+  from scribbling a buffer it does not own; an IOMMU is what would confine it.
 - **No PD fault handling.** A domain that a peer manages to wedge is not restarted.
 
 ### A/B image update
@@ -333,7 +318,7 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the six library crates, `xtask`, and both protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.69% combined, weakest crate `pd-runtime` at 98.60% |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.54% combined, weakest crate `pd-runtime` at 98.62%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
 | QEMU end-to-end gate (byte-identical forwarding, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer` and `virtio` only; `pd-runtime`'s forwarding stage and `nic-driver-core`'s poll pass are hot paths with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | six persistent targets covering every crate that interprets untrusted input; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus |
@@ -345,21 +330,18 @@ is *done* currently sits.
 Two of those deserve more than a table cell.
 
 **The SBOM does not describe the shipped payload.** syft catalogs the workspace *source tree*, with
-`build/`, `dist/`, `target/`, `fuzz/` and `tools/` excluded. Two consequences follow, and a consumer
-must not read the document as the boot payload's contents. Its cargo cataloger reads `Cargo.lock`,
-which does not distinguish normal from dev dependencies, so host-only crates that never enter an
-image — `criterion`, `proptest`, and their trees — appear in the inventory. And the third-party
-components that genuinely *do* ship inside the disk — the seL4 kernel from the Microkit SDK and the
-GRUB core image — are invisible to a source-tree scan; they are recorded as version-verified
-provenance in the release manifest instead. Closing the gap needs a payload-scoped inventory syft's
-single-source model does not offer.
+`build/`, `dist/`, `target/`, `fuzz/` and `tools/` excluded, so a consumer must not read the document
+as the boot payload's contents. Host-only crates that never enter an image — `criterion`, `proptest`,
+and their trees — appear in the inventory. And the third-party components that genuinely *do* ship
+inside the disk — the seL4 kernel from the Microkit SDK and the GRUB core image — are absent; they
+are recorded as version-verified provenance in the release manifest instead.
 
 **Live fuzzing is conditional.** All six targets always build under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
-run by an explicit probe, because the hermetic builder (`--cap-drop=all`, read-only rootfs,
-`no-new-privileges`) can stop ASan before `main`. When the probe passes, every subsequent non-zero
-exit is treated as a finding and fails the gate. When it fails, the run reports loudly and proceeds
-with build-plus-seed coverage only — so a gate can go green having done no live fuzzing at all.
+run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
+probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
+fails, the run reports loudly and proceeds with build-plus-seed coverage only — so a gate can go
+green having done no live fuzzing at all.
 
 ## Build and test
 
