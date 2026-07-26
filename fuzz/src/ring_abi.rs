@@ -34,6 +34,26 @@
 //! computed from `CAP` alone — never from a value read out of the region — and
 //! every slot index is reduced modulo `CAP` before use, so no input can drive
 //! an access outside the ring.
+//!
+//! # Why the peer stores one word at a time
+//!
+//! A slot is three separate `AtomicU32`s and `queue::Slot::load` reads them as
+//! three separate relaxed loads, so the peer's real granularity is **one
+//! word**, not one descriptor. That distinction is the whole of the torn-read
+//! hazard the `queue` crate names ("a concurrent peer write can yield a
+//! descriptor whose three fields come from different writes"), and a view that
+//! could only store whole descriptors would have excluded it — TEST-8, because
+//! a *conforming* peer publishes whole descriptors and only a byzantine one
+//! leaves a slot half-rewritten.
+//!
+//! [`store_slot_field`](PeerView::store_slot_field) is therefore the primitive
+//! and [`store_slot`](PeerView::store_slot) is three of it. Single-location
+//! coherence makes that sufficient rather than merely convenient: each field
+//! `load` returns *some* value stored to that field at or before it, so the
+//! descriptors a torn read can produce are exactly the field-wise mixtures, and
+//! a harness that can set each field independently between operations reaches
+//! all of them without a second thread — whose unsynchronised writes into the
+//! same words would be a data race this harness manufactured itself.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,6 +69,47 @@ const TAIL_WORD: usize = 1;
 const SLOTS_WORD: usize = 2;
 /// `u32` words per slot: `buffer`, `offset`, `len`.
 const WORDS_PER_SLOT: usize = 3;
+
+/// Which of a slot's three `AtomicU32` words a peer store lands in.
+///
+/// An enum rather than an index, so no caller can name a fourth word: the
+/// bound `store_slot_field`'s safety argument rests on is carried by the type
+/// instead of by a check the caller is trusted to have made (DOC-9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotField {
+    Buffer,
+    Offset,
+    Len,
+}
+
+impl SlotField {
+    /// The three words in the order [`PeerView::load_slot`] and
+    /// `queue::Slot::load` read them.
+    pub const ALL: [Self; WORDS_PER_SLOT] = [Self::Buffer, Self::Offset, Self::Len];
+
+    /// This field's word index within its slot; `< WORDS_PER_SLOT` for every
+    /// variant, which is what bounds the accesses below and what lets a caller
+    /// index its own per-word shadow of a slot by the same number.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Buffer => 0,
+            Self::Offset => 1,
+            Self::Len => 2,
+        }
+    }
+
+    /// Pick a field from an arbitrary byte, so the fuzzer chooses which word a
+    /// peer store lands in.
+    #[must_use]
+    pub const fn from_selector(selector: u32) -> Self {
+        match selector % WORDS_PER_SLOT as u32 {
+            0 => Self::Buffer,
+            1 => Self::Offset,
+            _ => Self::Len,
+        }
+    }
+}
 
 /// A byzantine peer's view of a shared ring: both cursors and every slot.
 ///
@@ -114,17 +175,33 @@ impl<'ring, const CAP: usize> PeerView<'ring, CAP> {
         unsafe { self.word(TAIL_WORD) }.load(Ordering::Relaxed)
     }
 
-    /// Overwrite slot `slot % CAP` with `descriptor`, field by field, as a peer
-    /// storing to the mapped image does.
+    /// Store one `u32` word of slot `slot % CAP` — the peer's real granularity,
+    /// and the primitive every other slot write here is built from.
+    ///
+    /// Leaving the other two words alone is what a torn descriptor *is*: the
+    /// next `queue::Slot::load` mixes this value with whatever the untouched
+    /// words still hold, which is exactly what a peer store landing between two
+    /// of that function's three relaxed loads produces.
+    pub fn store_slot_field(&self, slot: usize, field: SlotField, value: u32) {
+        let word = SLOTS_WORD + WORDS_PER_SLOT * (slot % CAP) + field.index();
+        // SAFETY: `slot % CAP < CAP` and `SlotField::index() < WORDS_PER_SLOT`,
+        // so `word < 2 + 3 * CAP` — inside the ring image.
+        unsafe { self.word(word) }.store(value, Ordering::Relaxed);
+    }
+
+    /// Overwrite all three words of slot `slot % CAP`, as a peer publishing a
+    /// whole descriptor into the mapped image does.
+    ///
+    /// Three [`store_slot_field`](Self::store_slot_field) calls and nothing
+    /// more: a peer has no wider store, and expressing it any other way would
+    /// let this convenience drift from the granularity it stands for.
     pub fn store_slot(&self, slot: usize, descriptor: Descriptor) {
-        let base = SLOTS_WORD + WORDS_PER_SLOT * (slot % CAP);
-        for (offset, value) in [descriptor.buffer, descriptor.offset, descriptor.len]
-            .into_iter()
-            .enumerate()
+        for (field, value) in
+            SlotField::ALL
+                .into_iter()
+                .zip([descriptor.buffer, descriptor.offset, descriptor.len])
         {
-            // SAFETY: `slot % CAP < CAP` and `offset < 3`, so
-            // `base + offset < 2 + 3 * CAP` — inside the ring image.
-            unsafe { self.word(base + offset) }.store(value, Ordering::Relaxed);
+            self.store_slot_field(slot, field, value);
         }
     }
 
@@ -187,5 +264,56 @@ mod tests {
         let forged = Descriptor::new(1, 2, 3);
         peer.store_slot(usize::MAX, forged);
         assert_eq!(peer.load_slot(usize::MAX % 4), forged);
+        for field in SlotField::ALL {
+            peer.store_slot_field(usize::MAX, field, 0xC0DE);
+        }
+        assert_eq!(
+            peer.load_slot(usize::MAX % 4),
+            Descriptor::new(0xC0DE, 0xC0DE, 0xC0DE)
+        );
+    }
+
+    #[test]
+    fn a_single_field_store_tears_the_descriptor_the_consumer_reads() {
+        // The torn read, generated without a second thread: the producer
+        // publishes a whole descriptor, the peer rewrites one word of that same
+        // slot, and `try_dequeue` hands back the mixture — one field from the
+        // producer's write and two from the peer's, which is precisely what a
+        // store landing between two of `Slot::load`'s three relaxed loads
+        // yields.
+        let ring = SpscRing::<8>::new();
+        let peer = PeerView::new(&ring);
+        let mut producer = ring.producer();
+        let mut consumer = ring.consumer();
+
+        producer
+            .try_enqueue(Descriptor::new(0x1111, 0x2222, 0x3333))
+            .expect("the ring is empty");
+        peer.store_slot_field(0, SlotField::Offset, 0xDEAD);
+        peer.store_slot_field(0, SlotField::Len, 0xBEEF);
+        assert_eq!(
+            consumer.try_dequeue(),
+            Some(Descriptor::new(0x1111, 0xDEAD, 0xBEEF)),
+            "a field-wise mixture must reach the consumer verbatim"
+        );
+    }
+
+    #[test]
+    fn each_field_selector_reaches_exactly_its_own_word() {
+        // If two selectors collided the harness would believe it had torn a
+        // descriptor while writing the same word twice, and the torn-delivery
+        // count resting on this mapping would be fiction.
+        let ring = SpscRing::<2>::new();
+        let peer = PeerView::new(&ring);
+        for (selector, field) in (0u32..3).zip(SlotField::ALL) {
+            assert_eq!(SlotField::from_selector(selector), field);
+            assert_eq!(SlotField::from_selector(selector + 3), field);
+        }
+        peer.store_slot_field(0, SlotField::Buffer, 7);
+        assert_eq!(peer.load_slot(0), Descriptor::new(7, 0, 0));
+        peer.store_slot_field(0, SlotField::Offset, 8);
+        assert_eq!(peer.load_slot(0), Descriptor::new(7, 8, 0));
+        peer.store_slot_field(0, SlotField::Len, 9);
+        assert_eq!(peer.load_slot(0), Descriptor::new(7, 8, 9));
     }
 }

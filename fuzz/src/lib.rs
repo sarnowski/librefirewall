@@ -40,6 +40,13 @@
 //!   peer, falls outside the region it must stay inside. This is the
 //!   arbitrary-physical-write invariant, and it is asserted explicitly rather
 //!   than inferred from the absence of a crash.
+//! * **Multiplicity, counted rather than predicted.** Where a layer *permits*
+//!   an outcome that would be a defect one layer up — [`spsc_ring`]'s
+//!   redelivery of a descriptor under a forged cursor is the case — the harness
+//!   observes and counts the occurrence and asserts the **bound** the layer
+//!   really promises. Predicting the outcome from the adversary's own forged
+//!   value instead is how a harness comes to assert that the defect is correct
+//!   behaviour, which is what that module's header records.
 //!
 //! # Modelling authority, not politeness
 //!
@@ -47,15 +54,45 @@
 //! harness "sane" deletes precisely the region where the bug lives. The
 //! adversary's *authority* is therefore reproduced in full — duplicate and
 //! out-of-range indices, returns of buffers never lent, completions for
-//! descriptors never posted, cursors rewound and forged, arbitrary bytes over
-//! any shared word the adversary can reach — and the assertion is that the code
-//! **rejects** it, not that the harness never produced it.
+//! descriptors never posted, used indices forged between two polls, cursors
+//! rewound and forged, single shared *words* rewritten so a reader assembles a
+//! value from two writes, registers answered afresh on every access, arbitrary
+//! bytes over any shared word the adversary can reach — and the assertion is
+//! that the code **rejects** it, not that the harness never produced it.
 //!
-//! Two limits are deliberate and are not capability filters, and each is
-//! justified where it appears: an operation-count budget per input (a libFuzzer
-//! timeout budget, unrelated to what any single operation may contain), and, in
-//! [`driver`], suspending one *audit* — never an adversary action — once the
-//! device has scribbled the region the audit reads its evidence from.
+//! Authority also covers what a *caller* may do where no type stops it:
+//! [`spsc_ring`] takes second producer and consumer handles, because
+//! `SpscRing`'s single-handle rule is an unenforced contract its own header
+//! calls out, and a harness that respected it would have left the redelivery it
+//! warns about permanently unreachable.
+//!
+//! # The limits that are not capability filters
+//!
+//! Three, each justified where it appears:
+//!
+//! * An **operation-count budget** per input ([`MAX_OPERATIONS`]): a libFuzzer
+//!   timeout budget, unrelated to what any single operation may contain. It
+//!   also bounds every collection a harness grows one element per operation,
+//!   such as [`spsc_ring`]'s extra handles.
+//! * In [`driver`], suspending one **audit** — never an adversary action — once
+//!   the device has scribbled the region the audit reads its evidence from.
+//! * In [`free_list`], a ceiling on the payload length materialised for
+//!   `BufferPool::write` (`free_list::MAX_PAYLOAD`). The parameter is a
+//!   `&[u8]`, so its length is bounded by memory a caller already holds rather
+//!   than by a `u32`; the ceiling is what a slice can be *made* to be, not what
+//!   an adversary may ask for, and it leaves the decision boundary covered from
+//!   both sides with room to spare.
+//!
+//! # A blind spot that is not a limit of this workspace
+//!
+//! [`virtio_pci`] cannot express three device behaviours — a reset that is
+//! never acknowledged, a device that clears `FEATURES_OK` on readback, and a
+//! feature bitmap whose two halves differ. Each needs a device that answers
+//! *within* one driver call, `nic_driver_core::bringup::VirtioDevice` is the
+//! seam built for exactly that, and the only constructor that admits a foreign
+//! implementation of it is `#[cfg(test)] pub(crate)`. That is a defect in
+//! `crates/nic-driver-core` rather than a harness choice, and it is recorded in
+//! that module's header rather than papered over here.
 //!
 //! # Two ways to run
 //!

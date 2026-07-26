@@ -12,7 +12,10 @@
 //! good — the exact bug the identity-based ledger replaced a counter to fix.
 //!
 //! `BufferPool::write` is the second surface: a length the caller does not
-//! control must be refused rather than truncated.
+//! control must be refused rather than truncated. The length is drawn from a
+//! full, unreduced `u32` and spread over `MAX_PAYLOAD` below, which is a limit on
+//! what a `&[u8]` can be *made* to be rather than on what an adversary may ask
+//! for — see that constant.
 //!
 //! # What the adversary may express here
 //!
@@ -51,6 +54,21 @@ use crate::{MAX_OPERATIONS, any_index, any_u32, next_op};
 /// stack's LIFO ordering is exercised rather than degenerate.
 const POOL: usize = 8;
 
+/// The longest payload this harness materialises for `BufferPool::write`.
+///
+/// **A materialisation limit, not a capability filter.** `write`'s length is
+/// `data.len()` of a slice the caller must already hold, so the lengths a
+/// caller can present are bounded by the memory it owns, not by a `u32` — a
+/// four-gigabyte `&[u8]` is not a value any caller of this API, adversarial or
+/// otherwise, can produce, and fabricating one from a pointer would be
+/// undefined behaviour of the harness's own making. What matters is that the
+/// *decision* boundary is covered from both sides with room to spare: `write`
+/// splits exactly at `BUFFER_SIZE` and reports the rejected length verbatim, so
+/// eight buffers' worth of spread reaches every length below the boundary, the
+/// boundary itself, and a wide band above it. Listed in this crate's header
+/// among the limits that are not capability filters.
+const MAX_PAYLOAD: usize = 8 * BUFFER_SIZE;
+
 /// What the ledger must answer for a return of `index`, derived from the model
 /// alone — the same predicate the crate's own property test uses, restated here
 /// so the harness is not checking the code against itself.
@@ -86,6 +104,10 @@ pub fn free_list_harness(data: &[u8]) {
     // Tokens physically in hand. A token stays here after its index is
     // reclaimed from under it, so returning it later must be refused.
     let mut held: Vec<OwnedBuffer> = Vec::new();
+    // One allocation for every write, sliced to the length under test: the
+    // lengths vary, the allocation does not, so the operation budget cannot
+    // turn into a quadratic allocation budget.
+    let payload = vec![0xA5u8; MAX_PAYLOAD];
 
     for _ in 0..MAX_OPERATIONS {
         let Some(op) = next_op(&mut unstructured) else {
@@ -158,12 +180,11 @@ pub fn free_list_harness(data: &[u8]) {
                 let Some(buffer) = held.first() else {
                     continue;
                 };
-                let len = any_u32(&mut unstructured) as usize % (2 * BUFFER_SIZE + 2);
-                let payload = vec![0xA5u8; len];
+                let len = any_u32(&mut unstructured) as usize % (MAX_PAYLOAD + 1);
                 // SAFETY: `buffer` is a token this harness holds, so it owns the
                 // index exclusively for this call, and `payload` is a local
                 // vector that cannot alias the pool.
-                let written = unsafe { pool.write(buffer.index() as usize, &payload) };
+                let written = unsafe { pool.write(buffer.index() as usize, &payload[..len]) };
                 if len > BUFFER_SIZE {
                     assert_eq!(
                         written,

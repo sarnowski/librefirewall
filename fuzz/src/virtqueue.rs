@@ -22,6 +22,13 @@
 //!   and a full `u32` length: forged ids, out-of-range ids, replays of a
 //!   descriptor already completed, echoes of one never posted, and lengths far
 //!   above what the driver programmed.
+//! * **Any used index, at any point in the stream.** Forging the index is an
+//!   operation in the table, not a one-shot after the loop, so a device that
+//!   claims completions it never published and is then polled — and polled
+//!   again after claiming a different count — is an ordinary input. As two
+//!   byte scribbles it was not: which of the index's two bytes the fuzzer wrote
+//!   first decided what the driver saw, so the *value* the device published was
+//!   never the fuzzer's to choose.
 //! * **Buffer addresses and lengths chosen freely** on `add_writable` and
 //!   `add_readable`, rather than the two constants the previous harness used,
 //!   which left the descriptor-table half of the ring outside the fuzzer's
@@ -212,14 +219,14 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
         let Some(op) = next_op(&mut unstructured) else {
             break;
         };
-        match op % 6 {
+        match op % 7 {
             // Publish a buffer, with an address and a length the harness does
             // not constrain: both land in the descriptor table the device reads.
             0 | 1 => {
                 let paddr = u64::from(any_u32(&mut unstructured)) << 12;
                 let len = any_u32(&mut unstructured);
                 let free_before = queue.free_count();
-                let outcome = if op % 6 == 0 {
+                let outcome = if op % 7 == 0 {
                     queue.add_writable(paddr, len)
                 } else {
                     queue.add_readable(paddr, len)
@@ -243,7 +250,7 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
             // Reap a completion and take one of the two terminal choices a
             // driver has for it: recycle it (op 2) or drop it (op 3), leaving
             // the descriptor reaped and out of the free list for good.
-            op @ (2 | 3) => {
+            selected @ (2 | 3) => {
                 let posted_before = queue.posted_count();
                 if let Some((completion, reported)) = queue.poll() {
                     let index = completion.index() as usize;
@@ -265,7 +272,7 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
                         "a completion arrived with nothing posted"
                     );
                     delivered += 1;
-                    if op == 2 {
+                    if selected == 2 {
                         completion.recycle();
                         model[index] = Lifecycle::Free;
                     } else {
@@ -278,6 +285,16 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
                 let id = any_u32(&mut unstructured);
                 let len = any_u32(&mut unstructured);
                 device.complete(id, len);
+            }
+            // Forge the used index outright, between two driver `poll` calls.
+            // As an operation rather than a one-shot at the end: a device
+            // publishing a used index it never backed with entries, and then
+            // being polled, is a *sequence*, and expressing it as two separate
+            // scribbles of the index's two bytes made the driver's view of it
+            // depend on which byte the fuzzer happened to write first.
+            5 => {
+                let value = any_u32(&mut unstructured) as u16;
+                device.forge_used_index(value);
             }
             _ => {
                 let offset = any_u32(&mut unstructured) as usize;
