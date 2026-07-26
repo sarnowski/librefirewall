@@ -5,7 +5,7 @@
 //! `SpscRing`'s two cursors and its slot array are **private fields**, and that
 //! is correct: no first-party code should reach them. A peer protection domain
 //! is under no such constraint. It maps the very same region read-write
-//! (CONCEPT §7.1, and `pd_runtime`'s `attach_pipeline!` states the aliasing set
+//! (CONCEPT §7.1, and `pd_runtime`'s `attach_region!` states the aliasing set
 //! explicitly), so every one of those words is a plain address it can store to
 //! at any moment. A harness that could not write them would be modelling a
 //! *polite* peer and would exclude the entire adversarial region — the TEST-8

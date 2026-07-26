@@ -91,8 +91,8 @@ use arbitrary::Unstructured;
 use nic_driver_core::bringup::QUEUE_SIZE;
 use nic_driver_core::{Counters, InvariantFaults, RxPath, TxPath};
 use pd_runtime::{
-    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, POOL_BUFFERS, Pipeline, PoolOwner, RING_SLOTS,
-    descriptor_in_bounds,
+    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, POOL_BUFFERS, Pool, PoolOwner, RING_SLOTS,
+    ReturnRing, attach_region, descriptor_in_bounds,
 };
 use virtio::net::VirtioNetHdr;
 use virtio::queue::SplitVirtqueue;
@@ -107,10 +107,13 @@ const Q: usize = QUEUE_SIZE;
 /// The queue type both directions use.
 type Vq = SplitVirtqueue<Q>;
 
-/// Physical address of the pipeline this driver receives into.
-const RX_PADDR: u64 = 0x3100_0000;
-/// Physical address of the pipeline this driver transmits out of.
-const TX_PADDR: u64 = 0x3200_0000;
+/// Physical address of the pool this driver receives into. The driver PD holds
+/// this address and no mapping of that region at all, which is what this
+/// harness reproduces: nothing below borrows `rx_pool`.
+const RX_POOL_PADDR: u64 = 0x3100_0000;
+/// Physical address of the pool this driver transmits out of, which it does
+/// map — `TxPath::post` writes the virtio-net header into it.
+const TX_POOL_PADDR: u64 = 0x3200_0000;
 
 /// The device's side of one virtqueue: it may write any byte of the region, and
 /// publishes completions naming whatever descriptor it likes.
@@ -264,15 +267,28 @@ impl DeviceSide {
 pub fn driver_paths_harness(data: &[u8]) {
     let mut unstructured = Unstructured::new(data);
 
-    let rx_region = ZeroedRegion::<Pipeline>::new();
-    let tx_region = ZeroedRegion::<Pipeline>::new();
-    // SAFETY: each region is a live, zeroed allocation of exactly one
-    // `Pipeline`, aligned by `Layout::new` and outliving every handle taken
-    // from it, and no `&mut Pipeline` is ever created — `Pipeline::attach`'s
-    // contract in full.
-    let rx_pipe: &Pipeline = unsafe { Pipeline::attach(rx_region.as_ptr()) };
-    // SAFETY: as above, for the transmit pipeline.
-    let tx_pipe: &Pipeline = unsafe { Pipeline::attach(tx_region.as_ptr()) };
+    // Six regions, one pipeline's worth each side, allocated separately exactly
+    // as Microkit maps them. The pool this driver receives into is allocated but
+    // never attached: the PD is granted its physical address alone, so a harness
+    // holding a reference to it would model a wider grant than the system gives.
+    let rx_rings_region = ZeroedRegion::<ForwardRings>::new();
+    let rx_free_region = ZeroedRegion::<ReturnRing>::new();
+    let tx_rings_region = ZeroedRegion::<ForwardRings>::new();
+    let tx_free_region = ZeroedRegion::<ReturnRing>::new();
+    let tx_pool_region = ZeroedRegion::<Pool>::new();
+    // SAFETY: each is a live, zeroed allocation of exactly its region type,
+    // aligned by `Layout::new`, outliving every handle taken from it, and `Sync`
+    // with no safe path to its bytes; no `&mut` is ever created to any of them
+    // — `attach_region`'s contract in full.
+    let rx_rings: &ForwardRings = unsafe { attach_region(rx_rings_region.as_ptr()) };
+    // SAFETY: as above, for the receive pipeline's return region.
+    let rx_free: &ReturnRing = unsafe { attach_region(rx_free_region.as_ptr()) };
+    // SAFETY: as above, for the transmit pipeline's forwarder region.
+    let tx_rings: &ForwardRings = unsafe { attach_region(tx_rings_region.as_ptr()) };
+    // SAFETY: as above, for the transmit pipeline's return region.
+    let tx_free: &ReturnRing = unsafe { attach_region(tx_free_region.as_ptr()) };
+    // SAFETY: as above, for the one pool a driver PD maps.
+    let tx_pool: &Pool = unsafe { attach_region(tx_pool_region.as_ptr()) };
 
     let rx_vq_region = DmaRegion::zeroed();
     let tx_vq_region = DmaRegion::zeroed();
@@ -301,25 +317,25 @@ pub fn driver_paths_harness(data: &[u8]) {
     // SAFETY: as above.
     let mut tx_device = unsafe { DeviceSide::new(tx_vq_region.as_ptr().cast::<u8>()) };
 
-    let mut pool = PoolOwner::attach(rx_pipe);
-    let mut receive = RxPath::<Q>::attach(rx_pipe, RX_PADDR);
-    let mut transmit = TxPath::<Q>::attach(tx_pipe, TX_PADDR);
+    let mut pool = PoolOwner::attach(rx_free);
+    let mut receive = RxPath::<Q>::attach(rx_rings, RX_POOL_PADDR);
+    let mut transmit = TxPath::<Q>::attach(tx_rings, tx_free, tx_pool, TX_POOL_PADDR);
     let mut counters = Counters::default();
 
     // The neighbouring domains, each taking exactly one handle.
-    let mut forwarder_takes_rx = rx_pipe.rx.consumer();
-    let mut far_driver_returns = rx_pipe.free.producer();
-    let mut forwarder_queues_tx = tx_pipe.tx.producer();
-    let mut far_owner_takes_free = tx_pipe.free.consumer();
+    let mut forwarder_takes_rx = rx_rings.rx.consumer();
+    let mut far_driver_returns = rx_free.free.producer();
+    let mut forwarder_queues_tx = tx_rings.tx.producer();
+    let mut far_owner_takes_free = tx_free.free.consumer();
 
-    let rx_ring_view = PeerView::<RING_SLOTS>::new(&rx_pipe.rx);
-    let rx_free_view = PeerView::<RING_SLOTS>::new(&rx_pipe.free);
-    let tx_ring_view = PeerView::<RING_SLOTS>::new(&tx_pipe.tx);
-    let tx_free_view = PeerView::<RING_SLOTS>::new(&tx_pipe.free);
+    let rx_ring_view = PeerView::<RING_SLOTS>::new(&rx_rings.rx);
+    let rx_free_view = PeerView::<RING_SLOTS>::new(&rx_free.free);
+    let tx_ring_view = PeerView::<RING_SLOTS>::new(&tx_rings.tx);
+    let tx_free_view = PeerView::<RING_SLOTS>::new(&tx_free.free);
 
-    let rx_pool_base = Pipeline::pool_paddr(RX_PADDR);
+    let rx_pool_base = RX_POOL_PADDR;
     let rx_pool_end = rx_pool_base + (POOL_BUFFERS * BUFFER_SIZE) as u64;
-    let tx_pool_base = Pipeline::pool_paddr(TX_PADDR);
+    let tx_pool_base = TX_POOL_PADDR;
     let tx_pool_end = tx_pool_base + (POOL_BUFFERS * BUFFER_SIZE) as u64;
 
     // Which receive-pool buffers this driver has handed to the forwarder and

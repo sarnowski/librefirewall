@@ -2,15 +2,15 @@
 //! memory regions a protection domain is handed at boot.
 //!
 //! Every region a harness drives is one seL4 maps and zeroes before a domain
-//! attaches: the `pd_runtime::Pipeline` shared with two peer domains, a
-//! virtqueue's DMA region, and a PCI function's ECAM page. A harness must
-//! reproduce both properties exactly, because both are *preconditions* of the
-//! `unsafe` constructors under test (`Pipeline::attach`, `SplitVirtqueue::new`,
+//! attaches: `pd_runtime`'s three pipeline regions, a virtqueue's DMA region,
+//! and a PCI function's ECAM page. A harness must reproduce both properties
+//! exactly, because both are *preconditions* of the `unsafe` constructors under
+//! test (`attach_region`, `SplitVirtqueue::new`,
 //! `PciConfig::new`). A harness that violated one would be reporting undefined
 //! behaviour of its own making as a finding in the crate — which is how a fuzz
 //! target comes to be trusted while proving nothing.
 //!
-//! Heap rather than stack for two reasons. A `Pipeline` is ~132 KiB, which a
+//! Heap rather than stack for two reasons. A `Pool` is 128 KiB, which a
 //! libFuzzer worker's stack does not comfortably hold under AddressSanitizer;
 //! and `alloc_zeroed` honours the `Layout`'s alignment for any type, whereas a
 //! stack local of an over-aligned `#[repr(align(4096))]` type relies on the

@@ -34,7 +34,7 @@
 //! (the forwarder) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
 //! must not do is reintroduce an unbounded loop between them.
 
-use pd_runtime::{Pipeline, PoolOwner};
+use pd_runtime::{ForwardRings, Pool, PoolOwner, ReturnRing};
 
 use crate::bringup::{DriverVirtqueue, Live, QUEUE_SIZE, VirtioDevice};
 use crate::{Counters, DriverStats, RxPath, TxPath};
@@ -70,6 +70,35 @@ impl PollOutcome {
     }
 }
 
+/// The regions of the pipeline a port receives *into*, whose pool it owns.
+///
+/// There is no `&Pool` field, and its absence *is* the grant: this direction
+/// hands buffer addresses to its NIC and never dereferences one, so the domain
+/// maps no part of that pool and holds only its physical base.
+///
+/// A struct rather than loose arguments because [`TransmitSide`] carries the
+/// same shapes in the same order; being a distinct type is what makes passing
+/// the two the wrong way round a compile error.
+pub struct ReceiveSide<'ring> {
+    /// Shared with the forwarder; this port produces on `rx`.
+    pub rings: &'ring ForwardRings,
+    /// Where the transmitting driver hands buffers back; consumed here.
+    pub returns: &'ring ReturnRing,
+    pub pool_paddr: u64,
+}
+
+/// The regions of the pipeline a port transmits *out of*, whose pool belongs to
+/// the peer driver and is mapped here: writing the virtio-net header in front
+/// of a frame is the only production dereference of pool bytes in the system.
+pub struct TransmitSide<'ring> {
+    /// Shared with the forwarder; this port consumes `tx`.
+    pub rings: &'ring ForwardRings,
+    /// Where this port hands buffers back to their owner.
+    pub returns: &'ring ReturnRing,
+    pub pool: &'ring Pool,
+    pub pool_paddr: u64,
+}
+
 /// One dataplane port's steady state.
 ///
 /// The port owns its virtqueues rather than borrowing them per call: a
@@ -77,24 +106,17 @@ impl PollOutcome {
 /// descriptors are free, which are published, and what length each was posted
 /// with — so a second view of the same ring would hand out descriptors the
 /// first still considers the device's.
-pub struct DataplanePort<'pipe> {
+pub struct DataplanePort<'ring> {
     receive_queue: DriverVirtqueue,
     transmit_queue: DriverVirtqueue,
-    pool: PoolOwner<'pipe>,
-    receive: RxPath<'pipe, QUEUE_SIZE>,
-    transmit: TxPath<'pipe, QUEUE_SIZE>,
+    pool: PoolOwner<'ring>,
+    receive: RxPath<'ring, QUEUE_SIZE>,
+    transmit: TxPath<'ring, QUEUE_SIZE>,
     counters: Counters,
 }
 
-impl<'pipe> DataplanePort<'pipe> {
+impl<'ring> DataplanePort<'ring> {
     /// Take every handle this port needs and move both virtqueues in.
-    ///
-    /// `receive_pipeline` is the pipeline this port receives *into* — its pool
-    /// is this NIC's receive DMA target and this port owns that pool — and
-    /// `transmit_pipeline` the one it transmits *out of*, whose pool belongs to
-    /// the peer driver. Each `_paddr` is the physical address of the region the
-    /// matching reference maps, which is what turns a pool index into a DMA
-    /// address.
     ///
     /// **Unenforced precondition (DOC-7):** call once per protection domain.
     /// Every handle taken here is this domain's own position in a ring, so a
@@ -104,19 +126,22 @@ impl<'pipe> DataplanePort<'pipe> {
     /// it as unenforced rather than as checked elsewhere.
     #[must_use]
     pub fn attach(
-        receive_pipeline: &'pipe Pipeline,
-        receive_pipeline_paddr: u64,
-        transmit_pipeline: &'pipe Pipeline,
-        transmit_pipeline_paddr: u64,
+        receive: ReceiveSide<'ring>,
+        transmit: TransmitSide<'ring>,
         receive_queue: DriverVirtqueue,
         transmit_queue: DriverVirtqueue,
     ) -> Self {
         Self {
             receive_queue,
             transmit_queue,
-            pool: PoolOwner::attach(receive_pipeline),
-            receive: RxPath::attach(receive_pipeline, receive_pipeline_paddr),
-            transmit: TxPath::attach(transmit_pipeline, transmit_pipeline_paddr),
+            pool: PoolOwner::attach(receive.returns),
+            receive: RxPath::attach(receive.rings, receive.pool_paddr),
+            transmit: TxPath::attach(
+                transmit.rings,
+                transmit.returns,
+                transmit.pool,
+                transmit.pool_paddr,
+            ),
             counters: Counters::default(),
         }
     }
@@ -265,8 +290,8 @@ mod tests {
     /// One dataplane port with both virtqueues over real regions, a live fake
     /// device, the peer handles on both pipelines, and the shared log.
     ///
-    /// The pipelines are leaked so the port's handles borrow them for
-    /// `'static`, exactly as a protection domain's mapped region does. Every
+    /// Every pipeline region is leaked so the port's handles borrow it for
+    /// `'static`, exactly as a protection domain's mapped regions do. Every
     /// peer handle is taken once here for the fixture's life: a fresh handle
     /// per assertion would restart at slot zero and re-walk slots already used.
     struct PortFixture {
@@ -302,8 +327,16 @@ mod tests {
                 .configure_queues(0x3000_0000)
                 .expect("a conforming device takes both queues");
 
-            let receive_pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
-            let transmit_pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
+            // The receive pipeline: this port owns its pool, and — as under
+            // seL4 — takes only that pool's address, never a reference to it.
+            let receive_pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+            let receive_rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
+            let receive_returns: &'static ReturnRing = Box::leak(Box::new(ReturnRing::new()));
+            // The transmit pipeline, whose pool belongs to the peer driver and
+            // is mapped here for the header write alone.
+            let transmit_pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+            let transmit_rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
+            let transmit_returns: &'static ReturnRing = Box::leak(Box::new(ReturnRing::new()));
             let receive_region = VqRegion::zeroed();
             let transmit_region = VqRegion::zeroed();
             // SAFETY: `VqRegion::zeroed` allocates a 16-byte-aligned, zeroed
@@ -314,13 +347,20 @@ mod tests {
             // SAFETY: as above, over the second, disjoint region.
             let transmit_queue = unsafe { DriverVirtqueue::new(transmit_region.base()) };
 
-            // The pipelines' real host addresses stand in for their physical
-            // ones, so a buffer address the port derives resolves to real bytes.
+            // Each pool region's real host address stands in for its physical
+            // one, so a buffer address the port derives resolves to real bytes.
             let mut port = DataplanePort::attach(
-                receive_pipeline,
-                core::ptr::from_ref(receive_pipeline) as u64,
-                transmit_pipeline,
-                core::ptr::from_ref(transmit_pipeline) as u64,
+                ReceiveSide {
+                    rings: receive_rings,
+                    returns: receive_returns,
+                    pool_paddr: core::ptr::from_ref(receive_pool) as u64,
+                },
+                TransmitSide {
+                    rings: transmit_rings,
+                    returns: transmit_returns,
+                    pool: transmit_pool,
+                    pool_paddr: core::ptr::from_ref(transmit_pool) as u64,
+                },
                 receive_queue,
                 transmit_queue,
             );
@@ -333,9 +373,9 @@ mod tests {
                 device: configured.go_live(),
                 forwarder: RecordingForwarder { log: log.clone() },
                 log,
-                forwarded: receive_pipeline.rx.consumer(),
-                returns: receive_pipeline.free.producer(),
-                peer: transmit_pipeline.tx.producer(),
+                forwarded: receive_rings.rx.consumer(),
+                returns: receive_returns.free.producer(),
+                peer: transmit_rings.tx.producer(),
                 receive_used_idx: 0,
             }
         }

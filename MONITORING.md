@@ -83,10 +83,11 @@ integer fields read in **decimal**, including PCI vendor and device ids. It has 
 - `error=Device(<BringUpError>)` — the device refused bring-up, or build data programmed into it was
   rejected. The inner variant names the fault and carries the value that caused it, e.g.
   `error=Device(NotVirtioNet { vendor: …, device: … })`.
-- `error=PipelineDmaBaseUnusable { region: Receive|Transmit, paddr: <n> }` — the pipeline DMA base
+- `error=PoolDmaBaseUnusable { region: Receive|Transmit, paddr: <n> }` — the buffer-pool DMA base
   the build patched in cannot be used: `paddr: 0` means the region's `setvar` is missing or
   misspelled in the system description, any other value means it is misaligned or would place the
-  region off the end of the address space. This shape is always `signalled=false`.
+  region off the end of the address space. `region` says which of the port's two pools it was.
+  This shape is always `signalled=false`.
 
 `signalled` says whether the device was told to stop (`STATUS_FAILED` written) or was left decoding
 nothing, which depends on whether its BAR had been placed when the rejection happened.

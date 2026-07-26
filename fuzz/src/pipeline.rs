@@ -2,19 +2,26 @@
 //!
 //! # The adversary and the surface
 //!
-//! `Pipeline` is the inter-PD protocol itself, so this is where "what one
+//! `pd_runtime` is the inter-PD protocol itself, so this is where "what one
 //! protection domain must withstand from another" is defined (CONCEPT §7.1).
-//! Every neighbour maps the whole region read-write — both cursors of all three
-//! rings, every slot, and the pool bytes — and the two mechanisms that stop
-//! that from becoming a double-owned buffer are `PoolOwner`'s *lent* set and
-//! `packet_buffer`'s ledger beneath it.
+//! The peer this harness plays is the transmitting driver, which maps every
+//! region under test read-write — both cursors of all three rings, every slot,
+//! and the pool bytes — and the two mechanisms that stop that from becoming a
+//! double-owned buffer are `PoolOwner`'s *lent* set and `packet_buffer`'s
+//! ledger beneath it.
+//!
+//! The forwarder is granted strictly less than this harness gives its peer: it
+//! maps `ForwardRings` alone. That is a property of the system description, not
+//! of `pd_runtime`, so this harness keeps modelling the *widest* peer any
+//! region has — narrowing it to what one domain happens to map would delete
+//! adversary authority the protocol must still withstand (TEST-8).
 //!
 //! The worst outcome this guards is not a crash. It is a forged index reaching
 //! the free stack, being handed back out by `alloc`, and turned into a physical
-//! address by `Pipeline::buffer_paddr` — a DMA target **outside the shared
-//! region**, which with no IOMMU is an arbitrary physical-memory write. This
-//! harness asserts the containment of that address explicitly rather than
-//! inferring it from the absence of a crash.
+//! address by `buffer_paddr` — a DMA target **outside the pool region**, which
+//! with no IOMMU is an arbitrary physical-memory write. This harness asserts
+//! the containment of that address explicitly rather than inferring it from the
+//! absence of a crash.
 //!
 //! # Roles
 //!
@@ -63,17 +70,17 @@ use std::collections::BTreeSet;
 use arbitrary::Unstructured;
 use packet_buffer::CopyOutError;
 use pd_runtime::{
-    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardStage, OwnedBuffer, POOL_BUFFERS, Pipeline,
-    PoolOwner, RING_SLOTS, descriptor_in_bounds,
+    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, ForwardStage, OwnedBuffer, POOL_BUFFERS,
+    Pool, PoolOwner, RING_SLOTS, ReturnRing, attach_region, buffer_paddr, descriptor_in_bounds,
 };
 
 use crate::region::ZeroedRegion;
 use crate::ring_abi::PeerView;
 use crate::{MAX_OPERATIONS, any_index, any_u32, next_op};
 
-/// Physical address the region is mapped at. Page-aligned, as Microkit
-/// guarantees, because `Pipeline`'s own alignment argument rests on it.
-const REGION_PADDR: u64 = 0x3100_0000;
+/// Physical address the pool region is mapped at. Page-aligned, as Microkit
+/// guarantees, because the pool's own DMA-alignment argument rests on it.
+const POOL_PADDR: u64 = 0x3100_0000;
 
 /// One descriptor whose three fields the peer chose freely.
 fn any_descriptor(unstructured: &mut Unstructured<'_>) -> Descriptor {
@@ -88,24 +95,35 @@ fn any_descriptor(unstructured: &mut Unstructured<'_>) -> Descriptor {
 /// that owns the `free` ring and every shared word in the region.
 pub fn pipeline_harness(data: &[u8]) {
     let mut unstructured = Unstructured::new(data);
-    let region = ZeroedRegion::<Pipeline>::new();
-    // SAFETY: `region` is a live, zeroed allocation of exactly one `Pipeline`,
-    // aligned to `align_of::<Pipeline>()` by `Layout::new`, and it outlives
-    // every handle taken below — `Pipeline::attach`'s contract in full. No
-    // `&mut Pipeline` is ever created to it: the borrow returned here is shared,
-    // and every mutation goes through an atomic or an `UnsafeCell` accessor.
-    let pipeline: &Pipeline = unsafe { Pipeline::attach(region.as_ptr()) };
+    // The three regions a pipeline is granted as, separately allocated exactly
+    // as Microkit maps them: nothing here places them adjacently, so a harness
+    // that accidentally reached past one region's end would fault rather than
+    // land in another.
+    let pool_region = ZeroedRegion::<Pool>::new();
+    let rings_region = ZeroedRegion::<ForwardRings>::new();
+    let returns_region = ZeroedRegion::<ReturnRing>::new();
+    // SAFETY: each is a live, zeroed allocation of exactly its region type,
+    // aligned by `Layout::new`, outliving every handle taken below, and `Sync`
+    // with no safe path to its bytes — `attach_region`'s contract in full. No
+    // `&mut` is ever created to any of them: the borrows returned here are
+    // shared, and every mutation goes through an atomic or an `UnsafeCell`
+    // accessor.
+    let pool: &Pool = unsafe { attach_region(pool_region.as_ptr()) };
+    // SAFETY: as above, for the forwarder's region.
+    let rings: &ForwardRings = unsafe { attach_region(rings_region.as_ptr()) };
+    // SAFETY: as above, for the return region.
+    let returns: &ReturnRing = unsafe { attach_region(returns_region.as_ptr()) };
 
-    let mut owner = PoolOwner::attach(pipeline);
-    let mut rx_producer = pipeline.rx.producer();
-    let mut stage = ForwardStage::attach(pipeline);
-    let mut peer_free = pipeline.free.producer();
-    let mut peer_tx = pipeline.tx.consumer();
-    let rx_view = PeerView::<RING_SLOTS>::new(&pipeline.rx);
-    let tx_view = PeerView::<RING_SLOTS>::new(&pipeline.tx);
-    let free_view = PeerView::<RING_SLOTS>::new(&pipeline.free);
+    let mut owner = PoolOwner::attach(returns);
+    let mut rx_producer = rings.rx.producer();
+    let mut stage = ForwardStage::attach(rings);
+    let mut peer_free = returns.free.producer();
+    let mut peer_tx = rings.tx.consumer();
+    let rx_view = PeerView::<RING_SLOTS>::new(&rings.rx);
+    let tx_view = PeerView::<RING_SLOTS>::new(&rings.tx);
+    let free_view = PeerView::<RING_SLOTS>::new(&returns.free);
 
-    let pool_base = Pipeline::pool_paddr(REGION_PADDR);
+    let pool_base = POOL_PADDR;
     let pool_end = pool_base + (POOL_BUFFERS * BUFFER_SIZE) as u64;
 
     let mut held: Vec<OwnedBuffer> = Vec::new();
@@ -132,7 +150,7 @@ pub fn pipeline_harness(data: &[u8]) {
                         !holding[index as usize],
                         "alloc handed out index {index} while this domain already held it"
                     );
-                    let paddr = Pipeline::buffer_paddr(REGION_PADDR, index);
+                    let paddr = buffer_paddr(POOL_PADDR, index);
                     assert!(
                         paddr >= pool_base && paddr + BUFFER_SIZE as u64 <= pool_end,
                         "buffer {index} resolves to {paddr:#x}, outside the pool \
@@ -239,7 +257,7 @@ pub fn pipeline_harness(data: &[u8]) {
                     // out-of-bounds span too — which is what lets it be made
                     // unconditionally, as the assertion requires.
                     let snapshot = unsafe {
-                        pipeline.pool.copy_out(
+                        pool.copy_out(
                             descriptor.buffer as usize,
                             descriptor.offset as usize,
                             descriptor.len,
@@ -335,7 +353,7 @@ pub fn pipeline_harness(data: &[u8]) {
             (index as usize) < POOL_BUFFERS,
             "the ledger held index {index}"
         );
-        let paddr = Pipeline::buffer_paddr(REGION_PADDR, index);
+        let paddr = buffer_paddr(POOL_PADDR, index);
         assert!(paddr >= pool_base && paddr + BUFFER_SIZE as u64 <= pool_end);
         assert!(drained.insert(index), "index {index} was free twice");
     }

@@ -53,8 +53,8 @@ pub mod port;
 mod fake_device;
 
 use pd_runtime::{
-    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, OwnedBuffer, POOL_BUFFERS, Pipeline, Pool, PoolOwner,
-    RING_SLOTS, RingConsumer, RingProducer, descriptor_in_bounds,
+    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS, Pool, PoolOwner,
+    RING_SLOTS, ReturnRing, RingConsumer, RingProducer, buffer_paddr, descriptor_in_bounds,
 };
 use virtio::net::VirtioNetHdr;
 use virtio::queue::{DeviceFaults, SplitVirtqueue};
@@ -172,18 +172,20 @@ fn bump(counter: &mut u64) {
 /// `Option`, so single ownership stays compiler-checkable while the buffer is
 /// inside this domain: the `take()` on completion moves it out, and the frame
 /// cannot be handed onward twice even by a coding error here.
-pub struct RxPath<'pipe, const Q: usize> {
+pub struct RxPath<'ring, const Q: usize> {
     /// The buffer handed to the device in each descriptor slot.
     posted: [Option<OwnedBuffer>; Q],
-    rx: RingProducer<'pipe, RING_SLOTS>,
-    /// Physical address of the receive pipeline region, for deriving each
-    /// posted buffer's DMA address.
-    pipe_paddr: u64,
+    rx: RingProducer<'ring, RING_SLOTS>,
+    /// Physical address of the pool region this NIC receives into, for deriving
+    /// each posted buffer's DMA address. An address and no reference, because
+    /// this path hands buffers to the device and never reads one: the domain is
+    /// granted that pool's physical address with no mapping at all.
+    pool_paddr: u64,
 }
 
-impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
-    /// Take the receive pipeline's `rx` producer handle. `rx_pipe_paddr` is the
-    /// physical address of the same region `rx_pipe` maps.
+impl<'ring, const Q: usize> RxPath<'ring, Q> {
+    /// Take the receive pipeline's `rx` producer handle. `pool_paddr` is the
+    /// physical base of the pool this NIC receives into.
     ///
     /// **Unenforced precondition (DOC-7):** call once per protection domain.
     /// The handle is this domain's publish position, so a second path over the
@@ -192,11 +194,11 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
     /// states that single-handle rule and why nothing enforces it. Treat it as
     /// unenforced rather than as checked elsewhere.
     #[must_use]
-    pub fn attach(rx_pipe: &'pipe Pipeline, rx_pipe_paddr: u64) -> Self {
+    pub fn attach(rings: &'ring ForwardRings, pool_paddr: u64) -> Self {
         Self {
             posted: [const { None }; Q],
-            rx: rx_pipe.rx.producer(),
-            pipe_paddr: rx_pipe_paddr,
+            rx: rings.rx.producer(),
+            pool_paddr,
         }
     }
 
@@ -218,7 +220,7 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
             // The index came from this pipeline's own ledger, so it is a real
             // pool index and the address it yields stays inside the region —
             // the property that keeps a DMA target where it belongs.
-            let paddr = Pipeline::buffer_paddr(self.pipe_paddr, buffer.index());
+            let paddr = buffer_paddr(self.pool_paddr, buffer.index());
             match rx.add_writable(paddr, BUFFER_SIZE as u32) {
                 Some(head) => {
                     let slot = head as usize;
@@ -309,7 +311,7 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
 /// in-flight set is indexed by *pool buffer* rather than by virtqueue slot, and
 /// guards the peer boundary alone: whether this driver already holds the buffer
 /// a new descriptor names.
-pub struct TxPath<'pipe, const Q: usize> {
+pub struct TxPath<'ring, const Q: usize> {
     /// The peer descriptor handed to the device in each descriptor slot.
     posted: [Option<Descriptor>; Q],
     /// Which pool buffers this driver has at the device right now. A second
@@ -317,20 +319,21 @@ pub struct TxPath<'pipe, const Q: usize> {
     /// virtqueue entries on one buffer and produce two returns for a buffer
     /// that was lent once.
     in_flight: [bool; POOL_BUFFERS],
-    tx: RingConsumer<'pipe, RING_SLOTS>,
-    free: RingProducer<'pipe, RING_SLOTS>,
+    tx: RingConsumer<'ring, RING_SLOTS>,
+    free: RingProducer<'ring, RING_SLOTS>,
     /// The pool the descriptors index, for writing the virtio-net header in
-    /// place. Borrowed from the same region as the handles above.
-    pool: &'pipe Pool,
-    /// Physical address of the transmit pipeline region, for deriving each
-    /// buffer's DMA address.
-    pipe_paddr: u64,
+    /// place. This direction is the only one that dereferences a pool byte, and
+    /// so the only one whose domain maps the region at all.
+    pool: &'ring Pool,
+    /// Physical address of that pool's region, for deriving each buffer's DMA
+    /// address.
+    pool_paddr: u64,
 }
 
-impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
+impl<'ring, const Q: usize> TxPath<'ring, Q> {
     /// Take the transmit pipeline's `tx` consumer and `free` producer handles.
-    /// `tx_pipe_paddr` is the physical address of the same region `tx_pipe`
-    /// maps.
+    /// `pool` and `pool_paddr` are the mapped pool this NIC transmits out of
+    /// and the physical base of that same region.
     ///
     /// **Unenforced precondition (DOC-7):** call once per protection domain. A
     /// second path over the same pipeline re-consumes frames the first has
@@ -339,14 +342,19 @@ impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
     /// single-handle rule and why nothing enforces it. Treat it as unenforced
     /// rather than as checked elsewhere.
     #[must_use]
-    pub fn attach(tx_pipe: &'pipe Pipeline, tx_pipe_paddr: u64) -> Self {
+    pub fn attach(
+        rings: &'ring ForwardRings,
+        returns: &'ring ReturnRing,
+        pool: &'ring Pool,
+        pool_paddr: u64,
+    ) -> Self {
         Self {
             posted: [None; Q],
             in_flight: [false; POOL_BUFFERS],
-            tx: tx_pipe.tx.consumer(),
-            free: tx_pipe.free.producer(),
-            pool: &tx_pipe.pool,
-            pipe_paddr: tx_pipe_paddr,
+            tx: rings.tx.consumer(),
+            free: returns.free.producer(),
+            pool,
+            pool_paddr,
         }
     }
 
@@ -437,8 +445,7 @@ impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
                     &VirtioNetHdr::TX_NO_OFFLOAD,
                 );
             }
-            let paddr =
-                Pipeline::buffer_paddr(self.pipe_paddr, descriptor.buffer) + header_offset as u64;
+            let paddr = buffer_paddr(self.pool_paddr, descriptor.buffer) + header_offset as u64;
             // A first-party invariant, not device or peer input, so it fails
             // visibly rather than being counted (ENG-5). The guarantor is
             // `virtio::queue::SplitVirtqueue::add` — the single body behind
@@ -662,15 +669,16 @@ mod tests {
     }
 
     /// One receive virtqueue over a fresh region, plus the device on its far
-    /// side and the pipeline it feeds. The pipeline is leaked so the ring
-    /// handles the paths hold can borrow it for `'static`, exactly as a
-    /// protection domain's mapped region does.
+    /// side and the pipeline regions it feeds. Each region is leaked so the
+    /// ring handles the paths hold can borrow it for `'static`, exactly as a
+    /// protection domain's mapped regions do.
     struct RxFixture {
-        pipeline: &'static Pipeline,
+        pool: &'static Pool,
+        rings: &'static ForwardRings,
         _region: Box<VqRegion>,
         vq: Vq,
         device: FakeDevice,
-        pool: PoolOwner<'static>,
+        owner: PoolOwner<'static>,
         rx: RxPath<'static, Q>,
         /// The forwarder's end of the `rx` ring, taken once for the fixture's
         /// life — a fresh handle per assertion would restart at slot zero and
@@ -681,7 +689,9 @@ mod tests {
 
     impl RxFixture {
         fn new() -> Self {
-            let pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
+            let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+            let rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
+            let returns: &'static ReturnRing = Box::leak(Box::new(ReturnRing::new()));
             let mut region = VqRegion::boxed();
             let ptr = region.0.as_mut_ptr();
             // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned
@@ -689,23 +699,25 @@ mod tests {
             let vq = unsafe { Vq::new(ptr) };
             let device = FakeDevice::new(ptr);
             // The device writes to the descriptor address as a real pointer, so
-            // the "physical" region base is the pipeline's actual host address.
-            let region_paddr = core::ptr::from_ref(pipeline) as u64;
+            // the "physical" pool base is that region's actual host address —
+            // the pool being the whole of its region, with no offset to add.
+            let pool_paddr = core::ptr::from_ref(pool) as u64;
             Self {
-                pipeline,
+                pool,
+                rings,
                 _region: region,
                 vq,
                 device,
-                pool: PoolOwner::attach(pipeline),
-                rx: RxPath::attach(pipeline, region_paddr),
-                forwarder: pipeline.rx.consumer(),
+                owner: PoolOwner::attach(returns),
+                rx: RxPath::attach(rings, pool_paddr),
+                forwarder: rings.rx.consumer(),
                 counters: Counters::default(),
             }
         }
 
         fn refill(&mut self) -> bool {
             self.rx
-                .refill(&mut self.vq, &mut self.pool, &mut self.counters)
+                .refill(&mut self.vq, &mut self.owner, &mut self.counters)
         }
 
         /// What the receive virtqueue refused from the device, which is where
@@ -716,7 +728,7 @@ mod tests {
 
         fn drain(&mut self) -> bool {
             self.rx
-                .drain(&mut self.vq, &mut self.pool, &mut self.counters)
+                .drain(&mut self.vq, &mut self.owner, &mut self.counters)
         }
 
         /// What the forwarder sees next on the `rx` ring.
@@ -728,7 +740,9 @@ mod tests {
     /// One transmit virtqueue over a fresh region, plus the device on its far
     /// side and the pipeline it drains.
     struct TxFixture {
-        pipeline: &'static Pipeline,
+        pool: &'static Pool,
+        rings: &'static ForwardRings,
+        free: &'static ReturnRing,
         _region: Box<VqRegion>,
         vq: Vq,
         device: FakeDevice,
@@ -743,25 +757,29 @@ mod tests {
 
     impl TxFixture {
         fn new() -> Self {
-            let pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
+            let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+            let rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
+            let free: &'static ReturnRing = Box::leak(Box::new(ReturnRing::new()));
             let mut region = VqRegion::boxed();
             let ptr = region.0.as_mut_ptr();
             // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned
             // solely by this test — `Vq::new`'s contract.
             let vq = unsafe { Vq::new(ptr) };
             let device = FakeDevice::new(ptr);
-            // `post` derives buffer addresses from the region base via
-            // `Pipeline::buffer_paddr`, so the base is the pipeline's real host
-            // address and the pool then resolves to its real bytes.
-            let pipe_paddr = core::ptr::from_ref(pipeline) as u64;
+            // `post` derives buffer addresses from the pool region's base via
+            // `buffer_paddr`, so the base is that region's real host address and
+            // every buffer then resolves to its real bytes.
+            let pool_paddr = core::ptr::from_ref(pool) as u64;
             Self {
-                pipeline,
+                pool,
+                rings,
+                free,
                 _region: region,
                 vq,
                 device,
-                tx: TxPath::attach(pipeline, pipe_paddr),
-                forwarder: pipeline.tx.producer(),
-                returns: pipeline.free.consumer(),
+                tx: TxPath::attach(rings, free, pool, pool_paddr),
+                forwarder: rings.tx.producer(),
+                returns: free.free.consumer(),
                 counters: Counters::default(),
             }
         }
@@ -800,14 +818,12 @@ mod tests {
             // SAFETY: single-threaded test; the buffer is not otherwise in use,
             // and both spans lie within it.
             unsafe {
-                self.pipeline.pool.write_at(
+                self.pool.write_at(
                     buffer as usize,
                     offset - VirtioNetHdr::LEN,
                     &[0xFFu8; VirtioNetHdr::LEN],
                 );
-                self.pipeline
-                    .pool
-                    .write_at(buffer as usize, offset, payload);
+                self.pool.write_at(buffer as usize, offset, payload);
             }
             self.queue(Descriptor::new(buffer, offset as u32, payload.len() as u32));
         }
@@ -820,7 +836,7 @@ mod tests {
         // The queue holds Q descriptors, the pool 64 buffers, so the queue is
         // the limit: Q posted, the rest still owned.
         assert_eq!(fx.vq.free_count(), 0);
-        assert_eq!(fx.pool.owned(), POOL_BUFFERS - Q);
+        assert_eq!(fx.owner.owned(), POOL_BUFFERS - Q);
     }
 
     #[test]
@@ -828,11 +844,11 @@ mod tests {
         let mut fx = RxFixture::new();
         // Leave the owner holding fewer buffers than the queue can hold.
         let mut held = Vec::new();
-        while fx.pool.owned() > 4 {
-            held.push(fx.pool.alloc().unwrap());
+        while fx.owner.owned() > 4 {
+            held.push(fx.owner.alloc().unwrap());
         }
         assert!(fx.refill());
-        assert_eq!(fx.pool.owned(), 0);
+        assert_eq!(fx.owner.owned(), 0);
         // Only four descriptors were consumed; the rest of the queue is free.
         assert_eq!(fx.vq.free_count(), Q - 4);
     }
@@ -856,7 +872,7 @@ mod tests {
         // span was published by the code under test. The bytes are snapshotted
         // into this test's own `storage`, so nothing borrows the pool.
         let bytes = unsafe {
-            fx.pipeline.pool.copy_out(
+            fx.pool.copy_out(
                 descriptor.buffer as usize,
                 descriptor.offset as usize,
                 descriptor.len,
@@ -948,7 +964,7 @@ mod tests {
     fn a_runt_frame_is_dropped_and_counted() {
         let mut fx = RxFixture::new();
         fx.refill();
-        let owned_before = fx.pool.owned();
+        let owned_before = fx.owner.owned();
         let free_before = fx.vq.free_count();
         // Nothing past the 12-byte header.
         fx.device
@@ -958,7 +974,7 @@ mod tests {
         assert_eq!(fx.counters.input.rx_runt_dropped, 1);
         assert!(fx.forwarded().is_none());
         // The buffer was released back and the descriptor recycled.
-        assert_eq!(fx.pool.owned(), owned_before + 1);
+        assert_eq!(fx.owner.owned(), owned_before + 1);
         assert_eq!(fx.vq.free_count(), free_before + 1);
     }
 
@@ -970,10 +986,10 @@ mod tests {
         // ring looks full to this side and every hand-off is refused. Filling
         // the ring with a second producer handle would prove nothing — that
         // handle would have its own position and never meet the path's.
-        forge_cursors(&fx.pipeline.rx, 1, 0);
+        forge_cursors(&fx.rings.rx, 1, 0);
 
         fx.refill();
-        let owned_before = fx.pool.owned();
+        let owned_before = fx.owner.owned();
         let free_before = fx.vq.free_count();
         let frame = std::vec![0u8; VirtioNetHdr::LEN + 8];
         fx.device.deliver(&frame, frame.len() as u32);
@@ -993,7 +1009,7 @@ mod tests {
             }
         );
         // The buffer came back to the owner and the descriptor was recycled.
-        assert_eq!(fx.pool.owned(), owned_before + 1);
+        assert_eq!(fx.owner.owned(), owned_before + 1);
         assert_eq!(fx.vq.free_count(), free_before + 1);
     }
 
@@ -1157,7 +1173,7 @@ mod tests {
         // malformed-but-in-range descriptors than the free ring can hold, every
         // one takes the return path, and the ring fills.
         let mut fx = TxFixture::new();
-        let capacity = fx.pipeline.free.capacity();
+        let capacity = fx.free.free.capacity();
         // In bounds, but no header room, so each is rejected *and* returned.
         let bad = Descriptor::new(1, 0, 8);
 
@@ -1206,7 +1222,7 @@ mod tests {
         // that keeps publishing does.
         let mut fx = TxFixture::new();
         for round in 0..6u32 {
-            forge_cursors(&fx.pipeline.tx, 0, round.wrapping_mul(31).wrapping_add(7));
+            forge_cursors(&fx.rings.tx, 0, round.wrapping_mul(31).wrapping_add(7));
             assert!(!fx.post());
         }
         // Bounded per call: never more than DRAIN_LIMIT rejections in a round.
@@ -1264,7 +1280,7 @@ mod tests {
         stray.post_and_complete(0x1000, (VirtioNetHdr::LEN + 8) as u32);
 
         // The path has posted nothing, so every slot of its map is empty.
-        assert!(!fx.rx.drain(&mut stray.vq, &mut fx.pool, &mut fx.counters));
+        assert!(!fx.rx.drain(&mut stray.vq, &mut fx.owner, &mut fx.counters));
         assert_eq!(fx.counters.invariant.rx_completion_unmapped, 1);
         assert_eq!(fx.counters.input, InputDrops::default());
         assert!(fx.forwarded().is_none(), "no frame may be invented");
@@ -1298,14 +1314,14 @@ mod tests {
         // never returned to the pool, where it could be issued a second time.
         let mut fx = RxFixture::new();
         assert!(fx.refill());
-        let owned_after_first = fx.pool.owned();
+        let owned_after_first = fx.owner.owned();
         let mut stray = StrayQueue::new();
 
-        assert!(fx.rx.refill(&mut stray.vq, &mut fx.pool, &mut fx.counters));
+        assert!(fx.rx.refill(&mut stray.vq, &mut fx.owner, &mut fx.counters));
         assert_eq!(fx.counters.invariant.rx_slot_occupied, Q as u64);
         assert_eq!(fx.counters.input, InputDrops::default());
         // Q buffers were taken from the pool and Q leaked, none released back.
-        assert_eq!(fx.pool.owned(), owned_after_first - Q);
+        assert_eq!(fx.owner.owned(), owned_after_first - Q);
     }
 
     #[test]
@@ -1396,7 +1412,7 @@ mod tests {
                 forwarded += fx.forwarder.drain(DRAIN_LIMIT).count();
                 let posted = fx.rx.posted.iter().filter(|slot| slot.is_some()).count();
                 prop_assert!(
-                    posted + fx.pool.owned() <= POOL_BUFFERS,
+                    posted + fx.owner.owned() <= POOL_BUFFERS,
                     "a buffer is both posted to the device and free in the pool"
                 );
                 prop_assert!(fx.vq.free_count() <= Q);

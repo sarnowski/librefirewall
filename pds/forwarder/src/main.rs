@@ -2,43 +2,43 @@
 #![no_std]
 
 //! Forwarder protection domain — the software stage between the two NIC ports.
-//! Each direction is one [`Pipeline`]: pipeline 0 carries frames received on
-//! port 0 to port 1's transmitter, pipeline 1 the reverse. Forwarding moves
-//! descriptors from a pipeline's `rx` ring to its `tx` ring — ownership moves,
-//! bytes never do.
+//! Pipeline 0 carries frames received on port 0 to port 1's transmitter and
+//! pipeline 1 the reverse, moving descriptors from a pipeline's `rx` ring to
+//! its `tx`: ownership moves, bytes never do.
 //!
 //! # Adversary
 //!
 //! A byzantine neighbour PD (CONCEPT §7.1): every descriptor this domain reads
-//! was written into shared memory by one of the two NIC driver domains, and
-//! nothing about it is trusted.
+//! was written into shared memory by a NIC driver domain and is untrusted.
 //!
 //! # Constraints
 //!
-//! The ring handles are taken once at start-up and kept for the domain's life,
-//! because a handle *is* this domain's position in a ring: taking one per
-//! notification would restart at slot zero and re-deliver descriptors already
-//! forwarded.
+//! Two [`ForwardRings`] regions are the entire grant — no device capability,
+//! and of each pipeline only the two rings a descriptor crosses. The 128 KiB
+//! pool those descriptors index and the ring they return on are regions this
+//! domain holds no mapping for, so a compromised forwarder can neither corrupt
+//! a frame in flight nor forge a return; dropping, reordering and duplicating
+//! descriptors is what it keeps, and what neighbours survive.
 //!
-//! Microkit coalesces notifications and a wakeup does not say which port it
-//! came from, so both pipelines are drained unconditionally. The drivers poll
-//! their rings, so nothing is notified onward.
+//! Ring handles are taken once and kept for the domain's life, a handle being
+//! this domain's position: one per notification would restart at slot zero and
+//! re-deliver. Microkit coalesces notifications and a wakeup names no port, so
+//! both pipelines drain unconditionally; the drivers poll, so nothing is
+//! notified onward.
 
-use pd_runtime::{ForwardStage, Pipeline, attach_pipeline};
+use pd_runtime::{ForwardRings, ForwardStage, attach_region};
 use sel4_microkit::{ChannelSet, Handler, Infallible, debug_println, protection_domain};
 
 #[protection_domain]
 fn init() -> Forwarder {
-    let pipe0: &'static Pipeline = attach_pipeline!(pipe0_vaddr);
-    let pipe1: &'static Pipeline = attach_pipeline!(pipe1_vaddr);
+    let fwd0: &'static ForwardRings = attach_region!(fwd0_vaddr: ForwardRings);
+    let fwd1: &'static ForwardRings = attach_region!(fwd1_vaddr: ForwardRings);
     debug_println!("LIBREFIREWALL_FWD:start");
     Forwarder {
-        stages: [ForwardStage::attach(pipe0), ForwardStage::attach(pipe1)],
+        stages: [ForwardStage::attach(fwd0), ForwardStage::attach(fwd1)],
     }
 }
 
-/// The forwarder's steady state: one stage per direction. `'static` is a
-/// Microkit memory region's lifetime — mapped for the whole life of the system.
 struct Forwarder {
     stages: [ForwardStage<'static>; 2],
 }

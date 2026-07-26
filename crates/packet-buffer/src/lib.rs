@@ -49,14 +49,13 @@
 //! its buffers land in physical memory. The power-of-two stride buys only
 //! congruence: every buffer shares whatever alignment the pool's base has, up
 //! to [`BUFFER_SIZE`]. That base is a *placement* precondition discharged
-//! outside this crate — by the Microkit system description, which fixes the
-//! region's page-aligned physical address, and by `pd_runtime::Pipeline`, whose
-//! field order puts the pool at offset zero. Three build-time assertions in
-//! `crates/pd-runtime/src/lib.rs` hold that chain (`offset_of!(Pipeline, pool)
-//! == 0`, `POOL_OFFSET.is_multiple_of(BUFFER_SIZE)`,
-//! `MAPPING_ALIGN.is_multiple_of(BUFFER_SIZE)`), and its
-//! `the_pool_sits_at_the_front_so_every_buffer_inherits_the_region_alignment`
-//! test walks every index and checks the address a NIC would be handed.
+//! outside this crate: a pool is granted a whole Microkit memory region and so
+//! *is* that region, at the page-aligned physical address the system
+//! description fixes. No offset enters the chain — buffer `i` sits at the
+//! region base plus `i * BUFFER_SIZE` — so one build-time assertion in
+//! `crates/pd-runtime/src/lib.rs` holds the whole argument
+//! (`MAPPING_ALIGN.is_multiple_of(BUFFER_SIZE)`), and its
+//! `a_pool_region_gives_every_buffer_the_region_alignment` test walks it.
 //!
 //! What that yields is [`BUFFER_SIZE`] alignment and no more; a device needing
 //! more must have it enforced where the placement is decided.
