@@ -88,12 +88,12 @@ pub const RING_SLOTS: usize = 128;
 pub const DRAIN_LIMIT: usize = RING_SLOTS;
 
 /// Bytes the system description reserves per region
-/// (`systems/qemu-x86_64/librefirewall.system:85,86`). The assertions below
-/// fail the build if a region type outgrows this, so the Rust types can never
-/// exceed the declared mapping. The guarantee is one-directional: nothing here
-/// re-reads that XML, so shrinking it below this constant surfaces only at boot
-/// as a truncated mapping.
-pub const REGION_SIZE: usize = 0x40000;
+/// (`systems/qemu-x86_64/librefirewall.system:90,91`), derived rather than
+/// chosen: the fewest [`MAPPING_ALIGN`] pages that hold a [`Pipeline`]. As a
+/// literal it drifted to 1.93x the type, mapping bytes no field names into
+/// three domains. Nothing here re-reads that XML, so a smaller `size=` still
+/// surfaces only at boot, as a truncated mapping.
+pub const REGION_SIZE: usize = size_of::<Pipeline>().next_multiple_of(MAPPING_ALIGN);
 
 /// The granularity Microkit maps a memory region at, and so the alignment a
 /// [`Pipeline`]'s base address has. With the pool at the region's front it is
@@ -162,7 +162,13 @@ const _: () = {
     // only alignment in the region, and an upper-bound check can never fail, so
     // it could never catch the reorder or field-type change it exists to catch.
     assert!(align_of::<Pipeline>() == 4);
-    assert!(size_of::<Pipeline>() <= REGION_SIZE);
+    // The grant itself, pinned as tightly as the fields: `size=` in the system
+    // description is this literal, and the region exceeds the type by less than
+    // one page, so no unaddressed slack can return unnoticed.
+    assert!(size_of::<Pipeline>() == 0x21218);
+    assert!(REGION_SIZE == 0x22000);
+    assert!(REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
+    assert!(REGION_SIZE - size_of::<Pipeline>() < MAPPING_ALIGN);
 };
 
 // The DMA-alignment obligation `packet_buffer` names this type as the owner of:
@@ -266,8 +272,8 @@ impl Pipeline {
 ///
 /// Each pipeline region is mapped **read-write into three protection domains at
 /// once** — the forwarder, the driver receiving into it, and the driver
-/// transmitting out of it (`systems/qemu-x86_64/librefirewall.system:90,91,99,
-/// 100,112,113`) — and its pool is additionally a DMA target of both NICs.
+/// transmitting out of it (`systems/qemu-x86_64/librefirewall.system:95,96,
+/// 104,105,117,118`) — and its pool is additionally a DMA target of both NICs.
 /// Sharing it as `&Pipeline` is sound in the face of all that because
 /// `Pipeline` exposes no safe path to those bytes; whether the peers behave is
 /// the protocol question the crate header answers, not a soundness one.
@@ -282,20 +288,20 @@ macro_rules! attach_pipeline {
         //
         // * Address, page alignment, lifetime — the Microkit tool, which
         //   patches `$vaddr_symbol` from the `<map ... setvar_vaddr>` at
-        //   `systems/qemu-x86_64/librefirewall.system:90,91,99,100,112,113`,
+        //   `systems/qemu-x86_64/librefirewall.system:95,96,104,105,117,118`,
         //   maps at page granularity (far beyond this type's 4 bytes), and
         //   makes the mapping static, so it outlives the protection domain.
         // * Zero-initialisation — the seL4 kernel, which zeroes a frame
         //   retyped from a general-purpose untyped but not one retyped from a
         //   device untyped. Which it is follows from the region's `phys_addr`
-        //   lying inside RAM (`librefirewall.system:29-37,85,86`), and that
+        //   lying inside RAM (`librefirewall.system:29-37,90,91`), and that
         //   from QEMU's `-m 1G` (`tools/xtask/src/qemu.rs:245`). Nothing
         //   first-party re-checks it; a region outside RAM surfaces as unbacked
         //   reads at run time rather than as a build or boot error.
-        // * Minimum size — the `size="0x40000"` attribute at
-        //   `librefirewall.system:85,86`. The Rust side holds only
-        //   `size_of::<Pipeline>() <= REGION_SIZE` against its own constant and
-        //   never re-reads that XML, so the two move together or not at all.
+        // * Minimum size — the `size="0x22000"` attribute at
+        //   `librefirewall.system:90,91`, which must equal `REGION_SIZE`. That
+        //   constant is derived from `size_of::<Pipeline>()`, but nothing here
+        //   re-reads that XML, so the two move together or not at all.
         //
         // No `&mut Pipeline` is created here or by `attach`.
         unsafe {
@@ -680,7 +686,12 @@ mod tests {
             size_of::<Pipeline>(),
             size_of::<Pool>() + 3 * size_of::<Ring>()
         );
-        assert!(size_of::<Pipeline>() <= REGION_SIZE);
+        // The grant the system description must declare, as a value: 0x21218
+        // bytes of type in 0x22000 bytes of mapping, the whole remainder being
+        // the page-rounding and nothing else.
+        assert_eq!(size_of::<Pipeline>(), 0x21218);
+        assert_eq!(REGION_SIZE, 0x22000);
+        assert!(REGION_SIZE - size_of::<Pipeline>() < MAPPING_ALIGN);
     }
 
     #[test]

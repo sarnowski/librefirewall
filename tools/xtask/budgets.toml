@@ -16,7 +16,7 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
-"crates/nic-driver-core/src/bringup.rs" = 0.5158
+"crates/nic-driver-core/src/bringup.rs" = 0.3697
 "crates/nic-driver-core/src/lib.rs" = 0.4979
 "crates/nic-driver-core/src/port.rs" = 0.4706
 "crates/packet-buffer/src/lib.rs" = 0.4634
@@ -24,7 +24,7 @@
 "crates/queue/src/lib.rs" = 0.4271
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
-"crates/virtio/src/pci.rs" = 0.4242
+"crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
 "crates/wire/src/lib.rs" = 0.3231
 "pds/forwarder/src/main.rs" = 0.4364
@@ -35,7 +35,7 @@
 "crates/packet-buffer" = 3
 "crates/pd-runtime" = 2
 "crates/queue" = 0
-"crates/virtio" = 33
+"crates/virtio" = 20
 "crates/wire" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 4
@@ -45,7 +45,7 @@
 "crates/packet-buffer" = 3
 "crates/pd-runtime" = 1
 "crates/queue" = 0
-"crates/virtio" = 16
+"crates/virtio" = 4
 "crates/wire" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0

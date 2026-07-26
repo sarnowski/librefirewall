@@ -3,74 +3,22 @@
 //!
 //! # The adversary
 //!
-//! Every byte this module reads is written by CONCEPT §7.1's **hostile or
-//! malfunctioning device**: the configuration-space ids, the capability chain,
+//! Every byte read here — the configuration-space ids, the capability chain,
 //! the BAR type bits, the feature bitmap, the `device_status` readback, the
-//! queue count, and each queue's `queue_notify_off`. A merely broken device
-//! produces the same bytes as a malicious one, so both are answered the same
-//! way — **every rejection is a typed [`BringUpError`] naming the specific
-//! cause, and no rejection panics.** A driver protection domain that cannot
+//! queue count, each queue's `queue_notify_off` — is written by CONCEPT §7.1's
+//! **hostile or malfunctioning device**. A merely broken device produces the
+//! same bytes as a malicious one, so both are answered the same way: a typed
+//! [`BringUpError`] naming the cause. A driver protection domain that cannot
 //! bring its device up parks; it never faults.
 //!
-//! What is checked and where is `virtio::pci`'s business, and this module does
-//! not re-check it: it composes those checks in the one order the virtio 1.0
-//! specification permits, which is the thing `virtio::pci` cannot express.
-//!
-//! # The handshake ordering is a typestate, not a comment
+//! # Why the sequence is a typestate
 //!
 //! virtio 1.0 §3.1.1 fixes the initialization order, and getting it wrong is
 //! silent: a device whose features are written before `DRIVER` is set, or which
-//! is told `DRIVER_OK` before its virtqueues carry addresses, misbehaves in
-//! ways that surface as a dead link rather than as an error. The order is
-//! therefore carried by distinct types, each transition consuming the previous
-//! state:
-//!
-//! ```text
-//! identify ──▶ Identified ──place_bar──▶ PlacedBar ──map──▶ Offered
-//!    │                                                         │
-//!    │                                                    acknowledge
-//!    │                                                         ▼
-//!    │        Live ◀──go_live── Configured ◀─configure_queues─ Negotiated
-//!    │                                                         ▲
-//!    └── every step returns Err(BringUpError) instead    negotiate_features
-//!        of panicking; nothing continues past a rejection.     │
-//!                                                         Acknowledged
-//! ```
-//!
-//! There is no constructor for any state but [`Identified`], and no transition
-//! that skips one, so a caller cannot write the sequence in the wrong order,
-//! repeat a step, or reach a later step without the earlier one having
-//! succeeded. Concretely: `set_driver_features` is reachable only from
-//! [`Acknowledged`], which only [`Offered::acknowledge`] produces after the
-//! reset and the `ACKNOWLEDGE | DRIVER` writes; and a ringable doorbell exists
-//! only inside [`Live`], which only [`Configured::go_live`] produces after
-//! `DRIVER_OK` — so **the driver cannot notify a device it has not yet
-//! declared itself ready to**, which was previously a comment.
-//!
-//! # Failure is signalled to the device where the device can hear it
-//!
-//! `STATUS_FAILED` lives in the common-configuration structure, inside the BAR.
-//! Before [`PlacedBar::map`] that BAR has not been placed, so a rejection in
-//! [`identify`] or [`Identified::place_bar`] **cannot** be signalled at all and
-//! the device is left decoding nothing. From [`Offered`] onward the register is
-//! reachable and every rejection writes `STATUS_FAILED` before returning, so
-//! the device is told to stop rather than left mid-handshake with a driver that
-//! walked away. Which of the two happened is not left to the caller's memory:
-//! [`BringUpError::signalled_to_device`] answers it per variant, and
-//! `status_failed_is_signalled_once_the_device_is_reachable` proves the two
-//! agree.
-//!
-//! # The region constants are this crate's, not the caller's
-//!
-//! [`BAR_WINDOW_SIZE`], [`VQ_REGION_SIZE`], [`TX_VQ_OFFSET`] and
-//! [`QUEUE_SIZE`] were duplicated in the driver protection domain, where the
-//! bound a device offset is checked against and the window actually mapped were
-//! two independently editable numbers. They are defined here once; the PD maps
-//! the window these constants describe and passes only pointers. The remaining
-//! cross-check — that `BAR_WINDOW_SIZE` and `VQ_REGION_SIZE` equal the `size=`
-//! attributes of the `bar*` and `vq*` memory regions in
-//! `systems/qemu-x86_64/librefirewall.system` — has **no enforcer on this
-//! side** and is stated as such on each constant (DOC-7).
+//! is told `DRIVER_OK` before its virtqueues carry addresses, misbehaves as a
+//! dead link rather than as an error, so no readback distinguishes the two.
+//! The order is therefore carried by types that consume the state they advance
+//! from, rather than by a call sequence a caller is trusted to write.
 
 use pd_runtime::MAPPING_ALIGN;
 use virtio::net::features;
@@ -81,195 +29,144 @@ use virtio::pci::{
 };
 use virtio::queue::{QueueLayout, SplitVirtqueue};
 
-/// virtio-net virtqueue index that receives.
+/// virtio-net's receive virtqueue index, fixed by the specification.
 pub const RX_QUEUE: u16 = 0;
-/// virtio-net virtqueue index that transmits.
+/// virtio-net's transmit virtqueue index, fixed by the specification.
 pub const TX_QUEUE: u16 = 1;
 
-/// Descriptors per virtqueue: how many buffers may be at the device at once in
-/// one direction. Also the per-call bound on every device-driven loop in this
-/// crate, which is why it is a driver-owned constant and never a device value.
+/// Descriptors per virtqueue: a driver constant rather than the device-reported
+/// queue maximum, so a loop bounded by it is bounded by a value the adversary
+/// does not choose (ENG-4).
 pub const QUEUE_SIZE: usize = 16;
 
 /// Byte offset of the transmit virtqueue within the virtqueue DMA region; the
-/// receive virtqueue sits at offset 0.
+/// receive virtqueue starts at 0.
 pub const TX_VQ_OFFSET: usize = 0x800;
 
 /// Size of the virtqueue DMA region a driver protection domain maps.
 ///
-/// **Unenforced cross-check (DOC-7):** this must equal the `size` attribute of
+/// **Cross-artifact, unenforced (DOC-7):** must equal the `size` attribute of
 /// the `vq0`/`vq1` memory regions in
-/// `systems/qemu-x86_64/librefirewall.system`. Nothing in this workspace
-/// compares the two — the system description is XML consumed by the Microkit
-/// tool, and no build step reads it back into Rust. The const assertions below
-/// bound the virtqueue layout against *this* number, so an inconsistency here
-/// is caught; an inconsistency against the `.system` file is not, and would
-/// surface as the transmit virtqueue lying outside the mapping.
+/// `systems/qemu-x86_64/librefirewall.system`. That XML is consumed by the
+/// Microkit tool and no build step reads it back into Rust, so nothing compares
+/// the two; a disagreement surfaces as the transmit virtqueue lying outside the
+/// mapping.
 pub const VQ_REGION_SIZE: usize = 0x1000;
 
-/// Size of the device MMIO BAR window a driver protection domain maps, and the
-/// bound every device-supplied BAR offset is checked against.
+/// Size of the device MMIO BAR window a driver protection domain maps, the
+/// bound every device-supplied BAR offset is checked against, and the alignment
+/// [`Identified::place_bar`] requires of the address the BAR is relocated to —
+/// so the mapped window and the decoded window describe the same bytes.
 ///
-/// **Unenforced cross-check (DOC-7):** as [`VQ_REGION_SIZE`], this must equal
-/// the `size` attribute of the `bar0`/`bar1` memory regions in
-/// `systems/qemu-x86_64/librefirewall.system`, and nothing compares them. It is
-/// also the alignment [`Identified::place_bar`] requires of the physical
-/// address the BAR is relocated to, so the mapped window and the programmed
-/// window describe the same bytes.
+/// **Cross-artifact, unenforced (DOC-7):** as [`VQ_REGION_SIZE`], must equal the
+/// `size` attribute of the `bar0`/`bar1` memory regions in
+/// `systems/qemu-x86_64/librefirewall.system`.
 pub const BAR_WINDOW_SIZE: usize = 0x4000;
 
-/// The virtqueue this driver programs into its device, in both directions. The
-/// layout the device is told about and the layout the driver walks are the same
-/// type, so they cannot disagree.
 pub type DriverVirtqueue = SplitVirtqueue<QUEUE_SIZE>;
 
-/// The feature bits this driver will accept if the device offers them.
+/// The feature bits this driver accepts if the device offers them.
 ///
 /// Negotiating a feature changes what the device is *permitted to produce*, so
-/// accepting one no code handles would licence buffers this driver cannot
-/// service — merged receive buffers spanning descriptors, or a header whose
-/// offload fields must be acted on (`virtio::net`). The mask is therefore the
-/// set this driver implements, not the set it recognises, and virtio 1.0 is the
-/// only member.
+/// accepting one no code handles licences buffers this driver cannot service —
+/// merged receive buffers spanning descriptors, or a header whose offload
+/// fields must be acted on. The mask is what this driver implements, not what
+/// it recognises.
 pub const ACCEPTED_FEATURES: u64 = features::VIRTIO_F_VERSION_1;
 
-// Both virtqueues must fit the DMA region with the transmit queue's 16-byte
-// descriptor-table alignment preserved, and both mapped regions must be whole
-// pages, since Microkit maps at page granularity.
+// Microkit maps at page granularity, so both regions are whole pages; the
+// transmit virtqueue's descriptor table needs 16-byte alignment.
 const _: () = assert!(DriverVirtqueue::LAYOUT.total_bytes <= TX_VQ_OFFSET);
 const _: () = assert!(TX_VQ_OFFSET.is_multiple_of(16));
 const _: () = assert!(TX_VQ_OFFSET + DriverVirtqueue::LAYOUT.total_bytes <= VQ_REGION_SIZE);
 const _: () = assert!(VQ_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
 const _: () = assert!(BAR_WINDOW_SIZE.is_multiple_of(MAPPING_ALIGN));
-// The common-configuration structure is the one thing the BAR window must be
-// able to hold whatever offset the device names, or `within` can never pass.
+// Without this, no device-named offset could ever pass `VirtioCaps::within`.
 const _: () = assert!(pci::COMMON_CFG_MIN_LEN <= BAR_WINDOW_SIZE);
 
 /// Why bring-up refused to continue.
 ///
-/// Every variant carries the value that caused the rejection, because an
-/// operator with no shell (CONCEPT §11) can only tell a device that exposes no
-/// capability list from one whose capability chain loops if the two produce
-/// different console lines. A single "bring-up failed" would make the two
-/// indistinguishable, which is the failure mode ENG-12 names.
+/// Each variant carries the value that caused the rejection: an operator with
+/// no shell (CONCEPT §11) can only tell a device that exposes no capability
+/// list from one whose chain loops if the two produce different console lines,
+/// and a single "bring-up failed" is the collapse ENG-12 names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BringUpError {
-    /// The function at the pinned BDF is not a modern virtio-net device. The
-    /// driver is built for one specific device (see the protection domain's
-    /// header) and binds nothing else.
     NotVirtioNet {
-        /// PCI vendor id read from configuration space.
         vendor: u16,
-        /// PCI device id read from configuration space.
         device: u16,
     },
-    /// The virtio PCI capability chain could not be resolved. The inner
-    /// [`CapError`] distinguishes an absent capability list from a looped
-    /// chain, an invalid BAR index, structures split across BARs, and a missing
-    /// required structure.
     Capabilities(CapError),
-    /// A virtio structure's offset, or its extent, lies outside the BAR window
-    /// this driver mapped. The offsets are the device's own claim, so this is a
-    /// malformed device rather than a driver error.
+    /// A virtio structure's offset, or its extent, lies outside
+    /// `bar_window` — [`BAR_WINDOW_SIZE`], the window the driver mapped.
     StructuresOutsideBar {
-        /// The offsets the device claimed.
         caps: VirtioCaps,
-        /// The window the driver mapped, i.e. [`BAR_WINDOW_SIZE`].
         bar_window: usize,
     },
-    /// The device claimed a common-configuration offset that is not
-    /// [`pci::COMMON_CFG_ALIGN`]-aligned.
-    ///
-    /// Distinct from [`StructuresOutsideBar`](Self::StructuresOutsideBar)
-    /// because it is a different fault with the same shape: the structure fits
-    /// the mapped window perfectly and is still unusable, since its registers
-    /// are reached as `u16` and `u32` volatile accesses and the offset decides
-    /// their alignment. Refused here so no `CommonCfg` is ever built on it.
+    /// A common-configuration offset that fits the mapped window perfectly and
+    /// is still unusable: the structure's registers are reached as `u16` and
+    /// `u32` volatile accesses, and this offset decides their alignment.
+    /// Distinct from [`StructuresOutsideBar`](Self::StructuresOutsideBar) so
+    /// the two faults reach the operator as two lines.
     CommonCfgMisaligned {
-        /// The offset the device claimed for its common-configuration
-        /// structure.
         offset: u32,
-        /// The alignment that structure's registers require, i.e.
-        /// [`pci::COMMON_CFG_ALIGN`].
         required: usize,
     },
-    /// The BAR holding the virtio structures is not the 64-bit memory BAR this
-    /// transport relocates.
     BarNotSixtyFourBit {
-        /// The BAR index the capability chain named.
         bar: u8,
     },
-    /// A BAR operation refused the index the capability chain named; see
-    /// [`BarError`].
     BarIndexRefused(BarError),
-    /// The physical address the build patched in as the BAR relocation target
-    /// is unusable: zero, above 4 GiB, or not [`BAR_WINDOW_SIZE`]-aligned. Not
-    /// device input — this is the `bar_paddr` setvar from the system
-    /// description, and a wrong value here means the mapped window and the
-    /// programmed window would describe different bytes.
+    /// Zero, above 4 GiB, or not [`BAR_WINDOW_SIZE`]-aligned. Not device input:
+    /// the `bar_paddr` setvar the build patches in from the system description,
+    /// checked because a wrong value leaves the mapped window and the decoded
+    /// window describing different bytes.
     BarTargetUnusable {
-        /// The address the build supplied.
         paddr: usize,
     },
-    /// The device did not acknowledge the reset within the transport's poll
-    /// bound; see [`ResetError`].
     ResetRefused(ResetError),
     /// The device does not offer virtio 1.0, so the modern layout this driver
     /// programs does not apply to it.
     NoVirtio1 {
-        /// The full feature bitmap the device offered.
         offered: u64,
     },
-    /// The device cleared `FEATURES_OK` on readback, refusing the negotiated
-    /// feature set. virtio 1.0 §3.1.1 requires initialization to stop here.
+    /// The device cleared `FEATURES_OK` on readback; virtio 1.0 §3.1.1 requires
+    /// initialization to stop here.
     FeaturesRejected {
-        /// The `device_status` byte read back.
         status: u8,
     },
-    /// The device offers too few virtqueues to carry both directions.
     TransmitQueueAbsent {
-        /// How many virtqueues the device reports.
         offered: u16,
-        /// How many this driver needs, i.e. `TX_QUEUE + 1`.
         required: u16,
     },
-    /// The physical address the build patched in for the virtqueue DMA region
-    /// is unusable: zero, not page-aligned, or so high that the region would
-    /// wrap. Like [`BarTargetUnusable`](Self::BarTargetUnusable) this is build
-    /// data, checked because the value is programmed into a device that will
-    /// DMA to it.
+    /// Zero, not page-aligned, or so high the region would wrap. Build data,
+    /// like [`BarTargetUnusable`](Self::BarTargetUnusable), checked because it
+    /// is programmed into a device that will DMA to it.
     VirtqueueRegionUnusable {
-        /// The address the build supplied.
         paddr: u64,
     },
-    /// The device refused to have a virtqueue programmed; see
-    /// [`QueueSetupError`] for whether the queue is absent or too small.
     QueueSetupRefused {
-        /// Which virtqueue was being programmed.
         index: u16,
-        /// The transport's reason.
         error: QueueSetupError,
     },
-    /// The device named a doorbell slot that does not lie within the mapped BAR
-    /// window, or one at an odd offset; see [`NotifyError`].
     DoorbellRefused {
-        /// Which virtqueue's doorbell was being placed.
         index: u16,
-        /// The transport's reason.
         error: NotifyError,
     },
 }
 
 impl BringUpError {
     /// Whether `STATUS_FAILED` was written to the device before this error was
-    /// returned.
+    /// returned — which of two states the device was left in, for the console
+    /// line an operator reads (MONITORING.md).
     ///
-    /// False for every rejection raised before [`PlacedBar::map`], because the
-    /// status register lives in a BAR that has not been placed and there is
-    /// nothing to write it through — the device is simply left decoding
-    /// nothing. True from [`Offered::acknowledge`] onward. A caller reports
-    /// this rather than deciding it, so the console line says which of the two
-    /// states the device was left in.
+    /// False for every rejection raised before [`PlacedBar::map`]: the status
+    /// register lives in the common-configuration structure inside a BAR that
+    /// has not been placed, so there is nothing to write it through and the
+    /// device is left decoding nothing. True from [`Offered::acknowledge`]
+    /// onward, where every rejection writes `STATUS_FAILED` before returning so
+    /// the device is told to stop rather than left mid-handshake. The two
+    /// halves are held to agree by
+    /// `status_failed_is_signalled_once_the_device_is_reachable`.
     #[must_use]
     pub fn signalled_to_device(&self) -> bool {
         match self {
@@ -293,13 +190,11 @@ impl BringUpError {
 
 /// One virtqueue's doorbell: writing it tells the device to examine that queue.
 ///
-/// Abstracted from `virtio::pci::Doorbell` so the bring-up sequence and the
-/// poll loop can be driven against a recording stand-in on the host. A doorbell
-/// write is a two-byte MMIO store into a device BAR, which no host test can
-/// observe *in order* relative to the status writes around it — and that order
-/// is precisely what [`Configured::go_live`] exists to get right.
+/// A seam over `virtio::pci::Doorbell`, because a doorbell write is a two-byte
+/// MMIO store into a device BAR and no host test can observe it *in order*
+/// relative to the status writes around it — which is the order
+/// [`Configured::go_live`] exists to get right.
 pub trait QueueDoorbell {
-    /// Tell the device to examine `queue`.
     fn ring(&self, queue: u16);
 }
 
@@ -313,49 +208,32 @@ impl QueueDoorbell for Doorbell {
 /// common-configuration registers, and turning a queue's `queue_notify_off`
 /// into a doorbell.
 ///
-/// The one shipped implementation is [`MappedDevice`], which is the device's
-/// real MMIO. The trait exists for the same reason `virtio::pci`'s
-/// `poll_status_cleared` is a closure rather than a method: the interesting
-/// device behaviours — refusing a reset, clearing `FEATURES_OK` on readback,
-/// reporting one virtqueue — are *disagreements* between what the driver wrote
-/// and what it reads back, and a `CommonCfg` mapped over plain host memory
-/// reads back exactly what was written, so none of them can be modelled through
-/// it. Without this seam those branches would be unreachable on the host and
-/// the QEMU device would be their only test, which it is not, because QEMU's
-/// virtio-net conforms.
+/// A seam, because the interesting device behaviours — refusing a reset,
+/// clearing `FEATURES_OK` on readback, reporting one virtqueue — are
+/// *disagreements* between what the driver wrote and what it reads back, and a
+/// `CommonCfg` mapped over plain host memory reads back exactly what was
+/// written. Without the seam those branches would be reachable only under QEMU,
+/// whose virtio-net conforms and so never takes them.
 pub trait VirtioDevice {
-    /// The doorbell this device hands out; see [`place_doorbell`](Self::place_doorbell).
     type Doorbell: QueueDoorbell;
 
     /// Reset the device and wait, bounded, for it to acknowledge.
-    ///
-    /// # Errors
-    /// [`ResetError`] when the device does not acknowledge within the bound.
     fn reset(&self) -> Result<(), ResetError>;
 
-    /// Read the `device_status` byte back.
     fn status(&self) -> u8;
 
-    /// Overwrite the `device_status` byte.
     fn set_status(&self, value: u8);
 
-    /// The device's 64-bit feature bitmap.
     fn device_features(&self) -> u64;
 
-    /// Write the feature bitmap the driver accepts.
     fn set_driver_features(&self, features: u64);
 
-    /// How many virtqueues the device offers.
     fn num_queues(&self) -> u16;
 
     /// Program one virtqueue's ring addresses and enable it, returning the
     /// device's `queue_notify_off` for it — raw device output, bounded by
-    /// nothing, which is why it is only ever consumed by
+    /// nothing, and so fit only to be handed to
     /// [`place_doorbell`](Self::place_doorbell).
-    ///
-    /// # Errors
-    /// [`QueueSetupError`] when the device says the queue does not exist or is
-    /// smaller than `layout` requires.
     fn setup_queue(
         &self,
         index: u16,
@@ -365,22 +243,14 @@ pub trait VirtioDevice {
 
     /// Turn a `queue_notify_off` into a doorbell, bounding it against the
     /// window the device's BAR is mapped into.
-    ///
-    /// # Errors
-    /// [`NotifyError`] when the slot the device names lies outside that window
-    /// or at an odd offset.
     fn place_doorbell(&self, notify_off: u16) -> Result<Self::Doorbell, NotifyError>;
 }
 
 /// A virtio device reached through its mapped MMIO BAR.
 ///
-/// It has no public constructor on purpose. The only way to obtain one is
-/// [`PlacedBar::map`], which is reachable only from [`identify`] — so
-/// `self.caps` has provably passed both `VirtioCaps::within(BAR_WINDOW_SIZE)`
-/// and `VirtioCaps::common_is_aligned`, and those two together are exactly what
-/// make the common-configuration pointer and every doorbell placement below
-/// sound. Handing the type a public `new` would put unvalidated capability
-/// offsets one call away from a raw pointer.
+/// Its fields are private and it has no public constructor, so the only way to
+/// obtain one is [`PlacedBar::map`]. A public `new` would put unvalidated
+/// capability offsets one call away from a raw pointer.
 pub struct MappedDevice {
     common: CommonCfg,
     bar_base: *mut u8,
@@ -424,14 +294,12 @@ impl VirtioDevice for MappedDevice {
     }
 
     fn place_doorbell(&self, notify_off: u16) -> Result<Doorbell, NotifyError> {
-        // SAFETY: `PlacedBar::map` is this type's only constructor and its
-        // contract is that `bar_base` names a live, `COMMON_CFG_ALIGN`-aligned
-        // mapping of `BAR_WINDOW_SIZE` bytes outliving this value — which
-        // discharges `Doorbell::new`'s contract, whose alignment requirement is
-        // two bytes and so is subsumed by the four. The device-supplied
-        // `notify_off` needs nothing from this side: `Doorbell::new` is the
-        // component that bounds and aligns it, proved by `virtio::pci`'s
-        // `doorbell_rejects_a_slot_outside_the_bar`.
+        // SAFETY: `bar_base` names a live, `COMMON_CFG_ALIGN`-aligned mapping
+        // of `BAR_WINDOW_SIZE` bytes, guaranteed by `PlacedBar::map`, this
+        // type's only constructor; four bytes of alignment subsume the two
+        // `Doorbell::new` requires. The device-supplied `notify_off` needs
+        // nothing from this side — `Doorbell::new` bounds and aligns it, proved
+        // by `virtio::pci`'s `doorbell_rejects_a_slot_outside_the_bar`.
         unsafe { Doorbell::new(self.bar_base, BAR_WINDOW_SIZE, &self.caps, notify_off) }
     }
 }
@@ -439,23 +307,13 @@ impl VirtioDevice for MappedDevice {
 /// Identify the device at the pinned function and validate everything about it
 /// that can be checked before its BAR is placed.
 ///
-/// In order: the (vendor, device) id pair must be modern virtio-net; the virtio
-/// capability chain must resolve; every structure offset must fit
-/// [`BAR_WINDOW_SIZE`]; the common-configuration offset must additionally be
-/// [`pci::COMMON_CFG_ALIGN`]-aligned; and the BAR holding them must be the
-/// 64-bit memory BAR this transport relocates.
-///
-/// **This function is the enforcer the rest of the chain names.** Both offset
-/// checks are made here and nowhere else, and every later state is reachable
-/// only through the [`Identified`] this returns, so what a `CommonCfg` pointer
-/// rests on is established before the value that could form one exists rather
-/// than delegated onward to a caller (DOC-7). The extent and the alignment are
-/// separate faults with separate errors, because an offset that fits the window
-/// can still misalign every register behind it.
-///
-/// # Errors
-/// The corresponding [`BringUpError`] for whichever of those the device fails.
-/// None of them is signalled to the device — see the module header.
+/// **This function is the enforcer the rest of the chain names (DOC-7).** Both
+/// device-offset checks — `VirtioCaps::within(BAR_WINDOW_SIZE)` for the extent
+/// and `VirtioCaps::common_is_aligned` for the alignment — are made here, and
+/// every later state is reachable only through the [`Identified`] this returns,
+/// so what a `CommonCfg` pointer rests on holds before a value that could form
+/// one exists. They are separate faults with separate errors because an offset
+/// that fits the window can still misalign every register behind it.
 pub fn identify(config: &PciConfig) -> Result<Identified, BringUpError> {
     let (vendor, device) = config.ids();
     if vendor != VIRTIO_VENDOR_ID || device != VIRTIO_NET_DEVICE_ID {
@@ -485,35 +343,26 @@ pub fn identify(config: &PciConfig) -> Result<Identified, BringUpError> {
 /// fit the window the driver mapped and whose common-configuration offset is
 /// aligned for the registers behind it. Produced only by [`identify`], so both
 /// facts hold of every value of this type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Identified {
     caps: VirtioCaps,
 }
 
 impl Identified {
-    /// Where the device says its virtio structures are, already bounded against
-    /// [`BAR_WINDOW_SIZE`] and checked for common-configuration alignment by
-    /// [`identify`].
     #[must_use]
     pub fn caps(&self) -> VirtioCaps {
         self.caps
     }
 
     /// Relocate the device's BAR to `bar_paddr` and re-enable memory decoding
-    /// and bus mastering.
+    /// and bus mastering. Nothing is written to the device on rejection.
     ///
     /// `bar_paddr` is build data — the `bar_paddr` setvar the Microkit tool
     /// patches from the system description — and is validated rather than
-    /// trusted, because it is the address the driver *also* mapped: a value
-    /// that is not [`BAR_WINDOW_SIZE`]-aligned would leave the mapped window
-    /// and the decoded window describing different bytes, and every subsequent
-    /// bound would be checked against the wrong region.
-    ///
-    /// # Errors
-    /// [`BringUpError::BarTargetUnusable`] when `bar_paddr` is zero, above
-    /// 4 GiB, or misaligned, and [`BringUpError::BarIndexRefused`] when the BAR
-    /// index cannot be the low half of a 64-bit pair. Nothing is written to the
-    /// device in either case.
+    /// trusted, because it is also the address the driver mapped: a value that
+    /// is not [`BAR_WINDOW_SIZE`]-aligned leaves the mapped window and the
+    /// decoded window describing different bytes, and every later bound would
+    /// then be checked against the wrong region.
     pub fn place_bar(
         self,
         config: &PciConfig,
@@ -538,7 +387,7 @@ impl Identified {
 
 /// A device whose BAR now decodes at the address the driver mapped. Produced
 /// only by [`Identified::place_bar`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PlacedBar {
     caps: VirtioCaps,
 }
@@ -549,39 +398,28 @@ impl PlacedBar {
     /// # Safety
     /// `bar_base` must point to a live mapping of exactly [`BAR_WINDOW_SIZE`]
     /// bytes of the BAR just relocated, at least
-    /// [`pci::COMMON_CFG_ALIGN`]-aligned (a Microkit mapping is page-aligned,
-    /// so this is free), and it must stay mapped for as long as the returned
-    /// value or anything derived from it is used.
+    /// [`pci::COMMON_CFG_ALIGN`]-aligned, and it must stay mapped for as long
+    /// as the returned value or anything derived from it is used. Four bytes of
+    /// alignment, not two, because the common-configuration registers are
+    /// reached as `u32` volatiles; a Microkit mapping is page-aligned, so this
+    /// costs the caller nothing and subsumes what `Doorbell::new` asks for.
     ///
-    /// Four bytes of alignment, not two: the common-configuration registers are
-    /// reached as `u32` volatiles, and the alignment of `bar_base + caps.common`
-    /// is what makes them aligned, so the window has to carry at least what
-    /// those accesses need. It subsumes the two bytes `Doorbell::new` asks for.
-    ///
-    /// Nothing is required of the caller about the *device's* offsets.
-    /// [`identify`] checked both halves of `CommonCfg::new`'s contract before
-    /// this type could exist — `caps.within(BAR_WINDOW_SIZE)` for the extent and
-    /// `caps.common_is_aligned()` for the alignment — and `Doorbell::new` bounds
-    /// and aligns the notify slot in [`MappedDevice::place_doorbell`]. Those are
-    /// enforcements, not assumptions:
+    /// Nothing is required of the caller about the *device's* offsets:
+    /// [`identify`] is their enforcer, proved by
     /// `a_structure_outside_the_mapped_window_is_refused_before_any_dereference`
-    /// and `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`
-    /// prove the first two, `virtio::pci`'s `doorbell_rejects_a_misaligned_slot`
-    /// the third (DOC-7).
+    /// and
+    /// `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`
+    /// (DOC-7).
     #[must_use]
     pub unsafe fn map(self, bar_base: *mut u8) -> Offered<MappedDevice> {
-        // SAFETY: `caps` reached this value through `identify`, which checked
-        // `caps.within(BAR_WINDOW_SIZE)` — bounding
-        // `caps.common + COMMON_CFG_MIN_LEN` against the window size — and
-        // `caps.common_is_aligned()`, bounding `caps.common` modulo
-        // `COMMON_CFG_ALIGN`. Nothing outside this module can produce a
-        // `PlacedBar` any other way, its field being private, and this module's
-        // own tests assert both predicates at each literal construction. The
-        // caller guarantees `bar_base` names a live, `COMMON_CFG_ALIGN`-aligned
-        // mapping of exactly `BAR_WINDOW_SIZE` bytes, so `bar_base +
-        // caps.common` is itself `COMMON_CFG_ALIGN`-aligned and starts at least
-        // `COMMON_CFG_MIN_LEN` readable and writable bytes inside it —
-        // `CommonCfg::new`'s contract in both of its halves.
+        // SAFETY: `CommonCfg::new` requires `COMMON_CFG_MIN_LEN` readable and
+        // writable bytes at a `COMMON_CFG_ALIGN`-aligned address. The caller
+        // guarantees `bar_base` names a live, aligned mapping of exactly
+        // `BAR_WINDOW_SIZE` bytes; `identify` — the only producer of the
+        // `Identified` this value came from, its field being private —
+        // guarantees `caps.within(BAR_WINDOW_SIZE)` for the extent and
+        // `caps.common_is_aligned()` for the alignment of the offset added to
+        // it.
         let common = unsafe { CommonCfg::new(bar_base.add(self.caps.common as usize)) };
         Offered {
             device: MappedDevice {
@@ -602,8 +440,7 @@ pub struct Offered<D> {
 ///
 /// Test-only, and deliberately not a public constructor: on a real device
 /// "reachable" means the BAR has been relocated and mapped, which is what
-/// [`PlacedBar::map`] establishes and nothing else can. A stand-in device needs
-/// none of that, and this is how the sibling modules' tests get one.
+/// [`PlacedBar::map`] establishes. A stand-in device needs none of that.
 #[cfg(test)]
 pub(crate) fn offered<D: VirtioDevice>(device: D) -> Offered<D> {
     Offered { device }
@@ -615,11 +452,8 @@ impl<D: VirtioDevice> Offered<D> {
     ///
     /// Both writes are cumulative ORs of the bits set so far, as virtio 1.0
     /// §3.1.1 requires: the device latches the status byte as written, so
-    /// setting `DRIVER` alone would retract `ACKNOWLEDGE`.
-    ///
-    /// # Errors
-    /// [`BringUpError::ResetRefused`] when the device never acknowledges the
-    /// reset. `STATUS_FAILED` is written first.
+    /// setting `DRIVER` alone would retract `ACKNOWLEDGE`. A refused reset
+    /// writes `STATUS_FAILED` before returning.
     pub fn acknowledge(self) -> Result<Acknowledged<D>, BringUpError> {
         if let Err(error) = self.device.reset() {
             self.device.set_status(STATUS_FAILED);
@@ -634,8 +468,7 @@ impl<D: VirtioDevice> Offered<D> {
 }
 
 /// A device that has been reset and told the driver is present. Produced only
-/// by [`Offered::acknowledge`], which is what makes the feature write below
-/// reachable only after `DRIVER` is set.
+/// by [`Offered::acknowledge`], which has written `ACKNOWLEDGE | DRIVER`.
 pub struct Acknowledged<D> {
     device: D,
 }
@@ -643,18 +476,10 @@ pub struct Acknowledged<D> {
 impl<D: VirtioDevice> Acknowledged<D> {
     /// Negotiate features and confirm the device can carry both directions.
     ///
-    /// Reads the offered bitmap, masks it to [`ACCEPTED_FEATURES`], writes the
-    /// result back, sets `FEATURES_OK`, and **re-reads the status byte** — a
-    /// virtio 1.0 device may clear that bit to refuse the set, and a driver
-    /// that does not read it back proceeds against a device that has already
-    /// said no. Finally the virtqueue count is checked, because a device
-    /// offering one queue cannot transmit.
-    ///
-    /// # Errors
-    /// [`BringUpError::NoVirtio1`] when the device does not offer virtio 1.0,
-    /// [`BringUpError::FeaturesRejected`] when it clears `FEATURES_OK`, and
-    /// [`BringUpError::TransmitQueueAbsent`] when it offers too few queues.
-    /// Each writes `STATUS_FAILED` before returning.
+    /// The status byte is **re-read** after `FEATURES_OK` is set: a virtio 1.0
+    /// device may clear that bit to refuse the set, and a driver that does not
+    /// read it back proceeds against a device that has already said no. Every
+    /// rejection writes `STATUS_FAILED` before returning.
     pub fn negotiate_features(self) -> Result<Negotiated<D>, BringUpError> {
         let offered = self.device.device_features();
         let negotiated = offered & ACCEPTED_FEATURES;
@@ -693,8 +518,8 @@ pub struct Negotiated<D> {
 }
 
 impl<D: VirtioDevice> Negotiated<D> {
-    /// The feature bits actually negotiated — the offered set masked to
-    /// [`ACCEPTED_FEATURES`], never the device's raw offer.
+    /// The offered feature set masked to [`ACCEPTED_FEATURES`], never the
+    /// device's raw offer.
     #[must_use]
     pub fn features(&self) -> u64 {
         self.features
@@ -702,22 +527,15 @@ impl<D: VirtioDevice> Negotiated<D> {
 
     /// Program both virtqueues into the device and place their doorbells.
     ///
-    /// The receive queue is programmed at `vq_region_paddr` and the transmit
-    /// queue at `vq_region_paddr + TX_VQ_OFFSET`, matching the single DMA
-    /// region the driver maps. `vq_region_paddr` is build data, checked for the
-    /// same reason `bar_paddr` is: it is handed to a device that will DMA to
-    /// it, so a zero, misaligned, or wrapping value must fail visibly rather
-    /// than point the hardware at whatever lies there.
+    /// `vq_region_paddr` is build data, checked for the same reason `bar_paddr`
+    /// is: it is handed to a device that will DMA to it, so a zero, misaligned,
+    /// or wrapping value must fail visibly rather than point the hardware at
+    /// whatever lies there.
     ///
     /// The doorbells are placed here rather than returned as offsets, so a
-    /// `queue_notify_off` never leaves this module as a bare number: it is
-    /// either bounded into a [`QueueDoorbell`] or it is an error.
-    ///
-    /// # Errors
-    /// [`BringUpError::VirtqueueRegionUnusable`] for a bad region address,
-    /// [`BringUpError::QueueSetupRefused`] when the device refuses a queue, and
-    /// [`BringUpError::DoorbellRefused`] when it names an unusable doorbell
-    /// slot. Each writes `STATUS_FAILED` before returning.
+    /// `queue_notify_off` never leaves as a bare number: it is either bounded
+    /// into a [`QueueDoorbell`] or it is an error. Every rejection writes
+    /// `STATUS_FAILED` before returning.
     pub fn configure_queues(self, vq_region_paddr: u64) -> Result<Configured<D>, BringUpError> {
         // The whole region must be addressable, because the transmit queue's
         // address is derived by adding into it below.
@@ -745,8 +563,7 @@ impl<D: VirtioDevice> Negotiated<D> {
     }
 
     /// Program one virtqueue and bound its doorbell, signalling `STATUS_FAILED`
-    /// on either refusal. Shared by both directions so the failure handling is
-    /// written once.
+    /// on either refusal.
     fn program(
         &self,
         index: u16,
@@ -770,11 +587,10 @@ impl<D: VirtioDevice> Negotiated<D> {
 /// A device whose virtqueues are programmed and whose doorbells are placed, but
 /// which has not been told the driver is ready.
 ///
-/// This is the state in which a driver fills the receive virtqueue with
-/// buffers: the descriptors are published, and the device is not yet permitted
-/// to act on a notification. The doorbells are held privately here and become
-/// ringable only in [`Live`], so the "`DRIVER_OK` before the first doorbell"
-/// rule is a property of the types rather than of a comment.
+/// This is the state in which a driver fills the receive virtqueue: the
+/// descriptors are published, and the device is not yet permitted to act on a
+/// notification. The doorbells are held privately and become ringable only in
+/// [`Live`].
 pub struct Configured<D: VirtioDevice> {
     device: D,
     receive: D::Doorbell,
@@ -784,12 +600,9 @@ pub struct Configured<D: VirtioDevice> {
 impl<D: VirtioDevice> Configured<D> {
     /// Set `DRIVER_OK` and then ring the receive doorbell, in that order.
     ///
-    /// The order is the whole point and is not the caller's to get right: a
-    /// virtio device need not act on a notification before the driver has
+    /// A virtio device need not act on a notification before the driver has
     /// declared itself ready, so ringing first can lose every buffer already
-    /// posted and leave the link dead with no error anywhere. Because the only
-    /// [`QueueDoorbell`] in existence is the one this call moves into [`Live`],
-    /// there is no earlier ring to write.
+    /// posted and leave the link dead with no error anywhere.
     #[must_use]
     pub fn go_live(self) -> Live<D> {
         self.device
@@ -803,24 +616,20 @@ impl<D: VirtioDevice> Configured<D> {
     }
 }
 
-/// A live device: the only state from which a doorbell can be rung.
-///
-/// The device handle itself is dropped at [`Configured::go_live`]: past
+/// A live device: [`Configured::go_live`] drops the device handle, because past
 /// `DRIVER_OK` the steady-state driver touches no common-configuration
-/// register, only the two doorbells and the virtqueues in the DMA region, so
-/// keeping the MMIO handle would be reach this domain does not need.
+/// register, only the doorbells and the virtqueues in the DMA region — keeping
+/// the MMIO handle would be reach this domain does not need.
 pub struct Live<D: VirtioDevice> {
     receive: D::Doorbell,
     transmit: D::Doorbell,
 }
 
 impl<D: VirtioDevice> Live<D> {
-    /// Tell the device to examine the receive virtqueue.
     pub fn ring_receive(&self) {
         self.receive.ring(RX_QUEUE);
     }
 
-    /// Tell the device to examine the transmit virtqueue.
     pub fn ring_transmit(&self) {
         self.transmit.ring(TX_QUEUE);
     }
@@ -1103,16 +912,12 @@ mod tests {
         // Regression for the fuzz finding whose reproducer is
         // `fuzz/corpus/find_virtio_caps/unaligned_common_cfg_offset`: a device
         // that advertises common-cfg at 0x0009 instead of 0x0000. The offset
-        // fits the window, so `within` passes and the old `identify` accepted
-        // it; `PlacedBar::map` then built a `CommonCfg` on an odd base and
-        // `negotiate_features` performed a misaligned `u32` volatile write.
-        //
-        // Every non-multiple-of-four is the same fault, including the merely
-        // even ones — the common-configuration registers are mostly 32-bit, so
-        // two-byte alignment is not enough.
-        // The last entry is the largest offset that still fits the window, made
-        // odd: extent and alignment must be judged independently right up to
-        // the boundary where one of them is about to fail on its own.
+        // fits the window, so `within` passes on its own; unrefused, it puts a
+        // `CommonCfg` on an odd base and every `u32` volatile behind it is
+        // misaligned. Every non-multiple-of-four is the same fault, including
+        // the merely even ones. The last entry is the largest offset that still
+        // fits the window, made odd: extent and alignment must be judged
+        // independently right up to the boundary.
         for offset in [
             1u32,
             2,
@@ -1238,11 +1043,6 @@ mod tests {
 
     #[test]
     fn the_receive_doorbell_is_never_rung_before_driver_ok() {
-        // The invariant that was previously only a comment. `Configured` holds
-        // the doorbells privately and `go_live` is the only way to reach them,
-        // so the strongest statement available is that no ring precedes the
-        // DRIVER_OK write in the recorded order — there is no API through which
-        // one could.
         let log = Log::new();
         bring_up(FakeDevice::conforming(&log)).expect("a conforming device");
         let events = log.events();

@@ -26,7 +26,7 @@
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
 
-         * vq0/vq1 and pipe0/pipe1 (0x30000000..0x31080000) must lie INSIDE
+         * vq0/vq1 and pipe0/pipe1 (0x30000000..0x31044000) must lie INSIDE
            RAM. They are ordinary memory, and seL4 zeroes a frame retyped from
            a general-purpose untyped but not one retyped from a device untyped
            — which is what an address outside RAM yields. That kernel behaviour
@@ -43,7 +43,7 @@
          Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
          which puts the first group inside it and the second above it. The
          window either side is narrow and nothing checks it: below ~785 MiB RAM
-         ends short of 0x31080000 and the DMA regions leave RAM, while at
+         ends short of 0x31044000 and the DMA regions leave RAM, while at
          1280 MiB or more RAM reaches 0x50000000 and swallows the BAR window.
          Changing `-m`, or targeting hardware with a different memory map,
          means re-deriving this map.
@@ -77,13 +77,18 @@
          fixed physical addresses the drivers hand to the devices
          (region_paddr, below). pipe0: port 0 -> port 1; pipe1: the reverse.
 
-         The size is `pd_runtime::REGION_SIZE`, and the two are one value in two
-         places: that constant is what the Rust layout assertions hold
-         `size_of::<Pipeline>()` against, and nothing re-reads this file, so
-         shrinking either alone silently either truncates the mapping or
-         re-widens the grant. They move together or not at all. -->
-    <memory_region name="pipe0" size="0x40000" phys_addr="0x31000000" />
-    <memory_region name="pipe1" size="0x40000" phys_addr="0x31040000" />
+         The size is `pd_runtime::REGION_SIZE`, which is no longer a chosen
+         number: it is `size_of::<Pipeline>()` (0x21218) rounded up to the
+         mapping granularity, so the grant is the smallest one that holds the
+         type and the remainder below is page-rounding alone. The two are still
+         one value in two places — nothing re-reads this file — so shrinking
+         either alone silently either truncates the mapping or re-widens the
+         grant. They move together or not at all.
+
+         The regions are packed back to back, as they were at the previous
+         size: pipe0 ends at 0x31022000, where pipe1 begins. -->
+    <memory_region name="pipe0" size="0x22000" phys_addr="0x31000000" />
+    <memory_region name="pipe1" size="0x22000" phys_addr="0x31022000" />
 
     <protection_domain name="forwarder" priority="2" stack_size="0x4000">
         <program_image path="forwarder.elf" />

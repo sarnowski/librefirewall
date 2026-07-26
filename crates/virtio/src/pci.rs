@@ -25,6 +25,13 @@
 //! fit the mapped window perfectly and still make every wide access into it
 //! misaligned — so each is checked on its own.
 //!
+//! Keeping the two apart is what the offset types are for. The driver's own
+//! register offsets are constants, so they are settled when the program is
+//! compiled and no access can be made at one that was not. The device's values
+//! — a capability pointer, a BAR index, a structure offset, a
+//! `queue_notify_off` — are settled at every use, by the type whose only
+//! constructor is that check.
+//!
 //! What is **not** checked, because it is not checkable from this side: whether
 //! the device honours anything it was programmed with. It may ignore the queue
 //! size it acknowledged, DMA outside the addresses it was given (nothing but an
@@ -32,7 +39,10 @@
 //! descriptor. The first two are outside this module's reach; the third is a
 //! stall, visible to the driver as a queue that stops making progress.
 
-use core::sync::atomic::{Ordering, fence};
+use core::{
+    marker::PhantomData,
+    sync::atomic::{Ordering, fence},
+};
 
 use crate::queue::QueueLayout;
 
@@ -40,13 +50,102 @@ pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 /// A modern (virtio 1.0) network device.
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 
-// PCI configuration-space register offsets.
-const PCI_VENDOR_ID: u16 = 0x00;
-const PCI_DEVICE_ID: u16 = 0x02;
-const PCI_COMMAND: u16 = 0x04;
-const PCI_STATUS: u16 = 0x06;
-const PCI_CAPABILITIES_PTR: u16 = 0x34;
-const PCI_BAR0: u16 = 0x10;
+/// Byte extent of one PCI function's configuration space, as ECAM maps it.
+const PCI_CONFIG_LEN: usize = 4096;
+
+/// A mapped MMIO structure this module reaches into, described by what an
+/// offset has to be judged against: the bytes a caller must have mapped, and
+/// the alignment the base is required to carry. Judging is all it is for — no
+/// value of an implementing type is ever built.
+trait Region {
+    /// Bytes the region's constructor requires mapped.
+    const LEN: usize;
+    /// Alignment the region's constructor requires of the base, which every
+    /// offset into it carries through to the access made there.
+    const BASE_ALIGN: usize;
+}
+
+/// One PCI function's configuration space, through the ECAM window.
+#[derive(Clone, Copy)]
+enum ConfigSpace {}
+
+impl Region for ConfigSpace {
+    const LEN: usize = PCI_CONFIG_LEN;
+    const BASE_ALIGN: usize = align_of::<u32>();
+}
+
+/// The virtio common configuration structure, inside the device BAR.
+#[derive(Clone, Copy)]
+enum CommonRegion {}
+
+impl Region for CommonRegion {
+    const LEN: usize = COMMON_CFG_MIN_LEN;
+    const BASE_ALIGN: usize = COMMON_CFG_ALIGN;
+}
+
+/// An offset into `R` at which an access `WIDTH` bytes wide, needing `ALIGN`
+/// bytes of alignment, is both in range and correctly aligned.
+///
+/// Extent and alignment are separate parameters because they are separate
+/// faults: a 64-bit virtio register is written as two 32-bit halves, so it
+/// spans eight bytes while needing only four of alignment, and one parameter
+/// would demand an alignment the access does not have.
+#[derive(Clone, Copy)]
+struct Off<R: Region, const ALIGN: usize, const WIDTH: usize>(usize, PhantomData<R>);
+
+impl<R: Region, const ALIGN: usize, const WIDTH: usize> Off<R, ALIGN, WIDTH> {
+    /// The offset `OFFSET`, admitted only when the whole access fits `R` and is
+    /// aligned within it — decided while the program is compiled, so an offset
+    /// that would not be is not a value this program can hold.
+    const fn at<const OFFSET: usize>() -> Self {
+        const {
+            assert!(
+                ALIGN <= R::BASE_ALIGN,
+                "the access needs more alignment than the region's base carries"
+            );
+            assert!(
+                OFFSET.is_multiple_of(ALIGN),
+                "the offset misaligns the access made at it"
+            );
+            assert!(
+                OFFSET + WIDTH <= R::LEN,
+                "the access runs past the end of the region"
+            );
+        }
+        Self(OFFSET, PhantomData)
+    }
+
+    const fn bytes(self) -> usize {
+        self.0
+    }
+
+    /// One past the last byte the access at this offset touches.
+    const fn end(self) -> usize {
+        self.0 + WIDTH
+    }
+}
+
+/// A configuration-space access whose alignment requirement is its own width,
+/// which every access this module makes there has.
+type CfgOff<const WIDTH: usize> = Off<ConfigSpace, WIDTH, WIDTH>;
+/// The same, into the common configuration structure.
+type CommonOff<const WIDTH: usize> = Off<CommonRegion, WIDTH, WIDTH>;
+/// A 64-bit common-configuration register: eight bytes, written as two
+/// four-byte halves and so needing only four-byte alignment.
+type CommonOff64 = Off<CommonRegion, 4, 8>;
+
+// PCI configuration-space registers, as offsets an access may be made at.
+const PCI_VENDOR_ID: CfgOff<2> = CfgOff::at::<0x00>();
+const PCI_DEVICE_ID: CfgOff<2> = CfgOff::at::<0x02>();
+const PCI_COMMAND: CfgOff<2> = CfgOff::at::<0x04>();
+const PCI_STATUS: CfgOff<2> = CfgOff::at::<0x06>();
+const PCI_CAPABILITIES_PTR: CfgOff<1> = CfgOff::at::<0x34>();
+
+/// The first BAR register. The rest follow it at four-byte intervals, which
+/// [`BarIndex::register`] is the only way to reach.
+const PCI_BAR0: usize = 0x10;
+/// Bytes between one BAR register and the next, which is also the width of one.
+const PCI_BAR_STRIDE: usize = 4;
 
 const PCI_LAST_BAR: u8 = 5;
 /// Highest index that can be the **low half** of a 64-bit BAR pair: BAR 5's
@@ -93,6 +192,62 @@ pub enum BarError {
     NoHighHalf(u8),
 }
 
+/// A BAR index that is a BAR of this function, so the register it names is one
+/// rather than an unrelated configuration register. The index reaching here is
+/// the device's own claim, out of its capability list, so the range check is
+/// this type's only constructor.
+#[derive(Clone, Copy)]
+struct BarIndex(u8);
+
+impl BarIndex {
+    /// # Errors
+    /// [`BarError::IndexOutOfRange`] for an index that is not a BAR.
+    const fn new(index: u8) -> Result<Self, BarError> {
+        if index > PCI_LAST_BAR {
+            return Err(BarError::IndexOutOfRange(index));
+        }
+        Ok(Self(index))
+    }
+
+    /// This BAR's own register.
+    fn register(self) -> CfgOff<4> {
+        const {
+            assert!(
+                PCI_BAR0.is_multiple_of(PCI_BAR_STRIDE),
+                "the first BAR register is not aligned for a 32-bit access"
+            );
+            assert!(
+                PCI_BAR0 + (PCI_LAST_BAR as usize + 1) * PCI_BAR_STRIDE <= PCI_CONFIG_LEN,
+                "the last BAR register runs past the configuration space"
+            );
+        }
+        Off(PCI_BAR0 + self.0 as usize * PCI_BAR_STRIDE, PhantomData)
+    }
+
+    /// The register holding the high half of the 64-bit pair this index is the
+    /// low half of.
+    ///
+    /// # Errors
+    /// [`BarError::NoHighHalf`] for BAR 5: the pair does not exist there, so
+    /// neither does an offset naming its high half.
+    fn high_half(self) -> Result<CfgOff<4>, BarError> {
+        if self.0 > PCI_LAST_BAR64_LOW_HALF {
+            return Err(BarError::NoHighHalf(self.0));
+        }
+        const {
+            assert!(
+                PCI_BAR0 + (PCI_LAST_BAR64_LOW_HALF as usize + 2) * PCI_BAR_STRIDE
+                    <= PCI_CONFIG_LEN,
+                "the high half of the last 64-bit pair runs past the configuration space"
+            );
+        }
+        Ok(Off(
+            PCI_BAR0 + (self.0 as usize + 1) * PCI_BAR_STRIDE,
+            PhantomData,
+        ))
+    }
+}
+
 /// Access to one PCI function's 4 KiB configuration space, as mapped through
 /// ECAM. Reads and writes are volatile.
 pub struct PciConfig {
@@ -110,56 +265,45 @@ impl PciConfig {
         }
     }
 
-    /// # Safety
-    /// `offset` must be less than 4096.
-    unsafe fn read8(&self, offset: u16) -> u8 {
-        // SAFETY: `offset < 4096` per this fn's contract, so the byte lies within the page `PciConfig::new` guarantees.
-        unsafe { self.base.add(offset as usize).read_volatile() }
+    fn read8(&self, offset: CfgOff<1>) -> u8 {
+        // SAFETY: `CfgOff` admits only an access inside the page `PciConfig::new` requires mapped, aligned for its width.
+        unsafe { self.base.add(offset.bytes()).read_volatile() }
     }
 
-    /// # Safety
-    /// `offset` must be even, and `offset + 2` at most 4096.
-    unsafe fn read16(&self, offset: u16) -> u16 {
-        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
-        unsafe { self.base.add(offset as usize).cast::<u16>().read_volatile() }
+    fn read16(&self, offset: CfgOff<2>) -> u16 {
+        // SAFETY: `CfgOff` admits only an access inside the page `PciConfig::new` requires mapped, aligned for its width.
+        unsafe { self.base.add(offset.bytes()).cast::<u16>().read_volatile() }
     }
 
-    /// # Safety
-    /// `offset` must be a multiple of 4, and `offset + 4` at most 4096.
-    unsafe fn read32(&self, offset: u16) -> u32 {
-        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
-        unsafe { self.base.add(offset as usize).cast::<u32>().read_volatile() }
+    fn read32(&self, offset: CfgOff<4>) -> u32 {
+        // SAFETY: `CfgOff` admits only an access inside the page `PciConfig::new` requires mapped, aligned for its width.
+        unsafe { self.base.add(offset.bytes()).cast::<u32>().read_volatile() }
     }
 
-    /// # Safety
-    /// `offset` must be even, and `offset + 2` at most 4096.
-    unsafe fn write16(&self, offset: u16, value: u16) {
-        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
+    fn write16(&self, offset: CfgOff<2>, value: u16) {
+        // SAFETY: `CfgOff` admits only an access inside the page `PciConfig::new` requires mapped, aligned for its width.
         unsafe {
             self.base
-                .add(offset as usize)
+                .add(offset.bytes())
                 .cast::<u16>()
-                .write_volatile(value)
+                .write_volatile(value);
         }
     }
 
-    /// # Safety
-    /// `offset` must be a multiple of 4, and `offset + 4` at most 4096.
-    unsafe fn write32(&self, offset: u16, value: u32) {
-        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
+    fn write32(&self, offset: CfgOff<4>, value: u32) {
+        // SAFETY: `CfgOff` admits only an access inside the page `PciConfig::new` requires mapped, aligned for its width.
         unsafe {
             self.base
-                .add(offset as usize)
+                .add(offset.bytes())
                 .cast::<u32>()
-                .write_volatile(value)
+                .write_volatile(value);
         }
     }
 
     /// The device's (vendor, device) id pair.
     #[must_use]
     pub fn ids(&self) -> (u16, u16) {
-        // SAFETY: both offsets are even, fixed constants below 4096 — `read16`'s contract.
-        unsafe { (self.read16(PCI_VENDOR_ID), self.read16(PCI_DEVICE_ID)) }
+        (self.read16(PCI_VENDOR_ID), self.read16(PCI_DEVICE_ID))
     }
 
     /// Enable memory-space decoding and bus-master DMA for the device.
@@ -168,26 +312,16 @@ impl PciConfig {
     /// [`reprogram_bar64`](Self::reprogram_bar64), which deliberately leaves it
     /// off.
     pub fn enable_memory_and_bus_master(&self) {
-        // SAFETY: `PCI_COMMAND` is an even, fixed constant below 4096 — `read16`/`write16`'s contract.
-        unsafe {
-            let command = self.read16(PCI_COMMAND);
-            self.write16(
-                PCI_COMMAND,
-                command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
-            );
-        }
+        let command = self.read16(PCI_COMMAND);
+        self.write16(
+            PCI_COMMAND,
+            command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
+        );
     }
 
     fn disable_memory(&self) {
-        // SAFETY: `PCI_COMMAND` is an even, fixed constant below 4096 — `read16`/`write16`'s contract.
-        unsafe {
-            let command = self.read16(PCI_COMMAND);
-            self.write16(PCI_COMMAND, command & !PCI_COMMAND_MEMORY);
-        }
-    }
-
-    fn bar_offset(bar_index: u8) -> u16 {
-        PCI_BAR0 + (bar_index as u16) * 4
+        let command = self.read16(PCI_COMMAND);
+        self.write16(PCI_COMMAND, command & !PCI_COMMAND_MEMORY);
     }
 
     /// Whether BAR `bar_index` is a 64-bit memory BAR, so its address spans
@@ -197,12 +331,7 @@ impl PciConfig {
     /// [`BarError::IndexOutOfRange`] for an index that is not a BAR: the
     /// question is refused rather than answered from an unrelated register.
     pub fn bar_is_64bit(&self, bar_index: u8) -> Result<bool, BarError> {
-        if bar_index > PCI_LAST_BAR {
-            return Err(BarError::IndexOutOfRange(bar_index));
-        }
-        // SAFETY: the check above puts the offset at most `0x10 + 5*4 = 0x24`
-        // — 4-aligned and far below 4096, which is `read32`'s contract.
-        let low = unsafe { self.read32(Self::bar_offset(bar_index)) };
+        let low = self.read32(BarIndex::new(bar_index)?.register());
         // Bit 0 == 0 => memory BAR; bits [2:1] == 0b10 => 64-bit.
         Ok(low & 0x1 == 0 && (low >> 1) & 0x3 == 0x2)
     }
@@ -221,23 +350,14 @@ impl PciConfig {
     /// [`BarError`], rejected before decoding is disabled, so a refused call
     /// leaves the device exactly as it found it.
     pub fn reprogram_bar64(&self, bar_index: u8, address: u32) -> Result<(), BarError> {
-        if bar_index > PCI_LAST_BAR {
-            return Err(BarError::IndexOutOfRange(bar_index));
-        }
-        if bar_index > PCI_LAST_BAR64_LOW_HALF {
-            return Err(BarError::NoHighHalf(bar_index));
-        }
-        let low = Self::bar_offset(bar_index);
-        let high = low + 4;
+        let bar = BarIndex::new(bar_index)?;
+        let low = bar.register();
+        let high = bar.high_half()?;
         self.disable_memory();
-        // SAFETY: the checks above put `low` at most `0x10 + 4*4 = 0x20` and
-        // `high` at most `0x24` — both 4-aligned and far below 4096, which is
-        // `write32`'s contract. The hardware ignores writes to the read-only
-        // type flags in the low bits, so writing the aligned address is defined.
-        unsafe {
-            self.write32(low, address);
-            self.write32(high, 0);
-        }
+        // The hardware ignores writes to the read-only type flags in the low
+        // bits, so writing the aligned address whole is defined.
+        self.write32(low, address);
+        self.write32(high, 0);
         Ok(())
     }
 }
@@ -276,11 +396,11 @@ pub const COMMON_CFG_MIN_LEN: usize = 56;
 /// Byte alignment the **base** of the common configuration structure must have
 /// for [`CommonCfg`]'s accessors to be sound.
 ///
-/// The widest access into the structure is a `u32` — a 64-bit register is
-/// written as two `u32` halves, per the virtio spec's 64-bit access rules — and
-/// every field offset carries the base's alignment through rather than adding
-/// to it. The base's alignment therefore *is* the accesses' alignment: a base
-/// off by one byte misaligns every wide one.
+/// A field offset carries the base's alignment through to the access made at it
+/// rather than adding to it, so the base's alignment *is* every access's
+/// alignment: a base off by one byte misaligns every wide one. Whether this
+/// value is enough for a given register is settled where that register's offset
+/// is written down, when the program is compiled.
 pub const COMMON_CFG_ALIGN: usize = 4;
 /// One notify doorbell: a single `u16` queue index.
 const NOTIFY_SLOT_LEN: usize = 2;
@@ -369,75 +489,122 @@ impl VirtioCaps {
 /// # Errors
 /// A [`CapError`].
 pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
-    // SAFETY: every offset read below is either a fixed, aligned constant
-    // (`PCI_STATUS` at 6, `PCI_CAPABILITIES_PTR` at 0x34) or `pointer + k` where
-    // `pointer <= 0xfc` (masked with `& 0xfc`, which also makes it 4-aligned)
-    // and `k <= 16` — at most 268, well inside the 4 KiB page `PciConfig::new`
-    // guarantees, and correctly aligned for each accessor's width.
-    unsafe {
-        if config.read16(PCI_STATUS) & PCI_STATUS_CAP_LIST == 0 {
-            return Err(CapError::NoCapabilities);
-        }
-        let mut bar: Option<u8> = None;
-        let mut common = None;
-        let mut notify = None;
-        let mut notify_multiplier = 0;
-        let mut isr_present = false;
-        let mut device = None;
+    if config.read16(PCI_STATUS) & PCI_STATUS_CAP_LIST == 0 {
+        return Err(CapError::NoCapabilities);
+    }
+    let mut bar: Option<u8> = None;
+    let mut common = None;
+    let mut notify = None;
+    let mut notify_multiplier = 0;
+    let mut isr_present = false;
+    let mut device = None;
 
-        let mut pointer = (config.read8(PCI_CAPABILITIES_PTR) & 0xfc) as u16;
-        let mut guard = 0;
-        while pointer != 0 {
-            guard += 1;
-            if guard > 64 {
-                return Err(CapError::Malformed);
-            }
-            let id = config.read8(pointer);
-            let next = (config.read8(pointer + 1) & 0xfc) as u16;
-            if id == PCI_CAP_ID_VNDR {
-                let cap_len = config.read8(pointer + 2);
-                let cfg_type = config.read8(pointer + 3);
-                let cap_bar = config.read8(pointer + 4);
-                let offset = config.read32(pointer + 8);
-                if cap_len >= 16 {
-                    // Only the four mapped structures must share a BAR; another
-                    // virtio cap (VIRTIO_PCI_CAP_PCI_CFG, type 5) legitimately
-                    // names a different one and is ignored.
-                    match cfg_type {
-                        VIRTIO_PCI_CAP_COMMON_CFG => {
-                            record_bar(&mut bar, cap_bar)?;
-                            common.get_or_insert(offset);
-                        }
-                        VIRTIO_PCI_CAP_ISR_CFG => {
-                            record_bar(&mut bar, cap_bar)?;
-                            isr_present = true;
-                        }
-                        VIRTIO_PCI_CAP_DEVICE_CFG => {
-                            record_bar(&mut bar, cap_bar)?;
-                            device.get_or_insert(offset);
-                        }
-                        VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify.is_none() => {
-                            record_bar(&mut bar, cap_bar)?;
-                            notify = Some(offset);
-                            notify_multiplier = config.read32(pointer + 16);
-                        }
-                        _ => {}
+    let mut pointer = CapPointer::from_device_byte(config.read8(PCI_CAPABILITIES_PTR));
+    let mut guard = 0;
+    while !pointer.is_end() {
+        guard += 1;
+        if guard > 64 {
+            return Err(CapError::Malformed);
+        }
+        let id = config.read8(pointer.field::<0, 1>());
+        let next = CapPointer::from_device_byte(config.read8(pointer.field::<1, 1>()));
+        if id == PCI_CAP_ID_VNDR {
+            let cap_len = config.read8(pointer.field::<2, 1>());
+            let cfg_type = config.read8(pointer.field::<3, 1>());
+            let cap_bar = config.read8(pointer.field::<4, 1>());
+            let offset = config.read32(pointer.field::<8, 4>());
+            if cap_len >= 16 {
+                // Only the four mapped structures must share a BAR; another
+                // virtio cap (VIRTIO_PCI_CAP_PCI_CFG, type 5) legitimately
+                // names a different one and is ignored.
+                match cfg_type {
+                    VIRTIO_PCI_CAP_COMMON_CFG => {
+                        record_bar(&mut bar, cap_bar)?;
+                        common.get_or_insert(offset);
                     }
+                    VIRTIO_PCI_CAP_ISR_CFG => {
+                        record_bar(&mut bar, cap_bar)?;
+                        isr_present = true;
+                    }
+                    VIRTIO_PCI_CAP_DEVICE_CFG => {
+                        record_bar(&mut bar, cap_bar)?;
+                        device.get_or_insert(offset);
+                    }
+                    VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify.is_none() => {
+                        record_bar(&mut bar, cap_bar)?;
+                        notify = Some(offset);
+                        notify_multiplier = config.read32(pointer.field::<16, 4>());
+                    }
+                    _ => {}
                 }
             }
-            pointer = next;
         }
+        pointer = next;
+    }
 
-        match (bar, common, notify, isr_present, device) {
-            (Some(bar), Some(common), Some(notify), true, Some(device)) => Ok(VirtioCaps {
-                bar,
-                common,
-                notify,
-                notify_multiplier,
-                device,
-            }),
-            _ => Err(CapError::MissingStructure),
+    match (bar, common, notify, isr_present, device) {
+        (Some(bar), Some(common), Some(notify), true, Some(device)) => Ok(VirtioCaps {
+            bar,
+            common,
+            notify,
+            notify_multiplier,
+            device,
+        }),
+        _ => Err(CapError::MissingStructure),
+    }
+}
+
+/// Bytes in one unit of a [`CapPointer`]. PCI capability structures are
+/// four-byte aligned and the pointer's low two bits are reserved — hardware
+/// semantics, so a constant rather than something derived.
+const CAP_POINTER_UNIT: usize = 4;
+
+/// A PCI capability-list pointer, held in the four-byte units the PCI
+/// specification defines it in rather than in bytes.
+///
+/// The representation is what bounds every access derived from it: a `u8` of
+/// units makes [`bytes`](Self::bytes) at most `u8::MAX * CAP_POINTER_UNIT` and
+/// a multiple of `CAP_POINTER_UNIT`, so [`field`](Self::field) has only the
+/// constant it adds left to judge. The device supplies the byte; nothing else
+/// about it is trusted.
+#[derive(Clone, Copy)]
+struct CapPointer(u8);
+
+impl CapPointer {
+    /// The widest byte offset any pointer can name, from the `u8` it is held in.
+    const MAX_BYTES: usize = u8::MAX as usize * CAP_POINTER_UNIT;
+
+    /// Take the device's byte, dropping the two reserved low bits.
+    const fn from_device_byte(byte: u8) -> Self {
+        Self(byte >> 2)
+    }
+
+    /// Whether this is the list terminator.
+    const fn is_end(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn bytes(self) -> usize {
+        self.0 as usize * CAP_POINTER_UNIT
+    }
+
+    /// The field `SKIP` bytes into the capability this points at.
+    fn field<const SKIP: usize, const WIDTH: usize>(self) -> CfgOff<WIDTH> {
+        const {
+            assert!(
+                CAP_POINTER_UNIT.is_multiple_of(WIDTH),
+                "the pointer's four-byte alignment does not carry this width"
+            );
+            assert!(
+                SKIP.is_multiple_of(WIDTH),
+                "the field's own offset misaligns the access"
+            );
+            assert!(
+                CapPointer::MAX_BYTES + SKIP + WIDTH <= PCI_CONFIG_LEN,
+                "a capability at the furthest reachable pointer would overrun the page"
+            );
         }
+        Off(self.bytes() + SKIP, PhantomData)
     }
 }
 
@@ -469,43 +636,28 @@ pub enum CapError {
     MissingStructure,
 }
 
-// virtio_pci_common_cfg field offsets (bytes into the common structure).
-const CFG_DEVICE_FEATURE_SELECT: usize = 0;
-const CFG_DEVICE_FEATURE: usize = 4;
-const CFG_DRIVER_FEATURE_SELECT: usize = 8;
-const CFG_DRIVER_FEATURE: usize = 12;
-const CFG_NUM_QUEUES: usize = 18;
-const CFG_DEVICE_STATUS: usize = 20;
-const CFG_QUEUE_SELECT: usize = 22;
-const CFG_QUEUE_SIZE: usize = 24;
-const CFG_QUEUE_ENABLE: usize = 28;
-const CFG_QUEUE_NOTIFY_OFF: usize = 30;
-const CFG_QUEUE_DESC: usize = 32;
-const CFG_QUEUE_DRIVER: usize = 40;
-const CFG_QUEUE_DEVICE: usize = 48;
+// virtio_pci_common_cfg registers, as offsets an access may be made at. The
+// layout is one the virtio spec fixes and this file transcribes, so a
+// transcription error is the failure mode to catch: an offset that misaligned
+// or overran the access made at it is refused where it is written down.
+const CFG_DEVICE_FEATURE_SELECT: CommonOff<4> = CommonOff::at::<0>();
+const CFG_DEVICE_FEATURE: CommonOff<4> = CommonOff::at::<4>();
+const CFG_DRIVER_FEATURE_SELECT: CommonOff<4> = CommonOff::at::<8>();
+const CFG_DRIVER_FEATURE: CommonOff<4> = CommonOff::at::<12>();
+const CFG_NUM_QUEUES: CommonOff<2> = CommonOff::at::<18>();
+const CFG_DEVICE_STATUS: CommonOff<1> = CommonOff::at::<20>();
+const CFG_QUEUE_SELECT: CommonOff<2> = CommonOff::at::<22>();
+const CFG_QUEUE_SIZE: CommonOff<2> = CommonOff::at::<24>();
+const CFG_QUEUE_ENABLE: CommonOff<2> = CommonOff::at::<28>();
+const CFG_QUEUE_NOTIFY_OFF: CommonOff<2> = CommonOff::at::<30>();
+const CFG_QUEUE_DESC: CommonOff64 = CommonOff64::at::<32>();
+const CFG_QUEUE_DRIVER: CommonOff64 = CommonOff64::at::<40>();
+const CFG_QUEUE_DEVICE: CommonOff64 = CommonOff64::at::<48>();
 
-// The offsets are a layout the virtio spec fixes and this file transcribes, so
-// a transcription error is the failure mode to catch. These assertions are the
-// compile-time half of every accessor's `SAFETY:` comment — the half about
-// `off`: each offset stays inside the extent `CommonCfg::new` requires mapped,
-// and each carries the base's alignment through to the access made at it, so a
-// `COMMON_CFG_ALIGN`-aligned base is enough to make the accessors sound.
-const _: () = assert!(CFG_QUEUE_DEVICE + 8 == COMMON_CFG_MIN_LEN);
-const _: () = assert!(COMMON_CFG_ALIGN.is_multiple_of(align_of::<u32>()));
-const _: () = assert!(CFG_DEVICE_FEATURE_SELECT.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_DEVICE_FEATURE.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_DRIVER_FEATURE_SELECT.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_DRIVER_FEATURE.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_QUEUE_DESC.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_QUEUE_DRIVER.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_QUEUE_DEVICE.is_multiple_of(COMMON_CFG_ALIGN));
-const _: () = assert!(CFG_NUM_QUEUES.is_multiple_of(align_of::<u16>()));
-const _: () = assert!(CFG_QUEUE_SELECT.is_multiple_of(align_of::<u16>()));
-const _: () = assert!(CFG_QUEUE_SIZE.is_multiple_of(align_of::<u16>()));
-const _: () = assert!(CFG_QUEUE_ENABLE.is_multiple_of(align_of::<u16>()));
-const _: () = assert!(CFG_QUEUE_NOTIFY_OFF.is_multiple_of(align_of::<u16>()));
-// The one byte-wide register needs no alignment, only the extent.
-const _: () = assert!(CFG_DEVICE_STATUS < COMMON_CFG_MIN_LEN);
+// The extent is exactly what the last register needs and no more: a larger one
+// would demand mapped bytes this transport never touches. `Off` decides the
+// other direction, that no register runs past it.
+const _: () = assert!(CFG_QUEUE_DEVICE.end() == COMMON_CFG_MIN_LEN);
 
 /// How many times [`CommonCfg::reset`] reads the device-status register back
 /// before giving up.
@@ -570,78 +722,56 @@ impl CommonCfg {
         Self { base }
     }
 
-    /// # Safety
-    /// `off` must be less than [`COMMON_CFG_MIN_LEN`].
-    unsafe fn r8(&self, off: usize) -> u8 {
-        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, inside the extent `CommonCfg::new` requires mapped; one byte needs no alignment.
-        unsafe { self.base.add(off).read_volatile() }
+    fn read8(&self, off: CommonOff<1>) -> u8 {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).read_volatile() }
     }
 
-    /// # Safety
-    /// `off` must be less than [`COMMON_CFG_MIN_LEN`].
-    unsafe fn w8(&self, off: usize, v: u8) {
-        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, inside the extent `CommonCfg::new` requires mapped; one byte needs no alignment.
-        unsafe { self.base.add(off).write_volatile(v) }
+    fn write8(&self, off: CommonOff<1>, v: u8) {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).write_volatile(v) }
     }
 
-    /// # Safety
-    /// `off` must be even, and `off + 2` at most [`COMMON_CFG_MIN_LEN`].
-    unsafe fn r16(&self, off: usize) -> u16 {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is 2-aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
-        unsafe { self.base.add(off).cast::<u16>().read_volatile() }
+    fn read16(&self, off: CommonOff<2>) -> u16 {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).cast::<u16>().read_volatile() }
     }
 
-    /// # Safety
-    /// `off` must be even, and `off + 2` at most [`COMMON_CFG_MIN_LEN`].
-    unsafe fn w16(&self, off: usize, v: u16) {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is 2-aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
-        unsafe { self.base.add(off).cast::<u16>().write_volatile(v) }
+    fn write16(&self, off: CommonOff<2>, v: u16) {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).cast::<u16>().write_volatile(v) }
     }
 
-    /// # Safety
-    /// `off` must be a multiple of 4, and `off + 4` at most
-    /// [`COMMON_CFG_MIN_LEN`].
-    unsafe fn r32(&self, off: usize) -> u32 {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
-        unsafe { self.base.add(off).cast::<u32>().read_volatile() }
+    fn read32(&self, off: CommonOff<4>) -> u32 {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).cast::<u32>().read_volatile() }
     }
 
-    /// # Safety
-    /// `off` must be a multiple of 4, and `off + 4` at most
-    /// [`COMMON_CFG_MIN_LEN`].
-    unsafe fn w32(&self, off: usize, v: u32) {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
-        unsafe { self.base.add(off).cast::<u32>().write_volatile(v) }
+    fn write32(&self, off: CommonOff<4>, v: u32) {
+        // SAFETY: `CommonOff` admits only an access inside the extent `CommonCfg::new` requires mapped, aligned for its width over the base that contract requires aligned.
+        unsafe { self.base.add(off.bytes()).cast::<u32>().write_volatile(v) }
     }
 
-    /// # Safety
-    /// `off` must be a multiple of 4 and `off + 8` at most
-    /// [`COMMON_CFG_MIN_LEN`]: **both** four-byte halves — `off` and `off + 4`
-    /// — are written, so the requirement covers eight bytes, not four.
-    unsafe fn w64(&self, off: usize, v: u64) {
-        // Written as two 32-bit halves, low first, matching the virtio spec's
-        // 64-bit register access rules.
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` and `base + off + 4` are both 4-aligned; `off + 8 <= COMMON_CFG_MIN_LEN` keeps both halves within the extent that same contract requires mapped.
+    fn write64(&self, off: CommonOff64, v: u64) {
+        // Two 32-bit halves, low first, matching the virtio spec's 64-bit
+        // register access rules.
+        // SAFETY: `CommonOff64` admits only an eight-byte, four-byte-aligned access inside the extent `CommonCfg::new` requires mapped, over the base that contract requires aligned, so both halves lie in it and each is aligned.
         unsafe {
-            self.base.add(off).cast::<u32>().write_volatile(v as u32);
-            self.base
-                .add(off + 4)
-                .cast::<u32>()
-                .write_volatile((v >> 32) as u32);
+            let low = self.base.add(off.bytes()).cast::<u32>();
+            low.write_volatile(v as u32);
+            low.add(1).write_volatile((v >> 32) as u32);
         }
     }
 
     /// Current device-status byte.
     #[must_use]
     pub fn status(&self) -> u8 {
-        // SAFETY: `CFG_DEVICE_STATUS` is 20, below `COMMON_CFG_MIN_LEN` — `r8`'s contract.
-        unsafe { self.r8(CFG_DEVICE_STATUS) }
+        self.read8(CFG_DEVICE_STATUS)
     }
 
     /// Overwrite the device-status byte.
     pub fn set_status(&self, value: u8) {
-        // SAFETY: `CFG_DEVICE_STATUS` is 20, below `COMMON_CFG_MIN_LEN` — `w8`'s contract.
-        unsafe { self.w8(CFG_DEVICE_STATUS, value) }
+        self.write8(CFG_DEVICE_STATUS, value);
     }
 
     /// Reset the device and poll until it acknowledges by reading back a zero
@@ -659,32 +789,25 @@ impl CommonCfg {
     /// Number of virtqueues the device offers.
     #[must_use]
     pub fn num_queues(&self) -> u16 {
-        // SAFETY: `CFG_NUM_QUEUES` is 18 — even, and `18 + 2 <= COMMON_CFG_MIN_LEN` — `r16`'s contract.
-        unsafe { self.r16(CFG_NUM_QUEUES) }
+        self.read16(CFG_NUM_QUEUES)
     }
 
     /// Read the device's 64-bit feature bitmap across both selector windows.
     #[must_use]
     pub fn device_features(&self) -> u64 {
-        // SAFETY: `CFG_DEVICE_FEATURE_SELECT` (0) and `CFG_DEVICE_FEATURE` (4) are 4-aligned, and each plus 4 is at most `COMMON_CFG_MIN_LEN` — `r32`/`w32`'s contract.
-        unsafe {
-            self.w32(CFG_DEVICE_FEATURE_SELECT, 0);
-            let low = self.r32(CFG_DEVICE_FEATURE) as u64;
-            self.w32(CFG_DEVICE_FEATURE_SELECT, 1);
-            let high = self.r32(CFG_DEVICE_FEATURE) as u64;
-            low | (high << 32)
-        }
+        self.write32(CFG_DEVICE_FEATURE_SELECT, 0);
+        let low = self.read32(CFG_DEVICE_FEATURE) as u64;
+        self.write32(CFG_DEVICE_FEATURE_SELECT, 1);
+        let high = self.read32(CFG_DEVICE_FEATURE) as u64;
+        low | (high << 32)
     }
 
     /// Write the negotiated 64-bit feature bitmap across both selector windows.
     pub fn set_driver_features(&self, features: u64) {
-        // SAFETY: `CFG_DRIVER_FEATURE_SELECT` (8) and `CFG_DRIVER_FEATURE` (12) are 4-aligned, and each plus 4 is at most `COMMON_CFG_MIN_LEN` — `w32`'s contract.
-        unsafe {
-            self.w32(CFG_DRIVER_FEATURE_SELECT, 0);
-            self.w32(CFG_DRIVER_FEATURE, features as u32);
-            self.w32(CFG_DRIVER_FEATURE_SELECT, 1);
-            self.w32(CFG_DRIVER_FEATURE, (features >> 32) as u32);
-        }
+        self.write32(CFG_DRIVER_FEATURE_SELECT, 0);
+        self.write32(CFG_DRIVER_FEATURE, features as u32);
+        self.write32(CFG_DRIVER_FEATURE_SELECT, 1);
+        self.write32(CFG_DRIVER_FEATURE, (features >> 32) as u32);
     }
 
     /// Program one virtqueue's three area addresses, placed contiguously per
@@ -709,13 +832,9 @@ impl CommonCfg {
         layout: &QueueLayout,
         ring_paddr: u64,
     ) -> Result<u16, QueueSetupError> {
-        // SAFETY: `CFG_QUEUE_SELECT` (22) and `CFG_QUEUE_SIZE` (24) are even and
-        // each plus 2 is at most `COMMON_CFG_MIN_LEN` — `w16`/`r16`'s contract.
-        let device_max = unsafe {
-            self.w16(CFG_QUEUE_SELECT, index);
-            // The device initialises queue_size to its maximum for this queue.
-            self.r16(CFG_QUEUE_SIZE)
-        };
+        self.write16(CFG_QUEUE_SELECT, index);
+        // The device initialises queue_size to its maximum for this queue.
+        let device_max = self.read16(CFG_QUEUE_SIZE);
         if device_max == 0 {
             return Err(QueueSetupError::QueueAbsent { index });
         }
@@ -738,20 +857,13 @@ impl CommonCfg {
         // region's physical address patched from `librefirewall.system`, and
         // `QueueLayout`'s offsets within it — so an overflow in these sums is a
         // build-time misconfiguration that must fail visibly, not device input.
-        // SAFETY: every offset written below is 4-aligned (`CFG_QUEUE_DESC` 32,
-        // `CFG_QUEUE_DRIVER` 40, `CFG_QUEUE_DEVICE` 48) or even
-        // (`CFG_QUEUE_SIZE` 24, `CFG_QUEUE_ENABLE` 28, `CFG_QUEUE_NOTIFY_OFF`
-        // 30), and each plus its width is at most `COMMON_CFG_MIN_LEN`, whose
-        // largest the `CFG_QUEUE_DEVICE + 8` assertion above pins. The write
-        // order (size, addresses, enable) follows the virtio spec.
-        unsafe {
-            self.w16(CFG_QUEUE_SIZE, required);
-            self.w64(CFG_QUEUE_DESC, ring_paddr + layout.descriptor_offset as u64);
-            self.w64(CFG_QUEUE_DRIVER, ring_paddr + layout.driver_offset as u64);
-            self.w64(CFG_QUEUE_DEVICE, ring_paddr + layout.device_offset as u64);
-            self.w16(CFG_QUEUE_ENABLE, 1);
-            Ok(self.r16(CFG_QUEUE_NOTIFY_OFF))
-        }
+        // The write order (size, addresses, enable) follows the virtio spec.
+        self.write16(CFG_QUEUE_SIZE, required);
+        self.write64(CFG_QUEUE_DESC, ring_paddr + layout.descriptor_offset as u64);
+        self.write64(CFG_QUEUE_DRIVER, ring_paddr + layout.driver_offset as u64);
+        self.write64(CFG_QUEUE_DEVICE, ring_paddr + layout.device_offset as u64);
+        self.write16(CFG_QUEUE_ENABLE, 1);
+        Ok(self.read16(CFG_QUEUE_NOTIFY_OFF))
     }
 }
 
@@ -995,8 +1107,8 @@ mod tests {
         // The full four-structure chain every valid-device case needs, in BAR
         // `bar` with notify multiplier 4.
         fn put_full_chain(&mut self, bar: u8) {
-            self.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-            self.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+            self.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+            self.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
             self.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, bar, 0x0000, 16);
             self.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, bar, 0x3000, 20);
             self.w32(0x50 + 16, 4);
@@ -1024,8 +1136,8 @@ mod tests {
     #[test]
     fn finds_all_virtio_structures_in_one_bar() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_VENDOR_ID as usize, VIRTIO_VENDOR_ID);
-        fake.w16(PCI_DEVICE_ID as usize, VIRTIO_NET_DEVICE_ID);
+        fake.w16(PCI_VENDOR_ID.bytes(), VIRTIO_VENDOR_ID);
+        fake.w16(PCI_DEVICE_ID.bytes(), VIRTIO_NET_DEVICE_ID);
         // common @0x40 -> notify @0x50 -> isr @0x64 -> device @0x74 -> end
         fake.put_full_chain(4);
 
@@ -1048,8 +1160,8 @@ mod tests {
         // it ever reads. A swapped offset would report the ids reversed, which
         // an all-zero or all-ones config space could not distinguish.
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_VENDOR_ID as usize, VIRTIO_VENDOR_ID);
-        fake.w16(PCI_DEVICE_ID as usize, VIRTIO_NET_DEVICE_ID);
+        fake.w16(PCI_VENDOR_ID.bytes(), VIRTIO_VENDOR_ID);
+        fake.w16(PCI_DEVICE_ID.bytes(), VIRTIO_NET_DEVICE_ID);
         assert_eq!(
             fake.config().ids(),
             (VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)
@@ -1069,8 +1181,8 @@ mod tests {
     #[test]
     fn rejects_structures_split_across_bars() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x00, VIRTIO_PCI_CAP_NOTIFY_CFG, 2, 0x3000, 20);
         assert_eq!(
@@ -1186,52 +1298,57 @@ mod tests {
     }
 
     #[test]
-    fn every_common_cfg_register_stays_aligned_over_an_aligned_base() {
-        // The run-time half of the const assertions beside the field offsets,
-        // and what makes each accessor's `SAFETY:` comment true: given a base
-        // the constructor's contract requires, every register this transport
-        // touches is naturally aligned for the width it is touched at. A
-        // transcribed offset that broke this would make the accessor comments
-        // false while every existing test still passed.
-        let fake = FakeConfig::new();
-        let base = fake.region.base() as usize;
-        assert!(base.is_multiple_of(COMMON_CFG_ALIGN), "the fixture's base");
-        for off in [
-            CFG_DEVICE_FEATURE_SELECT,
-            CFG_DEVICE_FEATURE,
-            CFG_DRIVER_FEATURE_SELECT,
-            CFG_DRIVER_FEATURE,
-            CFG_QUEUE_DESC,
-            CFG_QUEUE_DRIVER,
-            CFG_QUEUE_DEVICE,
-            CFG_QUEUE_DEVICE + 4,
-        ] {
-            assert!(
-                (base + off).is_multiple_of(align_of::<u32>()),
-                "the 32-bit register at {off} is misaligned"
-            );
-            assert!(off + 4 <= COMMON_CFG_MIN_LEN);
+    fn the_capability_pointer_keeps_the_four_byte_units_the_mask_produced() {
+        // `CapPointer` holds units rather than bytes, and that representation
+        // is what bounds every access derived from it. It must still name the
+        // same byte the discarded `& 0xfc` named, for every byte a device can
+        // supply — a shift that kept the wrong bits would walk the chain to
+        // offsets no test distinguishes from the right ones.
+        for byte in 0..=u8::MAX {
+            let pointer = CapPointer::from_device_byte(byte);
+            assert_eq!(pointer.bytes(), usize::from(byte & 0xfc), "byte {byte:#x}");
+            assert_eq!(pointer.is_end(), byte & 0xfc == 0, "byte {byte:#x}");
+            // The furthest field the walk reads must stay inside the page the
+            // accessors are bounded to, which is what `field`'s const block
+            // decides for the widest pointer rather than for this one.
+            assert!(pointer.field::<16, 4>().end() <= PCI_CONFIG_LEN);
         }
-        for off in [
-            CFG_NUM_QUEUES,
-            CFG_QUEUE_SELECT,
-            CFG_QUEUE_SIZE,
-            CFG_QUEUE_ENABLE,
-            CFG_QUEUE_NOTIFY_OFF,
-        ] {
-            assert!(
-                (base + off).is_multiple_of(align_of::<u16>()),
-                "the 16-bit register at {off} is misaligned"
-            );
-            assert!(off + 2 <= COMMON_CFG_MIN_LEN);
+    }
+
+    #[test]
+    fn a_bar_index_names_its_own_register_and_the_high_half_after_it() {
+        // The two offsets BAR programming writes, against the register layout
+        // the tests below read back by hand. An index is only a `BarIndex`
+        // after the range check, so this also pins that the check and the
+        // arithmetic agree at the boundary.
+        for index in 0..=PCI_LAST_BAR {
+            let bar = BarIndex::new(index).expect("a BAR of this function");
+            assert_eq!(bar.register().bytes(), PCI_BAR0 + usize::from(index) * 4);
+            assert!(bar.register().end() <= PCI_CONFIG_LEN);
         }
+        assert_eq!(
+            BarIndex::new(PCI_LAST_BAR + 1).err(),
+            Some(BarError::IndexOutOfRange(PCI_LAST_BAR + 1))
+        );
+        let low = BarIndex::new(PCI_LAST_BAR64_LOW_HALF).expect("a 64-bit low half");
+        assert_eq!(
+            low.high_half().map(|high| high.bytes()),
+            Ok(PCI_BAR0 + usize::from(PCI_LAST_BAR64_LOW_HALF + 1) * 4)
+        );
+        assert_eq!(
+            BarIndex::new(PCI_LAST_BAR)
+                .expect("a BAR of this function")
+                .high_half()
+                .err(),
+            Some(BarError::NoHighHalf(PCI_LAST_BAR))
+        );
     }
 
     #[test]
     fn rejects_missing_required_structures() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         // Only common and notify are present; ISR and device are absent.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x00, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
@@ -1248,8 +1365,8 @@ mod tests {
         // structure at all is still non-conforming and must be refused — the
         // presence check is what makes the shared-BAR rule cover it too.
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
         fake.w32(0x50 + 16, 4);
@@ -1263,8 +1380,8 @@ mod tests {
     #[test]
     fn rejects_a_looping_capability_chain() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         // A -> B -> A never terminates; the iteration guard must trip.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x40, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
@@ -1274,8 +1391,8 @@ mod tests {
     #[test]
     fn rejects_a_capability_naming_an_invalid_bar() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         // BAR 6 is outside the valid 0..=5 range.
         fake.put_cap(0x40, 0x00, VIRTIO_PCI_CAP_COMMON_CFG, 6, 0, 16);
         assert_eq!(find_virtio_caps(&fake.config()), Err(CapError::InvalidBar));
@@ -1295,18 +1412,18 @@ mod tests {
         // Memory decoding is on going in; a refused relocation must leave both
         // it and the CardBus-CIS pointer untouched.
         fake.w16(
-            PCI_COMMAND as usize,
+            PCI_COMMAND.bytes(),
             PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
         );
-        let cis_before = fake.r32(PCI_BAR0 as usize + 6 * 4);
+        let cis_before = fake.r32(PCI_BAR0 + 6 * 4);
         assert_eq!(
             fake.config().reprogram_bar64(caps.bar, 0x5000_0000),
             Err(BarError::NoHighHalf(5))
         );
-        assert_eq!(fake.r32(PCI_BAR0 as usize + 6 * 4), cis_before);
-        assert_eq!(fake.r32(PCI_BAR0 as usize + 5 * 4), 0);
+        assert_eq!(fake.r32(PCI_BAR0 + 6 * 4), cis_before);
+        assert_eq!(fake.r32(PCI_BAR0 + 5 * 4), 0);
         assert_eq!(
-            fake.r16(PCI_COMMAND as usize),
+            fake.r16(PCI_COMMAND.bytes()),
             PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER
         );
     }
@@ -1329,17 +1446,17 @@ mod tests {
             Err(BarError::IndexOutOfRange(6))
         );
         // Nothing was written anywhere in the header.
-        assert_eq!(fake.r32(PCI_BAR0 as usize + 6 * 4), 0);
-        assert_eq!(fake.r16(PCI_COMMAND as usize), 0);
+        assert_eq!(fake.r32(PCI_BAR0 + 6 * 4), 0);
+        assert_eq!(fake.r16(PCI_COMMAND.bytes()), 0);
     }
 
     #[test]
     fn bar_type_detects_64bit_memory_bars() {
         let mut fake = FakeConfig::new();
         // BAR4: memory (bit0=0), 64-bit (bits[2:1]=0b10), prefetchable (bit3).
-        fake.w32(PCI_BAR0 as usize + 4 * 4, 0x0000_000c);
+        fake.w32(PCI_BAR0 + 4 * 4, 0x0000_000c);
         // BAR2: 32-bit memory BAR.
-        fake.w32(PCI_BAR0 as usize + 2 * 4, 0x0000_0000);
+        fake.w32(PCI_BAR0 + 2 * 4, 0x0000_0000);
         let config = fake.config();
         assert_eq!(config.bar_is_64bit(4), Ok(true));
         assert_eq!(config.bar_is_64bit(2), Ok(false));
@@ -1351,7 +1468,7 @@ mod tests {
     fn bar_type_rejects_an_io_space_bar() {
         let mut fake = FakeConfig::new();
         // Bit 0 set marks an I/O-space BAR, which is never a 64-bit memory pair.
-        fake.w32(PCI_BAR0 as usize + 3 * 4, 0x0000_0001);
+        fake.w32(PCI_BAR0 + 3 * 4, 0x0000_0001);
         assert_eq!(fake.config().bar_is_64bit(3), Ok(false));
     }
 
@@ -1360,10 +1477,10 @@ mod tests {
         let mut fake = FakeConfig::new();
         // A device whose command register already has I/O decode (bit 0) on:
         // the call must OR in memory + bus-master and disturb nothing else.
-        fake.w16(PCI_COMMAND as usize, 0x0001);
+        fake.w16(PCI_COMMAND.bytes(), 0x0001);
         fake.config().enable_memory_and_bus_master();
         assert_eq!(
-            fake.r16(PCI_COMMAND as usize),
+            fake.r16(PCI_COMMAND.bytes()),
             0x0001 | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER
         );
     }
@@ -1374,17 +1491,17 @@ mod tests {
         // Memory + bus-master + I/O all enabled going in; the high half of the
         // BAR pair holds stale bits that must be cleared to zero.
         fake.w16(
-            PCI_COMMAND as usize,
+            PCI_COMMAND.bytes(),
             PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER | 0x0001,
         );
-        fake.w32(PCI_BAR0 as usize + 4 * 4 + 4, 0xFFFF_FFFF);
+        fake.w32(PCI_BAR0 + 4 * 4 + 4, 0xFFFF_FFFF);
         assert_eq!(fake.config().reprogram_bar64(4, 0x5000_0000), Ok(()));
         // Low half receives the address; high half is zeroed (address < 4 GiB).
-        assert_eq!(fake.r32(PCI_BAR0 as usize + 4 * 4), 0x5000_0000);
-        assert_eq!(fake.r32(PCI_BAR0 as usize + 4 * 4 + 4), 0);
+        assert_eq!(fake.r32(PCI_BAR0 + 4 * 4), 0x5000_0000);
+        assert_eq!(fake.r32(PCI_BAR0 + 4 * 4 + 4), 0);
         // Memory decode was disabled across the change and not re-enabled here;
         // the untouched bus-master and I/O bits remain.
-        let command = fake.r16(PCI_COMMAND as usize);
+        let command = fake.r16(PCI_COMMAND.bytes());
         assert_eq!(command & PCI_COMMAND_MEMORY, 0);
         assert_eq!(command & PCI_COMMAND_BUS_MASTER, PCI_COMMAND_BUS_MASTER);
         assert_eq!(command & 0x0001, 0x0001);
@@ -1397,7 +1514,7 @@ mod tests {
         cfg.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
         assert_eq!(cfg.status(), STATUS_ACKNOWLEDGE | STATUS_DRIVER);
         assert_eq!(
-            fake.r8(CFG_DEVICE_STATUS),
+            fake.r8(CFG_DEVICE_STATUS.bytes()),
             STATUS_ACKNOWLEDGE | STATUS_DRIVER
         );
     }
@@ -1405,7 +1522,7 @@ mod tests {
     #[test]
     fn common_cfg_reads_num_queues() {
         let mut fake = FakeConfig::new();
-        fake.w16(CFG_NUM_QUEUES, 2);
+        fake.w16(CFG_NUM_QUEUES.bytes(), 2);
         assert_eq!(fake.common().num_queues(), 2);
     }
 
@@ -1415,12 +1532,12 @@ mod tests {
         // The device-feature register is one 32-bit window multiplexed by the
         // select field; a plain buffer presents the same value in both windows,
         // so the assembled result is `low | (low << 32)`. The point of the test
-        // is that the read targets CFG_DEVICE_FEATURE, assembles the halves with
+        // is that the read targets CFG_DEVICE_FEATURE.bytes(), assembles the halves with
         // the high word shifted, and leaves the selector advanced to window 1.
-        fake.w32(CFG_DEVICE_FEATURE, 0xDEAD_BEEF);
+        fake.w32(CFG_DEVICE_FEATURE.bytes(), 0xDEAD_BEEF);
         let features = fake.common().device_features();
         assert_eq!(features, 0xDEAD_BEEF | (0xDEAD_BEEF << 32));
-        assert_eq!(fake.r32(CFG_DEVICE_FEATURE_SELECT), 1);
+        assert_eq!(fake.r32(CFG_DEVICE_FEATURE_SELECT.bytes()), 1);
     }
 
     #[test]
@@ -1430,8 +1547,8 @@ mod tests {
         // The write sequence ends with the high window selected and the high
         // 32 bits in the feature register; a swapped half-order or a wrong
         // offset changes this observable final state.
-        assert_eq!(fake.r32(CFG_DRIVER_FEATURE_SELECT), 1);
-        assert_eq!(fake.r32(CFG_DRIVER_FEATURE), 0x1122_3344);
+        assert_eq!(fake.r32(CFG_DRIVER_FEATURE_SELECT.bytes()), 1);
+        assert_eq!(fake.r32(CFG_DRIVER_FEATURE.bytes()), 0x1122_3344);
     }
 
     #[test]
@@ -1439,48 +1556,48 @@ mod tests {
         let mut fake = FakeConfig::new();
         // The device advertises a queue max at least as large as our layout and
         // a notify offset the driver must return unchanged.
-        fake.w16(CFG_QUEUE_SIZE, 32);
-        fake.w16(CFG_QUEUE_NOTIFY_OFF, 7);
+        fake.w16(CFG_QUEUE_SIZE.bytes(), 32);
+        fake.w16(CFG_QUEUE_NOTIFY_OFF.bytes(), 7);
         let layout = layout16();
         let ring_paddr = 0x5000_0000u64;
         let notify_off = fake.common().setup_queue(1, &layout, ring_paddr);
 
         assert_eq!(notify_off, Ok(7));
-        assert_eq!(fake.r16(CFG_QUEUE_SELECT), 1);
+        assert_eq!(fake.r16(CFG_QUEUE_SELECT.bytes()), 1);
         // The driver clamps the programmed size to its own layout, not the
         // device's larger maximum.
-        assert_eq!(fake.r16(CFG_QUEUE_SIZE), 16);
+        assert_eq!(fake.r16(CFG_QUEUE_SIZE.bytes()), 16);
         // The three area addresses are written as 64-bit values, low half first,
         // at their contiguous offsets from the ring base.
         assert_eq!(
-            fake.r64(CFG_QUEUE_DESC),
+            fake.r64(CFG_QUEUE_DESC.bytes()),
             ring_paddr + layout.descriptor_offset as u64
         );
         assert_eq!(
-            fake.r64(CFG_QUEUE_DRIVER),
+            fake.r64(CFG_QUEUE_DRIVER.bytes()),
             ring_paddr + layout.driver_offset as u64
         );
         assert_eq!(
-            fake.r64(CFG_QUEUE_DEVICE),
+            fake.r64(CFG_QUEUE_DEVICE.bytes()),
             ring_paddr + layout.device_offset as u64
         );
-        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 1);
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE.bytes()), 1);
     }
 
     #[test]
     fn setup_queue_rejects_a_zero_device_queue_size() {
         let mut fake = FakeConfig::new();
         // A device-reported max of 0 means the queue does not exist.
-        fake.w16(CFG_QUEUE_SIZE, 0);
+        fake.w16(CFG_QUEUE_SIZE.bytes(), 0);
         assert_eq!(
             fake.common().setup_queue(3, &layout16(), 0x5000_0000),
             Err(QueueSetupError::QueueAbsent { index: 3 })
         );
         // Nothing was programmed: the queue is left disabled and no ring
         // address was handed to the device.
-        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 0);
-        assert_eq!(fake.r64(CFG_QUEUE_DESC), 0);
-        assert_eq!(fake.r16(CFG_QUEUE_SIZE), 0);
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE.bytes()), 0);
+        assert_eq!(fake.r64(CFG_QUEUE_DESC.bytes()), 0);
+        assert_eq!(fake.r16(CFG_QUEUE_SIZE.bytes()), 0);
     }
 
     #[test]
@@ -1488,7 +1605,7 @@ mod tests {
         let mut fake = FakeConfig::new();
         // The device offers only 8 descriptors; programming 16 is a protocol
         // violation the driver must refuse.
-        fake.w16(CFG_QUEUE_SIZE, 8);
+        fake.w16(CFG_QUEUE_SIZE.bytes(), 8);
         assert_eq!(
             fake.common().setup_queue(0, &layout16(), 0x5000_0000),
             Err(QueueSetupError::QueueTooSmall {
@@ -1497,10 +1614,10 @@ mod tests {
                 required: 16,
             })
         );
-        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 0);
-        assert_eq!(fake.r64(CFG_QUEUE_DESC), 0);
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE.bytes()), 0);
+        assert_eq!(fake.r64(CFG_QUEUE_DESC.bytes()), 0);
         // The device's own advertised maximum is left in place, unprogrammed.
-        assert_eq!(fake.r16(CFG_QUEUE_SIZE), 8);
+        assert_eq!(fake.r16(CFG_QUEUE_SIZE.bytes()), 8);
     }
 
     #[test]
@@ -1509,7 +1626,7 @@ mod tests {
         // device input, but it must not be truncated into a size the device
         // would then read a shorter ring for than the driver publishes into.
         let mut fake = FakeConfig::new();
-        fake.w16(CFG_QUEUE_SIZE, u16::MAX);
+        fake.w16(CFG_QUEUE_SIZE.bytes(), u16::MAX);
         let layout = QueueLayout {
             size: usize::from(u16::MAX) + 1,
             descriptor_offset: 0,
@@ -1525,19 +1642,19 @@ mod tests {
                 required: usize::from(u16::MAX) + 1,
             })
         );
-        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 0);
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE.bytes()), 0);
     }
 
     #[test]
     fn setup_queue_accepts_a_device_max_exactly_equal_to_the_layout() {
         let mut fake = FakeConfig::new();
-        fake.w16(CFG_QUEUE_SIZE, 16);
-        fake.w16(CFG_QUEUE_NOTIFY_OFF, 2);
+        fake.w16(CFG_QUEUE_SIZE.bytes(), 16);
+        fake.w16(CFG_QUEUE_NOTIFY_OFF.bytes(), 2);
         assert_eq!(
             fake.common().setup_queue(0, &layout16(), 0x5000_0000),
             Ok(2)
         );
-        assert_eq!(fake.r16(CFG_QUEUE_ENABLE), 1);
+        assert_eq!(fake.r16(CFG_QUEUE_ENABLE.bytes()), 1);
     }
 
     #[test]
@@ -1545,9 +1662,9 @@ mod tests {
         let mut fake = FakeConfig::new();
         // The status byte is already zero (a fresh device), so the reset writes
         // zero and observes the acknowledgement immediately without polling.
-        fake.w8(CFG_DEVICE_STATUS, 0);
+        fake.w8(CFG_DEVICE_STATUS.bytes(), 0);
         assert_eq!(fake.common().reset(), Ok(()));
-        assert_eq!(fake.r8(CFG_DEVICE_STATUS), 0);
+        assert_eq!(fake.r8(CFG_DEVICE_STATUS.bytes()), 0);
     }
 
     #[test]
@@ -1739,8 +1856,8 @@ mod tests {
     #[test]
     fn ignores_a_notify_capability_that_is_too_short() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         // A notify cap needs at least 20 bytes (it carries the multiplier); a
         // 16-byte one is not accepted, leaving notify absent.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
@@ -1756,8 +1873,8 @@ mod tests {
     #[test]
     fn keeps_the_first_of_a_duplicated_capability_type() {
         let mut fake = FakeConfig::new();
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
         // Two common caps: `get_or_insert` keeps the first offset seen.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x1111, 16);
         fake.put_cap(0x50, 0x60, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x2222, 16);
@@ -1784,8 +1901,8 @@ mod tests {
         let mut fake = FakeConfig::new();
         // The status bit claims a capability list, but the pointer is null: the
         // walk visits nothing and every required structure is absent.
-        fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x00);
+        fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+        fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x00);
         assert_eq!(
             find_virtio_caps(&fake.config()),
             Err(CapError::MissingStructure)
@@ -1813,8 +1930,8 @@ mod tests {
             // walk actually traverses on roughly half the cases; every byte it
             // then reads is still arbitrary.
             let status = if cap_list { PCI_STATUS_CAP_LIST } else { 0 };
-            fake.w16(PCI_STATUS as usize, status);
-            fake.w8(PCI_CAPABILITIES_PTR as usize, cap_pointer);
+            fake.w16(PCI_STATUS.bytes(), status);
+            fake.w8(PCI_CAPABILITIES_PTR.bytes(), cap_pointer);
             let config = fake.config();
             if let Ok(caps) = find_virtio_caps(&config) {
                 prop_assert!(caps.bar <= PCI_LAST_BAR);
@@ -1847,8 +1964,8 @@ mod tests {
             multiplier in any::<u32>(),
         ) {
             let mut fake = FakeConfig::new();
-            fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-            fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
+            fake.w16(PCI_STATUS.bytes(), PCI_STATUS_CAP_LIST);
+            fake.w8(PCI_CAPABILITIES_PTR.bytes(), 0x40);
             let slots = [0x40usize, 0x50, 0x64, 0x74];
             for (index, at) in slots.iter().enumerate() {
                 // The last capability's `next` is perturbed like the rest, so a
@@ -1943,7 +2060,7 @@ mod tests {
             let at = common as usize;
             // A device maximum the queue programming can act on, so the 64-bit
             // ring-address writes are reached rather than short-circuited.
-            window.write(at + CFG_QUEUE_SIZE, queue_max.to_le_bytes());
+            window.write(at + CFG_QUEUE_SIZE.bytes(), queue_max.to_le_bytes());
             // SAFETY: a live, page-aligned `WINDOW_BYTES`-byte region owned by this test; `caps.within(WINDOW_BYTES)` was just checked, so `COMMON_CFG_MIN_LEN` bytes from `base + common` lie inside it, and `caps.common_is_aligned()` over a page-aligned base makes that address `COMMON_CFG_ALIGN`-aligned — `CommonCfg::new`'s contract in both halves.
             let cfg = unsafe { CommonCfg::new(window.base().add(at)) };
             // Every accessor width the transport uses: 8, 16, 32, and the

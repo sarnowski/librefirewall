@@ -44,13 +44,15 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "xtask",
 ];
 
-/// The six library crates held to the coverage floor: the portable `no_std`
-/// logic the firewall is built from. The binary/tool crates are excluded for
-/// two different reasons. The PD adapters are thin and only observable under
-/// seL4, so the QEMU gate covers them instead. `xtask` is build orchestration
-/// rather than shipped firewall logic — none of it runs on a deployed
-/// appliance — so it is host-tested to keep the build honest, not held to a
-/// coverage number defending the product.
+/// The library crates held to the coverage floor: the portable `no_std` logic
+/// the firewall is built from.
+///
+/// Its exact complement over the workspace is `tests::COVERAGE_EXCLUSIONS`,
+/// which records for every remaining member the AGENTS.md TEST-3 reason that
+/// admits leaving it out — and, where that reason does not cover the whole of
+/// the member, the part it does not. A test in that module holds the two to
+/// partitioning the workspace, so a member in neither fails the build rather
+/// than going quietly unmeasured.
 const LIBRARY_PACKAGES: &[&str] = &[
     "wire",
     "queue",
@@ -524,6 +526,96 @@ pub(crate) fn clean(root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Why a workspace member is outside the [`LIBRARY_PACKAGES`] coverage
+    /// floor.
+    ///
+    /// AGENTS.md TEST-3 closes the set of admissible reasons, so the reason is
+    /// this enum rather than free prose: an exclusion that cannot name one of
+    /// these variants is not an exclusion, and the check below refuses it.
+    /// Only the two reasons this workspace uses are declared — TEST-3's third
+    /// (a test or benchmark harness) owns no member of its own here, because
+    /// the criterion benches live inside crates that are themselves floored.
+    enum CoverageExclusion {
+        /// TEST-3 reason (1): a protection-domain adapter, which no host
+        /// command can measure because it does not build for the host.
+        ///
+        /// Reason (1) holds only when the exclusion "names the QEMU test that
+        /// covers it instead", so that clause is a field and not a sentence
+        /// someone may forget to write. `qemu_evidence` names the covering
+        /// command and what it asserts; `residue` names the adapter code that
+        /// evidence does NOT reach. `None` claims the evidence covers the
+        /// whole adapter — a claim made deliberately, never by omission.
+        OnlyObservableUnderSel4 {
+            qemu_evidence: &'static str,
+            residue: Option<&'static str>,
+        },
+        /// TEST-3 reason (2): build orchestration. None of it runs on a
+        /// deployed appliance, so it is host-tested to keep the build honest
+        /// rather than held to a number defending the product.
+        BuildOrchestration,
+    }
+
+    /// The xtask commands a reason (1) exclusion may cite: the only two that
+    /// boot a real image and judge it by a machine-observable contract.
+    /// Requiring the evidence to name one is what separates it from "the QEMU
+    /// gate covers it", which names nothing and can be written about anything.
+    const QEMU_TESTS: &[&str] = &["test-system", "test-ab"];
+
+    /// Every workspace member outside the coverage floor, with the TEST-3
+    /// reason admitting it — the exact complement of [`LIBRARY_PACKAGES`].
+    ///
+    /// The pair is what makes "excluded" a decision someone recorded rather
+    /// than a consequence of the directory a crate happens to sit in.
+    const COVERAGE_EXCLUSIONS: &[(&str, CoverageExclusion)] = &[
+        (
+            "nic-driver",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
+                                forwarding contract — a frame injected into each virtio port \
+                                must egress byte-identical on the other — which no frame can \
+                                satisfy unless this domain's whole bring-up ran against the \
+                                device (identify, place_bar, map, acknowledge, \
+                                negotiate_features, configure_queues, go_live) and then primed \
+                                and polled. `xtask test-ab` re-asserts the same contract on the \
+                                slot it selected in six of its eight scenarios.",
+                residue: Some(
+                    "`PipelineDmaBase::new`'s rejecting branches and the `StartupError` console \
+                     path are reached by no QEMU test: every scenario boots the one correct \
+                     system description, so the patched `rx_pipe_paddr`/`tx_pipe_paddr` are \
+                     always valid and only the accepting branch runs. That is the LAY-2 \
+                     layering defect the crate header already records — first-party decision \
+                     logic sitting in a PD, where neither the host floor nor the QEMU gate can \
+                     reach it — and not a covered path. Closing it means moving the newtype \
+                     into `pd_runtime`, beside the `MAPPING_ALIGN` and `REGION_SIZE` it checks \
+                     against, and having `DataplanePort::attach` take it, which puts the check \
+                     under the host coverage floor.",
+                ),
+            },
+        ),
+        (
+            "forwarder",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
+                                forwarding contract in both directions at once; a frame \
+                                egresses on the opposite port only if this domain attached both \
+                                pipelines in `init` and moved the descriptor in `notified`, \
+                                which is every statement it has. `xtask test-ab` re-asserts it \
+                                on the selected slot in six of its eight scenarios.",
+                residue: None,
+            },
+        ),
+        ("xtask", CoverageExclusion::BuildOrchestration),
+    ];
+
+    /// The recorded reason `package` sits outside the coverage floor, or
+    /// `None` when no exclusion names it.
+    fn coverage_exclusion(package: &str) -> Option<&'static CoverageExclusion> {
+        COVERAGE_EXCLUSIONS
+            .iter()
+            .find(|(name, _)| *name == package)
+            .map(|(_, reason)| reason)
+    }
+
     /// The `(package name, directory)` of every member the root workspace
     /// manifest declares. The name is read from the member's own manifest
     /// rather than taken from its directory, because the package lists in this
@@ -559,60 +651,173 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn every_workspace_member_is_linted() {
-        // What this closes: the gate's lint coverage is exactly these lists,
-        // because `default-members` makes an unqualified cargo invocation see
-        // almost nothing (see the module header). A crate added to the
-        // workspace and forgotten here would be unlinted — and, under
-        // `crates/`, also untested and unmeasured — while the gate stayed
-        // green. Reviewing a list against a manifest is precisely the kind of
-        // check that gets skipped, so it is a build failure instead.
-        let root = crate::util::workspace_root().expect("the workspace root");
-        let members = workspace_members(&root);
+    /// Guard against a manifest parse that silently produced almost nothing:
+    /// every check below is a loop over the members, so an empty or truncated
+    /// parse would pass them all while examining nothing.
+    fn members_of_the_whole_workspace(root: &Path) -> Vec<(String, String)> {
+        let members = workspace_members(root);
         assert!(
             members.len() >= 3,
             "the manifest parse produced {members:?}, which cannot be the whole workspace"
         );
+        members
+    }
 
-        for (name, directory) in &members {
+    #[test]
+    fn every_member_is_built_for_exactly_one_of_the_host_and_sel4() {
+        // What this closes: the gate's build and lint coverage is exactly
+        // these two lists, because `default-members` makes an unqualified
+        // cargo invocation see almost nothing (see the module header). A
+        // member in neither list is never compiled by any gate command while
+        // the gate stays green.
+        //
+        // Membership of the lists — not the member's directory — is what
+        // decides which side it belongs to, so the classification is total
+        // over the workspace by construction: there is no directory to add a
+        // crate under that would place it outside both questions.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        for (name, directory) in members_of_the_whole_workspace(&root) {
             let package = name.as_str();
-            if directory.starts_with("crates/") {
-                assert!(
-                    HOST_TEST_PACKAGES.contains(&package),
-                    "{directory} is not in HOST_TEST_PACKAGES, so it is never built, tested or \
-                     linted by the gate"
-                );
-                assert!(
-                    LIBRARY_PACKAGES.contains(&package),
-                    "{directory} is not in LIBRARY_PACKAGES, so no coverage floor defends it"
-                );
-            } else if directory.starts_with("pds/") {
-                assert!(
-                    image::SYSTEM_PDS.contains(&package),
-                    "{directory} is not in SYSTEM_PDS, so it is neither assembled into the image \
-                     nor linted for the seL4 target"
-                );
-                assert!(
-                    !HOST_TEST_PACKAGES.contains(&package),
-                    "{directory} is a protection domain and does not build for the host"
-                );
-            } else {
-                assert!(
-                    HOST_TEST_PACKAGES.contains(&package),
-                    "{directory} is in the workspace but in no lint list"
-                );
+            match (
+                HOST_TEST_PACKAGES.contains(&package),
+                image::SYSTEM_PDS.contains(&package),
+            ) {
+                (true, false) | (false, true) => {}
+                (false, false) => panic!(
+                    "{directory} ({package}) is a workspace member that no build list names. \
+                     HOST_TEST_PACKAGES does not, so no host command builds, tests or lints it; \
+                     SYSTEM_PDS does not, so it is neither assembled into the image nor linted \
+                     for the seL4 target. Add it to HOST_TEST_PACKAGES, or — if it is a \
+                     protection domain, which does not build for the host — to SYSTEM_PDS."
+                ),
+                (true, true) => panic!(
+                    "{directory} ({package}) is in both HOST_TEST_PACKAGES and SYSTEM_PDS. A \
+                     protection domain does not build for the host, so the two are exclusive: \
+                     remove it from whichever describes it wrongly."
+                ),
             }
         }
+    }
 
+    #[test]
+    fn every_member_is_coverage_floored_or_excluded_for_a_stated_reason() {
+        // What this closes: TEST-3 admits an exclusion only for a reason on
+        // its closed list, so every member is either inside the floor or named
+        // by an exclusion carrying one.
+        //
+        // Both questions are answered from the lists and never from the
+        // member's directory, because a directory-keyed partition cannot be
+        // total: it matches the directories someone thought of and needs a
+        // fallback for the rest, and whatever that fallback does not demand is
+        // an exclusion no one states. A library crate outside `crates/` is
+        // then linted and host-tested with no coverage floor and no recorded
+        // reason — green, and exempt. Keyed off the lists there is no such
+        // fallback, and no directory to add that reaches one.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        for (name, directory) in members_of_the_whole_workspace(&root) {
+            let package = name.as_str();
+            match (
+                LIBRARY_PACKAGES.contains(&package),
+                coverage_exclusion(package),
+            ) {
+                (true, None) => {}
+                (false, Some(reason)) => assert_reason_is_stated(package, reason),
+                (false, None) => panic!(
+                    "{directory} ({package}) is a workspace member no coverage decision names: \
+                     absent from LIBRARY_PACKAGES, and absent from COVERAGE_EXCLUSIONS. It is \
+                     therefore built and linted while no coverage floor defends it and no \
+                     reason is recorded for that — exactly the unstated exclusion TEST-3 \
+                     forbids. Either add it to LIBRARY_PACKAGES, or give it a \
+                     COVERAGE_EXCLUSIONS entry naming its reason from TEST-3's closed list."
+                ),
+                (true, Some(_)) => panic!(
+                    "{directory} ({package}) is in LIBRARY_PACKAGES and is also excluded by \
+                     COVERAGE_EXCLUSIONS. It cannot be both held to the floor and outside it: \
+                     drop whichever of the two is wrong."
+                ),
+            }
+        }
+    }
+
+    /// Hold a recorded exclusion to actually stating its reason, rather than
+    /// merely selecting a variant. TEST-3's reason (1) is only satisfied when
+    /// the exclusion names the QEMU test covering the member instead, so an
+    /// evidence string that names neither QEMU command is the same defect as
+    /// no evidence at all.
+    fn assert_reason_is_stated(package: &str, reason: &CoverageExclusion) {
+        let CoverageExclusion::OnlyObservableUnderSel4 {
+            qemu_evidence,
+            residue,
+        } = reason
+        else {
+            // Reason (2) is complete in the variant: nothing runs on a
+            // deployed appliance, so there is no covering test to name.
+            return;
+        };
+        assert!(
+            QEMU_TESTS.iter().any(|test| qemu_evidence.contains(test)),
+            "{package} is excluded under TEST-3 reason (1), which holds only when the exclusion \
+             names the QEMU test that covers it instead, but its evidence names none of \
+             {QEMU_TESTS:?}: {qemu_evidence:?}"
+        );
+        if let Some(residue) = residue {
+            assert!(
+                residue.contains("LAY-2"),
+                "{package} admits adapter code its QEMU evidence does not reach. That is \
+                 first-party logic in a PD that neither the host floor nor the QEMU gate can \
+                 measure — the layering defect LAY-2 names — and the admission must say so \
+                 rather than read as an accepted exclusion: {residue:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crate_with_benchmarks_is_benched_and_a_benched_crate_has_them() {
+        // BENCH_PACKAGES was the one package list nothing validated: a crate
+        // that grew a `benches/` and was left off it is never benched, and the
+        // measurement TEST-11 asks for silently does not happen. Both
+        // directions are one comparison, because the directory on disk is the
+        // whole truth about whether a crate has benchmarks.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        for (name, directory) in members_of_the_whole_workspace(&root) {
+            let package = name.as_str();
+            match (
+                root.join(&directory).join("benches").is_dir(),
+                BENCH_PACKAGES.contains(&package),
+            ) {
+                (true, true) | (false, false) => {}
+                (true, false) => panic!(
+                    "{directory} has a benches/ directory but {package} is not in \
+                     BENCH_PACKAGES, so `xtask bench` never runs those benchmarks and a \
+                     regression in them is invisible (TEST-11). Add it, or delete the \
+                     benchmarks nothing runs."
+                ),
+                (false, true) => panic!(
+                    "{package} is in BENCH_PACKAGES but {directory}/benches does not exist, so \
+                     `cargo bench -p {package}` measures nothing and the list overstates what \
+                     the command covers."
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn no_package_list_names_a_non_member() {
         // The reverse direction, so a package removed from the workspace but
         // left in a list fails here rather than as a confusing cargo error in
-        // the middle of the gate.
+        // the middle of the gate. Every list this module drives a command or a
+        // decision from participates, COVERAGE_EXCLUSIONS included: an
+        // exclusion for a package that no longer exists is a reason defending
+        // nothing.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        let members = members_of_the_whole_workspace(&root);
         let declared: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
         for package in HOST_TEST_PACKAGES
             .iter()
             .chain(LIBRARY_PACKAGES)
             .chain(image::SYSTEM_PDS)
+            .chain(BENCH_PACKAGES)
+            .chain(COVERAGE_EXCLUSIONS.iter().map(|(name, _)| name))
         {
             assert!(
                 declared.contains(package),
