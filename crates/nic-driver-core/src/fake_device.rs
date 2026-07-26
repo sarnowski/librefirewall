@@ -5,9 +5,9 @@
 //! host memory reads back exactly what was written, so a device that refuses a
 //! reset, clears `FEATURES_OK`, offers one virtqueue, or names an unusable
 //! doorbell slot cannot be expressed at all — and neither can "was the doorbell
-//! rung before or after `DRIVER_OK`". This type is the other implementation of
-//! [`VirtioDevice`](crate::bringup::VirtioDevice): it answers as a device
-//! chooses to and appends every driver action to a shared [`Log`], so a test
+//! rung before or after `DRIVER_OK`". This type implements
+//! [`VirtioDevice`](crate::bringup::VirtioDevice) as a device *chooses* to
+//! answer, and appends every driver action to a shared [`Log`], so a test
 //! asserts the sequence rather than the end state.
 //!
 //! It models the *authority a device has* — any feature bitmap, any queue

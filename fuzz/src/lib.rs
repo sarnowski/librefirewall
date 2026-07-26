@@ -8,7 +8,7 @@
 //!
 //! | module | surface under test | adversary |
 //! |---|---|---|
-//! | [`virtio_pci`] | `virtio::pci` capability walk and BAR bounds | a hostile or malfunctioning device |
+//! | [`virtio_pci`] | `virtio::pci` capability walk and BAR bounds, and the `nic_driver_core` bring-up typestate above them | a hostile or malfunctioning device |
 //! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
 //! | [`spsc_ring`] | `queue::SpscRing` cursors and slots | a byzantine neighbour PD |
@@ -83,16 +83,22 @@
 //!   an adversary may ask for, and it leaves the decision boundary covered from
 //!   both sides with room to spare.
 //!
-//! # A blind spot that is not a limit of this workspace
+//! # Answering inside the call, not only between calls
 //!
-//! [`virtio_pci`] cannot express three device behaviours — a reset that is
-//! never acknowledged, a device that clears `FEATURES_OK` on readback, and a
-//! feature bitmap whose two halves differ. Each needs a device that answers
-//! *within* one driver call, `nic_driver_core::bringup::VirtioDevice` is the
-//! seam built for exactly that, and the only constructor that admits a foreign
-//! implementation of it is `#[cfg(test)] pub(crate)`. That is a defect in
-//! `crates/nic-driver-core` rather than a harness choice, and it is recorded in
-//! that module's header rather than papered over here.
+//! Three device behaviours are a disagreement *within* one driver call — a
+//! reset that is never acknowledged, a `FEATURES_OK` cleared on readback, and a
+//! feature bitmap whose two halves differ — so none of them is expressible
+//! against a window of plain RAM, however the bytes in it are chosen.
+//! `nic_driver_core::bringup::VirtioDevice` is the seam built for exactly that,
+//! and [`virtio_pci`] holds an implementation of it that answers every access
+//! from its own run of the fuzzer's bytes at the moment the driver asks. The
+//! whole bring-up typestate is driven over it, so those three and the two
+//! refusals that only a *second* virtqueue can carry are ordinary inputs.
+//!
+//! It is deterministic rather than threaded, for the same reason
+//! [`ring_abi`]'s per-word peer stores are: a second thread writing the words
+//! the code under test is reading would be a data race the harness
+//! manufactured itself, and the finding would be the harness's.
 //!
 //! # Two ways to run
 //!

@@ -436,17 +436,19 @@ pub struct Offered<D> {
     device: D,
 }
 
-/// Wrap an already-reachable device in the first handshake state.
-///
-/// Test-only, and deliberately not a public constructor: on a real device
-/// "reachable" means the BAR has been relocated and mapped, which is what
-/// [`PlacedBar::map`] establishes. A stand-in device needs none of that.
-#[cfg(test)]
-pub(crate) fn offered<D: VirtioDevice>(device: D) -> Offered<D> {
-    Offered { device }
-}
-
 impl<D: VirtioDevice> Offered<D> {
+    /// Wrap an already-reachable device in the first handshake state.
+    ///
+    /// Public, and no wider than the surrounding types already are: `D` is any
+    /// [`VirtioDevice`], and the one implementation that reaches real MMIO —
+    /// [`MappedDevice`] — has no constructor outside this crate, so what this
+    /// admits is a stand-in. Withholding it left the refusal branches the seam
+    /// exists for reachable by this crate's own tests and by nothing else.
+    #[must_use]
+    pub fn new(device: D) -> Self {
+        Self { device }
+    }
+
     /// Reset the device, then tell it the driver has noticed it and knows how
     /// to drive it (`ACKNOWLEDGE`, then `ACKNOWLEDGE | DRIVER`).
     ///
@@ -810,7 +812,7 @@ mod tests {
 
     /// Run the whole handshake against `device`, from [`Offered`] to [`Live`].
     fn bring_up(device: FakeDevice) -> Result<Live<FakeDevice>, BringUpError> {
-        Ok(Offered { device }
+        Ok(Offered::new(device)
             .acknowledge()?
             .negotiate_features()?
             .configure_queues(0x3000_0000)?
@@ -1150,7 +1152,7 @@ mod tests {
         for paddr in [0u64, 0x3000_0800, u64::MAX] {
             let log = Log::new();
             let device = FakeDevice::conforming(&log);
-            let negotiated = Offered { device }
+            let negotiated = Offered::new(device)
                 .acknowledge()
                 .unwrap()
                 .negotiate_features()

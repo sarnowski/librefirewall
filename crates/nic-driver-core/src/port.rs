@@ -214,7 +214,7 @@ impl<'ring> DataplanePort<'ring> {
 mod tests {
     use super::*;
     use crate::InvariantFaults;
-    use crate::bringup::{RX_QUEUE, TX_QUEUE, offered};
+    use crate::bringup::{Offered, RX_QUEUE, TX_QUEUE};
     use crate::fake_device::{Event, FakeDevice, Log};
     use core::sync::atomic::{Ordering, fence};
     use pd_runtime::{
@@ -319,7 +319,7 @@ mod tests {
         /// virtqueue primed exactly as a driver protection domain does.
         fn new() -> Self {
             let log = Log::new();
-            let configured = offered(FakeDevice::conforming(&log))
+            let configured = Offered::new(FakeDevice::conforming(&log))
                 .acknowledge()
                 .expect("a conforming device acknowledges")
                 .negotiate_features()
