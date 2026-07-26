@@ -1,17 +1,15 @@
 # librefirewall monitoring contract
 
 This document is the **operator's interface to librefirewall**. Because the appliance has no shell
-and no CLI (CONCEPT.md §11), the console, the OpenTelemetry log stream, and the Prometheus metrics
-endpoint are the *only* windows into a running node — together they are the complete, sufficient
-surface for building dashboards, alerts, and analysis, and for debugging an incident. This file
-defines what that surface contains and how to interpret it, so an operator can rely on it as a
-stable contract.
+and no CLI (CONCEPT.md §11), the console, the OpenTelemetry log stream, and the `GET /metrics`,
+`GET /logs` and `GET /config` endpoints are the *only* windows into a running node — together they
+are the complete, sufficient surface for building dashboards, alerts, and analysis, and for
+debugging an incident. This file defines what that surface contains and how to interpret it, so an
+operator can rely on it as a stable contract.
 
-> **Status.** This document defines the monitoring contract and its conventions. The conventions
-> below are settled and binding. The concrete inventories — the exact console events, log records,
-> and metric names — are **populated as each signal is implemented**; a section marked *“None
-> implemented yet”* states the current truth, not a gap in this contract. Any change to an exposed
-> signal updates this document in the same change (AGENTS.md).
+> **Status.** The conventions below are settled and binding. The concrete inventories — the exact
+> console events, log records, and metric names — are populated as each signal is implemented; a
+> section marked *“None implemented yet”* states the current truth of the contract, not a gap in it.
 
 ## The four surfaces, and the complete-state principle
 
@@ -65,42 +63,47 @@ address reconfigured, or a configuration version applied. It is about firewall *
 traffic or user interactions except where those trigger a system-state change.
 
 **Event inventory:** *None finalized yet.* The current build emits ad-hoc bring-up markers on the
-serial console; these are pre-contract diagnostics and are superseded by the structured system-state
-events defined here as the observability implementation lands.
-
-The pre-contract markers are listed so an operator reading a serial console today knows exactly what
-the five of them are, and so their eventual replacement is a visible change rather than a silent
-one. All are system state; none is traffic. The two that were per-frame — a first-frame-forwarded
-announcement and a dropped-transmit-descriptor notice — have been removed, because a per-packet
-event on the console violates the surface's contract. Dropped frames are counted in memory instead,
-awaiting the metrics endpoint.
+serial console. These five are pre-contract diagnostics: they are not a stable interface and are
+superseded by the structured system-state events defined here. All are system state, and each is
+emitted at most once per protection domain, during start-up; none is traffic — no per-frame or
+per-packet event appears on this surface, and dropped frames are counted in memory instead (see
+*Prometheus metrics*).
 
 | marker | protection domain | when |
 |---|---|---|
 | `LIBREFIREWALL_FWD:start` | forwarder | the domain has attached to both pipelines |
 | `LIBREFIREWALL_NIC:driver:start` | nic-driver (once per port) | bring-up begins |
-| `LIBREFIREWALL_NIC:features negotiated=<mask>` | nic-driver | the device accepted the feature set |
+| `LIBREFIREWALL_NIC:features negotiated=0x<hex>` | nic-driver | the device accepted the feature set |
 | `LIBREFIREWALL_NIC:driver-ok rx-posted=<n>` | nic-driver | the device is live with its receive queue primed |
-| `LIBREFIREWALL_NIC:fail error=<BringUpError> signalled=<bool>` | nic-driver | bring-up was refused; the domain parks |
+| `LIBREFIREWALL_NIC:fail error=<StartupError> signalled=<true\|false>` | nic-driver | start-up was refused; the domain parks |
 
-The failure marker carries the whole reason rather than a summary — every `BringUpError` variant
-carries the value that caused it — because with no shell and no CLI this line is all an operator
-gets. `signalled` says whether the device was told to stop (`STATUS_FAILED` written) or was left
-decoding nothing, which depends on whether its BAR had been placed when the rejection happened.
+`error=` carries the whole reason rather than a summary, rendered as Rust's `Debug` form — so
+integer fields read in **decimal**, including PCI vendor and device ids. It has exactly two shapes:
+
+- `error=Device(<BringUpError>)` — the device refused bring-up, or build data programmed into it was
+  rejected. The inner variant names the fault and carries the value that caused it, e.g.
+  `error=Device(NotVirtioNet { vendor: …, device: … })`.
+- `error=PipelineDmaBaseUnusable { region: Receive|Transmit, paddr: <n> }` — the pipeline DMA base
+  the build patched in cannot be used: `paddr: 0` means the region's `setvar` is missing or
+  misspelled in the system description, any other value means it is misaligned or would place the
+  region off the end of the address space. This shape is always `signalled=false`.
+
+`signalled` says whether the device was told to stop (`STATUS_FAILED` written) or was left decoding
+nothing, which depends on whether its BAR had been placed when the rejection happened.
 
 ### Boot-manager records (pre-kernel)
 
 Before seL4 starts, the boot manager writes its slot-selection decisions to the same serial console
 in a **structured, closed-vocabulary** form. This is a contract, not a diagnostic: it is the only
-signal that says which slot is running, and it is what the A/B system tests assert against.
+signal that says which slot is running.
 
 ```
 LFW-BOOT slot=<A|B|none> state=<confirmed|trying|rejected|exhausted|unpersisted|bad-order|halted>
 ```
 
-One record per decision, in decision order. The state set is closed; adding, renaming or reordering
-one is a contract change. The human-readable `librefirewall: …` lines printed beside each record are
-prose and carry no contract — a reader (or a test) must key on the `LFW-BOOT ` prefix alone.
+One record per decision, in decision order; the seven states above are the complete set. The
+human-readable `librefirewall: …` lines printed beside each record are prose and carry no contract —
+a reader must key on the `LFW-BOOT ` prefix alone.
 
 ## OpenTelemetry logs
 
@@ -159,7 +162,6 @@ debug dump, scrapably and without degrading the dataplane.
 **Coverage intent:** every internal queue, buffer pool, and ring; per-NIC and per-core counters;
 dataplane verdict and throughput counters; connection/flow-table occupancy and limits; the local log
 buffer's occupancy and drop count; and the applied-configuration state reflected as metrics.
-Instrumentation is bounded-cardinality and allocation-free on the hot path.
 
 **Counter semantics (binding).** Every counter is **monotonic for the protection domain's life** and
 **saturates** rather than wrapping. There is no reset: a scraper derives a rate by differencing
@@ -174,9 +176,9 @@ a violation of a domain's own invariant, which is expected to read zero forever 
 a traffic statistic.
 
 **Metric inventory:** *None implemented yet* — populated per subsystem as metrics are implemented,
-each with its type, unit, labels, and meaning. The dataplane's counter groundwork exists in memory
-today (drop and fault tallies in the driver, virtqueue, and pool-ownership layers) but nothing reads
-or exposes it, so there is no metric on this surface yet.
+each with its type, unit, labels, and meaning. The dataplane already tallies its drops and faults in
+memory under the semantics above, but no surface reads them out: **a drop is currently unobservable
+from outside the node**, on this surface or any other.
 
 ## Configuration read endpoint
 

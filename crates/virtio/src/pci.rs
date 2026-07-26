@@ -1,76 +1,43 @@
 //! Modern virtio 1.0 PCI transport for x86.
 //!
 //! Two mapped windows drive a virtio-pci device: its PCI **configuration
-//! space** (reached here through the q35 ECAM/MMCONFIG window) and a memory
-//! **BAR** holding the virtio structures. It walks the virtio PCI
+//! space**, reached here through the q35 ECAM/MMCONFIG window, and a memory
+//! **BAR** holding the virtio structures. This module walks the virtio PCI
 //! capabilities, reprograms the BAR to an address the driver PD pre-mapped,
 //! runs the device-init handshake, and programs a virtqueue ([`crate::queue`])
-//! into the device's common configuration. It is written from scratch rather
-//! than reusing `virtio-drivers`, whose rust-sel4 integration ships only an ARM
-//! virtio-MMIO transport — there is no x86 PCI transport to reuse (CONCEPT §8).
+//! into the device's common configuration.
 //!
-//! All device access is volatile MMIO. The transport holds raw pointers into
-//! the two mapped windows; the driver PD establishes those mappings (static
-//! `.system` capabilities) and upholds their validity.
+//! All device access is volatile MMIO through raw pointers into those two
+//! windows. The driver PD establishes the mappings as static `.system`
+//! capabilities and upholds their validity.
 //!
 //! # The device is untrusted
 //!
-//! The adversary here is CONCEPT §7.1's **hostile or malfunctioning device**.
-//! Every byte this module reads is the device's: its configuration-space
-//! registers, its capability list, its BAR type bits, and — after the
-//! handshake — its `queue_size` and `queue_notify_off` registers. A device that
-//! is merely broken produces the same bytes as one that is malicious, so both
-//! are handled the same way: **no device value reaches a pointer computation
-//! before a check this module performs itself**, and every rejection is a typed
-//! error rather than a panic, so bring-up fails visibly in the driver PD
-//! instead of faulting it.
-//!
-//! Concretely, and in the order bring-up meets them:
-//!
-//! - **A capability's BAR index is range-checked where it is parsed.**
-//!   [`record_bar`] rejects anything outside 0..=5, so no index that is not a
-//!   BAR of this function can reach BAR programming.
-//! - **Being a BAR is not enough to be a 64-bit BAR pair.**
-//!   [`PciConfig::reprogram_bar64`] additionally rejects BAR 5, whose successor
-//!   register is the CardBus-CIS pointer rather than the pair's high half, and
-//!   [`PciConfig::bar_is_64bit`] refuses to answer for a non-BAR index instead
-//!   of reading an unrelated register and reporting a meaningless answer.
-//! - **The structure offsets are bounded against the window actually mapped**
-//!   ([`VirtioCaps::within`]) before any structure is dereferenced.
-//! - **The common-configuration offset is checked for alignment, not only for
-//!   extent.** Its registers are reached as `u16` and `u32` volatile accesses,
-//!   so an offset that fits the window perfectly still makes every one of them
-//!   misaligned unless it is [`COMMON_CFG_ALIGN`]-aligned — undefined behaviour
-//!   in the abstract machine and a split transaction on the wire, from a value
-//!   the device simply advertises. [`VirtioCaps::common_is_aligned`] is the
-//!   predicate; the shipped enforcer is `nic_driver_core::bringup::identify`,
-//!   which runs it before anything that can construct a [`CommonCfg`] exists.
-//! - **The handshake is bounded.** [`CommonCfg::reset`] polls a device-owned
-//!   status byte a fixed number of times and gives up, rather than spinning
-//!   until the device chooses to answer.
-//! - **The device's queue maximum is checked, not trusted.**
-//!   [`CommonCfg::setup_queue`] refuses to program a queue the device says does
-//!   not exist, or one larger than the device admits to.
-//! - **The doorbell slot is bounded by the callee that writes it.** The
-//!   `queue_notify_off` register and the notify multiplier are both device
-//!   data, and their product is unbounded relative to the mapped BAR;
-//!   [`Doorbell::new`] is the one place that checks it, and the resulting
-//!   [`Doorbell::ring`] needs no further check.
+//! The adversary is CONCEPT §7.1's **hostile or malfunctioning device**. Every
+//! byte this module reads is the device's: its configuration registers, its
+//! capability list, its BAR type bits, and — after the handshake — its
+//! `queue_size` and `queue_notify_off` registers. A device that is merely
+//! broken produces the same bytes as one that is malicious, so both meet the
+//! same rule: **no device value reaches a pointer computation before a check
+//! this module performs itself**, and every rejection is a typed error rather
+//! than a panic, so bring-up fails visibly in the driver PD instead of faulting
+//! it. Extent and alignment are independent faults throughout — an offset can
+//! fit the mapped window perfectly and still make every wide access into it
+//! misaligned — so each is checked on its own.
 //!
 //! What is **not** checked, because it is not checkable from this side: whether
-//! the device honours anything it was programmed with. A device may ignore the
-//! queue size it acknowledged, DMA outside the addresses it was given (nothing
-//! but an IOMMU can stop that — CONCEPT §7.2, an open item), or never complete
-//! a descriptor. The first two are outside this module's reach; the third is a
+//! the device honours anything it was programmed with. It may ignore the queue
+//! size it acknowledged, DMA outside the addresses it was given (nothing but an
+//! IOMMU can stop that — CONCEPT §7.2, an open item), or never complete a
+//! descriptor. The first two are outside this module's reach; the third is a
 //! stall, visible to the driver as a queue that stops making progress.
 
 use core::sync::atomic::{Ordering, fence};
 
 use crate::queue::QueueLayout;
 
-/// PCI vendor id for virtio devices.
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
-/// PCI device id of a modern (virtio 1.0) network device.
+/// A modern (virtio 1.0) network device.
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 
 // PCI configuration-space register offsets.
@@ -81,19 +48,17 @@ const PCI_STATUS: u16 = 0x06;
 const PCI_CAPABILITIES_PTR: u16 = 0x34;
 const PCI_BAR0: u16 = 0x10;
 
-/// Highest BAR index a PCI function has: BARs are 0..=5.
 const PCI_LAST_BAR: u8 = 5;
-/// Highest BAR index that can be the **low half** of a 64-bit BAR pair. BAR 5's
+/// Highest index that can be the **low half** of a 64-bit BAR pair: BAR 5's
 /// successor register is the CardBus-CIS pointer, not a BAR.
 const PCI_LAST_BAR64_LOW_HALF: u8 = 4;
 
-// PCI command-register bits.
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
 const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
-// PCI status-register bit: a capability list is present.
+/// PCI status-register bit: a capability list is present.
 const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
 
-// Vendor-specific capability id; virtio config caps carry it.
+/// Vendor-specific capability id; virtio config caps carry it.
 const PCI_CAP_ID_VNDR: u8 = 0x09;
 
 // virtio PCI capability `cfg_type` values.
@@ -102,44 +67,29 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-// virtio device-status bits, written to the common-config `device_status`
-// register to step the device through the initialization handshake (virtio 1.x
-// §2.1). The driver ORs these in cumulatively; the device latches them.
-/// The driver has noticed the device. First bit set in the handshake.
+// virtio device-status bits, ORed cumulatively into the common-config
+// `device_status` register to step the device through the initialization
+// handshake (virtio 1.x §2.1); the device latches them.
 pub const STATUS_ACKNOWLEDGE: u8 = 1;
-/// The driver knows how to drive this device type. Set together with
-/// [`STATUS_ACKNOWLEDGE`] before feature negotiation begins.
 pub const STATUS_DRIVER: u8 = 2;
-/// The driver is set up and ready to drive the device. Set last, after the
-/// virtqueues are configured, to bring the device live.
 pub const STATUS_DRIVER_OK: u8 = 4;
-/// The driver has written the feature bits it accepts. Set after
-/// `set_driver_features`; if the device then clears it, the negotiated feature
-/// set is unacceptable and initialization must not continue.
+/// Set once the driver has written the features it accepts. A device that then
+/// clears it rejects the negotiated set, and initialization must not continue.
 pub const STATUS_FEATURES_OK: u8 = 8;
-/// The device signals an unrecoverable internal error, or the driver sets it to
-/// give up on the device. Terminal: the device must be reset to recover.
-///
-/// The driver PD writes this on every bring-up rejection it can still reach the
-/// device for — that is, once the BAR has been relocated and [`CommonCfg`]
-/// exists. A rejection before that point (a malformed capability list, an
-/// unusable BAR) cannot be signalled at all, because the register lives in the
-/// BAR that has not yet been placed.
+/// An unrecoverable device error, or the driver giving up on the device.
+/// Terminal: only a reset recovers. It lives in the BAR, so it cannot be
+/// signalled for a rejection that happens before the BAR is placed.
 pub const STATUS_FAILED: u8 = 0x80;
 
-/// Why a BAR operation refused the index it was given. Both variants mean the
-/// *index* is wrong, which for an index that came from the device's own
-/// capability list means the device is malformed.
+/// Why a BAR operation refused the index it was given. An index that came from
+/// the device's own capability list means a malformed device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarError {
-    /// The index is not a BAR of this function: a PCI function has at most six
-    /// (0..=5). Reading at the corresponding offset would land on an unrelated
-    /// configuration register, so no answer is given and nothing is written.
+    /// Not a BAR of this function; the offset would land on an unrelated
+    /// configuration register.
     IndexOutOfRange(u8),
-    /// The index names BAR 5, so the register that would hold the high half of
-    /// a 64-bit BAR pair is the CardBus-CIS pointer instead. A device
-    /// advertising a 64-bit BAR 5 is malformed; writing it would corrupt a
-    /// non-BAR register.
+    /// BAR 5, whose successor register is the CardBus-CIS pointer rather than
+    /// the high half of a 64-bit pair; writing it would corrupt a non-BAR.
     NoHighHalf(u8),
 }
 
@@ -161,37 +111,30 @@ impl PciConfig {
     }
 
     /// # Safety
-    /// `offset` must be less than 4096, so the byte lies within the
-    /// configuration space [`PciConfig::new`]'s contract maps.
+    /// `offset` must be less than 4096.
     unsafe fn read8(&self, offset: u16) -> u8 {
         // SAFETY: `offset < 4096` per this fn's contract, so the byte lies within the page `PciConfig::new` guarantees.
         unsafe { self.base.add(offset as usize).read_volatile() }
     }
 
     /// # Safety
-    /// `offset` must be even and `offset + 2` must be at most 4096, so the
-    /// whole 16-bit value lies within the mapped configuration space and is
-    /// naturally aligned.
+    /// `offset` must be even, and `offset + 2` at most 4096.
     unsafe fn read16(&self, offset: u16) -> u16 {
-        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, so the read is aligned and within the page `PciConfig::new` guarantees.
+        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
         unsafe { self.base.add(offset as usize).cast::<u16>().read_volatile() }
     }
 
     /// # Safety
-    /// `offset` must be a multiple of 4 and `offset + 4` must be at most 4096,
-    /// so the whole 32-bit value lies within the mapped configuration space and
-    /// is naturally aligned.
+    /// `offset` must be a multiple of 4, and `offset + 4` at most 4096.
     unsafe fn read32(&self, offset: u16) -> u32 {
-        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, so the read is aligned and within the page `PciConfig::new` guarantees.
+        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
         unsafe { self.base.add(offset as usize).cast::<u32>().read_volatile() }
     }
 
     /// # Safety
-    /// `offset` must be even and `offset + 2` must be at most 4096, so the
-    /// whole 16-bit value lies within the mapped configuration space and is
-    /// naturally aligned.
+    /// `offset` must be even, and `offset + 2` at most 4096.
     unsafe fn write16(&self, offset: u16, value: u16) {
-        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, so the write is aligned and within the page `PciConfig::new` guarantees.
+        // SAFETY: `offset` is even and `offset + 2 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
         unsafe {
             self.base
                 .add(offset as usize)
@@ -201,11 +144,9 @@ impl PciConfig {
     }
 
     /// # Safety
-    /// `offset` must be a multiple of 4 and `offset + 4` must be at most 4096,
-    /// so the whole 32-bit value lies within the mapped configuration space and
-    /// is naturally aligned.
+    /// `offset` must be a multiple of 4, and `offset + 4` at most 4096.
     unsafe fn write32(&self, offset: u16, value: u32) {
-        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, so the write is aligned and within the page `PciConfig::new` guarantees.
+        // SAFETY: `offset` is 4-aligned and `offset + 4 <= 4096` per this fn's contract, inside the aligned page `PciConfig::new` guarantees.
         unsafe {
             self.base
                 .add(offset as usize)
@@ -237,7 +178,6 @@ impl PciConfig {
         }
     }
 
-    /// Disable memory-space decoding (before reprogramming a BAR).
     fn disable_memory(&self) {
         // SAFETY: `PCI_COMMAND` is an even, fixed constant below 4096 — `read16`/`write16`'s contract.
         unsafe {
@@ -246,50 +186,40 @@ impl PciConfig {
         }
     }
 
-    /// Configuration-space offset of BAR `bar_index`, for an index already
-    /// range-checked against [`PCI_LAST_BAR`]. Returning the offset from the
-    /// same place that owns the range check keeps the two from drifting apart.
     fn bar_offset(bar_index: u8) -> u16 {
         PCI_BAR0 + (bar_index as u16) * 4
     }
 
-    /// Whether BAR `bar_index` is a 64-bit memory BAR (so its address spans
-    /// this register and the next). The driver checks this before treating a
-    /// BAR as a 64-bit pair, rather than trusting the device's layout.
+    /// Whether BAR `bar_index` is a 64-bit memory BAR, so its address spans
+    /// this register and the next.
     ///
     /// # Errors
-    /// [`BarError::IndexOutOfRange`] when `bar_index` is not a BAR of this
-    /// function (0..=5). The question is refused rather than answered from an
-    /// unrelated configuration register, which would report a type for
-    /// something that is not a BAR at all.
+    /// [`BarError::IndexOutOfRange`] for an index that is not a BAR: the
+    /// question is refused rather than answered from an unrelated register.
     pub fn bar_is_64bit(&self, bar_index: u8) -> Result<bool, BarError> {
         if bar_index > PCI_LAST_BAR {
             return Err(BarError::IndexOutOfRange(bar_index));
         }
-        // SAFETY: `bar_index <= 5` was just checked, so the offset is at most
-        // `0x10 + 5*4 = 0x24` — 4-aligned and far below 4096, which is
-        // `read32`'s contract.
+        // SAFETY: the check above puts the offset at most `0x10 + 5*4 = 0x24`
+        // — 4-aligned and far below 4096, which is `read32`'s contract.
         let low = unsafe { self.read32(Self::bar_offset(bar_index)) };
         // Bit 0 == 0 => memory BAR; bits [2:1] == 0b10 => 64-bit.
         Ok(low & 0x1 == 0 && (low >> 1) & 0x3 == 0x2)
     }
 
-    /// Point a 64-bit memory BAR at `address` (below 4 GiB). `bar_index` is the
-    /// low half of the 64-bit BAR pair.
+    /// Point the 64-bit memory BAR pair whose low half is `bar_index` at
+    /// `address` (below 4 GiB).
     ///
     /// # Side effect
     /// Memory-space decoding is switched **off** before the write and is *not*
     /// switched back on: a BAR must not be moved while the device decodes it,
     /// and the caller may have further BARs to place. Call
     /// [`enable_memory_and_bus_master`](Self::enable_memory_and_bus_master)
-    /// once the BARs are final — until then the device decodes nothing. Bus
-    /// mastering and I/O decoding are left as they were.
+    /// once the BARs are final. Bus mastering and I/O decoding are untouched.
     ///
     /// # Errors
-    /// [`BarError::IndexOutOfRange`] when `bar_index` is not a BAR at all, and
-    /// [`BarError::NoHighHalf`] when it is BAR 5, whose successor register is
-    /// the CardBus-CIS pointer. Both are rejected before decoding is disabled,
-    /// so a refused call leaves the device exactly as it found it.
+    /// [`BarError`], rejected before decoding is disabled, so a refused call
+    /// leaves the device exactly as it found it.
     pub fn reprogram_bar64(&self, bar_index: u8, address: u32) -> Result<(), BarError> {
         if bar_index > PCI_LAST_BAR {
             return Err(BarError::IndexOutOfRange(bar_index));
@@ -300,11 +230,10 @@ impl PciConfig {
         let low = Self::bar_offset(bar_index);
         let high = low + 4;
         self.disable_memory();
-        // SAFETY: `bar_index <= 4` was just checked, so `low` is at most
-        // `0x10 + 4*4 = 0x20` and `high` at most `0x24` — both 4-aligned and far
-        // below 4096, which is `write32`'s contract. The low bits the hardware
-        // treats as read-only type flags are ignored on write, so writing the
-        // aligned address is well defined.
+        // SAFETY: the checks above put `low` at most `0x10 + 4*4 = 0x20` and
+        // `high` at most `0x24` — both 4-aligned and far below 4096, which is
+        // `write32`'s contract. The hardware ignores writes to the read-only
+        // type flags in the low bits, so writing the aligned address is defined.
         unsafe {
             self.write32(low, address);
             self.write32(high, 0);
@@ -313,126 +242,76 @@ impl PciConfig {
     }
 }
 
-/// The locations of the virtio structures within the device's BAR, discovered
-/// by walking the PCI capability list. All offsets are byte offsets into the
-/// BAR named by [`bar`](Self::bar); this transport requires every structure to
-/// live in the same BAR (true for QEMU's modern virtio-net-pci).
+/// Where the virtio structures sit within the device's BAR, as the PCI
+/// capability walk found them. Every field is the **device's own claim**;
+/// [`within`](Self::within) and [`common_is_aligned`](Self::common_is_aligned)
+/// are what a caller must run before turning one into a pointer.
 ///
-/// Every field is the **device's own claim**, checked only for what
-/// [`find_virtio_caps`] can check on its own (a real BAR index, one BAR shared
-/// by all the structures). The offsets are bounded against the window actually
-/// mapped by [`within`](Self::within) and [`notify_slot_within`](Self::notify_slot_within),
-/// and the common-configuration offset is additionally checked for alignment by
-/// [`common_is_aligned`](Self::common_is_aligned) — all of which the caller must
-/// run before dereferencing anything. Extent and alignment are independent
-/// faults: an offset can fit the window and still be unusable.
+/// Every offset is relative to the base of the single BAR named by `bar`. This
+/// transport requires all four structures to share one BAR, which QEMU's modern
+/// virtio-net-pci does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VirtioCaps {
-    /// Index of the BAR that holds every virtio structure below, always 0..=5
-    /// because [`find_virtio_caps`] rejects any other. All the offsets are
-    /// relative to the mapped base of this one BAR.
     pub bar: u8,
-    /// Byte offset of the common configuration structure (device/driver status,
-    /// feature negotiation, and per-queue setup registers) within the BAR.
-    ///
-    /// Two independent things must hold before this becomes a pointer: the
-    /// structure must fit the mapped window ([`within`](Self::within)) and the
-    /// offset must be [`COMMON_CFG_ALIGN`]-aligned
-    /// ([`common_is_aligned`](Self::common_is_aligned)), because the registers
-    /// behind it are `u16` and `u32` volatile accesses.
+    /// Device/driver status, feature negotiation, and the per-queue setup
+    /// registers.
     pub common: u32,
-    /// Byte offset of the notification structure within the BAR. A queue's
-    /// doorbell sits at `notify + queue_notify_off * notify_multiplier`, which
-    /// [`Doorbell::new`] bounds before writing.
+    /// The notification structure. A queue's doorbell sits at
+    /// `notify + queue_notify_off * notify_multiplier`.
     pub notify: u32,
-    /// Multiplier that scales a queue's `notify_off` into a byte offset within
-    /// the notification structure.
     pub notify_multiplier: u32,
-    /// Byte offset of the device-specific configuration structure within the
-    /// BAR (for virtio-net, the MAC address and status fields).
-    ///
-    /// Nothing in this workspace forms a pointer from this offset: the driver
-    /// reads neither the MAC nor the device status, so [`within`](Self::within)
-    /// bounds it against a one-byte extent and no alignment is required of it.
-    /// Both of those are adequate only while that stays true — virtio-net's
-    /// `status` field is a `u16`, so the first read of it needs a wider extent
-    /// *and* the same alignment check [`common_is_aligned`](Self::common_is_aligned)
-    /// performs, added here rather than assumed at the dereference.
+    /// The device-specific structure — for virtio-net, the MAC address and
+    /// status fields. [`within`](Self::within) bounds it against a one-byte
+    /// extent and requires no alignment of it, which suffices only while
+    /// nothing forms a pointer from it: virtio-net's `status` is a `u16`, so
+    /// reading it needs a wider extent and an alignment check first.
     pub device: u32,
 }
 
-/// Byte extent of the virtio common configuration structure that this transport
-/// accesses: through `queue_device` at offset 48 plus its eight bytes.
-///
-/// A caller establishing [`CommonCfg::new`]'s contract needs this number, which
-/// is why it is public: it is the amount of mapped memory the accessors assume.
+/// Byte extent of the common configuration structure this transport reaches
+/// into: through `queue_device` at offset 48 plus its eight bytes. Public
+/// because a caller establishing [`CommonCfg::new`]'s contract needs it.
 pub const COMMON_CFG_MIN_LEN: usize = 56;
 
 /// Byte alignment the **base** of the common configuration structure must have
 /// for [`CommonCfg`]'s accessors to be sound.
 ///
-/// The widest access this transport makes into the structure is a `u32` — a
-/// 64-bit register is written as two `u32` halves, following the virtio spec's
-/// 64-bit access rules — and every field offset carries the base's alignment
-/// through rather than adding to it (the const assertions beside the offsets
-/// pin that). So the base's alignment *is* the accesses' alignment: a
-/// 4-aligned base makes every one of them natural, and a base off by a byte
-/// makes every wide one misaligned.
-///
-/// It is public for the same reason [`COMMON_CFG_MIN_LEN`] is: a caller
-/// establishing [`CommonCfg::new`]'s contract has to know the number, and
-/// [`VirtioCaps::common_is_aligned`] is what checks the device's claim against
-/// it.
+/// The widest access into the structure is a `u32` — a 64-bit register is
+/// written as two `u32` halves, per the virtio spec's 64-bit access rules — and
+/// every field offset carries the base's alignment through rather than adding
+/// to it. The base's alignment therefore *is* the accesses' alignment: a base
+/// off by one byte misaligns every wide one.
 pub const COMMON_CFG_ALIGN: usize = 4;
-/// Byte width of one notify doorbell: a single `u16` queue index.
+/// One notify doorbell: a single `u16` queue index.
 const NOTIFY_SLOT_LEN: usize = 2;
-/// Minimum byte extent the driver accesses in the device-specific
-/// configuration structure.
 const DEVICE_CFG_MIN_LEN: usize = 1;
 
 // `notify_off * multiplier` is bounded by `u16::MAX * u32::MAX < 2^48`, so on a
 // 64-bit `usize` the product cannot overflow. x86_64 is the only target
-// (CONCEPT §3), and this assertion is what holds that reasoning to the code
-// rather than to a comment.
+// (CONCEPT §3), and this holds that reasoning to the code.
 const _: () = assert!(
     usize::BITS >= 64,
     "notify-slot arithmetic assumes a 64-bit usize"
 );
 
-/// Byte offset of a queue's notify slot within the notify structure:
-/// `queue_notify_off * notify_multiplier`.
-///
-/// Both operands are device data and the result is bounded only by 2^48, which
-/// is why this is an offset and not a location: it says nothing about whether
-/// the slot is mapped. [`VirtioCaps::notify_slot_within`] answers that.
+/// A queue's notify slot as an *offset* rather than a location: both operands
+/// are device data and the product is bounded only by 2^48, so this says
+/// nothing about whether the slot is mapped.
 fn notify_offset_bytes(notify_off: u16, multiplier: u32) -> usize {
     // Cannot overflow: see the `usize::BITS` assertion above.
     (notify_off as usize) * (multiplier as usize)
 }
 
 impl VirtioCaps {
-    /// Whether every structure this transport dereferences at a **fixed**
-    /// offset fits within a BAR window of `bar_size` bytes, accounting for the
-    /// extent the driver accesses in each: [`COMMON_CFG_MIN_LEN`] bytes of the
-    /// common configuration, one doorbell at the notify structure's base, and
-    /// one byte of the device-specific configuration.
+    /// Whether every structure reached at a **fixed** offset fits within a BAR
+    /// window of `bar_size` bytes, at the extent each is accessed to.
     ///
-    /// This deliberately does **not** cover a queue's doorbell, which is the
-    /// one access whose offset is not fixed: it sits at
-    /// `notify + queue_notify_off * notify_multiplier`, and `queue_notify_off`
-    /// is not known until [`CommonCfg::setup_queue`] has run. Bounding the
-    /// notify base proves only that *some* doorbell fits, never that a
-    /// particular queue's does — [`notify_slot_within`](Self::notify_slot_within)
-    /// is what proves that, and [`Doorbell::new`] is what enforces it.
-    ///
-    /// It also says nothing about **alignment**, which is a separate fault an
-    /// extent check cannot see: a structure can fit the window exactly and
-    /// still sit at an offset that makes every wide access into it misaligned.
-    /// [`common_is_aligned`](Self::common_is_aligned) is what answers that for
-    /// the common configuration, and a caller needs both.
-    ///
-    /// The offsets come from the (untrusted) device, so this must be checked
-    /// against the window actually mapped before any structure is dereferenced.
+    /// Deliberately not a queue's doorbell, the one access whose offset is not
+    /// fixed: `queue_notify_off` is unknown until [`CommonCfg::setup_queue`]
+    /// has run, so bounding the notify base proves only that *some* doorbell
+    /// fits, never that a particular queue's does.
+    /// [`notify_slot_within`](Self::notify_slot_within) proves that, and
+    /// [`Doorbell::new`] enforces it.
     #[must_use]
     pub fn within(&self, bar_size: usize) -> bool {
         let fits = |offset: u32, needed: usize| {
@@ -445,22 +324,14 @@ impl VirtioCaps {
             && fits(self.device, DEVICE_CFG_MIN_LEN)
     }
 
-    /// Whether the common configuration structure's offset is
-    /// [`COMMON_CFG_ALIGN`]-aligned, so that adding it to a BAR window that is
-    /// itself at least that aligned yields a base [`CommonCfg`]'s accessors can
-    /// use.
+    /// Whether `common` is [`COMMON_CFG_ALIGN`]-aligned — the half
+    /// [`within`](Self::within) cannot answer.
     ///
-    /// This is the half [`within`](Self::within) cannot answer, and the two are
-    /// independent: `common` is a raw `u32` lifted straight out of the device's
-    /// capability list, and an odd value fits any window large enough for it
-    /// while making every `u16` and `u32` access into the structure misaligned.
-    /// That is undefined behaviour rather than a slow load, and it is exactly
-    /// the fault [`NotifyError::SlotMisaligned`] answers for the notify slot —
-    /// checked here for the same reason and against the same kind of adversary.
-    ///
-    /// A caller mapping the BAR at page granularity (as Microkit does) needs
-    /// nothing further: `bar_base + common` is `COMMON_CFG_ALIGN`-aligned
-    /// exactly when this returns true.
+    /// `common` is a raw `u32` lifted out of the device's capability list, and
+    /// an odd value fits any window large enough for it while misaligning every
+    /// `u16` and `u32` access into the structure. A caller mapping the BAR at
+    /// page granularity, as Microkit does, needs nothing further: `bar_base +
+    /// common` is aligned exactly when this returns true.
     #[must_use]
     pub fn common_is_aligned(&self) -> bool {
         (self.common as usize).is_multiple_of(COMMON_CFG_ALIGN)
@@ -469,24 +340,20 @@ impl VirtioCaps {
     /// Whether the doorbell of a queue whose `queue_notify_off` is `notify_off`
     /// lies wholly within a BAR window of `bar_size` bytes.
     ///
-    /// `notify_off` is the device's own [`CommonCfg::setup_queue`] output and
-    /// `notify_multiplier` its own capability datum, so their product is
-    /// bounded only by 2^48 — far outside any mapped window. Every step is
-    /// computed with checked arithmetic, so an offset that cannot be
-    /// represented is rejected rather than wrapped into range.
-    ///
-    /// Fitting is necessary but not sufficient to make the doorbell usable: the
-    /// offset must also be even, since the slot is written as a `u16`. That is
-    /// [`Doorbell::new`]'s business, and `Doorbell::new` is what a caller should
-    /// use rather than deciding from this predicate alone.
+    /// Both operands are device data, so the product reaches 2^48 — far outside
+    /// any mapped window — and every step is checked arithmetic, so an offset
+    /// that cannot be represented is rejected rather than wrapped into range.
+    /// Fitting is necessary but not sufficient: the offset must also be even,
+    /// which is [`Doorbell::new`]'s business, so a caller should use that
+    /// rather than decide from this predicate alone.
     #[must_use]
     pub fn notify_slot_within(&self, notify_off: u16, bar_size: usize) -> bool {
         self.notify_slot_end(notify_off)
             .is_some_and(|end| end <= bar_size)
     }
 
-    /// One past the last byte of the queue's doorbell, relative to the BAR
-    /// base, or `None` if that offset is not representable.
+    /// One past the doorbell's last byte, relative to the BAR base, or `None`
+    /// when that offset is not representable.
     fn notify_slot_end(&self, notify_off: u16) -> Option<usize> {
         (self.notify as usize)
             .checked_add(notify_offset_bytes(notify_off, self.notify_multiplier))?
@@ -494,21 +361,13 @@ impl VirtioCaps {
     }
 }
 
-/// Walk the PCI capability list and locate the virtio configuration
-/// structures. All four (common, notify, ISR, device) must be present and share
-/// one BAR.
-///
-/// The ISR structure's presence is required — a modern virtio device exposes
-/// one, and its capability participates in the shared-BAR check — but its
-/// offset is not retained: this transport is busy-poll only and never reads the
-/// ISR status register (README, *virtio-net driver*). It will be carried in
-/// [`VirtioCaps`] when interrupt delivery lands and there is something to read
-/// it for.
+/// Walk the PCI capability list and locate the virtio configuration structures.
+/// All four — common, notify, ISR, device — must be present and share one BAR.
+/// The ISR's offset is not retained: this transport is busy-poll only and reads
+/// no ISR status register, so its capability serves only the shared-BAR check.
 ///
 /// # Errors
-/// A [`CapError`] if the device exposes no capability list, the chain is
-/// malformed, a capability names an invalid BAR, the structures span multiple
-/// BARs, or a required structure is absent.
+/// A [`CapError`].
 pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
     // SAFETY: every offset read below is either a fixed, aligned constant
     // (`PCI_STATUS` at 6, `PCI_CAPABILITIES_PTR` at 0x34) or `pointer + k` where
@@ -541,9 +400,9 @@ pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
                 let cap_bar = config.read8(pointer + 4);
                 let offset = config.read32(pointer + 8);
                 if cap_len >= 16 {
-                    // Only the four structures we actually map must share a BAR;
-                    // other virtio caps (e.g. VIRTIO_PCI_CAP_PCI_CFG, type 5)
-                    // legitimately reference a different BAR and are ignored.
+                    // Only the four mapped structures must share a BAR; another
+                    // virtio cap (VIRTIO_PCI_CAP_PCI_CFG, type 5) legitimately
+                    // names a different one and is ignored.
                     match cfg_type {
                         VIRTIO_PCI_CAP_COMMON_CFG => {
                             record_bar(&mut bar, cap_bar)?;
@@ -582,12 +441,10 @@ pub fn find_virtio_caps(config: &PciConfig) -> Result<VirtioCaps, CapError> {
     }
 }
 
-/// Record the BAR index a used virtio structure lives in, rejecting a mix of
-/// BARs across the structures the transport maps together.
+/// Record the BAR index a mapped virtio structure lives in, rejecting a mix of
+/// BARs across the four and any index that is not a BAR of this function — the
+/// point at which a malformed index is stopped from reaching BAR programming.
 fn record_bar(bar: &mut Option<u8>, cap_bar: u8) -> Result<(), CapError> {
-    // A PCI function has at most six BARs (0..=5); a capability naming anything
-    // else is a malformed, untrusted device descriptor and is rejected here,
-    // before the index could ever reach BAR programming.
     if cap_bar > PCI_LAST_BAR {
         return Err(CapError::InvalidBar);
     }
@@ -603,15 +460,12 @@ fn record_bar(bar: &mut Option<u8>, cap_bar: u8) -> Result<(), CapError> {
 /// Why [`find_virtio_caps`] could not resolve the virtio structures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapError {
-    /// The device advertises no PCI capability list.
     NoCapabilities,
-    /// The capability chain is malformed (looped or out of range).
+    /// The chain looped or ran past the configuration space.
     Malformed,
-    /// virtio structures are split across BARs (unsupported here).
+    /// The structures are split across BARs, which this transport does not map.
     MultipleBars,
-    /// A capability named a BAR index outside the valid range 0..=5.
     InvalidBar,
-    /// A required structure (common, notify, ISR, or device) was absent.
     MissingStructure,
 }
 
@@ -630,22 +484,13 @@ const CFG_QUEUE_DESC: usize = 32;
 const CFG_QUEUE_DRIVER: usize = 40;
 const CFG_QUEUE_DEVICE: usize = 48;
 
-// Every offset above must lie inside the extent `CommonCfg::new` requires its
-// caller to map, so the accessors' safety contracts are satisfied by the
-// constructor's alone.
+// The offsets are a layout the virtio spec fixes and this file transcribes, so
+// a transcription error is the failure mode to catch. These assertions are the
+// compile-time half of every accessor's `SAFETY:` comment — the half about
+// `off`: each offset stays inside the extent `CommonCfg::new` requires mapped,
+// and each carries the base's alignment through to the access made at it, so a
+// `COMMON_CFG_ALIGN`-aligned base is enough to make the accessors sound.
 const _: () = assert!(CFG_QUEUE_DEVICE + 8 == COMMON_CFG_MIN_LEN);
-
-// And every offset must carry the base's alignment through to the access made
-// at it, or a `COMMON_CFG_ALIGN`-aligned base would not be enough to make the
-// accessors sound and `VirtioCaps::common_is_aligned` would be checking the
-// wrong thing. This is the compile-time half of every accessor's `SAFETY:`
-// comment — the half about `off` — and it is asserted rather than described
-// because the field offsets are a layout the virtio spec fixes and this file
-// transcribes, so a transcription error is the failure mode to catch.
-//
-// `COMMON_CFG_ALIGN` must cover the widest access (a `u32`); the `u32`-wide
-// registers, and both halves of each 64-bit one, must then be 4-aligned, and
-// the `u16`-wide registers even. `r8`/`w8` need nothing.
 const _: () = assert!(COMMON_CFG_ALIGN.is_multiple_of(align_of::<u32>()));
 const _: () = assert!(CFG_DEVICE_FEATURE_SELECT.is_multiple_of(COMMON_CFG_ALIGN));
 const _: () = assert!(CFG_DEVICE_FEATURE.is_multiple_of(COMMON_CFG_ALIGN));
@@ -665,21 +510,19 @@ const _: () = assert!(CFG_DEVICE_STATUS < COMMON_CFG_MIN_LEN);
 /// How many times [`CommonCfg::reset`] reads the device-status register back
 /// before giving up.
 ///
-/// This bounds **polls, not elapsed time**: a driver protection domain has no
-/// timer capability, so there is no clock to bound a wait against, and the
-/// only adversary-independent quantity available is the iteration count. What
-/// it guarantees is therefore exactly what a caller may rely on — that `reset`
-/// returns — and not that it returns within any particular interval.
+/// Polls, **not elapsed time**: a driver protection domain has no timer
+/// capability, so the iteration count is the only adversary-independent
+/// quantity available. It guarantees that `reset` returns, not when.
 const RESET_POLL_LIMIT: u32 = 1_000_000;
 
 /// Why [`CommonCfg::reset`] gave up on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResetError {
     /// The device did not read back a zero `device_status` within
-    /// [`RESET_POLL_LIMIT`] polls. The last value observed is carried so a
-    /// caller can report which bits the device is holding.
+    /// [`RESET_POLL_LIMIT`] polls.
     NotAcknowledged {
-        /// The `device_status` byte read on the final poll.
+        /// The `device_status` byte read on the final poll, so a caller can
+        /// report which bits the device is holding.
         status: u8,
     },
 }
@@ -689,21 +532,15 @@ pub enum ResetError {
 /// contradicts what the driver must program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueSetupError {
-    /// The device reports a maximum queue size of zero at this index, which
-    /// means the queue does not exist.
-    QueueAbsent {
-        /// The virtqueue index selected.
-        index: u16,
-    },
-    /// The device's maximum queue size is smaller than the layout the driver
-    /// must program. Programming the driver's larger size would tell the device
-    /// to read a ring past the end of the one it admits to.
+    /// The device reports a maximum queue size of zero, meaning the queue does
+    /// not exist.
+    QueueAbsent { index: u16 },
+    /// The device's maximum is smaller than the layout the driver must program.
+    /// Programming the larger size would tell the device to read a ring past
+    /// the end of the one it admits to.
     QueueTooSmall {
-        /// The virtqueue index selected.
         index: u16,
-        /// The maximum the device advertised.
         device_max: u16,
-        /// The number of descriptors the layout requires.
         required: usize,
     },
 }
@@ -716,34 +553,18 @@ pub struct CommonCfg {
 impl CommonCfg {
     /// # Safety
     /// `base` must point to at least [`COMMON_CFG_MIN_LEN`] readable and
-    /// writable bytes of the device's mapped `virtio_pci_common_cfg` (the BAR
-    /// vaddr plus the common-cfg offset), they must stay valid for use, and
-    /// `base` must be [`COMMON_CFG_ALIGN`]-aligned.
+    /// writable bytes of the device's mapped `virtio_pci_common_cfg` — the BAR
+    /// vaddr plus the common-cfg offset — that stay valid for use, and must be
+    /// [`COMMON_CFG_ALIGN`]-aligned. Both are the device's claim, so neither may
+    /// be assumed, and an extent check catches only the first.
     ///
-    /// Two requirements because there are two ways to get this wrong, and an
-    /// extent check catches only one of them:
-    ///
-    /// - **Extent.** Every accessor reaches through `queue_device` at offset 48,
-    ///   so the whole [`COMMON_CFG_MIN_LEN`] is required, not merely the
-    ///   structure's base. A caller establishes it with [`VirtioCaps::within`],
-    ///   which bounds `common + COMMON_CFG_MIN_LEN` against the size of the BAR
-    ///   window it actually mapped.
-    /// - **Alignment.** Every accessor casts `base + off` to a `u16` or a `u32`,
-    ///   and the field offsets carry the base's alignment through rather than
-    ///   supplying any of their own (const-asserted beside them), so **the
-    ///   base's alignment is what makes those accesses aligned**. A caller
-    ///   establishes it with [`VirtioCaps::common_is_aligned`] over a BAR window
-    ///   that is itself at least [`COMMON_CFG_ALIGN`]-aligned — which a page
-    ///   mapping is.
-    ///
-    /// Both halves are the device's claim, so neither may be assumed. The
-    /// shipped enforcer of both is `nic_driver_core::bringup::identify`: it runs
-    /// the two predicates before an `Identified` exists, and `PlacedBar` — the
-    /// only thing that constructs this type outside tests — is reachable only
-    /// from an `Identified`. Its
+    /// The shipped enforcer of both is `nic_driver_core::bringup::identify`: it
+    /// runs [`VirtioCaps::within`] and [`VirtioCaps::common_is_aligned`] before
+    /// an `Identified` exists, and the `PlacedBar` that constructs this type
+    /// outside tests is reachable only from one. Its
     /// `a_structure_outside_the_mapped_window_is_refused_before_any_dereference`
     /// and `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`
-    /// tests are what prove that enforcement rather than assert it (DOC-7).
+    /// tests prove that enforcement rather than assert it (DOC-7).
     #[must_use]
     pub unsafe fn new(base: *mut u8) -> Self {
         Self { base }
@@ -752,48 +573,44 @@ impl CommonCfg {
     /// # Safety
     /// `off` must be less than [`COMMON_CFG_MIN_LEN`].
     unsafe fn r8(&self, off: usize) -> u8 {
-        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, so the byte lies within the extent `CommonCfg::new` requires mapped; a one-byte access needs no alignment.
+        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, inside the extent `CommonCfg::new` requires mapped; one byte needs no alignment.
         unsafe { self.base.add(off).read_volatile() }
     }
 
     /// # Safety
     /// `off` must be less than [`COMMON_CFG_MIN_LEN`].
     unsafe fn w8(&self, off: usize, v: u8) {
-        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, so the byte lies within the extent `CommonCfg::new` requires mapped; a one-byte access needs no alignment.
+        // SAFETY: `off < COMMON_CFG_MIN_LEN` per this fn's contract, inside the extent `CommonCfg::new` requires mapped; one byte needs no alignment.
         unsafe { self.base.add(off).write_volatile(v) }
     }
 
     /// # Safety
-    /// `off` must be even and `off + 2` at most [`COMMON_CFG_MIN_LEN`], so the
-    /// whole value is mapped and naturally aligned.
+    /// `off` must be even, and `off + 2` at most [`COMMON_CFG_MIN_LEN`].
     unsafe fn r16(&self, off: usize) -> u16 {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is two-byte aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it within the extent that same contract requires mapped.
+        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is 2-aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
         unsafe { self.base.add(off).cast::<u16>().read_volatile() }
     }
 
     /// # Safety
-    /// `off` must be even and `off + 2` at most [`COMMON_CFG_MIN_LEN`], so the
-    /// whole value is mapped and naturally aligned.
+    /// `off` must be even, and `off + 2` at most [`COMMON_CFG_MIN_LEN`].
     unsafe fn w16(&self, off: usize, v: u16) {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is two-byte aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it within the extent that same contract requires mapped.
+        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is even per this fn's, so `base + off` is 2-aligned; `off + 2 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
         unsafe { self.base.add(off).cast::<u16>().write_volatile(v) }
     }
 
     /// # Safety
-    /// `off` must be a multiple of 4 and `off + 4` at most
-    /// [`COMMON_CFG_MIN_LEN`], so the whole value is mapped and naturally
-    /// aligned.
+    /// `off` must be a multiple of 4, and `off + 4` at most
+    /// [`COMMON_CFG_MIN_LEN`].
     unsafe fn r32(&self, off: usize) -> u32 {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it within the extent that same contract requires mapped.
+        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
         unsafe { self.base.add(off).cast::<u32>().read_volatile() }
     }
 
     /// # Safety
-    /// `off` must be a multiple of 4 and `off + 4` at most
-    /// [`COMMON_CFG_MIN_LEN`], so the whole value is mapped and naturally
-    /// aligned.
+    /// `off` must be a multiple of 4, and `off + 4` at most
+    /// [`COMMON_CFG_MIN_LEN`].
     unsafe fn w32(&self, off: usize, v: u32) {
-        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it within the extent that same contract requires mapped.
+        // SAFETY: `base` is `COMMON_CFG_ALIGN`-aligned per `CommonCfg::new`'s contract and `off` is a multiple of it per this fn's, so `base + off` is 4-aligned; `off + 4 <= COMMON_CFG_MIN_LEN` keeps it inside the extent that contract requires mapped.
         unsafe { self.base.add(off).cast::<u32>().write_volatile(v) }
     }
 
@@ -832,10 +649,8 @@ impl CommonCfg {
     ///
     /// # Errors
     /// [`ResetError::NotAcknowledged`] once [`RESET_POLL_LIMIT`] polls have
-    /// passed without the device answering. A device that never acknowledges is
-    /// a hardware or deployment fault, and this is where it becomes visible:
-    /// the alternative is a driver protection domain spinning for as long as
-    /// the device cares to withhold the answer.
+    /// passed without an answer. The alternative is a driver protection domain
+    /// spinning for as long as the device cares to withhold one.
     pub fn reset(&self) -> Result<(), ResetError> {
         self.set_status(0);
         poll_status_cleared(|| self.status())
@@ -872,25 +687,22 @@ impl CommonCfg {
         }
     }
 
-    /// Program one virtqueue's descriptor/driver/device area physical
-    /// addresses and enable it. The three areas are placed contiguously per
-    /// [`QueueLayout`] at `ring_paddr`.
+    /// Program one virtqueue's three area addresses, placed contiguously per
+    /// [`QueueLayout`] at `ring_paddr`, and enable it.
     ///
     /// # Returns
-    /// The device's `queue_notify_off` for this queue — **raw device output**,
-    /// read straight out of a register the device controls, and bounded by
-    /// nothing but its width. Multiplied by `notify_multiplier` it reaches 2^48,
-    /// so it must never be turned into a doorbell address without a bounds
-    /// check against the BAR window actually mapped. [`Doorbell::new`] performs
-    /// that check and is the only supported way to reach a doorbell from this
-    /// value; it is proved by the `doorbell_rejects_a_slot_outside_the_bar` and
-    /// `notify_slot_bound_is_computable_and_exact` tests in this module.
+    /// The device's `queue_notify_off` — **raw device output**, bounded by
+    /// nothing but its width, and reaching 2^48 once multiplied by
+    /// `notify_multiplier`. Turn it into a doorbell only through
+    /// [`Doorbell::new`], which bounds it against the mapped BAR window;
+    /// `doorbell_rejects_a_slot_outside_the_bar` and
+    /// `notify_slot_bound_is_computable_and_exact` prove that (DOC-7).
     ///
     /// # Errors
     /// [`QueueSetupError`] when the device's own `queue_size` register says the
     /// queue does not exist or is smaller than `layout` requires. Nothing is
-    /// programmed in either case: the queue is left disabled, so a caller that
-    /// gives up leaves the device with no ring addresses it could act on.
+    /// programmed in either case, so a caller that gives up leaves the device
+    /// with no ring addresses it could act on.
     pub fn setup_queue(
         &self,
         index: u16,
@@ -907,10 +719,9 @@ impl CommonCfg {
         if device_max == 0 {
             return Err(QueueSetupError::QueueAbsent { index });
         }
-        // A layout wider than a `u16` cannot be programmed into a `u16`
-        // register at all, which is the same refusal as a device maximum below
-        // it — and doing the comparison after the conversion keeps every
-        // arithmetic step below in one width.
+        // A layout wider than the `u16` register is the same refusal as a
+        // device maximum below it, and converting first keeps the comparison
+        // and everything after it in one width.
         let too_small = |device_max| QueueSetupError::QueueTooSmall {
             index,
             device_max,
@@ -924,17 +735,15 @@ impl CommonCfg {
         }
 
         // `ring_paddr` and the layout offsets are the driver's own — the DMA
-        // region's physical address patched from `librefirewall.system` and
-        // `QueueLayout`'s offsets within it — so these sums are internal
-        // invariants, not device input, and an overflow here would be a
-        // build-time misconfiguration that must fail visibly.
+        // region's physical address patched from `librefirewall.system`, and
+        // `QueueLayout`'s offsets within it — so an overflow in these sums is a
+        // build-time misconfiguration that must fail visibly, not device input.
         // SAFETY: every offset written below is 4-aligned (`CFG_QUEUE_DESC` 32,
         // `CFG_QUEUE_DRIVER` 40, `CFG_QUEUE_DEVICE` 48) or even
         // (`CFG_QUEUE_SIZE` 24, `CFG_QUEUE_ENABLE` 28, `CFG_QUEUE_NOTIFY_OFF`
-        // 30), and each plus its width is at most `COMMON_CFG_MIN_LEN` — the
-        // `CFG_QUEUE_DEVICE + 8 == COMMON_CFG_MIN_LEN` assertion above pins the
-        // largest of them. The write order (size, addresses, enable) follows the
-        // virtio spec.
+        // 30), and each plus its width is at most `COMMON_CFG_MIN_LEN`, whose
+        // largest the `CFG_QUEUE_DEVICE + 8` assertion above pins. The write
+        // order (size, addresses, enable) follows the virtio spec.
         unsafe {
             self.w16(CFG_QUEUE_SIZE, required);
             self.w64(CFG_QUEUE_DESC, ring_paddr + layout.descriptor_offset as u64);
@@ -948,12 +757,10 @@ impl CommonCfg {
 
 /// Read `status` until it reads back zero, at most [`RESET_POLL_LIMIT`] times.
 ///
-/// Split out of [`CommonCfg::reset`] because the give-up path is otherwise not
+/// A closure rather than a method because the give-up path is otherwise not
 /// host-testable: a `CommonCfg` over plain memory reads back the very zero
-/// `reset` just wrote, so the device that *never* acknowledges — the one that
-/// used to hang the driver protection domain — cannot be modelled through the
-/// MMIO accessors at all. Here it is a closure, and the bound is proved against
-/// it directly.
+/// `reset` just wrote, so a device that never acknowledges cannot be modelled
+/// through the MMIO accessors at all.
 fn poll_status_cleared(mut status: impl FnMut() -> u8) -> Result<(), ResetError> {
     for _ in 0..RESET_POLL_LIMIT {
         if status() == 0 {
@@ -967,39 +774,29 @@ fn poll_status_cleared(mut status: impl FnMut() -> u8) -> Result<(), ResetError>
 /// Why a [`Doorbell`] could not be placed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotifyError {
-    /// The queue's doorbell does not lie within the mapped BAR window. Its
-    /// offset is `notify + queue_notify_off * notify_multiplier`, all three of
-    /// them device data, so this is a malformed device rather than a driver
-    /// error. `slot_end` is `None` when the offset is not even representable.
+    /// The doorbell does not lie within the mapped BAR window. Its offset is
+    /// `notify + queue_notify_off * notify_multiplier`, all three device data,
+    /// so this is a malformed device rather than a driver error.
     SlotOutsideBar {
         /// One past the doorbell's last byte, relative to the BAR base, or
         /// `None` when that offset overflows.
         slot_end: Option<usize>,
-        /// The size of the BAR window the driver mapped.
         bar_size: usize,
     },
-    /// The doorbell's offset within the BAR is odd, so the `u16` write would be
-    /// unaligned — undefined behaviour, not merely a slow access.
-    ///
-    /// Nothing this driver can enforce makes the offset even: `notify` and
-    /// `notify_multiplier` come from the device's capability and
-    /// `queue_notify_off` from its `setup_queue` register, so a device that
-    /// names an odd product gets an unaligned volatile write unless it is
-    /// refused here.
-    SlotMisaligned {
-        /// The doorbell's offset relative to the BAR base.
-        offset: usize,
-    },
+    /// The doorbell's offset within the BAR is odd, making the `u16` write
+    /// unaligned — undefined behaviour, not merely a slow access. Nothing this
+    /// driver can enforce makes the product of three device-supplied values
+    /// even, so a device that names an odd one is refused here.
+    SlotMisaligned { offset: usize },
 }
 
 /// One virtqueue's doorbell: a validated pointer to the `u16` slot whose write
 /// tells the device to look at that queue.
 ///
-/// This type exists so the bound is checked **once, where it can fail**, rather
-/// than on every ring in the poll loop or — as it was — nowhere at all. Placing
-/// the doorbell is fallible because its offset is device data; ringing it is
-/// then infallible and safe, because the only value that varies afterwards is
-/// the queue index being written, which is the driver's own.
+/// The type exists to check the bound **once, where it can fail**, rather than
+/// on every ring in the poll loop: placing the doorbell is fallible because its
+/// offset is device data, and ringing it is then infallible and safe, the only
+/// value that varies afterwards being the driver's own queue index.
 #[derive(Debug)]
 pub struct Doorbell {
     slot: *mut u16,
@@ -1010,21 +807,18 @@ impl Doorbell {
     /// within a BAR window of `bar_size` bytes starting at `bar_base`.
     ///
     /// # Errors
-    /// [`NotifyError::SlotOutsideBar`] when the doorbell would not lie wholly
-    /// within the window — including when its offset is not representable at
-    /// all — and [`NotifyError::SlotMisaligned`] when that offset is odd.
-    /// Together these are the whole notify path's guarantee: `notify_off` and
-    /// `notify_multiplier` are both device data, their product reaches 2^48 and
-    /// need not be even, so without these two checks a conforming caller still
-    /// gets an out-of-bounds or unaligned volatile write.
+    /// [`NotifyError`], which between them are the whole notify path's
+    /// guarantee: the device's `notify_off` and `notify_multiplier` have a
+    /// product that reaches 2^48 and need not be even, so without these two
+    /// checks even a conforming caller gets an out-of-bounds or unaligned
+    /// volatile write.
     ///
     /// # Safety
     /// `bar_base` must point to a mapped window of at least `bar_size` bytes —
-    /// the device's BAR as the driver relocated and mapped it — it must be at
-    /// least two-byte aligned (any BAR mapping is page-aligned, so this is
-    /// free), and the window must stay valid for the lifetime of the returned
-    /// value. Nothing else is required of the caller: the device-supplied
-    /// offsets are bounded and aligned here, not by the caller.
+    /// the device's BAR as the driver relocated and mapped it — must be at
+    /// least two-byte aligned, and must stay valid for the lifetime of the
+    /// returned value. Nothing else: the device-supplied offsets are bounded
+    /// and aligned here rather than by the caller.
     pub unsafe fn new(
         bar_base: *mut u8,
         bar_size: usize,
@@ -1035,30 +829,25 @@ impl Doorbell {
         if slot_end.is_none_or(|end| end > bar_size) {
             return Err(NotifyError::SlotOutsideBar { slot_end, bar_size });
         }
-        // `slot_end <= bar_size` was just checked and `slot_end` is the offset
-        // plus the slot's own two bytes, so the offset itself is at most
-        // `bar_size - 2` and this addition cannot overflow.
+        // `slot_end` is this offset plus the slot's own two bytes and was just
+        // bounded by `bar_size`, so the addition cannot overflow.
         let offset = caps.notify as usize + notify_offset_bytes(notify_off, caps.notify_multiplier);
         if !offset.is_multiple_of(2) {
             return Err(NotifyError::SlotMisaligned { offset });
         }
-        // SAFETY: `offset + 2 <= bar_size` and `bar_base` names a mapped window
-        // of at least `bar_size` bytes per this fn's contract, so the whole slot
-        // lies within it; `offset` is even and `bar_base` is two-byte aligned by
-        // the same contract, so the `u16` pointer is naturally aligned. Both
-        // conditions were checked immediately above.
+        // SAFETY: the two checks above give `offset + 2 <= bar_size` and an
+        // even `offset`; `bar_base` names a mapped, two-byte-aligned window of
+        // at least `bar_size` bytes per this fn's contract, so the whole slot
+        // lies within it and the `u16` pointer is naturally aligned.
         let slot = unsafe { bar_base.add(offset).cast::<u16>() };
         Ok(Self { slot })
     }
 
     /// Ring the doorbell for `queue`, telling the device to examine that
     /// virtqueue.
-    ///
-    /// Safe and infallible: [`new`](Self::new) established that the slot lies
-    /// within the mapped BAR, and nothing since can have moved it.
     pub fn ring(&self, queue: u16) {
-        // Ensure prior descriptor/avail publication is visible before the
-        // doorbell, which is what licenses the device to read them.
+        // The doorbell is what licenses the device to read the descriptors, so
+        // their publication has to be visible first.
         fence(Ordering::Release);
         // SAFETY: `Doorbell::new` bounded this slot inside the mapped BAR window
         // its caller vouched for, and a `Doorbell` cannot be constructed any
@@ -1072,89 +861,142 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// A 4 KiB buffer with the alignment a mapped ECAM page has.
+    /// The heap allocation a fixture region owns, carrying the alignment a
+    /// Microkit mapping supplies.
     ///
-    /// `[u8; 4096]` has `align_of == 1`, so a fixture handing one to
-    /// `PciConfig::new` or `CommonCfg::new` would be under-delivering on the
-    /// contract it is testing against and manufacturing its own misalignment —
-    /// which it could then not tell apart from the device's, the very
-    /// confusion `VirtioCaps::common_is_aligned` exists to remove. A real
-    /// mapping is page-aligned, so the fixture is too.
+    /// `[u8; N]` has `align_of == 1`, so a fixture handing one to
+    /// `PciConfig::new` or `CommonCfg::new` would under-deliver on the very
+    /// contract under test and manufacture its own misalignment — which it
+    /// could then not tell apart from the device's, the confusion
+    /// `VirtioCaps::common_is_aligned` exists to remove.
     #[repr(C, align(4096))]
-    struct AlignedPage([u8; 4096]);
+    struct Page<const N: usize>([u8; N]);
 
-    impl core::ops::Deref for AlignedPage {
-        type Target = [u8; 4096];
+    /// A fixture mapping, reachable only through the one raw pointer the code
+    /// under test is attached to.
+    ///
+    /// The bytes are `Box::into_raw`d and no `&`/`&mut` into them is ever
+    /// formed, so fixture and transport share a single tag for the whole
+    /// region's life. A reference would not survive: the transport writes its
+    /// registers through the raw pointer, and such a write invalidates any
+    /// reference derived from the same allocation, so a fixture that read a
+    /// register back through one would itself be undefined behaviour while
+    /// claiming to prove the transport's conduct against a hostile device
+    /// (TEST-6). Exposing no reference makes that unrepresentable rather than a
+    /// rule to remember (DOC-9).
+    struct MappedRegion<const N: usize> {
+        page: *mut Page<N>,
+    }
 
-        fn deref(&self) -> &Self::Target {
-            &self.0
+    impl<const N: usize> MappedRegion<N> {
+        fn zeroed() -> Self {
+            Self {
+                page: Box::into_raw(Box::new(Page([0u8; N]))),
+            }
+        }
+
+        /// The pointer the code under test is mapped over, and the only route
+        /// to the bytes — `*mut` from `&self` deliberately, because handing it
+        /// a second, separately derived pointer is what a fixture must not do.
+        fn base(&self) -> *mut u8 {
+            self.page.cast::<u8>()
+        }
+
+        // Byte at a time rather than one volatile access of the whole `[u8; M]`:
+        // a 64 KiB volatile load segfaults LLVM's SelectionDAG on the pinned
+        // nightly, and the region-sized reads below are exactly that shape.
+        fn read<const M: usize>(&self, off: usize) -> [u8; M] {
+            assert!(
+                off.saturating_add(M) <= N,
+                "read of {off:#x} escapes {N:#x}"
+            );
+            let mut out = [0u8; M];
+            for (index, byte) in out.iter_mut().enumerate() {
+                // SAFETY: the assertion above puts `off + index` inside the
+                // `N`-byte allocation `zeroed` made, which `Drop` alone frees
+                // and which therefore outlives `self`; a byte needs no
+                // alignment.
+                *byte = unsafe { self.base().add(off + index).read_volatile() };
+            }
+            out
+        }
+
+        fn write<const M: usize>(&mut self, off: usize, bytes: [u8; M]) {
+            assert!(
+                off.saturating_add(M) <= N,
+                "write of {off:#x} escapes {N:#x}"
+            );
+            for (index, byte) in bytes.into_iter().enumerate() {
+                // SAFETY: bounded by the assertion above into the allocation
+                // `zeroed` made and `Drop` alone frees, exactly as `read`.
+                unsafe { self.base().add(off + index).write_volatile(byte) };
+            }
         }
     }
 
-    impl core::ops::DerefMut for AlignedPage {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
+    impl<const N: usize> Drop for MappedRegion<N> {
+        fn drop(&mut self) {
+            // SAFETY: `page` came from `Box::into_raw` in `zeroed`, is never
+            // replaced, and no other owner exists, so this reconstructs that
+            // `Box` exactly once.
+            drop(unsafe { Box::from_raw(self.page) });
         }
     }
 
     // A synthetic 4 KiB config space with a virtio capability chain, used to
     // test the pure capability-walk logic without a device.
     struct FakeConfig {
-        bytes: Box<AlignedPage>,
+        region: MappedRegion<4096>,
     }
 
     impl FakeConfig {
         fn new() -> Self {
             Self {
-                bytes: Box::new(AlignedPage([0u8; 4096])),
+                region: MappedRegion::zeroed(),
             }
         }
         fn w8(&mut self, off: usize, v: u8) {
-            self.bytes[off] = v;
+            self.region.write(off, [v]);
         }
         fn w16(&mut self, off: usize, v: u16) {
-            self.bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            self.region.write(off, v.to_le_bytes());
         }
         fn w32(&mut self, off: usize, v: u32) {
-            self.bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            self.region.write(off, v.to_le_bytes());
         }
         fn r8(&self, off: usize) -> u8 {
-            self.bytes[off]
+            self.region.read::<1>(off)[0]
         }
         fn r16(&self, off: usize) -> u16 {
-            u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+            u16::from_le_bytes(self.region.read(off))
         }
         fn r32(&self, off: usize) -> u32 {
-            u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap())
+            u32::from_le_bytes(self.region.read(off))
         }
         fn r64(&self, off: usize) -> u64 {
-            u64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap())
+            u64::from_le_bytes(self.region.read(off))
         }
         fn config(&mut self) -> PciConfig {
-            // SAFETY: `self.bytes` is a live, page-aligned, config-space-sized buffer owned by this test — `PciConfig::new`'s contract over plain memory.
-            unsafe { PciConfig::new(self.bytes.as_mut_ptr()) }
+            // SAFETY: `MappedRegion<4096>` is exactly the page-aligned ECAM page `PciConfig::new` names, live until this fixture's `Drop` and so outliving the value.
+            unsafe { PciConfig::new(self.region.base()) }
         }
-        // A `CommonCfg` mapped over this buffer's base, so its register methods
-        // can be driven against plain backing memory the test seeds and reads
-        // back — the same pointer-into-a-Box pattern the queue tests use.
+        // A `CommonCfg` over this region's base, so its register methods can be
+        // driven against plain backing memory the test seeds and reads back.
         fn common(&mut self) -> CommonCfg {
-            // SAFETY: `self.bytes` is 4096 bytes, far more than `COMMON_CFG_MIN_LEN`, is page-aligned (so `COMMON_CFG_ALIGN`-aligned) as an `AlignedPage`, and outlives the value — `CommonCfg::new`'s contract in both halves.
-            unsafe { CommonCfg::new(self.bytes.as_mut_ptr()) }
+            // SAFETY: the region is 4096 bytes, far more than `COMMON_CFG_MIN_LEN`, page-aligned by `Page` (so `COMMON_CFG_ALIGN`-aligned), and outlives the value — `CommonCfg::new`'s contract in both halves.
+            unsafe { CommonCfg::new(self.region.base()) }
         }
         // Write a virtio cap at `at`, chaining to `next`.
         fn put_cap(&mut self, at: usize, next: u8, cfg_type: u8, bar: u8, offset: u32, len: u8) {
-            self.bytes[at] = PCI_CAP_ID_VNDR;
-            self.bytes[at + 1] = next;
-            self.bytes[at + 2] = len;
-            self.bytes[at + 3] = cfg_type;
-            self.bytes[at + 4] = bar;
+            self.region
+                .write(at, [PCI_CAP_ID_VNDR, next, len, cfg_type, bar]);
             self.w32(at + 8, offset);
         }
         // The full four-structure chain every valid-device case needs, in BAR
         // `bar` with notify multiplier 4.
         fn put_full_chain(&mut self, bar: u8) {
             self.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-            self.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+            self.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
             self.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, bar, 0x0000, 16);
             self.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, bar, 0x3000, 20);
             self.w32(0x50 + 16, 4);
@@ -1162,6 +1004,10 @@ mod tests {
             self.put_cap(0x74, 0x00, VIRTIO_PCI_CAP_DEVICE_CFG, bar, 0x2000, 16);
         }
     }
+
+    /// The widest BAR window the doorbell cases draw, and the size the fixture
+    /// region is backed at.
+    const MAX_BAR_BYTES: usize = 0x1_0000;
 
     /// A layout the queue-setup cases share: 16 descriptors, matching
     /// `SplitVirtqueue::<16>::LAYOUT`.
@@ -1224,7 +1070,7 @@ mod tests {
     fn rejects_structures_split_across_bars() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x00, VIRTIO_PCI_CAP_NOTIFY_CFG, 2, 0x3000, 20);
         assert_eq!(
@@ -1347,8 +1193,8 @@ mod tests {
         // touches is naturally aligned for the width it is touched at. A
         // transcribed offset that broke this would make the accessor comments
         // false while every existing test still passed.
-        let mut fake = FakeConfig::new();
-        let base = fake.bytes.as_mut_ptr() as usize;
+        let fake = FakeConfig::new();
+        let base = fake.region.base() as usize;
         assert!(base.is_multiple_of(COMMON_CFG_ALIGN), "the fixture's base");
         for off in [
             CFG_DEVICE_FEATURE_SELECT,
@@ -1385,7 +1231,7 @@ mod tests {
     fn rejects_missing_required_structures() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         // Only common and notify are present; ISR and device are absent.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x00, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
@@ -1403,7 +1249,7 @@ mod tests {
         // presence check is what makes the shared-BAR rule cover it too.
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x64, VIRTIO_PCI_CAP_NOTIFY_CFG, 4, 0x3000, 20);
         fake.w32(0x50 + 16, 4);
@@ -1418,7 +1264,7 @@ mod tests {
     fn rejects_a_looping_capability_chain() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         // A -> B -> A never terminates; the iteration guard must trip.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
         fake.put_cap(0x50, 0x40, VIRTIO_PCI_CAP_ISR_CFG, 4, 0x1000, 16);
@@ -1429,7 +1275,7 @@ mod tests {
     fn rejects_a_capability_naming_an_invalid_bar() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         // BAR 6 is outside the valid 0..=5 range.
         fake.put_cap(0x40, 0x00, VIRTIO_PCI_CAP_COMMON_CFG, 6, 0, 16);
         assert_eq!(find_virtio_caps(&fake.config()), Err(CapError::InvalidBar));
@@ -1438,9 +1284,9 @@ mod tests {
     #[test]
     fn a_capability_naming_bar5_is_refused_at_bar_relocation() {
         // BAR 5 is a real BAR, so the capability walk accepts it — but it can
-        // never be the low half of a 64-bit pair, because the register after it
-        // is the CardBus-CIS pointer. This is the full device-driven path that
-        // used to end in a panic: caps -> caps.bar == 5 -> reprogram_bar64(5).
+        // never be the low half of a 64-bit pair, because the register after
+        // it is the CardBus-CIS pointer. This drives the whole device-driven
+        // path: caps -> caps.bar == 5 -> reprogram_bar64(5).
         let mut fake = FakeConfig::new();
         fake.put_full_chain(5);
         let caps = find_virtio_caps(&fake.config()).unwrap();
@@ -1742,7 +1588,7 @@ mod tests {
     fn doorbell_writes_the_index_at_the_computed_slot() {
         // A BAR window whose notify structure sits at offset 16; the doorbell
         // for notify_off 3 with multiplier 4 lands at 16 + 12 = 28.
-        let mut bar = Box::new([0u8; 256]);
+        let bar = MappedRegion::<256>::zeroed();
         let caps = VirtioCaps {
             bar: 4,
             common: 0,
@@ -1750,19 +1596,20 @@ mod tests {
             notify_multiplier: 4,
             device: 0,
         };
-        // SAFETY: `bar` is a live 256-byte buffer that outlives the doorbell — `Doorbell::new`'s contract.
-        let doorbell = unsafe { Doorbell::new(bar.as_mut_ptr(), 256, &caps, 3) }.unwrap();
+        // SAFETY: a live, page-aligned (so two-byte-aligned) 256-byte window that outlives the doorbell — `Doorbell::new`'s contract.
+        let doorbell = unsafe { Doorbell::new(bar.base(), 256, &caps, 3) }.unwrap();
         doorbell.ring(1);
-        assert_eq!(u16::from_le_bytes([bar[28], bar[29]]), 1);
+        let image = bar.read::<256>(0);
+        assert_eq!(u16::from_le_bytes([image[28], image[29]]), 1);
         // Nothing was written at the notify base or anywhere else.
-        assert_eq!(u16::from_le_bytes([bar[16], bar[17]]), 0);
-        assert!(bar[..28].iter().all(|&b| b == 0));
-        assert!(bar[30..].iter().all(|&b| b == 0));
+        assert_eq!(u16::from_le_bytes([image[16], image[17]]), 0);
+        assert!(image[..28].iter().all(|&b| b == 0));
+        assert!(image[30..].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn doorbell_rejects_a_slot_outside_the_bar() {
-        let mut bar = Box::new([0u8; 256]);
+        let bar = MappedRegion::<256>::zeroed();
         let caps = VirtioCaps {
             bar: 4,
             common: 0,
@@ -1771,11 +1618,11 @@ mod tests {
             device: 0,
         };
         // The notify *base* is comfortably inside the window, so `within` is
-        // satisfied — and yet the slot for queue 1 is at 16 + 4096, far outside.
-        // This is the out-of-bounds volatile write the old contract permitted.
+        // satisfied — and yet the slot for queue 1 is at 16 + 4096, far
+        // outside: the out-of-bounds volatile write an extent check misses.
         assert!(caps.within(256));
-        // SAFETY: `bar` is a live 256-byte buffer that outlives the call — `Doorbell::new`'s contract.
-        let placed = unsafe { Doorbell::new(bar.as_mut_ptr(), 256, &caps, 1) };
+        // SAFETY: a live, page-aligned (so two-byte-aligned) 256-byte window that outlives the call — `Doorbell::new`'s contract.
+        let placed = unsafe { Doorbell::new(bar.base(), 256, &caps, 1) };
         assert_eq!(
             placed.err(),
             Some(NotifyError::SlotOutsideBar {
@@ -1783,14 +1630,14 @@ mod tests {
                 bar_size: 256,
             })
         );
-        assert!(bar.iter().all(|&b| b == 0));
+        assert!(bar.read::<256>(0).iter().all(|&b| b == 0));
     }
 
     #[test]
     fn doorbell_rejects_a_slot_that_ends_one_byte_past_the_window() {
         // The doorbell is two bytes wide, so a slot starting at the last byte
         // of the window is out of range even though its start offset is in it.
-        let mut bar = Box::new([0u8; 256]);
+        let bar = MappedRegion::<256>::zeroed();
         let caps = VirtioCaps {
             bar: 4,
             common: 0,
@@ -1798,8 +1645,8 @@ mod tests {
             notify_multiplier: 1,
             device: 0,
         };
-        // SAFETY: `bar` is a live 256-byte buffer that outlives the call — `Doorbell::new`'s contract.
-        let placed = unsafe { Doorbell::new(bar.as_mut_ptr(), 256, &caps, 0) };
+        // SAFETY: a live, page-aligned (so two-byte-aligned) 256-byte window that outlives the call — `Doorbell::new`'s contract.
+        let placed = unsafe { Doorbell::new(bar.base(), 256, &caps, 0) };
         assert_eq!(
             placed.err(),
             Some(NotifyError::SlotOutsideBar {
@@ -1812,10 +1659,10 @@ mod tests {
             notify: 254,
             ..caps
         };
-        // SAFETY: `bar` is a live 256-byte buffer that outlives the doorbell — `Doorbell::new`'s contract.
-        let doorbell = unsafe { Doorbell::new(bar.as_mut_ptr(), 256, &caps, 0) }.unwrap();
+        // SAFETY: as above — a live, two-byte-aligned window outliving the doorbell.
+        let doorbell = unsafe { Doorbell::new(bar.base(), 256, &caps, 0) }.unwrap();
         doorbell.ring(7);
-        assert_eq!(u16::from_le_bytes([bar[254], bar[255]]), 7);
+        assert_eq!(u16::from_le_bytes(bar.read::<2>(254)), 7);
     }
 
     #[test]
@@ -1824,9 +1671,7 @@ mod tests {
         // window perfectly well and would still make the `u16` doorbell write
         // unaligned — undefined behaviour, and the one failure mode a bounds
         // check alone does not catch.
-        #[repr(align(2))]
-        struct Window([u8; 256]);
-        let mut bar = Box::new(Window([0u8; 256]));
+        let bar = MappedRegion::<256>::zeroed();
         let caps = VirtioCaps {
             bar: 4,
             common: 0,
@@ -1835,8 +1680,8 @@ mod tests {
             device: 0,
         };
         assert!(caps.notify_slot_within(0, 256));
-        // SAFETY: `bar` is a live, two-byte-aligned 256-byte buffer that outlives the call — `Doorbell::new`'s contract.
-        let placed = unsafe { Doorbell::new(bar.0.as_mut_ptr(), 256, &caps, 0) };
+        // SAFETY: a live, page-aligned (so two-byte-aligned) 256-byte window that outlives the call — `Doorbell::new`'s contract.
+        let placed = unsafe { Doorbell::new(bar.base(), 256, &caps, 0) };
         assert_eq!(
             placed.err(),
             Some(NotifyError::SlotMisaligned { offset: 17 })
@@ -1848,13 +1693,13 @@ mod tests {
             notify_multiplier: 3,
             ..caps
         };
-        // SAFETY: as above — `bar` is live, two-byte aligned, and outlives the call.
-        let placed = unsafe { Doorbell::new(bar.0.as_mut_ptr(), 256, &caps, 1) };
+        // SAFETY: as above — live, two-byte aligned, and outliving the call.
+        let placed = unsafe { Doorbell::new(bar.base(), 256, &caps, 1) };
         assert_eq!(
             placed.err(),
             Some(NotifyError::SlotMisaligned { offset: 19 })
         );
-        assert!(bar.0.iter().all(|&b| b == 0));
+        assert!(bar.read::<256>(0).iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1895,7 +1740,7 @@ mod tests {
     fn ignores_a_notify_capability_that_is_too_short() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         // A notify cap needs at least 20 bytes (it carries the multiplier); a
         // 16-byte one is not accepted, leaving notify absent.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0, 16);
@@ -1912,7 +1757,7 @@ mod tests {
     fn keeps_the_first_of_a_duplicated_capability_type() {
         let mut fake = FakeConfig::new();
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
         // Two common caps: `get_or_insert` keeps the first offset seen.
         fake.put_cap(0x40, 0x50, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x1111, 16);
         fake.put_cap(0x50, 0x60, VIRTIO_PCI_CAP_COMMON_CFG, 4, 0x2222, 16);
@@ -1940,7 +1785,7 @@ mod tests {
         // The status bit claims a capability list, but the pointer is null: the
         // walk visits nothing and every required structure is absent.
         fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-        fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x00;
+        fake.w8(PCI_CAPABILITIES_PTR as usize, 0x00);
         assert_eq!(
             find_virtio_caps(&fake.config()),
             Err(CapError::MissingStructure)
@@ -1961,17 +1806,16 @@ mod tests {
             cap_list in any::<bool>(),
             cap_pointer in any::<u8>(),
         ) {
-            let mut space: Box<[u8; 4096]> = Box::new([0u8; 4096]);
-            space.copy_from_slice(&bytes);
+            let mut fake = FakeConfig::new();
+            let page: [u8; 4096] = bytes.try_into().expect("the strategy yields 4096 bytes");
+            fake.region.write(0, page);
             // The status bit and the head pointer are steered explicitly so the
             // walk actually traverses on roughly half the cases; every byte it
             // then reads is still arbitrary.
             let status = if cap_list { PCI_STATUS_CAP_LIST } else { 0 };
-            space[PCI_STATUS as usize..PCI_STATUS as usize + 2]
-                .copy_from_slice(&status.to_le_bytes());
-            space[PCI_CAPABILITIES_PTR as usize] = cap_pointer;
-            // SAFETY: `space` is a live 4096-byte buffer that outlives `config` — `PciConfig::new`'s contract.
-            let config = unsafe { PciConfig::new(space.as_mut_ptr()) };
+            fake.w16(PCI_STATUS as usize, status);
+            fake.w8(PCI_CAPABILITIES_PTR as usize, cap_pointer);
+            let config = fake.config();
             if let Ok(caps) = find_virtio_caps(&config) {
                 prop_assert!(caps.bar <= PCI_LAST_BAR);
                 // The accepted index must therefore be answerable, never
@@ -2004,7 +1848,7 @@ mod tests {
         ) {
             let mut fake = FakeConfig::new();
             fake.w16(PCI_STATUS as usize, PCI_STATUS_CAP_LIST);
-            fake.bytes[PCI_CAPABILITIES_PTR as usize] = 0x40;
+            fake.w8(PCI_CAPABILITIES_PTR as usize, 0x40);
             let slots = [0x40usize, 0x50, 0x64, 0x74];
             for (index, at) in slots.iter().enumerate() {
                 // The last capability's `next` is perturbed like the rest, so a
@@ -2024,10 +1868,10 @@ mod tests {
                     prop_assert!(fake.config().bar_is_64bit(caps.bar).is_ok());
                     // Placing a doorbell from these offsets must decide, not
                     // fault: the window is real and exactly 0x4000 bytes.
-                    let mut window = vec![0u8; 0x4000];
-                    // SAFETY: `window` is a live 0x4000-byte buffer that outlives the call — `Doorbell::new`'s contract.
+                    let window = MappedRegion::<0x4000>::zeroed();
+                    // SAFETY: a live, page-aligned (so two-byte-aligned) 0x4000-byte window that outlives the call — `Doorbell::new`'s contract.
                     let placed = unsafe {
-                        Doorbell::new(window.as_mut_ptr(), 0x4000, &caps, u16::MAX)
+                        Doorbell::new(window.base(), 0x4000, &caps, u16::MAX)
                     };
                     prop_assert_eq!(
                         placed.is_ok(),
@@ -2069,8 +1913,6 @@ mod tests {
             queue_max in any::<u16>(),
         ) {
             const WINDOW_BYTES: usize = 0x4000;
-            #[repr(C, align(4096))]
-            struct Window([u8; WINDOW_BYTES]);
 
             let caps = VirtioCaps {
                 bar: 0,
@@ -2097,15 +1939,13 @@ mod tests {
             if !aligned || !caps.within(WINDOW_BYTES) {
                 return Ok(());
             }
-            let mut window = Box::new(Window([0u8; WINDOW_BYTES]));
+            let mut window = MappedRegion::<WINDOW_BYTES>::zeroed();
             let at = common as usize;
             // A device maximum the queue programming can act on, so the 64-bit
             // ring-address writes are reached rather than short-circuited.
-            window.0[at + CFG_QUEUE_SIZE..at + CFG_QUEUE_SIZE + 2]
-                .copy_from_slice(&queue_max.to_le_bytes());
-            let base = window.0.as_mut_ptr();
-            // SAFETY: `window` is a live, page-aligned `WINDOW_BYTES`-byte buffer owned by this test; `caps.within(WINDOW_BYTES)` was just checked, so `COMMON_CFG_MIN_LEN` bytes from `base + common` lie inside it, and `caps.common_is_aligned()` with a page-aligned `base` makes that address `COMMON_CFG_ALIGN`-aligned — `CommonCfg::new`'s contract in both halves.
-            let cfg = unsafe { CommonCfg::new(base.add(at)) };
+            window.write(at + CFG_QUEUE_SIZE, queue_max.to_le_bytes());
+            // SAFETY: a live, page-aligned `WINDOW_BYTES`-byte region owned by this test; `caps.within(WINDOW_BYTES)` was just checked, so `COMMON_CFG_MIN_LEN` bytes from `base + common` lie inside it, and `caps.common_is_aligned()` over a page-aligned base makes that address `COMMON_CFG_ALIGN`-aligned — `CommonCfg::new`'s contract in both halves.
+            let cfg = unsafe { CommonCfg::new(window.base().add(at)) };
             // Every accessor width the transport uses: 8, 16, 32, and the
             // 64-bit register written as two halves.
             cfg.set_status(STATUS_ACKNOWLEDGE);
@@ -2134,7 +1974,7 @@ mod tests {
             notify in prop_oneof![Just(0u32), 0u32..=0x200, any::<u32>()],
             notify_off in prop_oneof![0u16..=64, any::<u16>()],
             multiplier in prop_oneof![Just(0u32), 1u32..=8, any::<u32>()],
-            bar_size in 0usize..=0x1_0000,
+            bar_size in 0usize..=MAX_BAR_BYTES,
         ) {
             let caps = VirtioCaps {
                 bar: 0,
@@ -2160,10 +2000,12 @@ mod tests {
             // are two-byte aligned — an odd offset would make the `u16` write
             // unaligned, which is undefined behaviour rather than a slow store.
             let slot = (notify as usize) + (notify_off as usize) * (multiplier as usize);
-            let mut window = vec![0u16; bar_size.div_ceil(2)];
-            let base = window.as_mut_ptr().cast::<u8>();
-            // SAFETY: `window` holds at least `bar_size` bytes, is `u16`-aligned, and outlives the call — `Doorbell::new`'s contract.
-            let placed = unsafe { Doorbell::new(base, bar_size, &caps, notify_off) };
+            // Backed at the widest `bar_size` the strategy draws; `Doorbell`
+            // is told `bar_size`, which its contract requires the window to be
+            // at least, so a larger backing store changes no decision.
+            let window = MappedRegion::<MAX_BAR_BYTES>::zeroed();
+            // SAFETY: a live, page-aligned (so two-byte-aligned) region of at least `bar_size` bytes that outlives the call — `Doorbell::new`'s contract.
+            let placed = unsafe { Doorbell::new(window.base(), bar_size, &caps, notify_off) };
             prop_assert_eq!(
                 placed.is_ok(),
                 caps.notify_slot_within(notify_off, bar_size) && slot.is_multiple_of(2)
@@ -2172,9 +2014,10 @@ mod tests {
                 doorbell.ring(0xBEEF);
                 // The write landed wholly inside the window, at the offset the
                 // arithmetic named and nowhere else.
-                prop_assert_eq!(window[slot / 2], 0xBEEFu16);
-                prop_assert!(window[..slot / 2].iter().all(|&v| v == 0));
-                prop_assert!(window[slot / 2 + 1..].iter().all(|&v| v == 0));
+                let image = window.read::<MAX_BAR_BYTES>(0);
+                prop_assert_eq!(u16::from_le_bytes([image[slot], image[slot + 1]]), 0xBEEF);
+                prop_assert!(image[..slot].iter().all(|&v| v == 0));
+                prop_assert!(image[slot + 2..].iter().all(|&v| v == 0));
             }
         }
     }

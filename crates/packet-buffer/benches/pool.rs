@@ -1,7 +1,7 @@
 //! Microbenchmarks for the packet buffer pool and the owner-side ownership
 //! ledger.
 //!
-//! `write`/`write_at`/`read` are the only byte copies on the "zero-copy"
+//! `write`/`write_at`/`copy_out` are the only byte copies on the "zero-copy"
 //! dataplane, so their cost is benched across representative frame sizes (64,
 //! 512, 1500 bytes) to confirm they scale with payload and stay header-cheap.
 //!
@@ -12,14 +12,10 @@
 //! the handful-of-cycles range; the point of the bench is to catch a regression
 //! that makes validation cost real time on the per-packet path.
 
-// Benchmark target: no public API to document (the `criterion_group!` macro
-// expands to public items).
-#![allow(missing_docs)]
-
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use packet_buffer::{BufferPool, FreeList};
+use packet_buffer::{BUFFER_SIZE, BufferPool, FreeList};
 
 /// Representative Ethernet payload sizes: a minimum frame, a mid-size frame,
 /// and a near-MTU frame.
@@ -32,8 +28,9 @@ fn buffer_pool_write(c: &mut Criterion) {
         let data = vec![0xABu8; size];
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, data| {
-            // SAFETY: single-threaded bench owns index 0 throughout; `data` is a
-            // separate allocation and never borrows from the pool.
+            // SAFETY: `write`'s two clauses. `pool` is constructed in this
+            // function and handed to nothing else, so index 0 is owned here;
+            // `data` is a separate `Vec` and so cannot borrow from the pool.
             b.iter(|| black_box(unsafe { pool.write(0, black_box(data)) }));
         });
     }
@@ -49,24 +46,49 @@ fn buffer_pool_write_at(c: &mut Criterion) {
         let data = vec![0xCDu8; size];
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, data| {
-            // SAFETY: own index 0; `HEADER + size <= BUFFER_SIZE` for every
-            // benched size; `data` does not borrow from the pool.
+            // SAFETY: `write_at`'s two clauses. `pool` is constructed in this
+            // function and handed to nothing else, so index 0 is owned here;
+            // `data` is a separate `Vec` and so cannot borrow from the pool.
+            // (`HEADER + size` stays inside `BUFFER_SIZE` for every benched
+            // size, which keeps the `# Panics` assert quiet — not a soundness
+            // clause: `write_at` checks that span itself.)
             b.iter(|| unsafe { pool.write_at(0, HEADER, black_box(data)) });
         });
     }
     group.finish();
 }
 
-fn buffer_pool_read(c: &mut Criterion) {
+fn buffer_pool_copy_out(c: &mut Criterion) {
     let pool = BufferPool::<4>::new();
-    // SAFETY: own index 0; the payload fits in BUFFER_SIZE.
+    // SAFETY: `write`'s two clauses. `pool` is local to this function, so index
+    // 0 is owned here, and the literal is not a borrow from the pool.
     unsafe { pool.write(0, &[0xEFu8; 1500]) }.expect("1500 bytes fit a buffer");
-    let mut group = c.benchmark_group("buffer_pool_read");
+    let mut group = c.benchmark_group("buffer_pool_copy_out");
     for &size in &SIZES {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            // SAFETY: own index 0; `offset + len <= BUFFER_SIZE`.
-            b.iter(|| black_box(unsafe { pool.read(0, 0, black_box(size as u32)) }));
+            // The destination is the caller's to provide, so it is allocated
+            // once here rather than inside `iter`: a per-iteration buffer would
+            // put its zeroing — which grows with the benched size — inside the
+            // measurement and report it as copy cost.
+            let mut storage = [0u8; BUFFER_SIZE];
+            b.iter(|| {
+                // SAFETY: `copy_out`'s one clause is ownership of the index,
+                // and `pool` is local to this function, so index 0 is owned
+                // here. The span is not a soundness clause — `copy_out` bounds
+                // it itself and returns `SpanOutsideBuffer` — which is why the
+                // returned slice borrows `storage` and never the pool.
+                let copied = unsafe { pool.copy_out(0, 0, black_box(size as u32), &mut storage) }
+                    .expect("the span lies within one buffer and storage holds a whole one");
+                // Reduced to its length before it leaves the closure: the
+                // returned slice borrows `storage`, which is captured, and an
+                // `FnMut` cannot let such a borrow escape its body. The
+                // destination is fenced separately because nothing here reads
+                // the bytes back, and the copy is the whole measurement — it
+                // must not be elided as dead.
+                black_box(copied.len());
+                black_box(&mut storage);
+            });
         });
     }
     group.finish();
@@ -103,7 +125,7 @@ criterion_group!(
     benches,
     buffer_pool_write,
     buffer_pool_write_at,
-    buffer_pool_read,
+    buffer_pool_copy_out,
     free_list_pop_push,
     free_list_pop_reclaim
 );

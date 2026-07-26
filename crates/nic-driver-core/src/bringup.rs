@@ -834,8 +834,8 @@ mod tests {
     use std::boxed::Box;
     use std::vec;
 
-    /// A buffer carrying the alignment a Microkit mapping supplies, used for
-    /// both fixture regions below.
+    /// The heap allocation a fixture region owns, carrying the alignment a
+    /// Microkit mapping supplies.
     ///
     /// `[u8; N]` has `align_of == 1`, so a fixture handing one to
     /// `PciConfig::new` or `PlacedBar::map` would under-deliver on the very
@@ -843,19 +843,91 @@ mod tests {
     /// could then not tell apart from the device's. Page alignment is what the
     /// real mappings have, so it is what the fixtures have.
     #[repr(C, align(4096))]
-    struct MappedRegion<const N: usize>([u8; N]);
+    struct Page<const N: usize>([u8; N]);
 
-    impl<const N: usize> core::ops::Deref for MappedRegion<N> {
-        type Target = [u8; N];
+    /// A fixture mapping, reachable only through the one raw pointer the driver
+    /// under test is attached to.
+    ///
+    /// The bytes are `Box::into_raw`d and no `&`/`&mut` into them is ever
+    /// formed, so fixture and driver share a single tag for the whole region's
+    /// life. A reference would not survive: the driver writes its registers
+    /// through the raw pointer, and such a write invalidates any reference
+    /// derived from the same allocation, so a fixture that read a register back
+    /// through one would itself be undefined behaviour while claiming to prove
+    /// the driver's conduct against a hostile device (TEST-6). Exposing no
+    /// reference is what makes that unrepresentable rather than a rule to
+    /// remember (DOC-9).
+    struct MappedRegion<const N: usize> {
+        page: *mut Page<N>,
+    }
 
-        fn deref(&self) -> &Self::Target {
-            &self.0
+    impl<const N: usize> MappedRegion<N> {
+        fn zeroed() -> Self {
+            Self {
+                page: Box::into_raw(Box::new(Page([0u8; N]))),
+            }
+        }
+
+        /// The pointer the driver is mapped over, and the only route to the
+        /// bytes — `*mut` from `&self` deliberately, because handing the driver
+        /// a second, separately derived pointer is what a fixture must not do.
+        fn base(&self) -> *mut u8 {
+            self.page.cast::<u8>()
+        }
+
+        fn read<const M: usize>(&self, off: usize) -> [u8; M] {
+            assert!(
+                off.saturating_add(M) <= N,
+                "read of {off:#x} escapes {N:#x}"
+            );
+            // SAFETY: the assertion above puts `off..off + M` inside the
+            // `N`-byte allocation `zeroed` made, which `Drop` alone frees and
+            // which therefore outlives `self`; `[u8; M]` imposes no alignment.
+            unsafe { self.base().add(off).cast::<[u8; M]>().read_volatile() }
+        }
+
+        fn write<const M: usize>(&mut self, off: usize, bytes: [u8; M]) {
+            assert!(
+                off.saturating_add(M) <= N,
+                "write of {off:#x} escapes {N:#x}"
+            );
+            // SAFETY: bounded by the assertion above into the allocation
+            // `zeroed` made and `Drop` alone frees, exactly as `read`.
+            unsafe { self.base().add(off).cast::<[u8; M]>().write_volatile(bytes) };
         }
     }
 
-    impl<const N: usize> core::ops::DerefMut for MappedRegion<N> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
+    impl MappedRegion<4096> {
+        /// A `PciConfig` over this region.
+        fn config(&mut self) -> PciConfig {
+            // SAFETY: `N == 4096` makes this allocation exactly the ECAM page
+            // `PciConfig::new` names, page-aligned by `Page`, live until this
+            // region's `Drop` and so outliving the value — the whole contract.
+            unsafe { PciConfig::new(self.base()) }
+        }
+    }
+
+    impl MappedRegion<BAR_WINDOW_SIZE> {
+        /// Attach the driver to this region as though `caps` had come from
+        /// [`identify`], which is the only other way a `PlacedBar` is made.
+        fn map(&mut self, caps: VirtioCaps) -> Offered<MappedDevice> {
+            assert!(caps.within(BAR_WINDOW_SIZE));
+            assert!(caps.common_is_aligned());
+            // SAFETY: `N == BAR_WINDOW_SIZE` makes this allocation exactly the
+            // window `PlacedBar::map` names, page-aligned by `Page` and live
+            // until this region's `Drop`, which nothing derived here outlives.
+            // The two predicates it relies on `identify` for were just
+            // asserted, this being the literal construction they guard.
+            unsafe { PlacedBar { caps }.map(self.base()) }
+        }
+    }
+
+    impl<const N: usize> Drop for MappedRegion<N> {
+        fn drop(&mut self) {
+            // SAFETY: `page` came from `Box::into_raw` in `zeroed`, is never
+            // replaced, and no other owner exists, so this reconstructs that
+            // `Box` exactly once.
+            drop(unsafe { Box::from_raw(self.page) });
         }
     }
 
@@ -863,7 +935,7 @@ mod tests {
     // `identify` and `place_bar` run against real `PciConfig` accessors over
     // plain memory — the same pattern `virtio::pci`'s own tests use.
     struct FakeConfig {
-        bytes: Box<MappedRegion<4096>>,
+        region: MappedRegion<4096>,
     }
 
     // Configuration-space offsets the fixture writes. Private to `virtio::pci`,
@@ -884,12 +956,12 @@ mod tests {
         /// structures inside a `BAR_WINDOW_SIZE` window.
         fn conforming() -> Self {
             let mut fake = Self {
-                bytes: Box::new(MappedRegion([0u8; 4096])),
+                region: MappedRegion::zeroed(),
             };
             fake.w16(CFG_VENDOR, VIRTIO_VENDOR_ID);
             fake.w16(CFG_DEVICE, VIRTIO_NET_DEVICE_ID);
             fake.w16(CFG_STATUS, CAP_LIST_BIT);
-            fake.bytes[CFG_CAP_PTR] = 0x40;
+            fake.w8(CFG_CAP_PTR, 0x40);
             fake.put_cap(0x40, 0x50, 1, 4, 0x0000, 16);
             fake.put_cap(0x50, 0x64, 2, 4, 0x3000, 20);
             fake.w32(0x50 + 16, 4);
@@ -899,31 +971,31 @@ mod tests {
             fake
         }
 
+        fn w8(&mut self, off: usize, v: u8) {
+            self.region.write(off, [v]);
+        }
         fn w16(&mut self, off: usize, v: u16) {
-            self.bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            self.region.write(off, v.to_le_bytes());
         }
         fn w32(&mut self, off: usize, v: u32) {
-            self.bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            self.region.write(off, v.to_le_bytes());
         }
         fn r32(&self, off: usize) -> u32 {
-            u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap())
+            u32::from_le_bytes(self.region.read(off))
         }
         fn r16(&self, off: usize) -> u16 {
-            u16::from_le_bytes(self.bytes[off..off + 2].try_into().unwrap())
+            u16::from_le_bytes(self.region.read(off))
         }
         fn put_cap(&mut self, at: usize, next: u8, cfg_type: u8, bar: u8, offset: u32, len: u8) {
-            self.bytes[at] = CAP_ID_VNDR;
-            self.bytes[at + 1] = next;
-            self.bytes[at + 2] = len;
-            self.bytes[at + 3] = cfg_type;
-            self.bytes[at + 4] = bar;
+            self.w8(at, CAP_ID_VNDR);
+            self.w8(at + 1, next);
+            self.w8(at + 2, len);
+            self.w8(at + 3, cfg_type);
+            self.w8(at + 4, bar);
             self.w32(at + 8, offset);
         }
         fn config(&mut self) -> PciConfig {
-            // SAFETY: `self.bytes` is a live, page-aligned,
-            // configuration-space-sized buffer owned by this test and outliving
-            // the value — `PciConfig::new`'s contract over plain memory.
-            unsafe { PciConfig::new(self.bytes.as_mut_ptr()) }
+            self.region.config()
         }
     }
 
@@ -980,21 +1052,21 @@ mod tests {
 
         let mut looped = FakeConfig::conforming();
         // 0x40 chains to itself, so the walk never terminates on its own.
-        looped.bytes[0x41] = 0x40;
+        looped.w8(0x41, 0x40);
         assert_eq!(
             identify(&looped.config()),
             Err(BringUpError::Capabilities(CapError::Malformed))
         );
 
         let mut split = FakeConfig::conforming();
-        split.bytes[0x50 + 4] = 2;
+        split.w8(0x50 + 4, 2);
         assert_eq!(
             identify(&split.config()),
             Err(BringUpError::Capabilities(CapError::MultipleBars))
         );
 
         let mut invalid = FakeConfig::conforming();
-        invalid.bytes[0x40 + 4] = 9;
+        invalid.w8(0x40 + 4, 9);
         assert_eq!(
             identify(&invalid.config()),
             Err(BringUpError::Capabilities(CapError::InvalidBar))
@@ -1002,7 +1074,7 @@ mod tests {
 
         let mut missing = FakeConfig::conforming();
         // Drop the ISR capability out of the chain.
-        missing.bytes[0x50 + 1] = 0x74;
+        missing.w8(0x50 + 1, 0x74);
         assert_eq!(
             identify(&missing.config()),
             Err(BringUpError::Capabilities(CapError::MissingStructure))
@@ -1102,7 +1174,7 @@ mod tests {
         // device's, so this is a malformed device, not a driver error.
         let mut fake = FakeConfig::conforming();
         for cap in [0x40usize, 0x50, 0x64, 0x74] {
-            fake.bytes[cap + 4] = 5;
+            fake.w8(cap + 4, 5);
         }
         fake.w32(CFG_BAR0 + 5 * 4, BAR_TYPE_64BIT);
         let identified = identify(&fake.config()).expect("a 64-bit BAR 5 identifies");
@@ -1376,18 +1448,15 @@ mod tests {
     /// so a `CommonCfg` driven over it answers as a conforming device would:
     /// virtio 1.0 offered, two virtqueues, a queue maximum of [`QUEUE_SIZE`],
     /// and notify slot 3.
-    fn seeded_bar(common: usize) -> Box<MappedRegion<BAR_WINDOW_SIZE>> {
-        let mut bar = Box::new(MappedRegion([0u8; BAR_WINDOW_SIZE]));
-        let put16 = |bar: &mut [u8; BAR_WINDOW_SIZE], off: usize, v: u16| {
-            bar[off..off + 2].copy_from_slice(&v.to_le_bytes());
-        };
+    fn seeded_bar(common: usize) -> MappedRegion<BAR_WINDOW_SIZE> {
+        let mut bar = MappedRegion::zeroed();
         // `device_features` reads the same register under both selector
         // windows over plain memory, so bit 0 here becomes bit 32 of the pair
         // — which is VIRTIO_F_VERSION_1, the one bit this driver requires.
-        bar[common + 4..common + 8].copy_from_slice(&1u32.to_le_bytes());
-        put16(&mut bar, common + 18, 2); // num_queues
-        put16(&mut bar, common + 24, QUEUE_SIZE as u16); // queue_size maximum
-        put16(&mut bar, common + 30, 3); // queue_notify_off
+        bar.write(common + 4, 1u32.to_le_bytes());
+        bar.write(common + 18, 2u16.to_le_bytes()); // num_queues
+        bar.write(common + 24, (QUEUE_SIZE as u16).to_le_bytes()); // queue_size maximum
+        bar.write(common + 30, 3u16.to_le_bytes()); // queue_notify_off
         bar
     }
 
@@ -1410,16 +1479,8 @@ mod tests {
             notify_multiplier: 4,
             device: 0x300,
         };
-        // The two predicates `identify` establishes on a real device,
-        // discharged here directly because this test builds the capabilities
-        // itself.
-        assert!(caps.within(BAR_WINDOW_SIZE));
-        assert!(caps.common_is_aligned());
-        // SAFETY: `bar` is a live, owned, page-aligned BAR_WINDOW_SIZE-byte
-        // buffer that outlives everything derived from it, and both of the
-        // predicates `map` relies on `identify` for were just asserted for that
-        // size — `PlacedBar::map`'s contract.
-        let live = unsafe { PlacedBar { caps }.map(bar.as_mut_ptr()) }
+        let live = bar
+            .map(caps)
             .acknowledge()
             .expect("a zeroed status register reads back as an acknowledged reset")
             .negotiate_features()
@@ -1434,36 +1495,48 @@ mod tests {
             .expect("both queues fit the device maximum")
             .go_live();
 
-        let read16 = |off: usize| u16::from_le_bytes([bar[off], bar[off + 1]]);
-        let read64 = |off: usize| u64::from_le_bytes(bar[off..off + 8].try_into().unwrap());
         // The handshake's final status, at common+20.
         assert_eq!(
-            bar[COMMON + 20],
+            u8::from_le_bytes(bar.read(COMMON + 20)),
             STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK
         );
         // The driver's accepted feature set, written low half first at
         // common+12 under selector 1 — so the high half of ACCEPTED_FEATURES.
         assert_eq!(
-            u32::from_le_bytes(bar[COMMON + 12..COMMON + 16].try_into().unwrap()),
+            u32::from_le_bytes(bar.read(COMMON + 12)),
             (ACCEPTED_FEATURES >> 32) as u32
         );
         // The last queue programmed is the transmit one, at TX_VQ_OFFSET into
         // the region, with its ring addresses and the enable bit.
-        assert_eq!(read16(COMMON + 22), TX_QUEUE, "queue_select");
-        assert_eq!(read16(COMMON + 24), QUEUE_SIZE as u16, "queue_size");
-        assert_eq!(read16(COMMON + 28), 1, "queue_enable");
+        assert_eq!(
+            u16::from_le_bytes(bar.read(COMMON + 22)),
+            TX_QUEUE,
+            "queue_select"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bar.read(COMMON + 24)),
+            QUEUE_SIZE as u16,
+            "queue_size"
+        );
+        assert_eq!(u16::from_le_bytes(bar.read(COMMON + 28)), 1, "queue_enable");
         let layout = &DriverVirtqueue::LAYOUT;
         let tx_ring = VQ_PADDR + TX_VQ_OFFSET as u64;
         assert_eq!(
-            read64(COMMON + 32),
+            u64::from_le_bytes(bar.read(COMMON + 32)),
             tx_ring + layout.descriptor_offset as u64
         );
-        assert_eq!(read64(COMMON + 40), tx_ring + layout.driver_offset as u64);
-        assert_eq!(read64(COMMON + 48), tx_ring + layout.device_offset as u64);
+        assert_eq!(
+            u64::from_le_bytes(bar.read(COMMON + 40)),
+            tx_ring + layout.driver_offset as u64
+        );
+        assert_eq!(
+            u64::from_le_bytes(bar.read(COMMON + 48)),
+            tx_ring + layout.device_offset as u64
+        );
         // `go_live` rang the receive doorbell at notify + 3 * 4.
-        assert_eq!(read16(NOTIFY + 12), RX_QUEUE);
+        assert_eq!(u16::from_le_bytes(bar.read(NOTIFY + 12)), RX_QUEUE);
         live.ring_transmit();
-        assert_eq!(read16(NOTIFY + 12), TX_QUEUE);
+        assert_eq!(u16::from_le_bytes(bar.read(NOTIFY + 12)), TX_QUEUE);
     }
 
     #[test]
@@ -1472,50 +1545,43 @@ mod tests {
         // memory: it must reach the *common-configuration* structure at the
         // offset the capabilities named, not the BAR base. Reading back the
         // status byte the accessor wrote is what pins the offset.
-        let mut bar = Box::new(MappedRegion([0u8; BAR_WINDOW_SIZE]));
-        let caps = VirtioCaps {
-            bar: 4,
-            common: 0x100,
-            notify: 0x200,
-            notify_multiplier: 4,
-            device: 0x300,
-        };
-        assert!(caps.within(BAR_WINDOW_SIZE));
-        assert!(caps.common_is_aligned());
-        // SAFETY: `bar` is a live, BAR_WINDOW_SIZE-byte, page-aligned buffer
-        // owned by this test and outliving `device`; both `caps.within` and
-        // `caps.common_is_aligned` were just asserted, which is what
-        // `PlacedBar::map` relies on `identify` for.
-        let device = unsafe { PlacedBar { caps }.map(bar.as_mut_ptr()) }.device;
+        let mut bar = MappedRegion::zeroed();
+        let device = bar
+            .map(VirtioCaps {
+                bar: 4,
+                common: 0x100,
+                notify: 0x200,
+                notify_multiplier: 4,
+                device: 0x300,
+            })
+            .device;
 
         device.set_status(STATUS_DRIVER);
-        assert_eq!(bar[0x100 + 20], STATUS_DRIVER, "device_status at common+20");
+        assert_eq!(
+            u8::from_le_bytes(bar.read(0x100 + 20)),
+            STATUS_DRIVER,
+            "device_status at common+20"
+        );
         assert_eq!(device.status(), STATUS_DRIVER);
 
         // Slot 3 of a multiplier-4 notify structure: 0x200 + 12.
         let doorbell = device.place_doorbell(3).expect("a slot inside the window");
         doorbell.ring(TX_QUEUE);
-        assert_eq!(
-            u16::from_le_bytes([bar[0x200 + 12], bar[0x200 + 13]]),
-            TX_QUEUE
-        );
+        assert_eq!(u16::from_le_bytes(bar.read(0x200 + 12)), TX_QUEUE);
     }
 
     #[test]
     fn a_mapped_device_refuses_a_doorbell_slot_outside_the_window() {
-        let mut bar = Box::new(MappedRegion([0u8; BAR_WINDOW_SIZE]));
-        let caps = VirtioCaps {
-            bar: 4,
-            common: 0,
-            notify: 0x3000,
-            notify_multiplier: u32::MAX,
-            device: 0x2000,
-        };
-        assert!(caps.within(BAR_WINDOW_SIZE) && caps.common_is_aligned());
-        // SAFETY: as above — a live, owned, page-aligned BAR_WINDOW_SIZE-byte
-        // buffer, with capability offsets that fit it and a common-configuration
-        // offset that is aligned, both just asserted.
-        let device = unsafe { PlacedBar { caps }.map(bar.as_mut_ptr()) }.device;
+        let mut bar = MappedRegion::zeroed();
+        let device = bar
+            .map(VirtioCaps {
+                bar: 4,
+                common: 0,
+                notify: 0x3000,
+                notify_multiplier: u32::MAX,
+                device: 0x2000,
+            })
+            .device;
         assert!(matches!(
             device.place_doorbell(u16::MAX),
             Err(NotifyError::SlotOutsideBar { .. })
@@ -1535,17 +1601,14 @@ mod tests {
             seed in prop::collection::vec(any::<u8>(), 0..512),
             base in prop::array::uniform4(any::<u8>()),
         ) {
-            let mut bytes = Box::new([0u8; 4096]);
+            let mut page = MappedRegion::<4096>::zeroed();
             // Seed the head of the page, where the capability pointer and the
             // chain live, and keep the ids reachable so the walk is entered.
-            for (slot, byte) in bytes.iter_mut().zip(seed.iter()) {
-                *slot = *byte;
+            for (offset, byte) in seed.iter().enumerate() {
+                page.write(offset, [*byte]);
             }
-            bytes[0x00..0x04].copy_from_slice(&base);
-            // SAFETY: a live, owned 4096-byte buffer outliving the value —
-            // `PciConfig::new`'s contract over plain memory.
-            let config = unsafe { PciConfig::new(bytes.as_mut_ptr()) };
-            match identify(&config) {
+            page.write(0x00, base);
+            match identify(&page.config()) {
                 // Anything accepted must satisfy both halves of what
                 // `PlacedBar::map`'s safety comment names `identify` as the
                 // guarantor of: inside the window, or a later dereference

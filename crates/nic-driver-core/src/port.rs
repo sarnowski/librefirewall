@@ -2,36 +2,29 @@
 //! in.
 //!
 //! [`RxPath`] and [`TxPath`] (the crate root) each answer for one direction's
-//! distrust boundaries. What is left is the *sequence* in which a driver runs
-//! them and which step raises which signal — six ordered calls that used to
-//! live inside the protection domain's `loop`, where no host test could reach
-//! them. [`DataplanePort`] owns them, so the sequence is asserted here rather
+//! distrust boundaries. What is left is the *sequence* a driver runs them in,
+//! which used to live inside the protection domain's `loop` where no host test
+//! could reach it. [`DataplanePort`] owns it, so it is asserted here rather
 //! than believed.
 //!
 //! # Why the order is the order
 //!
-//! One pass is `reclaim → refill → drain → notify`, then `reap → post → notify`:
+//! One pass is `reclaim → refill → drain → notify`, then `reap → post →
+//! notify`. Each adjacency is chosen against a named failure of its reverse:
 //!
-//! 1. **`reclaim`** first, because it is what returns buffers the forwarder has
-//!    finished with to the pool ledger. Running it after `refill` would refill
-//!    from a pool that is a whole pass out of date, and a busy link would post
-//!    fewer buffers than it has.
-//! 2. **`refill`** before `drain`, so descriptors freed by the *previous*
-//!    pass's completions are back at the device before this pass takes more
-//!    frames out. The receive doorbell is rung once for the whole batch, after
-//!    `drain`, rather than per buffer.
-//! 3. **`drain`** publishes completed frames to the forwarder, and the
-//!    forwarder is notified once per pass rather than once per frame: a
-//!    notification is an seL4 system call, and the forwarder rereads the ring
-//!    until it is empty, so a second notification for the same batch buys
-//!    nothing and costs a context switch.
-//! 4. **`reap` before `post`**, because reaping frees the virtqueue descriptors
-//!    that `post` then fills. The reverse order would post against a queue
-//!    still holding last pass's completed descriptors and stall the transmit
-//!    direction one pass in every burst.
+//! - `reclaim` before `refill`, or the refill draws on a pool a whole pass out
+//!   of date and a busy link posts fewer buffers than it holds.
+//! - `refill` before `drain`, so descriptors freed by the *previous* pass's
+//!   completions are back at the device before this pass takes more frames out.
+//! - `reap` before `post`, because reaping frees the virtqueue descriptors
+//!   `post` then fills; the reverse stalls the transmit direction one pass in
+//!   every burst.
 //!
-//! Each doorbell is rung only when its step actually produced work, so an idle
-//! port performs no MMIO writes at all.
+//! Each signal is raised once per batch, not once per frame: a notification is
+//! an seL4 system call and the forwarder rereads the ring until it is empty, so
+//! a second one for the same batch buys nothing and costs a context switch. A
+//! doorbell is rung only when its step produced work, so an idle port performs
+//! no MMIO write at all.
 //!
 //! # Adversaries
 //!
@@ -39,11 +32,7 @@
 //! already exist. The **hostile or malfunctioning device** (CONCEPT §7.1) is
 //! answered by `virtio::queue` and [`RxPath`], the **byzantine neighbour PD**
 //! (the forwarder) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
-//! must not do is reintroduce an unbounded loop between them, and it does not:
-//! [`poll_once`](DataplanePort::poll_once) runs each step exactly once, and
-//! every step is itself bounded per call by a driver-owned quantity, so one
-//! pass performs a bounded amount of work whatever the device and the peer
-//! publish. There is no `while` anywhere in this module.
+//! must not do is reintroduce an unbounded loop between them.
 
 use pd_runtime::{Pipeline, PoolOwner};
 
@@ -52,51 +41,42 @@ use crate::{Counters, DriverStats, RxPath, TxPath};
 
 /// How a poll pass tells the forwarder that frames are waiting.
 ///
-/// A protection domain implements this over its Microkit channel. It is a trait
-/// so the poll sequence is host-testable: `sel4_microkit::Channel` cannot be
-/// constructed off seL4, and a notification is invisible from inside the domain
-/// that sends it, so a test asserting "the forwarder was notified exactly once,
-/// after `drain` and before the receive doorbell" has nothing else to observe.
+/// A trait so the poll sequence is host-testable: `sel4_microkit::Channel`
+/// cannot be constructed off seL4, and a notification is invisible from inside
+/// the domain that sends it, so a test asserting "notified exactly once, after
+/// `drain` and before the receive doorbell" has nothing else to observe.
 pub trait ForwarderSignal {
     /// Signal the forwarder. Called at most once per poll pass.
     fn notify(&self);
 }
 
-/// What one poll pass did.
+/// Which signals one poll pass raised.
 ///
-/// Every field is "at least one", not a count: the pass raises each signal once
-/// for the whole batch (see the module header), so the counts a caller might
-/// want are the [`Counters`] and `DeviceFaults` that
-/// [`stats`](DataplanePort::stats) samples, not this. It exists so a test can
-/// assert which steps produced work without reading the device's MMIO, and so a
-/// caller can tell a pass that moved traffic from an idle one.
+/// Exists so a test can assert which steps produced work without reading the
+/// device's MMIO, and so a caller can tell a pass that moved traffic from an
+/// idle one. It is not a tally: the counts an operator wants are the
+/// [`Counters`] and `DeviceFaults` that [`stats`](DataplanePort::stats) samples.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PollOutcome {
-    /// Frames were published to the forwarder and it was notified.
     pub notified_forwarder: bool,
-    /// Buffers were reposted to the receive virtqueue and its doorbell rung.
     pub rang_receive_doorbell: bool,
-    /// Frames were posted to the transmit virtqueue and its doorbell rung.
     pub rang_transmit_doorbell: bool,
 }
 
 impl PollOutcome {
-    /// Whether the pass did nothing at all: no frame in either direction, no
-    /// buffer reposted, and so no MMIO write and no notification.
     #[must_use]
     pub fn is_idle(&self) -> bool {
         *self == Self::default()
     }
 }
 
-/// One dataplane port's steady state: both virtqueues, both pipeline
-/// directions, and the tallies.
+/// One dataplane port's steady state.
 ///
-/// The port owns its virtqueues rather than borrowing them per call, for the
-/// same reason [`RxPath`] owns its ring handle: a virtqueue carries the
-/// driver-private descriptor lifecycle — which descriptors are free, which are
-/// published, and what length each was posted with — so a second view of the
-/// same ring would hand out descriptors the first still considers the device's.
+/// The port owns its virtqueues rather than borrowing them per call: a
+/// virtqueue carries the driver-private descriptor lifecycle — which
+/// descriptors are free, which are published, and what length each was posted
+/// with — so a second view of the same ring would hand out descriptors the
+/// first still considers the device's.
 pub struct DataplanePort<'pipe> {
     receive_queue: DriverVirtqueue,
     transmit_queue: DriverVirtqueue,
@@ -107,7 +87,7 @@ pub struct DataplanePort<'pipe> {
 }
 
 impl<'pipe> DataplanePort<'pipe> {
-    /// Take every handle this port needs, once, and move both virtqueues in.
+    /// Take every handle this port needs and move both virtqueues in.
     ///
     /// `receive_pipeline` is the pipeline this port receives *into* — its pool
     /// is this NIC's receive DMA target and this port owns that pool — and
@@ -116,10 +96,12 @@ impl<'pipe> DataplanePort<'pipe> {
     /// matching reference maps, which is what turns a pool index into a DMA
     /// address.
     ///
-    /// Call once per protection domain. Every handle taken here is this
-    /// domain's own position in a ring; taking a second set would restart at
-    /// slot zero and re-walk slots already used (see the `pd_runtime` crate
-    /// header).
+    /// **Unenforced precondition (DOC-7):** call once per protection domain.
+    /// Every handle taken here is this domain's own position in a ring, so a
+    /// second port over the same pipelines restarts at slot zero and re-walks
+    /// slots already used. No type refuses the second call; `queue`'s crate
+    /// header states that single-handle rule and why nothing enforces it. Treat
+    /// it as unenforced rather than as checked elsewhere.
     #[must_use]
     pub fn attach(
         receive_pipeline: &'pipe Pipeline,
@@ -139,7 +121,8 @@ impl<'pipe> DataplanePort<'pipe> {
         }
     }
 
-    /// Fill the receive virtqueue with buffers before the device is live.
+    /// Fill the receive virtqueue with buffers before the device is live,
+    /// returning whether any was posted.
     ///
     /// Separate from [`poll_once`](Self::poll_once) because it must run while
     /// the device is still [`Configured`](crate::bringup::Configured): the
@@ -149,9 +132,6 @@ impl<'pipe> DataplanePort<'pipe> {
     /// `DRIVER_OK`. Priming from inside the poll loop instead would leave the
     /// device live with an empty receive queue for one pass, dropping whatever
     /// arrived in it.
-    ///
-    /// Returns whether any buffer was posted — false only if the pool is empty,
-    /// which at attach time it never is.
     pub fn prime(&mut self) -> bool {
         self.receive
             .refill(&mut self.receive_queue, &mut self.pool, &mut self.counters)
@@ -160,9 +140,8 @@ impl<'pipe> DataplanePort<'pipe> {
     /// Run one poll pass in both directions; see the module header for the
     /// order and why it is that order.
     ///
-    /// Bounded: six calls, each itself bounded per call by a driver-owned
-    /// quantity, and no loop of its own. Neither the device nor the forwarder
-    /// can extend a pass.
+    /// Each step is bounded per call by a driver-owned quantity, so neither the
+    /// device nor the forwarder can extend a pass.
     pub fn poll_once<D: VirtioDevice>(
         &mut self,
         device: &Live<D>,
@@ -198,8 +177,8 @@ impl<'pipe> DataplanePort<'pipe> {
         }
     }
 
-    /// Sample everything this port can say about its device, its peer, and
-    /// itself, in the shape the metrics endpoint (CONCEPT §11) will scrape.
+    /// Sample this port in the shape the metrics endpoint (CONCEPT §11) will
+    /// scrape.
     #[must_use]
     pub fn stats(&self) -> DriverStats {
         DriverStats::sample(&self.counters, &self.receive_queue, &self.transmit_queue)
@@ -234,10 +213,51 @@ mod tests {
         }
     }
 
-    /// A 16-byte-aligned virtqueue backing region, the alignment
-    /// `SplitVirtqueue::new` requires.
+    /// The heap allocation a fixture region owns, carrying the 16-byte
+    /// alignment `SplitVirtqueue::new` requires.
     #[repr(C, align(16))]
-    struct VqRegion([u8; 4096]);
+    struct VqPage([u8; 4096]);
+
+    /// A fixture virtqueue region, reachable only through the one raw pointer
+    /// the queue under test is built over.
+    ///
+    /// The bytes are `Box::into_raw`d and no `&`/`&mut` into them is ever
+    /// formed, so fixture and driver share a single tag for the whole region's
+    /// life. A `Box` field would not survive: moving the fixture into place
+    /// emits a `Unique` retag over the allocation, which pops the tag the
+    /// virtqueue was built from and makes every later driver access undefined
+    /// behaviour — while the fixture goes on claiming to prove the driver's
+    /// conduct against a hostile device (TEST-6). Owning the allocation as a
+    /// raw pointer leaves no `Box` to move and so no ordering to get wrong,
+    /// which is what makes that unrepresentable rather than a rule to remember
+    /// (DOC-9).
+    struct VqRegion {
+        page: *mut VqPage,
+    }
+
+    impl VqRegion {
+        fn zeroed() -> Self {
+            Self {
+                page: Box::into_raw(Box::new(VqPage([0; 4096]))),
+            }
+        }
+
+        /// The pointer the virtqueue is built over, and the only route to the
+        /// bytes — `*mut` from `&self` deliberately, because handing out a
+        /// second, separately derived pointer is what a fixture must not do.
+        fn base(&self) -> *mut u8 {
+            self.page.cast::<u8>()
+        }
+    }
+
+    impl Drop for VqRegion {
+        fn drop(&mut self) {
+            // SAFETY: `page` came from `Box::into_raw` in `zeroed`, is never
+            // replaced, and no other owner exists, so this reconstructs that
+            // `Box` exactly once.
+            drop(unsafe { Box::from_raw(self.page) });
+        }
+    }
 
     /// A frame length the device can report that is neither runt nor clamped.
     const FRAME_LEN: u32 = (VirtioNetHdr::LEN + 64) as u32;
@@ -250,8 +270,8 @@ mod tests {
     /// peer handle is taken once here for the fixture's life: a fresh handle
     /// per assertion would restart at slot zero and re-walk slots already used.
     struct PortFixture {
-        receive_region: Box<VqRegion>,
-        transmit_region: Box<VqRegion>,
+        receive_region: VqRegion,
+        transmit_region: VqRegion,
         port: DataplanePort<'static>,
         device: Live<FakeDevice>,
         forwarder: RecordingForwarder,
@@ -284,14 +304,15 @@ mod tests {
 
             let receive_pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
             let transmit_pipeline: &'static Pipeline = Box::leak(Box::new(Pipeline::new()));
-            let mut receive_region = Box::new(VqRegion([0; 4096]));
-            let mut transmit_region = Box::new(VqRegion([0; 4096]));
-            // SAFETY: the pointer backs a 16-byte-aligned, zeroed region owned
-            // solely by this test and outliving the queue, and no second queue
-            // is built over it — `SplitVirtqueue::new`'s contract.
-            let receive_queue = unsafe { DriverVirtqueue::new(receive_region.0.as_mut_ptr()) };
+            let receive_region = VqRegion::zeroed();
+            let transmit_region = VqRegion::zeroed();
+            // SAFETY: `VqRegion::zeroed` allocates a 16-byte-aligned, zeroed
+            // 4096-byte region freed by its own `Drop` alone, so it outlives
+            // the queue, and `base` is the only pointer into it, so no second
+            // queue is built over it — `SplitVirtqueue::new`'s contract.
+            let receive_queue = unsafe { DriverVirtqueue::new(receive_region.base()) };
             // SAFETY: as above, over the second, disjoint region.
-            let transmit_queue = unsafe { DriverVirtqueue::new(transmit_region.0.as_mut_ptr()) };
+            let transmit_queue = unsafe { DriverVirtqueue::new(transmit_region.base()) };
 
             // The pipelines' real host addresses stand in for their physical
             // ones, so a buffer address the port derives resolves to real bytes.
@@ -329,7 +350,7 @@ mod tests {
         fn complete_receive(&mut self, head: u16, used_len: u32) {
             let used = DriverVirtqueue::LAYOUT.device_offset;
             let slot = (self.receive_used_idx as usize) & (QUEUE_SIZE - 1);
-            let base = self.receive_region.0.as_mut_ptr();
+            let base = self.receive_region.base();
             self.receive_used_idx = self.receive_used_idx.wrapping_add(1);
             // SAFETY: `slot < QUEUE_SIZE`, so the used element and the used
             // index both lie inside the 4096-byte region this test owns, and
@@ -353,7 +374,7 @@ mod tests {
         fn transmit_everything(&mut self) {
             let driver = DriverVirtqueue::LAYOUT.driver_offset;
             let used = DriverVirtqueue::LAYOUT.device_offset;
-            let base = self.transmit_region.0.as_mut_ptr();
+            let base = self.transmit_region.base();
             // SAFETY: every offset below lies inside the 4096-byte region this
             // test owns — the available-ring header and its `QUEUE_SIZE`
             // entries, and the used ring's header and its `QUEUE_SIZE`

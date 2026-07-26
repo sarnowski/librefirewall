@@ -47,17 +47,21 @@
 //! * **Bounded work.** `PoolOwner::reclaim` and `ForwardStage::poll` each move
 //!   at most `DRAIN_LIMIT` descriptors per call, whatever cursor the peer
 //!   publishes.
-//! * **The delegated precondition terminates.** `descriptor_in_bounds` is the
-//!   component `packet_buffer`'s accessors name as the enforcer for a
-//!   peer-supplied span (AGENTS.md DOC-7). Every descriptor that reaches the tx
-//!   side and passes it is then actually read through the pool, so a
-//!   disagreement between the two surfaces as a fault rather than as a comment
-//!   nobody checked.
+//! * **The delegated precondition terminates, and its two ends agree.**
+//!   `descriptor_in_bounds` is the component `packet_buffer`'s accessors name
+//!   as the enforcer for a peer-supplied span (AGENTS.md DOC-7), and
+//!   `copy_out` re-checks that span itself. Every descriptor reaching the tx
+//!   side is put to *both*, and their verdicts asserted equal — in both
+//!   directions, which is why the copy is attempted even for a span the
+//!   validator rejects. A guard that passes what the accessor refuses, or
+//!   refuses what it would have served, surfaces as a fault rather than as a
+//!   comment nobody checked.
 //! * **Counters only ever rise**, so a rejection is never silently un-counted.
 
 use std::collections::BTreeSet;
 
 use arbitrary::Unstructured;
+use packet_buffer::CopyOutError;
 use pd_runtime::{
     BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardStage, OwnedBuffer, POOL_BUFFERS, Pipeline,
     PoolOwner, RING_SLOTS, descriptor_in_bounds,
@@ -201,25 +205,74 @@ pub fn pipeline_harness(data: &[u8]) {
                 let mut taken = 0usize;
                 let drained: Vec<Descriptor> = peer_tx.drain(limit).collect();
                 assert!(drained.len() <= limit, "drain exceeded its limit");
+                // Sized at one whole buffer, which is what makes the two
+                // verdicts below comparable at all: a destination this size
+                // cannot be the reason `copy_out` refuses an in-bounds span,
+                // since `descriptor_in_bounds` has already bounded `len` to
+                // `BUFFER_SIZE`. Any `DestinationTooSmall` is therefore a
+                // defect in this harness's own sizing, and is asserted as one
+                // rather than folded in with the span verdict.
+                let mut storage = [0u8; BUFFER_SIZE];
                 for descriptor in drained {
                     taken += 1;
-                    if descriptor_in_bounds(&descriptor) {
-                        // SAFETY: this side dequeued the descriptor, so by the
-                        // ring protocol it owns the buffer until it returns it
-                        // below; the borrow ends before that. `descriptor_in_bounds`
-                        // just proved the span lies within one pool buffer,
-                        // which is the precondition `BufferPool::read` names —
-                        // and the unconditional span check inside it is what
-                        // turns a disagreement between the two into a fault
-                        // here instead of an out-of-bounds read.
-                        let bytes = unsafe {
-                            pipeline.pool.read(
-                                descriptor.buffer as usize,
-                                descriptor.offset as usize,
-                                descriptor.len,
+                    // `descriptor_in_bounds` is the enforcer `packet_buffer`
+                    // names for a peer-supplied span (AGENTS.md DOC-7), and
+                    // `copy_out` re-checks that same span unconditionally. Both
+                    // rule on the identical question over the identical pool —
+                    // `Pool` is `BufferPool<POOL_BUFFERS>`, the very bound the
+                    // validator tests — so their verdicts must agree exactly,
+                    // and the copy is attempted for every descriptor rather
+                    // than only the ones that pass, or the disagreement this
+                    // asserts could never be observed in one direction.
+                    //
+                    // A disagreement is a defect in one of the two, never a
+                    // peer's doing: a span the validator passes and the
+                    // accessor refuses means the guard does not guard what it
+                    // claims, and the converse means the validator rejects
+                    // frames the pool would have served. Neither is untrusted
+                    // input, so both fail here instead of being counted.
+                    let in_bounds = descriptor_in_bounds(&descriptor);
+                    // SAFETY: this side dequeued the descriptor, so by the ring
+                    // protocol it owns the buffer until it returns it below.
+                    // The snapshot lands in this harness's own `storage`, so
+                    // nothing borrows the pool and the call is sound for an
+                    // out-of-bounds span too — which is what lets it be made
+                    // unconditionally, as the assertion requires.
+                    let snapshot = unsafe {
+                        pipeline.pool.copy_out(
+                            descriptor.buffer as usize,
+                            descriptor.offset as usize,
+                            descriptor.len,
+                            &mut storage,
+                        )
+                    };
+                    match snapshot {
+                        Ok(bytes) => {
+                            assert!(
+                                in_bounds,
+                                "copy_out accepted buffer {} span {}..+{}, which \
+                                 descriptor_in_bounds refused",
+                                descriptor.buffer, descriptor.offset, descriptor.len
+                            );
+                            assert_eq!(
+                                bytes.len(),
+                                descriptor.len as usize,
+                                "copy_out filled a prefix of a length other than the one asked for"
+                            );
+                        }
+                        Err(CopyOutError::SpanOutsideBuffer { .. }) => {
+                            assert!(
+                                !in_bounds,
+                                "descriptor_in_bounds passed buffer {} span {}..+{}, which \
+                                 copy_out refused as outside the buffer",
+                                descriptor.buffer, descriptor.offset, descriptor.len
+                            );
+                        }
+                        Err(error @ CopyOutError::DestinationTooSmall { .. }) => {
+                            panic!(
+                                "{error}: storage is a whole buffer, so no in-bounds span exceeds it"
                             )
-                        };
-                        assert_eq!(bytes.len(), descriptor.len as usize);
+                        }
                     }
                     let _full = peer_free.try_enqueue(descriptor);
                 }

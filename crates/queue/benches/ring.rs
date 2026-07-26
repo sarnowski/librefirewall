@@ -11,10 +11,6 @@
 //! a rejection would report the cost of the rejection path under the name of the
 //! path it claims to measure, which is worse than no number at all.
 
-// Benchmark target: no public API to document (the `criterion_group!` macro
-// expands to public items).
-#![allow(missing_docs)]
-
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

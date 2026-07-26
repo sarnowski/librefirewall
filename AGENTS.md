@@ -29,21 +29,14 @@ that is retired leaves its number retired with it.
 `make ci` verifies the rules a machine can check. It does not verify the rest, and there are more of
 the rest. **A green gate does not mean this document's rules are met.**
 
-This is measured, not theoretical. A full rule-adherence audit of this repository found roughly 230
-violations, about 45 of them CRITICAL — including an unauthenticated path from a byzantine peer
-protection domain to an arbitrary physical-memory write, roughly twenty panics reachable from
-hostile device input, six `SAFETY` comments whose stated invariant was untrue, and a fuzz harness
-structurally incapable of finding the bug class it was written for. `make ci` was green throughout,
-before and after.
-
 Mechanically enforced today, and nothing else:
 
 | Check | Command |
 |---|---|
 | Formatting | `cargo fmt --all --check` |
 | Lints, warnings denied — every host crate, and the PDs for seL4 in **both** kernel configurations | `cargo clippy` over an explicit `-p` list, in `xtask test` |
-| Public-API documentation | `missing_docs = "deny"` (workspace lints) |
 | `SAFETY` comment *present* on every `unsafe` block | `undocumented_unsafe_blocks = "deny"` |
+| Per-file comment ratio and per-crate `unsafe` count never rise | `xtask test` (DOC-11 / ENG-13 ratchets) |
 | Coverage floors (94% combined, 90% per library crate) | `cargo llvm-cov` in `xtask test` |
 | Dependency, license and source policy | `cargo deny check bans licenses sources` |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
@@ -130,8 +123,9 @@ make hooks
 ```
 
 - **pre-commit** runs `make test` — the fast host gate: formatting, Clippy (warnings denied),
-  `missing_docs`, `undocumented_unsafe_blocks`, the dependency/license/source policy, and all unit
-  and property tests with the coverage floors enforced. It does not boot QEMU, so it stays fast.
+  `undocumented_unsafe_blocks`, the comment-ratio and `unsafe`-count ratchets, the
+  dependency/license/source policy, and all unit and property tests with the coverage floors
+  enforced. It does not boot QEMU, so it stays fast.
 - **pre-push** runs `make ci` — the complete gate: the host gate plus the fuzz targets, image
   assembly, and the QEMU system and A/B scenarios.
 
@@ -142,62 +136,81 @@ it appears to.
 
 ## Documentation
 
-Documentation earns its place by carrying what the code cannot: the goal a piece of code serves,
-the constraint that shaped it, the non-obvious reason behind a choice. A comment that restates the
-code is worse than none — it drifts and misleads. When in doubt, leave it out and sharpen the name.
+Documentation is a liability that earns its place only by carrying what the code cannot. Every
+sentence is an untested assertion: nothing fails when it becomes false. A wrong comment is worse
+than no comment and worse than wrong code — wrong code is eventually tested, while a wrong comment
+misleads every reader and every agent until someone audits it by hand.
+
+That gives an order of obligation, not a menu. Each step is mandatory before the next is permitted:
+
+1. **Make it unrepresentable.** If the type system can carry the constraint, it MUST carry it.
+2. **Make it checked.** If a build-time or runtime check can carry it, it MUST carry it.
+3. **Only then write it down** — and only the part neither of the above can carry.
 
 **Project documentation lives in exactly four standalone Markdown documents, and no further
-documentation files are to be created (DOC-1):**
+documentation files are to be created (DOC-1).** Each has exactly one mandate, and content
+belonging to another document's mandate is a finding in the document that hosts it:
 
-- **README.md** — overview, status, build/test instructions, license.
-- **CONCEPT.md** — target architecture, threat model, critical decisions.
-- **AGENTS.md** — this guide.
-- **MONITORING.md** — the operator contract for logs and metrics (see *Observability*).
+- **README.md** — **status**: what works, what does not, and how to build and test it. Never
+  architecture, never mechanism.
+- **CONCEPT.md** — **intent**: target architecture, threat model, critical decisions.
+- **AGENTS.md** — **the rules**.
+- **MONITORING.md** — **exposed signals**: the operator contract.
 
 (`LICENSE.md` is the verbatim license text, not project documentation, and is exempt from this rule.)
 
 Everything else lives **in the source**:
 
-- **Self-documenting code first.** Precise names for types, functions, parameters, and variables
-  remove the need for most comments. Reach for a better name before a comment.
-- **Comments state *why*, not *what* (DOC-2).** Invariants, constraints, non-obvious consequences,
-  and the reason a thing is done a particular way. Never annotate what the next line plainly does,
-  and never let a comment contradict the code.
-- **Every crate carries a crate-level `//!` header (DOC-3)** that explains its concepts,
-  architecture, design, and invariants, so a reader understands the crate fully from its source
-  alone. A module with non-obvious design carries a module `//!` header too. Architectural
-  documentation that would otherwise become a standalone Markdown file (how a driver works, what a
-  protocol's core concepts are, why an ABI is laid out a certain way) belongs in these headers,
-  living with the code it describes.
-- **Public items carry rustdoc (DOC-4)** documenting what a caller may rely on: inputs, outputs,
-  errors, side effects, and — for `unsafe` — the safety contract the caller must uphold.
-  `missing_docs = "deny"` is workspace-wide and **absolute**: library crates, protection-domain
-  binaries and `xtask` all carry it, and no crate opts out. The sole exception is a Criterion bench
-  harness under `benches/`, which is neither a public API nor shipped, and which states the reason
-  on the line above its `#![allow(missing_docs)]`. Do not restate type signatures or framework
-  defaults.
+- **A constraint the type system can express MUST be expressed in the type system, and MUST NOT be
+  written as a comment (DOC-9).** Before writing any `SAFETY:`, `# Safety`, or precondition comment,
+  establish whether the invariant can be made unrepresentable — a consumed `self`, a non-`Copy`
+  token, a branded wrapper, a single private constructor, a typed error. If it can, it is done that
+  way and the comment is not written. A comment is permitted **only** for an invariant no
+  first-party type can carry, and it states which kind it is: hardware semantics, third-party
+  runtime behaviour, or a cross-artifact fact. A comment asserting a property of first-party Rust
+  that the compiler could have enforced is a **design defect**, not a documentation one.
+- **A comment MUST carry information the code cannot (DOC-2).** The test is deletion: remove it, and
+  if nothing is lost, it was a defect. It never restates the code and never contradicts it.
+- **A comment MUST NOT claim anything about code outside the item it annotates (DOC-10).** "The only
+  panic-capable construct in this crate", "nothing else reaches the event loop", "this is the sole
+  caller" — every such claim is falsified by an edit elsewhere, is owned by nobody, and is
+  unmaintainable by construction.
+- **Every crate carries a crate-level `//!` header (DOC-3)** stating three things and nothing else:
+  what the crate is for, which CONCEPT §7.1 adversary it faces, and the non-obvious constraints or
+  rejected alternatives that shaped it. **It MUST NOT state invariants** — those are types (DOC-9),
+  and an invariant in a header is a DOC-9 finding against the type system.
+- **Documentation is written only where the signature does not carry the contract (DOC-4).** A typed
+  error enum is the error documentation; a consumed `self` is the lifecycle documentation; a named
+  type is the unit documentation. `missing_docs` is deliberately **not** enforced: forcing a comment
+  onto every public item manufactures contentless prose, and a rule that makes documentation *exist*
+  without making it *true* buys nothing. One obligation is retained absolutely: **every `unsafe fn`
+  carries a `# Safety` section**, because a caller obligation across an unsafe boundary has no other
+  carrier.
+- **The comment budget only shrinks (DOC-11).** Per production file, the comment-line ratio is
+  recorded and MUST NOT rise. Raising one requires human approval (SCM-6) and a recorded reason.
 
 ### `SAFETY` comments must be verifiable, not merely present
 
 `undocumented_unsafe_blocks = "deny"` catches an *absent* safety comment. It cannot catch a *false*
-one, and the audit found six that were simply untrue — including one asserting a memory region was
-shared with a single protection domain while the system description mapped it read-write into three.
+one — a comment is free to assert an invariant the system does not provide, and a reader cannot tell
+the two apart unless the comment says *who* provides it.
 
 - **Every `unsafe` block carries a `SAFETY:` comment (DOC-5)** stating the invariant that makes the
   block sound.
 - **The comment names the component that guarantees the invariant (DOC-6)** — a `file:line` in the
   system description, the type whose constructor establishes it, or the function that validated the
   value. *Who* guarantees it is the checkable part. "Guaranteed by `librefirewall.system:48,62`,
-  which maps this region into this PD alone" can be verified in one step and would have caught that
-  finding; "the region is only shared with the driver" cannot be verified at all. A safety comment
-  the surrounding API does not actually guarantee is a CRITICAL defect, not a documentation nit.
+  which maps this region into this PD alone" can be verified in one step; "the region is only shared
+  with the driver" cannot be verified at all. A safety comment the surrounding API does not actually
+  guarantee is a CRITICAL defect, not a documentation nit.
 
 ### A delegated precondition names its enforcer
 
-The worst finding of the audit was not a bug in any one place. Every layer's documentation delegated
-descriptor-index validation to a different layer — the driver to the runtime, the runtime to the
-queue, the queue back to the caller — and no layer performed it. The delegation formed a cycle, and
-the cycle terminated in an arbitrary physical-memory write from a byzantine peer.
+A precondition delegated layer by layer can complete a circle — the driver defers to the runtime,
+the runtime to the queue, the queue back to its caller — and then no layer performs the check at
+all. Every document reads as though the validation happens elsewhere, and the gap is invisible in
+any single file. Where the value is an index into shared memory, the end of that chain is a
+memory-safety violation.
 
 - **When documentation delegates a precondition to its caller, it names the component that enforces
   it, and that component has a test proving the enforcement (DOC-7).** "The caller must ensure
@@ -214,9 +227,8 @@ in the same change (DOC-8). Code is the source of truth — when docs and code d
 ## Status truth
 
 README declares itself the single source of truth for status, which only holds if changes maintain
-it. The audit found `Untrusted-device hardening | done` while README's own prose three sections
-later listed missing interrupt handling, unconfined DMA, and bring-up failures that are all
-`assert!`.
+it. A status table is the easiest thing in the repository to leave behind: it is read far more often
+than it is edited, and a row that has quietly gone stale still reads as authoritative.
 
 - **A change that alters what works updates README's status table in the same change (STA-1)** —
   the same in-change requirement that already applies to MONITORING.md for exposed signals (OBS-6).
@@ -241,8 +253,8 @@ background.
   until the code says whose input it is.
 - **The trusted base is exactly seL4, Microkit and `rust-sel4` (CON-3).** Nothing first-party
   inherits that status — not a PD, not `xtask`, not a crate that "only ever sees our own data". A
-  first-party component claiming trust it was not granted is how the coverage exclusion for `xtask`
-  was once justified and how a peer PD came to be treated as well-behaved.
+  first-party component claiming trust it was not granted is how it escapes the scrutiny its
+  position requires.
 - **x86_64 only (CON-4).** No `cfg` branch, abstraction layer, or "portable for later" indirection
   for another architecture; CONCEPT §3 is explicit that no accommodation is made.
 
@@ -284,11 +296,10 @@ The testing pyramid, from broad base to narrow top:
 
 ### Fuzzing rules
 
-The audit found the fuzz workspace depending on exactly one crate (`virtio`), leaving five crates
-that parse untrusted input structurally unreachable — including the two where the critical ownership
-bugs lived. It also found a harness whose `if held[index]` guard rejected the very input shape the
-bug required, making a known bug class unfindable by construction. A fuzz target that cannot reach a
-bug is worse than none: it reads as coverage.
+A fuzz target that cannot reach a bug is worse than none: it reads as coverage. Two things put a
+target out of reach of what it was written for — a crate the workspace does not depend on, so no
+target exists for it at all, and a harness guard that filters out the very input shape the bug
+requires. Neither is visible in a passing run.
 
 - **The fuzz workspace depends on every crate that parses or interprets untrusted input (TEST-7)** —
   bytes from a device, a peer protection domain, or the network. Adding such a crate without adding
@@ -319,11 +330,10 @@ floor as coverage rises; never lower one to land a change.
    host-tested to keep the build honest, not held to a number defending the product.
 3. **Test or benchmark harness** — code whose only purpose is to run tests or benchmarks.
 
-"State it explicitly" was previously satisfied by citing CONCEPT's trusted-base boundary to exempt
-`xtask` — but the trusted base is seL4, Microkit and `rust-sel4`, and nothing else (CON-3). The
-trusted-base argument is **never** available for first-party code. A reason outside this list
-requires a human decision (SCM-6) and is added here in the same change; an exclusion citing no
-listed reason is a MAJOR finding.
+The trusted-base argument is **never** available for first-party code: the trusted base is seL4,
+Microkit and `rust-sel4`, and nothing else (CON-3). A reason outside this list requires a human
+decision (SCM-6) and is added here in the same change; an exclusion citing no listed reason is a
+MAJOR finding.
 
 ## Observability
 
@@ -362,10 +372,8 @@ checksums and an SBOM.
 **The shipped profile is the tested profile (BLD-3).** `make release` runs the full acceptance gate,
 assembles the release configuration, *and boots that release artifact against the same forwarding
 contract* before it counts as a release; if it fails, `dist/` is emptied rather than left holding an
-unproven image that looks finished. This rule exists because `make release` previously validated a
-debug artifact and shipped an unbooted release one — a different kernel build, proven by nothing.
-The release configuration is a different build; passing the gate on the debug image says nothing
-about it.
+unproven image that looks finished. The release configuration is a different kernel build from the
+one the gate exercises, so passing the gate on the debug image says nothing about it.
 
 The build container is a tool, not the product. The deployable output is the signed Microkit boot
 payload and its versioned machine contract (BLD-6). A cache may accelerate a build but must never be
@@ -445,9 +453,9 @@ reference; do not copy an Arm loader recipe.
 
 ### ENG-5 — reject untrusted input safely; fail visibly on an internal invariant violation
 
-This rule caused roughly half of all CRITICAL audit findings while stated as a principle. The
-principle is unchanged and remains the point; what follows is the mechanical test that makes it
-reviewable.
+Stated as a principle alone, this rule is agreed with and then not applied: "reject safely" reads as
+advice, and each individual `unwrap` looks locally justified. The principle remains the point; what
+follows is the mechanical test that makes it reviewable.
 
 **The test.** Any `panic!`, `assert!`, `unwrap`, `expect`, `debug_assert!`, slice index (`a[i]`), or
 arithmetic that can overflow, on a path reachable from bytes written by **a device, a peer
@@ -470,10 +478,10 @@ rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-
 
 ### ENG-10 — `debug_assert!` is never the only check on external input
 
-A `debug_assert!` is compiled out of the release build. Three CRITICAL findings came from exactly
-this: a release build proceeding past a removed bounds check straight into an out-of-bounds
-`copy_nonoverlapping`, and silent virtqueue free-list corruption where the only guard was a
-`debug_assert!`.
+A `debug_assert!` is compiled out of the release build, and the protection domains are built with
+the optimized Cargo profile in every kernel configuration (`tools/xtask/src/image.rs:83-91`) — so a
+`debug_assert!` is absent from every image that boots. A bounds check written that way is not a
+weaker check; in the artifact that ships it is no check at all, and what follows it is unguarded.
 
 **A `debug_assert!` may never be the sole validation of a value that originates outside the
 component.** It documents an expectation and catches a first-party mistake in development; it is
@@ -501,6 +509,9 @@ booted in release form is not a guarantee.
 - **Keep `unsafe` confined to the crates that genuinely need it (ENG-11)** — MMIO, DMA,
   shared-memory ABIs. `unsafe` appearing in a crate that has no hardware or ABI reason for it is a
   design finding, not a local one.
+- **The `unsafe` budget only shrinks (ENG-13).** Every `unsafe` block obliges a DOC-6 claim the
+  compiler cannot check, so the per-crate block count is the leading indicator of prose that no
+  mechanism verifies. The count is recorded and MUST NOT rise without human approval (SCM-6).
 - **Never paper over a real failure (ENG-12)** with a silent fallback, a default value, or a
   swallowed error. Surface it: log with full technical detail, mark the relevant signal (a
   trace/span once tracing exists), and return an actionable, typed error. Keep this distinct from
@@ -512,9 +523,9 @@ booted in release form is not a guarantee.
 The author's bar. A change is done when, from a clean checkout:
 
 1. The full gate is green through the same commands users and CI run: formatting, Clippy,
-   `missing_docs`, `undocumented_unsafe_blocks`, dependency policy, unit and property tests at or
-   above the coverage floors, the fuzz targets, image assembly, and the QEMU system and A/B
-   scenarios (ENG-9).
+   `undocumented_unsafe_blocks`, the DOC-11 and ENG-13 ratchets, dependency policy, unit and
+   property tests at or above the coverage floors, the fuzz targets, image assembly, and the QEMU
+   system and A/B scenarios (ENG-9).
 2. Documentation and tests are updated **in the same change** — crate headers, rustdoc, `SAFETY`
    comments with their named guarantors (DOC-6), delegated preconditions with their named enforcers
    (DOC-7).
@@ -535,8 +546,8 @@ produce comparable output.
    check **ENG-4, ENG-5, ENG-10, ENG-12** on every new path, and **TEST-6, TEST-7, TEST-8, TEST-9**
    on its tests. Run the ENG-5 candidate finder over the diff.
 3. **`unsafe`.** For each block: **DOC-5** (present), **DOC-6** (names its guarantor), and then
-   *verify the guarantor actually guarantees it* — open the named `file:line` or constructor. Six of
-   these were false. Check **ENG-11** for placement.
+   *verify the guarantor actually guarantees it* — open the named `file:line` or constructor.
+   Check **ENG-11** for placement.
 4. **Preconditions.** For each documented precondition delegated to a caller: **DOC-7**. Follow the
    delegation chain to a component that validates and has a test. A chain that cycles or ends
    nowhere is CRITICAL.
@@ -582,14 +593,17 @@ a command finds *candidates*, not violations — it makes the review reproducibl
 
 | ID | Rule | Sev | Enforcement / check |
 |---|---|---|---|
-| DOC-1 | Exactly four standalone Markdown docs (README, CONCEPT, AGENTS, MONITORING) plus LICENSE.md; no fifth | MAJ | REVIEW · `find . -name '*.md' -not -path './target/*'` |
-| DOC-2 | Comments state *why*, never restate the code, never contradict it | MIN | REVIEW |
-| DOC-3 | Every crate has a `//!` header covering concepts, architecture, invariants; non-obvious modules too | MAJ | REVIEW · `head -1 crates/*/src/lib.rs` |
-| DOC-4 | Public items carry rustdoc; `missing_docs` deny is absolute — only a `benches/` harness may opt out, stating why | MAJ | GATE · `missing_docs = "deny"` + REVIEW for any `allow` |
+| DOC-1 | Exactly four standalone Markdown docs, each strictly to its own mandate (README=status, CONCEPT=intent, AGENTS=rules, MONITORING=signals); content in the wrong document is a finding | MAJ | REVIEW · `find . -name '*.md' -not -path './target/*'` |
+| DOC-2 | A comment MUST carry what the code cannot; deletion test — if nothing is lost, it was a defect | MAJ | REVIEW |
+| DOC-3 | A crate `//!` header states purpose, adversary, and constraint — and MUST NOT state invariants | MAJ | REVIEW · `head -40 crates/*/src/lib.rs` |
+| DOC-4 | Documented only where the signature does not carry the contract; `missing_docs` is NOT enforced; `# Safety` on every `unsafe fn` is absolute | MAJ | REVIEW · `rg -n 'pub unsafe fn' crates/ pds/` |
 | DOC-5 | Every `unsafe` block carries a `SAFETY:` comment | MAJ | GATE · `undocumented_unsafe_blocks = "deny"` |
 | DOC-6 | The `SAFETY:` comment names the component guaranteeing the invariant (`file:line`, constructor, or validating fn) — and that component really does | CRIT | REVIEW · `rg -B3 'unsafe \{' crates/ pds/` |
 | DOC-7 | A precondition delegated to a caller names its enforcing component, which has a test proving enforcement; no enforcer = unenforced; a delegation cycle is CRITICAL | CRIT | REVIEW · `rg -ni -e 'caller must' -e '# Safety' crates/ pds/` |
 | DOC-8 | A change that falsifies a doc, header, or comment corrects it in the same change | MAJ | REVIEW |
+| DOC-9 | A constraint the type system can express MUST be a type, never a comment; a comment asserting a compiler-enforceable property of first-party Rust is a design defect | MAJ | REVIEW · for each `SAFETY`/precondition comment, name the type change that makes it redundant |
+| DOC-10 | A comment MUST NOT claim anything about code outside the item it annotates | MIN | REVIEW · `rg -n 'the only\|nothing else\|sole caller\|never reaches' crates/ pds/` |
+| DOC-11 | Per-file comment-line ratio MUST NOT rise; raising one needs human approval and a recorded reason | MAJ | GATE · `xtask test` (comment-ratio ratchet) |
 
 ### STA — status truth
 
@@ -643,6 +657,7 @@ a command finds *candidates*, not violations — it makes the review reproducibl
 | ENG-10 | A `debug_assert!` is never the only check on an externally driven value; the real check is unconditional | CRIT | REVIEW · `rg -n 'debug_assert' crates/ pds/` |
 | ENG-11 | `unsafe` is confined to crates that genuinely need it (MMIO, DMA, shared-memory ABI) | MAJ | REVIEW · `rg -l 'unsafe' crates/` |
 | ENG-12 | Never paper over a failure with a silent fallback, default, or swallowed error; log with detail and return a typed error | CRIT | REVIEW · `rg -n -e unwrap_or -e 'let _ =' -e '.ok()' crates/ pds/` |
+| ENG-13 | Per-crate `unsafe` block count MUST NOT rise without human approval; every `unsafe` block mandates a DOC-6 claim the compiler cannot check | MAJ | GATE · `xtask test` (unsafe-count ratchet) |
 
 ### LAY — repository layout
 

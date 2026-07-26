@@ -11,8 +11,13 @@
 # Makefile `container` recipe) runs --network=none against the warmed offline
 # caches. Contract with the Makefile: BASE_IMAGE arrives as a build-arg (from
 # sources.lock's DEBIAN_IMAGE) and the corporate TLS-inspection CA arrives as
-# the optional build secret `enterprise_ca`, folded into a temporary bundle for
-# the network phase and never written into a layer.
+# the optional build secret `enterprise_ca`. Each RUN that needs it folds it
+# together with the system trust store into a bundle on a per-RUN tmpfs
+# (/run/build-ca), which is not part of the layer's filesystem: the bundle
+# therefore cannot reach an image layer however the block exits, rather than
+# depending on a trailing `rm` that a `set -eu` abort — or a later edit past it
+# — would skip. The `rm -rf /tmp/*` closing each block is size hygiene for the
+# downloaded archives and carries no part of that guarantee.
 #
 # Apt package versions are pinned inline below rather than in sources.lock:
 # a version is only meaningful next to the package name it belongs to, and
@@ -25,6 +30,7 @@ FROM ${BASE_IMAGE}
 COPY third-party/sources.lock /tmp/sources.lock
 
 RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
     set -eu; \
     . /tmp/sources.lock; \
     printf '%s\n' \
@@ -46,8 +52,8 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
     sed -i 's|http://snapshot.debian.org|https://snapshot.debian.org|g' /etc/apt/sources.list; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
     if [ -s /run/secrets/enterprise_ca ]; then \
-      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
-      ca_bundle=/tmp/build-ca-bundle.crt; \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
     fi; \
     apt-get -o Acquire::https::CaInfo="$ca_bundle" update; \
     # clang is here for libclang, which bindgen dlopens to parse the seL4
@@ -136,12 +142,13 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
 COPY third-party/sources.lock /tmp/syft-sources.lock
 
 RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
     set -eu; \
     . /tmp/syft-sources.lock; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
     if [ -s /run/secrets/enterprise_ca ]; then \
-      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
-      ca_bundle=/tmp/build-ca-bundle.crt; \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
     fi; \
     curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
       --output /tmp/syft.tar.gz "$SYFT_URL"; \
@@ -165,12 +172,13 @@ RUN chmod -R a+rX /opt/microkit/
 # --locked builds each tool from its published lockfile for reproducibility.
 COPY third-party/sources.lock /tmp/tools-sources.lock
 RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
     set -eu; \
     . /tmp/tools-sources.lock; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
     if [ -s /run/secrets/enterprise_ca ]; then \
-      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
-      ca_bundle=/tmp/build-ca-bundle.crt; \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
     fi; \
     SSL_CERT_FILE="$ca_bundle" \
       cargo install --locked --version "$CARGO_LLVM_COV_VERSION" cargo-llvm-cov; \
@@ -190,11 +198,12 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
 COPY . /tmp/workspace/
 
 RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
     set -eu; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
     if [ -s /run/secrets/enterprise_ca ]; then \
-      cat "$ca_bundle" /run/secrets/enterprise_ca > /tmp/build-ca-bundle.crt; \
-      ca_bundle=/tmp/build-ca-bundle.crt; \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
     fi; \
     cd /tmp/workspace; \
     # Materialize the manifest list first: inside `$(...)` a failing find would

@@ -13,10 +13,6 @@
 //! descriptors, which a per-descriptor timing could not do without measuring
 //! mostly the clock.
 
-// Benchmark target: no public API to document (the `criterion_group!` macro
-// expands to public items).
-#![allow(missing_docs)]
-
 use std::hint::black_box;
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
@@ -31,6 +27,10 @@ const QSIZE: usize = 16;
 /// [`SplitVirtqueue::new`] requires.
 #[repr(C, align(16))]
 struct Region([u8; 4096]);
+
+// Checked rather than asserted in prose: `SplitVirtqueue::new` requires the
+// region to hold the whole queue, and `QSIZE` and `Region` can be edited apart.
+const _: () = assert!(SplitVirtqueue::<QSIZE>::LAYOUT.total_bytes <= size_of::<Region>());
 
 /// Write a used-ring completion for descriptor `head` at the next used slot,
 /// exactly as the device would, using only the public queue layout offsets.
@@ -60,8 +60,12 @@ unsafe fn device_complete(region: *mut u8, used_idx: &mut u16, head: u16, len: u
 fn virtqueue_post_and_reap_a_full_ring(c: &mut Criterion) {
     let mut region = Box::new(Region([0u8; 4096]));
     let ptr = region.0.as_mut_ptr();
-    // SAFETY: `region` is 16-byte aligned, zeroed, and larger than the queue's
-    // total_bytes; it is the sole owner of this queue for the bench's lifetime.
+    // SAFETY: `SplitVirtqueue::new`'s four clauses. `Region`'s `align(16)`
+    // gives the alignment and its `[0u8; 4096]` initialiser the zeroing; the
+    // `const _` above proves it holds the queue's `total_bytes`; the `Box` is
+    // local to this function and outlives `queue`; and the only other writer of
+    // `ptr` is `device_complete`, which is this bench standing in for the one
+    // device that owns the queue.
     let mut queue = unsafe { SplitVirtqueue::<QSIZE>::new(ptr) };
     let mut used_idx: u16 = 0;
 
@@ -87,9 +91,9 @@ fn virtqueue_post_and_reap_a_full_ring(c: &mut Criterion) {
                 }
 
                 let start = Instant::now();
-                while let Some((token, len)) = queue.poll() {
+                while let Some((completion, len)) = queue.poll() {
                     black_box(len);
-                    queue.recycle(token).expect("a just-reaped descriptor");
+                    completion.recycle();
                 }
                 driver_time += start.elapsed();
             }
@@ -135,8 +139,9 @@ fn valid_config_space() -> Box<[u8; 4096]> {
 
 fn find_caps(c: &mut Criterion) {
     let mut bytes = valid_config_space();
-    // SAFETY: `bytes` is a live 4 KiB buffer; `find_virtio_caps` only reads
-    // config registers within it.
+    // SAFETY: `PciConfig::new`'s two clauses. `valid_config_space` returns an
+    // owned `Box<[u8; 4096]>` — one function's worth of ECAM, stood in for by
+    // this bench — and it is local to this function, so it outlives `config`.
     let config = unsafe { PciConfig::new(bytes.as_mut_ptr()) };
     c.bench_function("find_virtio_caps_valid", |b| {
         b.iter(|| black_box(find_virtio_caps(black_box(&config))));

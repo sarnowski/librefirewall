@@ -1,77 +1,41 @@
-//! Wire types shared across protection domains.
+//! The layout of the descriptor protection domains exchange over the
+//! shared-memory dataplane queues.
 //!
-//! A [`Descriptor`] is the unit of ownership transfer on the dataplane: it
-//! names one buffer in the shared pool and how many bytes of it are valid. It
-//! is the element type of the shared-memory queues, so its layout is part of
-//! the cross-protection-domain ABI and is asserted below.
+//! Faces the byzantine peer protection domain (CONCEPT §7.1): a descriptor read
+//! out of a shared region is peer-written input. This crate fixes the ABI only
+//! — it validates nothing and accounts nothing.
 //!
-//! A descriptor received from a peer is **untrusted**: its `buffer`, `offset`,
-//! and `len` must be range-validated by the receiver before the buffer they
-//! name is touched (`pd_runtime::descriptor_in_bounds`, backstopped by the
-//! `packet-buffer` accessors' own span checks). This crate defines the ABI; it
-//! does not enforce that validation, and it does not account ownership either
-//! — see [`Descriptor`].
-//!
-//! # Byte order
-//!
-//! Every field is a **little-endian** `u32`, and the type carries no
-//! byte-swapping code because none is needed: the project targets x86_64
-//! exclusively (CONCEPT §3), so the native representation of a `#[repr(C)]`
-//! struct of `u32`s already *is* the wire image. That is a deliberate
-//! consequence of the single-architecture decision rather than an oversight, and
-//! it is pinned by the byte-image tests below, so a future port to a big-endian
-//! target would fail them rather than silently ship swapped descriptors.
-//!
-//! The rule applies to the descriptor as it sits in a shared region, which is
-//! also how a peer protection domain reads it. It says nothing about network
-//! byte order in packet *payloads*: those are parsed by the protocol crates,
-//! which convert explicitly.
+//! Every field is a little-endian `u32` and no byte-swapping code exists,
+//! because x86_64 is the only target (CONCEPT §3): the native image of a
+//! `#[repr(C)]` struct of `u32`s already *is* the wire image. The byte-image
+//! tests below exist so a port to a big-endian target fails them rather than
+//! silently shipping swapped descriptors. That fixes the descriptor as a peer
+//! domain reads it, and says nothing about byte order inside packet payloads.
 
 #![cfg_attr(not(test), no_std)]
 
 use core::mem::{align_of, offset_of, size_of};
 
-/// A reference to a span of one pool buffer moving through a queue.
+/// The `len` bytes at `offset` in pool buffer `buffer`.
 ///
-/// `buffer` indexes the shared buffer pool, and the valid data is the `len`
-/// bytes starting at `offset` within that buffer. The offset lets a producer
-/// hand over data that does not start at the buffer's front — for a NIC
-/// receive that is the frame after the device's header, published zero-copy
-/// without moving the bytes. Handing a descriptor on is what transferring the
-/// buffer means.
-///
-/// The value is deliberately `Copy`, which means **holding one proves nothing
-/// about ownership**: enqueuing a descriptor leaves the producer with an
-/// identical value, and a descriptor in a ring is bytes on shared memory that a
-/// byzantine peer can write, so neither the borrow checker nor the queue
-/// protocol can make single ownership a property of this type — the `queue`
-/// crate explicitly disclaims it. What actually accounts ownership is the
-/// pool owner's ledger, `packet_buffer::FreeList`, which tracks buffers by
-/// identity and refuses to reclaim an index that is out of range or not
-/// outstanding, together with `pd_runtime::PoolOwner`, which additionally
-/// refuses an index it never lent out. This type is the message; those two are
-/// the accounting.
+/// `offset` exists so a producer can publish data that does not begin at the
+/// buffer's front: on a NIC receive the frame sits behind the device's own
+/// header, and handing the descriptor on publishes it without moving a byte.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Descriptor {
-    /// Index of the owned buffer within the shared pool.
     pub buffer: u32,
-    /// Byte offset of the valid data within the buffer.
     pub offset: u32,
-    /// Number of valid bytes at `offset`.
     pub len: u32,
 }
 
 impl Descriptor {
-    /// The all-zero descriptor. Also the value of a freshly zeroed queue slot,
-    /// which is why a zeroed shared region is a valid empty ring.
     pub const ZERO: Self = Self {
         buffer: 0,
         offset: 0,
         len: 0,
     };
 
-    /// A descriptor naming `len` valid bytes at `offset` within pool `buffer`.
     #[must_use]
     pub const fn new(buffer: u32, offset: u32, len: u32) -> Self {
         Self {
@@ -88,10 +52,9 @@ impl Default for Descriptor {
     }
 }
 
-// The descriptor is copied verbatim between protection domains, so its size,
-// alignment, and field offsets are a fixed ABI rather than an implementation
-// detail: a field reorder or width change is a compile error here, not a silent
-// break of the mapping the peer PD reads.
+// The descriptor crosses protection domains byte for byte, so a field reorder
+// or a width change must be a compile error here rather than a silent break of
+// the image the peer domain reads.
 const _: () = {
     assert!(size_of::<Descriptor>() == 12);
     assert!(align_of::<Descriptor>() == 4);

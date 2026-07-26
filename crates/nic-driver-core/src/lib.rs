@@ -1,117 +1,48 @@
 //! Host-testable driver logic for the virtio-net driver protection domain:
-//! device bring-up, the steady-state dataplane, and the poll pass that runs it.
+//! device bring-up ([`bringup`]), the steady-state dataplane in this root, and
+//! the poll pass that runs it ([`port`]).
 //!
-//! The driver PD (`pds/nic-driver`) is a thin adapter. It maps the regions the
+//! The driver PD (`pds/nic-driver`) is a thin adapter: it maps the regions the
 //! system description grants it, turns the three pointers into this crate's
-//! types, and runs a loop; **everything that can be wrong in a logic sense
-//! lives here**, where a host test can reach it. Three modules divide the work:
-//!
-//! | module | what it owns |
-//! |---|---|
-//! | [`bringup`] | PCI identification, BAR placement, the virtio 1.0 handshake *ordering*, virtqueue configuration, and the `DRIVER_OK`-before-first-doorbell rule |
-//! | this root | the two steady-state directions, [`RxPath`] and [`TxPath`], and the counters |
-//! | [`port`] | one poll pass: which step runs when, and which step rings which doorbell |
-//!
-//! The security-critical dataplane logic in this root — clamping a
-//! device-reported length to the buffer behind it, dropping a runt frame,
-//! validating an untrusted peer's transmit descriptors — is portable `no_std`
-//! code for the same reason: it runs under host unit tests, which it never
-//! could while welded to the Microkit entrypoint. Refusing the device's forged,
-//! replayed, and out-of-range completions is one layer further down, in
-//! `virtio::queue`, and is host-tested there.
-//!
-//! # Handles are taken once, at attach
-//!
-//! Both paths are parameterised by the pipeline region's lifetime and take
-//! their ring handles in `attach`, keeping them for the protection domain's
-//! whole life. A handle holds this domain's own position in the ring, so taking
-//! one per call would restart at slot zero and re-walk slots already used; see
-//! the `pd_runtime` crate header. A driver calls each `attach` exactly once per
-//! pipeline: [`RxPath`] takes the receive pipeline's `rx` producer, [`TxPath`]
-//! the transmit pipeline's `tx` consumer and `free` producer, and
-//! `pd_runtime::PoolOwner` the receive pipeline's `free` consumer.
+//! types, and runs a loop. The logic lives here instead because welded to the
+//! Microkit entrypoint none of it could be reached by a host test.
 //!
 //! # Untrusted inputs, and which layer answers for each
 //!
-//! Two distrust boundaries meet in this crate (CONCEPT §7.1), and one of them
-//! is answered a layer below:
+//! Two of CONCEPT §7.1's distrust boundaries meet in this crate, and one is
+//! answered a layer below:
 //!
-//! - **The device** is hostile, but everything it can *say* about a completion
-//!   — a forged or out-of-range descriptor id, a replay of one already reaped,
-//!   an echo of one never published, a flood of used entries — is refused
-//!   inside [`virtio::queue`] before a `Token` exists, and counted there in
-//!   [`DeviceFaults`]. This crate keeps no second copy of that check: it would
-//!   be a second answer to one question, and the queue is the layer holding the
-//!   descriptor lifecycle the answer is derived from. What stays this crate's
-//!   business is what the queue cannot know — that the reported length must be
-//!   clamped to the *pool buffer* behind the descriptor before a downstream
-//!   domain reads it, and that a completion with nothing past the virtio-net
-//!   header carries no frame and is dropped at the rx edge rather than
-//!   forwarded as a header-only one.
-//! - **The forwarder peer** is untrusted: every transmit descriptor it queues
-//!   is range-validated ([`pd_runtime::descriptor_in_bounds`], plus header
-//!   room) before the span is touched, and checked against this driver's own
-//!   in-flight set so the same buffer cannot be posted to the device twice. A
-//!   descriptor naming a real pool buffer is returned to its owner; a forged
-//!   index has no owner and is dropped. Nothing below the queue guards this
-//!   boundary, so it is guarded here and nowhere else.
-//!
-//! Neither can drive this crate to an out-of-bounds access, a panic, or
-//! unbounded work: every loop over a device- or peer-fed queue is capped per
-//! call by a driver-owned bound (the virtqueue's own `Q`, or
-//! `pd_runtime::DRAIN_LIMIT`), and every rejection above is a counted drop.
-//! Returning a buffer on the pipeline's free ring is likewise fallible — a full
-//! ring is counted, not asserted.
-//!
-//! One `expect` survives that sweep, in [`TxPath::post`], and it is the only
-//! panic-capable construct outside this crate's tests and its `const _` layout
-//! assertions. It rests on a virtqueue invariant no device or peer can reach;
-//! the proof, its guarantor and the property test that holds it are stated at
-//! the call site.
-//!
-//! # The per-slot maps are a map, not a second check
-//!
-//! Each path holds a per-virtqueue-slot `Option`: which pool buffer went into
-//! each receive descriptor, which peer descriptor into each transmit one. That
-//! is the token→buffer mapping, which only this crate can hold — the virtqueue
-//! carries no payload. It is *not* the duplicate-completion check it used to
-//! double as; the queue makes a completion for a descriptor it did not post
-//! unrepresentable, so an empty slot no longer means "the device lied". It now
-//! means this driver's own two pieces of state disagree, which is a defect in
-//! this crate or in how a protection domain wired it — see [`InvariantFaults`].
+//! - The **hostile or malfunctioning device**. Everything it can *say* about a
+//!   completion — a forged or out-of-range descriptor id, a replay of one
+//!   already reaped, an echo of one never published, a flood of used entries —
+//!   is refused inside [`virtio::queue`] before a `Completion` exists, and
+//!   counted there in [`DeviceFaults`]. This crate keeps no second copy of that
+//!   check: it would be a second answer to one question, and the queue is the
+//!   layer holding the descriptor lifecycle the answer is derived from. What
+//!   stays this crate's business is what the queue cannot know — the reported
+//!   length must be clamped to the *pool buffer* behind the descriptor before a
+//!   downstream domain reads it, and a completion with nothing past the
+//!   virtio-net header carries no frame.
+//! - The **byzantine neighbour PD** (the forwarder). Every transmit descriptor
+//!   it queues is range-validated ([`pd_runtime::descriptor_in_bounds`], plus
+//!   header room) before the span is touched, and checked against this driver's
+//!   own in-flight set so the same buffer cannot be posted to the device twice.
+//!   Nothing below the queue guards this boundary, so it is guarded here and
+//!   nowhere else.
 //!
 //! # What this crate cannot enforce
 //!
 //! Writing the virtio-net header in front of a transmit frame needs the buffer
 //! to be exclusively this driver's for the duration. That is a *protocol*
 //! claim, not one this domain can verify: the buffer belongs to the transmit
-//! pipeline's pool, whose ledger lives in the peer driver that owns it. What is
-//! checked here is everything that is checkable locally — the span lies inside
-//! one pool buffer, and this driver is not already holding that buffer in
-//! flight. A byzantine forwarder can still name a buffer the pool owner has
-//! posted as its own NIC's receive DMA target, in which case the 12-byte header
-//! write races that DMA. Closing that needs either an IOMMU confining NIC DMA
-//! (CONCEPT §7.2) or a cross-domain per-buffer ownership epoch; neither exists
-//! yet, and no code in this domain can substitute for them. The damage is
-//! bounded to corrupting a frame inside the shared pool: the address handed to
-//! the device is always inside the region, because it is derived from an index
-//! that passed the pool bounds check.
-//!
-//! # Observability groundwork
-//!
-//! Three counter sets meet here, and keeping them apart is the point: a number
-//! is only actionable if it says *who* misbehaved.
-//!
-//! | set | who it indicts | where it lives |
-//! |---|---|---|
-//! | [`DeviceFaults`] | the device lied about a completion | `virtio::queue`, one per virtqueue |
-//! | [`InputDrops`] | the device or the peer sent something this layer refused | [`Counters::input`] |
-//! | [`InvariantFaults`] | *we* are broken | [`Counters::invariant`] |
-//!
-//! [`DriverStats`] samples all three into one snapshot, which is the shape the
-//! future Prometheus metrics endpoint (CONCEPT §11) scrapes. The console
-//! deliberately carries none of it, being reserved for system state rather than
-//! traffic (MONITORING.md).
+//! pipeline's pool, whose ledger lives in the peer driver that owns it. A
+//! byzantine forwarder can still name a buffer the pool owner has posted as its
+//! own NIC's receive DMA target, in which case the 12-byte header write races
+//! that DMA. Closing that needs either an IOMMU confining NIC DMA (CONCEPT
+//! §7.2) or a cross-domain per-buffer ownership epoch; neither exists yet, and
+//! no code in this domain can substitute for them. The damage is bounded to
+//! corrupting a frame inside the shared pool, because the address handed to the
+//! device is derived from an index that passed the pool bounds check.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -126,11 +57,9 @@ use pd_runtime::{
     RING_SLOTS, RingConsumer, RingProducer, descriptor_in_bounds,
 };
 use virtio::net::VirtioNetHdr;
-use virtio::queue::{DeviceFaults, SplitVirtqueue, Token};
+use virtio::queue::{DeviceFaults, SplitVirtqueue};
 
-/// The tallies a driver protection domain keeps, split by who is answerable for
-/// them. Passed to every path method, so one domain accumulates both halves
-/// across its two directions.
+/// The tallies a driver protection domain keeps, split by who is answerable.
 ///
 /// The split is structural on purpose. Both halves are recorded the same way —
 /// a saturating counter — so a flat struct would leave the only thing that
@@ -139,10 +68,9 @@ use virtio::queue::{DeviceFaults, SplitVirtqueue, Token};
 /// [`invariant`](Self::invariant) alone.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counters {
-    /// Frames refused because a neighbour sent something invalid. Expected to
-    /// be non-zero on a hostile network.
+    /// Expected to be non-zero on a hostile network.
     pub input: InputDrops,
-    /// Violations of this crate's own invariants. Expected to be zero forever.
+    /// Expected to be zero forever.
     pub invariant: InvariantFaults,
 }
 
@@ -157,21 +85,18 @@ pub struct Counters {
 /// back into a small number — precisely when the number matters most.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct InputDrops {
-    /// Received frames with nothing past the virtio-net header, dropped at the
-    /// rx edge instead of forwarded as a header-only frame.
+    /// Frames with nothing past the virtio-net header, dropped at the rx edge
+    /// instead of forwarded as a header-only frame.
     pub rx_runt_dropped: u64,
-    /// Received frames dropped because the forwarder's ring would not take
-    /// them. The buffer is returned to the pool, so nothing is lost but the
-    /// frame — the forwarder is not keeping up, or is stalled deliberately.
+    /// The buffer is returned to the pool, so nothing is lost but the frame —
+    /// the forwarder is not keeping up, or is stalled deliberately.
     pub rx_forwarder_ring_full: u64,
-    /// Transmit descriptors from the peer that failed span or header-room
-    /// validation.
+    /// Transmit descriptors that failed span or header-room validation.
     pub tx_malformed: u64,
-    /// Transmit descriptors naming a buffer this driver already has in flight
-    /// at the device. Dropped without a return, because the in-flight instance
-    /// still owes that buffer's single return.
+    /// Transmit descriptors naming a buffer already in flight at the device.
+    /// Dropped without a return, because the in-flight instance still owes that
+    /// buffer's single return.
     pub tx_duplicate: u64,
-    /// Buffer returns that could not be placed on the pipeline's free ring.
     /// Each one loses its buffer to the pool owner's ledger for good; the
     /// alternative — asserting — would let a peer that stalls the ring take
     /// this domain down.
@@ -180,66 +105,49 @@ pub struct InputDrops {
 
 /// Counts of this driver's own broken bookkeeping. **A non-zero field here is a
 /// defect in this crate or in how a protection domain wired it, never traffic.**
+/// What is left that could trip one is driving a path against two different
+/// virtqueues, which only this domain's own wiring can do.
 ///
-/// No device or peer input can reach any of these: `virtio::queue` refuses a
-/// completion for a descriptor it did not post, so every `Token` this crate
-/// sees names a descriptor its own `refill`/`post` published and its own
-/// per-slot map recorded. What is left that could trip them is driving one path
-/// against two different virtqueues, which only this domain's own wiring can
-/// do.
-///
-/// They are counted rather than asserted, unlike the equivalent in
-/// `pd_runtime::PoolOwner::release`, and the difference is deliberate: these
-/// sit on the path a hostile device drives at line rate, so being *wrong* about
-/// their unreachability would turn a reasoning error into a remotely triggered
-/// outage of a dataplane port. A saturating counter under a name that means
-/// "page someone" keeps the failure loud without handing the device a kill
-/// switch. The same monotonic/saturating contract as [`InputDrops`] applies.
-///
-/// What makes each of them worth a counter rather than a panic is that each is
-/// *reachable*: driving one path against two virtqueues trips it, which is what
-/// each one's test does. An unreachability argument that no wiring defect can
-/// falsify does not belong here — see the `expect` in [`TxPath::post`], whose
-/// check and use sit on the same queue in the same iteration.
+/// They are counted rather than asserted, and the difference is deliberate:
+/// these sit on the path a hostile device drives at line rate, so being *wrong*
+/// about their unreachability would turn a reasoning error into a remotely
+/// triggered outage of a dataplane port. A saturating counter under a name that
+/// means "page someone" keeps the failure loud without handing the device a
+/// kill switch. The same monotonic/saturating contract as [`InputDrops`]
+/// applies.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct InvariantFaults {
     /// A receive completion whose slot held no buffer: the virtqueue and this
     /// path's map disagree about what was posted. The frame is lost and the
     /// descriptor recycled.
     pub rx_completion_unmapped: u64,
-    /// A transmit completion whose slot held no descriptor — the transmit
-    /// mirror of [`rx_completion_unmapped`](Self::rx_completion_unmapped). No
-    /// buffer is returned, so the pool loses one.
+    /// The transmit mirror of
+    /// [`rx_completion_unmapped`](Self::rx_completion_unmapped). No buffer is
+    /// returned, so the pool loses one.
     pub tx_completion_unmapped: u64,
     /// `refill` was handed a descriptor whose slot still held a buffer. That
     /// buffer is still a live DMA target somewhere, so it is leaked rather than
     /// released: putting it back in the pool would let it be issued a second
     /// time, which is the one outcome worse than losing it.
     pub rx_slot_occupied: u64,
-    /// [`SplitVirtqueue::recycle`] refused a token this path had just reaped
-    /// from that same queue, which no consistent pairing can produce. That
-    /// descriptor never returns to the virtqueue's free list, so the queue
-    /// permanently loses one of its `Q` slots.
-    pub descriptor_recycle_refused: u64,
+    /// The transmit mirror of [`rx_slot_occupied`](Self::rx_slot_occupied). The
+    /// displaced descriptor's buffer is leaked for the same reason and keeps
+    /// its in-flight bit, so it is never reposted either.
+    pub tx_slot_occupied: u64,
 }
 
 /// A snapshot of everything a driver protection domain can say about its two
 /// neighbours and itself, in the shape the metrics endpoint (CONCEPT §11) will
-/// scrape. Taken by value: the device faults live in the virtqueues and the
-/// rest in [`Counters`], and a scrape wants one consistent picture, not four
-/// live borrows.
+/// scrape. Taken by value because a scrape wants one consistent picture, not
+/// four live borrows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverStats {
-    /// What this crate refused or broke; see [`Counters`].
     pub counters: Counters,
-    /// What the receive virtqueue refused from the device.
     pub rx_device: DeviceFaults,
-    /// What the transmit virtqueue refused from the device.
     pub tx_device: DeviceFaults,
 }
 
 impl DriverStats {
-    /// Sample the driver's two virtqueues and its counters together.
     #[must_use]
     pub fn sample<const Q: usize>(
         counters: &Counters,
@@ -254,40 +162,19 @@ impl DriverStats {
     }
 }
 
-/// Increment a counter, saturating rather than wrapping; see [`InputDrops`].
 fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-/// Return a just-reaped descriptor to its virtqueue's free list.
+/// The receive path.
 ///
-/// Shared by both paths so the refusal is handled in exactly one place. A
-/// refusal is impossible for a token polled from this same queue an instant
-/// earlier — `poll` leaves the descriptor in precisely the state `recycle`
-/// requires — so it is recorded as an invariant fault, never as device
-/// evidence; see [`InvariantFaults`] for why it is counted and not asserted.
-fn recycle_descriptor<const Q: usize>(
-    queue: &mut SplitVirtqueue<Q>,
-    token: Token,
-    faults: &mut InvariantFaults,
-) {
-    if queue.recycle(token).is_err() {
-        bump(&mut faults.descriptor_recycle_refused);
-    }
-}
-
-/// The receive path: which pool buffer is posted in each virtqueue slot, and
-/// the handle onto which completed frames are published.
-///
-/// Ownership of a posted buffer is held as a move-only [`OwnedBuffer`] in a
-/// per-slot `Option`, which is what makes the buffer's single ownership
-/// checkable by the compiler for as long as it is inside this domain: the
-/// `take()` on completion moves it out, so the frame cannot be handed onward
-/// twice even by a coding error here.
+/// A posted buffer's ownership is a move-only [`OwnedBuffer`] in a per-slot
+/// `Option`, so single ownership stays compiler-checkable while the buffer is
+/// inside this domain: the `take()` on completion moves it out, and the frame
+/// cannot be handed onward twice even by a coding error here.
 pub struct RxPath<'pipe, const Q: usize> {
     /// The buffer handed to the device in each descriptor slot.
     posted: [Option<OwnedBuffer>; Q],
-    /// Where completed frames are published to the forwarder. Taken once.
     rx: RingProducer<'pipe, RING_SLOTS>,
     /// Physical address of the receive pipeline region, for deriving each
     /// posted buffer's DMA address.
@@ -295,13 +182,15 @@ pub struct RxPath<'pipe, const Q: usize> {
 }
 
 impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
-    /// Take the receive pipeline's `rx` producer handle, with no buffers
-    /// posted. `rx_pipe_paddr` is the physical address of the same region
-    /// `rx_pipe` maps.
+    /// Take the receive pipeline's `rx` producer handle. `rx_pipe_paddr` is the
+    /// physical address of the same region `rx_pipe` maps.
     ///
-    /// Call once per protection domain: the handle is this domain's publish
-    /// position, so a second path over the same pipeline would overwrite slots
-    /// the first has already handed to the forwarder.
+    /// **Unenforced precondition (DOC-7):** call once per protection domain.
+    /// The handle is this domain's publish position, so a second path over the
+    /// same pipeline overwrites slots the first has already handed to the
+    /// forwarder. No type refuses the second call; `queue`'s crate header
+    /// states that single-handle rule and why nothing enforces it. Treat it as
+    /// unenforced rather than as checked elsewhere.
     #[must_use]
     pub fn attach(rx_pipe: &'pipe Pipeline, rx_pipe_paddr: u64) -> Self {
         Self {
@@ -311,10 +200,9 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
         }
     }
 
-    /// Post free pool buffers to the receive virtqueue until either the queue
-    /// or the pool runs dry, recording which buffer went in each descriptor.
-    /// Returns whether any buffer was posted, so the caller knows whether to
-    /// ring the receive doorbell.
+    /// Post free pool buffers to the receive virtqueue until either runs dry,
+    /// returning whether any was posted — which is how the caller knows whether
+    /// to ring the receive doorbell.
     ///
     /// Bounded without an explicit cap: each iteration consumes one buffer from
     /// the pool ledger and one virtqueue descriptor, both driver-owned and
@@ -332,22 +220,18 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
             // the property that keeps a DMA target where it belongs.
             let paddr = Pipeline::buffer_paddr(self.pipe_paddr, buffer.index());
             match rx.add_writable(paddr, BUFFER_SIZE as u32) {
-                Some(token) => {
-                    let slot = token.index() as usize;
+                Some(head) => {
+                    let slot = head as usize;
                     if let Some(displaced) = self.posted[slot].replace(buffer) {
-                        // The virtqueue handed out a descriptor whose slot is
-                        // still mapped, so this path and that queue disagree.
-                        // `displaced` is a live DMA target of whichever queue
-                        // really holds it, so it is dropped — leaking one pool
-                        // buffer — rather than released, which would let the
-                        // pool issue it to a second owner.
+                        // This path and that queue disagree about what is
+                        // posted; `displaced` is leaked rather than released,
+                        // for the reason on `InvariantFaults::rx_slot_occupied`.
                         bump(&mut counters.invariant.rx_slot_occupied);
                         drop(displaced);
                     }
                     posted = true;
                 }
                 None => {
-                    // The receive queue is full; keep the buffer for next time.
                     pool.release(buffer);
                     break;
                 }
@@ -357,8 +241,8 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
     }
 
     /// Drain completed receive descriptors, handing each valid frame to the
-    /// forwarder with no copy. Returns whether any frame was submitted, so the
-    /// caller knows whether to notify the forwarder.
+    /// forwarder with no copy. Returns whether any frame was submitted, which
+    /// is how the caller knows whether to notify the forwarder.
     ///
     /// At most `Q` completions are processed per call: a conformant device never
     /// has more than `Q` buffers outstanding, so the cap costs nothing, while a
@@ -366,13 +250,6 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
     /// forever. That cap composes with the virtqueue's own — a single `poll`
     /// examines at most `Q` used entries — so one call is bounded whatever the
     /// device publishes, and no bound anywhere derives from a device value.
-    ///
-    /// What a completion still gets checked for here, the queue having already
-    /// refused every forged, replayed, or out-of-range one: the device-reported
-    /// length is clamped to the pool buffer, a runt frame (nothing past the
-    /// virtio-net header) is dropped and counted at the edge, and a buffer the
-    /// forwarder's ring will not take is released rather than leaked. Every
-    /// completion recycles its virtqueue descriptor, on every path.
     pub fn drain(
         &mut self,
         rx: &mut SplitVirtqueue<Q>,
@@ -381,16 +258,15 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
     ) -> bool {
         let mut received = false;
         for _ in 0..Q {
-            let Some((token, used_len)) = rx.poll() else {
+            let Some((completion, used_len)) = rx.poll() else {
                 break;
             };
-            let slot = token.index() as usize;
+            let slot = completion.index() as usize;
             let Some(buffer) = self.posted[slot].take() else {
-                // Not device input — see `InvariantFaults`. The frame is lost
-                // because no buffer is known for it, but the descriptor is
-                // still this queue's and goes back.
+                // Not device input — see `InvariantFaults`. No buffer is known
+                // for the frame, but the descriptor is still this queue's.
                 bump(&mut counters.invariant.rx_completion_unmapped);
-                recycle_descriptor(rx, token, &mut counters.invariant);
+                completion.recycle();
                 continue;
             };
             // `used_len` is device-controlled; clamp to the buffer so a device
@@ -399,17 +275,14 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
                 .min(BUFFER_SIZE)
                 .saturating_sub(VirtioNetHdr::LEN);
             if frame_len == 0 {
-                // A frame with nothing past the header carries no payload; drop
-                // it at the rx edge rather than forward a header-only frame.
                 bump(&mut counters.input.rx_runt_dropped);
                 pool.release(buffer);
-                recycle_descriptor(rx, token, &mut counters.invariant);
+                completion.recycle();
                 continue;
             }
-            // Hand the frame span (after the virtio header) to the forwarder
-            // with no copy; the buffer is owned downstream until it comes back
-            // on the free ring. `lend` is where the token dissolves into a bare
-            // index, which is also what permits the return.
+            // `lend` is where the ownership token dissolves into a bare index:
+            // the buffer is owned downstream until it comes back on the free
+            // ring, and that dissolution is also what permits the return.
             match pool.lend(
                 &mut self.rx,
                 buffer,
@@ -422,23 +295,20 @@ impl<'pipe, const Q: usize> RxPath<'pipe, Q> {
                     pool.release(buffer);
                 }
             }
-            recycle_descriptor(rx, token, &mut counters.invariant);
+            completion.recycle();
         }
         received
     }
 }
 
-/// The transmit path: which peer descriptor is posted in each virtqueue slot,
-/// which pool buffers this driver currently has in flight, and the handles onto
-/// the transmit pipeline.
+/// The transmit path.
 ///
-/// The per-slot `Option` plays the same role as on the receive side: it is the
-/// slot→descriptor map, the only record of which peer descriptor to return once
-/// the device is done with it. The separate in-flight set is indexed by *pool
-/// buffer* rather than by virtqueue slot, and guards the other adversary
-/// entirely: whether the peer has already handed this driver the buffer a new
-/// descriptor names. Neither substitutes for the other, and neither duplicates
-/// the virtqueue's own device-facing checks.
+/// The two maps answer different questions and neither substitutes for the
+/// other. The per-slot `Option` is the slot→descriptor map, the only record of
+/// which peer descriptor to return once the device is done with it. The
+/// in-flight set is indexed by *pool buffer* rather than by virtqueue slot, and
+/// guards the peer boundary alone: whether this driver already holds the buffer
+/// a new descriptor names.
 pub struct TxPath<'pipe, const Q: usize> {
     /// The peer descriptor handed to the device in each descriptor slot.
     posted: [Option<Descriptor>; Q],
@@ -447,9 +317,7 @@ pub struct TxPath<'pipe, const Q: usize> {
     /// virtqueue entries on one buffer and produce two returns for a buffer
     /// that was lent once.
     in_flight: [bool; POOL_BUFFERS],
-    /// Frames the forwarder has queued. Taken once.
     tx: RingConsumer<'pipe, RING_SLOTS>,
-    /// Where transmitted buffers go back to their pool owner. Taken once.
     free: RingProducer<'pipe, RING_SLOTS>,
     /// The pool the descriptors index, for writing the virtio-net header in
     /// place. Borrowed from the same region as the handles above.
@@ -460,13 +328,16 @@ pub struct TxPath<'pipe, const Q: usize> {
 }
 
 impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
-    /// Take the transmit pipeline's `tx` consumer and `free` producer handles,
-    /// with no frames in flight. `tx_pipe_paddr` is the physical address of the
-    /// same region `tx_pipe` maps.
+    /// Take the transmit pipeline's `tx` consumer and `free` producer handles.
+    /// `tx_pipe_paddr` is the physical address of the same region `tx_pipe`
+    /// maps.
     ///
-    /// Call once per protection domain: a second path over the same pipeline
-    /// would re-consume frames the first has already handed to the device, and
-    /// return the buffers twice.
+    /// **Unenforced precondition (DOC-7):** call once per protection domain. A
+    /// second path over the same pipeline re-consumes frames the first has
+    /// already handed to the device and returns their buffers twice. No type
+    /// refuses the second call; `queue`'s crate header states that
+    /// single-handle rule and why nothing enforces it. Treat it as unenforced
+    /// rather than as checked elsewhere.
     #[must_use]
     pub fn attach(tx_pipe: &'pipe Pipeline, tx_pipe_paddr: u64) -> Self {
         Self {
@@ -483,43 +354,35 @@ impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
     /// pool-owning peer on the pipeline's free ring.
     ///
     /// At most `Q` completions per call, for the reason given on
-    /// [`RxPath::drain`]. A completion the device forged, replayed, or aimed
-    /// out of range never reaches here: the virtqueue refuses it and counts it
-    /// in its own [`DeviceFaults`]. A slot holding no descriptor is therefore
-    /// this driver's own bookkeeping fault, not traffic; see
-    /// [`InvariantFaults`].
+    /// [`RxPath::drain`].
     pub fn reap(&mut self, tx: &mut SplitVirtqueue<Q>, counters: &mut Counters) {
         for _ in 0..Q {
-            let Some((token, _written)) = tx.poll() else {
+            let Some((completion, _written)) = tx.poll() else {
                 break;
             };
-            let slot = token.index() as usize;
+            let slot = completion.index() as usize;
             let Some(descriptor) = self.posted[slot].take() else {
                 bump(&mut counters.invariant.tx_completion_unmapped);
-                recycle_descriptor(tx, token, &mut counters.invariant);
+                completion.recycle();
                 continue;
             };
             // In range because `post` validated the descriptor before storing
             // it, so no peer value reaches this index.
             self.in_flight[descriptor.buffer as usize] = false;
             self.return_buffer(descriptor, counters);
-            recycle_descriptor(tx, token, &mut counters.invariant);
+            completion.recycle();
         }
     }
 
     /// Post frames the forwarder queued to the device while descriptors are
-    /// free. Returns whether any frame was posted, so the caller knows whether
-    /// to ring the transmit doorbell.
+    /// free. Returns whether any frame was posted, which is how the caller
+    /// knows whether to ring the transmit doorbell.
     ///
     /// Each descriptor crossed a protection-domain boundary and is untrusted.
-    /// It is rejected unless this driver does not already hold the buffer in
-    /// flight, its span lies within one pool buffer, and it leaves room for the
-    /// virtio-net header in front of the frame. A malformed descriptor is
-    /// counted and dropped, and its buffer returned to the pool only when the
-    /// index names a real pool buffer (a forged index has no owner) and is not
-    /// the one an in-flight instance still owes a return for. A valid frame has
-    /// its 12-byte header zeroed in place — no offloads are negotiated — and is
-    /// handed to the device zero-copy.
+    /// A malformed one is counted and dropped, and its buffer returned to the
+    /// pool only when the index names a real pool buffer — a forged index has
+    /// no owner — and is not the one an in-flight instance still owes a return
+    /// for.
     ///
     /// The loop is capped at [`DRAIN_LIMIT`] iterations rather than at the
     /// virtqueue's free count, because a rejected descriptor consumes no
@@ -554,23 +417,19 @@ impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
             }
             let header_offset = descriptor.offset as usize - VirtioNetHdr::LEN;
             // The 12 bytes in front of the frame are reserved header space in
-            // the same buffer (on the receive side the device's own header
-            // occupied them). `TX_NO_OFFLOAD` is the image of a header
-            // requesting nothing, which is what this driver may ask for while
-            // it negotiates no offload feature.
+            // the same buffer; on the receive side the device's own header
+            // occupied them. `TX_NO_OFFLOAD` is a header requesting nothing,
+            // which is all this driver may ask for while it negotiates no
+            // offload feature.
             // SAFETY: `descriptor_in_bounds` bounded `descriptor.buffer` to the
             // pool and `offset + len` to one buffer, and the header-room check
             // above bounds `header_offset = offset - 12`, so the 12 bytes at
-            // `header_offset` lie inside buffer `descriptor.buffer` — the span
-            // is checked here, not assumed. Exclusive ownership is a protocol
-            // claim this domain cannot verify alone: the forwarder handing the
-            // descriptor over is the claim, `self.in_flight` rules out this
-            // driver holding the same buffer twice, and the pool owner's ledger
-            // refuses a second return of it. The residue — a byzantine
-            // forwarder naming a buffer its pool owner still has posted as an rx
-            // DMA target — is stated in the crate header and is not closable
-            // inside this domain. The source is a local constant, so it cannot
-            // alias the pool.
+            // `header_offset` lie inside buffer `descriptor.buffer`. The source
+            // is a local constant, so it cannot alias the pool. Exclusive
+            // ownership has no guarantor inside this domain: `self.in_flight`
+            // rules out this driver holding the buffer twice, and the residual
+            // race against the pool owner's own rx DMA is stated in the crate
+            // header and is not closable here.
             unsafe {
                 self.pool.write_at(
                     descriptor.buffer as usize,
@@ -581,39 +440,36 @@ impl<'pipe, const Q: usize> TxPath<'pipe, Q> {
             let paddr =
                 Pipeline::buffer_paddr(self.pipe_paddr, descriptor.buffer) + header_offset as u64;
             // A first-party invariant, not device or peer input, so it fails
-            // visibly rather than being counted (AGENTS.md ENG-5). The
-            // guarantor is `virtio::queue::SplitVirtqueue::add` — the single
-            // body behind both `add_*` methods — whose only early return is
-            // `if self.num_free == 0`, and whose `free_count()` *is*
-            // `num_free`. This iteration refused `free_count() == 0` at the
-            // top and has not touched `tx` since (the dequeue, the validation
-            // and the header write are all on the pipeline and the pool), so
-            // no descriptor was consumed in between. `virtio`'s property
-            // `split_virtqueue_accounting_holds_under_random_operations` is
-            // what proves it: it unwraps an `add` after every observed
-            // `free_count() > 0` across arbitrary add/complete/poll/recycle
-            // sequences.
-            //
-            // Counting it as an `InvariantFaults` field instead would be dead
-            // state, and that is the distinction those counters draw: each of
-            // them is reachable by driving one path against two virtqueues,
-            // which is why each has a test that does exactly that. Here the
-            // check and the call are on the same `tx` in the same iteration,
-            // so no wiring defect reaches this at all — a counter that can
-            // never move is noise in the operator contract.
-            let token = tx
+            // visibly rather than being counted (ENG-5). The guarantor is
+            // `virtio::queue::SplitVirtqueue::add` — the single body behind
+            // both `add_*` methods — whose only early return is `if
+            // self.num_free == 0`, and whose `free_count()` *is* `num_free`.
+            // This iteration refused `free_count() == 0` at the top and has not
+            // touched `tx` since: the dequeue, the validation and the header
+            // write are all on the pipeline and the pool, so no descriptor was
+            // consumed in between. `virtio`'s property
+            // `split_virtqueue_accounting_holds_under_random_operations` proves
+            // it, unwrapping an `add` after every observed `free_count() > 0`
+            // across arbitrary add/complete/poll/recycle sequences.
+            let head = tx
                 .add_readable(paddr, descriptor.len + VirtioNetHdr::LEN as u32)
                 .expect("free_count() > 0 was observed above and nothing since has touched tx");
-            let slot = token.index() as usize;
-            self.posted[slot] = Some(descriptor);
+            let slot = head as usize;
+            if self.posted[slot].replace(descriptor).is_some() {
+                // This path and that queue disagree about what is posted; see
+                // `InvariantFaults::tx_slot_occupied` for why the displaced
+                // descriptor is neither returned nor reposted. Unlike the
+                // receive side there is no token to drop: a `Descriptor` is
+                // plain `Copy` data, and discarding it *is* withholding the
+                // return.
+                bump(&mut counters.invariant.tx_slot_occupied);
+            }
             self.in_flight[descriptor.buffer as usize] = true;
             sent = true;
         }
         sent
     }
 
-    /// Return a transmitted (or rejected) buffer to the pipeline's pool owner.
-    ///
     /// The free ring is sized above the pool, so a correctly accounted return
     /// cannot fail. A failure means accounting has already broken — a byzantine
     /// peer over-filling the ring — which is untrusted input, so it is counted
@@ -995,15 +851,19 @@ mod tests {
         let descriptor = fx.forwarded().expect("one frame forwarded");
         assert_eq!(descriptor.offset, VirtioNetHdr::LEN as u32);
         assert_eq!(descriptor.len, payload.len() as u32);
+        let mut storage = [0u8; BUFFER_SIZE];
         // SAFETY: single-threaded test; we hold the dequeued descriptor and its
-        // span was published by the code under test.
+        // span was published by the code under test. The bytes are snapshotted
+        // into this test's own `storage`, so nothing borrows the pool.
         let bytes = unsafe {
-            fx.pipeline.pool.read(
+            fx.pipeline.pool.copy_out(
                 descriptor.buffer as usize,
                 descriptor.offset as usize,
                 descriptor.len,
+                &mut storage,
             )
-        };
+        }
+        .expect("the driver published a span within one buffer");
         assert_eq!(bytes, &payload);
     }
 
@@ -1383,13 +1243,12 @@ mod tests {
         }
 
         /// Post one buffer at `paddr` and have the device complete it, so a
-        /// `poll` on this queue yields a token no other path ever mapped.
+        /// `poll` on this queue yields a completion no other path ever mapped.
         fn post_and_complete(&mut self, paddr: u64, used_len: u32) {
             let head = self
                 .vq
                 .add_writable(paddr, BUFFER_SIZE as u32)
-                .expect("a descriptor is free")
-                .index();
+                .expect("a descriptor is free");
             self.device.complete(head, used_len);
         }
     }
@@ -1450,24 +1309,42 @@ mod tests {
     }
 
     #[test]
-    fn refusing_to_recycle_a_descriptor_is_counted_as_a_driver_fault() {
-        // `recycle` cannot refuse a token polled from the same queue an instant
-        // earlier, so the refusal is unreachable through either path — but the
-        // handling still has to be right, and it is the one place a `Result`
-        // from the queue is answered. Exercise it directly with the token kind
-        // the queue does refuse: one the device still owns.
-        let mut region = VqRegion::boxed();
-        // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned solely
-        // by this test — `Vq::new`'s contract.
-        let mut vq = unsafe { Vq::new(region.0.as_mut_ptr()) };
-        let token = vq.add_writable(0x1000, 64).expect("a descriptor is free");
-        let mut faults = InvariantFaults::default();
+    fn posting_into_an_already_mapped_slot_leaks_the_buffer_and_counts_the_fault() {
+        // The transmit mirror of the test above, and the same wiring defect:
+        // a second queue hands out slots this path has already filled from the
+        // first. The displaced descriptor names a buffer the first queue may
+        // still be reading, so the assertions are that it is *not* returned —
+        // returning it would let the pool issue a live DMA target a second
+        // time — and that it is not silently lost either.
+        let mut fx = TxFixture::new();
+        for buffer in 0..Q as u32 {
+            fx.queue(Descriptor::new(buffer, VirtioNetHdr::LEN as u32, 8));
+        }
+        assert!(fx.post());
+        assert_eq!(fx.counters, Counters::default());
 
-        recycle_descriptor(&mut vq, token, &mut faults);
-        assert_eq!(faults.descriptor_recycle_refused, 1);
-        // Refused means refused: the descriptor stays the device's.
-        assert_eq!(vq.free_count(), Q - 1);
-        assert_eq!(vq.posted_count(), 1);
+        // A fresh queue restarts at slot zero, so every one of these collides.
+        let mut stray = StrayQueue::new();
+        for buffer in Q as u32..2 * Q as u32 {
+            fx.queue(Descriptor::new(buffer, VirtioNetHdr::LEN as u32, 8));
+        }
+        assert!(fx.tx.post(&mut stray.vq, &mut fx.counters));
+
+        assert_eq!(fx.counters.invariant.tx_slot_occupied, Q as u64);
+        assert_eq!(fx.counters.input, InputDrops::default());
+        assert!(
+            fx.returned().is_none(),
+            "a displaced descriptor's buffer is leaked, never returned to the pool"
+        );
+
+        // The displaced buffer keeps its in-flight bit, which is what stops it
+        // being posted a second time while the first queue may still hold it:
+        // re-queueing buffer 0 is refused as a duplicate rather than reposted.
+        let mut third = StrayQueue::new();
+        fx.queue(Descriptor::new(0, VirtioNetHdr::LEN as u32, 8));
+        assert!(!fx.tx.post(&mut third.vq, &mut fx.counters));
+        assert_eq!(fx.counters.input.tx_duplicate, 1);
+        assert!(fx.returned().is_none());
     }
 
     #[test]

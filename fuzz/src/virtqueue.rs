@@ -22,18 +22,25 @@
 //!   and a full `u32` length: forged ids, out-of-range ids, replays of a
 //!   descriptor already completed, echoes of one never posted, and lengths far
 //!   above what the driver programmed.
-//! * **A duplicate surrender.** This is the shape the previous harness made
-//!   unreachable by construction: it guarded `recycle` behind `if held[index]`,
-//!   so a `recycle` of a descriptor that was not outstanding could never be
-//!   generated, and the bug class the target was named for could not be found.
-//!   Here every `Token` the queue mints is retained — from `add_*` (still
-//!   posted to the device) as well as from `poll` (reaped) — and any of them
-//!   may be surrendered at any time, so `StillPosted` and `AlreadyFree` are
-//!   both reachable and both asserted.
 //! * **Buffer addresses and lengths chosen freely** on `add_writable` and
 //!   `add_readable`, rather than the two constants the previous harness used,
 //!   which left the descriptor-table half of the ring outside the fuzzer's
 //!   reach entirely.
+//! * **Either terminal choice for a completion**: recycled back to the free
+//!   list, or dropped and stranded out of it. Those are the two a driver has,
+//!   and the harness takes both from the fuzzer's data.
+//!
+//! # What is no longer expressible, and why that is the fix
+//!
+//! A surrender to the *wrong* queue, and a second surrender of one descriptor,
+//! used to be generated here — and were the bug class this target was named
+//! for. They are now compile errors: a `Completion` **is** the exclusive borrow
+//! of the queue that produced it, and `recycle` takes no queue argument, so
+//! there is no expression that hands one to another queue or uses it twice.
+//! That capability was never the *device's*, which is what TEST-8 governs; it
+//! was the driver's own bookkeeping, and the queue's API no longer admits it.
+//! Everything the device can express — every byte of the region, any
+//! completion, any used index — is untouched below.
 //!
 //! # What is asserted
 //!
@@ -55,19 +62,18 @@
 //!   previous harness capped its loop at `4 * QSIZE` and never checked how the
 //!   loop ended, so a regression removing the queue's own scan bound would have
 //!   been silently truncated into a pass.
-//! * **`recycle`'s result is consumed.** It returns `#[must_use]`
-//!   `Result<(), RecycleError>`; the previous harness dropped it, which the
-//!   fuzz workspace's missing `[lints]` reduced to a warning nobody read. Here
-//!   the exact variant is asserted, and `unused_must_use` is denied in
-//!   `fuzz/Cargo.toml`.
+//! * **The over-report tally.** A device claiming more bytes than the buffer
+//!   was posted with is clamped, and the clamp must be *counted*: the tally is
+//!   checked against the completions the model knows were over-reported, so a
+//!   silently absorbed over-report fails here.
 
 use std::sync::atomic::{Ordering, fence};
 
 use arbitrary::Unstructured;
-use virtio::queue::{RecycleError, SplitVirtqueue, Token};
+use virtio::queue::SplitVirtqueue;
 
 use crate::region::{DMA_REGION_BYTES, DmaRegion};
-use crate::{MAX_OPERATIONS, any_index, any_u32, next_op};
+use crate::{MAX_OPERATIONS, any_u32, next_op};
 
 /// Queue size the harness drives. 16 matches the driver PD's virtqueues and
 /// keeps the region far inside the 4 KiB backing page.
@@ -196,10 +202,11 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
     // The length this harness programmed into each descriptor, mirroring the
     // queue's private `posted_len`, so the clamp can be checked independently.
     let mut programmed = [0u32; QSIZE];
-    // Every token the queue has minted and this harness has not surrendered:
-    // both the posted ones from `add_*` and the reaped ones from `poll`, so a
-    // surrender of either is expressible.
-    let mut tokens: Vec<Token> = Vec::new();
+    // Completions handed out. A clamped over-report is indistinguishable from
+    // an exact report on this side — both come back as the posted length — so
+    // what the model can hold the tally to is that it never counts more
+    // over-reports than there were completions to over-report.
+    let mut delivered = 0u64;
 
     for _ in 0..MAX_OPERATIONS {
         let Some(op) = next_op(&mut unstructured) else {
@@ -218,8 +225,8 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
                     queue.add_readable(paddr, len)
                 };
                 match outcome {
-                    Some(token) => {
-                        let index = token.index() as usize;
+                    Some(head) => {
+                        let index = head as usize;
                         assert!(free_before > 0, "a full queue handed out a descriptor");
                         assert!(index < QSIZE, "add handed out descriptor {index}");
                         assert_eq!(
@@ -229,15 +236,17 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
                         );
                         model[index] = Lifecycle::Posted;
                         programmed[index] = len;
-                        tokens.push(token);
                     }
                     None => assert_eq!(free_before, 0, "add refused while descriptors were free"),
                 }
             }
-            2 => {
+            // Reap a completion and take one of the two terminal choices a
+            // driver has for it: recycle it (op 2) or drop it (op 3), leaving
+            // the descriptor reaped and out of the free list for good.
+            op @ (2 | 3) => {
                 let posted_before = queue.posted_count();
-                if let Some((token, reported)) = queue.poll() {
-                    let index = token.index() as usize;
+                if let Some((completion, reported)) = queue.poll() {
+                    let index = completion.index() as usize;
                     assert!(index < QSIZE, "poll returned descriptor {index}");
                     assert_eq!(
                         model[index],
@@ -255,34 +264,14 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
                         posted_before > 0,
                         "a completion arrived with nothing posted"
                     );
-                    model[index] = Lifecycle::Reaped;
-                    tokens.push(token);
-                }
-            }
-            // Surrender an arbitrary held token: posted or reaped, this queue's
-            // or a stale one. The outcome is fully determined by the model.
-            3 => {
-                if tokens.is_empty() {
-                    continue;
-                }
-                let token = tokens.remove(any_index(&mut unstructured, tokens.len()));
-                let index = token.index() as usize;
-                let outcome = queue.recycle(token);
-                match model[index] {
-                    Lifecycle::Reaped => {
-                        assert_eq!(outcome, Ok(()), "recycle refused a reaped descriptor");
+                    delivered += 1;
+                    if op == 2 {
+                        completion.recycle();
                         model[index] = Lifecycle::Free;
+                    } else {
+                        drop(completion);
+                        model[index] = Lifecycle::Reaped;
                     }
-                    Lifecycle::Posted => assert_eq!(
-                        outcome,
-                        Err(RecycleError::StillPosted(index as u16)),
-                        "recycle reclaimed a descriptor the device still owns"
-                    ),
-                    Lifecycle::Free => assert_eq!(
-                        outcome,
-                        Err(RecycleError::AlreadyFree(index as u16)),
-                        "recycle accepted a second surrender of one descriptor"
-                    ),
                 }
             }
             4 => {
@@ -305,6 +294,10 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
             QSIZE,
             "a descriptor was invented, lost, or held in two states at once"
         );
+        assert!(
+            queue.device_faults().completion_length_over_reported <= delivered,
+            "the queue counted more over-reports than it handed out completions"
+        );
     }
 
     // The device claims a used index far ahead of anything it published, which
@@ -320,10 +313,10 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
     let budget = queue.posted_count();
     let mut delivered = 0usize;
     for _ in 0..=budget {
-        let Some((token, reported)) = queue.poll() else {
+        let Some((completion, reported)) = queue.poll() else {
             break;
         };
-        let index = token.index() as usize;
+        let index = completion.index() as usize;
         assert_eq!(
             model[index],
             Lifecycle::Posted,
@@ -334,11 +327,7 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
             "the drain returned an unclamped length for descriptor {index}"
         );
         delivered += 1;
-        assert_eq!(
-            queue.recycle(token),
-            Ok(()),
-            "recycle refused a token this drain reaped an instant earlier"
-        );
+        completion.recycle();
         model[index] = Lifecycle::Free;
     }
     assert!(
@@ -347,11 +336,10 @@ pub fn virtqueue_poll_harness(data: &[u8]) {
     );
     // With nothing posted, no completion can be legitimate, so the used ring's
     // remaining entries — however the device forged its index — must all be
-    // refused and `poll` must say so rather than mint a token.
+    // refused and `poll` must say so rather than hand one out.
     if queue.posted_count() == 0 {
-        assert_eq!(
-            queue.poll(),
-            None,
+        assert!(
+            queue.poll().is_none(),
             "a completion was accepted while no descriptor was posted"
         );
     }

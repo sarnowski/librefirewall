@@ -29,7 +29,7 @@ use std::{
     process::Command,
 };
 
-use crate::{image, util::run_command};
+use crate::{budgets, image, util::run_command};
 
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target, and
@@ -119,6 +119,7 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .args(["fmt", "--all", "--check"]),
         "check formatting",
     )?;
+    enforce_budgets(root)?;
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -239,6 +240,26 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+/// Enforce the DOC-11 comment budget and the ENG-13 `unsafe` budget against
+/// the recorded baseline in [`budgets::BASELINE`].
+///
+/// Both are ratchets rather than thresholds: a number may fall and may never
+/// rise. [`budgets`] carries the definitions and the reasoning; what belongs
+/// here is only where the check sits in the gate.
+///
+/// # Why it runs before the compiling steps rather than beside the coverage floor
+///
+/// [`enforce_coverage`] is last because it needs an instrumented test run.
+/// This check needs nothing built at all — it reads the `.rs` files and scans
+/// them — so it costs milliseconds against the minutes of the steps below it,
+/// and it is exactly the kind of finding that is worthless discovered late. A
+/// documentation change that pushes a file's ratio up is reported here before
+/// the author waits out a full test and Clippy pass to hear it. The same
+/// argument [`lint_protection_domains`] makes for itself.
+fn enforce_budgets(root: &Path) -> Result<(), String> {
+    budgets::enforce(root)
 }
 
 /// Enforce the library coverage floors: the combined floor across all six

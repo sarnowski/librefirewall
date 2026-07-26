@@ -1,133 +1,82 @@
-//! Lock-free single-producer/single-consumer ring, the primitive the whole
-//! dataplane moves descriptors over.
+//! Lock-free single-producer/single-consumer ring of [`Descriptor`]s over
+//! memory two protection domains map at once.
 //!
-//! # Two structures, not one
+//! Faces the byzantine peer protection domain (CONCEPT §7.1), which maps the
+//! whole region read-write: both cursors and every slot.
 //!
-//! [`SpscRing`] is the shared-memory image: two cursors and a slot array,
-//! `#[repr(C)]` because it is mapped into two protection domains at once. It
-//! carries no queue operations at all. Each side instead takes a handle —
-//! [`SpscRing::producer`] on the enqueuing side, [`SpscRing::consumer`] on the
-//! dequeuing side — and drives the ring through that handle for as long as the
-//! domain uses it.
+//! # Why each side's position is private
 //!
-//! A handle holds **this domain's own position** in private memory, which the
-//! peer does not map and cannot write. The matching cursor inside the shared
-//! image is a *publication* of that position for the peer's flow control, never
-//! a value this side reads back. The only shared word a side ever reads is the
-//! *peer's* cursor, and it is masked into `0..CAP` before it is used for
-//! anything.
+//! [`SpscRing`] is the shared image and carries no operations; a side drives it
+//! through a handle holding that side's position in domain-private memory. The
+//! shared cursor is a *publication* of that position for the peer's flow
+//! control, never a value this side reads back — because re-reading it would
+//! hand the peer two ownership bugs rather than mere corruption: a rewound
+//! consumer cursor redelivers a descriptor, giving one buffer two owners, and a
+//! rewound producer cursor overwrites a slot the consumer never read, losing a
+//! buffer already handed over. Private, a position is a function of this side's
+//! own history alone, so "this side is the sole accessor of the slot at its own
+//! position" is a statement about local state rather than about peer
+//! cooperation.
 //!
-//! Exactly one handle of each kind may exist per ring for the ring's lifetime.
-//! A second handle would restart at position zero and re-walk slots the first
-//! already used, so taking one is a protocol error — the same class of caller
-//! contract as the one-producer/one-consumer rule itself, which the types
-//! likewise cannot express because a shared region is reachable through a
-//! shared reference by construction.
+//! The position needs no ordering of its own, being read and written by one
+//! domain. Ordering is needed only on the two shared cursors, where a release
+//! store publishes a position and the peer's acquire load observes it; on x86
+//! those are plain loads and stores plus compiler fences.
 //!
-//! # Why the position is private
+//! # The single-handle rule is an unenforced caller contract (DOC-9)
 //!
-//! The peer maps the whole region read-write, both cursors included
-//! (CONCEPT §7.1), so any value read back from there is attacker-controlled. A
-//! side that re-read *its own* cursor from the shared image would hand the peer
-//! two levers, and both are ownership bugs rather than mere corruption:
+//! At most one handle of each kind may exist per ring for the ring's life. A
+//! second restarts at position zero and re-walks slots the first already used,
+//! reinstating the very redelivery that double-owns a buffer.
 //!
-//! * rewinding the consumer's cursor would make it deliver a descriptor it had
-//!   already delivered, so one packet buffer would have two owners; and
-//! * rewinding the producer's cursor would make it overwrite a slot the
-//!   consumer had not yet read, losing a buffer that had already been handed
-//!   over.
-//!
-//! With the position private, neither is reachable: **each side's position is a
-//! function of that side's own history alone — it starts at zero and advances
-//! exactly one slot per successful operation — and no peer write can move it.**
-//! That is what makes "this side is the sole accessor of the slot at its own
-//! position" a statement about local state rather than about peer cooperation.
-//!
-//! The position also needs no atomic ordering of its own: it is an ordinary
-//! `u32` in domain-private memory that only this domain reads or writes, so
-//! there is nothing to synchronise. Ordering is needed only for the two shared
-//! cursors, where a release store publishes a position and the peer's acquire
-//! load observes it, establishing happens-before for the slot access on either
-//! side. On x86 those compile to plain loads and stores plus compiler fences,
-//! so the hot path stays cheap.
+//! No type here stops it. [`SpscRing::producer`] and [`SpscRing::consumer`]
+//! take `&self` because a mapped region is reachable only through a shared
+//! reference, and the "already taken" flag that would close it could only live
+//! in that same region — which the peer can clear. Closing it needs a claim
+//! minted outside the shared memory: drop both methods for `ProducerClaim` /
+//! `ConsumerClaim` types handed out once by whoever attaches the region and
+//! consumed by `take(self)`.
 //!
 //! # Slots are atomic, so a byzantine write is defined behaviour
 //!
-//! A slot is a [`Descriptor`] laid out field for field as [`AtomicU32`]s, and
-//! every slot access goes through those atomics. This is a soundness mechanism,
-//! not an optimisation: the peer can write any slot at any moment, and a
-//! non-atomic access racing with that write would be undefined behaviour in the
-//! Rust abstract machine — which would let the compiler assume the memory
-//! cannot change underneath it. Atomic accesses cannot race by definition, so
-//! the worst a byzantine writer achieves is an unexpected *value*. That is why
-//! this crate contains no `unsafe` at all (`#![forbid(unsafe_code)]`) and why
-//! [`SpscRing`] is `Sync` by the ordinary auto-trait rules rather than by an
+//! A peer can write any slot at any moment, and a non-atomic access racing with
+//! that write is undefined behaviour — which would let the compiler assume the
+//! memory cannot change underneath it. Atomic accesses cannot race by
+//! definition, so the worst a byzantine writer achieves is an unexpected
+//! *value*. That is what lets this crate hold `#![forbid(unsafe_code)]` and
+//! makes [`SpscRing`] `Sync` by the ordinary auto-trait rules rather than by an
 //! `unsafe impl` resting on a promise the API cannot keep.
 //!
-//! The slot accesses themselves are `Relaxed`, because all the ordering they
-//! need comes from the release/acquire pair on the published cursor: the
-//! producer's release store to `tail` orders its slot writes before the
-//! consumer's acquire load of `tail`, and the consumer's release store to
-//! `head` orders its slot reads before the producer's acquire load of `head`.
+//! Slot accesses are `Relaxed`; all the ordering they need comes from the
+//! release/acquire pair on the published cursor.
 //!
-//! # Ownership protocol
+//! # Zeroed is empty
 //!
-//! A [`Descriptor`] in the ring names a packet buffer, and enqueuing it is how
-//! the producing domain hands that buffer over: after a successful
-//! [`RingProducer::try_enqueue`] the buffer belongs to the consuming domain,
-//! and after a successful [`RingConsumer::try_dequeue`] it belongs to this one.
-//! A rejected enqueue returns the descriptor in `Err`, so nothing was handed
-//! over and the producer still owns the buffer.
+//! A zero-initialised region is already a valid empty ring, so no setup step
+//! exists; a handle starts at position zero without consulting the image, so
+//! attaching depends on nothing the peer controls. One slot is always left
+//! unused, which is what tells a full ring from an empty one without a flag.
 //!
-//! That hand-over is a *protocol* obligation, and this crate cannot enforce it.
-//! [`Descriptor`] is `Copy`, so a successful enqueue leaves the producer
-//! holding an identical value and nothing in the type system stops it enqueuing
-//! the same buffer twice. A move-only token such as `packet_buffer::OwnedBuffer`
-//! cannot close that gap here either: a descriptor in the ring is bytes on
-//! shared memory that a peer domain writes, not a Rust value whose moves the
-//! compiler can follow. What does catch a buffer handed over twice is the pool
-//! owner's ledger — `packet_buffer::FreeList` accounts buffers by identity and
-//! refuses to reclaim an index that is out of range or not outstanding. The
-//! ring moves descriptors; it claims nothing beyond that.
+//! # The residue a private position does not remove
 //!
-//! # Initialisation
-//!
-//! The shared region is zero-initialised, which is already a valid empty ring
-//! ([`Descriptor::ZERO`] slots, both cursors zero), so no explicit setup step is
-//! required. A handle likewise starts at position zero and never consults the
-//! shared image to do so, so attaching depends on nothing the peer controls.
-//! One slot is always left unused, which is what distinguishes a full ring from
-//! an empty one without a separate flag.
-//!
-//! # What remains outside this crate's control
-//!
-//! The private position bounds what a hostile peer can do; it does not
-//! eliminate it. Honestly stated, the residue is:
-//!
-//! * **Flow control is advisory.** The peer's published cursor is what gates
-//!   whether an operation proceeds. A forged `head` can stall a producer
-//!   indefinitely, or let it overwrite a slot the consumer has not read; a
-//!   forged `tail` can present a consumer with up to [`SpscRing::capacity`]
-//!   slots that were never published. Those slots are stale or zero — in
-//!   bounds, never out of it — and each such phantom dequeue still costs the
-//!   consumer one step of its own position, so no peer write makes a single
-//!   slot deliver twice in a row.
-//! * **Slot contents are untrusted input.** Because the atomics are per field,
-//!   a peer writing a slot concurrently can yield a `Descriptor` whose three
-//!   fields come from different writes. It is always a well-formed value and
-//!   never undefined behaviour, and like any peer input it must be
-//!   range-validated (`pd_runtime::descriptor_in_bounds`) before the span it
-//!   names is touched.
-//! * **Buffer ownership is not accounted here**, for the reason given above;
-//!   `packet_buffer::FreeList` is where a duplicate or forged return is caught.
-//! * **A one-sided restart desynchronises the ring.** A domain that restarts
-//!   while its peer keeps running resumes at position zero with the peer
-//!   somewhere else, after which descriptors are replayed or lost. Recovering
-//!   from that means restarting the region and both domains together, which is
-//!   a system-level question this crate cannot answer.
-//! * **Unbounded drainage is the caller's to prevent.** A peer that keeps
-//!   advancing `tail` keeps [`RingConsumer::try_dequeue`] returning `Some`, so
-//!   a consumer loop must cap its own work — see [`RingConsumer::drain`].
+//! * **Flow control is advisory.** A forged `head` can stall a producer or let
+//!   it overwrite an unread slot; a forged `tail` can present a consumer with
+//!   up to [`SpscRing::capacity`] slots that were never published. Those slots
+//!   are stale or zero — in bounds, never out of it — and each phantom dequeue
+//!   still costs the consumer one step of its own position, so no peer write
+//!   makes one slot deliver twice in a row.
+//! * **Slot contents are untrusted input.** Per-field atomics mean a concurrent
+//!   peer write can yield a descriptor whose three fields come from different
+//!   writes: always a well-formed value, never undefined behaviour, and to be
+//!   range-validated like any peer input before the span it names is touched.
+//! * **Ownership is not accounted here.** [`Descriptor`] is `Copy` and a slot
+//!   is peer-writable memory rather than a Rust value whose moves the compiler
+//!   follows, so nothing in this crate can tell a first hand-over from a
+//!   second. This crate moves descriptors and claims nothing more.
+//! * **A one-sided restart desynchronises the ring**, replaying or losing
+//!   descriptors until the region and both domains are restarted together.
+//! * **Unbounded drainage is the caller's to prevent** — see
+//!   [`RingConsumer::drain`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -136,12 +85,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use wire::Descriptor;
 
-/// One ring slot: a [`Descriptor`] laid out field for field as atomics.
+/// One ring slot.
 ///
-/// Per-field rather than a single wider atomic because a `Descriptor` is 12
-/// bytes and no atomic of that width exists. The consequence — a concurrent
-/// peer write can be observed as a mix of two descriptors — is a *value*
-/// problem the consumer already validates for, not a soundness problem.
+/// Per-field rather than one wider atomic because a `Descriptor` is 12 bytes
+/// and no atomic of that width exists.
 #[repr(C)]
 struct Slot {
     buffer: AtomicU32,
@@ -150,11 +97,9 @@ struct Slot {
 }
 
 impl Slot {
-    /// The image of [`Descriptor::ZERO`], and the state of a freshly zeroed
-    /// shared region. A `const fn` rather than an associated constant because a
-    /// constant holding atomics is copied at each use, which is a trap worth
-    /// keeping out of the crate even where the array initialiser below would
-    /// have been a correct use of one.
+    /// A `const fn` rather than an associated constant: a constant holding
+    /// atomics is copied at each use, a trap worth keeping out of the crate
+    /// even where the array initialiser below would have been a correct use.
     const fn zero() -> Self {
         Self {
             buffer: AtomicU32::new(0),
@@ -163,16 +108,12 @@ impl Slot {
         }
     }
 
-    /// `Relaxed` throughout: the release store to the publishing cursor that
-    /// follows is what orders these writes for the peer.
     fn store(&self, descriptor: Descriptor) {
         self.buffer.store(descriptor.buffer, Ordering::Relaxed);
         self.offset.store(descriptor.offset, Ordering::Relaxed);
         self.len.store(descriptor.len, Ordering::Relaxed);
     }
 
-    /// `Relaxed` throughout: the acquire load of the peer's cursor that
-    /// precedes it is what makes the producer's writes visible here.
     fn load(&self) -> Descriptor {
         Descriptor::new(
             self.buffer.load(Ordering::Relaxed),
@@ -182,38 +123,30 @@ impl Slot {
     }
 }
 
-/// The shared-memory image of a bounded lock-free SPSC ring of [`Descriptor`]s.
+/// The shared-memory image of a bounded lock-free SPSC ring, `CAP` slots of
+/// which `CAP - 1` are usable.
 ///
-/// `CAP` is the number of slots and must be a power of two of at least 2; the
-/// usable capacity is `CAP - 1`. The layout is `#[repr(C)]` because the ring is
-/// aliased into two address spaces.
-///
-/// This type carries no queue operations. Take a [`producer`](Self::producer)
-/// or a [`consumer`](Self::consumer) handle once and keep it — see the crate
-/// header for why the position lives there and not here.
+/// `#[repr(C)]` because the ring is aliased into two address spaces.
 #[repr(C)]
 pub struct SpscRing<const CAP: usize> {
-    /// The consumer's published position. Written by the consumer's domain,
-    /// read by the producer's as advisory flow control — never read back by the
-    /// consumer.
+    /// Published by the consumer's domain for the producer's flow control, and
+    /// never read back by the consumer; `tail` mirrors it the other way.
     head: AtomicU32,
-    /// The producer's published position, mirroring [`head`](Self::head).
     tail: AtomicU32,
     slots: [Slot; CAP],
 }
 
-// The ring is a cross-PD shared-memory ABI; pin its layout so a field reorder or
-// size change becomes a compile error rather than a silent corruption of the
-// mapping the peer PD reads.
+// A cross-PD shared-memory ABI: pin the layout so a field reorder or size
+// change is a compile error rather than a silent corruption of the mapping the
+// peer domain reads.
 const _: () = {
     assert!(core::mem::offset_of!(SpscRing<2>, head) == 0);
     assert!(core::mem::offset_of!(SpscRing<2>, tail) == 4);
     assert!(core::mem::offset_of!(SpscRing<2>, slots) == 8);
     assert!(core::mem::align_of::<SpscRing<2>>() == 4);
     assert!(core::mem::size_of::<SpscRing<2>>() == 8 + 2 * core::mem::size_of::<Descriptor>());
-    // A slot is a `Descriptor` field for field, so expressing the slots as
-    // atomics leaves the image the peer maps byte-identical. Without these the
-    // switch could silently move the ABI.
+    // Expressing the slots as atomics must leave the image the peer maps
+    // byte-identical to a plain `Descriptor` array.
     assert!(core::mem::size_of::<Slot>() == core::mem::size_of::<Descriptor>());
     assert!(core::mem::align_of::<Slot>() == core::mem::align_of::<Descriptor>());
     assert!(core::mem::offset_of!(Slot, buffer) == core::mem::offset_of!(Descriptor, buffer));
@@ -222,6 +155,11 @@ const _: () = {
 };
 
 impl<const CAP: usize> SpscRing<CAP> {
+    /// The usable capacity, and the mask that bounds every cursor. Named from
+    /// each constructor and from [`capacity`](Self::capacity) so that an
+    /// invalid `CAP` is a build error however the ring is reached — a
+    /// production ring is cast from a mapped region rather than constructed,
+    /// so `new` alone cannot force these.
     const MASK: u32 = {
         assert!(
             CAP.is_power_of_two(),
@@ -238,8 +176,6 @@ impl<const CAP: usize> SpscRing<CAP> {
         (CAP - 1) as u32
     };
 
-    /// A new, empty ring. Const so it can initialise a shared region in place;
-    /// note that a zeroed region is already a valid empty ring.
     #[must_use]
     pub const fn new() -> Self {
         let _ = Self::MASK;
@@ -253,22 +189,14 @@ impl<const CAP: usize> SpscRing<CAP> {
     /// The number of descriptors the ring can hold at once.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        // `MASK` *is* the usable capacity, and naming it evaluates the capacity
-        // invariants. A production ring is not constructed but cast from a
-        // mapped region, so `new` cannot be relied on to force them; every way
-        // into the ring names `MASK` for that reason, so an invalid `CAP` is a
-        // build error whichever door the caller comes through.
         Self::MASK as usize
     }
 
     /// Take the enqueuing side's handle, positioned at the start of the ring.
     ///
-    /// Call this once per ring and keep the handle for as long as the domain
-    /// enqueues: the handle *is* this side's position, so a second one restarts
-    /// at slot zero and re-walks slots the first already published to. The
-    /// position starts at zero rather than at the shared cursor's value because
-    /// that value is peer-controlled, and a zeroed region is by definition the
-    /// ring's initial state.
+    /// Take it **once** per ring and keep it — see the crate header on the
+    /// single-handle rule and why no type enforces it. The position starts at
+    /// zero rather than at the shared cursor, whose value is peer-controlled.
     #[must_use]
     pub const fn producer(&self) -> RingProducer<'_, CAP> {
         let _ = Self::MASK;
@@ -278,9 +206,8 @@ impl<const CAP: usize> SpscRing<CAP> {
         }
     }
 
-    /// Take the dequeuing side's handle, positioned at the start of the ring.
-    /// The single-handle rule and the zero start of [`producer`](Self::producer)
-    /// apply here too.
+    /// Take the dequeuing side's handle, on the terms of
+    /// [`producer`](Self::producer).
     #[must_use]
     pub const fn consumer(&self) -> RingConsumer<'_, CAP> {
         let _ = Self::MASK;
@@ -299,14 +226,11 @@ impl<const CAP: usize> Default for SpscRing<CAP> {
 
 /// The enqueuing side of a [`SpscRing`], holding this domain's publish position
 /// in private memory.
-///
-/// See the crate header: the position advances exactly one slot per successful
-/// enqueue and no peer write can move it.
 pub struct RingProducer<'ring, const CAP: usize> {
     ring: &'ring SpscRing<CAP>,
-    /// Where the next descriptor is written. Private to this domain, and always
-    /// already masked into `0..CAP`, so it indexes `slots` directly; that is an
-    /// internal invariant, and the slice index is its unconditional backstop.
+    /// Always already masked into `0..CAP`, so it indexes `slots` directly;
+    /// that is an internal invariant, and the slice index is its unconditional
+    /// backstop.
     tail: u32,
 }
 
@@ -319,9 +243,8 @@ impl<const CAP: usize> RingProducer<'_, CAP> {
         self.ring.capacity()
     }
 
-    /// The peer's published position, masked into range because it is
-    /// attacker-controlled. Acquire so that the consumer's reads of a slot are
-    /// ordered before this side overwrites it.
+    /// Masked into range because it is attacker-controlled. Acquire so the
+    /// consumer's reads of a slot precede this side overwriting it.
     fn peer_head(&self) -> u32 {
         self.ring.head.load(Ordering::Acquire) & Self::MASK
     }
@@ -330,13 +253,10 @@ impl<const CAP: usize> RingProducer<'_, CAP> {
     /// domain.
     ///
     /// # Errors
-    /// Returns the descriptor unchanged in `Err` when the ring appears full, so
-    /// the caller retains ownership of the buffer it names and can release or
-    /// retry it. "Appears" is deliberate: fullness is judged against the peer's
-    /// published cursor, which a hostile peer can forge in either direction —
-    /// it can withhold a slot that is really free, or claim room in a slot the
-    /// consumer has not read, in which case the unread descriptor is
-    /// overwritten and the buffer it named is lost to the pool ledger.
+    /// Returns the descriptor unchanged when the ring *appears* full, so the
+    /// caller keeps the buffer it names. "Appears" is deliberate: fullness is
+    /// judged against the peer's published cursor, which is forgeable either
+    /// way — see the crate header on advisory flow control.
     pub fn try_enqueue(&mut self, descriptor: Descriptor) -> Result<(), Descriptor> {
         let next = self.tail.wrapping_add(1) & Self::MASK;
         if next == self.peer_head() {
@@ -350,21 +270,17 @@ impl<const CAP: usize> RingProducer<'_, CAP> {
 
     /// A best-effort instantaneous estimate of how many descriptors are queued.
     ///
-    /// Only the first operand is this side's own position; the other is the
-    /// peer's published cursor, so the answer is a snapshot of a value that may
-    /// already have changed, and under a hostile peer it is an arbitrary number
-    /// in `0..=capacity()`. Never use it to size a following batch — the ring
-    /// may hold fewer descriptors by then, or the peer may simply have lied.
-    /// Drive enqueues from the `Result` of [`try_enqueue`](Self::try_enqueue)
-    /// instead.
+    /// One operand is the peer's published cursor, so under a hostile peer this
+    /// is an arbitrary number in `0..=capacity()`. Never size a following batch
+    /// from it; drive enqueues from [`try_enqueue`](Self::try_enqueue)'s
+    /// `Result`.
     #[must_use]
     pub fn len(&self) -> usize {
         (self.tail.wrapping_sub(self.peer_head()) & Self::MASK) as usize
     }
 
-    /// Whether [`len`](Self::len) is zero, and exactly as best-effort as it is —
-    /// the two are defined against the same snapshot so they can never
-    /// contradict each other.
+    /// Defined against the same snapshot as [`len`](Self::len), so the two can
+    /// never contradict each other.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -373,14 +289,9 @@ impl<const CAP: usize> RingProducer<'_, CAP> {
 
 /// The dequeuing side of a [`SpscRing`], holding this domain's consume position
 /// in private memory.
-///
-/// See the crate header: the position advances exactly one slot per successful
-/// dequeue and no peer write can move it, which is what stops a rewound peer
-/// cursor from delivering the same descriptor twice.
 pub struct RingConsumer<'ring, const CAP: usize> {
     ring: &'ring SpscRing<CAP>,
-    /// Where the next descriptor is read from. Private to this domain, and
-    /// always already masked into `0..CAP`; see [`RingProducer::tail`].
+    /// Always already masked into `0..CAP`; see [`RingProducer::tail`].
     head: u32,
 }
 
@@ -393,9 +304,8 @@ impl<'ring, const CAP: usize> RingConsumer<'ring, CAP> {
         self.ring.capacity()
     }
 
-    /// The peer's published position, masked into range because it is
-    /// attacker-controlled. Acquire so that the producer's slot writes are
-    /// visible before this side reads them.
+    /// Masked into range because it is attacker-controlled. Acquire so the
+    /// producer's slot writes are visible before this side reads them.
     fn peer_tail(&self) -> u32 {
         self.ring.tail.load(Ordering::Acquire) & Self::MASK
     }
@@ -403,14 +313,8 @@ impl<'ring, const CAP: usize> RingConsumer<'ring, CAP> {
     /// Dequeue one descriptor, taking ownership of the buffer it names.
     ///
     /// `None` means only that nothing is queued *at this instant*, judged
-    /// against the peer's published cursor; it is not a durable state, and a
-    /// later call may well return `Some`.
-    ///
-    /// A returned descriptor is untrusted input. The producing domain may be
-    /// byzantine, so it may name any buffer, any span, or a slot that was never
-    /// published — range-validate it (`pd_runtime::descriptor_in_bounds`) before
-    /// touching the span, and remember that the pool ledger, not this ring, is
-    /// what decides whether the buffer was really the peer's to hand over.
+    /// against the peer's published cursor; a later call may return `Some`.
+    /// What comes back is untrusted input — see the crate header.
     pub fn try_dequeue(&mut self) -> Option<Descriptor> {
         if self.head == self.peer_tail() {
             return None;
@@ -421,17 +325,15 @@ impl<'ring, const CAP: usize> RingConsumer<'ring, CAP> {
         Some(descriptor)
     }
 
-    /// Dequeue at most `limit` descriptors, as an iterator that also stops early
-    /// once the ring appears empty.
+    /// Dequeue at most `limit` descriptors, stopping early once the ring
+    /// appears empty.
     ///
-    /// This is the bounded form every consumer loop should use. Draining with
-    /// `while let Some(..)` is unbounded work driven by an untrusted peer: a
-    /// producer that keeps advancing its published cursor keeps
-    /// [`try_dequeue`](Self::try_dequeue) returning `Some`, so such a loop never
-    /// returns and the domain stops making progress on anything else. The cap
-    /// belongs to the caller because only the caller knows its own budget per
-    /// scheduling round; [`len`](Self::len) must not supply it, being a peer-
-    /// influenced estimate.
+    /// The bounded form a consumer loop needs: a peer that keeps advancing its
+    /// published cursor keeps [`try_dequeue`](Self::try_dequeue) returning
+    /// `Some`, so a `while let Some(..)` loop never returns and the domain
+    /// stops progressing on anything else. The cap belongs to the caller, who
+    /// alone knows its budget per scheduling round; [`len`](Self::len) must not
+    /// supply it, being peer-influenced.
     #[must_use = "a drain iterator dequeues nothing until it is consumed"]
     pub fn drain(&mut self, limit: usize) -> Drain<'_, 'ring, CAP> {
         Drain {
@@ -440,27 +342,22 @@ impl<'ring, const CAP: usize> RingConsumer<'ring, CAP> {
         }
     }
 
-    /// A best-effort instantaneous estimate of how many descriptors are queued;
-    /// as best-effort as [`RingProducer::len`], and bounded the same way.
+    /// As best-effort as [`RingProducer::len`], and bounded the same way.
     #[must_use]
     pub fn len(&self) -> usize {
         (self.peer_tail().wrapping_sub(self.head) & Self::MASK) as usize
     }
 
-    /// Whether [`len`](Self::len) is zero, defined against the same snapshot so
-    /// the two can never contradict each other.
+    /// Defined against the same snapshot as [`len`](Self::len), so the two can
+    /// never contradict each other.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/// A bounded dequeue iterator over a [`RingConsumer`], created by
-/// [`RingConsumer::drain`].
-///
-/// Yields at most the `limit` it was created with, and stops early the first
-/// time the ring appears empty. Dropping it early leaves the remaining
-/// descriptors queued.
+/// The bounded dequeue iterator from [`RingConsumer::drain`]. Dropping it early
+/// leaves the remaining descriptors queued.
 pub struct Drain<'consumer, 'ring, const CAP: usize> {
     consumer: &'consumer mut RingConsumer<'ring, CAP>,
     remaining: usize,
@@ -479,8 +376,8 @@ impl<const CAP: usize> Iterator for Drain<'_, '_, CAP> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // The upper bound is the whole guarantee: a caller can rely on the
-        // iteration being finite whatever the peer does.
+        // The upper bound is the whole guarantee: iteration is finite whatever
+        // the peer does.
         (0, Some(self.remaining))
     }
 }

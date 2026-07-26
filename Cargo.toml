@@ -33,13 +33,14 @@ criterion = "0.7.0"
 # lints that already pass everywhere belong here; the gate denies all warnings.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# Every public item carries rustdoc; enforced here so an undocumented public API
-# fails the build. The deny is absolute — the library crates, the PD adapters and
-# xtask all carry it, and no crate opts out. The sole exception is a Criterion
-# bench harness under `benches/`, which is neither a public API nor shipped and
-# whose `criterion_group!` expansion is public; each states that reason on the
-# line above its `#![allow(missing_docs)]`.
-missing_docs = "deny"
+# `missing_docs` is deliberately absent (AGENTS.md DOC-4). Forcing a comment
+# onto every public item manufactures contentless prose — a lint that makes
+# documentation *exist* without making it *true* buys nothing, and every
+# sentence it compels is an untested assertion that nothing fails when it goes
+# stale. What replaces it is the DOC-11 ratchet in `tools/xtask/src/budgets.rs`,
+# which lets a file's comment ratio fall and never rise, and the two `unsafe`
+# obligations that have no other carrier and so stay denied above and below:
+# `unsafe_op_in_unsafe_fn` and `undocumented_unsafe_blocks`.
 
 [workspace.lints.clippy]
 # Every `unsafe` block carries a truthful `// SAFETY:` comment stating the
@@ -63,3 +64,12 @@ undocumented_unsafe_blocks = "deny"
 codegen-units = 1
 lto = true
 panic = "abort"
+# On, so the artifact that ships is the one the property tests prove. Those
+# tests assert "arbitrary input never panics" while running with overflow
+# checking; leaving it off here shipped a binary that wraps silently instead,
+# and a wrap on a dataplane index is precisely the reachable-from-input
+# arithmetic ENG-5 forbids. The arithmetic on those paths is bounded by
+# construction, so this is expected to change no behaviour — and where that
+# expectation is ever wrong, a `panic = "abort"` PD faulting loudly is the
+# outcome ENG-12 asks for over a silently wrapped index.
+overflow-checks = true

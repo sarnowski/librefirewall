@@ -1,92 +1,63 @@
 //! The shared dataplane region and the buffer-ownership protocol common to the
 //! protection domains.
 //!
-//! This crate deliberately carries no seL4/Microkit dependency: the region
-//! layout and the ownership protocol are pure logic and are exercised in full
-//! on the host (see the concurrency test below). The protection-domain binaries
-//! are thin adapters that map a region, hand its address here, and drive the
-//! protocol from Microkit notifications.
+//! Faces the byzantine peer protection domain (CONCEPT §7.1): this crate *is*
+//! the inter-PD protocol, so it defines what one domain must withstand from
+//! another. Every neighbour maps the whole region read-write — both ring
+//! cursors, every slot, and the pool bytes.
 //!
-//! # The forwarding region
+//! It carries no seL4/Microkit dependency on purpose: region layout and
+//! ownership protocol are pure logic, so both are exercised in full on the
+//! host, and the protection-domain binaries stay thin adapters that map a
+//! region, hand its address here, and drive the protocol from notifications.
 //!
-//! [`Pipeline`] joins three domains into the forwarding chain
-//! `rx driver -> forwarder -> tx driver` over one buffer pool: `rx` carries
-//! received frames to the forwarder, `tx` carries them onward to the
-//! transmitting driver, and `free` returns transmitted buffers to the
-//! pool-owning rx driver. A buffer is always owned by exactly one side: it sits
-//! in the owner's [`FreeList`], or in exactly one ring, or in one domain's hand
-//! — never in two places at once. That single-ownership chain is what makes
-//! forwarding zero-copy end to end: the receiving NIC DMAs a frame into a pool
-//! buffer and the transmitting NIC DMAs it back out of that very buffer, and
-//! only the descriptor ever moves.
+//! [`Pipeline`] joins three domains into `rx driver -> forwarder -> tx driver`
+//! over one buffer pool. One pool is what makes forwarding zero-copy end to
+//! end: the receiving NIC DMAs a frame into a pool buffer, the transmitting NIC
+//! DMAs it back out of that very buffer, and only the descriptor moves.
 //!
-//! # Handles are taken once, at attach
+//! # Handles are taken once, at attach (DOC-9)
 //!
-//! A `queue` ring carries no operations; each side drives it through a handle
-//! that holds *that side's own position* in domain-private memory. A handle
-//! taken per call would restart at slot zero every time and re-walk slots the
-//! previous one had already used — reinstating precisely the redelivery bug the
-//! private position exists to prevent. So every role type here
-//! ([`PoolOwner`], [`ForwardStage`], and their counterparts in
-//! `nic-driver-core`) is parameterised by the region's lifetime and **takes
-//! each handle exactly once, in its `attach` constructor, keeping it for the
-//! protection domain's whole life**. A protection domain must call each role's
-//! `attach` once per pipeline and never construct a second role over the same
-//! ring end.
+//! A handle holds its side's ring position, so a second one restarts at slot
+//! zero and redelivers descriptors the first already handed over. Every role
+//! type here therefore borrows the region for its lifetime and takes each
+//! handle in its `attach` constructor — but nothing stops a domain calling two
+//! `attach`es over one ring end, and this crate's own tests take extra handles
+//! on a pipeline deliberately. Closing it needs the once-only claim `queue`'s
+//! header describes, threaded from [`Pipeline::attach`] down through every
+//! role's `attach` across this crate and `nic-driver-core`.
 //!
-//! # Trust stance: a byzantine peer PD
+//! # What a hostile peer cannot cause, and what enforces it
 //!
-//! This crate *is* the inter-PD protocol, so it defines what one protection
-//! domain must withstand from another. Every neighbour shares read-write access
-//! to the whole region — both ring cursors and every slot, and the pool bytes —
-//! and is treated as untrusted (CONCEPT §7.1). What a hostile peer cannot cause
-//! here, and which component enforces each:
-//!
-//! * **No out-of-bounds slot access, no arithmetic panic, and no redelivery of
-//!   a descriptor already handed over** — enforced by `queue`: each side's
-//!   position lives in domain-private memory the peer cannot map, and the only
-//!   shared word a side reads is the peer's cursor, masked into range.
-//! * **No out-of-bounds dereference of a forged descriptor** — enforced by the
-//!   consumer, which validates every inbound descriptor with
-//!   [`descriptor_in_bounds`] before touching the span it names, backstopped
-//!   unconditionally by `packet_buffer`'s own span checks.
+//! * **No out-of-bounds slot access and no redelivery of a descriptor already
+//!   handed over** — `queue`, whose positions live in memory the peer cannot
+//!   map and whose only shared read is masked into range.
+//! * **No out-of-bounds dereference of a forged descriptor** —
+//!   [`descriptor_in_bounds`] on the consuming side before the span is touched,
+//!   backstopped unconditionally by `packet_buffer`'s own span checks.
 //! * **No double-owned buffer through a forged or duplicated return** —
-//!   enforced in two layers by [`PoolOwner::reclaim`]. `packet_buffer`'s
-//!   [`FreeList::reclaim`] is the trust boundary for the index itself: it
-//!   refuses an index outside the pool and one that is not outstanding, so a
-//!   forged or duplicated return is rejected rather than counted. On top of
-//!   that the owner keeps its own *lent* set, because the ledger alone cannot
-//!   tell a buffer lent to the peer from one still posted to this domain's own
-//!   NIC — both are merely "outstanding" — and accepting the latter back would
-//!   free a live DMA target. Only an index this domain actually dissolved onto
-//!   a ring is accepted.
-//! * **No unbounded work.** Every loop driven by a peer-fed ring drains through
-//!   [`RingConsumer::drain`] with a [`DRAIN_LIMIT`] derived from this crate's
-//!   own [`RING_SLOTS`] and [`POOL_BUFFERS`], never from a peer-influenced
-//!   estimate, so a peer that keeps its published cursor moving cannot stop the
-//!   domain from servicing its device.
-//! * **No panic.** Every rejection above is a counted drop
-//!   ([`PoolCounters`], [`ForwardCounters`]) rather than a fault. The
-//!   distinction this crate keeps is the one AGENTS.md draws: peer-supplied
-//!   values are *input* and are rejected safely; only a violated invariant of
-//!   this domain's own private state fails visibly.
+//!   [`PoolOwner::reclaim`], in two layers: `packet_buffer`'s ledger for the
+//!   index itself, and this crate's *lent* set for what the ledger cannot see.
+//! * **No unbounded work** — [`DRAIN_LIMIT`], derived from this crate's own
+//!   constants and never from a peer-influenced estimate.
+//! * **No panic** — every rejection above is a counted drop ([`PoolCounters`],
+//!   [`ForwardCounters`]). Peer-supplied values are input and are rejected
+//!   safely; only a violated invariant of this domain's own private state fails
+//!   visibly.
 //!
-//! What a hostile peer **can** still cause — the accepted, tracked residue:
+//! # The accepted, tracked residue
 //!
-//! * **Buffer loss.** A peer that stalls its side of a ring can make
-//!   [`ForwardStage::poll`] unable to place a descriptor it has already
-//!   dequeued; the descriptor is dropped and counted, and the buffer it named
-//!   is then lost to its owner's ledger for good (a descriptor cannot be
-//!   un-dequeued, and this domain is not that ring's producer, so it cannot
-//!   return it either). The pool shrinks; nothing is double-owned and nothing
-//!   crashes.
-//! * **Frame loss and reordering**, by forging a cursor: `queue` documents that
-//!   flow control is advisory.
-//! * **Writing pool bytes at any time.** No Rust type can stop a peer mapping
-//!   the same region from scribbling a buffer it does not own. That is a data
-//!   integrity problem, contained by the fact that the pool never hands out a
-//!   safe reference to those bytes, and it is why an IOMMU (CONCEPT §7.2) is
-//!   what finally confines a NIC's DMA rather than anything in this crate.
+//! * **Buffer loss.** A peer stalling its side of a ring can leave
+//!   [`ForwardStage::poll`] unable to place a descriptor it already dequeued.
+//!   A dequeue cannot be undone and this domain does not produce onto that
+//!   ring, so the buffer is lost to its owner's ledger for good. The pool
+//!   shrinks; nothing is double-owned and nothing crashes.
+//! * **Frame loss and reordering**, by forging a cursor.
+//! * **Writing pool bytes at any time.** No Rust type stops a peer mapping the
+//!   same region from scribbling a buffer it does not own. That is contained by
+//!   the pool never handing out a safe reference to those bytes, and it is why
+//!   an IOMMU (CONCEPT §7.2) is what finally confines a NIC's DMA rather than
+//!   anything here.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -99,60 +70,42 @@ pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
 pub use wire::Descriptor;
 
-/// Number of buffers in a shared pool.
 pub const POOL_BUFFERS: usize = 64;
 
-/// Slot count of each ring. Power of two; usable capacity is one less. Sized
-/// above [`POOL_BUFFERS`] so no ring can fill before the pool is exhausted,
-/// which makes buffer hand-offs along a correctly accounted chain infallible.
+/// Power of two; usable capacity is one less. Sized above [`POOL_BUFFERS`] so
+/// no ring can fill before the pool is exhausted, which makes buffer hand-offs
+/// along a correctly accounted chain infallible.
 pub const RING_SLOTS: usize = 128;
 
 /// The most descriptors any single drain of a peer-fed ring will process.
 ///
-/// The bound exists because the producing side of every ring here is untrusted:
-/// a peer that keeps advancing its published cursor keeps a dequeue returning
-/// descriptors forever, and a domain stuck in such a loop stops servicing its
-/// own device. It is deliberately derived from this crate's own constants and
-/// never from a ring's `len()`, which is a peer-influenced estimate.
-///
-/// One full ring's worth is the natural size: a ring cannot hold more than
-/// `RING_SLOTS - 1` real descriptors and the pool cannot have more than
-/// [`POOL_BUFFERS`] buffers outstanding, so any legitimate backlog is drained
-/// in a single round while a fabricated one is cut off after a fixed amount of
-/// work.
+/// A peer that keeps advancing its published cursor keeps a dequeue returning
+/// descriptors forever, and a domain stuck in that loop stops servicing its own
+/// device. One full ring's worth is the natural bound — no legitimate backlog
+/// can exceed `RING_SLOTS - 1` real descriptors or [`POOL_BUFFERS`] outstanding
+/// buffers — and it comes from this crate's own constants rather than from a
+/// ring's peer-influenced `len()`.
 pub const DRAIN_LIMIT: usize = RING_SLOTS;
 
-/// Bytes reserved for a region in the system description. The `const _`
-/// assertions below fail the build if a region type outgrows this, so the Rust
-/// types can never silently exceed the mapping declared in the `.system` file.
-/// The guarantee is one-directional: nothing here re-reads the `.system`
-/// `<memory_region>` size, so shrinking that XML below this constant is caught
-/// only at boot (a truncated mapping), not at build time.
+/// Bytes the system description reserves per region
+/// (`systems/qemu-x86_64/librefirewall.system:85,86`). The assertions below
+/// fail the build if a region type outgrows this, so the Rust types can never
+/// exceed the declared mapping. The guarantee is one-directional: nothing here
+/// re-reads that XML, so shrinking it below this constant surfaces only at boot
+/// as a truncated mapping.
 pub const REGION_SIZE: usize = 0x40000;
 
-/// The granularity Microkit maps a memory region at, and therefore the
-/// alignment a [`Pipeline`]'s base address is guaranteed to have.
-///
-/// It is what ultimately fixes the DMA alignment of every pool buffer: the pool
-/// sits at the region's front (see [`Pipeline`]), so a buffer's alignment is the
-/// region base's, and the assertion below proves a page-aligned base is enough
-/// for the [`BUFFER_SIZE`] stride.
+/// The granularity Microkit maps a memory region at, and so the alignment a
+/// [`Pipeline`]'s base address has. With the pool at the region's front it is
+/// also what fixes every pool buffer's DMA alignment.
 pub const MAPPING_ALIGN: usize = 0x1000;
 
-/// A ring sized for this dataplane.
-///
-/// A ring carries no operations of its own: each domain takes a
-/// [`RingProducer`] or [`RingConsumer`] handle once and keeps it, because the
-/// handle holds that side's position in memory the peer cannot reach.
 pub type Ring = SpscRing<RING_SLOTS>;
 
-/// The pool sized for this dataplane.
 pub type Pool = BufferPool<POOL_BUFFERS>;
 
-/// Whether a descriptor received from a neighbouring protection domain names
-/// a span that lies within one pool buffer. Neighbours are untrusted, so a
-/// domain validates every inbound descriptor with this before dereferencing
-/// the span; a failing descriptor is rejected, never followed.
+/// Whether a descriptor from a neighbouring protection domain names a span
+/// within one pool buffer. A failing descriptor is rejected, never followed.
 #[must_use]
 pub fn descriptor_in_bounds(descriptor: &Descriptor) -> bool {
     (descriptor.buffer as usize) < POOL_BUFFERS
@@ -161,36 +114,29 @@ pub fn descriptor_in_bounds(descriptor: &Descriptor) -> bool {
             .is_some_and(|end| end <= BUFFER_SIZE)
 }
 
-/// Increment a counter of untrusted-input events, saturating rather than
-/// wrapping. The rate is attacker-controlled, and a wrapped counter would turn
-/// a sustained flood back into a small number and hide it.
+/// Saturating rather than wrapping: the rate is attacker-controlled, and a
+/// wrapped counter turns a sustained flood back into a small number.
 fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-/// The three-domain forwarding region: an rx driver, a forwarder, and a tx
-/// driver joined by three rings over one pool. The single pool is what makes
-/// forwarding zero-copy end to end: the receiving NIC DMAs a frame into a pool
-/// buffer, and the transmitting NIC DMAs it back out of the very same buffer;
-/// only the descriptor moves.
+/// The three-domain forwarding region: three rings over one pool.
 ///
-/// The **pool comes first**, and that ordering is load-bearing rather than
-/// cosmetic. `packet_buffer` guarantees only that its buffers are mutually
-/// congruent modulo [`BUFFER_SIZE`]; their absolute alignment is decided by
-/// whoever places the pool, which is this type. With the pool at offset zero a
-/// buffer's alignment is exactly the region base's, which Microkit guarantees to
-/// be [`MAPPING_ALIGN`] — a multiple of [`BUFFER_SIZE`], as the assertions below
-/// prove. Behind the rings the pool would start at their combined size, which is
-/// neither a multiple of [`BUFFER_SIZE`] nor of a page, and every buffer address
-/// handed to a NIC would inherit that much weaker alignment.
+/// The **pool comes first**, and that ordering is load-bearing.
+/// `packet_buffer` guarantees only that its buffers are mutually congruent
+/// modulo [`BUFFER_SIZE`]; their absolute alignment is decided by whoever
+/// places the pool, which is this type. At offset zero a buffer's alignment is
+/// exactly the region base's, which Microkit maps at [`MAPPING_ALIGN`] — a
+/// multiple of [`BUFFER_SIZE`], as the assertions below prove. Behind the rings
+/// the pool would start at their combined size, a multiple of neither the
+/// stride nor a page, and every buffer address handed to a NIC would inherit
+/// that much weaker alignment.
 ///
-/// seL4 hands out the region zero-initialised, and a zeroed value is the valid
-/// empty state (all rings empty, all buffers zeroed), so no domain needs to
-/// construct it — each attaches to the mapped frames with [`attach_pipeline!`].
+/// A zeroed region is the valid empty state, so no domain constructs one; each
+/// attaches to the mapped frames with [`attach_pipeline!`].
 #[repr(C)]
 pub struct Pipeline {
-    /// Backing storage the descriptors index; also both NICs' DMA target. First
-    /// so that its alignment is the region's own — see the type's documentation.
+    /// Both NICs' DMA target. First so its alignment is the region's own.
     pub pool: Pool,
     /// Received frames, rx driver to forwarder.
     pub rx: Ring,
@@ -200,11 +146,10 @@ pub struct Pipeline {
     pub free: Ring,
 }
 
-// The region is aliased into multiple protection domains, so its layout is a
-// hard ABI: a peer PD reads these bytes at these offsets. Pin every field
-// offset, not merely the component sizes — a reorder keeps the sizes identical
-// while silently making one domain's `rx` another's `tx`. Pinning the offsets
-// *and* the total size together also proves the layout carries no padding.
+// A peer domain reads these bytes at these offsets, so pin every field offset
+// and not merely the component sizes: a reorder keeps the sizes identical while
+// silently making one domain's `rx` another's `tx`. Offsets and total size
+// together also prove the layout carries no padding.
 const _: () = {
     assert!(size_of::<Ring>() == 8 + RING_SLOTS * size_of::<Descriptor>());
     assert!(size_of::<Pool>() == POOL_BUFFERS * BUFFER_SIZE);
@@ -221,21 +166,18 @@ const _: () = {
 };
 
 // The DMA-alignment obligation `packet_buffer` names this type as the owner of:
-// buffer `i` sits at `region_paddr + POOL_OFFSET + i * BUFFER_SIZE`, so buffers
-// are `BUFFER_SIZE`-aligned exactly when the pool's offset is a multiple of the
-// stride and the region base is too. The first assertion holds the offset, the
-// second holds the mapping granularity that supplies the base.
+// buffer `i` sits at `region_paddr + POOL_OFFSET + i * BUFFER_SIZE`, so it is
+// `BUFFER_SIZE`-aligned exactly when the offset is a multiple of the stride and
+// the region base is too.
 const _: () = assert!(Pipeline::POOL_OFFSET.is_multiple_of(BUFFER_SIZE));
 const _: () = assert!(MAPPING_ALIGN.is_multiple_of(BUFFER_SIZE));
 
 impl Pipeline {
-    /// Byte offset of the buffer pool within the region. A driver that also
-    /// hands the pool to a device (NIC DMA) adds this to the region's physical
-    /// address to get each buffer's physical address.
+    /// A driver that hands the pool to a device adds this to the region's
+    /// physical address to reach each buffer.
     pub const POOL_OFFSET: usize = offset_of!(Pipeline, pool);
 
-    /// Physical address of the buffer pool, given the region's physical address
-    /// (from a `region_paddr` mapping).
+    /// `region_paddr` comes from a `region_paddr` mapping.
     #[must_use]
     pub const fn pool_paddr(region_paddr: u64) -> u64 {
         region_paddr + Self::POOL_OFFSET as u64
@@ -244,33 +186,25 @@ impl Pipeline {
     /// Physical address of pool buffer `index`.
     ///
     /// # Panics
-    /// If `index >= POOL_BUFFERS` — in every build profile. The result would
-    /// otherwise be an address *outside* the region, and a driver posts what
-    /// this returns to a NIC as a DMA target; with no IOMMU that is an
-    /// arbitrary physical write.
+    /// If `index >= POOL_BUFFERS`, in every build profile — a `debug_assert!`
+    /// would be absent from every image that boots (ENG-10, BLD-3). The result
+    /// would otherwise address *outside* the region, and a driver posts it to a
+    /// NIC as a DMA target: with no IOMMU, an arbitrary physical write.
     ///
-    /// The fault is a first-party invariant break rather than untrusted input,
-    /// because the index is bounded before every call and the two guarantors
-    /// are:
+    /// A first-party invariant break rather than untrusted input, because
+    /// `index` is bounded before every call by one of two enforcers:
     ///
-    /// * `nic-driver-core`'s `RxPath::refill` passes an [`OwnedBuffer`] index,
-    ///   and a token exists only if [`PoolOwner::alloc`] minted it from a
-    ///   `FreeList<POOL_BUFFERS>`, which names no other value — proven by the
-    ///   `a_forged_out_of_range_return_is_dropped_and_counted` test in this
-    ///   crate, which asserts every minted index is below `POOL_BUFFERS`.
-    /// * `nic-driver-core`'s `TxPath::post` passes a peer-supplied
-    ///   [`Descriptor`]`::buffer`, but only past an unconditional
-    ///   [`descriptor_in_bounds`] rejection, which bounds it to the pool and is
-    ///   proven by that function's `descriptor_in_bounds_matches_a_widened_reference`
-    ///   property.
+    /// * an [`OwnedBuffer`] index, which exists only if [`PoolOwner::alloc`]
+    ///   minted it from a `FreeList<POOL_BUFFERS>` — proven by this crate's
+    ///   `a_forged_out_of_range_return_is_dropped_and_counted`, which asserts
+    ///   every minted index is below `POOL_BUFFERS`;
+    /// * a peer-supplied [`Descriptor`]`::buffer` past an unconditional
+    ///   [`descriptor_in_bounds`] rejection — proven by
+    ///   `descriptor_in_bounds_matches_a_widened_reference`.
     ///
-    /// So a hostile peer or device reaches a *rejection*, never this assertion;
-    /// reaching it means one of those guarantors broke, which is surfaced
-    /// visibly rather than counted as traffic (AGENTS.md ENG-5, ENG-12). It is
-    /// deliberately not a `debug_assert!`: the protection domains are compiled
-    /// with the optimized profile in every seL4 configuration, so a
-    /// debug-only bound would be absent from every image that ever boots
-    /// (ENG-10, BLD-3).
+    /// A hostile peer or device therefore reaches a rejection, never this
+    /// assertion; reaching it means an enforcer broke, which is surfaced
+    /// visibly rather than counted as traffic (ENG-5, ENG-12).
     #[must_use]
     pub const fn buffer_paddr(region_paddr: u64, index: u32) -> u64 {
         assert!(
@@ -280,8 +214,8 @@ impl Pipeline {
         Self::pool_paddr(region_paddr) + index as u64 * BUFFER_SIZE as u64
     }
 
-    /// A new, empty region. Const so it can back a static; mainly for host use,
-    /// since the mapped region is already zeroed.
+    /// For host use; a mapped region is already zeroed and needs no
+    /// construction.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -293,40 +227,28 @@ impl Pipeline {
     }
 
     /// Attach to a mapped region and borrow it for the domain's lifetime.
-    ///
     /// Protection domains call this through [`attach_pipeline!`], which states
     /// the aliasing invariant once for every call site.
     ///
     /// # Panics
-    /// If `ptr` is not aligned for `Self` — in every build profile, since a
-    /// bound that is absent from the shipped image is not a bound (AGENTS.md
-    /// ENG-10). It costs one compare once per protection domain at start-up.
+    /// If `ptr` is not aligned for `Self`, in every build profile: a bound
+    /// absent from the shipped image is not a bound (ENG-10). It costs one
+    /// compare per protection domain at start-up.
     ///
     /// # Safety
-    /// `ptr` must
-    ///
-    /// * be aligned to `align_of::<Self>()` — creating the reference below is
-    ///   undefined behaviour otherwise, and a mapped region's page alignment
-    ///   supplies far more than this type needs;
-    /// * point to a live mapping of at least `size_of::<Self>()` bytes that is
-    ///   either zeroed or already a valid value; and
-    /// * outlive `'a`.
-    ///
-    /// The mapping may be shared read-write with peer protection domains and
-    /// used as a device DMA target: `Pipeline` exposes no safe path to its
-    /// bytes, so a peer's writes are a protocol concern rather than a soundness
-    /// one. The caller must not, however, create a `&mut Self` to it.
+    /// `ptr` must be aligned to `align_of::<Self>()`, point to a live mapping
+    /// of at least `size_of::<Self>()` bytes that is either zeroed or already a
+    /// valid value, and outlive `'a`. The mapping may be shared read-write with
+    /// peer protection domains and used as a device DMA target — `Pipeline`
+    /// exposes no safe path to its bytes, so a peer's writes are a protocol
+    /// concern rather than a soundness one — but the caller must never create a
+    /// `&mut Self` to it.
     #[must_use]
     pub unsafe fn attach<'a>(ptr: *mut Self) -> &'a Self {
-        // Alignment is a soundness precondition of the reference below, so the
-        // check that enforces it is unconditional. Production callers reach
-        // here through `attach_pipeline!`, where the Microkit tool's
-        // page-granular mapping supplies far more alignment than this type
-        // needs; this catches a first-party caller that constructs a pointer
-        // some other way, in the profile that actually ships.
         assert!(ptr.is_aligned(), "pipeline region is misaligned");
         // SAFETY: the caller guarantees an aligned, live, correctly sized,
-        // correctly initialised mapping outliving `'a`. Aliasing with the peer
+        // correctly initialised mapping outliving `'a`, and the assertion above
+        // re-checks the alignment unconditionally. Aliasing with the peer
         // domains and with NIC DMA is sound because every field is either an
         // atomic (the rings) or an `UnsafeCell` reachable only through an
         // `unsafe` accessor (the pool), so no safe code can hold a reference to
@@ -338,34 +260,44 @@ impl Pipeline {
 /// Attach this protection domain to the [`Pipeline`] region a Microkit
 /// `setvar_vaddr` symbol names, yielding a `&'static Pipeline`.
 ///
-/// Every domain sharing a pipeline attaches through this macro so that the
-/// aliasing invariant which makes the `&'static` share sound is written once,
-/// here, instead of being re-derived at four call sites — where one copy drifted
-/// out of step with the system description and understated the aliasing set.
+/// Every domain attaches through this macro so the aliasing invariant that
+/// makes the `&'static` share sound is written once instead of re-derived at
+/// four call sites, where one copy drifted and understated the aliasing set.
 ///
-/// The invariant, stated for `systems/qemu-x86_64/librefirewall.system`: the
-/// Microkit tool patches the symbol with the virtual address of a mapped,
-/// zero-initialised, page-aligned region of at least `size_of::<Pipeline>()`
-/// bytes that exists for the whole life of the system, so it outlives the
-/// `'static` borrow, and page alignment covers the type's own. Each pipeline
-/// region is mapped **read-write into three protection domains at once** — the
-/// forwarder, the driver that receives into it, and the driver that transmits
-/// out of it — and its pool is additionally a DMA target of both NICs. Sharing
-/// it as `&Pipeline` is sound in the face of all of that because `Pipeline`
-/// exposes no safe path to those bytes; whether the peers behave is a protocol
-/// question the crate header answers, not a soundness one.
+/// Each pipeline region is mapped **read-write into three protection domains at
+/// once** — the forwarder, the driver receiving into it, and the driver
+/// transmitting out of it (`systems/qemu-x86_64/librefirewall.system:90,91,99,
+/// 100,112,113`) — and its pool is additionally a DMA target of both NICs.
+/// Sharing it as `&Pipeline` is sound in the face of all that because
+/// `Pipeline` exposes no safe path to those bytes; whether the peers behave is
+/// the protocol question the crate header answers, not a soundness one.
 ///
 /// The calling crate must depend on `sel4-microkit`; this crate deliberately
-/// does not, so that the protocol stays host-testable.
+/// does not, so the protocol stays host-testable.
 #[macro_export]
 macro_rules! attach_pipeline {
     ($vaddr_symbol:ident) => {{
-        // SAFETY: the Microkit tool patches `$vaddr_symbol` with the address of
-        // a live, page-aligned, zero-initialised mapping of at least
-        // `size_of::<Pipeline>()` bytes that outlives the protection domain, and
-        // no `&mut Pipeline` is ever created to it. Read-write aliasing with the
-        // two peer domains and with NIC DMA is expected and sound — see this
-        // macro's documentation for why, and for the exact aliasing set.
+        // SAFETY: `Pipeline::attach`'s preconditions come from three different
+        // components, and only the first is the Microkit tool's.
+        //
+        // * Address, page alignment, lifetime — the Microkit tool, which
+        //   patches `$vaddr_symbol` from the `<map ... setvar_vaddr>` at
+        //   `systems/qemu-x86_64/librefirewall.system:90,91,99,100,112,113`,
+        //   maps at page granularity (far beyond this type's 4 bytes), and
+        //   makes the mapping static, so it outlives the protection domain.
+        // * Zero-initialisation — the seL4 kernel, which zeroes a frame
+        //   retyped from a general-purpose untyped but not one retyped from a
+        //   device untyped. Which it is follows from the region's `phys_addr`
+        //   lying inside RAM (`librefirewall.system:29-37,85,86`), and that
+        //   from QEMU's `-m 1G` (`tools/xtask/src/qemu.rs:245`). Nothing
+        //   first-party re-checks it; a region outside RAM surfaces as unbacked
+        //   reads at run time rather than as a build or boot error.
+        // * Minimum size — the `size="0x40000"` attribute at
+        //   `librefirewall.system:85,86`. The Rust side holds only
+        //   `size_of::<Pipeline>() <= REGION_SIZE` against its own constant and
+        //   never re-reads that XML, so the two move together or not at all.
+        //
+        // No `&mut Pipeline` is created here or by `attach`.
         unsafe {
             $crate::Pipeline::attach(
                 ::sel4_microkit::memory_region_symbol!($vaddr_symbol: *mut $crate::Pipeline)
@@ -382,41 +314,32 @@ impl Default for Pipeline {
 }
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
-/// invisible: a byzantine peer's activity would look exactly like an idle link.
+/// invisible: a byzantine peer's activity looks exactly like an idle link.
 ///
-/// Every field is monotonic for the domain's life and saturates at
-/// [`u64::MAX`]; there is no reset, because a metrics endpoint (CONCEPT §11)
-/// consumes a counter by differencing successive scrapes and a reset would
-/// forge a negative rate.
+/// Monotonic for the domain's life and saturating; there is no reset, because a
+/// metrics endpoint (CONCEPT §11) differences successive scrapes and a reset
+/// would forge a negative rate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PoolCounters {
-    /// Buffer returns naming an index this domain never lent to the peer: a
-    /// forged or out-of-range index, a duplicate of a return already accepted,
-    /// or — the reason this set exists at all — a real buffer that is still
-    /// posted to this domain's own NIC as a DMA target.
+    /// Returns naming an index this domain never lent: forged, out of range, a
+    /// duplicate of a return already accepted, or — the reason the lent set
+    /// exists — a real buffer still posted to this domain's own NIC.
     pub reclaim_not_lent: u64,
     /// Returns of a lent index that `packet_buffer`'s ledger nevertheless
-    /// refused. Unreachable while the lent set and the ledger agree, since a
-    /// lent index is by construction outstanding; it is counted rather than
-    /// asserted so that a divergence between the two surfaces as a lost buffer
-    /// with a number attached instead of a silent one.
+    /// refused. Unreachable while the lent set and the ledger agree, a lent
+    /// index being outstanding by construction; counted rather than asserted so
+    /// a divergence surfaces as a lost buffer with a number attached.
     pub reclaim_refused: u64,
 }
 
-/// The pool-owning side of a [`Pipeline`]: it owns every buffer in the pool,
-/// lends buffers out as bare indices, and takes them back off the `free` ring.
+/// The pool-owning side of a [`Pipeline`]: it owns every buffer, lends them out
+/// as bare indices, and takes them back off the `free` ring.
 ///
-/// An rx driver is the pool owner of its receive pipeline. It takes the `free`
-/// ring's consumer handle here, once, at [`attach`](Self::attach) — see the
-/// crate header on why that must not happen per call.
-///
-/// Ownership is carried as a move-only [`OwnedBuffer`] for as long as the buffer
-/// stays inside this domain, so a local double-release is not expressible.
-/// The token is dissolved to a bare index at exactly one place,
-/// [`lend`](Self::lend), because that is where the buffer leaves Rust's
-/// ownership tracking and enters the cross-domain ring protocol.
+/// Ownership is a move-only [`OwnedBuffer`] for as long as the buffer stays
+/// inside this domain, so a local double-release is not expressible. The token
+/// dissolves to a bare index at [`lend`](Self::lend) alone, that being where
+/// the buffer leaves Rust's ownership tracking for the ring protocol.
 pub struct PoolOwner<'pipe> {
-    /// Which indices are free to hand out, by identity.
     ledger: FreeList<POOL_BUFFERS>,
     /// Which indices were dissolved onto a ring and may therefore legitimately
     /// come back. The ledger cannot answer this: a buffer posted to this
@@ -424,19 +347,13 @@ pub struct PoolOwner<'pipe> {
     /// naming it would otherwise have a live DMA target handed back to the free
     /// stack and re-issued to a second owner.
     lent: [bool; POOL_BUFFERS],
-    /// Returns from the transmitting domain. Taken once; see the crate header.
     free: RingConsumer<'pipe, RING_SLOTS>,
     counters: PoolCounters,
 }
 
 impl<'pipe> PoolOwner<'pipe> {
     /// Take ownership of `pipeline`'s pool and of its `free` ring's consumer
-    /// handle.
-    ///
-    /// Call once per protection domain per pipeline: the handle is this
-    /// domain's position in the ring, so a second owner over the same pipeline
-    /// would re-read slots this one has already consumed, and both would
-    /// believe they own the same buffers.
+    /// handle — once per protection domain per pipeline; see the crate header.
     #[must_use]
     pub fn attach(pipeline: &'pipe Pipeline) -> Self {
         Self {
@@ -449,10 +366,6 @@ impl<'pipe> PoolOwner<'pipe> {
 
     /// Take exclusive ownership of a free buffer, e.g. to hand to a device for
     /// it to fill. `None` when the pool is momentarily exhausted.
-    ///
-    /// The token proves the caller holds the buffer alone. Dropping it without
-    /// returning it leaks the buffer for the domain's life, which is why it is
-    /// `#[must_use]` in `packet_buffer`.
     pub fn alloc(&mut self) -> Option<OwnedBuffer> {
         self.ledger.pop()
     }
@@ -461,15 +374,13 @@ impl<'pipe> PoolOwner<'pipe> {
     /// path taken when a hand-off could not proceed.
     ///
     /// # Panics
-    /// If the ledger refuses the token. That is unreachable, and deliberately
-    /// left as a visible failure rather than a counted drop, because it is a
-    /// violation of *this domain's own* invariant rather than untrusted input:
-    /// holding the token means the index is outstanding, and the only route by
-    /// which a peer could have had it freed underneath us is
-    /// [`reclaim`](Self::reclaim), which accepts an index only if it is in the
-    /// lent set — which a held token's index never is. That refusal is proven
-    /// by the `a_return_of_a_buffer_still_held_by_this_domain_is_refused`
-    /// test in this crate.
+    /// If the ledger refuses the token: a violation of *this domain's own*
+    /// invariant rather than untrusted input, so it fails visibly. Holding the
+    /// token means the index is outstanding, and the only route by which a peer
+    /// could have had it freed underneath us is [`reclaim`](Self::reclaim),
+    /// which accepts an index only if it is in the lent set — which a held
+    /// token's index never is. Proven by this crate's
+    /// `a_return_of_a_buffer_still_held_by_this_domain_is_refused`.
     pub fn release(&mut self, buffer: OwnedBuffer) {
         self.ledger
             .push(buffer)
@@ -477,14 +388,18 @@ impl<'pipe> PoolOwner<'pipe> {
     }
 
     /// Publish `len` bytes at `offset` of an already-filled buffer on `ring`,
-    /// handing it to the next domain. No bytes are copied.
+    /// handing it to the next domain without copying.
     ///
-    /// This is the one place a buffer's identity stops being tracked by the
-    /// compiler: the token is consumed and only a bare index crosses onto the
-    /// shared ring, because a move-only token cannot cross a protection-domain
+    /// The token is consumed and only a bare index crosses onto the shared
+    /// ring, a move-only token being unable to cross a protection-domain
     /// boundary. The index is recorded as lent, which is what later lets
     /// [`reclaim`](Self::reclaim) tell a legitimate return from a peer naming a
     /// buffer it was never given.
+    ///
+    /// `buffer` must have been minted by *this* owner's [`alloc`](Self::alloc):
+    /// an [`OwnedBuffer`] is not branded with its ledger, so one from a
+    /// differently sized pool would index the lent set out of range. Branding
+    /// the token with its pool size is the recorded DOC-9 fix.
     ///
     /// # Errors
     /// Returns the token unchanged when the ring is momentarily full, so the
@@ -504,27 +419,22 @@ impl<'pipe> PoolOwner<'pipe> {
         {
             return Err(buffer);
         }
-        // In range because the token was minted by a `FreeList<POOL_BUFFERS>`,
-        // so no peer value reaches this index.
+        // In range because `alloc` mints only from this owner's
+        // `FreeList<POOL_BUFFERS>`, so no peer value reaches this index;
+        // asserted by `a_forged_out_of_range_return_is_dropped_and_counted`.
         self.lent[index as usize] = true;
         Ok(())
     }
 
     /// Take back the buffers the transmitting domain has returned, until the
     /// `free` ring is observed empty or [`DRAIN_LIMIT`] descriptors have been
-    /// processed, whichever comes first. Returns how many buffers were
-    /// reclaimed.
+    /// processed. Returns how many buffers were reclaimed.
     ///
-    /// Every index here is peer-supplied and therefore untrusted (CONCEPT
-    /// §7.1). A return is accepted only if the index is in this domain's lent
-    /// set *and* `packet_buffer`'s ledger — the crate's own trust boundary —
-    /// accepts it. A rejected return is dropped and counted in
-    /// [`counters`](Self::counters); it changes nothing, so the buffer it named
-    /// keeps whatever state it really had and its rightful holder can still
-    /// return it. Nothing here panics: these are inputs, not invariants.
-    ///
-    /// The bound is what keeps a peer from parking this domain in a drain loop
-    /// forever; see [`DRAIN_LIMIT`].
+    /// Every index here is peer-supplied, so a return is accepted only if the
+    /// index is in this domain's lent set *and* `packet_buffer`'s ledger
+    /// accepts it. A rejected return changes nothing and is counted in
+    /// [`counters`](Self::counters), so the buffer it named keeps whatever
+    /// state it really had and its rightful holder can still return it.
     pub fn reclaim(&mut self) -> usize {
         let Self {
             ledger,
@@ -560,31 +470,26 @@ impl<'pipe> PoolOwner<'pipe> {
         self.ledger.len()
     }
 
-    /// The untrusted-input rejections seen so far; see [`PoolCounters`].
     #[must_use]
     pub fn counters(&self) -> PoolCounters {
         self.counters
     }
 }
 
-/// Counts of the forwarding stage's outcomes. Monotonic and saturating for the
-/// reasons given on [`PoolCounters`].
+/// Monotonic and saturating for the reasons given on [`PoolCounters`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardCounters {
     /// Descriptors moved onward, ownership and all.
     pub forwarded: u64,
     /// Descriptors dropped because the destination ring would not take them.
-    /// Each one loses its buffer to the pool for good — see the crate header —
-    /// so this counter is the only trace such a peer leaves.
+    /// Each loses its buffer to the pool for good — see the crate header — so
+    /// a rising count is a shrinking pool.
     pub dropped: u64,
 }
 
 /// One direction of the forwarding chain: it moves descriptors from a
 /// pipeline's `rx` ring to its `tx` ring, transferring buffer ownership onward
 /// without touching the bytes.
-///
-/// Both handles are taken once, at [`attach`](Self::attach), and kept for the
-/// domain's life — see the crate header.
 pub struct ForwardStage<'pipe> {
     from: RingConsumer<'pipe, RING_SLOTS>,
     to: RingProducer<'pipe, RING_SLOTS>,
@@ -592,11 +497,8 @@ pub struct ForwardStage<'pipe> {
 }
 
 impl<'pipe> ForwardStage<'pipe> {
-    /// Take `pipeline`'s `rx` consumer and `tx` producer handles.
-    ///
-    /// Call once per protection domain per pipeline; a second stage over the
-    /// same pipeline would restart both positions at slot zero and redeliver
-    /// descriptors the first has already forwarded.
+    /// Take `pipeline`'s `rx` consumer and `tx` producer handles — once per
+    /// protection domain per pipeline; see the crate header.
     #[must_use]
     pub fn attach(pipeline: &'pipe Pipeline) -> Self {
         Self {
@@ -611,12 +513,12 @@ impl<'pipe> ForwardStage<'pipe> {
     /// Returns how many moved.
     ///
     /// The rings are sized above the pool, so along a correctly accounted chain
-    /// the destination can always take what the source held and this never
-    /// drops. A refusal means accounting has already broken — a byzantine peer
-    /// over-filling the source while the destination stalls — and the response
-    /// is to count the drop and stop draining, not to fault: the descriptor is
-    /// peer-supplied input. Stopping on the first refusal is deliberate, since
-    /// every further dequeue into a full destination would lose another buffer.
+    /// the destination can always take what the source held. A refusal means
+    /// accounting has already broken — a byzantine peer over-filling the source
+    /// while the destination stalls — and the response is to count the drop and
+    /// stop draining rather than fault, the descriptor being peer input.
+    /// Stopping on the first refusal is deliberate: every further dequeue into
+    /// a full destination would lose another buffer.
     pub fn poll(&mut self) -> usize {
         let Self { from, to, counters } = self;
         let mut moved = 0;
@@ -631,7 +533,6 @@ impl<'pipe> ForwardStage<'pipe> {
         moved
     }
 
-    /// The forwarding tallies so far; see [`ForwardCounters`].
     #[must_use]
     pub fn counters(&self) -> ForwardCounters {
         self.counters
@@ -698,18 +599,25 @@ mod tests {
         mut on_payload: impl FnMut(&[u8]),
     ) -> usize {
         let mut count = 0;
+        // One buffer's worth of private storage, reused across the drain: what
+        // `on_payload` inspects is a snapshot here, never a borrow of the pool.
+        let mut storage = [0u8; BUFFER_SIZE];
         for descriptor in tx.drain(DRAIN_LIMIT) {
             {
                 // SAFETY: we dequeued this descriptor, so we own its buffer
-                // until it is returned below; the borrow ends before that. The
-                // data is the `len` bytes at `offset` the rx side published.
+                // until it is returned below. The data is the `len` bytes at
+                // `offset` the rx side published, and the snapshot lands in
+                // `storage`, so the borrow handed to `on_payload` is of this
+                // frame's own memory and ends before the buffer is returned.
                 let bytes = unsafe {
-                    pipeline.pool.read(
+                    pipeline.pool.copy_out(
                         descriptor.buffer as usize,
                         descriptor.offset as usize,
                         descriptor.len,
+                        &mut storage,
                     )
-                };
+                }
+                .expect("`receive` published a span within one buffer");
                 on_payload(bytes);
             }
             free.try_enqueue(descriptor)

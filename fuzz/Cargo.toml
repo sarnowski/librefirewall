@@ -36,17 +36,15 @@ nic-driver-core = { path = "../crates/nic-driver-core" }
 
 # This workspace is standalone, so the root workspace's `[workspace.lints]` does
 # not reach it and its lint policy has to be stated here. `unused_must_use` is
-# the one that earned its place: the harness dropped a `#[must_use]`
-# `Result<(), RecycleError>` from `SplitVirtqueue::recycle` and nothing failed,
-# because a warning in a workspace no lint policy covered is a warning nobody
-# reads. In a harness a refusal *is* the finding — the opposite of the
-# dataplane's drop-and-count choice — so ignoring one must not compile.
+# the one that earned its place: in a harness a refusal *is* the finding — the
+# opposite of the dataplane's drop-and-count choice — so a dropped `#[must_use]`
+# rejection must not compile. `missing_docs` is deliberately absent, matching
+# the root workspace (AGENTS.md DOC-4).
 #
 # These are enforced by the gate through `cargo test --locked --lib` in this
 # directory (`xtask fuzz` runs it first), which compiles the harness library.
 [lints.rust]
 unused_must_use = "deny"
-missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unused = "deny"
 
