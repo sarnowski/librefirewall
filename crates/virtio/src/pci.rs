@@ -51,7 +51,7 @@ pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 
 /// Byte extent of one PCI function's configuration space, as ECAM maps it.
-const PCI_CONFIG_LEN: usize = 4096;
+pub const PCI_CONFIG_LEN: usize = 4096;
 
 /// A mapped MMIO structure this module reaches into, described by what an
 /// offset has to be judged against: the bytes a caller must have mapped, and

@@ -58,23 +58,21 @@ use std::{fs, path::Path};
 
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
+use virtio::pci::PCI_CONFIG_LEN;
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
 
-/// What the `size` attribute of one `<memory_region>` must equal.
-enum ExpectedSize {
-    /// An exported Rust constant that the protection domains compile against.
-    /// `rust_name` is carried so a disagreement names both sides rather than
+/// The exported Rust constant one `<memory_region>`'s `size` must equal.
+///
+/// There is deliberately no way to name none. A rule that could opt out is a
+/// rule an author reaches for instead of exporting the constant, and the
+/// exemption then outlives the reason for it: where nothing exported states a
+/// region's extent, exporting it is the work.
+struct ExpectedSize {
+    /// Carried beside the value so a disagreement names both sides rather than
     /// printing two numbers.
-    Constant {
-        rust_name: &'static str,
-        bytes: usize,
-    },
-    /// No *exported* constant states this region's extent, so nothing here can
-    /// compare it. The reason names what does govern the size and what would
-    /// have to change for the gate to check it too — an unchecked region is
-    /// recorded as a decision, never reached by omission.
-    Unchecked { reason: &'static str },
+    rust_name: &'static str,
+    bytes: usize,
 }
 
 /// How a region must be mapped. Both values are correctness premises a crate
@@ -171,13 +169,17 @@ const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region
 /// code. A region absent from this table fails the gate; so does a rule here
 /// that matches no region, because a rule defending nothing reads as coverage.
 const REGIONS: &[RegionRule] = &[
+    // The two ECAM pages. Their extent is fixed by PCIe rather than by us, but
+    // that is what makes the row load-bearing rather than ceremonial:
+    // `PciConfig::new`'s safety contract is stated in terms of "the mapped
+    // 4 KiB ECAM page", and pds/nic-driver names this file as what guarantees
+    // it. A short region truncates the mapping the whole capability-pointer
+    // walk is bounded against.
     RegionRule {
         name: "ecam0",
-        size: ExpectedSize::Unchecked {
-            reason: "one PCI function's configuration space, whose 4 KiB extent is fixed by PCIe \
-                     ECAM rather than by us. `virtio::pci::PCI_CONFIG_LEN` states it and \
-                     `PciConfig::new`'s safety contract rests on it, but the constant is private \
-                     to that module; exporting it is what would let this row become a Constant",
+        size: ExpectedSize {
+            rust_name: "virtio::pci::PCI_CONFIG_LEN",
+            bytes: PCI_CONFIG_LEN,
         },
         cacheability: Cacheability::Uncached,
         perms: "rw",
@@ -186,8 +188,9 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "ecam1",
-        size: ExpectedSize::Unchecked {
-            reason: "the second driver's ECAM page; see ecam0",
+        size: ExpectedSize {
+            rust_name: "virtio::pci::PCI_CONFIG_LEN",
+            bytes: PCI_CONFIG_LEN,
         },
         cacheability: Cacheability::Uncached,
         perms: "rw",
@@ -196,7 +199,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "bar0",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "nic_driver_core::bringup::BAR_WINDOW_SIZE",
             bytes: BAR_WINDOW_SIZE,
         },
@@ -207,7 +210,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "bar1",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "nic_driver_core::bringup::BAR_WINDOW_SIZE",
             bytes: BAR_WINDOW_SIZE,
         },
@@ -218,7 +221,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "vq0",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "nic_driver_core::bringup::VQ_REGION_SIZE",
             bytes: VQ_REGION_SIZE,
         },
@@ -229,7 +232,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "vq1",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "nic_driver_core::bringup::VQ_REGION_SIZE",
             bytes: VQ_REGION_SIZE,
         },
@@ -245,7 +248,7 @@ const REGIONS: &[RegionRule] = &[
     // copy.
     RegionRule {
         name: "pool0",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::POOL_REGION_SIZE",
             bytes: POOL_REGION_SIZE,
         },
@@ -256,7 +259,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "fwd0",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::FORWARD_REGION_SIZE",
             bytes: FORWARD_REGION_SIZE,
         },
@@ -267,7 +270,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "free0",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::RETURN_REGION_SIZE",
             bytes: RETURN_REGION_SIZE,
         },
@@ -278,7 +281,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "pool1",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::POOL_REGION_SIZE",
             bytes: POOL_REGION_SIZE,
         },
@@ -289,7 +292,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "fwd1",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::FORWARD_REGION_SIZE",
             bytes: FORWARD_REGION_SIZE,
         },
@@ -300,7 +303,7 @@ const REGIONS: &[RegionRule] = &[
     },
     RegionRule {
         name: "free1",
-        size: ExpectedSize::Constant {
+        size: ExpectedSize {
             rust_name: "pd_runtime::RETURN_REGION_SIZE",
             bytes: RETURN_REGION_SIZE,
         },
@@ -386,7 +389,6 @@ pub(crate) fn check(root: &Path) -> Result<(), Error> {
             elements.iter().filter(|e| e.tag == "map").count(),
             elements.iter().filter(|e| e.tag == "end").count(),
         );
-        report_unchecked_sizes();
         return Ok(());
     }
 
@@ -407,32 +409,6 @@ pub(crate) fn check(root: &Path) -> Result<(), Error> {
          shape is checked rather than exempt.",
     );
     Err(Error::invalid(report))
-}
-
-/// Name every region whose size this gate compared against nothing, and why.
-///
-/// Printed on the way past, because the alternative is a pass that reads as
-/// "every size agrees" while two of them were never looked at. What a check
-/// does *not* cover is part of what it reports; leaving it out is how an
-/// exemption stops being a decision anyone remembers making.
-fn report_unchecked_sizes() {
-    let unchecked: Vec<(&str, &str)> = REGIONS
-        .iter()
-        .filter_map(|rule| match rule.size {
-            ExpectedSize::Constant { .. } => None,
-            ExpectedSize::Unchecked { reason } => Some((rule.name, reason)),
-        })
-        .collect();
-    if unchecked.is_empty() {
-        return;
-    }
-    println!(
-        "sysdesc: {} region size(s) are compared against no constant, by decision:",
-        unchecked.len()
-    );
-    for (name, reason) in unchecked {
-        println!("  - {name}: {reason}");
-    }
 }
 
 /// Everything wrong with the parsed description, collected rather than reported
@@ -524,8 +500,8 @@ fn check_regions(elements: &[Element], findings: &mut Vec<String>) -> Vec<String
             findings.push(format!(
                 "line {}: <memory_region name={name:?}> is named by no rule in sysdesc.rs, so \
                  its size, cacheability and perms are compared against nothing. Add a \
-                 RegionRule — with an ExpectedSize::Constant naming the Rust constant it must \
-                 equal, or an ExpectedSize::Unchecked stating why no constant governs it",
+                 RegionRule, whose ExpectedSize names the Rust constant this region must \
+                 equal — exporting that constant if it is not exported yet",
                 element.line
             ));
             continue;
@@ -557,9 +533,7 @@ fn check_regions(elements: &[Element], findings: &mut Vec<String>) -> Vec<String
 }
 
 fn check_region_size(line: usize, rule: &RegionRule, size: u64, findings: &mut Vec<String>) {
-    let ExpectedSize::Constant { rust_name, bytes } = rule.size else {
-        return;
-    };
+    let ExpectedSize { rust_name, bytes } = rule.size;
     if size == bytes as u64 {
         return;
     }
@@ -1262,6 +1236,28 @@ mod tests {
             only_finding(&bar).contains("nic_driver_core::bringup::BAR_WINDOW_SIZE"),
             "{bar:#?}"
         );
+    }
+
+    #[test]
+    fn a_short_ecam_page_is_reported_against_the_constant_pci_config_bounds_against() {
+        // `PciConfig::new` takes "the mapped 4 KiB ECAM page" as its premise
+        // and pds/nic-driver names this file as what guarantees it. Every
+        // capability-pointer and BAR offset the driver walks is bounded
+        // against PCI_CONFIG_LEN, so a description granting less hands that
+        // walk a window shorter than the one it proved itself safe within.
+        for ecam in ["ecam0", "ecam1"] {
+            let findings = findings_after(
+                &format!("<memory_region name=\"{ecam}\" size=\"0x1000\""),
+                &format!("<memory_region name=\"{ecam}\" size=\"0x800\""),
+            );
+            let finding = only_finding(&findings);
+            assert!(finding.contains(ecam), "{finding}");
+            assert!(finding.contains("virtio::pci::PCI_CONFIG_LEN"), "{finding}");
+            assert!(
+                finding.contains(&format!("{PCI_CONFIG_LEN:#x}")),
+                "the code's side: {finding}"
+            );
+        }
     }
 
     #[test]

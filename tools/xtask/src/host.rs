@@ -587,16 +587,16 @@ mod tests {
                                 and polled. `xtask test-ab` re-asserts the same contract on the \
                                 slot it selected in six of its eight scenarios.",
                 residue: Some(
-                    "`PipelineDmaBase::new`'s rejecting branches and the `StartupError` console \
+                    "`PoolDmaBase::new`'s rejecting branches and the `StartupError` console \
                      path are reached by no QEMU test: every scenario boots the one correct \
-                     system description, so the patched `rx_pipe_paddr`/`tx_pipe_paddr` are \
+                     system description, so the patched `rx_pool_paddr`/`tx_pool_paddr` are \
                      always valid and only the accepting branch runs. That is the LAY-2 \
                      layering defect the crate header already records — first-party decision \
                      logic sitting in a PD, where neither the host floor nor the QEMU gate can \
                      reach it — and not a covered path. Closing it means moving the newtype \
-                     into `pd_runtime`, beside the `MAPPING_ALIGN` and `REGION_SIZE` it checks \
-                     against, and having `DataplanePort::attach` take it, which puts the check \
-                     under the host coverage floor.",
+                     into `pd_runtime`, beside the `MAPPING_ALIGN` and `POOL_REGION_SIZE` it \
+                     checks against, and having `DataplanePort::attach` take it, which puts the \
+                     check under the host coverage floor.",
                 ),
             },
         ),
@@ -606,9 +606,10 @@ mod tests {
                 qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
                                 forwarding contract in both directions at once; a frame \
                                 egresses on the opposite port only if this domain attached both \
-                                pipelines in `init` and moved the descriptor in `notified`, \
-                                which is every statement it has. `xtask test-ab` re-asserts it \
-                                on the selected slot in six of its eight scenarios.",
+                                `ForwardRings` regions in `init` and moved the descriptor in \
+                                `notified`, which is every statement it has. `xtask test-ab` \
+                                re-asserts it on the selected slot in six of its eight \
+                                scenarios.",
                 residue: None,
             },
         ),

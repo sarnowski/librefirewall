@@ -4,16 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The two crates whose constants the Microkit system description must agree
-# with, depended on so `sysdesc` compares the real values rather than a copy of
-# them: a checker that restates a constant recreates exactly the drift it
-# exists to close. Both are `no_std` and neither reaches for seL4, so they
-# build for the host unchanged. These are the whole of xtask's dependency set —
-# it carries no third-party crate, so the bootstrap tooling stays auditable and
-# builds offline inside the pinned container.
+# The crates whose constants the Microkit system description must agree with,
+# depended on so `sysdesc` compares the real values rather than a copy of them:
+# a checker that restates a constant recreates exactly the drift it exists to
+# close. All are `no_std` and none reaches for seL4, so they build for the host
+# unchanged. These are the whole of xtask's dependency set — it carries no
+# third-party crate, so the bootstrap tooling stays auditable and builds
+# offline inside the pinned container.
 [dependencies]
 pd-runtime = { path = "../../crates/pd-runtime" }
 nic-driver-core = { path = "../../crates/nic-driver-core" }
+# Reached for `pci::PCI_CONFIG_LEN` alone. `nic-driver-core` already pulls it
+# in transitively, but a transitive dependency is not a name this crate may
+# use, and the alternative — writing 4096 into sysdesc.rs — is the drift above.
+virtio = { path = "../../crates/virtio" }
 
 [lints]
 workspace = true
