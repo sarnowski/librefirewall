@@ -45,12 +45,12 @@ pub const TX_VQ_OFFSET: usize = 0x800;
 
 /// Size of the virtqueue DMA region a driver protection domain maps.
 ///
-/// **Cross-artifact, unenforced (DOC-7):** must equal the `size` attribute of
-/// the `vq0`/`vq1` memory regions in
-/// `systems/qemu-x86_64/librefirewall.system`. That XML is consumed by the
-/// Microkit tool and no build step reads it back into Rust, so nothing compares
-/// the two; a disagreement surfaces as the transmit virtqueue lying outside the
-/// mapping.
+/// **Cross-artifact (DOC-7):** equal to the `size` attribute of the `vq0`/`vq1`
+/// memory regions in `systems/qemu-x86_64/librefirewall.system`, which
+/// `xtask::sysdesc` reads back and holds to this constant in the fast gate and
+/// again before the image is assembled — proved by its
+/// `a_short_virtqueue_or_bar_region_is_reported_too`. Unheld, a disagreement
+/// surfaced as the transmit virtqueue lying outside the mapping, at boot.
 pub const VQ_REGION_SIZE: usize = 0x1000;
 
 /// Size of the device MMIO BAR window a driver protection domain maps, the
@@ -58,9 +58,9 @@ pub const VQ_REGION_SIZE: usize = 0x1000;
 /// [`Identified::place_bar`] requires of the address the BAR is relocated to —
 /// so the mapped window and the decoded window describe the same bytes.
 ///
-/// **Cross-artifact, unenforced (DOC-7):** as [`VQ_REGION_SIZE`], must equal the
-/// `size` attribute of the `bar0`/`bar1` memory regions in
-/// `systems/qemu-x86_64/librefirewall.system`.
+/// **Cross-artifact (DOC-7):** as [`VQ_REGION_SIZE`], equal to the `size` of
+/// the `bar0`/`bar1` regions in `systems/qemu-x86_64/librefirewall.system`,
+/// and held to it by the same check and the same test.
 pub const BAR_WINDOW_SIZE: usize = 0x4000;
 
 pub type DriverVirtqueue = SplitVirtqueue<QUEUE_SIZE>;
