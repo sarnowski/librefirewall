@@ -229,13 +229,13 @@ fn run_scenario(
     }
 
     let log_name = format!("ab-{name}.log");
-    let output = match scenario.outcome {
+    let booted = match scenario.outcome {
         Outcome::Routes => boot_and_forward(root, work, &log_name),
         Outcome::Halts => boot_and_halt(root, work, &log_name, HALT_RECORD),
     }
     .map_err(|error| format!("scenario {name}: {error}"))?;
 
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&booted.serial);
     let observed = boot_records(&text);
     if observed.as_slice() != scenario.records {
         return Err(format!(
@@ -255,7 +255,15 @@ fn run_scenario(
             ));
         }
     }
-    println!("  A/B scenario ok: {name}");
+    // The counts, not the whole traffic table: eight scenarios each printing
+    // the same six-line table would bury the one line per scenario that says
+    // which of them ran. A halted scenario is a scenario nothing routed
+    // through, so counting its traffic would only restate its name.
+    let traffic = match scenario.outcome {
+        Outcome::Routes => format!(" ({})", booted.traffic.summary()),
+        Outcome::Halts => String::new(),
+    };
+    println!("  A/B scenario ok: {name}{traffic}");
     Ok(())
 }
 

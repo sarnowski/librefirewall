@@ -354,7 +354,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eight library crates, `xtask`, and both protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.26% combined, weakest crate `routing` at 98.17%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (the forwarding contract, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (the routed forwarding contract, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | seven persistent targets covering every crate that interprets untrusted input; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
@@ -392,9 +392,21 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the signed A/B disk + release bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot the image in QEMU and assert the forwarding contract on both ports
+make test-system    # boot the image in QEMU and route traffic between two host endpoints
 make ci             # the complete gate (host gate + fuzz + image + system + A/B scenarios)
 ```
+
+`make test-system` is also the smoke test. It boots the signed disk with a host-controlled endpoint
+attached to each NIC port — 10.0.0.2 on port 0 and 10.0.1.2 on port 1, two /24 subnets the
+appliance routes between — and prints what the two of them exchanged. Each of the two datagrams is
+reported as it came back off the wire: its addresses and ports, the TTL the hop decremented, the MAC
+pair the appliance rewrote it to, and its length on the wire. The same boot injects four classes of
+traffic the appliance must refuse — a TTL that cannot survive a hop, a frame carrying another
+station's destination MAC, a destination no interface prefix covers, and a non-IPv4 broadcast frame
+— and each must reach nobody. The verdict is those two sockets and nothing else: no part of it is
+read from the guest's serial output, which is captured to `build/image/qemu.log` for reading after a
+failure. A failing run prints the same table with the offending probe marked, ahead of the
+diagnostic naming the field that departed from the contract.
 
 `make image` is the only network-enabled phase (the OCI build). Every target that runs a build or a
 gate — `make clean` included — checks that the pinned builder image already exists and refuses with
@@ -414,7 +426,7 @@ make test                 # fast host gate (format, clippy, tests, coverage floo
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
-make test-system          # boot QEMU and assert the forwarding contract
+make test-system          # boot QEMU and route traffic between two host endpoints
 make test-ab              # boot the eight A/B state-machine scenarios and assert on each
 make ci                   # the complete gate: host gate, fuzz, image, system and A/B
 make release              # run CI, then assemble AND boot the Microkit release payload

@@ -120,8 +120,8 @@ fn release(root: &Path) -> Result<(), Box<dyn Error>> {
     ci(root)?;
     let dist = root.join("dist");
     match prove_release_configuration(root, &dist) {
-        Ok(()) => {
-            println!("release image proved against the forwarding contract");
+        Ok(traffic) => {
+            println!("release image proved against the forwarding contract: {traffic} as required");
             Ok(())
         }
         Err(failure) => Err(discard_dist(&dist, &failure).into()),
@@ -129,11 +129,14 @@ fn release(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 /// Assemble the release configuration into `dist/` and hold the disk it
-/// produced to the forwarding contract.
-fn prove_release_configuration(root: &Path, dist: &Path) -> Result<(), Box<dyn Error>> {
+/// produced to the forwarding contract, returning what that boot moved. A
+/// release that says only "proved" cannot be told from one whose contract had
+/// grown empty; the counts say how much traffic the claim rests on.
+fn prove_release_configuration(root: &Path, dist: &Path) -> Result<String, Box<dyn Error>> {
     image::image(root, image::RELEASE_CONFIG)?;
-    qemu::boot_and_forward(root, &dist.join(artifacts::DIST_DISK), "qemu-release.log")?;
-    Ok(())
+    let booted =
+        qemu::boot_and_forward(root, &dist.join(artifacts::DIST_DISK), "qemu-release.log")?;
+    Ok(booted.traffic.summary())
 }
 
 /// Empty `dist/` after a release attempt that did not prove its artifact, and

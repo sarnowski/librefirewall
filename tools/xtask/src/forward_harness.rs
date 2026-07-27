@@ -22,6 +22,16 @@
 //! to the caller. The returned bytes are the guest's output alone, never the
 //! header, so a caller asserting on the guest's structured records can never
 //! match something the harness itself wrote.
+//!
+//! Every run also yields a [`TrafficReport`]: what each probe was observed to
+//! do, with the delivered ones described by the frame that came back — its
+//! addresses, its TTL, the MAC pair the appliance rewrote it to, its length on
+//! the wire — rather than by the expectation it was matched against. Reporting
+//! the expectation would make the table agree with the contract by
+//! construction and say nothing about the appliance. The report is a rendering
+//! of the verdict and never an input to it; it is printed on the way out of a
+//! failed run too, ahead of the verdict, because "which probe" is the first
+//! question a failure raises.
 
 use std::{
     fmt, fs,
@@ -45,9 +55,16 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 /// up. The netdev sockets connect when QEMU starts, well before guest boot.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Cadence of re-injection. virtio-net silently drops received frames while
-/// the guest driver has not yet posted RX buffers, so a single early frame can
-/// be lost; we resend until the packet is delivered or the test times out.
+/// How often an endpoint retransmits a probe it has not seen delivered.
+///
+/// The endpoints are stations, and a station sends more than once. A packet put
+/// on the wire before the appliance has booted is simply lost — QEMU's
+/// virtio-net drops a receive while the guest has posted no RX buffer, as a
+/// real link drops one to a peer that is not up yet — and nothing here
+/// compensates for that loss or hides it. Injecting once and waiting would not
+/// be a stricter test but a different one: a station that sends a single
+/// datagram and gives up, which no appliance booting after QEMU starts could
+/// ever answer.
 const REINJECT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long the refused packets are watched for after both routed packets have
@@ -400,10 +417,17 @@ fn header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
 
 /// What must become of one injected packet.
 enum Expectation {
-    /// It must arrive on `egress`, and be exactly `packet`.
-    Routed { egress: usize, packet: UdpPacket },
+    /// It must arrive at endpoint `to`, and be exactly `delivered`. `sent` is
+    /// the same packet as it went in, kept so the report can put the TTL the
+    /// appliance produced beside the one it was handed.
+    Routed {
+        to: Endpoint,
+        sent: UdpPacket,
+        delivered: UdpPacket,
+    },
     /// It must never arrive anywhere; `because` names the rule that forbids it,
-    /// so a wrongly delivered packet says which one the guest broke.
+    /// so a wrongly delivered packet says which one the guest broke — and the
+    /// report says which one each refusal demonstrates.
     Dropped { because: &'static str },
 }
 
@@ -415,7 +439,10 @@ struct Probe {
     /// so a delivery is attributed to the packet that caused it and a stray can
     /// never satisfy the wrong assertion.
     marker: &'static [u8],
-    ingress: usize,
+    /// The endpoint that injects it, rather than its port alone: the report
+    /// names both ends of a probe's path, and a port number recovers the
+    /// endpoint only through a lookup that can fail.
+    from: Endpoint,
     frame: Vec<u8>,
     expectation: Expectation,
 }
@@ -428,7 +455,7 @@ impl Probe {
     /// contract — every field it differs in. A hex dump would say the frame was
     /// wrong; naming the field says whether the router rewrote the wrong MAC,
     /// failed to decrement, or corrupted the payload.
-    fn judge(&self, egress: usize, frame: &[u8]) -> Result<(), String> {
+    fn judge(&self, egress: usize, frame: &[u8]) -> Result<Delivery, String> {
         let name = self.name;
         let (expected_egress, expected) = match &self.expectation {
             Expectation::Dropped { because } => {
@@ -437,7 +464,7 @@ impl Probe {
                      must never put it on a wire"
                 ));
             }
-            Expectation::Routed { egress, packet } => (*egress, packet),
+            Expectation::Routed { to, delivered, .. } => (to.port, delivered),
         };
         if egress != expected_egress {
             return Err(format!(
@@ -446,10 +473,10 @@ impl Probe {
             ));
         }
 
-        let expected_bytes = expected.build();
-        if frame == expected_bytes {
-            return Ok(());
-        }
+        // Decoded before the whole-frame comparison rather than after it, so an
+        // accepted delivery is described by fields read back off the wire; a
+        // frame that only matched byte for byte would otherwise have to be
+        // reported from the expectation it matched.
         let observed = match UdpPacket::decode(frame) {
             Ok(packet) => packet,
             Err(defect) => {
@@ -460,7 +487,15 @@ impl Probe {
             }
         };
         let fields = differences(expected, &observed);
-        if fields.is_empty() {
+        if !fields.is_empty() {
+            return Err(format!(
+                "probe {name}: the frame delivered on port{egress} departs from the routed \
+                 contract in {}",
+                fields.join("; ")
+            ));
+        }
+        let expected_bytes = expected.build();
+        if frame != expected_bytes {
             // Every field the contract is written in agrees, so what differs is
             // a byte the field view does not model — Ethernet padding, an IPv4
             // identification or flag the router must carry through untouched.
@@ -470,12 +505,189 @@ impl Probe {
                 byte_difference(&expected_bytes, frame)
             ));
         }
-        Err(format!(
-            "probe {name}: the frame delivered on port{egress} departs from the routed contract \
-             in {}",
-            fields.join("; ")
-        ))
+        Ok(Delivery {
+            packet: observed,
+            bytes: frame.len(),
+        })
     }
+}
+
+/// One accepted delivery as it arrived: the frame's own fields, and its length
+/// on the wire including any padding the field view disclaims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Delivery {
+    packet: UdpPacket,
+    bytes: usize,
+}
+
+/// What one probe was seen to do. The four states are what a reader has to be
+/// able to tell apart: a delivery that met the contract, a refusal that is the
+/// contract, a routed probe that never came back, and the one probe whose
+/// delivery broke the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    Delivered,
+    Refused,
+    Missing,
+    Broke,
+}
+
+impl Seen {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Refused => "dropped",
+            Self::Missing => "missing",
+            Self::Broke => "failed",
+        }
+    }
+}
+
+/// One rendered line of the traffic report.
+#[derive(Debug)]
+struct Row {
+    seen: Seen,
+    name: &'static str,
+    path: String,
+    detail: String,
+}
+
+/// What the injected probes were observed to do over one boot.
+#[derive(Debug)]
+pub struct TrafficReport {
+    rows: Vec<Row>,
+}
+
+impl TrafficReport {
+    /// Derive the report from what the run recorded: the delivery accepted for
+    /// each probe, if any, and the index of the probe whose delivery ended the
+    /// run. Deriving it here rather than accumulating lines as the run goes
+    /// keeps one place deciding what each state means.
+    fn new(probes: &[Probe], deliveries: &[Option<Delivery>], broke: Option<usize>) -> Self {
+        let rows = probes
+            .iter()
+            .zip(deliveries)
+            .enumerate()
+            .map(|(index, (probe, delivery))| {
+                let routed = match &probe.expectation {
+                    Expectation::Routed { to, sent, .. } => Some((to, sent)),
+                    Expectation::Dropped { .. } => None,
+                };
+                let path = match routed {
+                    Some((to, _)) => format!("{}->{}", probe.from.name, to.name),
+                    // Nothing left the appliance, so naming a far end would
+                    // claim a journey the packet never made.
+                    None => format!("{}->.", probe.from.name),
+                };
+                let (seen, detail) = match (broke == Some(index), delivery, &probe.expectation) {
+                    (true, _, _) => (Seen::Broke, "see the verdict below".to_owned()),
+                    (false, Some(delivery), Expectation::Routed { sent, .. }) => {
+                        (Seen::Delivered, describe(delivery, sent.ttl))
+                    }
+                    // A refused probe that arrived is the `broke` case above,
+                    // so a delivery here can only belong to a routed probe.
+                    (false, Some(delivery), Expectation::Dropped { because }) => (
+                        Seen::Broke,
+                        format!("{because}, yet {} bytes came back", delivery.bytes),
+                    ),
+                    (false, None, Expectation::Routed { .. }) => {
+                        (Seen::Missing, "never came back".to_owned())
+                    }
+                    (false, None, Expectation::Dropped { because }) => {
+                        (Seen::Refused, (*because).to_owned())
+                    }
+                };
+                Row {
+                    seen,
+                    name: probe.name,
+                    path,
+                    detail,
+                }
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// The topology the probes cross, then one line per probe. Printed on a
+    /// successful run because a boolean is not evidence that two endpoints on
+    /// separate subnets exchanged anything.
+    pub fn render(&self) -> String {
+        let mut out = String::from("  librefirewall routed smoke test");
+        if !self.finished() {
+            // A run that ended early never reached the window a refusal is
+            // judged over, so its `dropped` rows report what had not come back
+            // rather than what the appliance refused.
+            out.push_str(" (unfinished: a dropped row is only what had not come back yet)");
+        }
+        out.push('\n');
+        for endpoint in ENDPOINTS {
+            out.push_str(&format!(
+                "    endpoint {}  {}  {}  --  port {}  {}\n",
+                endpoint.name,
+                ipv4(endpoint.address),
+                mac(endpoint.mac),
+                endpoint.port,
+                mac(endpoint.gateway_mac()),
+            ));
+        }
+        out.push('\n');
+        let width = self
+            .rows
+            .iter()
+            .map(|row| row.name.len())
+            .max()
+            .unwrap_or(0);
+        for row in &self.rows {
+            out.push_str(&format!(
+                "  {:<9}  {:<width$}  {}  {}\n",
+                row.seen.label(),
+                row.name,
+                row.path,
+                row.detail,
+            ));
+        }
+        out
+    }
+
+    /// The same run as one clause. Counts only, and no claim about whether they
+    /// are the right counts: the caller ran the contract and is the one that
+    /// can say so.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} routed, {} dropped",
+            self.count(Seen::Delivered),
+            self.count(Seen::Refused)
+        )
+    }
+
+    fn count(&self, seen: Seen) -> usize {
+        self.rows.iter().filter(|row| row.seen == seen).count()
+    }
+
+    /// Whether every probe reached an end state the contract defines. A run
+    /// that broke, or that is still waiting on a direction, reached neither.
+    fn finished(&self) -> bool {
+        self.rows
+            .iter()
+            .all(|row| matches!(row.seen, Seen::Delivered | Seen::Refused))
+    }
+}
+
+/// Render one delivery as the frame that arrived, beside the TTL it was handed.
+/// Every other number is the wire's own.
+fn describe(delivery: &Delivery, sent_ttl: u8) -> String {
+    let packet = &delivery.packet;
+    format!(
+        "{}:{} -> {}:{}  ttl {sent_ttl}->{}  mac {}->{}  {} bytes",
+        ipv4(packet.source),
+        packet.source_port,
+        ipv4(packet.destination),
+        packet.destination_port,
+        packet.ttl,
+        mac(packet.source_mac),
+        mac(packet.destination_mac),
+        delivery.bytes,
+    )
 }
 
 /// Name every field in which `observed` departs from `expected`.
@@ -624,7 +836,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             name: "legacy-l2-broadcast",
             marker: b"LFW-PROBE/legacy-l2-broadcast",
-            ingress: a.port,
+            from: a,
             frame: legacy_broadcast_frame(b"LFW-PROBE/legacy-l2-broadcast"),
             expectation: Expectation::Dropped {
                 because: "it is neither IPv4 nor addressed to the port's own MAC",
@@ -669,11 +881,12 @@ fn routed(
     Probe {
         name,
         marker,
-        ingress: from.port,
+        from,
         frame: sent.build(),
         expectation: Expectation::Routed {
-            egress: to.port,
-            packet: delivered,
+            to,
+            sent,
+            delivered,
         },
     }
 }
@@ -688,7 +901,7 @@ fn dropped(
     Probe {
         name,
         marker,
-        ingress: from.port,
+        from,
         frame: sent.build(),
         expectation: Expectation::Dropped { because },
     }
@@ -810,11 +1023,19 @@ fn inject_probes(
         let port = attached.endpoint.port;
         for probe in probes
             .iter()
-            .filter(|probe| probe.ingress == port && wanted(probe))
+            .filter(|probe| probe.from.port == port && wanted(probe))
         {
             attached.inject(&probe.frame);
         }
     }
+}
+
+/// What one boot yielded: the guest's serial output, and what the probes
+/// injected into it were observed to do.
+#[derive(Debug)]
+pub struct Booted {
+    pub serial: Vec<u8>,
+    pub traffic: TrafficReport,
 }
 
 /// Spawn the prepared QEMU `command` (which must carry this harness's NIC
@@ -822,12 +1043,14 @@ fn inject_probes(
 ///
 /// The captured serial output is always written to the run log, whether the
 /// test passes or fails, and is returned on success; QEMU is always killed and
-/// reaped on every exit path.
+/// reaped on every exit path. A failed run prints its traffic report before
+/// returning, so the table and the verdict it explains cannot reach a terminal
+/// in the other order.
 pub fn run_boot_test(
     command: Command,
     backends: NicBackends,
     test: BootTest,
-) -> Result<Vec<u8>, String> {
+) -> Result<Booted, String> {
     run_boot(command, backends, test, ACCEPT_TIMEOUT, BOOT_TEST_TIMEOUT)
 }
 
@@ -840,7 +1063,7 @@ fn run_boot(
     test: BootTest,
     accept_timeout: Duration,
     total_timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Booted, String> {
     let log_path = test.log_path;
     let mut child = command
         .stdout(Stdio::piped())
@@ -872,6 +1095,12 @@ fn run_boot(
     let mut output: Vec<u8> = Vec::new();
     // Kept alive across finalisation so they can be joined after QEMU dies.
     let mut frame_readers: Vec<JoinHandle<io::Result<()>>> = Vec::new();
+
+    // What the run observed, held outside the block that fills it so the report
+    // can be built on every exit path rather than only where the run succeeded.
+    let probes = probes();
+    let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
+    let mut broke: Option<usize> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept both of QEMU's socket dial-ins.
@@ -935,29 +1164,30 @@ fn run_boot(
         }
         drop(frame_sender);
 
-        let probes = probes();
-        // Inject immediately; the drivers may not be ready yet, which is
-        // exactly why we also re-inject on a fixed cadence below.
+        // Inject immediately: a station does not wait to be told its peer is
+        // ready, and a packet sent into an unbooted appliance is lost rather
+        // than queued. That is why sending continues on a cadence below.
         let mut last_injection = Instant::now();
         inject_probes(&mut endpoints, &probes, |_| true);
 
         // Phase 2: watch both ports and the serial channel, re-injecting
         // periodically, until the contract is decided.
-        let mut delivered = vec![false; probes.len()];
+        //
         // Set once both routed packets have arrived, starting the window in
         // which a refused packet would still have time to come back.
         let mut settling_since: Option<Instant> = None;
         loop {
             drain(&serial_receiver, &mut output);
             while let Ok((egress, frame)) = frame_receiver.try_recv() {
-                for (probe, seen) in probes.iter().zip(delivered.iter_mut()) {
+                for (index, (probe, seen)) in probes.iter().zip(deliveries.iter_mut()).enumerate() {
                     if !contains(&frame, probe.marker) {
                         continue;
                     }
                     match &test.contract {
                         BootContract::Routed => match probe.judge(egress, &frame) {
-                            Ok(()) => *seen = true,
+                            Ok(delivery) => *seen = Some(delivery),
                             Err(verdict) => {
+                                broke = Some(index);
                                 break 'run Err(format!("{verdict}; see {}", log_path.display()));
                             }
                         },
@@ -977,7 +1207,7 @@ fn run_boot(
             }
             match &test.contract {
                 BootContract::Routed => match settling_since {
-                    None if all_routed(&probes, &delivered) => {
+                    None if all_routed(&probes, &deliveries) => {
                         // Both directions have completed, so the guest is
                         // demonstrably taking frames off both ports: a refused
                         // packet injected now is one that reached the driver.
@@ -1003,7 +1233,7 @@ fn run_boot(
                         break 'run Err(format!(
                             "QEMU exited before the routed contract was met ({status}); {}{}; \
                              see {}",
-                            describe_pending(&probes, &delivered),
+                            describe_pending(&probes, &deliveries),
                             describe_injection_failures(&endpoints),
                             log_path.display()
                         ));
@@ -1022,7 +1252,7 @@ fn run_boot(
                     BootContract::Routed => format!(
                         "timed out after {}s waiting for the routed contract; {}{}; see {}",
                         total_timeout.as_secs(),
-                        describe_pending(&probes, &delivered),
+                        describe_pending(&probes, &deliveries),
                         describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
@@ -1038,7 +1268,7 @@ fn run_boot(
             if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 inject_probes(&mut endpoints, &probes, |probe| {
-                    !is_delivered(&probes, &delivered, probe)
+                    !is_delivered(&probes, &deliveries, probe)
                 });
             }
             thread::sleep(Duration::from_millis(25));
@@ -1063,52 +1293,69 @@ fn run_boot(
     drain(&serial_receiver, &mut output);
 
     let outcome = decide(outcome, &test.contract, &output, log_path);
+    let traffic = TrafficReport::new(&probes, &deliveries, broke);
 
     // Persisting the log must never destroy the verdict that produced it, so
     // the two are reported together rather than one replacing the other.
     let capture_result = write_capture(log_path, test.log_header, &output);
-    match (outcome, capture_result) {
-        (Err(verdict), Err(capture)) => return Err(format!("{verdict}; additionally, {capture}")),
-        (Err(verdict), Ok(())) => return Err(verdict),
-        (Ok(()), Err(capture)) => return Err(capture),
-        (Ok(()), Ok(())) => {}
+    let verdict = match (outcome, capture_result) {
+        (Err(verdict), Err(capture)) => Err(format!("{verdict}; additionally, {capture}")),
+        (Err(verdict), Ok(())) => Err(verdict),
+        (Ok(()), Err(capture)) => Err(capture),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    if let Err(verdict) = verdict {
+        // Ahead of the verdict, and flushed: the verdict travels back as an
+        // error and reaches the terminal on stderr, which orders itself against
+        // a block-buffered stdout only if this is pushed out first.
+        print!("{}", traffic.render());
+        return Err(match io::stdout().flush() {
+            Ok(()) => verdict,
+            Err(error) => format!(
+                "{verdict}; additionally, the traffic report above may be \
+                 truncated: flushing stdout failed: {error}"
+            ),
+        });
     }
 
     terminate_result?;
     stdout_result?;
     stderr_result?;
     frame_reader_result?;
-    Ok(output)
+    Ok(Booted {
+        serial: output,
+        traffic,
+    })
 }
 
 /// Whether every probe that must be routed has arrived and been accepted.
-fn all_routed(probes: &[Probe], delivered: &[bool]) -> bool {
+fn all_routed(probes: &[Probe], deliveries: &[Option<Delivery>]) -> bool {
     probes
         .iter()
-        .zip(delivered)
+        .zip(deliveries)
         .filter(|(probe, _)| matches!(probe.expectation, Expectation::Routed { .. }))
-        .all(|(_, seen)| *seen)
+        .all(|(_, seen)| seen.is_some())
 }
 
 /// Whether this probe has already been accepted, so re-injecting it would only
 /// add traffic the contract no longer needs.
-fn is_delivered(probes: &[Probe], delivered: &[bool], probe: &Probe) -> bool {
+fn is_delivered(probes: &[Probe], deliveries: &[Option<Delivery>], probe: &Probe) -> bool {
     probes
         .iter()
-        .zip(delivered)
-        .any(|(candidate, seen)| candidate.name == probe.name && *seen)
+        .zip(deliveries)
+        .any(|(candidate, seen)| candidate.name == probe.name && seen.is_some())
 }
 
 /// Name which routed probes arrived and which never did. A run that timed out
 /// has to say which direction failed, not that something did.
-fn describe_pending(probes: &[Probe], delivered: &[bool]) -> String {
+fn describe_pending(probes: &[Probe], deliveries: &[Option<Delivery>]) -> String {
     let mut arrived = Vec::new();
     let mut missing = Vec::new();
-    for (probe, seen) in probes.iter().zip(delivered) {
+    for (probe, seen) in probes.iter().zip(deliveries) {
         if !matches!(probe.expectation, Expectation::Routed { .. }) {
             continue;
         }
-        if *seen {
+        if seen.is_some() {
             arrived.push(probe.name);
         } else {
             missing.push(probe.name);
@@ -1692,8 +1939,8 @@ mod tests {
         let probes = probes();
         let routes: Vec<(usize, usize)> = probes
             .iter()
-            .filter_map(|probe| match probe.expectation {
-                Expectation::Routed { egress, .. } => Some((probe.ingress, egress)),
+            .filter_map(|probe| match &probe.expectation {
+                Expectation::Routed { to, .. } => Some((probe.from.port, to.port)),
                 Expectation::Dropped { .. } => None,
             })
             .collect();
@@ -1746,16 +1993,20 @@ mod tests {
 
         // Marking every refused probe cannot satisfy the contract: only the two
         // routed ones count towards it.
-        let mut delivered: Vec<bool> = probes
+        let arrived = arrival(&probes[at("routed-a-to-b")]);
+        let mut deliveries: Vec<Option<Delivery>> = probes
             .iter()
-            .map(|probe| matches!(probe.expectation, Expectation::Dropped { .. }))
+            .map(|probe| match probe.expectation {
+                Expectation::Dropped { .. } => Some(arrived.clone()),
+                Expectation::Routed { .. } => None,
+            })
             .collect();
-        assert!(!all_routed(&probes, &delivered));
+        assert!(!all_routed(&probes, &deliveries));
 
-        delivered = vec![false; probes.len()];
-        delivered[at("routed-a-to-b")] = true;
-        assert!(!all_routed(&probes, &delivered));
-        let pending = describe_pending(&probes, &delivered);
+        deliveries = vec![None; probes.len()];
+        deliveries[at("routed-a-to-b")] = Some(arrived);
+        assert!(!all_routed(&probes, &deliveries));
+        let pending = describe_pending(&probes, &deliveries);
         assert!(
             pending.contains("routed: [routed-a-to-b]")
                 && pending.contains("never arrived: [routed-b-to-a]"),
@@ -1766,18 +2017,190 @@ mod tests {
         // so a delivered direction is not re-sent while the other is waited on.
         assert!(is_delivered(
             &probes,
-            &delivered,
+            &deliveries,
             &probes[at("routed-a-to-b")]
         ));
         assert!(!is_delivered(
             &probes,
-            &delivered,
+            &deliveries,
             &probes[at("routed-b-to-a")]
         ));
-        assert!(!is_delivered(&probes, &delivered, &probes[at("no-route")]));
+        assert!(!is_delivered(&probes, &deliveries, &probes[at("no-route")]));
 
-        delivered[at("routed-b-to-a")] = true;
-        assert!(all_routed(&probes, &delivered));
+        deliveries[at("routed-b-to-a")] = Some(arrival(&probes[at("routed-b-to-a")]));
+        assert!(all_routed(&probes, &deliveries));
+    }
+
+    /// The delivery a routed probe's own contract produces, taken by judging
+    /// the frame that contract describes — so a test's notion of an arrival is
+    /// the harness's own, never a hand-built stand-in that could agree with
+    /// nothing the run would accept.
+    fn arrival(probe: &Probe) -> Delivery {
+        let Expectation::Routed { to, delivered, .. } = &probe.expectation else {
+            panic!("probe {} is not one that routes", probe.name);
+        };
+        probe
+            .judge(to.port, &delivered.build())
+            .expect("the delivery a route produces is the one the matcher accepts")
+    }
+
+    #[test]
+    fn a_delivered_row_reports_the_frame_that_arrived_and_not_the_contract() {
+        // The whole value of the report: a row must be readable off the wire.
+        // Every number below is checked against the frame, so a row rendered
+        // from the expectation instead would still read plausibly and would
+        // stop proving anything.
+        let probes = probes();
+        let deliveries: Vec<Option<Delivery>> = probes
+            .iter()
+            .map(|probe| match probe.expectation {
+                Expectation::Routed { .. } => Some(arrival(probe)),
+                Expectation::Dropped { .. } => None,
+            })
+            .collect();
+        let report = TrafficReport::new(&probes, &deliveries, None);
+        let rendered = report.render();
+
+        assert_eq!(report.summary(), "2 routed, 4 dropped");
+        assert!(
+            !rendered.contains("unfinished"),
+            "every probe reached an end state: {rendered}"
+        );
+        for probe in &probes {
+            assert!(rendered.contains(probe.name), "{}\n{rendered}", probe.name);
+        }
+        // A->B: the far endpoint's address and MAC, the far interface as the
+        // new source MAC, one TTL gone, and the length the frame arrived at.
+        let [a, b] = ENDPOINTS;
+        let delivered = "delivered  routed-a-to-b";
+        let line = rendered
+            .lines()
+            .find(|line| line.contains(delivered))
+            .unwrap_or_else(|| panic!("no delivered row for routed-a-to-b:\n{rendered}"));
+        assert!(line.contains(&format!("{}->{}", a.name, b.name)), "{line}");
+        assert!(
+            line.contains(&format!("{}:{SOURCE_PORT} -> ", ipv4(a.address)))
+                && line.contains(&format!("{}:{DESTINATION_PORT}", ipv4(b.address))),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("ttl {INJECTED_TTL}->{}", INJECTED_TTL - 1)),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("mac {}->{}", mac(b.gateway_mac()), mac(b.mac))),
+            "{line}"
+        );
+        let frame_len = MIN_ETHERNET_FRAME.max(MIN_UDP_FRAME + b"LFW-PROBE/routed-a-to-b".len());
+        assert!(line.contains(&format!("{frame_len} bytes")), "{line}");
+
+        // Every refused probe reports the rule it demonstrates, and none of
+        // them claims a far end.
+        for probe in &probes {
+            let Expectation::Dropped { because } = probe.expectation else {
+                continue;
+            };
+            let line = rendered
+                .lines()
+                .find(|line| line.contains(probe.name))
+                .unwrap_or_else(|| panic!("no row for {}:\n{rendered}", probe.name));
+            assert!(line.contains("dropped") && line.contains(because), "{line}");
+            assert!(
+                line.contains(&format!("{}->.", probe.from.name)),
+                "a refused probe reached no far end: {line}"
+            );
+        }
+
+        // The topology the rows are read against, so the MACs in them can be
+        // attributed to an endpoint or to an appliance port.
+        for endpoint in ENDPOINTS {
+            assert!(
+                rendered.contains(&format!(
+                    "endpoint {}  {}  {}",
+                    endpoint.name,
+                    ipv4(endpoint.address),
+                    mac(endpoint.mac)
+                )) && rendered.contains(&mac(endpoint.gateway_mac())),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_marks_the_probe_that_failed_and_the_ones_that_never_came() {
+        // The report is also the failure's first line of explanation, so the
+        // three states a failed run distinguishes must be visible in it: the
+        // probe that broke the contract, the one still outstanding, and the
+        // refusals that behaved.
+        let probes = probes();
+        let at = |name: &str| {
+            probes
+                .iter()
+                .position(|probe| probe.name == name)
+                .expect("the probe set names this probe")
+        };
+        let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
+        deliveries[at("routed-a-to-b")] = Some(arrival(&probes[at("routed-a-to-b")]));
+
+        let report = TrafficReport::new(&probes, &deliveries, Some(at("routed-b-to-a")));
+        let rendered = report.render();
+        let row = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}:\n{rendered}"))
+                .to_owned()
+        };
+
+        assert!(row("routed-b-to-a").contains("failed"), "{rendered}");
+        assert!(
+            rendered.contains("unfinished"),
+            "a run that ended early must not present its refusals as judged: {rendered}"
+        );
+        assert!(row("routed-a-to-b").contains("delivered"), "{rendered}");
+        assert!(row("no-route").contains("dropped"), "{rendered}");
+        // One direction delivered is not two, and the failure must not be
+        // countable as either outcome.
+        assert_eq!(report.summary(), "1 routed, 4 dropped");
+
+        // A routed probe that simply never arrived is neither a failure of its
+        // own nor a delivery: it is outstanding, and says so.
+        let nothing: Vec<Option<Delivery>> = vec![None; probes.len()];
+        let outstanding = TrafficReport::new(&probes, &nothing, None);
+        assert!(
+            outstanding.render().contains("missing"),
+            "{}",
+            outstanding.render()
+        );
+        assert_eq!(outstanding.summary(), "0 routed, 4 dropped");
+    }
+
+    #[test]
+    fn a_refused_probe_that_came_back_is_never_reported_as_a_refusal() {
+        // The run fails the instant a refusal is delivered, so this state is
+        // only reachable where a delivery was recorded against a probe that
+        // must never produce one. Reporting it as "dropped" would render the
+        // one case the contract exists to catch as a pass.
+        let probes = probes();
+        let refused = probes
+            .iter()
+            .position(|probe| matches!(probe.expectation, Expectation::Dropped { .. }))
+            .expect("the probe set refuses something");
+        let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
+        deliveries[refused] = Some(arrival(&probes[0]));
+
+        let report = TrafficReport::new(&probes, &deliveries, None);
+        let line = report
+            .render()
+            .lines()
+            .find(|line| line.contains(probes[refused].name))
+            .expect("the refused probe has a row")
+            .to_owned();
+        assert!(
+            line.contains("failed") && line.contains("came back"),
+            "{line}"
+        );
+        assert_eq!(report.summary(), "0 routed, 3 dropped");
     }
 
     #[test]

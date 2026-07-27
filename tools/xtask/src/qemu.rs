@@ -23,7 +23,7 @@ use std::{fs, path::Path, process::Command};
 
 use crate::{
     artifacts::DIST_DISK,
-    forward_harness::{self, BootContract, BootTest},
+    forward_harness::{self, BootContract, BootTest, Booted},
     util::{copy_file, locate, require_file, run_command},
 };
 
@@ -106,36 +106,38 @@ struct Invocation {
 /// host endpoints, and refuses everything the routed contract says it must.
 pub(crate) fn test_system(root: &Path) -> Result<(), String> {
     let disk = root.join("dist").join(DIST_DISK);
-    boot_and_forward(root, &disk, "qemu.log")?;
+    let booted = boot_and_forward(root, &disk, "qemu.log")?;
+    // The table before the verdict: what the two endpoints exchanged and what
+    // the appliance refused is the thing a smoke run is run to see, and the
+    // verdict is only the count of it.
+    print!("{}", booted.traffic.render());
     println!(
-        "system test passed; QEMU output is in {}",
+        "system test passed: {} as required; QEMU output is in {}",
+        booted.traffic.summary(),
         root.join("build/image/qemu.log").display()
     );
     Ok(())
 }
 
 /// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the
-/// bidirectional routed contract, returning the captured guest serial output
-/// (always also written to `build/image/<log_name>`) for callers that
-/// additionally assert on the boot manager's structured records.
-pub(crate) fn boot_and_forward(
-    root: &Path,
-    disk: &Path,
-    log_name: &str,
-) -> Result<Vec<u8>, String> {
+/// bidirectional routed contract, returning what the boot was observed to do:
+/// the guest's serial output (always also written to `build/image/<log_name>`)
+/// for callers that additionally assert on the boot manager's structured
+/// records, and the traffic the probes produced.
+pub(crate) fn boot_and_forward(root: &Path, disk: &Path, log_name: &str) -> Result<Booted, String> {
     boot(root, disk, log_name, BootContract::Routed)
 }
 
 /// Boot `disk` expecting NO slot to be bootable: no injected packet may come
 /// back in any form, and the guest must emit `marker` — the boot manager's
-/// structured halt record. Returns the captured guest serial output like
-/// [`boot_and_forward`].
+/// structured halt record. Returns the same observation as
+/// [`boot_and_forward`], whose traffic half records that nothing moved.
 pub(crate) fn boot_and_halt(
     root: &Path,
     disk: &Path,
     log_name: &str,
     marker: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Booted, String> {
     boot(root, disk, log_name, BootContract::Halted { marker })
 }
 
@@ -144,7 +146,7 @@ fn boot(
     disk: &Path,
     log_name: &str,
     contract: BootContract,
-) -> Result<Vec<u8>, String> {
+) -> Result<Booted, String> {
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
     let backends = forward_harness::NicBackends::new()?;
     let Invocation {
