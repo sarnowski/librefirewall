@@ -18,7 +18,9 @@ cargo-fuzz = true
 # AGENTS.md TEST-7: this list is diffed against `crates/` whenever a crate is
 # added, and a crate on an untrusted-input path without an entry is a finding.
 #
-#   wire            the descriptor ABI a peer PD writes
+#   wire            the descriptor ABI and the config handover image a peer PD writes
+#   config          the configuration document, whose every byte is the
+#                   management-plane attacker's, and the model read out of it
 #   net-headers     the Ethernet/IPv4/UDP headers a wire carries
 #   routing         the forwarding decision made from those headers
 #   queue           the shared ring whose cursors and slots a peer PD owns
@@ -30,6 +32,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
 wire = { path = "../crates/wire" }
+config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
 routing = { path = "../crates/routing" }
 queue = { path = "../crates/queue" }
@@ -106,6 +109,20 @@ bench = false
 [[bin]]
 name = "nic_driver_paths"
 path = "fuzz_targets/nic_driver_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_image"
+path = "fuzz_targets/config_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_document"
+path = "fuzz_targets/config_document.rs"
 test = false
 doc = false
 bench = false

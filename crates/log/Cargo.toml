@@ -1,0 +1,16 @@
+[package]
+# `log` is taken by a well-known crate; the directory keeps the short name and
+# the package carries the project prefix, so the lib target is `lfw_log`.
+name = "lfw-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+net-headers = { path = "../net-headers" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

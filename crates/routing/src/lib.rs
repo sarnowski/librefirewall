@@ -8,7 +8,7 @@
 //! verdict for anything it does not recognise is a named [`DropReason`] rather
 //! than a fallthrough.
 //!
-//! # Connected routes only, and static neighbours
+//! # Connected routes only, and configured neighbours
 //!
 //! There is no route table separate from the interfaces: a destination is
 //! routable exactly when some interface's prefix covers it, and the next hop is
@@ -50,14 +50,25 @@ pub struct Interface {
     /// The MAC this port answers to, and the source MAC it forwards under.
     pub mac: MacAddress,
     pub address: Ipv4Address,
-    /// Bits of `address` that form the network. Values above 32 are treated as
-    /// 32 and 0 matches everything, so no value is invalid; see
-    /// [`prefix_mask`].
+    /// Bits of `address` that form the network; see [`prefix_mask`], which is
+    /// what makes every value of this field a valid one.
     pub prefix_length: u8,
+    /// Administratively up. A disabled interface is neither a valid ingress
+    /// nor a selectable egress.
+    pub enabled: bool,
 }
 
 impl Interface {
-    /// Whether this interface's connected prefix covers `destination`.
+    /// What a slot past the configured length holds: disabled, and covering
+    /// only an address no packet may be destined for.
+    pub const UNUSED: Self = Self {
+        port: PortId(0),
+        mac: MacAddress([0; 6]),
+        address: Ipv4Address::from_octets([0, 0, 0, 0]),
+        prefix_length: 32,
+        enabled: false,
+    };
+
     #[must_use]
     pub const fn covers(&self, destination: Ipv4Address) -> bool {
         let mask = prefix_mask(self.prefix_length);
@@ -71,6 +82,14 @@ pub struct Neighbour {
     pub port: PortId,
     pub address: Ipv4Address,
     pub mac: MacAddress,
+}
+
+impl Neighbour {
+    pub const UNUSED: Self = Self {
+        port: PortId(0),
+        address: Ipv4Address::from_octets([0, 0, 0, 0]),
+        mac: MacAddress([0; 6]),
+    };
 }
 
 /// The network mask for a prefix length, saturating rather than rejecting: a
@@ -95,6 +114,9 @@ pub enum DropReason {
     /// The ingress port has no configured interface, so the appliance has no
     /// address to route on behalf of.
     UnconfiguredIngressPort,
+    /// The ingress interface is administratively down. Distinct from having no
+    /// interface at all, because an operator acts on the two differently.
+    InterfaceDisabled,
     /// The destination MAC is not this port's. A router forwards what was
     /// addressed to it; broadcast and multicast frames land here too, which is
     /// what makes ARP traverse nothing.
@@ -124,8 +146,9 @@ pub enum DropReason {
 impl DropReason {
     /// Every variant, so a counter table and a report can be built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::UnconfiguredIngressPort,
+        Self::InterfaceDisabled,
         Self::NotAddressedToUs,
         Self::VlanTagged,
         Self::MartianSource,
@@ -142,6 +165,7 @@ impl DropReason {
     pub const fn name(self) -> &'static str {
         match self {
             Self::UnconfiguredIngressPort => "unconfigured_ingress_port",
+            Self::InterfaceDisabled => "interface_disabled",
             Self::NotAddressedToUs => "not_addressed_to_us",
             Self::VlanTagged => "vlan_tagged",
             Self::MartianSource => "martian_source",
@@ -228,43 +252,99 @@ impl Default for DropCounters {
     }
 }
 
-/// The static forwarding configuration: the appliance's interfaces and the
-/// neighbours it can resolve.
-///
-/// Const-generic in both table sizes rather than bounded by a maximum, so the
-/// configuration a protection domain compiles in is exactly as large as it is
-/// and the tables carry no empty slots to skip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Router<const INTERFACES: usize, const NEIGHBOURS: usize> {
-    interfaces: [Interface; INTERFACES],
-    neighbours: [Neighbour; NEIGHBOURS],
+pub enum CapacityError {
+    Interfaces { requested: usize, capacity: usize },
+    Neighbours { requested: usize, capacity: usize },
 }
 
-impl<const INTERFACES: usize, const NEIGHBOURS: usize> Router<INTERFACES, NEIGHBOURS> {
+/// The forwarding configuration: the appliance's interfaces and the neighbours
+/// it can resolve.
+///
+/// The const parameters are capacities and the lengths are data, because the
+/// configuration is data: a domain is handed one table and later handed
+/// another, and what it must have room for is not what it currently holds.
+/// Capacity stays a build-time number because there is no allocator to grow
+/// one, and holding both in a plain value is what lets a domain keep a running
+/// configuration beside a staged one and swap between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Router<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize> {
+    interfaces: [Interface; MAX_INTERFACES],
+    interface_count: usize,
+    neighbours: [Neighbour; MAX_NEIGHBOURS],
+    neighbour_count: usize,
+}
+
+impl<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
+    Router<MAX_INTERFACES, MAX_NEIGHBOURS>
+{
+    /// No interfaces and no neighbours, which forwards nothing: what a domain
+    /// runs under before it is given a configuration, and after one is refused.
     #[must_use]
-    pub const fn new(
-        interfaces: [Interface; INTERFACES],
-        neighbours: [Neighbour; NEIGHBOURS],
-    ) -> Self {
+    pub const fn empty() -> Self {
         Self {
-            interfaces,
-            neighbours,
+            interfaces: [Interface::UNUSED; MAX_INTERFACES],
+            interface_count: 0,
+            neighbours: [Neighbour::UNUSED; MAX_NEIGHBOURS],
+            neighbour_count: 0,
         }
+    }
+
+    /// Build from tables whose lengths are known only at runtime.
+    ///
+    /// Refused rather than truncated: a table cut to fit is a configuration
+    /// nobody wrote, and the traffic it silently stopped carrying would be
+    /// attributable to nothing.
+    pub fn from_slices(
+        interfaces: &[Interface],
+        neighbours: &[Neighbour],
+    ) -> Result<Self, CapacityError> {
+        if interfaces.len() > MAX_INTERFACES {
+            return Err(CapacityError::Interfaces {
+                requested: interfaces.len(),
+                capacity: MAX_INTERFACES,
+            });
+        }
+        if neighbours.len() > MAX_NEIGHBOURS {
+            return Err(CapacityError::Neighbours {
+                requested: neighbours.len(),
+                capacity: MAX_NEIGHBOURS,
+            });
+        }
+        let mut router = Self::empty();
+        for (slot, entry) in router.interfaces.iter_mut().zip(interfaces) {
+            *slot = *entry;
+        }
+        router.interface_count = interfaces.len();
+        for (slot, entry) in router.neighbours.iter_mut().zip(neighbours) {
+            *slot = *entry;
+        }
+        router.neighbour_count = neighbours.len();
+        Ok(router)
+    }
+
+    /// The configured interfaces and nothing past them, bounded by `take`
+    /// rather than by a range that could be asked to slice past the array.
+    fn configured_interfaces(&self) -> impl Iterator<Item = &Interface> {
+        self.interfaces.iter().take(self.interface_count)
     }
 
     #[must_use]
     pub fn interface(&self, port: PortId) -> Option<&Interface> {
-        self.interfaces.iter().find(|entry| entry.port == port)
+        self.configured_interfaces()
+            .find(|entry| entry.port == port)
     }
 
     /// The interface whose connected prefix covers `destination`, longest
     /// prefix first. Ordering by prefix length rather than by table position is
     /// what keeps the result independent of how the configuration was written.
+    ///
+    /// A disabled interface is not a candidate, this being where an egress is
+    /// chosen: a route out of a link that is down is not a route.
     #[must_use]
     pub fn route(&self, destination: Ipv4Address) -> Option<&Interface> {
-        self.interfaces
-            .iter()
-            .filter(|entry| entry.covers(destination))
+        self.configured_interfaces()
+            .filter(|entry| entry.enabled && entry.covers(destination))
             .max_by_key(|entry| entry.prefix_length)
     }
 
@@ -272,13 +352,17 @@ impl<const INTERFACES: usize, const NEIGHBOURS: usize> Router<INTERFACES, NEIGHB
     pub fn neighbour(&self, port: PortId, address: Ipv4Address) -> Option<&Neighbour> {
         self.neighbours
             .iter()
+            .take(self.neighbour_count)
             .find(|entry| entry.port == port && entry.address == address)
     }
 
-    /// Whether `address` is one the appliance itself holds.
+    /// Whether `address` is one the appliance itself holds — a disabled
+    /// interface's too, since a down link does not make traffic aimed at the
+    /// appliance something to forward onward.
     #[must_use]
     pub fn is_local_address(&self, address: Ipv4Address) -> bool {
-        self.interfaces.iter().any(|entry| entry.address == address)
+        self.configured_interfaces()
+            .any(|entry| entry.address == address)
     }
 
     /// The forwarding verdict for `frame` arriving on `ingress`.
@@ -293,6 +377,9 @@ impl<const INTERFACES: usize, const NEIGHBOURS: usize> Router<INTERFACES, NEIGHB
         let Some(interface) = self.interface(ingress) else {
             return Decision::Drop(DropReason::UnconfiguredIngressPort);
         };
+        if !interface.enabled {
+            return Decision::Drop(DropReason::InterfaceDisabled);
+        }
         if frame.vlan().is_some() {
             return Decision::Drop(DropReason::VlanTagged);
         }
@@ -366,35 +453,42 @@ mod tests {
         Ipv4Address::from_octets([10, 0, 1, 2])
     }
 
+    fn interfaces() -> [Interface; 2] {
+        [
+            Interface {
+                port: PORT0,
+                mac: GATEWAY0_MAC,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+            Interface {
+                port: PORT1,
+                mac: GATEWAY1_MAC,
+                address: Ipv4Address::from_octets([10, 0, 1, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+        ]
+    }
+
+    fn neighbours() -> [Neighbour; 2] {
+        [
+            Neighbour {
+                port: PORT0,
+                address: host_a(),
+                mac: HOST_A_MAC,
+            },
+            Neighbour {
+                port: PORT1,
+                address: host_b(),
+                mac: HOST_B_MAC,
+            },
+        ]
+    }
+
     fn router() -> Router<2, 2> {
-        Router::new(
-            [
-                Interface {
-                    port: PORT0,
-                    mac: GATEWAY0_MAC,
-                    address: Ipv4Address::from_octets([10, 0, 0, 1]),
-                    prefix_length: 24,
-                },
-                Interface {
-                    port: PORT1,
-                    mac: GATEWAY1_MAC,
-                    address: Ipv4Address::from_octets([10, 0, 1, 1]),
-                    prefix_length: 24,
-                },
-            ],
-            [
-                Neighbour {
-                    port: PORT0,
-                    address: host_a(),
-                    mac: HOST_A_MAC,
-                },
-                Neighbour {
-                    port: PORT1,
-                    address: host_b(),
-                    mac: HOST_B_MAC,
-                },
-            ],
-        )
+        Router::from_slices(&interfaces(), &neighbours()).expect("two of each fit in two")
     }
 
     struct FrameSpec {
@@ -471,14 +565,31 @@ mod tests {
         !(sum as u16)
     }
 
-    fn decide(spec: &FrameSpec, ingress: PortId) -> Decision {
+    fn decide_on<const I: usize, const N: usize>(
+        table: &Router<I, N>,
+        spec: &FrameSpec,
+        ingress: PortId,
+    ) -> Decision {
         let mut bytes = spec.build();
         let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
-        router().decide(ingress, &frame)
+        table.decide(ingress, &frame)
+    }
+
+    fn decide(spec: &FrameSpec, ingress: PortId) -> Decision {
+        decide_on(&router(), spec, ingress)
     }
 
     fn expect_drop(spec: &FrameSpec, ingress: PortId, reason: DropReason) {
         assert_eq!(decide(spec, ingress), Decision::Drop(reason));
+    }
+
+    fn expect_drop_on<const I: usize, const N: usize>(
+        table: &Router<I, N>,
+        spec: &FrameSpec,
+        ingress: PortId,
+        reason: DropReason,
+    ) {
+        assert_eq!(decide_on(table, spec, ingress), Decision::Drop(reason));
     }
 
     #[test]
@@ -627,19 +738,126 @@ mod tests {
             mac: GATEWAY0_MAC,
             address: Ipv4Address::from_octets([10, 0, 0, 0]),
             prefix_length: 8,
+            enabled: true,
         };
         let narrow = Interface {
             port: PORT1,
             mac: GATEWAY1_MAC,
             address: Ipv4Address::from_octets([10, 0, 1, 0]),
             prefix_length: 24,
+            enabled: true,
         };
         let target = Ipv4Address::from_octets([10, 0, 1, 2]);
 
-        let in_order = Router::<2, 0>::new([wide, narrow], []);
-        let reversed = Router::<2, 0>::new([narrow, wide], []);
+        let in_order = Router::<2, 0>::from_slices(&[wide, narrow], &[]).expect("two fit in two");
+        let reversed = Router::<2, 0>::from_slices(&[narrow, wide], &[]).expect("two fit in two");
         assert_eq!(in_order.route(target), Some(&narrow));
         assert_eq!(reversed.route(target), Some(&narrow));
+    }
+
+    #[test]
+    fn a_configuration_naming_more_entries_than_the_capacity_is_refused() {
+        let mut three = [interfaces()[0]; 3];
+        three[1].port = PORT1;
+        three[2].port = PortId(2);
+        assert_eq!(
+            Router::<2, 2>::from_slices(&three, &neighbours()),
+            Err(CapacityError::Interfaces {
+                requested: 3,
+                capacity: 2,
+            })
+        );
+
+        let five = [neighbours()[0]; 5];
+        assert_eq!(
+            Router::<2, 4>::from_slices(&interfaces(), &five),
+            Err(CapacityError::Neighbours {
+                requested: 5,
+                capacity: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn a_frame_arriving_on_a_disabled_interface_is_refused_before_anything_about_the_frame() {
+        let mut down = interfaces();
+        down[0].enabled = false;
+        let table = Router::<2, 2>::from_slices(&down, &neighbours()).expect("two fit in two");
+
+        // Also tagged, also addressed elsewhere, also martian: whichever of
+        // those would otherwise be reported, the interface state outranks it.
+        let spec = FrameSpec {
+            destination_mac: MacAddress::BROADCAST,
+            source: Ipv4Address::from_octets([224, 0, 0, 1]),
+            vlan: Some(0x0064),
+            ..FrameSpec::a_to_b()
+        };
+        assert_eq!(
+            decide_on(&table, &spec, PORT0),
+            Decision::Drop(DropReason::InterfaceDisabled)
+        );
+    }
+
+    #[test]
+    fn a_disabled_interface_is_never_selected_as_an_egress() {
+        let mut down = interfaces();
+        down[1].enabled = false;
+        let table = Router::<2, 2>::from_slices(&down, &neighbours()).expect("two fit in two");
+
+        assert_eq!(table.route(host_b()), None);
+        expect_drop_on(&table, &FrameSpec::a_to_b(), PORT0, DropReason::NoRoute);
+        // Still the appliance's own address, so still not forwardable.
+        let spec = FrameSpec {
+            destination: Ipv4Address::from_octets([10, 0, 1, 1]),
+            ..FrameSpec::a_to_b()
+        };
+        expect_drop_on(&table, &spec, PORT0, DropReason::AddressedToThisRouter);
+    }
+
+    #[test]
+    fn an_empty_router_has_no_port_to_receive_on() {
+        let table = Router::<8, 32>::empty();
+        for port in [PORT0, PORT1, PortId(7), PortId(255)] {
+            expect_drop_on(
+                &table,
+                &FrameSpec::a_to_b(),
+                port,
+                DropReason::UnconfiguredIngressPort,
+            );
+        }
+        assert_eq!(table.route(host_b()), None);
+        assert_eq!(table.neighbour(PORT0, host_a()), None);
+        assert!(!table.is_local_address(Ipv4Address::from_octets([10, 0, 0, 1])));
+    }
+
+    #[test]
+    fn spare_capacity_reaches_the_same_verdict_as_an_exactly_sized_table() {
+        let roomy = Router::<8, 32>::from_slices(&interfaces(), &neighbours())
+            .expect("two of each fit in eight and thirty-two");
+        let exact = router();
+
+        for spec in [
+            FrameSpec::a_to_b(),
+            FrameSpec {
+                destination: Ipv4Address::from_octets([192, 0, 2, 9]),
+                ..FrameSpec::a_to_b()
+            },
+            FrameSpec {
+                destination: Ipv4Address::from_octets([10, 0, 1, 77]),
+                ..FrameSpec::a_to_b()
+            },
+            FrameSpec {
+                destination_mac: MacAddress::BROADCAST,
+                ..FrameSpec::a_to_b()
+            },
+        ] {
+            for ingress in [PORT0, PORT1, PortId(7)] {
+                assert_eq!(
+                    decide_on(&roomy, &spec, ingress),
+                    decide_on(&exact, &spec, ingress),
+                );
+            }
+        }
     }
 
     #[test]
@@ -668,6 +886,13 @@ mod tests {
 
     #[test]
     fn drop_reason_names_are_distinct() {
+        for reason in DropReason::ALL {
+            assert_eq!(
+                std::format!("{reason}"),
+                reason.name(),
+                "a rendered reason is not the name a counter is keyed by"
+            );
+        }
         let mut names: Vec<&str> = DropReason::ALL.iter().map(|reason| reason.name()).collect();
         names.sort_unstable();
         let count = names.len();
@@ -685,7 +910,105 @@ mod tests {
         assert_eq!(counters.get(DropReason::NoRoute), u64::MAX);
     }
 
+    /// An address out of a small space, so a generated neighbour and a
+    /// generated destination coincide often enough for the forwarding branch to
+    /// be reached rather than merely declared reachable.
+    fn any_address() -> impl Strategy<Value = Ipv4Address> {
+        (0u8..4, 0u8..8).prop_map(|(subnet, host)| Ipv4Address::from_octets([10, 0, subnet, host]))
+    }
+
+    fn any_interface() -> impl Strategy<Value = Interface> {
+        (
+            0u8..4,
+            any::<[u8; 6]>(),
+            any_address(),
+            0u8..=32,
+            any::<bool>(),
+        )
+            .prop_map(|(port, mac, address, prefix_length, enabled)| Interface {
+                port: PortId(port),
+                mac: MacAddress(mac),
+                address,
+                prefix_length,
+                enabled,
+            })
+    }
+
+    fn any_neighbour() -> impl Strategy<Value = Neighbour> {
+        (0u8..4, any_address(), any::<[u8; 6]>()).prop_map(|(port, address, mac)| Neighbour {
+            port: PortId(port),
+            address,
+            mac: MacAddress(mac),
+        })
+    }
+
+    /// A configuration a validator would accept: one interface per port, which
+    /// is the rule that makes "the interface on this port" a single entry.
+    fn any_configuration() -> impl Strategy<Value = (Vec<Interface>, Vec<Neighbour>)> {
+        (
+            prop::collection::vec(any_interface(), 0..=4),
+            prop::collection::vec(any_neighbour(), 0..=4),
+        )
+            .prop_map(|(interfaces, neighbours)| {
+                let mut ports = Vec::new();
+                let unique = interfaces
+                    .into_iter()
+                    .filter(|entry| {
+                        let first = !ports.contains(&entry.port);
+                        ports.push(entry.port);
+                        first
+                    })
+                    .collect();
+                (unique, neighbours)
+            })
+    }
+
     proptest! {
+        /// Whatever configuration is loaded and whatever arrives, a verdict is
+        /// either a named reason or a forward the configuration itself backs:
+        /// out of a configured, enabled interface that is not the ingress,
+        /// under that interface's MAC, to a configured neighbour's.
+        #[test]
+        fn every_configuration_yields_a_verdict_its_own_tables_support(
+            (interfaces, neighbours) in any_configuration(),
+            destination_mac in any::<[u8; 6]>(),
+            source in any_address(),
+            destination in any_address(),
+            ttl in any::<u8>(),
+            ingress_port in 0u8..5,
+        ) {
+            let table = Router::<4, 4>::from_slices(&interfaces, &neighbours)
+                .expect("the strategy generates at most the capacity of each table");
+            let ingress = PortId(ingress_port);
+            let spec = FrameSpec {
+                destination_mac: MacAddress(destination_mac),
+                source_mac: HOST_A_MAC,
+                source,
+                destination,
+                ttl,
+                vlan: None,
+            };
+
+            match decide_on(&table, &spec, ingress) {
+                Decision::Drop(reason) => prop_assert!(
+                    DropReason::ALL.contains(&reason),
+                    "a reason outside the counted set",
+                ),
+                Decision::Forward { egress, source: from, destination: to } => {
+                    prop_assert_ne!(egress, ingress);
+                    let interface = table.interface(egress)
+                        .expect("a named egress is a configured interface");
+                    prop_assert!(interface.enabled, "forwarded out of a disabled interface");
+                    prop_assert_eq!(from, interface.mac);
+                    prop_assert!(
+                        table.neighbour(egress, destination)
+                            .is_some_and(|entry| entry.mac == to),
+                        "the next-hop MAC is not a configured neighbour's",
+                    );
+                }
+            }
+        }
+
         /// The decision is total: whatever the header fields, a verdict comes
         /// back and nothing panics.
         #[test]
@@ -762,6 +1085,7 @@ mod tests {
                 mac: GATEWAY0_MAC,
                 address: Ipv4Address::from_octets(network),
                 prefix_length,
+                enabled: true,
             };
             let reference = if prefix_length == 0 {
                 true

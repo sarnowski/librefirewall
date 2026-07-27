@@ -18,6 +18,20 @@ nic-driver-core = { path = "../../crates/nic-driver-core" }
 # in transitively, but a transitive dependency is not a name this crate may
 # use, and the alternative — writing 4096 into sysdesc.rs — is the drift above.
 virtio = { path = "../../crates/virtio" }
+# The configuration handover region sizes, for the same reason as every
+# constant above it.
+wire = { path = "../../crates/wire" }
+# The one dependency here that is a judgement rather than a constant: `image`
+# runs `config::load` over the document `pds/config` is about to embed, so the
+# build refuses exactly what the appliance would refuse. Re-implementing that
+# judgement in xtask would be a second validator to keep in step with the first,
+# which is the drift above wearing a larger coat.
+config = { path = "../../crates/config" }
+# The console grammar itself. `config_transcript` renders the records a boot
+# must produce with the very renderer the protection domains print through, so
+# the expectation and the appliance cannot come to describe one commit in two
+# different languages — the drift above, in the one place a test would hide it.
+lfw-log = { path = "../../crates/log" }
 
 [lints]
 workspace = true

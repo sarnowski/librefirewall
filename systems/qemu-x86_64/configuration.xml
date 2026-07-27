@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The running configuration for the QEMU q35 two-dataplane-port slice.
+
+     This document is the single source of the appliance's addressing. Three
+     things read it and none of them restates it: `pds/config` embeds it and
+     commits it at boot; `tools/xtask/src/topology.rs` reads the bench out of
+     it, which is where `qemu.rs` takes the MAC it gives each guest NIC and
+     where `forward_harness.rs` takes the endpoints the routed contract is
+     stated between; and `tools/xtask/src/config_transcript.rs` derives from it
+     the console records a boot must produce. Those used to be three literals
+     that had to agree and that nothing compared.
+
+     A guest NIC therefore cannot be given a MAC no interface here claims, and
+     the contract cannot expect a station this file has not attached to a port.
+
+     Hardware topology is not configurable here (CONCEPT.md §12.3): which ports
+     exist, and the protection domains and memory regions behind them, are fixed
+     in librefirewall.system at build time. What a port *is* — its addressing
+     and whether it is used at all — is this file. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+</configuration>

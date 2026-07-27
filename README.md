@@ -27,8 +27,15 @@ the code.
 **The current deployable system** is a two-dataplane-port routed IPv4 slice: one virtio-net driver
 protection domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4
 capabilities alone, and an isolated forwarder protection domain routes frames between the two ports
-— parsing each one, deciding on it against a static configuration, and rewriting its Ethernet and
-IPv4 headers in place, so the payload is never copied.
+— parsing each one, deciding on it against the configuration in force, and rewriting its Ethernet
+and IPv4 headers in place, so the payload is never copied.
+
+That configuration is a schema-validated XML document, read and committed by a fourth protection
+domain holding no device, no buffer pool and no ring, and handed to the forwarder through a shared
+region under an offer/acknowledge protocol. The forwarder boots **fail-closed** — an empty table,
+generation 0, forwarding nothing — and switches to a generation only after re-checking every field
+of it itself, so every boot performs a live configuration swap on a running dataplane. There is
+still no way to *submit* a document to a running node: it is embedded at build time.
 
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection
@@ -85,11 +92,11 @@ firewall.
 | Capability | Status | Notes |
 |---|---|---|
 | Management HTTP API over mTLS | **open** | |
-| Schema-validated XML configuration, hardened validator PD | **open** | |
-| Candidate/commit-confirm transactions, versioning, rollback | **open** | |
-| Distributed staged rollout across the pair | **open** | |
-| Console system-state events | **open** | five ad-hoc bring-up markers exist; not the MONITORING.md contract |
-| OpenTelemetry structured logs | **open** | |
+| Schema-validated XML configuration, hardened validator PD | **partial** | [detail](#configuration-management) |
+| Candidate/commit-confirm transactions, versioning, rollback | **partial** | the candidate/running split and monotonic generations exist; neither rollback nor commit-confirm does — [detail](#configuration-management) |
+| Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
+| Console system-state events | **partial** | [detail](#console-system-state-events) |
+| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`) and the console is one rendering of them; no transport, exporter or receiver exists |
 | Prometheus `/metrics` | **open** | groundwork only: the dataplane crates tally drops and faults in memory; nothing exposes, reads or names them as metrics |
 | Local log buffer (`GET /logs`) | **open** | |
 
@@ -123,12 +130,15 @@ What each partial capability already has, and what specifically remains to finis
 Ethernet, one optional 802.1Q tag, IPv4 and UDP, and applies the four edits a hop requires — both
 MACs, the TTL decrement, and the header checksum — as one operation that cannot be performed in
 part. `crates/routing` turns a parsed frame and its ingress port into a verdict: forward out of a
-named port under a named MAC pair, or one of ten named drop reasons, each with its own counter.
+named port under a named MAC pair, or one of eleven named drop reasons, each with its own counter.
 `pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of the pool, decide,
 rewrite, and write back the 34 header bytes — and marks every frame it refuses `Verdict::Discard`
-so the transmitting driver returns the buffer instead of transmitting it.
+so the transmitting driver returns the buffer instead of transmitting it. The table it decides
+against is data rather than code: the const parameters are capacities, the lengths are runtime
+values, and the domain is handed one table and later handed another (see
+*[Configuration management](#configuration-management)*).
 
-Held by 41 unit and property tests across the two crates, by the stage's own tests in
+Held by 47 unit and property tests across the two crates, by the stage's own tests in
 `crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
 and garbage traffic through it and asserts the pool comes back whole — and by a persistent fuzz
 target (`route_frame`) whose input is the frame itself.
@@ -138,9 +148,13 @@ target (`route_frame`) whose input is the frame itself.
 - **No ARP and no ICMP**, so neighbours are a static table and a drop is silent. Both need a domain
   that can *originate* a frame, which none can: the pools are owned by the receiving drivers, and a
   frame can only leave the port opposite the one it arrived on.
-- **No configuration.** The interfaces and neighbours are a `const` table compiled into the
-  forwarder PD. The two interface MACs must equal the ones QEMU gives the guest NICs
-  (`tools/xtask/src/qemu.rs`), and nothing checks that they do.
+- **Interfaces and neighbours are all that is configurable.** They come from
+  `systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
+  now the single source of the appliance's addressing: the MAC QEMU gives each guest NIC and the
+  endpoints the system test states its contract between are both read out of it
+  (`tools/xtask/src/topology.rs`), so the three literals that used to have to agree — and that
+  nothing compared — are one literal and two derivations. Everything else a hop depends on is still
+  compiled in: which ports exist, which pipeline joins which pair, and the pool and ring extents.
 - **Connected routes only.** A destination is routable exactly when an interface prefix covers it;
   no route table, no default route, no gateway indirection.
 - **IPv4 only, and no options**: `IHL != 5` is refused rather than skipped, IPv6 is absent, and a
@@ -155,10 +169,10 @@ SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership led
 (the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
 (the pipeline, pool owner and routing stage the protection domains are assembled from).
 
-Correctness is held by 86 unit and property tests across those four crates — including hostile-peer
+Correctness is held by 136 unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
 500,000-frame three-thread pipeline test that cycles every buffer through `rx → route → tx → free`
-far more times than the pool holds.
+far more times than the pool holds, exchanging the forwarding table at poll boundaries as it goes.
 
 A frame is copied twice per hop and never more: once out of the pool into the routing domain's own
 memory, because a decision made on bytes a peer may rewrite underneath it is no decision at all, and
@@ -184,12 +198,12 @@ BAR relocation, feature negotiation, queue programming, doorbells, and a split-v
 the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupError`, `NotifyError`,
 `CapError`) instead of panicking.
 
-`crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 67 further tests.
+`crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 69 further tests.
 Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
 every peer transmit descriptor.
 
-Seven persistent fuzz targets cover this surface, the peer-facing one, and the network-facing
-parser (see *Engineering foundations*).
+Nine persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
+and the configuration document and the handover image (see *Engineering foundations*).
 
 **Missing.**
 
@@ -213,23 +227,173 @@ parser (see *Engineering foundations*).
   domain is left idle rather than faulted — but nothing restarts it, and the port stays down until
   the node is rebooted.
 
+### Configuration management
+
+**Done.** One schema-validated XML document, `systems/qemu-x86_64/configuration.xml`, is the whole
+of the appliance's addressing, and it reaches the dataplane through four stages that never mix.
+
+`crates/config` reads it. The reader is `no_std`, allocator-free and hardened against a
+management-plane adversary rather than against a typo: `<!DOCTYPE`, entity declarations, CDATA,
+processing instructions and markup declarations are refused outright, only the five predefined
+entities and bounded numeric character references are expanded, and every dimension is a named
+bound — 64 KiB of document, 8 levels of nesting, 8 attributes per element, 32-byte names and
+values. The schema is closed: an unknown element or attribute is a refusal, not something skipped,
+because a misspelling nobody can see is the failure an appliance with no shell (CONCEPT §11) cannot
+afford. Parsing and semantic validation are separate passes over separate inputs — bytes, then a
+model — so a syntax rule cannot come to depend on an address and a topology rule cannot come to
+depend on where in the file something was written. Fifteen semantic rules then run over the model:
+a duplicate interface id, neighbour id or port; a port the build does not have; a prefix length past
+32; an interface address that is its own prefix's network or broadcast address; a non-unicast
+address or MAC on either object; overlapping prefixes; a neighbour naming an unknown interface, or
+sitting outside its interface's prefix, or equal to the interface's own address; and a duplicate
+neighbour address on one interface. A document naming more objects than the handover ABI can carry
+is refused by the reader rather than truncated. Every refusal is a typed error naming a **location**
+and never the offending bytes (OBS-5).
+
+`config::Datastore` versions what passed. A candidate is staged without touching what is running,
+`validate_document` takes `&self` so "an operation that changes nothing" is carried by the signature
+rather than by discipline, and a commit assigns the next monotonic generation and returns the diff —
+or assigns no generation at all and reports `unchanged`, a content hash held beside the generation
+being what recognises a commit of the content already in force. The diff is keyed by the document's
+`id`, so reordering the document produces **zero** change records — a property test, not an
+intention — and a modified object produces one record per changed field and nothing for the rest.
+
+`pds/config` is a protection domain of its own holding no device capability, no buffer pool and no
+dataplane ring, so the domain that parses attacker-supplied XML cannot reach a frame, a NIC, or the
+memory either travels through. It writes a fixed-layout POD image of the already-validated model
+into a shared region — the forwarder never parses XML, which is the entire point of the split — and
+publishes it under a two-phase protocol: offer, the consumer re-checks and acknowledges, then
+commit. The two regions are separate and mirrored (`cfg` read-write here and read-only there,
+`cfgack` the reverse) so neither domain can forge the other's half.
+
+`pd_runtime::ConfigurationSwitch` is the consumer. It treats the region as a byzantine peer's
+claim — copies the image out before deciding on it, exactly as `RouteStage` snapshots a frame, and
+re-checks every field: a count past capacity, an `enabled` byte that is neither 0 nor 1, a port with
+no driver, a prefix length past 32, a non-unicast MAC. A refused image leaves the running
+configuration exactly as it was and is never acknowledged, so the publisher never commits it. The
+switch happens **between two polls** and is provable rather than claimed: a Microkit domain runs one
+entrypoint to completion, so a frame is decided entirely under one generation with no lock involved.
+
+Because the forwarder boots fail-closed on generation 0 and the document the image carries commits
+as generation 1, **every boot performs a live configuration swap on a running forwarder**, and every
+changed value reaches the console as a structured `LFW-CFG` record (see
+[MONITORING.md](MONITORING.md)).
+
+Held by 170 tests in `crates/config` and 38 in `crates/log`, by the handover's own tests in
+`crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
+`enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
+test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
+frame is rewritten out of a blend of two, that the pool comes back whole across every commit
+boundary, and that payloads arrive in order under those rewritten headers. Two of the three QEMU
+system scenarios assert the console transcript, and one of those boots an image built from a second
+document that shares no address and no MAC with the first.
+
+**Missing.**
+
+- **No management API and no way to submit a document.** The XML is `include_bytes!`d into the
+  configuration domain at build time, so a configuration change requires a new image and a reboot.
+  That is a **deviation from CONCEPT §12.3**, which draws the static/dynamic line at hardware and
+  holds that a configuration change never requires a reboot; the mechanism that would honour it —
+  everything from the document reader to the poll-boundary switch — exists and is exercised on every
+  boot, and what is missing is only a channel to deliver a second document over. Everything above
+  therefore runs exactly once, at boot, and `validate_document` — the "check this without committing
+  it" half of a management API — is implemented, tested, and called by nothing at run time.
+- **No rollback.** CONCEPT §12.2's return to an earlier version does not exist. The datastore holds
+  the running configuration and at most one candidate, so there is no version history to roll back
+  *to*; with no persistence and no channel to submit a second document over there could not be one
+  worth holding, every generation but the single one each boot commits being unreachable by
+  construction. What is implemented of §12.2's versioning is the part that is reachable: monotonic
+  generations, and a content hash beside them that makes re-committing what is already running an
+  `unchanged` outcome rather than a new version.
+- **No commit-confirm.** The candidate/commit half of CONCEPT §12.2 exists; the confirm half does
+  not, and it cannot be built here: an automatic revert needs a deadline, and there is no timer, no
+  interrupt and no trusted time source anywhere in this system. It also needs a management channel
+  to be *protecting* — the failure commit-confirm exists to survive is a commit that severs the
+  operator's own access — and there is no such channel to sever.
+- **No persistence.** Nothing inside seL4 holds a disk capability and there is no block driver, so a
+  generation cannot outlive a reboot. The DATA partition, where configuration is meant to live, is
+  an empty unformatted GPT entry (see *[A/B image update](#ab-image-update)*).
+- **No distributed rollout.** CONCEPT §12.2's staged commit across an HA pair needs a pair; the
+  handover protocol is written for exactly one consumer, and "every consumer has staged" is one
+  comparison rather than a conjunction.
+- **Only interfaces and neighbours are configurable.** No routes, no policy, no zones, no NAT — none
+  of which exist to configure. Queue depths, pool sizes and buffer extents are deliberately *not*
+  runtime configuration: they are memory-region extents fixed in the system description, which is
+  where CONCEPT §12.3 draws the line at hardware, and moving one would move a capability grant.
+- **Refusal is only visible on the console.** A node that rejected its own document comes up
+  forwarding nothing and says so once, on a serial line, and nothing else can be asked. There is no
+  `GET /config`, no health signal, and no metric.
+
+### Console system-state events
+
+**Done.** The five ad-hoc bring-up markers are gone. Call sites in all three protection-domain
+binaries emit **typed events** — a closed set of named fields — and a backend renders them, so the
+attribute structure an OpenTelemetry record needs is produced at the call site rather than thrown
+away in a format string. The console backend writes two channels of closed vocabulary,
+`LFW-PD domain=… state=…` for a domain's lifecycle and `LFW-CFG generation=… …` for configuration,
+both specified field for field in [MONITORING.md](MONITORING.md) and matching the existing
+`LFW-BOOT` convention, so a reader keys on the `LFW-` prefix alone.
+
+That the values are safe to print is structural rather than a rule to remember: an event's value
+type is a closed set of already-parsed domain types with no arbitrary-bytes variant, and the one
+route text takes from a configuration document to a console line is an identifier validated to
+`[a-z0-9-]{1,16}` at parse time. Rendering is allocator-free into a caller's buffer and **refuses**
+rather than truncates, a truncated line being one an operator reads as complete. The transcript is
+a machine-checked contract, not prose: a QEMU scenario derives the records a document must produce
+by running that document through the same two calls the domain makes and the same renderer its
+console backend uses, then asserts the boot's `LFW-CFG` channel against it.
+
+**Missing.**
+
+- **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
+  no `ready`, no failure — so MONITORING.md's "each stage reporting healthy or the specific fault"
+  holds for the driver and configuration domains and not for the one that carries traffic.
+- **Records interleave, and nothing in the system prevents it.** The console is one unsynchronised
+  device written without a lock, and the two driver instances run at equal priority, so their
+  `LFW-PD` records are torn into one another in every normal boot capture. MONITORING.md answers
+  this by putting the obligation on the reader — recover a record by scanning for the `LFW-` prefix
+  anywhere in the stream — and the transcript assertion does exactly that, so a record that did not
+  begin its line is still judged. What no reader can do is reassemble a record torn through its own
+  middle: the continuation carries no marker, and two concurrent writers leave nothing to decide
+  which fragment continues which by. `LFW-CFG` records are not seen to tear today, and only because
+  the publishing domain runs to completion above every other priority; nothing structural holds
+  that, and the day it stops holding, a torn record is a loud transcript mismatch rather than a
+  recovered one.
+- **No fault or restart events**, because there is no fault handler and no PD restart to report.
+- **Nothing beyond the console.** These are the OTEL log stream's System category by construction,
+  but no transport exists (see the status table), so the records reach an operator only over a
+  serial line, on a node they are already attached to.
+
 ### Protection-domain decomposition
 
-**Done.** Three protection domains (one forwarder, two driver instances of one binary) with real,
-verifiable least privilege: the forwarder holds no device capability at all and neither pipeline's
-`free` ring — so it cannot hand a live DMA target back to be issued a second time — and each driver
-sees only its own ECAM page, BAR, virtqueue region, and its two pipelines. Each pipeline is three
-memory regions rather than one precisely so that those grants can differ; the forwarder maps the
-buffer pools, because a domain that rewrites a header must reach the bytes. Two notification channels,
-each granted in **one direction only** — the drivers may signal the forwarder, and the forwarder's
-two send capabilities do not exist rather than merely going unexercised. Zero IRQs. The capability
-grant is machine-checkable in the Microkit capability/memory report the build generates.
+**Done.** Four protection domains (one forwarder, one configuration domain, two driver instances of
+one binary) with real, verifiable least privilege: the forwarder holds no device capability at all
+and neither pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a second
+time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two pipelines.
+Each pipeline is three memory regions rather than one precisely so that those grants can differ; the
+forwarder maps the buffer pools, because a domain that rewrites a header must reach the bytes. The
+configuration domain's entire grant is two 4 KiB regions: no device, no pool, no ring, so the domain
+that parses attacker-supplied XML cannot reach a frame or a NIC. Those two regions are one per
+direction, and their perms are the argument — the forwarder maps the handover **read-only**, so it
+cannot rewrite the configuration it is about to be judged by, and the publisher maps the
+acknowledgement read-only, so it cannot forge the consent that releases its own generation.
 
-**Missing.** Roughly one of the fourteen component classes in CONCEPT §6.3 exists. Absent: Rx/Tx
-virtualisers, classifier, filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7
-parsers, DPI engine, content scanner, CA signing PD, management API PD, configuration validator PD,
-HA state-sync PD, and the update/health PD. There is no fault handler and no PD restart, one system
-description, and no SMP variant.
+Three notification channels. The two driver channels are granted in **one direction only** — the
+drivers may signal the forwarder, and the forwarder's send capability on each does not exist rather
+than merely going unexercised. The third, between the configuration domain and the forwarder, is the
+one granted in **both**, and stated as a decision at both ends rather than inherited from Microkit's
+default: applying a configuration is a two-phase commit and each phase is a signal the other end
+cannot infer. The forwarder therefore holds exactly one send capability in the whole system, on the
+configuration domain alone. Zero IRQs. The capability grant is machine-checkable in the Microkit
+capability/memory report the build generates.
+
+**Missing.** Two of the fourteen component classes in CONCEPT §6.3 exist: the NIC driver PDs, and —
+with this change — the configuration validator PD. Absent: Rx/Tx virtualisers, classifier,
+filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7 parsers, DPI engine,
+content scanner, CA signing PD, management API PD, HA state-sync PD, and the update/health PD. The
+routing/ARP/ICMP class is the one that is neither: routing exists as a *stage inside* the forwarder
+rather than as a domain of its own, and ARP and ICMP do not exist at all. There is no fault handler
+and no PD restart, one system description, and no SMP variant.
 
 One grant is also wider than the code needs, and it is not closed:
 
@@ -275,10 +439,18 @@ refuses one this domain never lent. A *local* double return is not representable
 non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
 Every rejection is a **counted drop**, never a fault: `PoolCounters` and `RouteCounters` record
-them, the latter attributing every refused frame to one of ten named routing reasons or to the stage
-check that caught it. Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit
-header-room check) and checked against the driver's in-flight set before any span is touched. Every
-peer-fed loop is bounded by `DRAIN_LIMIT`.
+them, the latter attributing every refused frame to one of eleven named routing reasons or to the
+stage check that caught it. `ConfigCounters` does the same for the handover, so a publisher offering
+images this domain will not run is distinguishable from one that has stopped offering any.
+Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit header-room
+check) and checked against the driver's in-flight set before any span is touched. Every peer-fed
+loop is bounded by `DRAIN_LIMIT`.
+
+The configuration handover is the same treatment applied to a second peer: the region is mapped
+read-only, its image is copied out before anything is decided on it, and every field of the copy —
+counts, the `enabled` byte, ports, prefix lengths, MACs — is re-checked in the consumer, which is
+the domain that has to live with the result. A refused image is counted, leaves the running
+configuration exactly as it was, and is never acknowledged, so the publisher cannot commit it.
 
 **Missing.**
 
@@ -352,17 +524,17 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eight library crates, `xtask`, and both protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.26% combined, weakest crate `routing` at 98.17%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (the routed forwarding contract, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the ten library crates, `xtask`, and all three protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.32% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
+| QEMU end-to-end gate (three system scenarios, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | seven persistent targets covering every crate that interprets untrusted input; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus |
+| Fuzzing | **partial** | nine persistent targets, between them covering every crate that interprets bytes it did not write; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
 | Build input pinning | **partial** | every apt package — QEMU and OVMF included — is pinned to an exact version against a dated snapshot, but no sha256 for one is recorded here, so apt's own archive signature is the integrity root; the `cargo install`ed developer tools are version-exact and `--locked`, but their integrity rests on the crates.io index rather than on a checksum in this repository |
 
-Two of those deserve more than a table cell.
+Two of those rows deserve more than a table cell, and the fuzzing row deserves two.
 
 **The SBOM does not describe the shipped payload.** syft catalogs the workspace *source tree*, with
 `build/`, `dist/`, `target/`, `fuzz/` and `tools/` excluded, so a consumer must not read the document
@@ -371,7 +543,21 @@ and their trees — appear in the inventory. And the third-party components that
 inside the disk — the seL4 kernel from the Microkit SDK and the GRUB core image — are absent; they
 are recorded as version-verified provenance in the release manifest instead.
 
-**Live fuzzing is conditional.** All seven targets always build under AddressSanitizer, and the
+**The two configuration harnesses assert semantics, not survival.** A target whose body is a bare
+parse call proves only that the parser did not crash on that input, which for a validator is the
+least interesting outcome: the failure that reaches a dataplane is an image *wrongly accepted*.
+`fuzz/src/handover.rs` therefore carries its own statement of the handover ABI's rules and of the
+order they are applied in, taken from the contract rather than read out of `wire`, and compares it
+with `ConfigImage::check` on every input — so an image the reader admits and the contract refuses
+fails exactly as loudly as a panic would. `fuzz/src/document.rs` closes the same gap across a crate
+boundary: every document `crates/config` accepts must build a handover image the *consuming* domain
+accepts, and a forwarding table carrying the entries the document named, which no test inside either
+crate alone can observe. Both claims were checked by sabotage rather than by reading — deleting the
+prefix-length rule from `ConfigImage::check`, and the port-range rule from `crates/config`, each
+fails the seed-corpus smoke test on the committed seed named after it, so the corpus alone catches a
+lost rule with no live fuzzing at all.
+
+**Live fuzzing is conditional.** All nine targets always build under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
 run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
 probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
@@ -392,21 +578,44 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the signed A/B disk + release bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot the image in QEMU and route traffic between two host endpoints
+make test-system    # boot three QEMU scenarios: forwarding, generation swap, alternate config
 make ci             # the complete gate (host gate + fuzz + image + system + A/B scenarios)
 ```
 
-`make test-system` is also the smoke test. It boots the signed disk with a host-controlled endpoint
-attached to each NIC port — 10.0.0.2 on port 0 and 10.0.1.2 on port 1, two /24 subnets the
-appliance routes between — and prints what the two of them exchanged. Each of the two datagrams is
-reported as it came back off the wire: its addresses and ports, the TTL the hop decremented, the MAC
-pair the appliance rewrote it to, and its length on the wire. The same boot injects four classes of
-traffic the appliance must refuse — a TTL that cannot survive a hop, a frame carrying another
-station's destination MAC, a destination no interface prefix covers, and a non-IPv4 broadcast frame
-— and each must reach nobody. The verdict is those two sockets and nothing else: no part of it is
-read from the guest's serial output, which is captured to `build/image/qemu.log` for reading after a
-failure. A failing run prints the same table with the offending probe marked, ahead of the
-diagnostic naming the field that departed from the contract.
+`make test-system` is also the smoke test. It runs **three scenarios**, each a full boot of a signed
+disk through OVMF and GRUB with a host-controlled endpoint attached to each NIC port, and each
+asserting the routed contract in both directions:
+
+1. **routed-forwarding** — the published disk, judged on traffic alone. It is the regression guard,
+   reporting a forwarding failure as a forwarding failure and nothing else.
+2. **generation-swap** — the same disk, judged additionally on its `LFW-CFG` console transcript: the
+   node comes up fail-closed on generation 0 and switches to generation 1, whose change records must
+   be the configuration document's own diff. A separate boot, because a transcript readable only off
+   a run whose traffic had already passed would be silent in exactly the case it exists for — a node
+   that committed nothing and forwarded nothing. The expected transcript is *derived* from the
+   document by the same calls and the same renderer the appliance uses, so a hand-written list
+   cannot drift from either.
+3. **alternate-configuration** — a disk assembled from a second document sharing no address and no
+   MAC with the first, judged on both. This is what proves the dataplane reads its table from the
+   document: a compiled-in table would satisfy the first two scenarios and fail every probe here.
+
+Every address in all of that comes from the configuration document the image under test was built
+from, so no part of the bench can hold an address the appliance does not. Each scenario prints what
+its two endpoints exchanged: each datagram as it came back off the wire, with its addresses and
+ports, the TTL the hop decremented, the MAC pair the appliance rewrote it to, and its length. Each
+boot also injects four classes of traffic the appliance must refuse — a TTL that cannot survive a
+hop, a frame carrying another station's destination MAC, a destination no interface prefix covers,
+and a non-IPv4 broadcast frame — and each must reach nobody. The traffic verdict is those two
+sockets and nothing else; the transcript verdict is the structured `LFW-CFG` channel and nothing
+else. Neither is read from timing, and neither is read from prose — the channel being recovered the
+way MONITORING.md obliges every reader to, by scanning for the `LFW-` marker anywhere in the stream
+rather than assuming a record begins a line, because on an unsynchronised console it routinely does
+not. The one thing that scan cannot tell apart from a record is prose *quoting* one, which is the
+marker's price and fails closed: the quotation comes with its surrounding words, so it lands as a
+mismatch rather than as a pass. The guest's serial output is captured to
+`build/image/qemu-<scenario>.log` for reading after a failure. A failing run prints the
+same table with the offending probe marked, ahead of the diagnostic naming the field that departed
+from the contract.
 
 `make image` is the only network-enabled phase (the OCI build). Every target that runs a build or a
 gate — `make clean` included — checks that the pinned builder image already exists and refuses with
@@ -426,7 +635,7 @@ make test                 # fast host gate (format, clippy, tests, coverage floo
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
-make test-system          # boot QEMU and route traffic between two host endpoints
+make test-system          # boot the three QEMU system scenarios and assert on each
 make test-ab              # boot the eight A/B state-machine scenarios and assert on each
 make ci                   # the complete gate: host gate, fuzz, image, system and A/B
 make release              # run CI, then assemble AND boot the Microkit release payload

@@ -23,6 +23,8 @@
 //! - [`evidence`] — the manifest, SPDX SBOM, and checksums.
 //! - [`host`] — the host-side commands (fast gate, coverage, bench, fuzz, clean).
 //! - [`forward_harness`] — the two-port socket-backed forwarding harness.
+//! - [`topology`] — the bench read out of the configuration document under test.
+//! - [`config_transcript`] — the `LFW-CFG` console channel one boot must carry.
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
 //! composes the two gates — [`ci`] is the complete pull-request gate, and
@@ -34,6 +36,7 @@ use std::{env, error::Error, fmt, fs, io, path::Path, process::ExitCode};
 mod ab_test;
 mod artifacts;
 mod budgets;
+mod config_transcript;
 mod disk;
 mod evidence;
 mod forward_harness;
@@ -45,6 +48,7 @@ mod qemu;
 mod reproducible;
 mod signing;
 mod sysdesc;
+mod topology;
 mod util;
 
 fn main() -> ExitCode {
@@ -134,8 +138,17 @@ fn release(root: &Path) -> Result<(), Box<dyn Error>> {
 /// grown empty; the counts say how much traffic the claim rests on.
 fn prove_release_configuration(root: &Path, dist: &Path) -> Result<String, Box<dyn Error>> {
     image::image(root, image::RELEASE_CONFIG)?;
-    let booted =
-        qemu::boot_and_forward(root, &dist.join(artifacts::DIST_DISK), "qemu-release.log")?;
+    // The bench the release disk's own configuration document describes: the
+    // release build embeds it and the contract is stated against it, so the two
+    // cannot disagree about what the appliance answers to.
+    let document = root.join(image::CONFIGURATION_DOCUMENT);
+    let topology = topology::Topology::read(&document).map_err(|error| error.to_string())?;
+    let booted = qemu::boot_and_forward(
+        root,
+        &dist.join(artifacts::DIST_DISK),
+        "qemu-release.log",
+        &topology,
+    )?;
     Ok(booted.traffic.summary())
 }
 

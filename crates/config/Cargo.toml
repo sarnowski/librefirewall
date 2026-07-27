@@ -1,0 +1,17 @@
+[package]
+name = "config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+net-headers = { path = "../net-headers" }
+routing = { path = "../routing" }
+lfw-log = { path = "../log" }
+wire = { path = "../wire" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

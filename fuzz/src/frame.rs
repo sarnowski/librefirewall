@@ -31,6 +31,8 @@
 //!   header checksum asserted the way the next hop tests it — with a TTL
 //!   exactly one lower.
 
+use std::sync::LazyLock;
+
 use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, Ipv4Address, MacAddress};
 use routing::{Decision, Interface, Neighbour, PortId, Router};
 
@@ -41,36 +43,41 @@ const PORT1: PortId = PortId(1);
 /// Everything past them is the sender's and must survive untouched.
 const REWRITTEN_HEADER_LEN: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
 
-/// The configuration `pds/forwarder` compiles in, so a verdict here is a
-/// verdict the appliance would reach.
-static ROUTER: Router<2, 2> = Router::new(
-    [
-        Interface {
-            port: PORT0,
-            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
-            address: Ipv4Address::from_octets([10, 0, 0, 1]),
-            prefix_length: 24,
-        },
-        Interface {
-            port: PORT1,
-            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]),
-            address: Ipv4Address::from_octets([10, 0, 1, 1]),
-            prefix_length: 24,
-        },
-    ],
-    [
-        Neighbour {
-            port: PORT0,
-            address: Ipv4Address::from_octets([10, 0, 0, 2]),
-            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
-        },
-        Neighbour {
-            port: PORT1,
-            address: Ipv4Address::from_octets([10, 0, 1, 2]),
-            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
-        },
-    ],
-);
+/// A two-port topology of the shape the appliance is configured into at run
+/// time, so a verdict here is a verdict it would reach.
+static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
+    Router::from_slices(
+        &[
+            Interface {
+                port: PORT0,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+            Interface {
+                port: PORT1,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]),
+                address: Ipv4Address::from_octets([10, 0, 1, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+        ],
+        &[
+            Neighbour {
+                port: PORT0,
+                address: Ipv4Address::from_octets([10, 0, 0, 2]),
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
+            },
+            Neighbour {
+                port: PORT1,
+                address: Ipv4Address::from_octets([10, 0, 1, 2]),
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
+            },
+        ],
+    )
+    .expect("two of each fit in two")
+});
 
 /// Parse one frame, decide on it as if it had arrived on each port in turn, and
 /// carry out whatever rewrite the decision authorises.

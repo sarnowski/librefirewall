@@ -161,6 +161,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "config"
+version = "0.1.0"
+dependencies = [
+ "lfw-log",
+ "net-headers",
+ "proptest",
+ "routing",
+ "wire",
+]
+
+[[package]]
+name = "config-pd"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "lfw-log",
+ "pd-runtime",
+ "sel4-microkit",
+]
+
+[[package]]
 name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,7 +294,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 name = "forwarder"
 version = "0.1.0"
 dependencies = [
- "net-headers",
+ "lfw-log",
  "pd-runtime",
  "routing",
  "sel4-microkit",
@@ -376,6 +397,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-log"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+ "proptest",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -435,6 +464,7 @@ dependencies = [
 name = "nic-driver"
 version = "0.1.0"
 dependencies = [
+ "lfw-log",
  "nic-driver-core",
  "pd-runtime",
  "sel4-microkit",
@@ -445,6 +475,7 @@ dependencies = [
 name = "nic-driver-core"
 version = "0.1.0"
 dependencies = [
+ "lfw-log",
  "pd-runtime",
  "proptest",
  "virtio",
@@ -503,6 +534,7 @@ name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "lfw-log",
  "net-headers",
  "packet-buffer",
  "proptest",
@@ -1285,9 +1317,12 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "config",
+ "lfw-log",
  "nic-driver-core",
  "pd-runtime",
  "virtio",
+ "wire",
 ]
 
 [[package]]

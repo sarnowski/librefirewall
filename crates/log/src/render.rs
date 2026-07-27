@@ -1,0 +1,684 @@
+//! The console grammar: one [`Event`] to one line of a closed vocabulary.
+
+use core::fmt::{self, Write as _};
+
+use crate::detail::{DomainDetail, Refusal, RefusalDetail};
+use crate::event::Event;
+
+/// An upper bound on what [`render`] produces, so a caller sizes one buffer
+/// once and is done with it. Held by
+/// `the_widest_line_of_each_shape_fits_the_maximum`, which renders the widest
+/// value of every field of every shape against it, a refusal's `cause` at
+/// [`crate::MAX_CAUSE_LEN`] — the one field this crate cannot itself bound.
+pub const MAX_LINE_LEN: usize = 192;
+
+/// The buffer could not hold the line.
+///
+/// Refusing is the whole point: a truncated line is one an operator reads as
+/// complete, and the field a console grammar loses off the end is the last one
+/// — `to=`, the value something was just changed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderError {
+    BufferTooSmall,
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BufferTooSmall => f.write_str("the buffer is too small for the rendered line"),
+        }
+    }
+}
+
+/// Write `event` into `out` as its console line, without a trailing newline,
+/// and return how many bytes it took.
+///
+/// There is no allocator, so the buffer is the caller's and the length comes
+/// back rather than a string.
+pub fn render(event: &Event, out: &mut [u8]) -> Result<usize, RenderError> {
+    let mut cursor = Cursor {
+        out,
+        written: 0usize,
+    };
+    match write_line(event, &mut cursor) {
+        Ok(()) => Ok(cursor.written),
+        // `fmt::Error` is a unit type, so this discards nothing: capacity is
+        // all a failure here can have been.
+        Err(fmt::Error) => Err(RenderError::BufferTooSmall),
+    }
+}
+
+fn write_line(event: &Event, cursor: &mut Cursor<'_>) -> fmt::Result {
+    match event {
+        Event::Domain {
+            domain,
+            state,
+            detail,
+        } => {
+            write!(cursor, "LFW-PD domain={domain} state={state}")?;
+            write_detail(detail, cursor)
+        }
+        Event::ConfigChange {
+            generation,
+            sequence,
+            change,
+            object,
+            key,
+            field,
+            from,
+            to,
+        } => {
+            write!(
+                cursor,
+                "LFW-CFG generation={generation} seq={sequence} change={change} \
+                 object={object} key={key} field={field}"
+            )?;
+            if let Some(value) = from {
+                write!(cursor, " from={value}")?;
+            }
+            if let Some(value) = to {
+                write!(cursor, " to={value}")?;
+            }
+            Ok(())
+        }
+        Event::ConfigGeneration {
+            generation,
+            outcome,
+            changes,
+        } => write!(
+            cursor,
+            "LFW-CFG generation={generation} outcome={outcome} changes={changes}"
+        ),
+        Event::ConfigRejected {
+            generation,
+            reason,
+            offset,
+        } => write!(
+            cursor,
+            "LFW-CFG generation={generation} rejected={reason} offset={offset}"
+        ),
+    }
+}
+
+/// The tail of an `LFW-PD` line, absent for the lifecycle points that carry
+/// nothing: a record ending in an empty field reads as a missing value.
+fn write_detail(detail: &DomainDetail, cursor: &mut Cursor<'_>) -> fmt::Result {
+    match detail {
+        DomainDetail::None => Ok(()),
+        DomainDetail::Features(bits) => write!(cursor, " features={bits:#x}"),
+        DomainDetail::ReceivePosted(count) => write!(cursor, " rx-posted={count}"),
+        DomainDetail::Refusal(Refusal {
+            cause,
+            detail,
+            signalled,
+        }) => {
+            write!(cursor, " cause={cause} signalled={signalled}")?;
+            // Hexadecimal throughout: a refusal's numbers are device
+            // identifiers, addresses and status bits, read against a datasheet.
+            match detail {
+                RefusalDetail::None => Ok(()),
+                RefusalDetail::One(value) => write!(cursor, " detail={value:#x}"),
+                RefusalDetail::Two(first, second) => {
+                    write!(cursor, " detail={first:#x},{second:#x}")
+                }
+            }
+        }
+    }
+}
+
+/// A `core::fmt` sink over a fixed slice that refuses rather than truncates.
+struct Cursor<'a> {
+    out: &'a mut [u8],
+    written: usize,
+}
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let bytes = text.as_bytes();
+        let end = self.written.checked_add(bytes.len()).ok_or(fmt::Error)?;
+        let slot = self.out.get_mut(self.written..end).ok_or(fmt::Error)?;
+        slot.copy_from_slice(bytes);
+        self.written = end;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detail::MAX_CAUSE_LEN;
+    use crate::event::{
+        ChangeKind, Domain, DomainState, Field, GenerationOutcome, ObjectKind, RejectReason, Value,
+    };
+    use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
+    use net_headers::{Ipv4Address, MacAddress};
+    use proptest::prelude::*;
+    use std::{boxed::Box, string::String, vec, vec::Vec};
+
+    fn id(text: &str) -> Identifier {
+        Identifier::new(text.as_bytes()).expect("the fixture is within the alphabet")
+    }
+
+    fn rendered(event: &Event) -> String {
+        let mut buffer = [0u8; MAX_LINE_LEN];
+        let written = render(event, &mut buffer).expect("MAX_LINE_LEN holds every line");
+        String::from_utf8(buffer[..written].to_vec()).expect("the grammar is ASCII")
+    }
+
+    fn change(from: Option<Value>, to: Option<Value>) -> Event {
+        Event::ConfigChange {
+            generation: 4,
+            sequence: 2,
+            change: ChangeKind::Modified,
+            object: ObjectKind::Interface,
+            key: id("wan"),
+            field: Field::PrefixLength,
+            from,
+            to,
+        }
+    }
+
+    #[test]
+    fn a_domain_lifecycle_point_renders_its_domain_and_state() {
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::None,
+            }),
+            "LFW-PD domain=nic-driver state=negotiated"
+        );
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Forwarder,
+                state: DomainState::Ready,
+                detail: DomainDetail::None,
+            }),
+            "LFW-PD domain=forwarder state=ready"
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_point_that_carries_a_payload_renders_it_as_a_field() {
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Features(0x1_3000_0020),
+            }),
+            "LFW-PD domain=nic-driver state=negotiated features=0x130000020"
+        );
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Ready,
+                detail: DomainDetail::ReceivePosted(64),
+            }),
+            "LFW-PD domain=nic-driver state=ready rx-posted=64"
+        );
+    }
+
+    #[test]
+    fn a_refusal_renders_its_cause_what_the_device_was_left_in_and_its_numbers() {
+        let refusal = |detail| {
+            rendered(&Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Refused,
+                detail: DomainDetail::Refusal(Refusal {
+                    cause: "not-virtio-net",
+                    detail,
+                    signalled: false,
+                }),
+            })
+        };
+        assert_eq!(
+            refusal(RefusalDetail::Two(0x1af4, 0x1000)),
+            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false \
+             detail=0x1af4,0x1000"
+        );
+        assert_eq!(
+            refusal(RefusalDetail::One(0x31000000)),
+            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false \
+             detail=0x31000000"
+        );
+        assert_eq!(
+            refusal(RefusalDetail::None),
+            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false"
+        );
+    }
+
+    /// The field an operator acts on first: whether the device is still
+    /// decoding and mastering the bus.
+    #[test]
+    fn a_signalled_refusal_and_an_unsignalled_one_do_not_read_alike() {
+        let line = |signalled| {
+            rendered(&Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Refused,
+                detail: DomainDetail::Refusal(Refusal {
+                    cause: "reset-not-acknowledged",
+                    detail: RefusalDetail::One(0x0f),
+                    signalled,
+                }),
+            })
+        };
+        assert!(line(true).contains("signalled=true"));
+        assert!(line(false).contains("signalled=false"));
+        assert_ne!(line(true), line(false));
+    }
+
+    #[test]
+    fn a_modification_renders_both_ends_of_the_change() {
+        assert_eq!(
+            rendered(&change(
+                Some(Value::PrefixLength(24)),
+                Some(Value::PrefixLength(25)),
+            )),
+            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+             field=prefix-length from=24 to=25"
+        );
+    }
+
+    #[test]
+    fn an_addition_omits_from_and_a_removal_omits_to() {
+        assert_eq!(
+            rendered(&change(None, Some(Value::PrefixLength(25)))),
+            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+             field=prefix-length to=25"
+        );
+        assert_eq!(
+            rendered(&change(Some(Value::PrefixLength(24)), None)),
+            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+             field=prefix-length from=24"
+        );
+    }
+
+    #[test]
+    fn a_record_with_neither_end_renders_the_key_and_stops() {
+        assert_eq!(
+            rendered(&change(None, None)),
+            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+             field=prefix-length"
+        );
+    }
+
+    #[test]
+    fn an_added_neighbour_renders_the_value_types_it_carries() {
+        let event = Event::ConfigChange {
+            generation: 1,
+            sequence: 0,
+            change: ChangeKind::Added,
+            object: ObjectKind::Neighbour,
+            key: id("gateway-a"),
+            field: Field::Mac,
+            from: None,
+            to: Some(Value::Mac(MacAddress([0x52, 0x54, 0, 0, 0, 0x0a]))),
+        };
+        assert_eq!(
+            rendered(&event),
+            "LFW-CFG generation=1 seq=0 change=added object=neighbour key=gateway-a \
+             field=mac to=52:54:00:00:00:0a"
+        );
+    }
+
+    #[test]
+    fn a_removed_interface_renders_the_address_it_held() {
+        let event = Event::ConfigChange {
+            generation: 9,
+            sequence: 3,
+            change: ChangeKind::Removed,
+            object: ObjectKind::Interface,
+            key: id("lan"),
+            field: Field::Address,
+            from: Some(Value::Ipv4(Ipv4Address::from_octets([10, 0, 1, 1]))),
+            to: None,
+        };
+        assert_eq!(
+            rendered(&event),
+            "LFW-CFG generation=9 seq=3 change=removed object=interface key=lan \
+             field=address from=10.0.1.1"
+        );
+    }
+
+    #[test]
+    fn a_generation_outcome_renders_its_change_count() {
+        for (outcome, token) in [
+            (GenerationOutcome::Applied, "applied"),
+            (GenerationOutcome::Refused, "refused"),
+            (GenerationOutcome::Unchanged, "unchanged"),
+        ] {
+            assert_eq!(
+                rendered(&Event::ConfigGeneration {
+                    generation: 0,
+                    outcome,
+                    changes: 0,
+                }),
+                std::format!("LFW-CFG generation=0 outcome={token} changes=0")
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_renders_a_location_and_never_the_document() {
+        assert_eq!(
+            rendered(&Event::ConfigRejected {
+                generation: 2,
+                reason: RejectReason::Doctype,
+                offset: 38,
+            }),
+            "LFW-CFG generation=2 rejected=doctype offset=38"
+        );
+    }
+
+    #[test]
+    fn every_reject_reason_renders_into_a_line_of_its_own() {
+        let mut lines: Vec<String> = RejectReason::ALL
+            .iter()
+            .map(|&reason| {
+                rendered(&Event::ConfigRejected {
+                    generation: 1,
+                    reason,
+                    offset: 0,
+                })
+            })
+            .collect();
+        let count = lines.len();
+        lines.sort();
+        lines.dedup();
+        assert_eq!(lines.len(), count, "two reasons render identically");
+    }
+
+    #[test]
+    fn a_buffer_one_byte_short_is_refused_rather_than_truncated() {
+        let event = change(Some(Value::PrefixLength(24)), Some(Value::PrefixLength(25)));
+        let exact = rendered(&event).len();
+        let mut just_enough = vec![0u8; exact];
+        assert_eq!(render(&event, &mut just_enough), Ok(exact));
+
+        for size in 0..exact {
+            let mut short = vec![0u8; size];
+            assert_eq!(
+                render(&event, &mut short),
+                Err(RenderError::BufferTooSmall),
+                "a {size}-byte buffer should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_reads_as_a_capacity_problem() {
+        assert_eq!(
+            std::format!("{}", RenderError::BufferTooSmall),
+            "the buffer is too small for the rendered line"
+        );
+    }
+
+    /// The widest line each shape can produce: every numeric field at its
+    /// maximum, the widest vocabulary token, a full-length key, and the widest
+    /// [`Value`] on both ends.
+    #[test]
+    fn the_widest_line_of_each_shape_fits_the_maximum() {
+        let widest_key = id(&"a".repeat(MAX_IDENTIFIER_LEN));
+        // Leaked because a `cause` is a `&'static str` by construction and this
+        // is a host test with an allocator; nothing in a protection domain
+        // reaches this path.
+        let widest_cause: &'static String = Box::leak(Box::new("a".repeat(MAX_CAUSE_LEN)));
+        let widest_value = Value::Mac(MacAddress([0xff; 6]));
+        let widest_reason = RejectReason::ALL
+            .into_iter()
+            .max_by_key(|reason| reason.name().len())
+            .expect("the vocabulary is not empty");
+        let shapes = [
+            Event::Domain {
+                domain: Domain::NicDriver,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Refusal(Refusal {
+                    cause: widest_cause.as_str(),
+                    detail: RefusalDetail::Two(u64::MAX, u64::MAX),
+                    signalled: false,
+                }),
+            },
+            Event::ConfigChange {
+                generation: u32::MAX,
+                sequence: u32::MAX,
+                change: ChangeKind::Modified,
+                object: ObjectKind::Neighbour,
+                key: widest_key,
+                field: Field::PrefixLength,
+                from: Some(widest_value),
+                to: Some(widest_value),
+            },
+            Event::ConfigGeneration {
+                generation: u32::MAX,
+                outcome: GenerationOutcome::Unchanged,
+                changes: u32::MAX,
+            },
+            Event::ConfigRejected {
+                generation: u32::MAX,
+                reason: widest_reason,
+                offset: u32::MAX,
+            },
+        ];
+        for shape in shapes {
+            let mut buffer = [0u8; MAX_LINE_LEN];
+            let written = render(&shape, &mut buffer);
+            assert!(
+                matches!(written, Ok(len) if len <= MAX_LINE_LEN),
+                "{shape:?} did not fit MAX_LINE_LEN"
+            );
+        }
+    }
+
+    #[test]
+    fn every_line_carries_the_prefix_a_reader_keys_on() {
+        for shape in every_shape() {
+            let line = rendered(&shape);
+            assert!(line.starts_with("LFW-"), "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+    }
+
+    fn every_shape() -> Vec<Event> {
+        let key = id("wan");
+        let mut shapes = Vec::new();
+        for domain in Domain::ALL {
+            for state in DomainState::ALL {
+                for detail in every_detail() {
+                    shapes.push(Event::Domain {
+                        domain,
+                        state,
+                        detail,
+                    });
+                }
+            }
+        }
+        for change in ChangeKind::ALL {
+            for object in ObjectKind::ALL {
+                for field in Field::ALL {
+                    shapes.push(Event::ConfigChange {
+                        generation: 1,
+                        sequence: 0,
+                        change,
+                        object,
+                        key,
+                        field,
+                        from: Some(Value::Count(1)),
+                        to: Some(Value::Bool(false)),
+                    });
+                }
+            }
+        }
+        for outcome in GenerationOutcome::ALL {
+            shapes.push(Event::ConfigGeneration {
+                generation: 1,
+                outcome,
+                changes: 0,
+            });
+        }
+        for reason in RejectReason::ALL {
+            shapes.push(Event::ConfigRejected {
+                generation: 1,
+                reason,
+                offset: 0,
+            });
+        }
+        shapes
+    }
+
+    /// One of every payload shape, the refusal in each of its three widths.
+    fn every_detail() -> Vec<DomainDetail> {
+        let mut details = vec![
+            DomainDetail::None,
+            DomainDetail::Features(u64::MAX),
+            DomainDetail::ReceivePosted(u32::MAX),
+        ];
+        for detail in [
+            RefusalDetail::None,
+            RefusalDetail::One(1),
+            RefusalDetail::Two(1, 2),
+        ] {
+            for signalled in [false, true] {
+                details.push(DomainDetail::Refusal(Refusal {
+                    cause: "pool-dma-base-unusable",
+                    detail,
+                    signalled,
+                }));
+            }
+        }
+        details
+    }
+
+    fn any_detail() -> impl Strategy<Value = DomainDetail> {
+        // A generated cause is one of a fixed set of literals rather than an
+        // arbitrary string: `cause` is a `&'static str`, which is exactly the
+        // property that keeps generated bytes out of it.
+        let causes = ["", "a", "not-virtio-net", "queue-setup-queue-too-small"];
+        prop_oneof![
+            Just(DomainDetail::None),
+            any::<u64>().prop_map(DomainDetail::Features),
+            any::<u32>().prop_map(DomainDetail::ReceivePosted),
+            (
+                (0..causes.len()),
+                prop_oneof![
+                    Just(RefusalDetail::None),
+                    any::<u64>().prop_map(RefusalDetail::One),
+                    any::<(u64, u64)>().prop_map(|(a, b)| RefusalDetail::Two(a, b)),
+                ],
+                any::<bool>(),
+            )
+                .prop_map(move |(index, detail, signalled)| DomainDetail::Refusal(
+                    Refusal {
+                        cause: causes[index],
+                        detail,
+                        signalled,
+                    }
+                )),
+        ]
+    }
+
+    fn any_identifier() -> impl Strategy<Value = Identifier> {
+        "[a-z0-9-]{1,16}"
+            .prop_map(|text| Identifier::new(text.as_bytes()).expect("the pattern is the alphabet"))
+    }
+
+    fn any_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            any::<u8>().prop_map(Value::Port),
+            any::<[u8; 4]>().prop_map(|octets| Value::Ipv4(Ipv4Address::from_octets(octets))),
+            any::<[u8; 6]>().prop_map(|octets| Value::Mac(MacAddress(octets))),
+            any::<u8>().prop_map(Value::PrefixLength),
+            any::<bool>().prop_map(Value::Bool),
+            any::<u32>().prop_map(Value::Generation),
+            any::<u32>().prop_map(Value::Count),
+            any_identifier().prop_map(Value::Id),
+        ]
+    }
+
+    fn pick<T: Copy + core::fmt::Debug, const N: usize>(
+        all: [T; N],
+    ) -> impl Strategy<Value = T> + Clone {
+        (0..N).prop_map(move |index| all[index])
+    }
+
+    fn any_event() -> impl Strategy<Value = Event> {
+        prop_oneof![
+            (pick(Domain::ALL), pick(DomainState::ALL), any_detail()).prop_map(
+                |(domain, state, detail)| Event::Domain {
+                    domain,
+                    state,
+                    detail,
+                }
+            ),
+            (
+                any::<u32>(),
+                any::<u32>(),
+                pick(ChangeKind::ALL),
+                pick(ObjectKind::ALL),
+                any_identifier(),
+                pick(Field::ALL),
+                proptest::option::of(any_value()),
+                proptest::option::of(any_value()),
+            )
+                .prop_map(
+                    |(generation, sequence, change, object, key, field, from, to)| {
+                        Event::ConfigChange {
+                            generation,
+                            sequence,
+                            change,
+                            object,
+                            key,
+                            field,
+                            from,
+                            to,
+                        }
+                    }
+                ),
+            (any::<u32>(), pick(GenerationOutcome::ALL), any::<u32>()).prop_map(
+                |(generation, outcome, changes)| Event::ConfigGeneration {
+                    generation,
+                    outcome,
+                    changes,
+                }
+            ),
+            (any::<u32>(), pick(RejectReason::ALL), any::<u32>()).prop_map(
+                |(generation, reason, offset)| Event::ConfigRejected {
+                    generation,
+                    reason,
+                    offset,
+                }
+            ),
+        ]
+    }
+
+    proptest! {
+        /// Bounded work and bounded output: whatever an event carries, the line
+        /// fits the advertised maximum and is the ASCII a console can print.
+        #[test]
+        fn every_event_fits_the_advertised_maximum(event in any_event()) {
+            let mut buffer = [0u8; MAX_LINE_LEN];
+            let written = render(&event, &mut buffer).expect("MAX_LINE_LEN holds every line");
+            prop_assert!(written <= MAX_LINE_LEN);
+            let line = core::str::from_utf8(&buffer[..written]).expect("the grammar is ASCII");
+            prop_assert!(line.starts_with("LFW-"));
+            prop_assert!(line.is_ascii());
+        }
+
+        /// Total over buffer size: every size either yields a line that fits it
+        /// or a typed refusal, and never a partial line reported as whole.
+        #[test]
+        fn any_buffer_size_yields_a_line_or_a_refusal(
+            event in any_event(),
+            size in 0usize..=MAX_LINE_LEN,
+        ) {
+            let reference = rendered(&event);
+            let mut buffer = vec![0u8; size];
+            match render(&event, &mut buffer) {
+                Ok(written) => {
+                    prop_assert!(written <= size);
+                    prop_assert_eq!(&buffer[..written], reference.as_bytes());
+                }
+                Err(RenderError::BufferTooSmall) => prop_assert!(size < reference.len()),
+            }
+        }
+    }
+}

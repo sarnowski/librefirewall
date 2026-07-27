@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lfw-log = { path = "../log" }
 virtio = { path = "../virtio" }
 pd-runtime = { path = "../pd-runtime" }
 

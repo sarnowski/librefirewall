@@ -14,15 +14,14 @@
 
     <!-- ===================================================================
          The physical address map is a contract, and this is where it is
-         stated. Every region below fixes phys_addr, and none of them may stop
-         doing so: each is named by a `setvar region_paddr` further down (a
-         driver hands the address to its device), and the Microkit tool refuses
-         that pairing without a fixed address — "setvar with 'region_paddr' for
-         MR without a specified paddr is unsupported on x86-64", because the
-         x86-64 physical memory layout is not known at build time (Microkit
-         2.3.0 manual, SDF `setvar`). Microkit therefore cannot place these
-         regions for us; the addresses are chosen here, so what makes each one
-         correct belongs here too.
+         stated. Every region a `setvar region_paddr` names fixes phys_addr, and
+         none of those may stop doing so: a driver hands the address to its
+         device, and the Microkit tool refuses that pairing without a fixed
+         address — "setvar with 'region_paddr' for MR without a specified paddr
+         is unsupported on x86-64", because the x86-64 physical memory layout is
+         not known at build time (Microkit 2.3.0 manual, SDF `setvar`). Microkit
+         therefore cannot place those regions for us; their addresses are chosen
+         here, so what makes each one correct belongs here too.
 
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
@@ -49,6 +48,19 @@
          1280 MiB or more RAM reaches 0x50000000 and swallows the BAR window.
          Changing `-m`, or targeting hardware with a different memory map,
          means re-deriving this map.
+
+         The two configuration regions (cfg, cfgack) are the exception and are
+         deliberately NOT in the packed range, which still ends at 0x31046000.
+         No device DMAs into them, so no driver needs their physical address, so
+         no `setvar region_paddr` names them and the tool has no reason to
+         demand a fixed one. Leaving it out is not a convenience: an unplaced
+         region is one Microkit allocates from general-purpose untyped memory,
+         which is precisely the retyping seL4 zeroes — so `attach_region!`'s
+         zero-initialisation precondition holds by construction for these two,
+         rather than by the RAM-membership argument above, which rests on `-m`
+         and which nothing checks. Fewer fixed addresses is the stronger
+         position here, and the only reason the regions above keep theirs is
+         that a device has to be told where they are.
          =================================================================== -->
 
     <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0. The
@@ -84,10 +96,10 @@
 
          Every size is a `pd_runtime` constant rather than a chosen number:
          `POOL_REGION_SIZE`, `FORWARD_REGION_SIZE` and `RETURN_REGION_SIZE`, each
-         its region type's `size_of` rounded up to the mapping granularity. They
-         are still one value in two places — nothing re-reads this file — so
-         shrinking either side alone silently either truncates the mapping or
-         re-widens the grant. They move together or not at all.
+         its region type's `size_of` rounded up to the mapping granularity. It is
+         one value in two places, and `xtask::sysdesc` reads this file back and
+         fails the gate on any inequality: moving one side alone would otherwise
+         silently truncate the mapping or re-widen the grant.
 
          Splitting the pool from the rings costs one page. `ForwardRings` is
          4112 bytes and `ReturnRing` 2056; the first needs two pages and the
@@ -104,7 +116,31 @@
     <memory_region name="fwd1" size="0x2000" phys_addr="0x31043000" />
     <memory_region name="free1" size="0x1000" phys_addr="0x31045000" />
 
-    <!-- The forwarder maps four regions and holds no device capability at all.
+    <!-- The configuration handover, one region per direction.
+
+         `cfg` carries the validated configuration image and the two generation
+         words that publish it; `cfgack` carries what the one consumer has done
+         with the offered generation. They are two regions rather than one field
+         set for the reason the pipeline is three regions: a region is the unit
+         of grant, and only two regions can give each domain write access to
+         exactly the direction it speaks in. The config domain cannot forge an
+         acknowledgement to release its own generation, and the forwarder cannot
+         rewrite the configuration it is about to be judged by.
+
+         Sizes are `wire::CONFIG_REGION_SIZE` and `wire::CONFIG_ACK_REGION_SIZE`,
+         each its type's `size_of` rounded up to the mapping granularity, on the
+         same footing as the pipeline constants above and held to them the same
+         way: `xtask::sysdesc` carries a rule for each of these two regions and
+         compares it. `ConfigHandover` is 664 bytes and `ConfigAck` 8, so both
+         round to one page and the pair costs two.
+
+         Neither carries phys_addr; see the address-map block above on why that
+         is the stronger position for a region no device is told about. -->
+    <memory_region name="cfg" size="0x1000" />
+    <memory_region name="cfgack" size="0x1000" />
+
+    <!-- The forwarder maps four dataplane regions and two configuration ones,
+         and holds no device capability at all.
          `RouteStage` decides on each frame and rewrites its Ethernet and IPv4
          headers in the buffer the receiving NIC DMA'd it into, so it is granted
          the two pools as well as the two ring pairs: a domain that rewrites a
@@ -122,13 +158,57 @@
 
          272 KiB mapped: the same byte count as the two undivided pipeline
          regions this replaced, and deliberately not the same bytes. What the
-         split buys is no longer a smaller grant but a different one. -->
+         split buys is no longer a smaller grant but a different one.
+
+         It additionally maps the two configuration regions, and the perms are
+         the whole of the argument. `cfg` is READ-ONLY here: the forwarder is
+         the domain that decides under the configuration, so it must read it,
+         and a domain that could also write it could rewrite the table it is
+         about to be held to and leave the publishing domain reporting a
+         generation nobody is running. `cfgack` is read-write because
+         acknowledging is this domain's own statement about itself — what it has
+         staged and what it is running — and it is the only domain that may make
+         it. The two perms together are what make the handover a protocol
+         between two domains rather than a shared scratch area. -->
     <protection_domain name="forwarder" priority="2" stack_size="0x4000">
         <program_image path="forwarder.elf" />
         <map mr="fwd0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="fwd0_vaddr" />
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="fwd1_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="pool0_vaddr" />
         <map mr="pool1" vaddr="0x2_300_000" perms="rw" cached="true" setvar_vaddr="pool1_vaddr" />
+        <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
+        <map mr="cfgack" vaddr="0x3_001_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
+    </protection_domain>
+
+    <!-- The configuration domain: it reads the document compiled into it,
+         refuses or commits it, and publishes the result. Its whole grant is the
+         two regions above, mirrored — `cfg` read-write because it is the writer
+         of the configuration, `cfgack` read-only because the acknowledgement is
+         the consumer's statement and a publisher that could forge one would
+         release a generation nobody had staged, which is the entire point of
+         there being two phases.
+
+         It holds NO device capability, NO buffer pool and NO dataplane ring, so
+         the domain that parses attacker-supplied XML cannot reach a frame, a
+         NIC, or the memory either travels through. That is the reason this is a
+         domain of its own rather than a function in the forwarder.
+
+         Priority 3, above the forwarder's 2 and the drivers' 1, and the
+         ordering is load-bearing in one direction only. The drivers never leave
+         `init` — they busy-loop at priority 1 — so a configuration domain at or
+         below their priority would be starved of the CPU it needs to publish
+         anything at all, and the appliance would come up permanently on
+         generation 0. Above them it runs to completion first and then blocks in
+         the Microkit event loop, where it costs nothing: it has no polling loop
+         and no work except when the consumer acknowledges, so being the highest
+         priority in the system cannot starve the dataplane.
+
+         cached="true" on both, as everywhere: they are ordinary memory shared
+         between two domains and no device decodes them. -->
+    <protection_domain name="config" priority="3" stack_size="0x10000">
+        <program_image path="config-pd.elf" />
+        <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
+        <map mr="cfgack" vaddr="0x3_001_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -191,5 +271,30 @@
     <channel>
         <end pd="nic_driver1" id="0" />
         <end pd="forwarder" id="1" notify="false" />
+    </channel>
+
+    <!-- The one channel in this system granted in BOTH directions, and it is a
+         decision rather than a `notify` nobody thought about — which is why
+         both ends state it rather than leaning on Microkit's default of true.
+
+         Applying a configuration is a two-phase commit, and each phase is a
+         signal the other end cannot infer. The config domain offers a
+         generation and signals; the forwarder re-checks every field of it,
+         stages a table, writes its acknowledgement and signals BACK, because
+         the config domain has no other way to learn that the generation is safe
+         to release — it cannot poll, having no loop to poll from, and it must
+         not release a generation the consumer has refused. The config domain
+         then publishes the commit and signals again, because the forwarder
+         switches tables between two polls and would otherwise not run one until
+         the next frame arrived — a node whose configuration lands only once
+         traffic starts is a node that is misconfigured for exactly as long as
+         it is idle.
+
+         The two driver channels remain one-directional for the reason stated
+         above them, and nothing here changes that: this pair grants the
+         forwarder a send capability on the config domain alone. -->
+    <channel>
+        <end pd="config" id="0" notify="true" />
+        <end pd="forwarder" id="2" notify="true" />
     </channel>
 </system>

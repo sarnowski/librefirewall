@@ -69,12 +69,15 @@
 //! than by control flow — a property of the system, not of this file. Microkit's
 //! optional `notify` attribute on a `<channel>`'s `<end>` "indicates that the
 //! protection domain for this end can send a notification to the other end;
-//! defaults to **true**" (Microkit 2.3.0 user manual §7.6). Both
-//! `<end pd="forwarder" …>` elements in the system description are marked
-//! `notify="false"`, so each driver keeps its send capability on the forwarder
-//! while the forwarder holds none. The entrypoint satisfies
+//! defaults to **true**" (Microkit 2.3.0 user manual §7.6). The forwarder's end
+//! of each of the two driver channels is marked `notify="false"` in the system
+//! description, so each driver keeps its send capability on the forwarder while
+//! the forwarder holds none on either driver. The entrypoint satisfies
 //! `sel4_microkit::Handler`.
 
+use lfw_log::{
+    Domain, DomainDetail, DomainState, Event, MAX_LINE_LEN, Refusal, RefusalDetail, Sink, render,
+};
 use nic_driver_core::bringup::{
     self, BringUpError, DriverVirtqueue, Live, MappedDevice, QUEUE_SIZE, TX_VQ_OFFSET,
 };
@@ -95,7 +98,7 @@ impl ForwarderSignal for ForwarderChannel {
 }
 
 /// Which pipeline's pool a rejected DMA base named.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 enum PoolRegion {
     /// `rx_pool_paddr`.
     Receive,
@@ -103,8 +106,17 @@ enum PoolRegion {
     Transmit,
 }
 
+impl PoolRegion {
+    /// The console token for a base this region could not supply.
+    const fn cause(self) -> &'static str {
+        match self {
+            Self::Receive => "receive-pool-dma-base",
+            Self::Transmit => "transmit-pool-dma-base",
+        }
+    }
+}
+
 /// Why this domain could not start.
-#[derive(Debug)]
 enum StartupError {
     /// A pool region's patched physical address cannot be a DMA base: it is
     /// zero, not [`MAPPING_ALIGN`]-aligned, or its region would run off the end
@@ -113,7 +125,6 @@ enum StartupError {
     /// `paddr` is the diagnosis, and the console is the only place an operator
     /// sees it (CONCEPT §11): zero means the `setvar` is missing or misspelled
     /// in the system description, any other value means it is misaligned.
-    #[expect(dead_code, reason = "read by the derived Debug on the console line")]
     PoolDmaBaseUnusable { region: PoolRegion, paddr: usize },
     /// The device refused bring-up, or build data it is programmed with was
     /// rejected; see [`BringUpError`].
@@ -127,16 +138,52 @@ impl From<BringUpError> for StartupError {
 }
 
 impl StartupError {
-    /// Whether the device was told to stop, or was left decoding nothing.
-    fn signalled_to_device(&self) -> bool {
+    /// This refusal as the console record of it. The device half is
+    /// `nic_driver_core`'s to name, that being where the tree it walks lives.
+    fn refusal(&self) -> Refusal {
         match self {
-            // Rejected before `PciConfig::new`, so no configuration-space
-            // access has happened: the BAR is unplaced and bus mastering is
-            // still off.
-            Self::PoolDmaBaseUnusable { .. } => false,
-            Self::Device(error) => error.signalled_to_device(),
+            Self::PoolDmaBaseUnusable { region, paddr } => Refusal {
+                cause: region.cause(),
+                detail: RefusalDetail::One(*paddr as u64),
+                // Rejected before `PciConfig::new`, so no configuration-space
+                // access has happened: the BAR is unplaced and bus mastering is
+                // still off, and there is nothing to have signalled through.
+                signalled: false,
+            },
+            Self::Device(error) => error.refusal(),
         }
     }
+}
+
+/// The console as a [`Sink`].
+///
+/// It is the last-resort channel and the only one this build has (CONCEPT §11),
+/// so a line that cannot be rendered is reported as the event it came from
+/// rather than dropped (ENG-12).
+struct Console;
+
+impl Sink for Console {
+    fn emit(&self, event: &Event) {
+        let mut line = [0u8; MAX_LINE_LEN];
+        let rendered = render(event, &mut line)
+            .ok()
+            .and_then(|written| line.get(..written))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok());
+        match rendered {
+            Some(text) => debug_println!("{text}"),
+            None => debug_println!("LFW-PD unrendered={event:?}"),
+        }
+    }
+}
+
+const CONSOLE: Console = Console;
+
+fn announce(state: DomainState, detail: DomainDetail) {
+    CONSOLE.emit(&Event::Domain {
+        domain: Domain::NicDriver,
+        state,
+        detail,
+    });
 }
 
 /// The physical base of a pool region, checked usable as a device DMA base.
@@ -178,10 +225,13 @@ impl PoolDmaBase {
 
 #[protection_domain]
 fn init() -> NicDriver {
-    debug_println!("LIBREFIREWALL_NIC:driver:start");
+    announce(DomainState::Starting, DomainDetail::None);
     match bring_up() {
         Ok((device, mut port)) => {
-            debug_println!("LIBREFIREWALL_NIC:driver-ok rx-posted={QUEUE_SIZE}");
+            announce(
+                DomainState::Ready,
+                DomainDetail::ReceivePosted(QUEUE_SIZE as u32),
+            );
             loop {
                 port.poll_once(&device, &ForwarderChannel);
                 core::hint::spin_loop();
@@ -190,10 +240,7 @@ fn init() -> NicDriver {
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
             // (CONCEPT §11) this line is all an operator gets.
-            debug_println!(
-                "LIBREFIREWALL_NIC:fail error={error:?} signalled={}",
-                error.signalled_to_device()
-            );
+            announce(DomainState::Refused, DomainDetail::Refusal(error.refusal()));
             NicDriver
         }
     }
@@ -235,9 +282,9 @@ fn bring_up() -> Result<(Live<MappedDevice>, DataplanePort<'static>), StartupErr
     let negotiated = unsafe { placed.map(bar) }
         .acknowledge()?
         .negotiate_features()?;
-    debug_println!(
-        "LIBREFIREWALL_NIC:features negotiated={:#x}",
-        negotiated.features()
+    announce(
+        DomainState::Negotiated,
+        DomainDetail::Features(negotiated.features()),
     );
     let configured = negotiated.configure_queues(vq_paddr)?;
 

@@ -16,23 +16,43 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
+"crates/config/src/diff.rs" = 0.1864
+"crates/config/src/hash.rs" = 0.2990
+"crates/config/src/lib.rs" = 0.5354
+"crates/config/src/model.rs" = 0.2519
+"crates/config/src/report.rs" = 0.2368
+"crates/config/src/runtime.rs" = 0.1650
+"crates/config/src/schema.rs" = 0.1518
+"crates/config/src/store.rs" = 0.3136
+"crates/config/src/validate.rs" = 0.1392
+"crates/config/src/value.rs" = 0.2615
+"crates/config/src/xml.rs" = 0.1947
+"crates/log/src/detail.rs" = 0.5902
+"crates/log/src/event.rs" = 0.2070
+"crates/log/src/identifier.rs" = 0.2121
+"crates/log/src/lib.rs" = 0.4225
+"crates/log/src/render.rs" = 0.1622
 "crates/net-headers/src/lib.rs" = 0.1925
 "crates/nic-driver-core/src/bringup.rs" = 0.3693
 "crates/nic-driver-core/src/lib.rs" = 0.4926
 "crates/nic-driver-core/src/port.rs" = 0.4575
 "crates/packet-buffer/src/lib.rs" = 0.4529
-"crates/pd-runtime/src/lib.rs" = 0.4970
+"crates/pd-runtime/src/handover.rs" = 0.3495
+"crates/pd-runtime/src/lib.rs" = 0.4954
 "crates/queue/src/lib.rs" = 0.4260
-"crates/routing/src/lib.rs" = 0.2803
+"crates/routing/src/lib.rs" = 0.2725
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
-"crates/wire/src/lib.rs" = 0.3211
-"pds/forwarder/src/main.rs" = 0.3966
+"crates/wire/src/lib.rs" = 0.2040
+"pds/config/src/main.rs" = 0.4518
+"pds/forwarder/src/main.rs" = 0.3898
 "pds/nic-driver/src/main.rs" = 0.4844
 
 [unsafe-blocks]
+"crates/config" = 0
+"crates/log" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 3
 "crates/packet-buffer" = 3
@@ -41,10 +61,13 @@
 "crates/routing" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
+"pds/config" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 4
 
 [unsafe-fns]
+"crates/config" = 0
+"crates/log" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 1
 "crates/packet-buffer" = 3
@@ -53,10 +76,13 @@
 "crates/routing" = 0
 "crates/virtio" = 4
 "crates/wire" = 0
+"pds/config" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0
 
 [unsafe-impls]
+"crates/config" = 0
+"crates/log" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 0
 "crates/packet-buffer" = 1
@@ -65,5 +91,6 @@
 "crates/routing" = 0
 "crates/virtio" = 0
 "crates/wire" = 0
+"pds/config" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0

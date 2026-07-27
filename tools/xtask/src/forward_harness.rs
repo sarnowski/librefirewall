@@ -23,6 +23,15 @@
 //! header, so a caller asserting on the guest's structured records can never
 //! match something the harness itself wrote.
 //!
+//! The addresses both sides of that contract are stated in are not written
+//! here. They come from the configuration document the image under test was
+//! built from, read by [`crate::topology`]: an endpoint is one of the
+//! document's own `<neighbour>` elements, and the gateway MAC a routed frame
+//! must carry is the MAC of the `<interface>` that neighbour names — which is
+//! also the MAC QEMU is told to put on the port. A contract that expected an
+//! address the appliance had never been configured with is therefore not
+//! something this file can express.
+//!
 //! Every run also yields a [`TrafficReport`]: what each probe was observed to
 //! do, with the delivered ones described by the frame that came back — its
 //! addresses, its TTL, the MAC pair the appliance rewrote it to, its length on
@@ -44,7 +53,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::qemu::PORT_MACS;
+use crate::topology::{Endpoint, PORTS, Topology};
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
 /// TCG (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
@@ -92,54 +101,19 @@ const UDP_PROTOCOL: u8 = 17;
 /// byte-identical; see [`legacy_broadcast_frame`].
 const LOCAL_EXPERIMENTAL_ETHERTYPE: u16 = 0x88b5;
 
-/// One host station on one dataplane port: the address the harness injects as,
-/// and the address a packet routed towards it must be addressed to.
-#[derive(Clone, Copy)]
-struct Endpoint {
-    /// Names this endpoint in a verdict.
-    name: &'static str,
-    port: usize,
-    mac: [u8; 6],
-    address: [u8; 4],
-}
-
-impl Endpoint {
-    /// The MAC of the appliance interface this endpoint's subnet terminates on
-    /// — the destination a packet must carry to be routed, and the source it
-    /// carries once it has been. Taken from [`PORT_MACS`] rather than written
-    /// out, so what the contract expects the appliance to answer to is by
-    /// construction the MAC QEMU puts on that port's NIC.
-    fn gateway_mac(self) -> [u8; 6] {
-        PORT_MACS[self.port]
-    }
-}
-
-/// The two endpoints the routed contract is stated between, one per dataplane
-/// port:
+/// The destination the `no-route` probe is sent to: a documentation address
+/// (RFC 5737) no plausible bench terminates on.
 ///
-/// ```text
-///   A 10.0.0.2                    appliance                   B 10.0.1.2
-///   52:54:00:00:00:0a ── port 0 ── 10.0.0.1/24 ┊ 10.0.1.1/24 ── port 1 ── 52:54:00:00:00:0b
-///                                  52:54:00:12:34:50 ┊ 52:54:00:12:34:51
-/// ```
-///
-/// A cross-artifact fact no build step checks: these four addresses must equal
-/// the `Router<2, 2>` compiled into `pds/forwarder/src/main.rs`, whose own
-/// header records what silently happens if they diverge.
-const ENDPOINTS: [Endpoint; PORT_MACS.len()] = [
-    Endpoint {
-        name: "A",
-        port: 0,
-        mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x0a],
-        address: [10, 0, 0, 2],
-    },
-    Endpoint {
-        name: "B",
-        port: 1,
-        mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x0b],
-        address: [10, 0, 1, 2],
-    },
-];
+/// [`probes`] refuses a bench whose document *does* cover it rather than
+/// injecting it anyway, because a probe the appliance has a route for is one
+/// the appliance may legitimately deliver — and the run would then fail with
+/// the appliance in the right and the harness in the wrong.
+const UNROUTED_DESTINATION: [u8; 4] = [192, 0, 2, 9];
+
+/// The destination MAC the `not-our-mac` probe carries: a station that is not
+/// on this bench, so a frame addressed to it is addressed to nobody the
+/// appliance is. Checked against the bench for the same reason as above.
+const FOREIGN_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x99, 0x99, 0x99];
 
 /// The UDP port pair every probe uses. Fixed rather than varied per probe: the
 /// payload marker is what attributes a delivery, so a second varying field
@@ -416,6 +390,7 @@ fn header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
 }
 
 /// What must become of one injected packet.
+#[derive(Debug)]
 enum Expectation {
     /// It must arrive at endpoint `to`, and be exactly `delivered`. `sent` is
     /// the same packet as it went in, kept so the report can put the TTL the
@@ -432,6 +407,7 @@ enum Expectation {
 }
 
 /// One injected packet and the single thing it proves.
+#[derive(Debug)]
 struct Probe {
     /// Names the probe in a verdict.
     name: &'static str,
@@ -556,6 +532,9 @@ struct Row {
 #[derive(Debug)]
 pub struct TrafficReport {
     rows: Vec<Row>,
+    /// The bench the rows are read against, kept so the topology block heading
+    /// the table is the one the run was actually stated between.
+    endpoints: [Endpoint; PORTS],
 }
 
 impl TrafficReport {
@@ -563,7 +542,12 @@ impl TrafficReport {
     /// each probe, if any, and the index of the probe whose delivery ended the
     /// run. Deriving it here rather than accumulating lines as the run goes
     /// keeps one place deciding what each state means.
-    fn new(probes: &[Probe], deliveries: &[Option<Delivery>], broke: Option<usize>) -> Self {
+    fn new(
+        endpoints: [Endpoint; PORTS],
+        probes: &[Probe],
+        deliveries: &[Option<Delivery>],
+        broke: Option<usize>,
+    ) -> Self {
         let rows = probes
             .iter()
             .zip(deliveries)
@@ -574,10 +558,10 @@ impl TrafficReport {
                     Expectation::Dropped { .. } => None,
                 };
                 let path = match routed {
-                    Some((to, _)) => format!("{}->{}", probe.from.name, to.name),
+                    Some((to, _)) => format!("{}->{}", probe.from.name(), to.name()),
                     // Nothing left the appliance, so naming a far end would
                     // claim a journey the packet never made.
-                    None => format!("{}->.", probe.from.name),
+                    None => format!("{}->.", probe.from.name()),
                 };
                 let (seen, detail) = match (broke == Some(index), delivery, &probe.expectation) {
                     (true, _, _) => (Seen::Broke, "see the verdict below".to_owned()),
@@ -605,7 +589,7 @@ impl TrafficReport {
                 }
             })
             .collect();
-        Self { rows }
+        Self { rows, endpoints }
     }
 
     /// The topology the probes cross, then one line per probe. Printed on a
@@ -620,14 +604,14 @@ impl TrafficReport {
             out.push_str(" (unfinished: a dropped row is only what had not come back yet)");
         }
         out.push('\n');
-        for endpoint in ENDPOINTS {
+        for endpoint in self.endpoints {
             out.push_str(&format!(
                 "    endpoint {}  {}  {}  --  port {}  {}\n",
-                endpoint.name,
+                endpoint.name(),
                 ipv4(endpoint.address),
                 mac(endpoint.mac),
                 endpoint.port,
-                mac(endpoint.gateway_mac()),
+                mac(endpoint.gateway_mac),
             ));
         }
         out.push('\n');
@@ -776,38 +760,64 @@ fn ipv4(address: [u8; 4]) -> String {
     format!("{a}.{b}.{c}.{d}")
 }
 
-/// The packets one boot injects, and what each of them proves.
+/// The packets one boot injects into `topology`'s bench, and what each of them
+/// proves.
 ///
 /// Two must be routed, in opposite directions, and four must be refused: a
 /// packet that cannot survive a hop, one not addressed to the ingress port,
 /// one for a destination no interface prefix covers, and the broadcast frame
 /// the retired L2 contract required to be forwarded byte-identical.
-fn probes() -> Vec<Probe> {
-    let [a, b] = ENDPOINTS;
-    let a_to_b = datagram(a, b, INJECTED_TTL, b"LFW-PROBE/routed-a-to-b");
-    vec![
+///
+/// The probes are named by port rather than by endpoint, because the endpoints
+/// are the document's and a document names them what it likes; a port is the
+/// build's own fact and reads the same under every bench.
+///
+/// # Errors
+/// A bench on which one of the two refusals would be the appliance's to make
+/// differently — the appliance has a route for [`UNROUTED_DESTINATION`], or
+/// something on the bench carries [`FOREIGN_MAC`]. Injecting either anyway
+/// would make the probe assert a rule the document does not impose.
+fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
+    if topology.covers(UNROUTED_DESTINATION) {
+        return Err(format!(
+            "the configuration document gives the appliance a route for {}, so the no-route \
+             probe would be asserting a refusal the appliance is right not to make",
+            ipv4(UNROUTED_DESTINATION)
+        ));
+    }
+    if topology.carries_mac(FOREIGN_MAC) {
+        return Err(format!(
+            "the configuration document puts {} on the bench, so the not-our-mac probe would be \
+             addressed to something the appliance is",
+            mac(FOREIGN_MAC)
+        ));
+    }
+
+    let [a, b] = topology.endpoints();
+    let a_to_b = datagram(a, b, INJECTED_TTL, b"LFW-PROBE/routed-0-to-1");
+    Ok(vec![
         routed(
-            "routed-a-to-b",
-            b"LFW-PROBE/routed-a-to-b",
+            "routed-0-to-1",
+            b"LFW-PROBE/routed-0-to-1",
             a,
             b,
             a_to_b.clone(),
         ),
         routed(
-            "routed-b-to-a",
-            b"LFW-PROBE/routed-b-to-a",
+            "routed-1-to-0",
+            b"LFW-PROBE/routed-1-to-0",
             b,
             a,
-            datagram(b, a, INJECTED_TTL, b"LFW-PROBE/routed-b-to-a"),
+            datagram(b, a, INJECTED_TTL, b"LFW-PROBE/routed-1-to-0"),
         ),
         dropped(
-            "ttl-one-a-to-b",
-            b"LFW-PROBE/ttl-one-a-to-b",
+            "ttl-one-0-to-1",
+            b"LFW-PROBE/ttl-one-0-to-1",
             a,
             "a TTL of 1 cannot survive a hop",
             UdpPacket {
                 ttl: 1,
-                payload: b"LFW-PROBE/ttl-one-a-to-b".to_vec(),
+                payload: b"LFW-PROBE/ttl-one-0-to-1".to_vec(),
                 ..a_to_b.clone()
             },
         ),
@@ -817,7 +827,7 @@ fn probes() -> Vec<Probe> {
             a,
             "its destination MAC is another station's, so it is not addressed to the appliance",
             UdpPacket {
-                destination_mac: [0x52, 0x54, 0x00, 0x99, 0x99, 0x99],
+                destination_mac: FOREIGN_MAC,
                 payload: b"LFW-PROBE/not-our-mac".to_vec(),
                 ..a_to_b.clone()
             },
@@ -826,9 +836,9 @@ fn probes() -> Vec<Probe> {
             "no-route",
             b"LFW-PROBE/no-route",
             a,
-            "no interface prefix covers 192.0.2.9",
+            "no interface prefix covers the destination",
             UdpPacket {
-                destination: [192, 0, 2, 9],
+                destination: UNROUTED_DESTINATION,
                 payload: b"LFW-PROBE/no-route".to_vec(),
                 ..a_to_b
             },
@@ -842,14 +852,14 @@ fn probes() -> Vec<Probe> {
                 because: "it is neither IPv4 nor addressed to the port's own MAC",
             },
         },
-    ]
+    ])
 }
 
 /// The datagram `from` sends `to`: addressed at L2 to the appliance interface
 /// it is attached to, and at L3 to the far endpoint.
 fn datagram(from: Endpoint, to: Endpoint, ttl: u8, marker: &[u8]) -> UdpPacket {
     UdpPacket {
-        destination_mac: from.gateway_mac(),
+        destination_mac: from.gateway_mac,
         source_mac: from.mac,
         source: from.address,
         destination: to.address,
@@ -874,7 +884,7 @@ fn routed(
 ) -> Probe {
     let delivered = UdpPacket {
         destination_mac: to.mac,
-        source_mac: to.gateway_mac(),
+        source_mac: to.gateway_mac,
         ttl: sent.ttl - 1,
         ..sent.clone()
     };
@@ -952,13 +962,18 @@ pub struct BootTest<'a> {
     /// recording how QEMU was configured. Reading a failure log must never
     /// require guessing whether the run was accelerated.
     pub log_header: &'a str,
+    /// The bench, read out of the configuration document the image under test
+    /// was built from. It decides every address the probes carry, so a boot can
+    /// only ever be judged against the addressing the appliance in it was
+    /// actually configured with.
+    pub topology: &'a Topology,
 }
 
 /// The host side of the two NIC ports: one loopback listener per port that
 /// QEMU's `socket` netdevs dial into, so the port identity of each accepted
 /// stream is unambiguous.
 pub struct NicBackends {
-    listeners: [TcpListener; ENDPOINTS.len()],
+    listeners: [TcpListener; PORTS],
 }
 
 impl NicBackends {
@@ -971,8 +986,9 @@ impl NicBackends {
     /// Append the two socket-backed virtio NICs to a QEMU invocation. Each
     /// port's `socket` netdev dials the corresponding host listener; the
     /// `-device` string (PCI address, MAC, no option ROM) is the single
-    /// definition shared with interactive runs via [`crate::qemu::nic_device`].
-    pub fn apply(&self, command: &mut Command) -> Result<(), String> {
+    /// definition shared with interactive runs via [`crate::qemu::nic_device`],
+    /// which takes the MAC from `topology`'s interface on that port.
+    pub fn apply(&self, command: &mut Command, topology: &Topology) -> Result<(), String> {
         for (port, listener) in self.listeners.iter().enumerate() {
             let tcp = listener
                 .local_addr()
@@ -982,7 +998,7 @@ impl NicBackends {
                 .arg("-netdev")
                 .arg(format!("socket,id=n{port},connect=127.0.0.1:{tcp}"))
                 .arg("-device")
-                .arg(crate::qemu::nic_device(port));
+                .arg(crate::qemu::nic_device(topology, port)?);
         }
         Ok(())
     }
@@ -1065,6 +1081,12 @@ fn run_boot(
     total_timeout: Duration,
 ) -> Result<Booted, String> {
     let log_path = test.log_path;
+    // Built before QEMU is spawned: a bench this harness cannot play is the
+    // caller's mistake and must be reported as one, not as a process nobody
+    // reaped.
+    let stations = test.topology.endpoints();
+    let probes = probes(test.topology)?;
+
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1098,13 +1120,12 @@ fn run_boot(
 
     // What the run observed, held outside the block that fills it so the report
     // can be built on every exit path rather than only where the run succeeded.
-    let probes = probes();
     let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
     let mut broke: Option<usize> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept both of QEMU's socket dial-ins.
-        let mut streams: [Option<TcpStream>; ENDPOINTS.len()] = [None, None];
+        let mut streams: [Option<TcpStream>; PORTS] = [None, None];
         while streams.iter().any(Option::is_none) {
             drain(&serial_receiver, &mut output);
             for (port, listener) in backends.listeners.iter().enumerate() {
@@ -1143,7 +1164,7 @@ fn run_boot(
         // path from blocking on a full host socket buffer.
         let (frame_sender, frame_receiver) = mpsc::channel();
         let mut endpoints: Vec<AttachedEndpoint> = Vec::new();
-        for (endpoint, stream) in ENDPOINTS.into_iter().zip(streams) {
+        for (endpoint, stream) in stations.into_iter().zip(streams) {
             if let Err(error) = stream.set_nonblocking(false) {
                 break 'run Err(format!("set NIC socket blocking: {error}"));
             }
@@ -1293,7 +1314,7 @@ fn run_boot(
     drain(&serial_receiver, &mut output);
 
     let outcome = decide(outcome, &test.contract, &output, log_path);
-    let traffic = TrafficReport::new(&probes, &deliveries, broke);
+    let traffic = TrafficReport::new(stations, &probes, &deliveries, broke);
 
     // Persisting the log must never destroy the verdict that produced it, so
     // the two are reported together rather than one replacing the other.
@@ -1409,7 +1430,8 @@ fn describe_injection_failures(endpoints: &[AttachedEndpoint]) -> String {
             attached.injection_failure.as_ref().map(|error| {
                 format!(
                     "endpoint {} on port{}: {error}",
-                    attached.endpoint.name, attached.endpoint.port
+                    attached.endpoint.name(),
+                    attached.endpoint.port
                 )
             })
         })
@@ -1552,21 +1574,37 @@ mod tests {
 
     const HEADER: &str = "# test header\n";
 
-    fn routed_test(log: &Path) -> BootTest<'_> {
+    /// The bench the appliance's own document describes — the same one
+    /// scenario 1 boots against, so a probe built here is the probe the gate
+    /// injects.
+    fn bench() -> Topology {
+        Topology::from_document(include_bytes!(
+            "../../../systems/qemu-x86_64/configuration.xml"
+        ))
+        .expect("the shipped document describes the bench")
+    }
+
+    fn endpoints() -> [Endpoint; PORTS] {
+        bench().endpoints()
+    }
+
+    fn routed_test<'a>(log: &'a Path, topology: &'a Topology) -> BootTest<'a> {
         BootTest {
             contract: BootContract::Routed,
             log_path: log,
             log_header: HEADER,
+            topology,
         }
     }
 
-    /// The A->B packet as injected, and the delivery it must produce.
+    /// The port-0-to-port-1 packet as injected, and the delivery it must
+    /// produce.
     fn a_to_b() -> (UdpPacket, UdpPacket) {
-        let [a, b] = ENDPOINTS;
-        let sent = datagram(a, b, INJECTED_TTL, b"marker-a-to-b");
+        let [a, b] = endpoints();
+        let sent = datagram(a, b, INJECTED_TTL, b"marker-0-to-1");
         let delivered = UdpPacket {
             destination_mac: b.mac,
-            source_mac: b.gateway_mac(),
+            source_mac: b.gateway_mac,
             ttl: INJECTED_TTL - 1,
             ..sent.clone()
         };
@@ -1574,21 +1612,103 @@ mod tests {
     }
 
     #[test]
-    fn the_topology_names_the_gateway_macs_qemu_puts_on_the_ports() {
+    fn the_bench_names_the_gateway_macs_qemu_puts_on_the_ports() {
         // The contract expects the appliance to answer to these, and QEMU is
         // what actually assigns them: a harness that expected a MAC no port
         // carries would fail with every frame refused and no reason visible.
-        for endpoint in ENDPOINTS {
+        // Both sides now read the same document, so this is a check that the
+        // derivation on each side lands on the same value rather than a check
+        // between two literals.
+        let topology = bench();
+        for endpoint in topology.endpoints() {
             assert!(
-                crate::qemu::nic_device(endpoint.port).contains(&mac(endpoint.gateway_mac())),
+                crate::qemu::nic_device(&topology, endpoint.port)
+                    .unwrap()
+                    .contains(&mac(endpoint.gateway_mac)),
                 "endpoint {} expects a gateway MAC port{} does not carry",
-                endpoint.name,
+                endpoint.name(),
                 endpoint.port
             );
-            assert_ne!(endpoint.mac, endpoint.gateway_mac());
+            assert_ne!(endpoint.mac, endpoint.gateway_mac);
         }
-        assert_ne!(ENDPOINTS[0].mac, ENDPOINTS[1].mac);
-        assert_ne!(ENDPOINTS[0].address, ENDPOINTS[1].address);
+        let [a, b] = topology.endpoints();
+        assert_ne!(a.mac, b.mac);
+        assert_ne!(a.address, b.address);
+    }
+
+    /// A bench the appliance has a route into, or one carrying the MAC a
+    /// refused probe is addressed to, would make two of the negatives assert a
+    /// rule the document does not impose. Both are refused rather than
+    /// injected.
+    #[test]
+    fn a_bench_that_would_make_a_refusal_wrong_is_refused_before_qemu_starts() {
+        let covering = Topology::from_document(
+            concat!(
+                "<configuration><interfaces>",
+                "<interface id=\"one\" port=\"0\" enabled=\"true\" mac=\"52:54:00:12:34:50\" ",
+                "address=\"192.0.2.1\" prefix-length=\"24\"/>",
+                "<interface id=\"two\" port=\"1\" enabled=\"true\" mac=\"52:54:00:12:34:51\" ",
+                "address=\"10.0.1.1\" prefix-length=\"24\"/>",
+                "</interfaces><neighbours>",
+                "<neighbour id=\"one-a\" interface=\"one\" address=\"192.0.2.2\" ",
+                "mac=\"52:54:00:00:00:0a\"/>",
+                "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
+                "mac=\"52:54:00:00:00:0b\"/>",
+                "</neighbours></configuration>"
+            )
+            .as_bytes(),
+        )
+        .expect("a valid document");
+        let verdict = probes(&covering).expect_err("the appliance has a route for 192.0.2.9");
+        assert!(verdict.contains("192.0.2.9"), "{verdict}");
+
+        let claiming = Topology::from_document(
+            concat!(
+                "<configuration><interfaces>",
+                "<interface id=\"one\" port=\"0\" enabled=\"true\" mac=\"52:54:00:99:99:99\" ",
+                "address=\"10.0.0.1\" prefix-length=\"24\"/>",
+                "<interface id=\"two\" port=\"1\" enabled=\"true\" mac=\"52:54:00:12:34:51\" ",
+                "address=\"10.0.1.1\" prefix-length=\"24\"/>",
+                "</interfaces><neighbours>",
+                "<neighbour id=\"one-a\" interface=\"one\" address=\"10.0.0.2\" ",
+                "mac=\"52:54:00:00:00:0a\"/>",
+                "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
+                "mac=\"52:54:00:00:00:0b\"/>",
+                "</neighbours></configuration>"
+            )
+            .as_bytes(),
+        )
+        .expect("a valid document");
+        let verdict = probes(&claiming).expect_err("a port carries the foreign MAC");
+        assert!(verdict.contains("52:54:00:99:99:99"), "{verdict}");
+    }
+
+    /// The bench the alternate scenario plays: every probe on it must carry
+    /// that document's addresses and none of the shipped one's, or scenario 3
+    /// would prove nothing.
+    #[test]
+    fn a_probe_carries_the_addresses_of_the_document_it_was_built_from() {
+        let alternate =
+            Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
+                .expect("the alternate document describes a bench");
+        let shipped_probes = probes(&bench()).expect("the shipped bench");
+        let alternate_probes = probes(&alternate).expect("the alternate bench");
+
+        assert_eq!(shipped_probes.len(), alternate_probes.len());
+        for (shipped, other) in shipped_probes.iter().zip(&alternate_probes) {
+            assert_eq!(shipped.name, other.name);
+            // The legacy L2 frame carries no address of either bench, so it is
+            // the one probe the two documents agree on.
+            if shipped.name == "legacy-l2-broadcast" {
+                assert_eq!(shipped.frame, other.frame);
+                continue;
+            }
+            assert_ne!(
+                shipped.frame, other.frame,
+                "probe {} is the same on both benches",
+                shipped.name
+            );
+        }
     }
 
     #[test]
@@ -1645,14 +1765,14 @@ mod tests {
         let (sent, delivered) = a_to_b();
         let probe = routed(
             "under-test",
-            b"marker-a-to-b",
-            ENDPOINTS[0],
-            ENDPOINTS[1],
+            b"marker-0-to-1",
+            endpoints()[0],
+            endpoints()[1],
             sent,
         );
 
         probe
-            .judge(ENDPOINTS[1].port, &delivered.build())
+            .judge(endpoints()[1].port, &delivered.build())
             .expect("the delivery the route produces is the one the matcher accepts");
 
         // One mutation per field the contract names; each must be refused, and
@@ -1710,7 +1830,7 @@ mod tests {
         ];
         for (field, mutated) in mutations {
             let verdict = probe
-                .judge(ENDPOINTS[1].port, &mutated.build())
+                .judge(endpoints()[1].port, &mutated.build())
                 .expect_err("a mutated field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
         }
@@ -1718,11 +1838,11 @@ mod tests {
         // The payload is compared as bytes, so an altered marker is refused as
         // a payload difference rather than as an unattributable frame.
         let altered = UdpPacket {
-            payload: b"marker-a-to-C".to_vec(),
+            payload: b"marker-0-to-C".to_vec(),
             ..delivered.clone()
         };
         let verdict = probe
-            .judge(ENDPOINTS[1].port, &altered.build())
+            .judge(endpoints()[1].port, &altered.build())
             .expect_err("an altered payload must be refused");
         assert!(verdict.contains("payload"), "{verdict}");
 
@@ -1731,7 +1851,7 @@ mod tests {
         let mut stale = delivered.build();
         stale[ETHERNET_HEADER_LEN + 10] ^= 0xff;
         let verdict = probe
-            .judge(ENDPOINTS[1].port, &stale)
+            .judge(endpoints()[1].port, &stale)
             .expect_err("a stale checksum must be refused");
         assert!(
             verdict.contains("header checksum") && verdict.contains("not a well-formed"),
@@ -1743,13 +1863,13 @@ mod tests {
         let mut padded = delivered.build();
         padded.push(0x99);
         let verdict = probe
-            .judge(ENDPOINTS[1].port, &padded)
+            .judge(endpoints()[1].port, &padded)
             .expect_err("a frame longer than the contract must be refused");
         assert!(verdict.contains("differs outside them"), "{verdict}");
 
         // The right packet on the wrong port is not a delivery.
         let verdict = probe
-            .judge(ENDPOINTS[0].port, &delivered.build())
+            .judge(endpoints()[0].port, &delivered.build())
             .expect_err("the far port is part of the contract");
         assert!(
             verdict.contains("port0") && verdict.contains("port1"),
@@ -1911,7 +2031,7 @@ mod tests {
 
     #[test]
     fn every_probe_is_attributable_to_itself_alone() {
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         assert_eq!(probes.len(), 6);
         for probe in &probes {
             assert!(
@@ -1936,7 +2056,7 @@ mod tests {
 
     #[test]
     fn the_two_routed_probes_cross_the_appliance_in_opposite_directions() {
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         let routes: Vec<(usize, usize)> = probes
             .iter()
             .filter_map(|probe| match &probe.expectation {
@@ -1951,11 +2071,11 @@ mod tests {
     fn every_refused_probe_is_refused_wherever_it_surfaces() {
         // The negatives carry no egress port, so a delivery on either port is a
         // failure — and the verdict has to name the rule that was broken.
-        for probe in probes() {
+        for probe in probes(&bench()).expect("the shipped bench") {
             let Expectation::Dropped { because } = probe.expectation else {
                 continue;
             };
-            for port in 0..ENDPOINTS.len() {
+            for port in 0..PORTS {
                 let verdict = probe
                     .judge(port, &probe.frame)
                     .expect_err("a refused probe must never be accepted");
@@ -1983,7 +2103,7 @@ mod tests {
 
     #[test]
     fn the_routed_contract_is_only_met_once_both_directions_have_arrived() {
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         let at = |name: &str| {
             probes
                 .iter()
@@ -1993,7 +2113,7 @@ mod tests {
 
         // Marking every refused probe cannot satisfy the contract: only the two
         // routed ones count towards it.
-        let arrived = arrival(&probes[at("routed-a-to-b")]);
+        let arrived = arrival(&probes[at("routed-0-to-1")]);
         let mut deliveries: Vec<Option<Delivery>> = probes
             .iter()
             .map(|probe| match probe.expectation {
@@ -2004,12 +2124,12 @@ mod tests {
         assert!(!all_routed(&probes, &deliveries));
 
         deliveries = vec![None; probes.len()];
-        deliveries[at("routed-a-to-b")] = Some(arrived);
+        deliveries[at("routed-0-to-1")] = Some(arrived);
         assert!(!all_routed(&probes, &deliveries));
         let pending = describe_pending(&probes, &deliveries);
         assert!(
-            pending.contains("routed: [routed-a-to-b]")
-                && pending.contains("never arrived: [routed-b-to-a]"),
+            pending.contains("routed: [routed-0-to-1]")
+                && pending.contains("never arrived: [routed-1-to-0]"),
             "{pending}"
         );
 
@@ -2018,16 +2138,16 @@ mod tests {
         assert!(is_delivered(
             &probes,
             &deliveries,
-            &probes[at("routed-a-to-b")]
+            &probes[at("routed-0-to-1")]
         ));
         assert!(!is_delivered(
             &probes,
             &deliveries,
-            &probes[at("routed-b-to-a")]
+            &probes[at("routed-1-to-0")]
         ));
         assert!(!is_delivered(&probes, &deliveries, &probes[at("no-route")]));
 
-        deliveries[at("routed-b-to-a")] = Some(arrival(&probes[at("routed-b-to-a")]));
+        deliveries[at("routed-1-to-0")] = Some(arrival(&probes[at("routed-1-to-0")]));
         assert!(all_routed(&probes, &deliveries));
     }
 
@@ -2050,7 +2170,7 @@ mod tests {
         // Every number below is checked against the frame, so a row rendered
         // from the expectation instead would still read plausibly and would
         // stop proving anything.
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         let deliveries: Vec<Option<Delivery>> = probes
             .iter()
             .map(|probe| match probe.expectation {
@@ -2058,7 +2178,7 @@ mod tests {
                 Expectation::Dropped { .. } => None,
             })
             .collect();
-        let report = TrafficReport::new(&probes, &deliveries, None);
+        let report = TrafficReport::new(endpoints(), &probes, &deliveries, None);
         let rendered = report.render();
 
         assert_eq!(report.summary(), "2 routed, 4 dropped");
@@ -2071,13 +2191,16 @@ mod tests {
         }
         // A->B: the far endpoint's address and MAC, the far interface as the
         // new source MAC, one TTL gone, and the length the frame arrived at.
-        let [a, b] = ENDPOINTS;
-        let delivered = "delivered  routed-a-to-b";
+        let [a, b] = endpoints();
+        let delivered = "delivered  routed-0-to-1";
         let line = rendered
             .lines()
             .find(|line| line.contains(delivered))
-            .unwrap_or_else(|| panic!("no delivered row for routed-a-to-b:\n{rendered}"));
-        assert!(line.contains(&format!("{}->{}", a.name, b.name)), "{line}");
+            .unwrap_or_else(|| panic!("no delivered row for routed-0-to-1:\n{rendered}"));
+        assert!(
+            line.contains(&format!("{}->{}", a.name(), b.name())),
+            "{line}"
+        );
         assert!(
             line.contains(&format!("{}:{SOURCE_PORT} -> ", ipv4(a.address)))
                 && line.contains(&format!("{}:{DESTINATION_PORT}", ipv4(b.address))),
@@ -2088,10 +2211,10 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains(&format!("mac {}->{}", mac(b.gateway_mac()), mac(b.mac))),
+            line.contains(&format!("mac {}->{}", mac(b.gateway_mac), mac(b.mac))),
             "{line}"
         );
-        let frame_len = MIN_ETHERNET_FRAME.max(MIN_UDP_FRAME + b"LFW-PROBE/routed-a-to-b".len());
+        let frame_len = MIN_ETHERNET_FRAME.max(MIN_UDP_FRAME + b"LFW-PROBE/routed-0-to-1".len());
         assert!(line.contains(&format!("{frame_len} bytes")), "{line}");
 
         // Every refused probe reports the rule it demonstrates, and none of
@@ -2106,21 +2229,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("no row for {}:\n{rendered}", probe.name));
             assert!(line.contains("dropped") && line.contains(because), "{line}");
             assert!(
-                line.contains(&format!("{}->.", probe.from.name)),
+                line.contains(&format!("{}->.", probe.from.name())),
                 "a refused probe reached no far end: {line}"
             );
         }
 
         // The topology the rows are read against, so the MACs in them can be
         // attributed to an endpoint or to an appliance port.
-        for endpoint in ENDPOINTS {
+        for endpoint in endpoints() {
             assert!(
                 rendered.contains(&format!(
                     "endpoint {}  {}  {}",
-                    endpoint.name,
+                    endpoint.name(),
                     ipv4(endpoint.address),
                     mac(endpoint.mac)
-                )) && rendered.contains(&mac(endpoint.gateway_mac())),
+                )) && rendered.contains(&mac(endpoint.gateway_mac)),
                 "{rendered}"
             );
         }
@@ -2132,7 +2255,7 @@ mod tests {
         // three states a failed run distinguishes must be visible in it: the
         // probe that broke the contract, the one still outstanding, and the
         // refusals that behaved.
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         let at = |name: &str| {
             probes
                 .iter()
@@ -2140,9 +2263,10 @@ mod tests {
                 .expect("the probe set names this probe")
         };
         let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
-        deliveries[at("routed-a-to-b")] = Some(arrival(&probes[at("routed-a-to-b")]));
+        deliveries[at("routed-0-to-1")] = Some(arrival(&probes[at("routed-0-to-1")]));
 
-        let report = TrafficReport::new(&probes, &deliveries, Some(at("routed-b-to-a")));
+        let report =
+            TrafficReport::new(endpoints(), &probes, &deliveries, Some(at("routed-1-to-0")));
         let rendered = report.render();
         let row = |name: &str| {
             rendered
@@ -2152,12 +2276,12 @@ mod tests {
                 .to_owned()
         };
 
-        assert!(row("routed-b-to-a").contains("failed"), "{rendered}");
+        assert!(row("routed-1-to-0").contains("failed"), "{rendered}");
         assert!(
             rendered.contains("unfinished"),
             "a run that ended early must not present its refusals as judged: {rendered}"
         );
-        assert!(row("routed-a-to-b").contains("delivered"), "{rendered}");
+        assert!(row("routed-0-to-1").contains("delivered"), "{rendered}");
         assert!(row("no-route").contains("dropped"), "{rendered}");
         // One direction delivered is not two, and the failure must not be
         // countable as either outcome.
@@ -2166,7 +2290,7 @@ mod tests {
         // A routed probe that simply never arrived is neither a failure of its
         // own nor a delivery: it is outstanding, and says so.
         let nothing: Vec<Option<Delivery>> = vec![None; probes.len()];
-        let outstanding = TrafficReport::new(&probes, &nothing, None);
+        let outstanding = TrafficReport::new(endpoints(), &probes, &nothing, None);
         assert!(
             outstanding.render().contains("missing"),
             "{}",
@@ -2181,7 +2305,7 @@ mod tests {
         // only reachable where a delivery was recorded against a probe that
         // must never produce one. Reporting it as "dropped" would render the
         // one case the contract exists to catch as a pass.
-        let probes = probes();
+        let probes = probes(&bench()).expect("the shipped bench");
         let refused = probes
             .iter()
             .position(|probe| matches!(probe.expectation, Expectation::Dropped { .. }))
@@ -2189,7 +2313,7 @@ mod tests {
         let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
         deliveries[refused] = Some(arrival(&probes[0]));
 
-        let report = TrafficReport::new(&probes, &deliveries, None);
+        let report = TrafficReport::new(endpoints(), &probes, &deliveries, None);
         let line = report
             .render()
             .lines()
@@ -2207,7 +2331,7 @@ mod tests {
     fn nic_backends_produce_per_port_socket_and_device_arguments() {
         let backends = NicBackends::new().unwrap();
         let mut command = Command::new("qemu-system-x86_64");
-        backends.apply(&mut command).unwrap();
+        backends.apply(&mut command, &bench()).unwrap();
 
         let args: Vec<String> = command
             .get_args()
@@ -2295,7 +2419,7 @@ mod tests {
         assert_eq!(receiver.recv().unwrap(), (0, Vec::new()));
         assert!(receiver.recv().is_err(), "decoder closes after EOF");
         decoder.join().unwrap().unwrap();
-        for probe in probes() {
+        for probe in probes(&bench()).expect("the shipped bench") {
             assert!(!contains(&[], probe.marker));
         }
     }
@@ -2316,24 +2440,27 @@ mod tests {
         assert_eq!(describe_injection_failures(&[]), "");
 
         let described = describe_injection_failures(&[
-            attached(ENDPOINTS[0], None),
+            attached(endpoints()[0], None),
             attached(
-                ENDPOINTS[1],
+                endpoints()[1],
                 Some(io::Error::new(io::ErrorKind::BrokenPipe, "gone")),
             ),
         ]);
         assert!(described.contains("port1"), "unexpected: {described}");
         assert!(!described.contains("port0"), "unexpected: {described}");
         assert!(described.contains("gone"), "the cause must survive");
-        assert!(described.contains('B'), "the endpoint must be named");
+        assert!(
+            described.contains(endpoints()[1].name()),
+            "the endpoint must be named by the id the document gave it: {described}"
+        );
 
         let described = describe_injection_failures(&[
             attached(
-                ENDPOINTS[0],
+                endpoints()[0],
                 Some(io::Error::new(io::ErrorKind::BrokenPipe, "left")),
             ),
             attached(
-                ENDPOINTS[1],
+                endpoints()[1],
                 Some(io::Error::new(io::ErrorKind::BrokenPipe, "right")),
             ),
         ]);
@@ -2357,7 +2484,7 @@ mod tests {
         // A broken socket must not be retried on every cadence tick, and the
         // first reason must be the one reported rather than the last.
         let mut endpoint = attached(
-            ENDPOINTS[0],
+            endpoints()[0],
             Some(io::Error::new(io::ErrorKind::BrokenPipe, "first")),
         );
         endpoint.inject(b"anything");
@@ -2424,7 +2551,7 @@ mod tests {
         let error = run_boot(
             Command::new("true"),
             backends,
-            routed_test(&log),
+            routed_test(&log, &bench()),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )
@@ -2451,7 +2578,7 @@ mod tests {
         let error = run_boot(
             child,
             backends,
-            routed_test(&log),
+            routed_test(&log, &bench()),
             Duration::from_millis(300),
             Duration::from_millis(600),
         )
@@ -2475,7 +2602,7 @@ mod tests {
         let error = run_boot(
             Command::new("true"),
             backends,
-            routed_test(log),
+            routed_test(log, &bench()),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )

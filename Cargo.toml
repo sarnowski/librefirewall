@@ -6,11 +6,14 @@ members = [
     "crates/packet-buffer",
     "crates/net-headers",
     "crates/routing",
+    "crates/log",
     "crates/virtio",
     "crates/pd-runtime",
     "crates/nic-driver-core",
+    "crates/config",
     "pds/nic-driver",
     "pds/forwarder",
+    "pds/config",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, not a shipping configuration.
+
+     `systems/qemu-x86_64/configuration.xml` is the appliance's own document
+     and the only one a release embeds. This one exists so a second image can
+     be built from a document that shares nothing with it — a different /24
+     pair, different interface MACs, different station MACs, different ids —
+     and the routed contract restated against it. Forwarding that follows this
+     file is the only evidence that the dataplane reads its table from the
+     document rather than carrying one compiled in; two documents that agreed
+     anywhere would leave a stale table able to satisfy both.
+
+     It lives beside the harness that boots it rather than in `systems/`,
+     where a second file would read as a second appliance configuration
+     somebody could ship. Nothing outside `tools/xtask` names it. -->
+<configuration>
+    <interfaces>
+        <interface id="uplink" port="0" enabled="true"
+                   mac="52:54:00:ab:cd:e0" address="172.20.5.1" prefix-length="24"/>
+        <interface id="downlink" port="1" enabled="true"
+                   mac="52:54:00:ab:cd:e1" address="172.20.6.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="peer-north" interface="uplink"
+                   address="172.20.5.7" mac="52:54:00:be:ef:07"/>
+        <neighbour id="peer-south" interface="downlink"
+                   address="172.20.6.9" mac="52:54:00:be:ef:09"/>
+    </neighbours>
+</configuration>

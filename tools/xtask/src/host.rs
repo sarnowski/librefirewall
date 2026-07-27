@@ -41,9 +41,11 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "packet-buffer",
     "net-headers",
     "routing",
+    "lfw-log",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
+    "config",
     "xtask",
 ];
 
@@ -62,22 +64,24 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "packet-buffer",
     "net-headers",
     "routing",
+    "lfw-log",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
+    "config",
 ];
 
 /// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced
 /// by the fast gate so a coverage regression fails locally and in CI. Set well
-/// below the measured ~99.7% combined coverage: a real floor that is not
+/// below the measured ~99.3% combined coverage: a real floor that is not
 /// flaky. Raise it as coverage rises; never lower it to land a change.
 const LIBRARY_COVERAGE_FLOOR_PCT: u32 = 94;
 
 /// Minimum line coverage EACH library crate must hold on its own. The combined
 /// floor alone lets one crate regress heavily while the high-coverage crates
 /// keep the total above [`LIBRARY_COVERAGE_FLOOR_PCT`]; this per-crate floor
-/// closes that gap. Set well below the current per-crate minimum (pd-runtime
-/// ~98.6%) so it is a real, non-flaky floor; raise it as the weakest crate
+/// closes that gap. Set well below the current per-crate minimum (routing
+/// ~98.4%) so it is a real, non-flaky floor; raise it as the weakest crate
 /// rises, never lower it to land a change.
 const LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT: u32 = 90;
 
@@ -105,14 +109,16 @@ const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio", "pd-runtim
 /// "the shipped profile is the tested profile" applied one stage earlier.
 const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFIG];
 
-/// Persistent fuzz targets under `fuzz/`, driven by `fuzz`.
-/// The persistent fuzz targets, ordered from the smallest, most self-contained
-/// untrusted-input surface to the deepest composite one, matching the harness
-/// list in `fuzz/src/lib.rs`. One defect often reaches several targets, and the
-/// narrowest one that reproduces it is the one worth reading, so it runs first.
+/// The persistent fuzz targets under `fuzz/`, driven by [`fuzz`], ordered from
+/// the smallest, most self-contained untrusted-input surface to the deepest
+/// composite one, matching the harness list in `fuzz/src/lib.rs`. One defect
+/// often reaches several targets, and the narrowest one that reproduces it is
+/// the one worth reading, so it runs first.
 const FUZZ_TARGETS: &[&str] = &[
+    "config_image",
     "free_list_ownership",
     "route_frame",
+    "config_document",
     "spsc_ring_peer",
     "virtqueue_poll",
     "pd_runtime_pipeline",
@@ -135,6 +141,12 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // makes `make test` catch a divergence with no image build at all — and
     // `ci` and `release` reach it through this function anyway.
     sysdesc::check(root)?;
+    // And for the third time the same argument: the configuration document is
+    // a source-controlled input the protection domains are built from, so a
+    // document the appliance would refuse is a finding available for the cost
+    // of reading one file. Without this the fast gate accepts a document that
+    // only fails at `make image`, minutes later and behind a compile.
+    image::check_configuration(root, Path::new(image::CONFIGURATION_DOCUMENT))?;
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -237,6 +249,15 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
                 .env(
                     "CARGO_TARGET_DIR",
                     root.join("target/lint-sel4").join(config),
+                )
+                // The configuration domain embeds this document through
+                // `include_bytes!(env!(…))`, so without it the lint would not
+                // reach a single lint — it would fail to expand. Named here
+                // exactly as `image` names it, because a lint of a domain built
+                // from a different document is a lint of a different binary.
+                .env(
+                    image::CONFIG_PATH_VAR,
+                    root.join(image::CONFIGURATION_DOCUMENT),
                 )
                 .args([
                     "clippy",
@@ -610,17 +631,65 @@ mod tests {
             "forwarder",
             CoverageExclusion::OnlyObservableUnderSel4 {
                 qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
-                                forwarding contract in both directions at once; a frame \
-                                egresses on the opposite port, rewritten for its next hop, only \
-                                if this domain attached both `ForwardRings` regions and both \
-                                pools in `init` and drove both `RouteStage`s in `notified`, \
-                                which is every statement it has. What that cannot reach is the \
-                                routing configuration itself: a wrong MAC or prefix in the \
-                                `const` table is a `Router::decide` drop, which this evidence \
-                                sees as no frame at all rather than as a misconfiguration. \
-                                `xtask test-ab` re-asserts it on the selected slot in six of \
+                                forwarding contract in both directions at once, and this domain \
+                                cannot satisfy it by accident: it starts on the fail-closed \
+                                generation 0, whose empty table forwards nothing at all. A frame \
+                                egressing on the opposite port, rewritten for its next hop, \
+                                therefore proves `init` attached both `ForwardRings` regions, \
+                                both pools and both configuration regions, and that `notified` \
+                                took the offered image, acknowledged it, switched to it at a \
+                                poll boundary and then drove both `RouteStage`s under it. The \
+                                `alternate-configuration` scenario boots a second disk whose \
+                                document shares no address and no MAC with the first, so the \
+                                table those frames were decided by is the one that crossed the \
+                                handover rather than one this binary could have held. `xtask \
+                                test-ab` re-asserts the contract on the slot it selected in six \
+                                of its eight scenarios.",
+                residue: Some(
+                    "The refusal arm of the handover — rendering the offer's \
+                     `Event::ConfigRejected` to the console, and withholding the signal that \
+                     tells the publisher a generation was staged — is reached by no QEMU test. \
+                     `xtask image` validates the document every scenario is built from, so \
+                     `image_from` can only produce an image `ConfigImage::check` accepts under \
+                     this build's port count, and `take_offer` answers `Offer::Staged` on every \
+                     boot. Refusing an offered configuration rather than forwarding under one \
+                     nobody checked is the fail-closed property itself; the decision behind it is \
+                     floored in `pd_runtime`, but this domain's reaction to it is first-party \
+                     logic sitting in a PD where neither the host floor nor the QEMU gate reaches \
+                     it — the layering defect LAY-2 names. Closing it means moving that reaction \
+                     beside `take_offer`: one call taking this domain's `Sink`, emitting whatever \
+                     the offer has to say, and returning whether the publisher must be signalled, \
+                     which leaves the domain a call and a `notify` and puts the arm under the \
+                     host coverage floor.",
+                ),
+            },
+        ),
+        (
+            "config-pd",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
+                                forwarding contract, which this domain is on the critical path \
+                                of: the forwarder comes up fail-closed on generation 0 and \
+                                forwards nothing, so a frame egressing at all proves this domain \
+                                read the document compiled into it, committed it, wrote the \
+                                handover image, published the offer, and released the commit once \
+                                the consumer had acknowledged it — `init` and `notified` \
+                                together, which is every statement it has. `xtask test-ab` \
+                                re-asserts the same contract on the slot it selected in six of \
                                 its eight scenarios.",
-                residue: None,
+                residue: Some(
+                    "The refusal branch — announcing `DomainState::Refused` and leaving the \
+                     handover region untouched — is reached by no QEMU test: `xtask image` \
+                     validates the one document every scenario boots, so only the accepting \
+                     branch ever runs. Choosing to publish nothing rather than something weaker \
+                     is the fail-closed property itself, and it is first-party decision logic \
+                     sitting in a PD where neither the host floor nor the QEMU gate reaches it — \
+                     the layering defect LAY-2 names. Closing it means moving the \
+                     commit-or-refuse decision into `crates/config` beside \
+                     `commit_and_report`, returning whether anything was offered and leaving the \
+                     domain with the publish call alone, which puts the branch under the host \
+                     coverage floor.",
+                ),
             },
         ),
         ("xtask", CoverageExclusion::BuildOrchestration),

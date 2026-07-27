@@ -11,6 +11,8 @@
 //! | [`virtio_pci`] | `virtio::pci` capability walk and BAR bounds, and the `nic_driver_core` bring-up typestate above them | a hostile or malfunctioning device |
 //! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
+//! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
+//! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
 //! | [`spsc_ring`] | `queue::SpscRing` cursors and slots | a byzantine neighbour PD |
 //! | [`pipeline`] | `pd_runtime` pool ownership and forwarding | a byzantine neighbour PD |
@@ -118,9 +120,11 @@
 //! guarantees every target still *builds* and the smoke tests still drive every
 //! harness over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
 
+pub mod document;
 pub mod driver;
 pub mod frame;
 pub mod free_list;
+pub mod handover;
 pub mod pipeline;
 pub mod region;
 pub mod ring_abi;
@@ -192,8 +196,10 @@ mod tests {
     /// Ordered from the smallest, most self-contained surface to the deepest
     /// composite one, and `tools/xtask`'s `FUZZ_TARGETS` matches. A defect in
     /// the ledger shows up in `free_list_ownership`, in `pd_runtime_pipeline`,
-    /// and in `nic_driver_paths` alike, and the narrowest of those is the one
-    /// worth reading — so it is the one that fails first. It also means a
+    /// and in `nic_driver_paths` alike, and one in the handover image shows up
+    /// in `config_image` and again in `config_document`, which builds one; the
+    /// narrowest of those is the one worth reading — so it is the one that
+    /// fails first. It also means a
     /// harness whose failure aborts the process (a violated `unsafe`
     /// precondition does, being non-unwinding) takes the fewest other harnesses
     /// down with it.
@@ -202,8 +208,10 @@ mod tests {
         reason = "a table of (target name, harness fn) pairs is clearer inline than behind an alias"
     )]
     const HARNESSES: &[(&str, fn(&[u8]))] = &[
+        ("config_image", crate::handover::handover_harness),
         ("free_list_ownership", crate::free_list::free_list_harness),
         ("route_frame", crate::frame::frame_routing_harness),
+        ("config_document", crate::document::document_harness),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("virtqueue_poll", crate::virtqueue::virtqueue_poll_harness),
         ("pd_runtime_pipeline", crate::pipeline::pipeline_harness),

@@ -18,6 +18,7 @@
 //! belongs to QEMU/KVM and physical hardware, not here.
 
 use std::hint::black_box;
+use std::sync::LazyLock;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use net_headers::{
@@ -25,8 +26,8 @@ use net_headers::{
     UDP_HEADER_LEN,
 };
 use pd_runtime::{
-    Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer, RouteStage,
-    Verdict,
+    Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
+    RouteStage, Verdict,
 };
 use routing::{Interface, Neighbour, PortId, Router};
 
@@ -47,36 +48,45 @@ const HOST_B: Ipv4Address = Ipv4Address::from_octets([10, 0, 1, 2]);
 /// The offset a real frame sits at: behind the device's own 12-byte header.
 const DEVICE_HEADER_LEN: u32 = 12;
 
-/// The configuration `pds/forwarder` compiles in, so the table walk being
-/// measured is the one the appliance performs.
-static ROUTER: Router<2, 2> = Router::new(
-    [
-        Interface {
-            port: PORT0,
-            mac: GATEWAY0_MAC,
-            address: Ipv4Address::from_octets([10, 0, 0, 1]),
-            prefix_length: 24,
-        },
-        Interface {
-            port: PORT1,
-            mac: GATEWAY1_MAC,
-            address: Ipv4Address::from_octets([10, 0, 1, 1]),
-            prefix_length: 24,
-        },
-    ],
-    [
-        Neighbour {
-            port: PORT0,
-            address: HOST_A,
-            mac: HOST_A_MAC,
-        },
-        Neighbour {
-            port: PORT1,
-            address: HOST_B,
-            mac: HOST_B_MAC,
-        },
-    ],
-);
+/// The generation the table below is attributed to. Which number it is does not
+/// reach any measured path — a poll must simply be given one.
+const GENERATION: u32 = 1;
+
+/// A two-port topology of the shape the appliance is configured into at run
+/// time, so the table walk being measured is the one it performs.
+static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
+    Router::from_slices(
+        &[
+            Interface {
+                port: PORT0,
+                mac: GATEWAY0_MAC,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+            Interface {
+                port: PORT1,
+                mac: GATEWAY1_MAC,
+                address: Ipv4Address::from_octets([10, 0, 1, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+        ],
+        &[
+            Neighbour {
+                port: PORT0,
+                address: HOST_A,
+                mac: HOST_A_MAC,
+            },
+            Neighbour {
+                port: PORT1,
+                address: HOST_B,
+                mac: HOST_B_MAC,
+            },
+        ],
+    )
+    .expect("two of each fit in two")
+});
 
 /// A well-formed UDP-over-IPv4 frame from host A to host B.
 fn udp_frame(destination: Ipv4Address, payload_len: usize) -> Vec<u8> {
@@ -167,7 +177,8 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
     let regions = Regions::new();
     let mut owner = PoolOwner::attach(&regions.returns);
     let mut rx_in = regions.rings.rx.producer();
-    let mut stage = RouteStage::attach(&regions.rings, &regions.pool, &ROUTER, PORT0, PORT1);
+    let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
+    let configuration = Configuration::new(GENERATION, &ROUTER);
     let mut tx_out = regions.rings.tx.consumer();
     let mut free_in = regions.returns.free.producer();
 
@@ -181,7 +192,11 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
         |b, frame| {
             b.iter(|| {
                 publish(&regions.pool, &mut owner, &mut rx_in, frame);
-                assert_eq!(black_box(stage.poll()), 1, "the frame must be handed on");
+                assert_eq!(
+                    black_box(stage.poll(configuration)),
+                    1,
+                    "the frame must be handed on"
+                );
                 // Drain the far side back to the owner, so every iteration starts
                 // from the same empty rings and full pool and measures one frame.
                 let descriptor: Descriptor = tx_out.try_dequeue().expect("one frame was handed on");

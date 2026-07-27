@@ -27,6 +27,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "config"
+version = "0.1.0"
+dependencies = [
+ "lfw-log",
+ "net-headers",
+ "routing",
+ "wire",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -54,6 +64,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-log"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -74,6 +91,7 @@ name = "librefirewall-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "config",
  "libfuzzer-sys",
  "net-headers",
  "nic-driver-core",
@@ -93,6 +111,7 @@ version = "0.1.0"
 name = "nic-driver-core"
 version = "0.1.0"
 dependencies = [
+ "lfw-log",
  "pd-runtime",
  "virtio",
 ]
@@ -105,6 +124,7 @@ version = "0.1.0"
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "lfw-log",
  "net-headers",
  "packet-buffer",
  "queue",

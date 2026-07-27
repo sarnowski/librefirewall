@@ -36,7 +36,9 @@ use std::{fs, path::Path, process::Command};
 use crate::{
     artifacts::DIST_DISK,
     disk::disk_at,
+    image,
     qemu::{boot_and_forward, boot_and_halt},
+    topology::Topology,
     util::{copy_file, require_file, run_command},
 };
 
@@ -91,6 +93,12 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
     let dist_disk = root.join("dist").join(DIST_DISK);
     require_file(&dist_disk)?;
     let work = root.join("build/image/ab-test.img");
+    // Every scenario boots the published disk, so the bench is the one the
+    // appliance's own configuration document describes. Read once: which slot
+    // GRUB chose is what varies here, never the addressing behind it.
+    let document = root.join(image::CONFIGURATION_DOCUMENT);
+    let topology =
+        Topology::read(&document).map_err(|error| format!("{}: {error}", document.display()))?;
 
     let scenarios = [
         // 1. Confirmed A boots directly.
@@ -205,7 +213,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
     ];
 
     for scenario in &scenarios {
-        run_scenario(root, &dist_disk, &work, scenario)?;
+        run_scenario(root, &dist_disk, &work, scenario, &topology)?;
     }
 
     println!("A/B fallback tests passed ({} scenarios)", scenarios.len());
@@ -217,6 +225,7 @@ fn run_scenario(
     dist_disk: &Path,
     work: &Path,
     scenario: &Scenario,
+    topology: &Topology,
 ) -> Result<(), String> {
     let name = scenario.name;
     copy_file(dist_disk, work)?;
@@ -230,8 +239,8 @@ fn run_scenario(
 
     let log_name = format!("ab-{name}.log");
     let booted = match scenario.outcome {
-        Outcome::Routes => boot_and_forward(root, work, &log_name),
-        Outcome::Halts => boot_and_halt(root, work, &log_name, HALT_RECORD),
+        Outcome::Routes => boot_and_forward(root, work, &log_name, topology),
+        Outcome::Halts => boot_and_halt(root, work, &log_name, HALT_RECORD, topology),
     }
     .map_err(|error| format!("scenario {name}: {error}"))?;
 

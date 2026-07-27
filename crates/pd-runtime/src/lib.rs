@@ -40,6 +40,15 @@
 //! describes, threaded through every role's `attach` across this crate and
 //! `nic-driver-core`.
 //!
+//! # A stage holds no forwarding table, so a commit lands between two polls
+//!
+//! [`RouteStage`] takes the [`Configuration`] it decides under as a parameter
+//! of [`RouteStage::poll`] and keeps none of it. Holding one made a second
+//! configuration unrepresentable — the borrow lasted as long as the stage — and
+//! passing it per call also settles *when* a commit takes effect without a
+//! lock: a Microkit protection domain runs one `notified` to completion at a
+//! time, so the caller cannot run while a poll holds the table it was lent.
+//!
 //! # What a hostile peer cannot cause, and what enforces it
 //!
 //! * **No out-of-bounds slot access and no redelivery of a descriptor already
@@ -92,6 +101,11 @@ pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
 pub use wire::{Descriptor, Verdict};
 
+/// Re-exported rather than restated: one number, one declaration. What is this
+/// crate's own is what it additionally fixes — a [`Pool`] is the whole of its
+/// region, so a region base's alignment is every buffer's DMA alignment.
+pub use wire::MAPPING_ALIGN;
+
 pub const POOL_BUFFERS: usize = 64;
 
 /// Power of two; usable capacity is one less. Sized above [`POOL_BUFFERS`] so
@@ -108,11 +122,6 @@ pub const RING_SLOTS: usize = 128;
 /// buffers — and it comes from this crate's own constants rather than from a
 /// ring's peer-influenced `len()`.
 pub const DRAIN_LIMIT: usize = RING_SLOTS;
-
-/// The granularity Microkit maps a memory region at, and so the alignment every
-/// region base has. For a [`Pool`] it is also what fixes each buffer's DMA
-/// alignment, the pool being the whole of its region rather than a field in one.
-pub const MAPPING_ALIGN: usize = 0x1000;
 
 pub type Ring = SpscRing<RING_SLOTS>;
 
@@ -332,11 +341,11 @@ pub unsafe fn attach_region<'a, T: Sync>(ptr: *mut T) -> &'a T {
 ///
 /// A [`ForwardRings`] region is mapped read-write into three protection domains
 /// at once and a [`ReturnRing`] into two; a [`Pool`] is mapped into the
-/// transmitting driver alone and is additionally a DMA target of both NICs —
-/// the exact aliasing set `xtask::sysdesc` holds the description to, per region
-/// and per domain. Sharing any of them as a `&` is sound in the face of it
-/// because none exposes a safe path to those bytes; whether the peers behave is
-/// the protocol question the crate header answers, not a soundness one.
+/// transmitting driver alone and is additionally a DMA target of both NICs; the
+/// two configuration regions are mapped into two domains, each writable in one
+/// of them. Sharing any of them as a `&` is sound in the face of that because
+/// none exposes a safe path to those bytes; whether the peers behave is the
+/// protocol question the crate header answers, not a soundness one.
 ///
 /// The calling crate must depend on `sel4-microkit`; this crate deliberately
 /// does not, so the protocol stays host-testable.
@@ -359,12 +368,16 @@ macro_rules! attach_region {
         //   no build step checks; a region outside RAM surfaces as unbacked
         //   reads at run time rather than as a build or boot error.
         // * Minimum size — the `size=` attribute on that region, which
-        //   `xtask::sysdesc` reads back and holds to the matching
-        //   `POOL_REGION_SIZE` / `FORWARD_REGION_SIZE` / `RETURN_REGION_SIZE`
-        //   in the fast gate and again before the image is assembled.
-        // * No safe path to the bytes — this crate's region types, whose fields
-        //   are atomics (`Ring`) or an `UnsafeCell` reachable only through an
-        //   `unsafe` accessor (`Pool`).
+        //   `xtask::sysdesc`'s `REGIONS` table names a rule for and
+        //   `check_region_size` holds *equal* to the constant the domains map
+        //   it as: `POOL_REGION_SIZE`, `FORWARD_REGION_SIZE`,
+        //   `RETURN_REGION_SIZE`, `CONFIG_REGION_SIZE`, `CONFIG_ACK_REGION_SIZE`.
+        //   A region the table names no rule for is itself a finding, so no
+        //   mapping here is sized by agreement alone. Both run in the fast gate
+        //   and again before the image is assembled.
+        // * No safe path to the bytes — the region types, whose fields are
+        //   atomics (`Ring`, `wire`'s configuration regions) or an `UnsafeCell`
+        //   reachable only through an `unsafe` accessor (`Pool`).
         //
         // No `&mut` is created here or by `attach_region`.
         unsafe {
@@ -374,6 +387,11 @@ macro_rules! attach_region {
         }
     }};
 }
+
+pub mod handover;
+
+pub use handover::{ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer, router_from};
+pub use wire::{ConfigAck, ConfigHandover, ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS};
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
 /// invisible: a byzantine peer's activity looks exactly like an idle link.
@@ -555,6 +573,11 @@ const _: () = assert!(REWRITTEN_HEADER_LEN <= BUFFER_SIZE);
 /// Monotonic and saturating for the reasons given on [`PoolCounters`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RouteCounters {
+    /// The generation the most recent poll decided under. The counts below span
+    /// the domain's life and no commit resets them, so this is what tells two
+    /// scrapes apart: a pair naming one generation differences to a rate under
+    /// one configuration.
+    pub generation: u32,
     /// Frames rewritten for their next hop and handed to the transmitting
     /// driver.
     pub forwarded: u64,
@@ -585,6 +608,28 @@ pub struct RouteCounters {
     pub drops: DropCounters,
 }
 
+/// The forwarding table a poll decides under, and the generation that produced
+/// it: one value, because a count attributed to a table that did not produce it
+/// is worse than an unattributed one. The pairing is made where the
+/// configuration is held, and a poll takes it whole or not at all.
+#[derive(Clone, Copy, Debug)]
+pub struct Configuration<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize> {
+    generation: u32,
+    table: &'table Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
+}
+
+impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
+    Configuration<'table, MAX_INTERFACES, MAX_NEIGHBOURS>
+{
+    #[must_use]
+    pub const fn new(
+        generation: u32,
+        table: &'table Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
+    ) -> Self {
+        Self { generation, table }
+    }
+}
+
 /// One direction of the routed dataplane: it snapshots each frame a pipeline's
 /// `rx` ring names, decides on it, rewrites the headers of the ones it
 /// forwards, and hands every descriptor on under the verdict the transmitting
@@ -594,13 +639,12 @@ pub struct RouteCounters {
 /// does. This domain maps no `free` ring — that is what denies it the ability
 /// to forge a return — so the transmitting driver is the only domain that can
 /// give the buffer back, and the verdict is how it is told to.
-pub struct RouteStage<'ring, const INTERFACES: usize, const NEIGHBOURS: usize> {
+pub struct RouteStage<'ring> {
     ingress: PortId,
     egress: PortId,
     from: RingConsumer<'ring, RING_SLOTS>,
     to: RingProducer<'ring, RING_SLOTS>,
     pool: &'ring Pool,
-    router: &'ring Router<INTERFACES, NEIGHBOURS>,
     /// Private storage the frame is snapshotted into. A field rather than a
     /// `poll` local because the protection domain's stack is 16 KiB and this is
     /// 2 KiB per stage.
@@ -608,18 +652,14 @@ pub struct RouteStage<'ring, const INTERFACES: usize, const NEIGHBOURS: usize> {
     counters: RouteCounters,
 }
 
-impl<'ring, const INTERFACES: usize, const NEIGHBOURS: usize>
-    RouteStage<'ring, INTERFACES, NEIGHBOURS>
-{
+impl<'ring> RouteStage<'ring> {
     /// Take `rings`' `rx` consumer and `tx` producer handles — once per
     /// protection domain per pipeline; see the crate header — and borrow the
-    /// pool those descriptors index together with the static configuration
-    /// every decision is made against.
+    /// pool those descriptors index.
     #[must_use]
     pub fn attach(
         rings: &'ring ForwardRings,
         pool: &'ring Pool,
-        router: &'ring Router<INTERFACES, NEIGHBOURS>,
         ingress: PortId,
         egress: PortId,
     ) -> Self {
@@ -629,18 +669,17 @@ impl<'ring, const INTERFACES: usize, const NEIGHBOURS: usize>
             from: rings.rx.consumer(),
             to: rings.tx.producer(),
             pool,
-            router,
             scratch: [0; BUFFER_SIZE],
             counters: RouteCounters::default(),
         }
     }
 
-    /// Route descriptors onward until the source ring is observed empty, the
-    /// destination refuses one, or [`DRAIN_LIMIT`] have been handled. Returns
-    /// how many reached the destination ring under either verdict — which is
-    /// the number of buffers that are on their way back to their owner, and so
-    /// the quantity a caller can act on; how many were forwarded is
-    /// [`RouteCounters::forwarded`].
+    /// Route descriptors onward under `configuration` until the source ring is
+    /// observed empty, the destination refuses one, or [`DRAIN_LIMIT`] have
+    /// been handled. Returns how many reached the destination ring under either
+    /// verdict — which is the number of buffers that are on their way back to
+    /// their owner, and so the quantity a caller can act on; how many were
+    /// forwarded is [`RouteCounters::forwarded`].
     ///
     /// The rings are sized above the pool, so along a correctly accounted chain
     /// the destination can always take what the source held. A refusal means
@@ -649,17 +688,21 @@ impl<'ring, const INTERFACES: usize, const NEIGHBOURS: usize>
     /// stop draining rather than fault, the descriptor being peer input.
     /// Stopping on the first refusal is deliberate: every further dequeue into
     /// a full destination would lose another buffer.
-    pub fn poll(&mut self) -> usize {
+    pub fn poll<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+        &mut self,
+        configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    ) -> usize {
         let Self {
             ingress,
             egress,
             from,
             to,
             pool,
-            router,
             scratch,
             counters,
         } = self;
+        let router = configuration.table;
+        counters.generation = configuration.generation;
         let mut handed_on = 0;
         for descriptor in from.drain(DRAIN_LIMIT) {
             // Unconditionally, and before the buffer is touched: the descriptor
@@ -753,8 +796,8 @@ fn snapshot<'scratch>(
 
 /// The verdict on one snapshotted frame, rewritten in place for its next hop
 /// when the verdict is to forward it.
-fn route_frame<const INTERFACES: usize, const NEIGHBOURS: usize>(
-    router: &Router<INTERFACES, NEIGHBOURS>,
+fn route_frame<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+    router: &Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
     ingress: PortId,
     egress: PortId,
     frame_bytes: &mut [u8],
@@ -840,6 +883,7 @@ mod tests {
     use routing::{Interface, Neighbour};
     use std::boxed::Box;
     use std::collections::BTreeSet;
+    use std::sync::LazyLock;
     use std::thread;
     use std::vec::Vec;
 
@@ -862,37 +906,113 @@ mod tests {
     /// in — a `u64`, so half a million frames are all distinguishable.
     const SEQUENCE_LEN: usize = 8;
 
+    /// Turns a thread of the concurrent chain spins without progress before it
+    /// declares the run stalled. Measured worst case on an idle host is a few
+    /// thousand, so this leaves five orders of magnitude of headroom and is
+    /// still seconds rather than forever — which is what turns a buffer lost
+    /// across a commit, or an assertion that killed the thread holding the far
+    /// end, into a named failure instead of a test that hangs.
+    const STALL_SPINS: u64 = 1 << 28;
+
     /// The configuration `pds/forwarder` compiles in, so what these tests hold
     /// the stage to is the appliance's own topology rather than one invented
     /// here.
-    static ROUTER: Router<2, 2> = Router::new(
-        [
-            Interface {
-                port: PORT0,
-                mac: GATEWAY0_MAC,
-                address: Ipv4Address::from_octets([10, 0, 0, 1]),
-                prefix_length: 24,
-            },
-            Interface {
-                port: PORT1,
-                mac: GATEWAY1_MAC,
-                address: Ipv4Address::from_octets([10, 0, 1, 1]),
-                prefix_length: 24,
-            },
-        ],
-        [
-            Neighbour {
-                port: PORT0,
-                address: HOST_A,
-                mac: HOST_A_MAC,
-            },
-            Neighbour {
-                port: PORT1,
-                address: HOST_B,
-                mac: HOST_B_MAC,
-            },
-        ],
-    );
+    const INTERFACE0: Interface = Interface {
+        port: PORT0,
+        mac: GATEWAY0_MAC,
+        address: Ipv4Address::from_octets([10, 0, 0, 1]),
+        prefix_length: 24,
+        enabled: true,
+    };
+    const INTERFACE1: Interface = Interface {
+        port: PORT1,
+        mac: GATEWAY1_MAC,
+        address: Ipv4Address::from_octets([10, 0, 1, 1]),
+        prefix_length: 24,
+        enabled: true,
+    };
+    const NEIGHBOURS: [Neighbour; 2] = [
+        Neighbour {
+            port: PORT0,
+            address: HOST_A,
+            mac: HOST_A_MAC,
+        },
+        Neighbour {
+            port: PORT1,
+            address: HOST_B,
+            mac: HOST_B_MAC,
+        },
+    ];
+
+    /// Built once and shared, the appliance's own two-port topology at the
+    /// generation a first commit produces.
+    static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
+        Router::from_slices(&[INTERFACE0, INTERFACE1], &NEIGHBOURS).expect("two of each fit in two")
+    });
+
+    /// The same topology with port 0 administratively down, so the one drop
+    /// reason a fully enabled configuration cannot reach is reachable here.
+    static ROUTER_PORT0_DOWN: LazyLock<Router<2, 2>> = LazyLock::new(|| {
+        Router::from_slices(
+            &[
+                Interface {
+                    enabled: false,
+                    ..INTERFACE0
+                },
+                INTERFACE1,
+            ],
+            &NEIGHBOURS,
+        )
+        .expect("two of each fit in two")
+    });
+
+    /// What a test decides under when the configuration is not what it is
+    /// about: the appliance's own table, at the generation a first commit
+    /// produces.
+    fn running() -> Configuration<'static, 2, 2> {
+        Configuration::new(1, &ROUTER)
+    }
+
+    /// The two addresses generation `number` writes into a forwarded frame: the
+    /// egress interface's own MAC, and the MAC of the neighbour it resolves the
+    /// next hop to. Both carry `number`, so no two generations share either,
+    /// and a frame rewritten out of two tables at once names a pair that
+    /// belongs to neither.
+    fn generation_macs(number: u8) -> (MacAddress, MacAddress) {
+        (
+            MacAddress([0x52, 0x54, 0x00, 0xAA, number, 0x01]),
+            MacAddress([0x52, 0x54, 0x00, 0xBB, number, 0x02]),
+        )
+    }
+
+    /// One generation of the appliance's configuration: the two real subnets
+    /// throughout, with `port0_up` deciding whether the ingress interface is
+    /// administratively up and [`generation_macs`] supplying the pair a rewrite
+    /// is attributed by.
+    fn generation(number: u8, port0_up: bool) -> (u32, Router<2, 2>) {
+        let (egress_mac, next_hop_mac) = generation_macs(number);
+        let table = Router::from_slices(
+            &[
+                Interface {
+                    enabled: port0_up,
+                    ..INTERFACE0
+                },
+                Interface {
+                    mac: egress_mac,
+                    ..INTERFACE1
+                },
+            ],
+            &[
+                NEIGHBOURS[0],
+                Neighbour {
+                    mac: next_hop_mac,
+                    ..NEIGHBOURS[1]
+                },
+            ],
+        )
+        .expect("two of each fit in two");
+        (u32::from(number), table)
+    }
 
     /// One pipeline's three regions, allocated the way a protection domain is
     /// handed them: separate mappings that share nothing.
@@ -1248,13 +1368,13 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         let mut free_in = r.returns.free.producer();
 
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(), 1);
+        assert_eq!(stage.poll(running()), 1);
         assert_eq!(stage.counters().forwarded, 1);
         assert_eq!(stage.counters().drops.total(), 0);
 
@@ -1308,12 +1428,12 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
 
         let sent = FrameSpec::a_to_b().build();
         let index =
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(), 1);
+        assert_eq!(stage.poll(running()), 1);
 
         let mut whole = [0u8; BUFFER_SIZE];
         // SAFETY: the buffer is lent, and this test is the only other party to
@@ -1362,7 +1482,7 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
 
         let sent = FrameSpec::a_to_b().build();
@@ -1389,7 +1509,7 @@ mod tests {
                 .expect("the ring is empty");
             drop(buffer);
 
-            assert_eq!(stage.poll(), 1);
+            assert_eq!(stage.poll(running()), 1);
             let handed_on = tx_out.try_dequeue().expect("the frame was handed on");
             assert_eq!(
                 Verdict::from_bits(handed_on.verdict),
@@ -1409,7 +1529,7 @@ mod tests {
         // is the residue the crate header records.
         let r = Regions::new();
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
 
         // Descriptors naming empty buffers: in bounds, so they reach the
         // destination ring under a `Discard` verdict and fill it.
@@ -1424,7 +1544,11 @@ mod tests {
                 ))
                 .unwrap();
         }
-        assert_eq!(stage.poll(), capacity, "the destination is now full");
+        assert_eq!(
+            stage.poll(running()),
+            capacity,
+            "the destination is now full"
+        );
         assert_eq!(stage.counters().egress_full, 0);
 
         for index in 0..4 {
@@ -1432,7 +1556,7 @@ mod tests {
                 .try_enqueue(Descriptor::new(index, 0, 64, Verdict::Transmit))
                 .unwrap();
         }
-        assert_eq!(stage.poll(), 0);
+        assert_eq!(stage.poll(running()), 0);
         assert_eq!(stage.counters().egress_full, 1);
         // Draining stopped at the first refusal rather than emptying `rx` into
         // a full destination and losing every buffer with it.
@@ -1444,11 +1568,11 @@ mod tests {
         // A peer that keeps advancing its published `tail` makes the source
         // look permanently non-empty. Work per poll must still be finite.
         let r = Regions::new();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         for round in 0..8u32 {
             forge_cursors(&r.rings.rx, 0, round.wrapping_mul(37).wrapping_add(11));
-            let handed_on = stage.poll();
+            let handed_on = stage.poll(running());
             assert!(
                 handed_on <= DRAIN_LIMIT,
                 "poll handled {handed_on} descriptors"
@@ -1468,7 +1592,7 @@ mod tests {
         // outside the pool.
         let r = Regions::new();
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
 
         for forged in [
@@ -1480,7 +1604,7 @@ mod tests {
             rx_in.try_enqueue(forged).expect("the ring has room");
         }
 
-        assert_eq!(stage.poll(), 0, "nothing may be handed on");
+        assert_eq!(stage.poll(running()), 0, "nothing may be handed on");
         assert_eq!(stage.counters().malformed_descriptor, 4);
         assert_eq!(stage.counters().snapshot_failed, 0);
         assert_eq!(tx_out.try_dequeue(), None);
@@ -1494,14 +1618,22 @@ mod tests {
         // only domain that can give the buffer back. A stage that dropped the
         // descriptor instead would shrink the pool by one buffer per hostile
         // packet, which is a denial of service with no counter attached.
-        for (reason, ingress, spec) in [
+        let cases = [
             (
                 DropReason::UnconfiguredIngressPort,
+                &*ROUTER,
                 PortId(7),
                 FrameSpec::a_to_b(),
             ),
             (
+                DropReason::InterfaceDisabled,
+                &*ROUTER_PORT0_DOWN,
+                PORT0,
+                FrameSpec::a_to_b(),
+            ),
+            (
                 DropReason::NotAddressedToUs,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination_mac: MacAddress::BROADCAST,
@@ -1510,6 +1642,7 @@ mod tests {
             ),
             (
                 DropReason::VlanTagged,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     tagged: true,
@@ -1518,6 +1651,7 @@ mod tests {
             ),
             (
                 DropReason::MartianSource,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     source: Ipv4Address::from_octets([224, 0, 0, 1]),
@@ -1526,6 +1660,7 @@ mod tests {
             ),
             (
                 DropReason::UnroutableDestination,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination: Ipv4Address::from_octets([255, 255, 255, 255]),
@@ -1534,6 +1669,7 @@ mod tests {
             ),
             (
                 DropReason::AddressedToThisRouter,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination: Ipv4Address::from_octets([10, 0, 1, 1]),
@@ -1542,6 +1678,7 @@ mod tests {
             ),
             (
                 DropReason::TtlExpired,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     ttl: 1,
@@ -1550,6 +1687,7 @@ mod tests {
             ),
             (
                 DropReason::NoRoute,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination: Ipv4Address::from_octets([192, 0, 2, 9]),
@@ -1558,6 +1696,7 @@ mod tests {
             ),
             (
                 DropReason::EgressIsIngress,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination: Ipv4Address::from_octets([10, 0, 0, 9]),
@@ -1566,23 +1705,41 @@ mod tests {
             ),
             (
                 DropReason::NoNeighbour,
+                &*ROUTER,
                 PORT0,
                 FrameSpec {
                     destination: Ipv4Address::from_octets([10, 0, 1, 77]),
                     ..FrameSpec::a_to_b()
                 },
             ),
-        ] {
+        ];
+
+        // What makes the name of this test true rather than aspirational: a
+        // reason added to the enum without a case here fails at once.
+        let mut covered: Vec<DropReason> = cases.iter().map(|(reason, ..)| *reason).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered,
+            DropReason::ALL.to_vec(),
+            "a drop reason no case here reaches"
+        );
+
+        for (reason, table, ingress, spec) in cases {
             let r = Regions::new();
             let mut owner = PoolOwner::attach(&r.returns);
             let mut rx_in = r.rings.rx.producer();
-            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, ingress, PORT1);
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, ingress, PORT1);
             let mut tx_out = r.rings.tx.consumer();
             let mut free_in = r.returns.free.producer();
 
             let sent = spec.build();
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-            assert_eq!(stage.poll(), 1, "{reason}: the descriptor must travel on");
+            assert_eq!(
+                stage.poll(Configuration::new(1, table)),
+                1,
+                "{reason}: the descriptor must travel on"
+            );
 
             let counters = stage.counters();
             assert_eq!(counters.drops.get(reason), 1, "{reason}: not counted");
@@ -1618,7 +1775,7 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         let mut free_in = r.returns.free.producer();
 
@@ -1636,7 +1793,7 @@ mod tests {
             receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
         }
 
-        assert_eq!(stage.poll(), unroutable.len());
+        assert_eq!(stage.poll(running()), unroutable.len());
         assert_eq!(stage.counters().unparsable, unroutable.len() as u64);
         assert_eq!(
             stage.counters().drops.total(),
@@ -1665,13 +1822,13 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT0);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT0);
         let mut tx_out = r.rings.tx.consumer();
 
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
 
-        assert_eq!(stage.poll(), 1);
+        assert_eq!(stage.poll(running()), 1);
         assert_eq!(stage.counters().misrouted, 1);
         assert_eq!(stage.counters().forwarded, 0);
         assert_eq!(
@@ -1751,7 +1908,7 @@ mod tests {
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         let mut free_in = r.returns.free.producer();
 
@@ -1770,7 +1927,7 @@ mod tests {
         }
         assert_eq!(owner.owned(), POOL_BUFFERS - 2);
 
-        assert_eq!(stage.poll(), 2);
+        assert_eq!(stage.poll(running()), 2);
 
         let mut seen = Vec::new();
         let transmitted = transmit(&r.pool, &mut tx_out, &mut free_in, |_, bytes| {
@@ -2059,30 +2216,91 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_pipeline_chain_routes_every_buffer_in_order() {
-        // The three-PD routed scenario end to end under real threads: an
-        // rx-driver thread fills and publishes buffers, a forwarder thread
-        // routes them onward, and a tx-driver thread consumes and returns them,
-        // so every buffer cycles rx -> route -> tx -> free far more times than
-        // the pool holds. Both rings wrap repeatedly and every buffer is reused;
-        // the sequence-numbered payloads must arrive intact and in order under
-        // rewritten headers, and full pool ownership must return to the rx
-        // driver.
+    fn one_stage_polled_under_three_tables_decides_each_frame_under_the_one_it_was_handed() {
+        // The stage carries no configuration of its own, which is the whole of
+        // what makes a second commit expressible. The same stage over the same
+        // frame three times, with nothing between the polls but the table
+        // handed to the next: two that forward it to different next hops under
+        // different source MACs, and one that refuses it outright.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+        let mut tx_out = r.rings.tx.consumer();
+        let mut free_in = r.returns.free.producer();
+
+        let sent = FrameSpec::a_to_b().build();
+        for (tag, port0_up) in [(1u8, true), (2u8, true), (3u8, false)] {
+            let (number, table) = generation(tag, port0_up);
+            receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+            assert_eq!(stage.poll(Configuration::new(number, &table)), 1);
+            assert_eq!(stage.counters().generation, number);
+
+            let expected = port0_up.then(|| generation_macs(tag));
+            let mut seen = 0;
+            transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+                seen += 1;
+                let verdict = Verdict::from_bits(descriptor.verdict);
+                match expected {
+                    Some((egress_mac, next_hop_mac)) => {
+                        assert_eq!(verdict, Some(Verdict::Transmit), "generation {number}");
+                        assert_eq!(&bytes[..6], &next_hop_mac.0, "generation {number}");
+                        assert_eq!(&bytes[6..12], &egress_mac.0, "generation {number}");
+                    }
+                    None => assert_eq!(verdict, Some(Verdict::Discard), "generation {number}"),
+                }
+            });
+            assert_eq!(seen, 1);
+            assert_eq!(owner.reclaim(), 1);
+            assert_eq!(owner.owned(), POOL_BUFFERS);
+        }
+        assert_eq!(stage.counters().forwarded, 2);
+        assert_eq!(stage.counters().drops.get(DropReason::InterfaceDisabled), 1);
+    }
+
+    #[test]
+    fn a_configuration_swapped_under_load_decides_every_frame_under_exactly_one_table() {
+        // The three-PD routed scenario end to end under real threads, with the
+        // configuration replaced between polls throughout: an rx-driver thread
+        // fills and publishes buffers, a forwarder thread routes them onward
+        // under a table it exchanges for the other one after every poll that
+        // carried traffic, and a tx-driver thread consumes and returns them, so
+        // every buffer cycles rx -> route -> tx -> free far more times than the
+        // pool holds and every one of those cycles crosses a commit. Both rings
+        // wrap repeatedly and every buffer is reused.
+        //
+        // Three things must hold, and the two tables are built to make the
+        // first of them observable: they share neither the egress interface's
+        // MAC nor the next hop's, so the pair in a frame's rewritten header
+        // names exactly one generation, and a frame carrying one table's source
+        // MAC under the other's destination MAC — a decision taken across a
+        // swap — matches neither and fails here.
+        //
+        //  * every forwarded frame is rewritten out of one table, never a blend;
+        //  * the pool comes back whole, so no commit lost or duplicated a
+        //    buffer in flight across it;
+        //  * the sequence-numbered payloads arrive intact and in order under
+        //    those rewritten headers.
         //
         // The forwarder thread borrows `rings` and `pool`, which is the grant
         // the system description gives that domain: it can reach `returns` here
-        // no more than it can there.
+        // no more than it can there. It owns the two tables, as the domain will
+        // own its running and staged configurations, and nothing else can
+        // reach them — which is what leaves the swap point at a poll boundary.
         const TOTAL: u64 = 500_000;
         let r = Regions::new();
         let pool: &Pool = &r.pool;
         let rings: &ForwardRings = &r.rings;
         let returns: &ReturnRing = &r.returns;
+        let generations = [generation(1, true), generation(2, true)];
+        let generations = &generations;
+        let rewrites = [generation_macs(1), generation_macs(2)];
 
         // Scoped threads because each domain's role type borrows its region: a
         // handle *is* that domain's position, so it is taken once inside the
         // thread that owns the role and kept for the thread's life, exactly as a
         // protection domain takes it once at attach.
-        thread::scope(|scope| {
+        let (applied, per_generation) = thread::scope(|scope| {
             scope.spawn(move || {
                 let mut owner = PoolOwner::attach(returns);
                 let mut rx_in = rings.rx.producer();
@@ -2097,54 +2315,104 @@ mod tests {
                 .build();
                 let sequence_at = frame.len() - SEQUENCE_LEN;
                 let mut sent = 0u64;
+                let mut idle = 0u64;
                 while sent < TOTAL {
                     owner.reclaim();
                     frame[sequence_at..].copy_from_slice(&sent.to_le_bytes());
                     if receive(pool, &mut owner, &mut rx_in, &frame).is_some() {
                         sent += 1;
+                        idle = 0;
                     } else {
+                        idle += 1;
+                        assert!(
+                            idle < STALL_SPINS,
+                            "the chain stopped taking frames at {sent}"
+                        );
                         std::hint::spin_loop();
                     }
                 }
                 // Wait for the chain to hand every buffer back.
-                loop {
+                let mut idle = 0u64;
+                while owner.owned() != POOL_BUFFERS {
                     owner.reclaim();
-                    if owner.owned() == POOL_BUFFERS {
-                        break;
-                    }
+                    idle += 1;
+                    assert!(
+                        idle < STALL_SPINS,
+                        "{} buffers never came back",
+                        POOL_BUFFERS - owner.owned()
+                    );
                     std::hint::spin_loop();
                 }
                 assert_eq!(owner.counters(), PoolCounters::default());
             });
 
-            scope.spawn(move || {
-                let mut stage = RouteStage::attach(rings, pool, &ROUTER, PORT0, PORT1);
+            let forwarder = scope.spawn(move || {
+                let mut stage = RouteStage::attach(rings, pool, PORT0, PORT1);
                 let mut handed_on = 0u64;
+                let mut current = 0usize;
+                let mut applied = 0u64;
+                let mut idle = 0u64;
                 while handed_on < TOTAL {
-                    handed_on += stage.poll() as u64;
+                    let (number, table) = &generations[current];
+                    let moved = stage.poll(Configuration::new(*number, table));
+                    if moved > 0 {
+                        handed_on += moved as u64;
+                        // The commit, and the only point one can occur: the
+                        // tables are this thread's own, and the poll the last
+                        // of them was lent to has returned.
+                        current ^= 1;
+                        applied += 1;
+                        idle = 0;
+                    } else {
+                        idle += 1;
+                        assert!(idle < STALL_SPINS, "nothing to route after {handed_on}");
+                    }
                     std::hint::spin_loop();
                 }
                 let counters = stage.counters();
                 assert_eq!(counters.egress_full, 0);
                 assert_eq!(counters.forwarded, TOTAL, "every frame was routable");
                 assert_eq!(counters.drops.total(), 0);
+                assert_eq!(
+                    counters.generation,
+                    generations[current ^ 1].0,
+                    "the sample names a generation other than the one it was taken under"
+                );
+                applied
             });
 
-            scope.spawn(move || {
+            let transmitter = scope.spawn(move || {
                 let mut tx_out = rings.tx.consumer();
                 let mut free_in = returns.free.producer();
                 let mut expected = 0u64;
+                let mut per_generation = [0u64; 2];
+                let mut idle = 0u64;
                 while expected < TOTAL {
+                    let before = expected;
                     transmit(pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
                         assert_eq!(
                             Verdict::from_bits(descriptor.verdict),
                             Some(Verdict::Transmit)
                         );
+                        // Which table decided this frame, taken from the source
+                        // MAC alone, and then the next hop held to that same
+                        // table's neighbour. A frame decided across a commit
+                        // carries one generation's source MAC under the other's
+                        // destination MAC, which is a pair neither table holds.
+                        let decided_by = rewrites
+                            .iter()
+                            .position(|(egress_mac, _)| bytes[6..12] == egress_mac.0)
+                            .expect("a source MAC no configuration's egress interface holds");
+                        assert_eq!(
+                            &bytes[..6],
+                            &rewrites[decided_by].1.0,
+                            "the next hop and the source MAC come from different generations"
+                        );
+                        per_generation[decided_by] += 1;
                         // The rewrite happened, and it happened to this frame:
                         // a stage that wrote one buffer's header into another's
                         // would show up here as the wrong sequence number under
                         // a correct MAC, or the reverse.
-                        assert_eq!(&bytes[..6], &HOST_B_MAC.0, "the next hop's MAC");
                         let value = u64::from_le_bytes(
                             bytes[bytes.len() - SEQUENCE_LEN..]
                                 .try_into()
@@ -2153,10 +2421,47 @@ mod tests {
                         assert_eq!(value, expected, "out-of-order or corrupted buffer");
                         expected += 1;
                     });
+                    if expected == before {
+                        idle += 1;
+                        assert!(idle < STALL_SPINS, "nothing to transmit after {expected}");
+                    } else {
+                        idle = 0;
+                    }
                     std::hint::spin_loop();
                 }
+                per_generation
             });
+
+            (
+                forwarder.join().expect("the forwarder thread"),
+                transmitter.join().expect("the tx-driver thread"),
+            )
         });
+
+        // What makes the run evidence rather than a green light: a poll moves
+        // at most `DRAIN_LIMIT` descriptors, so carrying `TOTAL` frames takes
+        // at least this many polls that carried traffic — and the table is
+        // exchanged after every one of them. A run in which nothing was
+        // swapped attributes every frame to one generation and fails here.
+        let least_polls = TOTAL.div_ceil(DRAIN_LIMIT as u64);
+        assert!(
+            applied >= least_polls,
+            "{applied} commits over {TOTAL} frames, fewer than the {least_polls} the drain \
+             bound forces"
+        );
+        assert_eq!(per_generation[0] + per_generation[1], TOTAL);
+        for (index, forwarded) in per_generation.iter().enumerate() {
+            assert!(
+                *forwarded >= least_polls / 2,
+                "generation {} decided {forwarded} frames, too few to have run under load",
+                generations[index].0
+            );
+        }
+        println!(
+            "swapped configuration {applied} times under load; generation {} decided {} frames \
+             and generation {} decided {}",
+            generations[0].0, per_generation[0], generations[1].0, per_generation[1]
+        );
     }
 
     /// The traffic mix both properties below draw from: every shape the stage
@@ -2250,7 +2555,7 @@ mod tests {
             let r = Regions::new();
             let mut owner = PoolOwner::attach(&r.returns);
             let mut rx_in = r.rings.rx.producer();
-            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
             let mut tx_out = r.rings.tx.consumer();
             let mut free_in = r.returns.free.producer();
             // Tokens this domain holds, standing in for buffers posted to a NIC.
@@ -2267,7 +2572,7 @@ mod tests {
                         }
                     }
                     PeerStep::Route => {
-                        prop_assert!(stage.poll() <= DRAIN_LIMIT);
+                        prop_assert!(stage.poll(running()) <= DRAIN_LIMIT);
                         // Play the tx driver: take what arrived and hand each
                         // buffer straight back, as a well-behaved peer would.
                         for descriptor in tx_out.drain(DRAIN_LIMIT) {
@@ -2339,7 +2644,7 @@ mod tests {
             let r = Regions::new();
             let mut owner = PoolOwner::attach(&r.returns);
             let mut rx_in = r.rings.rx.producer();
-            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
             let mut tx_out = r.rings.tx.consumer();
             let mut free_in = r.returns.free.producer();
 
@@ -2363,7 +2668,7 @@ mod tests {
             // Fewer than the pool holds and far fewer than a ring, so nothing
             // here can be refused for want of room: what the stage does with a
             // descriptor is the only thing under test.
-            let handed_on = stage.poll();
+            let handed_on = stage.poll(running());
             let counters = stage.counters();
             prop_assert_eq!(counters.egress_full, 0);
             prop_assert_eq!(handed_on, published, "a real descriptor did not travel on");
@@ -2385,6 +2690,54 @@ mod tests {
             prop_assert_eq!(owner.reclaim(), published);
             prop_assert_eq!(owner.owned(), POOL_BUFFERS);
             prop_assert_eq!(owner.counters(), PoolCounters::default());
+        }
+
+        /// A configuration exchanged between polls, over an arbitrary schedule
+        /// of tables and an arbitrary traffic mix. At every boundary a commit
+        /// falls on, the pool must be whole — nothing lost to the swap and
+        /// nothing returned twice across it — and every frame a poll forwarded
+        /// must carry the rewrite of the table *that* poll was handed, not a
+        /// neighbouring generation's. A stage keeping a table of its own would
+        /// answer with the previous generation's addresses here.
+        #[test]
+        fn swapping_configuration_between_polls_never_loses_a_buffer(
+            schedule in prop::collection::vec((1u8..=9, any::<bool>()), 1..12),
+            frames in prop::collection::vec(any_frame(), 1..8),
+        ) {
+            let r = Regions::new();
+            let mut owner = PoolOwner::attach(&r.returns);
+            let mut rx_in = r.rings.rx.producer();
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+            let mut tx_out = r.rings.tx.consumer();
+            let mut free_in = r.returns.free.producer();
+
+            for (tag, port0_up) in schedule {
+                let (number, table) = generation(tag, port0_up);
+                let mut published = 0usize;
+                for frame in &frames {
+                    if receive(&r.pool, &mut owner, &mut rx_in, frame).is_some() {
+                        published += 1;
+                    }
+                }
+                prop_assert_eq!(stage.poll(Configuration::new(number, &table)), published);
+                prop_assert_eq!(stage.counters().generation, number);
+
+                let (egress_mac, next_hop_mac) = generation_macs(tag);
+                let mut rewritten = Vec::new();
+                let returned = transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+                    if Verdict::from_bits(descriptor.verdict) == Some(Verdict::Transmit) {
+                        rewritten.push((bytes[..6].to_vec(), bytes[6..12].to_vec()));
+                    }
+                });
+                for (destination, source) in rewritten {
+                    prop_assert_eq!(destination, next_hop_mac.0.to_vec());
+                    prop_assert_eq!(source, egress_mac.0.to_vec());
+                }
+                prop_assert_eq!(returned, published);
+                prop_assert_eq!(owner.reclaim(), published);
+                prop_assert_eq!(owner.owned(), POOL_BUFFERS);
+                prop_assert_eq!(owner.counters(), PoolCounters::default());
+            }
         }
 
         /// The untrusted-descriptor validator accepts exactly the triples that

@@ -20,6 +20,7 @@
 //! The order is therefore carried by types that consume the state they advance
 //! from, rather than by a call sequence a caller is trusted to write.
 
+use lfw_log::{Refusal, RefusalDetail};
 use pd_runtime::MAPPING_ALIGN;
 use virtio::net::features;
 use virtio::pci::{
@@ -185,6 +186,118 @@ impl BringUpError {
             | Self::QueueSetupRefused { .. }
             | Self::DoorbellRefused { .. } => true,
         }
+    }
+
+    /// This refusal as the console record of it: a token naming what was
+    /// refused, the numbers that identify which instance of it, and what the
+    /// device was left in.
+    ///
+    /// The tokens are minted here rather than in `lfw_log` because they name
+    /// this tree, and a second copy of it beside the event vocabulary would go
+    /// stale with nothing failing. The `match` below is exhaustive over `Self`,
+    /// so a variant added to this enum is a compile error until it has a token.
+    #[must_use]
+    pub fn refusal(&self) -> Refusal {
+        let (cause, detail) = self.cause();
+        Refusal {
+            cause,
+            detail,
+            signalled: self.signalled_to_device(),
+        }
+    }
+
+    /// What a refusal is called and the at most two numbers it carries.
+    ///
+    /// Where a variant holds more than two, the pair kept is the one that
+    /// identifies the fault and the rest is named here rather than dropped
+    /// quietly: `StructuresOutsideBar` keeps the window the structures left and
+    /// not the four capability offsets that left it, all of which are readable
+    /// from the device itself; `QueueSetupError::QueueTooSmall` keeps the
+    /// device's maximum and the size the driver needs, dropping the queue index
+    /// its own token already narrows to one of two.
+    fn cause(&self) -> (&'static str, RefusalDetail) {
+        match *self {
+            Self::NotVirtioNet { vendor, device } => (
+                "not-virtio-net",
+                RefusalDetail::Two(vendor.into(), device.into()),
+            ),
+            Self::Capabilities(error) => (capability_cause(error), RefusalDetail::None),
+            Self::StructuresOutsideBar { bar_window, .. } => (
+                "structures-outside-bar",
+                RefusalDetail::One(bar_window as u64),
+            ),
+            Self::CommonCfgMisaligned { offset, required } => (
+                "common-cfg-misaligned",
+                RefusalDetail::Two(offset.into(), required as u64),
+            ),
+            Self::BarNotSixtyFourBit { bar } => ("bar-not-64-bit", RefusalDetail::One(bar.into())),
+            Self::BarIndexRefused(BarError::IndexOutOfRange(bar)) => {
+                ("bar-index-out-of-range", RefusalDetail::One(bar.into()))
+            }
+            Self::BarIndexRefused(BarError::NoHighHalf(bar)) => {
+                ("bar-has-no-high-half", RefusalDetail::One(bar.into()))
+            }
+            Self::BarTargetUnusable { paddr } => {
+                ("bar-target-unusable", RefusalDetail::One(paddr as u64))
+            }
+            Self::ResetRefused(ResetError::NotAcknowledged { status }) => {
+                ("reset-not-acknowledged", RefusalDetail::One(status.into()))
+            }
+            Self::NoVirtio1 { offered } => ("no-virtio-1", RefusalDetail::One(offered)),
+            Self::FeaturesRejected { status } => {
+                ("features-rejected", RefusalDetail::One(status.into()))
+            }
+            Self::TransmitQueueAbsent { offered, required } => (
+                "transmit-queue-absent",
+                RefusalDetail::Two(offered.into(), required.into()),
+            ),
+            Self::VirtqueueRegionUnusable { paddr } => {
+                ("virtqueue-region-unusable", RefusalDetail::One(paddr))
+            }
+            Self::QueueSetupRefused {
+                error: QueueSetupError::QueueAbsent { index },
+                ..
+            } => ("queue-absent", RefusalDetail::One(index.into())),
+            Self::QueueSetupRefused {
+                error:
+                    QueueSetupError::QueueTooSmall {
+                        device_max,
+                        required,
+                        ..
+                    },
+                ..
+            } => (
+                "queue-too-small",
+                RefusalDetail::Two(device_max.into(), required as u64),
+            ),
+            Self::DoorbellRefused {
+                error: NotifyError::SlotOutsideBar { slot_end, bar_size },
+                ..
+            } => (
+                "doorbell-outside-bar",
+                match slot_end {
+                    Some(end) => RefusalDetail::Two(end as u64, bar_size as u64),
+                    // The offset overflowed, so there is no end to report and
+                    // the window alone is the number.
+                    None => RefusalDetail::One(bar_size as u64),
+                },
+            ),
+            Self::DoorbellRefused {
+                error: NotifyError::SlotMisaligned { offset },
+                ..
+            } => ("doorbell-misaligned", RefusalDetail::One(offset as u64)),
+        }
+    }
+}
+
+/// The capability-chain refusals, which carry nothing beyond themselves.
+fn capability_cause(error: CapError) -> &'static str {
+    match error {
+        CapError::NoCapabilities => "no-capability-list",
+        CapError::Malformed => "malformed-capability-list",
+        CapError::MultipleBars => "structures-across-bars",
+        CapError::InvalidBar => "invalid-structure-bar",
+        CapError::MissingStructure => "missing-virtio-structure",
     }
 }
 
@@ -1505,5 +1618,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every refusal [`BringUpError::refusal`] distinguishes, so the
+    /// exhaustiveness the `match` gives is joined by a check of what the
+    /// tokens actually are. One refusal per token: the operand shapes a single
+    /// token takes are `a_refusal_carries_the_values_that_made_it_one`'s.
+    fn every_bring_up_error() -> vec::Vec<BringUpError> {
+        let mut errors = vec![
+            BringUpError::NotVirtioNet {
+                vendor: 0x8086,
+                device: 0x100e,
+            },
+            BringUpError::StructuresOutsideBar {
+                caps: VirtioCaps {
+                    bar: 4,
+                    common: 0,
+                    notify: 0,
+                    notify_multiplier: 0,
+                    device: 0,
+                },
+                bar_window: BAR_WINDOW_SIZE,
+            },
+            BringUpError::CommonCfgMisaligned {
+                offset: 3,
+                required: pci::COMMON_CFG_ALIGN,
+            },
+            BringUpError::BarNotSixtyFourBit { bar: 4 },
+            BringUpError::BarIndexRefused(BarError::IndexOutOfRange(9)),
+            BringUpError::BarIndexRefused(BarError::NoHighHalf(5)),
+            BringUpError::BarTargetUnusable { paddr: 1 },
+            BringUpError::ResetRefused(ResetError::NotAcknowledged { status: 0x0f }),
+            BringUpError::NoVirtio1 { offered: 0 },
+            BringUpError::FeaturesRejected { status: 0x0b },
+            BringUpError::TransmitQueueAbsent {
+                offered: 1,
+                required: 2,
+            },
+            BringUpError::VirtqueueRegionUnusable { paddr: 1 },
+            BringUpError::QueueSetupRefused {
+                index: RX_QUEUE,
+                error: QueueSetupError::QueueAbsent { index: RX_QUEUE },
+            },
+            BringUpError::QueueSetupRefused {
+                index: TX_QUEUE,
+                error: QueueSetupError::QueueTooSmall {
+                    index: TX_QUEUE,
+                    device_max: 8,
+                    required: QUEUE_SIZE,
+                },
+            },
+            BringUpError::DoorbellRefused {
+                index: RX_QUEUE,
+                error: NotifyError::SlotOutsideBar {
+                    slot_end: Some(BAR_WINDOW_SIZE + 2),
+                    bar_size: BAR_WINDOW_SIZE,
+                },
+            },
+            BringUpError::DoorbellRefused {
+                index: TX_QUEUE,
+                error: NotifyError::SlotMisaligned { offset: 1 },
+            },
+        ];
+        for cap in [
+            CapError::NoCapabilities,
+            CapError::Malformed,
+            CapError::MultipleBars,
+            CapError::InvalidBar,
+            CapError::MissingStructure,
+        ] {
+            errors.push(BringUpError::Capabilities(cap));
+        }
+        errors
+    }
+
+    #[test]
+    fn every_refusal_token_is_distinct_and_fits_the_console_line() {
+        // `lfw_log::MAX_CAUSE_LEN` is the width `MAX_LINE_LEN` was derived
+        // against and nothing in that crate can hold a literal to it, so this
+        // is where the bound is enforced. Distinctness is the second half: two
+        // faults that render the same line are one line an operator cannot act
+        // on.
+        let mut tokens = vec::Vec::new();
+        for error in every_bring_up_error() {
+            let refusal = error.refusal();
+            assert!(
+                !refusal.cause.is_empty() && refusal.cause.len() <= lfw_log::MAX_CAUSE_LEN,
+                "{error:?} names {:?}, which does not fit the console line",
+                refusal.cause
+            );
+            assert!(
+                refusal
+                    .cause
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+                "{error:?} names {:?}, which is not a console token",
+                refusal.cause
+            );
+            assert_eq!(
+                refusal.signalled,
+                error.signalled_to_device(),
+                "{error:?} reports one thing about the device and carries another"
+            );
+            tokens.push(refusal.cause);
+        }
+        let count = tokens.len();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), count, "two refusals render as one token");
+    }
+
+    /// The numbers are the half a token cannot carry: a device that is not
+    /// virtio-net is only actionable with the ids it did report.
+    #[test]
+    fn a_refusal_carries_the_values_that_made_it_one() {
+        assert_eq!(
+            BringUpError::NotVirtioNet {
+                vendor: 0x8086,
+                device: 0x100e,
+            }
+            .refusal()
+            .detail,
+            RefusalDetail::Two(0x8086, 0x100e)
+        );
+        assert_eq!(
+            BringUpError::BarTargetUnusable { paddr: 0x5000_0000 }
+                .refusal()
+                .detail,
+            RefusalDetail::One(0x5000_0000)
+        );
+        assert_eq!(
+            BringUpError::Capabilities(CapError::Malformed)
+                .refusal()
+                .detail,
+            RefusalDetail::None
+        );
+        // The one variant whose operand count depends on its own contents.
+        assert_eq!(
+            BringUpError::DoorbellRefused {
+                index: RX_QUEUE,
+                error: NotifyError::SlotOutsideBar {
+                    slot_end: None,
+                    bar_size: 0x4000,
+                },
+            }
+            .refusal()
+            .detail,
+            RefusalDetail::One(0x4000)
+        );
     }
 }

@@ -59,6 +59,7 @@ use std::{fs, path::Path};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
 use virtio::pci::PCI_CONFIG_LEN;
+use wire::{CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE};
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
 
@@ -116,6 +117,45 @@ impl Cacheability {
     }
 }
 
+/// One `<map>` a rule admits: the domain that makes it, and what that domain
+/// may do to the region through it.
+///
+/// Perms belong to the grant and not to the region, because one region can be
+/// two different authorities at once. The configuration handover is exactly
+/// that: `cfg` is the config domain's to write and the forwarder's only to
+/// read, and that asymmetry is the whole of what makes the handover a protocol
+/// between two domains rather than a shared scratch area. A single `perms` per
+/// region could state at most one of the two — necessarily the wider one — and
+/// the narrower grant, the one actually doing the withholding, would be
+/// compared against nothing.
+struct Grant {
+    domain: &'static str,
+    /// The `perms` attribute this domain's `<map>` must carry, exactly.
+    /// Recorded rather than derived because no Rust constant states an
+    /// authority: this is where a widened grant — an executable buffer pool, a
+    /// writable ECAM page, a forwarder that can rewrite the configuration it is
+    /// about to be judged by — becomes a build failure instead of a diff nobody
+    /// read (ENG-1).
+    perms: &'static str,
+}
+
+/// The two authorities this description grants, as constructors rather than
+/// literals. The table below is read as a table, and what a reader must see at
+/// a glance is which domain reaches which region and how; two dozen identical
+/// `perms: "rw"` spellings bury the two that are not.
+const fn read_write(domain: &'static str) -> Grant {
+    Grant {
+        domain,
+        perms: "rw",
+    }
+}
+
+/// As [`read_write`], for a domain admitted to read a region and not to change
+/// it.
+const fn read_only(domain: &'static str) -> Grant {
+    Grant { domain, perms: "r" }
+}
+
 /// One `<memory_region>` the description is expected to declare, with
 /// everything about it this gate can judge.
 struct RegionRule {
@@ -125,26 +165,38 @@ struct RegionRule {
     name: &'static str,
     size: ExpectedSize,
     cacheability: Cacheability,
-    /// The `perms` every `<map>` of this region must carry. Recorded rather
-    /// than derived because no Rust constant states an authority: this is where
-    /// a widened grant — an executable buffer pool, a writable ECAM page —
-    /// becomes a build failure instead of a diff nobody read (ENG-1).
-    perms: &'static str,
-    /// The protection domains that map this region — every one of them, and no
-    /// other. Naming the set rather than a minimum is what lets the table say
-    /// *this domain must not map this region*, which no other attribute of a
-    /// `<map>` can express: a withheld mapping has no element to carry a rule.
-    /// Both directions are findings, because a grant that appeared and a grant
-    /// that vanished are the two ways this file stops meaning what the code
-    /// assumes.
-    mappers: &'static [&'static str],
+    /// Every `<map>` of this region — every one of them, and no other. Naming
+    /// the set rather than a minimum is what lets the table say *this domain
+    /// must not map this region*, which no other attribute of a `<map>` can
+    /// express: a withheld mapping has no element to carry a rule. Both
+    /// directions are findings, because a grant that appeared and a grant that
+    /// vanished are the two ways this file stops meaning what the code assumes.
+    grants: &'static [Grant],
     /// The sentence elsewhere in the repository that this row's *exclusions*
     /// are what make true, where one exists. `None` where no domain's absence
     /// is claimed anywhere and the region simply has no other user; `Some` is
     /// quoted into the finding, so a widened grant reports what the widening
     /// costs rather than what to type. A claim on a rule that withholds its
     /// region from nobody is a defect in the rule, and is tested for.
+    ///
+    /// It is about exclusion alone: where what a rule withholds is an
+    /// authority rather than a mapping — `cfg`, `cfgack` — the withholding
+    /// lives in a [`Grant`]'s perms and there is nothing for this field to say.
     withheld: Option<&'static str>,
+}
+
+impl RegionRule {
+    /// What this rule admits `domain` to do, or `None` where it admits nothing
+    /// at all — the case [`check_region_mappers`] reports.
+    fn grant(&self, domain: &str) -> Option<&Grant> {
+        self.grants.iter().find(|grant| grant.domain == domain)
+    }
+
+    /// The domains this rule grants the region to, for a finding that has to
+    /// name the set the description departed from.
+    fn granted_to(&self) -> Vec<&'static str> {
+        self.grants.iter().map(|grant| grant.domain).collect()
+    }
 }
 
 /// What a pool region's exclusions buy, quoted into the finding that reports
@@ -192,8 +244,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: PCI_CONFIG_LEN,
         },
         cacheability: Cacheability::Uncached,
-        perms: "rw",
-        mappers: &["nic_driver0"],
+        grants: &[read_write("nic_driver0")],
         withheld: None,
     },
     RegionRule {
@@ -203,8 +254,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: PCI_CONFIG_LEN,
         },
         cacheability: Cacheability::Uncached,
-        perms: "rw",
-        mappers: &["nic_driver1"],
+        grants: &[read_write("nic_driver1")],
         withheld: None,
     },
     RegionRule {
@@ -214,8 +264,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: BAR_WINDOW_SIZE,
         },
         cacheability: Cacheability::Uncached,
-        perms: "rw",
-        mappers: &["nic_driver0"],
+        grants: &[read_write("nic_driver0")],
         withheld: None,
     },
     RegionRule {
@@ -225,8 +274,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: BAR_WINDOW_SIZE,
         },
         cacheability: Cacheability::Uncached,
-        perms: "rw",
-        mappers: &["nic_driver1"],
+        grants: &[read_write("nic_driver1")],
         withheld: None,
     },
     RegionRule {
@@ -236,8 +284,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: VQ_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["nic_driver0"],
+        grants: &[read_write("nic_driver0")],
         withheld: None,
     },
     RegionRule {
@@ -247,8 +294,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: VQ_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["nic_driver1"],
+        grants: &[read_write("nic_driver1")],
         withheld: None,
     },
     // The six regions one pipeline each direction is granted as. Port 0
@@ -264,8 +310,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: POOL_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["forwarder", "nic_driver1"],
+        grants: &[read_write("forwarder"), read_write("nic_driver1")],
         withheld: Some(POOL_WITHHELD),
     },
     RegionRule {
@@ -275,8 +320,11 @@ const REGIONS: &[RegionRule] = &[
             bytes: FORWARD_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["forwarder", "nic_driver0", "nic_driver1"],
+        grants: &[
+            read_write("forwarder"),
+            read_write("nic_driver0"),
+            read_write("nic_driver1"),
+        ],
         withheld: None,
     },
     RegionRule {
@@ -286,8 +334,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: RETURN_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["nic_driver0", "nic_driver1"],
+        grants: &[read_write("nic_driver0"), read_write("nic_driver1")],
         withheld: Some(RETURN_WITHHELD),
     },
     RegionRule {
@@ -297,8 +344,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: POOL_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["forwarder", "nic_driver0"],
+        grants: &[read_write("forwarder"), read_write("nic_driver0")],
         withheld: Some(POOL_WITHHELD),
     },
     RegionRule {
@@ -308,8 +354,11 @@ const REGIONS: &[RegionRule] = &[
             bytes: FORWARD_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["forwarder", "nic_driver0", "nic_driver1"],
+        grants: &[
+            read_write("forwarder"),
+            read_write("nic_driver0"),
+            read_write("nic_driver1"),
+        ],
         withheld: None,
     },
     RegionRule {
@@ -319,9 +368,39 @@ const REGIONS: &[RegionRule] = &[
             bytes: RETURN_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        perms: "rw",
-        mappers: &["nic_driver0", "nic_driver1"],
+        grants: &[read_write("nic_driver0"), read_write("nic_driver1")],
         withheld: Some(RETURN_WITHHELD),
+    },
+    // The configuration handover, and the one place in this description where
+    // what a rule withholds is an authority rather than a mapping: both domains
+    // map both regions, and each may write exactly the one it speaks in. That
+    // is why a rule's perms are per grant. A `cfg` the forwarder could write
+    // would let it rewrite the table it is about to be held to and leave the
+    // publisher reporting a generation nobody runs; a `cfgack` the config
+    // domain could write would let it forge the acknowledgement that releases
+    // its own generation, which is the whole of what the second phase is for.
+    // Neither exclusion — no driver maps either region — is claimed anywhere,
+    // and a driver has no more use for a configuration image than for a
+    // parser, so `withheld` is None and the perms carry the argument.
+    RegionRule {
+        name: "cfg",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_REGION_SIZE",
+            bytes: CONFIG_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("config"), read_only("forwarder")],
+        withheld: None,
+    },
+    RegionRule {
+        name: "cfgack",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_ACK_REGION_SIZE",
+            bytes: CONFIG_ACK_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("config"), read_write("forwarder")],
+        withheld: None,
     },
 ];
 
@@ -330,10 +409,10 @@ const REGIONS: &[RegionRule] = &[
 /// and [`CHANNEL_ENDS`] are written in, so a domain renamed here and not there
 /// would leave both tables judging a domain that no longer exists while the one
 /// that replaced it is judged by nothing.
-const DOMAINS: &[&str] = &["forwarder", "nic_driver0", "nic_driver1"];
+const DOMAINS: &[&str] = &["forwarder", "config", "nic_driver0", "nic_driver1"];
 
-/// Whether a protection domain may hold a send capability on the channels it
-/// is an end of.
+/// Whether a protection domain may hold a send capability on one channel it is
+/// an end of.
 enum Notification {
     /// The domain signals the other end: `notify` absent (Microkit's default is
     /// true) or stated `"true"`.
@@ -344,24 +423,81 @@ enum Notification {
     MayNotSend { claim: &'static str },
 }
 
-/// Every protection domain the description may name as a `<channel>` end, and
-/// the direction its channels are granted in. A domain absent from this table
-/// fails the gate, and so does a domain here that is an end of no channel — the
-/// second is what stops the forwarder rule from passing vacuously the day the
-/// domain is renamed.
-const CHANNEL_ENDS: &[(&str, Notification)] = &[
-    ("nic_driver0", Notification::MaySend),
-    ("nic_driver1", Notification::MaySend),
-    (
-        "forwarder",
-        Notification::MayNotSend {
-            claim: "README.md, *Protection-domain decomposition*: the two notification channels \
-                    are each granted in one direction only, and \"the forwarder's two send \
-                    capabilities do not exist rather than merely going unexercised\". \
-                    pds/nic-driver's crate header makes the same claim about its own `notified` \
-                    entrypoint being unreachable by capability rather than by control flow",
+/// One `<end>` the description may declare.
+struct ChannelEnd {
+    domain: &'static str,
+    /// The `id` attribute — the channel's identifier *within* that domain, and
+    /// the granularity a send capability actually exists at: a protection
+    /// domain notifies through `Channel::new(id)`, so "may this domain send" is
+    /// a question about one id and never about the domain. Keying the rule on
+    /// the domain alone was true only while every channel a domain ended was
+    /// granted the same way, and the configuration handover is what ended that:
+    /// the forwarder may signal the config domain and may signal neither
+    /// driver.
+    id: &'static str,
+    notification: Notification,
+}
+
+/// What the forwarder's two *driver* channel ends are worth, quoted into the
+/// finding that reports one being widened. Shared by both, because it is one
+/// argument twice and a check that defended the forwarder against one driver
+/// and not the other would defend neither direction of traffic.
+const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this as a property of \
+     the system rather than of its own code: its `notified` entrypoint is \"unreachable by \
+     *capability* rather than by control flow\", which holds only while these two ends carry \
+     notify=\"false\". A driver never leaves `init` and so never reaches the Microkit event loop, \
+     so a forwarder able to signal one would hold authority over a domain that cannot answer, and \
+     the claim that entrypoint rests on would stop being true. The configuration channel is the \
+     one end this domain may send on, and it was granted deliberately (ENG-1, SCM-6); these two \
+     were not";
+
+/// Every `<end>` the description may declare, and the direction that one
+/// channel is granted in. An end absent from this table fails the gate, and so
+/// does a row here that matches no `<end>` — the second is what stops a rule
+/// from passing vacuously the day a domain or a channel id is renamed.
+const CHANNEL_ENDS: &[ChannelEnd] = &[
+    ChannelEnd {
+        domain: "nic_driver0",
+        id: "0",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "nic_driver1",
+        id: "0",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "forwarder",
+        id: "0",
+        notification: Notification::MayNotSend {
+            claim: DRIVER_CHANNEL_ONE_WAY,
         },
-    ),
+    },
+    ChannelEnd {
+        domain: "forwarder",
+        id: "1",
+        notification: Notification::MayNotSend {
+            claim: DRIVER_CHANNEL_ONE_WAY,
+        },
+    },
+    // The one channel granted in both directions, and the two rows that say so.
+    // Applying a configuration is a two-phase commit whose phases neither end
+    // can infer: the config domain offers and signals, the forwarder stages and
+    // signals back — the publisher has no loop to poll from and must not
+    // release a generation the consumer refused — and the config domain then
+    // publishes the commit and signals again, because a forwarder that learned
+    // of it only when the next frame arrived would be misconfigured for exactly
+    // as long as the node was idle.
+    ChannelEnd {
+        domain: "forwarder",
+        id: "2",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "config",
+        id: "0",
+        notification: Notification::MaySend,
+    },
 ];
 
 /// Every element type this module knows how to judge. An element outside it
@@ -590,28 +726,16 @@ fn check_maps(
                  granted set looking unchanged"
             ));
         }
+        // A region no rule names has nothing for its maps to be judged
+        // against. The missing rule is the finding; restating it once per map
+        // site would bury it under itself.
+        if let Some(rule) = REGIONS.iter().find(|rule| rule.name == region) {
+            if let Some(cached) = required(element, "cached", findings) {
+                check_map_cacheability(&site, rule, cached, findings);
+            }
+            check_map_perms(&site, rule, &domain, element, findings);
+        }
         granted.push((region, domain));
-        let Some(rule) = REGIONS.iter().find(|rule| rule.name == region) else {
-            // A region no rule names has nothing for its maps to be judged
-            // against. The missing rule is the finding; restating it once per
-            // map site would bury it under itself.
-            continue;
-        };
-
-        if let Some(cached) = required(element, "cached", findings) {
-            check_map_cacheability(&site, rule, cached, findings);
-        }
-        if let Some(perms) = required(element, "perms", findings)
-            && perms != rule.perms
-        {
-            findings.push(format!(
-                "{site} grants perms={perms:?} where sysdesc.rs records {:?}. A change to what a \
-                 domain may do to a region is a capability change, and it is reviewed and \
-                 approved rather than merged (ENG-1, SCM-6); record the new grant here once it \
-                 is",
-                rule.perms
-            ));
-        }
     }
 
     // Only regions the description actually declares: for one it does not, the
@@ -639,23 +763,24 @@ fn check_region_mappers(rule: &RegionRule, granted: &[(&str, String)], findings:
         .map(|(_, domain)| domain.as_str())
         .collect();
 
-    if rule.mappers.is_empty() {
+    if rule.grants.is_empty() {
         findings.push(format!(
             "sysdesc.rs grants <memory_region name={:?}> to no protection domain, so whichever \
-             domains map it are compared against nothing. Name them in `mappers` — the empty set \
+             domains map it are compared against nothing. Name them in `grants` — the empty set \
              says the region is reachable by nobody, which is not what a declared region is for",
             rule.name
         ));
         return;
     }
 
+    let granted_to = rule.granted_to();
     for domain in &holders {
-        if !rule.mappers.contains(domain) {
+        if rule.grant(domain).is_none() {
             let mut finding = format!(
-                "{domain:?} maps <memory_region name={:?}>, which sysdesc.rs grants to {:?} and \
-                 to nothing else. A domain reaching a region it was withheld is a capability \
-                 change, reviewed and approved rather than merged (ENG-1, SCM-6)",
-                rule.name, rule.mappers
+                "{domain:?} maps <memory_region name={:?}>, which sysdesc.rs grants to \
+                 {granted_to:?} and to nothing else. A domain reaching a region it was withheld \
+                 is a capability change, reviewed and approved rather than merged (ENG-1, SCM-6)",
+                rule.name
             );
             if let Some(claim) = rule.withheld {
                 finding.push_str(". What that withholding is worth: ");
@@ -665,17 +790,47 @@ fn check_region_mappers(rule: &RegionRule, granted: &[(&str, String)], findings:
         }
     }
 
-    for domain in rule.mappers {
-        if !holders.contains(domain) {
+    for grant in rule.grants {
+        if !holders.contains(&grant.domain) {
             findings.push(format!(
-                "sysdesc.rs records {domain:?} as mapping <memory_region name={:?}>, and it maps \
-                 no such region. Either the grant was dropped — and that domain now faults on \
-                 the vaddr it attaches — or the rule is stale and still judging a topology this \
-                 file left behind",
-                rule.name
+                "sysdesc.rs records {:?} as mapping <memory_region name={:?}>, and it maps no \
+                 such region. Either the grant was dropped — and that domain now faults on the \
+                 vaddr it attaches — or the rule is stale and still judging a topology this file \
+                 left behind",
+                grant.domain, rule.name
             ));
         }
     }
+}
+
+/// The authority one `<map>` grants, against the authority its rule grants that
+/// domain.
+///
+/// A domain the rule admits no grant for is left to [`check_region_mappers`]:
+/// the mapping that should not exist at all is the finding, and judging the
+/// perms of a grant nobody made would report one edit as two.
+fn check_map_perms(
+    site: &str,
+    rule: &RegionRule,
+    domain: &str,
+    element: &Element,
+    findings: &mut Vec<String>,
+) {
+    let Some(perms) = required(element, "perms", findings) else {
+        return;
+    };
+    let Some(grant) = rule.grant(domain) else {
+        return;
+    };
+    if perms == grant.perms {
+        return;
+    }
+    findings.push(format!(
+        "{site} grants perms={perms:?} where sysdesc.rs grants {domain:?} {:?} on this region. A \
+         change to what a domain may do to a region is a capability change, and it is reviewed \
+         and approved rather than merged (ENG-1, SCM-6); record the new grant here once it is",
+        grant.perms
+    ));
 }
 
 fn check_map_cacheability(site: &str, rule: &RegionRule, cached: &str, findings: &mut Vec<String>) {
@@ -696,22 +851,28 @@ fn check_map_cacheability(site: &str, rule: &RegionRule, cached: &str, findings:
 }
 
 fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<(&str, &str)> = Vec::new();
     for element in elements.iter().filter(|e| e.tag == "end") {
         let Some(domain) = required(element, "pd", findings) else {
             continue;
         };
-        let site = format!("line {}: <end pd={domain:?}>", element.line);
+        let Some(id) = required(element, "id", findings) else {
+            continue;
+        };
+        let site = format!("line {}: <end pd={domain:?} id={id:?}>", element.line);
 
-        let Some((_, expected)) = CHANNEL_ENDS.iter().find(|(name, _)| *name == domain) else {
+        let Some(end) = CHANNEL_ENDS
+            .iter()
+            .find(|end| end.domain == domain && end.id == id)
+        else {
             findings.push(format!(
-                "{site} names a protection domain no rule in sysdesc.rs covers, so whether it \
-                 holds a send capability on this channel is compared against nothing. Add it to \
-                 CHANNEL_ENDS as MaySend or MayNotSend"
+                "{site} names a protection domain and channel id no rule in sysdesc.rs covers, \
+                 so whether it holds a send capability on this channel is compared against \
+                 nothing. Add it to CHANNEL_ENDS as MaySend or MayNotSend"
             ));
             continue;
         };
-        seen.push(domain);
+        seen.push((domain, id));
 
         // Microkit 2.3.0 §7.6: `notify` "indicates that the protection domain
         // for this end can send a notification to the other end; defaults to
@@ -723,7 +884,7 @@ fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
             ));
             continue;
         }
-        match (expected, notify) {
+        match (&end.notification, notify) {
             (Notification::MaySend, "true") | (Notification::MayNotSend { .. }, "false") => {}
             (Notification::MaySend, _) => findings.push(format!(
                 "{site} carries notify=\"false\", so this domain holds no send capability on \
@@ -736,13 +897,14 @@ fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
         }
     }
 
-    for (domain, _) in CHANNEL_ENDS {
-        if !seen.contains(domain) {
+    for end in CHANNEL_ENDS {
+        if !seen.contains(&(end.domain, end.id)) {
             findings.push(format!(
-                "sysdesc.rs carries a channel rule for a protection domain named {domain:?}, and \
-                 the description makes it an end of no channel. The rule then passes over an \
-                 empty set — which is how a renamed domain silently loses the direction its \
-                 grant was narrowed to"
+                "sysdesc.rs carries a channel rule for {:?} on channel id {:?}, and the \
+                 description makes it an end of no such channel. The rule then passes over an \
+                 empty set — which is how a renamed domain, or a renumbered channel, silently \
+                 loses the direction its grant was narrowed to",
+                end.domain, end.id
             ));
         }
     }
@@ -1314,10 +1476,13 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarder_end_that_can_send_is_reported() {
-        // README's claim that the forwarder's two send capabilities "do not
-        // exist rather than merely going unexercised" rested on nobody editing
-        // this attribute.
+    fn a_forwarder_end_that_can_send_a_driver_is_reported() {
+        // pds/nic-driver's claim that its own `notified` entrypoint is
+        // unreachable by capability rested on nobody editing this attribute.
+        // The forwarder does now hold one send capability — on the config
+        // domain — which is exactly why the rule is keyed on the channel id:
+        // these two ends are still granted in one direction only, and losing
+        // that is a different edit from granting the third.
         let dropped = findings_after(
             "<end pd=\"forwarder\" id=\"0\" notify=\"false\" />",
             "<end pd=\"forwarder\" id=\"0\" />",
@@ -1325,7 +1490,7 @@ mod tests {
         let finding = only_finding(&dropped);
         assert!(finding.contains("send capability"), "{finding}");
         assert!(
-            finding.contains("README.md"),
+            finding.contains("pds/nic-driver"),
             "the claim is named: {finding}"
         );
 
@@ -1337,6 +1502,59 @@ mod tests {
             only_finding(&flipped).contains("send capability"),
             "{flipped:#?}"
         );
+    }
+
+    #[test]
+    fn a_configuration_end_that_cannot_send_is_reported_at_either_end() {
+        // The other half of the bidirectional pair, and the half a rule keyed
+        // on the domain alone could not have: the forwarder's third end must
+        // send where its first two must not. Losing either direction stalls the
+        // two-phase commit — the publisher never learns the generation was
+        // staged, or the consumer never learns it was released — and the node
+        // comes up on generation 0 with no error anywhere.
+        for end in [
+            "<end pd=\"config\" id=\"0\" notify=\"true\" />",
+            "<end pd=\"forwarder\" id=\"2\" notify=\"true\" />",
+        ] {
+            let findings = findings_after(end, &end.replace("\"true\"", "\"false\""));
+            assert!(
+                only_finding(&findings).contains("cannot leave it"),
+                "{end}: {findings:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handover_region_writable_by_the_domain_that_may_only_read_it_is_reported() {
+        // What per-grant perms buy, and the edit no other check in this module
+        // can see: both domains map both regions, so the mapper set is
+        // unchanged, the cacheability is right, the size is right, and the
+        // `<map>` is well formed. Only the authority moved — and with it the
+        // property that makes the handover a protocol: a forwarder that could
+        // write `cfg` rewrites the table it is about to be judged by, and a
+        // publisher that could write `cfgack` forges the acknowledgement
+        // releasing its own generation.
+        for (region, vaddr, domain) in [
+            ("cfg", "0x3_000_000", "forwarder"),
+            ("cfgack", "0x3_001_000", "config"),
+        ] {
+            let findings = findings_after(
+                &format!(
+                    "<map mr=\"{region}\" vaddr=\"{vaddr}\" perms=\"r\" cached=\"true\" \
+                     setvar_vaddr=\"{region}_vaddr\" />"
+                ),
+                &format!(
+                    "<map mr=\"{region}\" vaddr=\"{vaddr}\" perms=\"rw\" cached=\"true\" \
+                     setvar_vaddr=\"{region}_vaddr\" />"
+                ),
+            );
+            let finding = only_finding(&findings);
+            assert!(
+                finding.contains(&format!("{domain:?}")) && finding.contains("\"rw\""),
+                "{region}: {finding}"
+            );
+            assert!(finding.contains("ENG-1"), "{region}: {finding}");
+        }
     }
 
     #[test]
@@ -1482,7 +1700,7 @@ mod tests {
         // failure this module refuses everywhere else.
         for rule in REGIONS.iter().filter(|rule| rule.withheld.is_some()) {
             assert!(
-                DOMAINS.iter().any(|domain| !rule.mappers.contains(domain)),
+                DOMAINS.iter().any(|domain| rule.grant(domain).is_none()),
                 "{} carries a withheld claim and is granted to every domain",
                 rule.name
             );
@@ -1490,23 +1708,61 @@ mod tests {
     }
 
     #[test]
-    fn every_rule_grants_its_region_to_domains_that_exist() {
-        // A mappers entry naming a domain outside DOMAINS could never match a
-        // `<map>`, so it would report a dropped grant on every run — or, worse,
-        // sit in a rule whose region is undeclared and report nothing at all.
+    fn every_rule_grants_its_region_to_domains_that_exist_and_each_of_them_once() {
+        // A grant naming a domain outside DOMAINS could never match a `<map>`,
+        // so it would report a dropped grant on every run — or, worse, sit in a
+        // rule whose region is undeclared and report nothing at all.
+        //
+        // Naming one domain twice is the hazard that arrived with perms moving
+        // into the grant: `RegionRule::grant` answers with the first row, so a
+        // second one carrying different perms would be the narrower authority
+        // recorded, believed, and never compared against anything.
         for rule in REGIONS {
             assert!(
-                !rule.mappers.is_empty(),
+                !rule.grants.is_empty(),
                 "{} is granted to no domain at all",
                 rule.name
             );
-            for domain in rule.mappers {
+            let mut seen: Vec<&str> = Vec::new();
+            for grant in rule.grants {
                 assert!(
-                    DOMAINS.contains(domain),
-                    "{} names {domain:?}, which is not a protection domain",
-                    rule.name
+                    DOMAINS.contains(&grant.domain),
+                    "{} names {:?}, which is not a protection domain",
+                    rule.name,
+                    grant.domain
                 );
+                assert!(
+                    !seen.contains(&grant.domain),
+                    "{} grants {:?} twice, so only the first perms are ever compared",
+                    rule.name,
+                    grant.domain
+                );
+                seen.push(grant.domain);
             }
+        }
+    }
+
+    #[test]
+    fn every_channel_rule_names_a_domain_that_exists_and_an_id_once() {
+        // The same hazard on the other keyed table, arrived for the same
+        // reason: the key gained an id when the forwarder stopped being granted
+        // every channel the same way, and `check_channel_ends` answers with the
+        // first row that matches the pair.
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for end in CHANNEL_ENDS {
+            assert!(
+                DOMAINS.contains(&end.domain),
+                "the channel rule for {:?} names no protection domain",
+                end.domain
+            );
+            assert!(
+                !seen.contains(&(end.domain, end.id)),
+                "{:?} carries two rules for channel id {:?}, so only the first direction is \
+                 ever compared",
+                end.domain,
+                end.id
+            );
+            seen.push((end.domain, end.id));
         }
     }
 

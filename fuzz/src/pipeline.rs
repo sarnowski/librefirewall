@@ -79,13 +79,15 @@
 //! * **Counters only ever rise**, so a rejection is never silently un-counted.
 
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
 use arbitrary::Unstructured;
 use net_headers::{Ipv4Address, MacAddress};
 use packet_buffer::CopyOutError;
 use pd_runtime::{
-    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS, Pool, PoolOwner,
-    RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr, descriptor_in_bounds,
+    BUFFER_SIZE, Configuration, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS,
+    Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
+    descriptor_in_bounds,
 };
 use routing::{Interface, Neighbour, PortId, Router};
 
@@ -100,39 +102,50 @@ const POOL_PADDR: u64 = 0x3100_0000;
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
 
-/// The configuration `pds/forwarder` compiles in. The routing decision is not
+/// The generation the table below is attributed to. The configuration is the
+/// forwarder's own and reaches the stage per poll, so it is not something this
+/// peer can express; the number is fixed here for that reason.
+const GENERATION: u32 = 1;
+
+/// A two-port topology of the shape the appliance is configured into at run
+/// time. The routing decision is not
 /// what this harness is aimed at — `routing` is total over every header by its
 /// own property tests — but it must be the real table, or the frames the
 /// adversary happens to produce would be judged against a topology nothing
 /// runs.
-static ROUTER: Router<2, 2> = Router::new(
-    [
-        Interface {
-            port: PORT0,
-            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
-            address: Ipv4Address::from_octets([10, 0, 0, 1]),
-            prefix_length: 24,
-        },
-        Interface {
-            port: PORT1,
-            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]),
-            address: Ipv4Address::from_octets([10, 0, 1, 1]),
-            prefix_length: 24,
-        },
-    ],
-    [
-        Neighbour {
-            port: PORT0,
-            address: Ipv4Address::from_octets([10, 0, 0, 2]),
-            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
-        },
-        Neighbour {
-            port: PORT1,
-            address: Ipv4Address::from_octets([10, 0, 1, 2]),
-            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
-        },
-    ],
-);
+static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
+    Router::from_slices(
+        &[
+            Interface {
+                port: PORT0,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+            Interface {
+                port: PORT1,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]),
+                address: Ipv4Address::from_octets([10, 0, 1, 1]),
+                prefix_length: 24,
+                enabled: true,
+            },
+        ],
+        &[
+            Neighbour {
+                port: PORT0,
+                address: Ipv4Address::from_octets([10, 0, 0, 2]),
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
+            },
+            Neighbour {
+                port: PORT1,
+                address: Ipv4Address::from_octets([10, 0, 1, 2]),
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
+            },
+        ],
+    )
+    .expect("two of each fit in two")
+});
 
 /// One descriptor whose four fields the peer chose freely — a field-wise
 /// literal and not `Descriptor::new`, whose `Verdict` argument would confine
@@ -181,7 +194,7 @@ pub fn pipeline_harness(data: &[u8]) {
 
     let mut owner = PoolOwner::attach(returns);
     let mut rx_producer = rings.rx.producer();
-    let mut stage = RouteStage::attach(rings, pool, &ROUTER, PORT0, PORT1);
+    let mut stage = RouteStage::attach(rings, pool, PORT0, PORT1);
     let mut peer_free = returns.free.producer();
     let mut peer_tx = rings.tx.consumer();
     let rx_view = PeerView::<RING_SLOTS>::new(&rings.rx);
@@ -264,7 +277,7 @@ pub fn pipeline_harness(data: &[u8]) {
                 );
             }
             4 => {
-                let handed_on = stage.poll();
+                let handed_on = stage.poll(Configuration::new(GENERATION, &ROUTER));
                 assert!(
                     handed_on <= DRAIN_LIMIT,
                     "the forwarder handed on {handed_on} descriptors, past the {DRAIN_LIMIT} bound"
