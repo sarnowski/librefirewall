@@ -15,7 +15,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use queue::SpscRing;
-use wire::Descriptor;
+use wire::{Descriptor, Verdict};
 
 /// Enqueue one descriptor then dequeue it, keeping the ring near-empty so each
 /// call takes the uncontended fast path and the pair measures a single
@@ -29,7 +29,7 @@ fn enqueue_dequeue_pair(c: &mut Criterion) {
             // Both outcomes are asserted so the pair cannot drift into measuring
             // backpressure: a rejected enqueue would mean the ring never drained,
             // and a `None` dequeue would mean it is filling up.
-            black_box(producer.try_enqueue(black_box(Descriptor::new(1, 2, 3))))
+            black_box(producer.try_enqueue(black_box(Descriptor::new(1, 2, 3, Verdict::Transmit))))
                 .expect("the ring is drained every iteration, so it is never full");
             assert!(
                 black_box(consumer.try_dequeue()).is_some(),
@@ -51,7 +51,7 @@ fn drain_batch(c: &mut Criterion) {
         b.iter(|| {
             for i in 0..BATCH as u32 {
                 producer
-                    .try_enqueue(black_box(Descriptor::new(i, 0, i)))
+                    .try_enqueue(black_box(Descriptor::new(i, 0, i, Verdict::Transmit)))
                     .expect("the batch is far smaller than the ring");
             }
             assert_eq!(black_box(consumer.drain(BATCH)).count(), BATCH);
@@ -64,11 +64,20 @@ fn drain_batch(c: &mut Criterion) {
 fn try_enqueue_on_full(c: &mut Criterion) {
     let ring = SpscRing::<64>::new();
     let mut producer = ring.producer();
-    while producer.try_enqueue(Descriptor::new(0, 0, 0)).is_ok() {}
+    while producer
+        .try_enqueue(Descriptor::new(0, 0, 0, Verdict::Transmit))
+        .is_ok()
+    {}
     c.bench_function("spsc_try_enqueue_on_full", |b| {
         b.iter(|| {
             assert!(
-                black_box(producer.try_enqueue(black_box(Descriptor::new(1, 1, 1)))).is_err(),
+                black_box(producer.try_enqueue(black_box(Descriptor::new(
+                    1,
+                    1,
+                    1,
+                    Verdict::Transmit
+                ))))
+                .is_err(),
                 "the ring was filled before the measurement and nothing drains it"
             );
         });

@@ -3,7 +3,7 @@
 //! # The adversary and the surface
 //!
 //! The peer maps the whole ring read-write (CONCEPT §7.1): both published
-//! cursors and every one of the `3 * CAP` slot words. The crate's central claim
+//! cursors and every one of the `4 * CAP` slot words. The crate's central claim
 //! is that this buys the peer *values*, never *positions* — each side's own
 //! position lives in private memory the peer cannot map.
 //!
@@ -51,8 +51,10 @@
 //!   field is a value some enqueue or some peer store actually wrote into *that
 //!   field of that slot*, or the zero of an untouched one. Per word, not per
 //!   descriptor: with per-field stores a delivered descriptor is routinely a
-//!   triple nobody ever wrote as a triple, and that is the correct outcome, not
-//!   a violation.
+//!   quadruple nobody ever wrote as a quadruple, and that is the correct
+//!   outcome, not a violation. The verdict word is included on exactly the same
+//!   terms — this layer moves it and rules on it no more than it rules on a
+//!   length.
 //! * **`drain(limit)` never yields more than `limit`**, and yields exactly the
 //!   sequence the shadow position predicts.
 //! * **`is_empty()` and `len()` never contradict**, and `len()` never exceeds
@@ -97,9 +99,9 @@ const MASK: u32 = (CAP - 1) as u32;
 enum Wrote {
     /// The zero of a slot no one has written since the region was zeroed.
     Zeroed,
-    /// This side's `n`-th enqueue, which wrote all three words at once.
+    /// This side's `n`-th enqueue, which wrote all four words at once.
     Enqueue(u64),
-    /// The peer's `n`-th store, whether of one word or of three.
+    /// The peer's `n`-th store, whether of one word or of four.
     Peer(u64),
 }
 
@@ -142,11 +144,11 @@ struct ProducerSide<'ring> {
 /// The harness's independent model of the shared image: what each word holds,
 /// who wrote it, and every value ever written to it.
 struct Image {
-    /// Provenance of each of the `3 * CAP` slot words.
-    wrote: [[Wrote; 3]; CAP],
+    /// Provenance of each of the `4 * CAP` slot words.
+    wrote: [[Wrote; 4]; CAP],
     /// Every value ever written to each slot word, so "nothing is invented" is
     /// checkable per word rather than per descriptor.
-    seen: [[BTreeSet<u32>; 3]; CAP],
+    seen: [[BTreeSet<u32>; 4]; CAP],
     /// The two published cursors as this harness's own history says they are —
     /// never read back out of the ring, which is what makes comparing them with
     /// the ring a claim rather than a tautology.
@@ -159,7 +161,7 @@ impl Image {
     /// and untouched.
     fn zeroed() -> Self {
         Self {
-            wrote: [[Wrote::Zeroed; 3]; CAP],
+            wrote: [[Wrote::Zeroed; 4]; CAP],
             seen: core::array::from_fn(|_| core::array::from_fn(|_| BTreeSet::from([0u32]))),
             published_head: 0,
             published_tail: 0,
@@ -172,13 +174,14 @@ impl Image {
         self.seen[slot % CAP][field.index()].insert(value);
     }
 
-    /// Record a write of all three words of one slot.
+    /// Record a write of all four words of one slot.
     fn record_descriptor(&mut self, slot: usize, descriptor: Descriptor, wrote: Wrote) {
-        for (field, value) in
-            SlotField::ALL
-                .into_iter()
-                .zip([descriptor.buffer, descriptor.offset, descriptor.len])
-        {
+        for (field, value) in SlotField::ALL.into_iter().zip([
+            descriptor.buffer,
+            descriptor.offset,
+            descriptor.len,
+            descriptor.verdict,
+        ]) {
             self.record(slot, field, value, wrote);
         }
     }
@@ -224,11 +227,17 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
                 let index = any_index(&mut unstructured, producers.len());
                 let side = &mut producers[index];
                 let ordinal = handed_out.len() as u64;
-                let descriptor = Descriptor::new(
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                );
+                // Every word unreduced, the verdict included: this side is
+                // the *producer*, and `wire::Descriptor::new` would restrict
+                // that word to a decodable value. The ring moves what it is
+                // given, so restricting it here would leave the one word a
+                // consumer must decode permanently well-formed (TEST-8).
+                let descriptor = Descriptor {
+                    buffer: any_u32(&mut unstructured),
+                    offset: any_u32(&mut unstructured),
+                    len: any_u32(&mut unstructured),
+                    verdict: any_u32(&mut unstructured),
+                };
                 // Flow control is judged against the modelled cursor, not
                 // against one read back out of the ring.
                 let refused = (side.tail.wrapping_add(1) & MASK) == (image.published_head & MASK);
@@ -326,11 +335,12 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
             }
             5 => {
                 let slot = any_u32(&mut unstructured) as usize;
-                let descriptor = Descriptor::new(
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                );
+                let descriptor = Descriptor {
+                    buffer: any_u32(&mut unstructured),
+                    offset: any_u32(&mut unstructured),
+                    len: any_u32(&mut unstructured),
+                    verdict: any_u32(&mut unstructured),
+                };
                 peer.store_slot(slot, descriptor);
                 peer_writes += 1;
                 image.record_descriptor(slot, descriptor, Wrote::Peer(peer_writes));
@@ -435,9 +445,14 @@ fn deliver(
 
     // Nothing invented, per word: each field is a value written to *that* field
     // of *that* slot, or the zero it started as.
-    for (index, value) in [descriptor.buffer, descriptor.offset, descriptor.len]
-        .into_iter()
-        .enumerate()
+    for (index, value) in [
+        descriptor.buffer,
+        descriptor.offset,
+        descriptor.len,
+        descriptor.verdict,
+    ]
+    .into_iter()
+    .enumerate()
     {
         assert!(
             image.seen[slot][index].contains(&value),
@@ -446,7 +461,7 @@ fn deliver(
     }
 
     let wrote = image.wrote[slot];
-    if wrote[0] != wrote[1] || wrote[1] != wrote[2] {
+    if wrote.iter().any(|written| *written != wrote[0]) {
         // A descriptor assembled from more than one write — exactly what a peer
         // store landing between two of `Slot::load`'s three relaxed loads
         // produces. Well-formed, in bounds, and untrusted, which is all the
@@ -509,8 +524,13 @@ mod tests {
             self
         }
 
-        fn enqueue(self, handle: u32, buffer: u32, offset: u32, len: u32) -> Self {
-            self.op(0).arg(handle).arg(buffer).arg(offset).arg(len)
+        fn enqueue(self, handle: u32, buffer: u32, offset: u32, len: u32, verdict: u32) -> Self {
+            self.op(0)
+                .arg(handle)
+                .arg(buffer)
+                .arg(offset)
+                .arg(len)
+                .arg(verdict)
         }
 
         fn dequeue(self, handle: u32) -> Self {
@@ -554,7 +574,7 @@ mod tests {
     fn lapping_tail_rewind() -> Vec<u8> {
         let mut input = Input::default();
         for stamp in 1..=7u32 {
-            input = input.enqueue(0, stamp, 0, 0);
+            input = input.enqueue(0, stamp, 0, 0, 0);
         }
         for _ in 0..7 {
             input = input.dequeue(0);
@@ -575,7 +595,7 @@ mod tests {
     fn second_consumer_handle() -> Vec<u8> {
         let mut input = Input::default();
         for stamp in 1..=4u32 {
-            input = input.enqueue(0, stamp, 0, 0);
+            input = input.enqueue(0, stamp, 0, 0, 0);
         }
         for _ in 0..4 {
             input = input.dequeue(0);
@@ -588,15 +608,16 @@ mod tests {
         input.bytes()
     }
 
-    /// A peer store of one slot word between two whole-descriptor writes: the
+    /// A peer store of one slot word after a whole-descriptor write: the
     /// consumer is handed a descriptor assembled from two different writes,
-    /// which is what a store landing between two of `Slot::load`'s three
+    /// which is what a store landing between two of `Slot::load`'s four
     /// relaxed loads produces and what a whole-descriptor-only peer could not
-    /// express.
+    /// express. The word chosen is the verdict, the one a producer here cannot
+    /// give an undecodable value to.
     fn torn_slot_word() -> Vec<u8> {
         Input::default()
-            .enqueue(0, 0x1111_1111, 0x2222_2222, 0x3333_3333)
-            .store_field(0, 2, 0xDEAD_BEEF)
+            .enqueue(0, 0x1111_1111, 0x2222_2222, 0x3333_3333, 0)
+            .store_field(0, 3, 0xDEAD_BEEF)
             .dequeue(0)
             .bytes()
     }
@@ -662,7 +683,7 @@ mod tests {
     fn without_a_forged_tail_or_a_second_handle_nothing_is_delivered_twice() {
         let mut input = Input::default();
         for stamp in 1..=7u32 {
-            input = input.enqueue(0, stamp, stamp, stamp);
+            input = input.enqueue(0, stamp, stamp, stamp, stamp);
         }
         for round in 0..7u32 {
             input = input.op(3).arg(round.wrapping_mul(0x9E37_79B9));

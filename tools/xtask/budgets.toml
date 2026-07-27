@@ -16,45 +16,53 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
-"crates/nic-driver-core/src/bringup.rs" = 0.3697
-"crates/nic-driver-core/src/lib.rs" = 0.4950
+"crates/net-headers/src/lib.rs" = 0.1925
+"crates/nic-driver-core/src/bringup.rs" = 0.3693
+"crates/nic-driver-core/src/lib.rs" = 0.4926
 "crates/nic-driver-core/src/port.rs" = 0.4575
 "crates/packet-buffer/src/lib.rs" = 0.4529
-"crates/pd-runtime/src/lib.rs" = 0.5373
-"crates/queue/src/lib.rs" = 0.4271
+"crates/pd-runtime/src/lib.rs" = 0.4970
+"crates/queue/src/lib.rs" = 0.4260
+"crates/routing/src/lib.rs" = 0.2803
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
-"crates/wire/src/lib.rs" = 0.3231
-"pds/forwarder/src/main.rs" = 0.4364
+"crates/wire/src/lib.rs" = 0.3211
+"pds/forwarder/src/main.rs" = 0.3966
 "pds/nic-driver/src/main.rs" = 0.4844
 
 [unsafe-blocks]
+"crates/net-headers" = 0
 "crates/nic-driver-core" = 3
 "crates/packet-buffer" = 3
-"crates/pd-runtime" = 2
+"crates/pd-runtime" = 4
 "crates/queue" = 0
+"crates/routing" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 4
 
 [unsafe-fns]
+"crates/net-headers" = 0
 "crates/nic-driver-core" = 1
 "crates/packet-buffer" = 3
 "crates/pd-runtime" = 1
 "crates/queue" = 0
+"crates/routing" = 0
 "crates/virtio" = 4
 "crates/wire" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0
 
 [unsafe-impls]
+"crates/net-headers" = 0
 "crates/nic-driver-core" = 0
 "crates/packet-buffer" = 1
 "crates/pd-runtime" = 0
 "crates/queue" = 0
+"crates/routing" = 0
 "crates/virtio" = 0
 "crates/wire" = 0
 "pds/forwarder" = 0

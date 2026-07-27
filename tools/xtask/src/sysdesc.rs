@@ -151,19 +151,29 @@ struct RegionRule {
 /// one being widened. Shared by both pools because the argument is the same
 /// one twice, and the two must never drift apart: a check that defended pool 0
 /// and not pool 1 would defend neither direction of traffic.
-const POOL_WITHHELD: &str = "the forwarder maps no pool at all — the property the region split \
-     exists to establish (pds/forwarder's crate header: \"a compromised forwarder can neither \
-     corrupt a frame in flight nor forge a return\"), because a pool mapping is every frame in \
-     flight, read-write, for as long as the domain runs. The receiving driver is withheld it too, \
-     for a different reason it must keep: it hands that pool's physical address to its NIC as a \
-     DMA target and dereferences no byte of it, so a mapping would be authority with no use \
-     (pds/nic-driver's crate header)";
+///
+/// The forwarder is deliberately **not** among the domains this withholds a
+/// pool from, and has not been since routing landed: `RouteStage` rewrites a
+/// frame's Ethernet and IPv4 headers in the buffer they arrived in, which is a
+/// grant that was decided and approved rather than acquired (ENG-1, SCM-6).
+/// What the region split still establishes is [`RETURN_WITHHELD`], and that is
+/// the load-bearing one.
+const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It hands that pool's \
+     physical address to its NIC as a DMA target and dereferences no byte of it, so a mapping \
+     would be authority with no use (pds/nic-driver's crate header) — and the DMA target the \
+     device writes would additionally become reachable from the CPU side of the same domain. The \
+     forwarder's own pool mapping is not an exclusion this rule defends: it is granted, because a \
+     domain that rewrites a header must reach the bytes";
 
-/// As [`POOL_WITHHELD`], for the return rings.
+/// As [`POOL_WITHHELD`], for the return rings — the exclusion the forwarder's
+/// isolation now rests on entirely.
 const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region of its own \
      rather than a third field beside `ForwardRings` precisely so that it can be withheld \
      (pd_runtime's `ReturnRing`: \"what denies the forwarder the ability to forge a return — the \
-     one move that would put a live buffer back on an owner's free stack\")";
+     one move that would put a live buffer back on an owner's free stack\"), and a forwarder that \
+     could produce on it would be a second producer on a ring that admits exactly one. This is \
+     what a compromised forwarder is still unable to do: it can corrupt a frame in flight, and it \
+     cannot hand a live DMA target back to be issued a second time";
 
 /// Every memory region the description may declare, and what each one owes the
 /// code. A region absent from this table fails the gate; so does a rule here
@@ -242,10 +252,11 @@ const REGIONS: &[RegionRule] = &[
         withheld: None,
     },
     // The six regions one pipeline each direction is granted as. Port 0
-    // receives into pool0 and transmits out of pool1, so the driver that maps a
-    // pool is always the one that did *not* receive into it — which is why the
+    // receives into pool0 and transmits out of pool1, so the *driver* that maps
+    // a pool is always the one that did not receive into it — which is why the
     // two pools' mapper sets are each other's mirror rather than each other's
-    // copy.
+    // copy. The forwarder maps both, being the domain that rewrites headers in
+    // either direction.
     RegionRule {
         name: "pool0",
         size: ExpectedSize {
@@ -254,7 +265,7 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Cached,
         perms: "rw",
-        mappers: &["nic_driver1"],
+        mappers: &["forwarder", "nic_driver1"],
         withheld: Some(POOL_WITHHELD),
     },
     RegionRule {
@@ -287,7 +298,7 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Cached,
         perms: "rw",
-        mappers: &["nic_driver0"],
+        mappers: &["forwarder", "nic_driver0"],
         withheld: Some(POOL_WITHHELD),
     },
     RegionRule {
@@ -1206,7 +1217,7 @@ mod tests {
         // FORWARD_REGION_SIZE and RETURN_REGION_SIZE would still pass today and
         // would stop being true the moment either type grew.
         for (region, size, constant) in [
-            ("fwd1", "0x1000", "pd_runtime::FORWARD_REGION_SIZE"),
+            ("fwd1", "0x2000", "pd_runtime::FORWARD_REGION_SIZE"),
             ("free1", "0x1000", "pd_runtime::RETURN_REGION_SIZE"),
         ] {
             let findings = findings_after(
@@ -1356,55 +1367,38 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_mapped_into_the_forwarder_is_reported() {
-        // The property the region split exists to establish, and the one edit
-        // that would undo it: the forwarder is granted two ring regions, and a
-        // pool mapping would hand it every frame in flight, read-write, for as
-        // long as it runs. Nothing about the edit is malformed — it is a
-        // well-formed `<map>` with the right perms, the right cacheability and
-        // a free vaddr — so no other check in this module can see it.
-        for pool in ["pool0", "pool1"] {
+    fn a_return_ring_mapped_into_the_forwarder_is_reported() {
+        // The property the region split still establishes, and the one edit
+        // that would undo it. The pool grant this test used to be aimed at was
+        // given deliberately when routing landed — a domain that rewrites a
+        // header must reach the bytes — so what is left to defend is the `free`
+        // ring: a forwarder holding one could hand a live DMA target back to be
+        // issued a second time while a NIC is still writing it. Nothing about
+        // the edit is malformed — it is a well-formed `<map>` with the right
+        // perms, the right cacheability and a free vaddr — so no other check in
+        // this module can see it, which is why the rule is a mapper set rather
+        // than an attribute.
+        for (ring, vaddr) in [("free0", "0x2_400_000"), ("free1", "0x2_500_000")] {
             let findings = findings_after(
-                "<map mr=\"fwd1\" vaddr=\"0x2_100_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd1_vaddr\" />",
+                "<map mr=\"fwd0\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd0_vaddr\" />",
                 &format!(
-                    "<map mr=\"fwd1\" vaddr=\"0x2_100_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd1_vaddr\" />\n        \
-                     <map mr=\"{pool}\" vaddr=\"0x2_200_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"pool_vaddr\" />"
+                    "<map mr=\"fwd0\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd0_vaddr\" />\n        \
+                     <map mr=\"{ring}\" vaddr=\"{vaddr}\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"free_vaddr\" />"
                 ),
             );
             let finding = only_finding(&findings);
             assert!(
-                finding.contains("\"forwarder\"") && finding.contains(pool),
+                finding.contains("\"forwarder\"") && finding.contains(ring),
                 "{finding}"
             );
             assert!(finding.contains("ENG-1"), "{finding}");
-            // And it says what the withholding was worth, not merely that the
+            // And it says what the withholding is worth, not merely that the
             // table disagrees.
             assert!(
-                finding.contains("every frame in flight"),
+                finding.contains("forge a return"),
                 "the claim is quoted: {finding}"
             );
         }
-    }
-
-    #[test]
-    fn a_return_ring_mapped_into_the_forwarder_is_reported() {
-        // The other half of the narrowed grant: `ReturnRing` is a region of its
-        // own so that it can be withheld, and a forwarder holding it could
-        // forge a return.
-        let findings = findings_after(
-            "<map mr=\"fwd0\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd0_vaddr\" />",
-            "<map mr=\"fwd0\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"fwd0_vaddr\" />\n        \
-             <map mr=\"free0\" vaddr=\"0x2_200_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"free0_vaddr\" />",
-        );
-        let finding = only_finding(&findings);
-        assert!(
-            finding.contains("\"forwarder\"") && finding.contains("free0"),
-            "{finding}"
-        );
-        assert!(
-            finding.contains("forge a return"),
-            "the claim is quoted: {finding}"
-        );
     }
 
     #[test]
@@ -1734,9 +1728,12 @@ mod tests {
         };
         assert_eq!(owners("fwd0"), ["forwarder", "nic_driver0", "nic_driver1"]);
         // And the grant the split established, read straight off the file
-        // rather than off this module's own table.
-        assert_eq!(owners("pool0"), ["nic_driver1"]);
-        assert_eq!(owners("pool1"), ["nic_driver0"]);
+        // rather than off this module's own table: each pool reaches the
+        // forwarder and the driver that transmits out of it, and neither
+        // `free` ring reaches the forwarder at all.
+        assert_eq!(owners("pool0"), ["forwarder", "nic_driver1"]);
+        assert_eq!(owners("pool1"), ["forwarder", "nic_driver0"]);
         assert_eq!(owners("free0"), ["nic_driver0", "nic_driver1"]);
+        assert_eq!(owners("free1"), ["nic_driver0", "nic_driver1"]);
     }
 }

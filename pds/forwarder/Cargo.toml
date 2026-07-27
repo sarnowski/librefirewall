@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 sel4-microkit.workspace = true
 pd-runtime = { path = "../../crates/pd-runtime" }
+net-headers = { path = "../../crates/net-headers" }
+routing = { path = "../../crates/routing" }
 
 [lints]
 workspace = true

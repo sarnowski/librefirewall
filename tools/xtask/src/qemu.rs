@@ -14,8 +14,10 @@
 //! emulation cannot pass for an accelerated run.
 //!
 //! [`test_system`] is the black-box system gate: it asserts the machine-
-//! observable forwarding contract (a frame injected into each NIC port egresses
-//! byte-identical on the other), driven by [`crate::forward_harness`].
+//! observable routed contract — a datagram sent from the host endpoint on each
+//! NIC port reaches the endpoint on the other rewritten for its next hop, and
+//! the packets the appliance must refuse reach nobody — driven by
+//! [`crate::forward_harness`].
 
 use std::{fs, path::Path, process::Command};
 
@@ -100,8 +102,8 @@ struct Invocation {
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour: a frame injected into each NIC port must egress byte-identical
-/// on the opposite port.
+/// behaviour: the appliance routes a datagram in each direction between the two
+/// host endpoints, and refuses everything the routed contract says it must.
 pub(crate) fn test_system(root: &Path) -> Result<(), String> {
     let disk = root.join("dist").join(DIST_DISK);
     boot_and_forward(root, &disk, "qemu.log")?;
@@ -113,20 +115,20 @@ pub(crate) fn test_system(root: &Path) -> Result<(), String> {
 }
 
 /// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the
-/// bidirectional forwarding contract, returning the captured guest serial
-/// output (always also written to `build/image/<log_name>`) for callers that
+/// bidirectional routed contract, returning the captured guest serial output
+/// (always also written to `build/image/<log_name>`) for callers that
 /// additionally assert on the boot manager's structured records.
 pub(crate) fn boot_and_forward(
     root: &Path,
     disk: &Path,
     log_name: &str,
 ) -> Result<Vec<u8>, String> {
-    boot(root, disk, log_name, BootContract::Forwarding)
+    boot(root, disk, log_name, BootContract::Routed)
 }
 
-/// Boot `disk` expecting NO slot to be bootable: no injected frame may be
-/// forwarded, and the guest must emit `marker` — the boot manager's structured
-/// halt record. Returns the captured guest serial output like
+/// Boot `disk` expecting NO slot to be bootable: no injected packet may come
+/// back in any form, and the guest must emit `marker` — the boot manager's
+/// structured halt record. Returns the captured guest serial output like
 /// [`boot_and_forward`].
 pub(crate) fn boot_and_halt(
     root: &Path,
@@ -180,7 +182,7 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
     println!("QEMU run: {}", acceleration.describe());
     // Interactive runs have no harness peer to dial into, so back the two NIC
     // ports with QEMU's self-contained user-mode stack instead.
-    for port in 0..2 {
+    for port in 0..PORT_MACS.len() {
         command
             .arg("-netdev")
             .arg(format!("user,id=n{port}"))
@@ -191,16 +193,27 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The virtio-net-pci `-device` argument for dataplane port `port` (0 or 1),
-/// pinned to the PCI address the system description assigns (00:02.0, 00:03.0)
-/// with the matching per-port MAC and no option ROM (so the firmware gains no
-/// PXE payload). This is the single definition of the device contract; the
-/// netdev backend (`socket` under the forwarding harness, `user` for
-/// interactive runs) is joined separately by the id `n{port}`.
+/// The MAC QEMU gives each dataplane NIC, indexed by port. Held here — the one
+/// place that tells QEMU what to assign — and read by
+/// [`crate::forward_harness`], so the address the routed contract expects the
+/// appliance to answer to cannot drift from the address the port carries. Its
+/// length is also how many dataplane ports there are.
+pub(crate) const PORT_MACS: [[u8; 6]; 2] = [
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x50],
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x51],
+];
+
+/// The virtio-net-pci `-device` argument for dataplane port `port`, pinned to
+/// the PCI address the system description assigns (00:02.0, 00:03.0) with the
+/// port's [`PORT_MACS`] entry and no option ROM (so the firmware gains no PXE
+/// payload). This is the single definition of the device contract; the netdev
+/// backend (`socket` under the routing harness, `user` for interactive runs) is
+/// joined separately by the id `n{port}`.
 pub(crate) fn nic_device(port: usize) -> String {
+    let [a, b, c, d, e, f] = PORT_MACS[port];
     format!(
         "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
-         mac=52:54:00:12:34:5{port},bus=pcie.0,addr=0{}.0,romfile=",
+         mac={a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x},bus=pcie.0,addr=0{}.0,romfile=",
         port + 2
     )
 }
@@ -328,13 +341,20 @@ mod tests {
 
     #[test]
     fn each_port_gets_its_pinned_pci_address_and_mac_with_no_option_rom() {
-        assert!(nic_device(0).contains("addr=02.0") && nic_device(0).contains("34:50"));
-        assert!(nic_device(1).contains("addr=03.0") && nic_device(1).contains("34:51"));
-        for port in 0..2 {
+        assert!(
+            nic_device(0).contains("addr=02.0") && nic_device(0).contains("mac=52:54:00:12:34:50")
+        );
+        assert!(
+            nic_device(1).contains("addr=03.0") && nic_device(1).contains("mac=52:54:00:12:34:51")
+        );
+        for port in 0..PORT_MACS.len() {
             assert!(
                 nic_device(port).ends_with("romfile="),
                 "an option ROM would give the firmware a PXE payload"
             );
         }
+        // Two ports must not answer to one address, or a routed frame would be
+        // accepted by whichever NIC saw it first.
+        assert_ne!(PORT_MACS[0], PORT_MACS[1]);
     }
 }

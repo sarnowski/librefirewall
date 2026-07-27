@@ -27,8 +27,12 @@
 //!   it queues is range-validated ([`pd_runtime::descriptor_in_bounds`], plus
 //!   header room) before the span is touched, and checked against this driver's
 //!   own in-flight set so the same buffer cannot be posted to the device twice.
-//!   Nothing below the queue guards this boundary, so it is guarded here and
-//!   nowhere else.
+//!   Its verdict word is decoded, not trusted. A frame it marked against the
+//!   wire still arrives here to be returned, because a return is a produce on
+//!   the free ring whose single producer is this driver; without that the pool
+//!   would lose a buffer per routing drop, and routing drops are ordinary
+//!   traffic. Nothing below the queue guards this boundary, so it is guarded
+//!   here and nowhere else.
 //!
 //! # What this crate cannot enforce
 //!
@@ -54,7 +58,8 @@ mod fake_device;
 
 use pd_runtime::{
     BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS, Pool, PoolOwner,
-    RING_SLOTS, ReturnRing, RingConsumer, RingProducer, buffer_paddr, descriptor_in_bounds,
+    RING_SLOTS, ReturnRing, RingConsumer, RingProducer, Verdict, buffer_paddr,
+    descriptor_in_bounds,
 };
 use virtio::net::VirtioNetHdr;
 use virtio::queue::{DeviceFaults, SplitVirtqueue};
@@ -68,15 +73,15 @@ use virtio::queue::{DeviceFaults, SplitVirtqueue};
 /// [`invariant`](Self::invariant) alone.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counters {
-    /// Expected to be non-zero on a hostile network.
+    /// Expected to be non-zero on any network carrying traffic this node drops.
     pub input: InputDrops,
     /// Expected to be zero forever.
     pub invariant: InvariantFaults,
 }
 
-/// Counts of frames dropped on the untrusted-input boundaries, which are
-/// otherwise invisible: a device or neighbour misbehaving at line rate would
-/// look exactly like an idle link.
+/// Counts of frames this driver did not put on the wire for a reason outside
+/// itself — a neighbour misbehaving, or a neighbour deciding against the wire —
+/// which are otherwise invisible: either at line rate looks like an idle link.
 ///
 /// Every field is **monotonic** for the protection domain's life and
 /// **saturates** at [`u64::MAX`] rather than wrapping. There is no reset: a
@@ -99,6 +104,14 @@ pub struct InputDrops {
     /// Dropped without a return, because the in-flight instance still owes that
     /// buffer's single return.
     pub tx_duplicate: u64,
+    /// Transmit descriptors carrying [`Verdict::Discard`]: the device is not
+    /// touched and no pool byte written. Non-zero is ordinary routing — ARP, a
+    /// broadcast, an expired TTL — and nobody's fault, unlike its neighbours.
+    pub tx_discarded: u64,
+    /// Transmit descriptors whose verdict word decodes to neither variant. The
+    /// buffer is returned as a discard's is, so nothing leaks, but the value is
+    /// a defect in the producing domain and is never coerced to one (ENG-12).
+    pub tx_verdict_undecodable: u64,
     /// Each one loses its buffer to the pool owner's ledger for good; the
     /// alternative — asserting — would let a peer that stalls the ring take
     /// this domain down.
@@ -292,6 +305,7 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
                 buffer,
                 VirtioNetHdr::LEN as u32,
                 frame_len as u32,
+                Verdict::Transmit,
             ) {
                 Ok(()) => received = true,
                 Err(buffer) => {
@@ -392,7 +406,8 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
     /// A malformed one is counted and dropped, and its buffer returned to the
     /// pool only when the index names a real pool buffer — a forged index has
     /// no owner — and is not the one an in-flight instance still owes a return
-    /// for.
+    /// for. A [`Verdict::Discard`] and an undecodable verdict are returned on
+    /// those same terms, with neither the device nor the pool touched.
     ///
     /// The loop is capped at [`DRAIN_LIMIT`] iterations rather than at the
     /// virtqueue's free count, because a rejected descriptor consumes no
@@ -408,13 +423,39 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
             let Some(descriptor) = self.tx.try_dequeue() else {
                 break;
             };
+            // Read first: it decides whether this is a frame at all, so a
+            // buffer marked against the wire reaches neither device nor pool.
+            let verdict = Verdict::from_bits(descriptor.verdict);
             let in_pool = (descriptor.buffer as usize) < POOL_BUFFERS;
             // The duplicate check comes first so a duplicate is never *also*
             // returned: exactly one return per lent buffer is what keeps the
-            // owner's ledger from seeing a second, refused one.
+            // owner's ledger from seeing a second, refused one — which is why
+            // it sits ahead of the verdict branch and not beside it.
             if in_pool && self.in_flight[descriptor.buffer as usize] {
                 bump(&mut counters.input.tx_duplicate);
                 continue;
+            }
+            match verdict {
+                Some(Verdict::Transmit) => {}
+                // Device untouched, no pool byte written; the buffer goes back
+                // the way `reap` sends a transmitted one.
+                Some(Verdict::Discard) => {
+                    bump(&mut counters.input.tx_discarded);
+                    if in_pool {
+                        self.return_buffer(descriptor, counters);
+                    }
+                    continue;
+                }
+                // Same handling of the buffer, separate tally: a word decoding
+                // to nothing is a defect in the producing domain, and merging
+                // the two would let it hide inside ordinary traffic (ENG-12).
+                None => {
+                    bump(&mut counters.input.tx_verdict_undecodable);
+                    if in_pool {
+                        self.return_buffer(descriptor, counters);
+                    }
+                    continue;
+                }
             }
             // The 12 bytes in front of the frame are reserved header space in
             // the same buffer; on the receive side the device's own header
@@ -526,6 +567,25 @@ mod tests {
         unsafe {
             (*base).store(head, Ordering::Relaxed);
             (*base.add(1)).store(tail, Ordering::Relaxed);
+        }
+    }
+
+    /// Overwrite the verdict word of ring slot `slot`, the way a byzantine
+    /// forwarder that maps the region read-write does. It is the one descriptor
+    /// field no first-party producer can put an undecodable value in —
+    /// `PoolOwner::lend` takes a `Verdict` — so a test that wants one has to
+    /// reach the shared image, exactly as the peer does. The route is the
+    /// region's pinned ABI: a ring is `head`, `tail`, then `RING_SLOTS` slots of
+    /// four `u32`s in `Descriptor` field order (asserted in `queue` and in
+    /// `pd_runtime`), so slot `n`'s verdict is word `2 + 4 * n + 3`.
+    fn forge_slot_verdict(ring: &pd_runtime::Ring, slot: usize, bits: u32) {
+        let base = core::ptr::from_ref(ring).cast::<core::sync::atomic::AtomicU32>();
+        // SAFETY: `slot % RING_SLOTS < RING_SLOTS`, so the computed word lies
+        // inside the live ring borrowed here, and the layout above makes every
+        // word of it a 4-aligned `AtomicU32`. An atomic store is precisely what
+        // a peer domain performs on this word.
+        unsafe {
+            (*base.add(2 + 4 * (slot % RING_SLOTS) + 3)).store(bits, Ordering::Relaxed);
         }
     }
 
@@ -750,7 +810,7 @@ mod tests {
         /// whatever buffer the peer chooses.
         fn peer_returns_buffer(&mut self, buffer: u32) {
             self.peer_returns
-                .try_enqueue(Descriptor::new(buffer, 0, 0))
+                .try_enqueue(Descriptor::new(buffer, 0, 0, Verdict::Transmit))
                 .expect("the free ring has room");
         }
 
@@ -887,7 +947,12 @@ mod tests {
                     .write_at(buffer as usize, offset, payload)
                     .expect("the payload span lies within the buffer");
             }
-            self.queue(Descriptor::new(buffer, offset as u32, payload.len() as u32));
+            self.queue(Descriptor::new(
+                buffer,
+                offset as u32,
+                payload.len() as u32,
+                Verdict::Transmit,
+            ));
         }
     }
 
@@ -1171,7 +1236,12 @@ mod tests {
     fn a_valid_frame_is_posted_with_a_zeroed_header_and_returned_on_completion() {
         let mut fx = TxFixture::new();
         let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
-        let descriptor = Descriptor::new(7, VirtioNetHdr::LEN as u32, payload.len() as u32);
+        let descriptor = Descriptor::new(
+            7,
+            VirtioNetHdr::LEN as u32,
+            payload.len() as u32,
+            Verdict::Transmit,
+        );
         fx.enqueue_frame(7, VirtioNetHdr::LEN, &payload);
 
         assert!(fx.post());
@@ -1190,6 +1260,136 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_frame_returns_its_buffer_without_reaching_the_device() {
+        // The routing drop, which is ordinary traffic rather than misbehaviour:
+        // the producing domain decided against the wire, so nothing may be
+        // posted and no pool byte written — and the buffer must still come
+        // back, or the pool bleeds one per drop and the port dies in seconds.
+        let mut fx = TxFixture::new();
+        let untouched = [0xFFu8; VirtioNetHdr::LEN];
+        // SAFETY: single-threaded test; buffer 6 is not otherwise in use and the
+        // span lies within it.
+        unsafe { fx.pool.write_at(6, 0, &untouched) }.expect("the header span lies within it");
+        let discarded = Descriptor::new(6, VirtioNetHdr::LEN as u32, 8, Verdict::Discard);
+        fx.queue(discarded);
+
+        assert!(!fx.post(), "a discard must not ring the transmit doorbell");
+        assert_eq!(
+            fx.counters,
+            Counters {
+                input: InputDrops {
+                    tx_discarded: 1,
+                    ..InputDrops::default()
+                },
+                invariant: InvariantFaults::default(),
+            }
+        );
+        assert_eq!(fx.vq.free_count(), Q, "no descriptor reached the device");
+        assert!(
+            fx.device.next_avail().is_none(),
+            "a discarded frame was made available to the device"
+        );
+
+        // The reserved header space still holds what the test put there, so the
+        // header write was never even attempted.
+        let mut storage = [0u8; BUFFER_SIZE];
+        // SAFETY: as above; the snapshot lands in this test's own storage, so
+        // nothing borrows the pool.
+        let bytes = unsafe {
+            fx.pool
+                .copy_out(6, 0, VirtioNetHdr::LEN as u32, &mut storage)
+        }
+        .expect("the header span lies within the buffer");
+        assert_eq!(bytes, &untouched, "a discarded buffer was written to");
+
+        // And it went back along the path a completed transmit uses.
+        assert_eq!(fx.returned(), Some(discarded));
+    }
+
+    #[test]
+    fn an_undecodable_verdict_returns_the_buffer_under_its_own_counter() {
+        // A peer defect rather than a decision. The buffer is handled exactly as
+        // a discard's — nothing may leak on a value nobody chose — while the
+        // tally stays separate, or a forwarder writing garbage would hide
+        // inside a routing-drop rate that is expected to be non-zero.
+        let mut fx = TxFixture::new();
+        let forged = Descriptor {
+            buffer: 2,
+            offset: VirtioNetHdr::LEN as u32,
+            len: 8,
+            verdict: 0xDEAD_BEEF,
+        };
+        fx.queue(forged);
+
+        assert!(!fx.post());
+        assert_eq!(
+            fx.counters,
+            Counters {
+                input: InputDrops {
+                    tx_verdict_undecodable: 1,
+                    ..InputDrops::default()
+                },
+                invariant: InvariantFaults::default(),
+            }
+        );
+        assert_eq!(fx.vq.free_count(), Q);
+        assert!(fx.device.next_avail().is_none());
+        assert_eq!(fx.returned(), Some(forged));
+    }
+
+    #[test]
+    fn a_discard_naming_a_forged_index_is_counted_and_not_returned() {
+        // A forged index has no owner, so returning it would put a buffer that
+        // never existed onto someone's free stack — the reason the malformed
+        // path withholds the return, and it holds however the frame is marked.
+        let mut fx = TxFixture::new();
+        for verdict in [Verdict::Discard, Verdict::Transmit] {
+            fx.queue(Descriptor::new(
+                POOL_BUFFERS as u32,
+                VirtioNetHdr::LEN as u32,
+                8,
+                verdict,
+            ));
+            assert!(!fx.post());
+            assert!(fx.returned().is_none());
+        }
+        assert_eq!(fx.counters.input.tx_discarded, 1);
+        assert_eq!(fx.counters.input.tx_malformed, 1);
+        assert_eq!(fx.counters.invariant, InvariantFaults::default());
+    }
+
+    #[test]
+    fn a_duplicate_is_refused_before_a_discard_can_make_it_a_second_return() {
+        // A buffer is in flight at the device and the forwarder queues it again,
+        // this time marked against the wire. Acting on the mark would produce
+        // the second return for a buffer that was lent once — which is why the
+        // duplicate check sits ahead of the verdict branch and not beside it.
+        let mut fx = TxFixture::new();
+        fx.enqueue_frame(4, VirtioNetHdr::LEN, &[0xABu8; 6]);
+        assert!(fx.post());
+
+        fx.queue(Descriptor::new(
+            4,
+            VirtioNetHdr::LEN as u32,
+            6,
+            Verdict::Discard,
+        ));
+        assert!(!fx.post());
+        assert_eq!(fx.counters.input.tx_duplicate, 1);
+        assert_eq!(
+            fx.counters.input.tx_discarded, 0,
+            "the mark was not acted on"
+        );
+        assert!(fx.returned().is_none());
+
+        // The in-flight instance still owes exactly one return, and delivers it.
+        fx.device.transmit();
+        fx.reap();
+        assert!(fx.returned().is_some());
+        assert!(fx.returned().is_none());
+    }
+
+    #[test]
     fn a_forged_buffer_index_is_dropped_without_a_return() {
         let mut fx = TxFixture::new();
         // Buffer index past the pool: it has no owner to return to.
@@ -1197,6 +1397,7 @@ mod tests {
             POOL_BUFFERS as u32,
             VirtioNetHdr::LEN as u32,
             8,
+            Verdict::Transmit,
         ));
 
         assert!(!fx.post());
@@ -1209,7 +1410,12 @@ mod tests {
     fn an_out_of_bounds_span_is_dropped_and_the_buffer_returned() {
         let mut fx = TxFixture::new();
         // Real buffer, but the span runs past the buffer end.
-        let bad = Descriptor::new(3, VirtioNetHdr::LEN as u32, BUFFER_SIZE as u32);
+        let bad = Descriptor::new(
+            3,
+            VirtioNetHdr::LEN as u32,
+            BUFFER_SIZE as u32,
+            Verdict::Transmit,
+        );
         fx.queue(bad);
 
         assert!(!fx.post());
@@ -1223,7 +1429,7 @@ mod tests {
     fn a_frame_without_header_room_is_dropped_and_the_buffer_returned() {
         let mut fx = TxFixture::new();
         // In bounds, but the offset leaves no room for the virtio-net header.
-        let bad = Descriptor::new(5, (VirtioNetHdr::LEN - 1) as u32, 8);
+        let bad = Descriptor::new(5, (VirtioNetHdr::LEN - 1) as u32, 8, Verdict::Transmit);
         fx.queue(bad);
 
         assert!(!fx.post());
@@ -1248,6 +1454,7 @@ mod tests {
             4,
             VirtioNetHdr::LEN as u32,
             payload.len() as u32,
+            Verdict::Transmit,
         ));
         assert!(!fx.post());
         assert_eq!(fx.counters.input.tx_duplicate, 1);
@@ -1329,7 +1536,7 @@ mod tests {
         let mut fx = TxFixture::new();
         let capacity = fx.free.free.capacity();
         // In bounds, but no header room, so each is rejected *and* returned.
-        let bad = Descriptor::new(1, 0, 8);
+        let bad = Descriptor::new(1, 0, 8, Verdict::Transmit);
 
         for _ in 0..capacity {
             fx.queue(bad);
@@ -1488,7 +1695,12 @@ mod tests {
         // time — and that it is not silently lost either.
         let mut fx = TxFixture::new();
         for buffer in 0..Q as u32 {
-            fx.queue(Descriptor::new(buffer, VirtioNetHdr::LEN as u32, 8));
+            fx.queue(Descriptor::new(
+                buffer,
+                VirtioNetHdr::LEN as u32,
+                8,
+                Verdict::Transmit,
+            ));
         }
         assert!(fx.post());
         assert_eq!(fx.counters, Counters::default());
@@ -1496,7 +1708,12 @@ mod tests {
         // A fresh queue restarts at slot zero, so every one of these collides.
         let mut stray = StrayQueue::new();
         for buffer in Q as u32..2 * Q as u32 {
-            fx.queue(Descriptor::new(buffer, VirtioNetHdr::LEN as u32, 8));
+            fx.queue(Descriptor::new(
+                buffer,
+                VirtioNetHdr::LEN as u32,
+                8,
+                Verdict::Transmit,
+            ));
         }
         assert!(fx.tx.post(&mut stray.vq, &mut fx.counters));
 
@@ -1511,7 +1728,12 @@ mod tests {
         // being posted a second time while the first queue may still hold it:
         // re-queueing buffer 0 is refused as a duplicate rather than reposted.
         let mut third = StrayQueue::new();
-        fx.queue(Descriptor::new(0, VirtioNetHdr::LEN as u32, 8));
+        fx.queue(Descriptor::new(
+            0,
+            VirtioNetHdr::LEN as u32,
+            8,
+            Verdict::Transmit,
+        ));
         assert!(!fx.tx.post(&mut third.vq, &mut fx.counters));
         assert_eq!(fx.counters.input.tx_duplicate, 1);
         assert!(fx.returned().is_none());
@@ -1538,8 +1760,208 @@ mod tests {
         assert_eq!(stats.counters.invariant, InvariantFaults::default());
     }
 
+    /// One whole transmit pipeline with the buffer cycle closed: the
+    /// pool-owning peer at one end, this driver's transmit path at the other,
+    /// and a byzantine forwarder between them choosing the verdict word.
+    ///
+    /// The publishing driver and the forwarder are collapsed into one
+    /// [`publish`](Self::publish), since the descriptor a forwarder emits is
+    /// what this fixture is about and the `rx` ring in between moves it
+    /// unchanged. It is the only fixture here that closes the cycle, which is
+    /// what makes "no buffer is leaked" observable at all: with the pool owner
+    /// absent, a buffer that never comes back is indistinguishable from one
+    /// nobody asked for.
+    struct PipelineFixture {
+        rings: &'static ForwardRings,
+        _region: Box<VqRegion>,
+        vq: Vq,
+        device: FakeDevice,
+        owner: PoolOwner<'static>,
+        /// The forwarder's end of the `tx` ring, taken once for the fixture's
+        /// life; see [`RxFixture::forwarder`].
+        forwarder: RingProducer<'static, RING_SLOTS>,
+        tx: TxPath<'static, Q>,
+        /// How many descriptors that handle has published, and so which slot
+        /// the next one lands in — the producer starts at zero and advances one
+        /// slot per successful enqueue.
+        published: usize,
+        counters: Counters,
+    }
+
+    impl PipelineFixture {
+        fn new() -> Self {
+            let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+            let rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
+            let returns: &'static ReturnRing = Box::leak(Box::new(ReturnRing::new()));
+            let mut region = VqRegion::boxed();
+            let ptr = region.0.as_mut_ptr();
+            // SAFETY: `ptr` backs a 16-byte-aligned, zeroed VqRegion owned
+            // solely by this test — `Vq::new`'s contract.
+            let vq = unsafe { Vq::new(ptr) };
+            let device = FakeDevice::new(ptr);
+            let pool_paddr = core::ptr::from_ref(pool) as u64;
+            Self {
+                rings,
+                _region: region,
+                vq,
+                device,
+                owner: PoolOwner::attach(returns),
+                forwarder: rings.tx.producer(),
+                tx: TxPath::attach(rings, returns, pool, pool_paddr),
+                published: 0,
+                counters: Counters::default(),
+            }
+        }
+
+        /// Take a buffer from the pool and queue it for transmit under a verdict
+        /// word wholly of the peer's choosing.
+        ///
+        /// `lend` cannot mint an undecodable word, so the forwarder writes it
+        /// into the shared slot afterwards — which is what the forwarder really
+        /// does, and the only way this case is expressible at all.
+        fn publish(&mut self, len: u32, verdict_bits: u32) {
+            let Some(buffer) = self.owner.alloc() else {
+                return;
+            };
+            if let Err(returned) = self.owner.lend(
+                &mut self.forwarder,
+                buffer,
+                VirtioNetHdr::LEN as u32,
+                len,
+                Verdict::Transmit,
+            ) {
+                self.owner.release(returned);
+                return;
+            }
+            forge_slot_verdict(&self.rings.tx, self.published, verdict_bits);
+            self.published += 1;
+        }
+
+        fn post(&mut self) -> bool {
+            self.tx.post(&mut self.vq, &mut self.counters)
+        }
+
+        /// Let the device finish everything it was made available, then reap.
+        fn complete_and_reap(&mut self) {
+            while let Some(head) = self.device.next_avail() {
+                let len = self.device.desc_len(head);
+                self.device.complete(head, len);
+            }
+            self.tx.reap(&mut self.vq, &mut self.counters);
+        }
+
+        fn reclaim(&mut self) -> usize {
+            self.owner.reclaim()
+        }
+
+        /// Buffers this driver has at the device right now — the only ones
+        /// legitimately outside the owner's ledger once the pipeline is idle.
+        fn in_flight(&self) -> usize {
+            self.tx.in_flight.iter().filter(|held| **held).count()
+        }
+    }
+
+    /// One move the byzantine forwarder makes against a closed pipeline.
+    #[derive(Clone, Debug)]
+    enum TxStep {
+        /// Publish a buffer under a verdict word of the peer's choosing.
+        Publish(u32, u32),
+        /// Hand what is queued to the device.
+        Post,
+        /// Let the device finish, and reap the completions.
+        Complete,
+        /// Take the returns back into the pool.
+        Reclaim,
+    }
+
+    /// A verdict word as a byzantine forwarder writes it: both values that
+    /// decode, and the whole of the space that does not. The undecodable case
+    /// is not a rare accident of `any::<u32>()` here — it is weighted in, so a
+    /// strategy edit cannot quietly stop generating it (TEST-8).
+    fn any_verdict_bits() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            3 => Just(Verdict::Transmit.to_bits()),
+            3 => Just(Verdict::Discard.to_bits()),
+            2 => any::<u32>(),
+        ]
+    }
+
+    fn any_tx_step() -> impl Strategy<Value = TxStep> {
+        prop_oneof![
+            5 => (1u32..64, any_verdict_bits()).prop_map(|(len, bits)| TxStep::Publish(len, bits)),
+            4 => Just(TxStep::Post),
+            3 => Just(TxStep::Complete),
+            3 => Just(TxStep::Reclaim),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The property this whole ABI exists to establish, over a long run of
+        /// mixed transmit, discard and undecodable verdicts in arbitrary
+        /// interleaving: every buffer comes home.
+        ///
+        /// A discard is normal traffic, so if the transmit path dropped a
+        /// discarded descriptor without returning its buffer the pool would
+        /// shrink by one per routing decision and a 64-buffer port would stop
+        /// within seconds — a leak no panic and no counter would reveal. The
+        /// mirror failure is as bad: returning a buffer that is still in flight
+        /// would give it two owners. So the assertion is both halves at once —
+        /// once the pipeline is drained the ledger holds the *whole* pool, and
+        /// what it hands out is pairwise distinct.
+        #[test]
+        fn mixed_verdicts_never_leak_a_buffer_or_give_one_two_owners(
+            steps in prop::collection::vec(any_tx_step(), 0..300),
+        ) {
+            let mut fx = PipelineFixture::new();
+
+            for step in steps {
+                match step {
+                    TxStep::Publish(len, bits) => fx.publish(len, bits),
+                    TxStep::Post => {
+                        fx.post();
+                    }
+                    TxStep::Complete => fx.complete_and_reap(),
+                    TxStep::Reclaim => {
+                        prop_assert!(fx.reclaim() <= DRAIN_LIMIT);
+                    }
+                }
+                // Conservation at every instant: nothing is invented, so what
+                // the owner holds free plus what sits at the device can never
+                // exceed the pool.
+                prop_assert!(fx.owner.owned() + fx.in_flight() <= POOL_BUFFERS);
+                // And no verdict the peer chose may be recorded as our defect.
+                prop_assert_eq!(fx.counters.invariant, InvariantFaults::default());
+            }
+
+            // Drain: post what is queued, let the device finish it, reclaim the
+            // returns. The pool holds 64 buffers and the queue takes 16 at a
+            // time, so four rounds suffice for anything still in flight; eight
+            // leaves margin without ever being what ends the loop, which the
+            // assertion below is the check on.
+            for _ in 0..8 {
+                fx.post();
+                fx.complete_and_reap();
+                fx.reclaim();
+            }
+            prop_assert_eq!(
+                fx.owner.owned(),
+                POOL_BUFFERS,
+                "the pool did not come whole again: a buffer was leaked"
+            );
+
+            let mut seen = [false; POOL_BUFFERS];
+            let mut handed_out = 0usize;
+            while let Some(buffer) = fx.owner.alloc() {
+                let index = buffer.index() as usize;
+                prop_assert!(index < POOL_BUFFERS, "the ledger held index {}", index);
+                prop_assert!(!seen[index], "index {} was handed to two owners", index);
+                seen[index] = true;
+                handed_out += 1;
+            }
+            prop_assert_eq!(handed_out, POOL_BUFFERS);
+        }
 
         /// Arbitrary device behaviour against the receive path: completions for
         /// arbitrary head indices with arbitrary reported lengths, in arbitrary
@@ -1588,7 +2010,13 @@ mod tests {
         #[test]
         fn arbitrary_peer_descriptors_never_panic_or_return_a_buffer_twice(
             descriptors in prop::collection::vec(
-                (any::<u32>(), any::<u32>(), any::<u32>(), any::<bool>()),
+                (
+                    any::<u32>(),
+                    any::<u32>(),
+                    any::<u32>(),
+                    any_verdict_bits(),
+                    any::<bool>(),
+                ),
                 0..120,
             ),
         ) {
@@ -1596,14 +2024,18 @@ mod tests {
             let mut returned = 0usize;
             let mut offered = 0usize;
 
-            for (buffer, offset, len, complete) in descriptors {
+            for (buffer, offset, len, verdict, complete) in descriptors {
                 // Bias towards plausible values so the valid path is reached at
-                // all, while arbitrary ones keep forged spans in the mix.
-                let descriptor = Descriptor::new(
-                    buffer % (POOL_BUFFERS as u32 + 2),
-                    offset % (BUFFER_SIZE as u32 + 2),
-                    len % (BUFFER_SIZE as u32 + 2),
-                );
+                // all, while arbitrary ones keep forged spans in the mix. The
+                // verdict is not reduced at all: it is one word wholly the
+                // peer's, and the values that decode to nothing are exactly the
+                // ones a bias towards the two variants would delete (TEST-8).
+                let descriptor = Descriptor {
+                    buffer: buffer % (POOL_BUFFERS as u32 + 2),
+                    offset: offset % (BUFFER_SIZE as u32 + 2),
+                    len: len % (BUFFER_SIZE as u32 + 2),
+                    verdict,
+                };
                 if fx.forwarder.try_enqueue(descriptor).is_ok() {
                     offered += 1;
                 }

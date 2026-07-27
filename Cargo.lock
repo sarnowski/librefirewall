@@ -273,7 +273,9 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 name = "forwarder"
 version = "0.1.0"
 dependencies = [
+ "net-headers",
  "pd-runtime",
+ "routing",
  "sel4-microkit",
 ]
 
@@ -423,6 +425,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "net-headers"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "nic-driver"
 version = "0.1.0"
 dependencies = [
@@ -493,9 +502,12 @@ dependencies = [
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "net-headers",
  "packet-buffer",
  "proptest",
  "queue",
+ "routing",
  "wire",
 ]
 
@@ -744,6 +756,14 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "routing"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+ "proptest",
+]
 
 [[package]]
 name = "rustc-hash"

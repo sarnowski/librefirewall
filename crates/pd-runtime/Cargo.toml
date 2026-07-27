@@ -8,9 +8,16 @@ license.workspace = true
 wire = { path = "../wire" }
 queue = { path = "../queue" }
 packet-buffer = { path = "../packet-buffer" }
+net-headers = { path = "../net-headers" }
+routing = { path = "../routing" }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "route"
+harness = false

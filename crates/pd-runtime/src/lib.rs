@@ -20,12 +20,14 @@
 //! Microkit grants memory a region at a time, so what a domain can reach is
 //! decided by where the region boundaries fall and never by which fields its
 //! code touches. The pipeline is therefore cut three ways — [`Pool`],
-//! [`ForwardRings`], [`ReturnRing`] — which lets the forwarder hold the two
-//! rings it moves descriptors between while holding neither the pool it never
-//! dereferences nor the return ring it never produces on. The cut is free: the
-//! two ring regions each round up to one mapping page, which is what all three
-//! rings in one region rounded up to. A [`Pool`] goes to the two drivers alone,
-//! and to the receiving one as a physical address with no mapping at all.
+//! [`ForwardRings`], [`ReturnRing`] — which lets the forwarder hold the pool
+//! whose L2/L3 headers it rewrites and the two rings it moves descriptors
+//! between, while holding neither pipeline's return ring. The cut costs one
+//! mapping page over a single region holding all four, and that page is what
+//! buys the separation: the ring on which a forged return would put a live DMA
+//! target back onto an owner's free stack is not addressable from the forwarder
+//! at all. A [`Pool`] goes to the forwarder and the transmitting driver, and to
+//! the receiving one as a physical address with no mapping at all.
 //!
 //! # Handles are taken once, at attach (DOC-9)
 //!
@@ -52,17 +54,24 @@
 //! * **No unbounded work** — [`DRAIN_LIMIT`], derived from this crate's own
 //!   constants and never from a peer-influenced estimate.
 //! * **No panic** — every rejection above is a counted drop ([`PoolCounters`],
-//!   [`ForwardCounters`]). Peer-supplied values are input and are rejected
+//!   [`RouteCounters`]). Peer-supplied values are input and are rejected
 //!   safely; only a violated invariant of this domain's own private state fails
 //!   visibly.
 //!
 //! # The accepted, tracked residue
 //!
 //! * **Buffer loss.** A peer stalling its side of a ring can leave
-//!   [`ForwardStage::poll`] unable to place a descriptor it already dequeued.
+//!   [`RouteStage::poll`] unable to place a descriptor it already dequeued.
 //!   A dequeue cannot be undone and this domain does not produce onto that
 //!   ring, so the buffer is lost to its owner's ledger for good. The pool
 //!   shrinks; nothing is double-owned and nothing crashes.
+//! * **A verdict rests on a snapshot, not on the frame.** [`RouteStage`] routes
+//!   a copy taken into its own memory, because a decision made on pool bytes a
+//!   peer may rewrite under it is no decision at all. The peer keeps the bytes:
+//!   it may rewrite them after the snapshot and before the transmitting NIC
+//!   reads them, so what leaves the port can differ from what was decided on,
+//!   in every field the rewrite does not overwrite. Nothing here closes that —
+//!   an IOMMU (CONCEPT §7.2) or a per-buffer cross-domain ownership epoch would.
 //! * **Frame loss and reordering**, by forging a cursor.
 //! * **Writing pool bytes at any time.** The two drivers share a pool, and no
 //!   Rust type stops one of them scribbling a buffer it does not own. That is
@@ -74,12 +83,14 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
-use packet_buffer::{BufferPool, FreeList, ReturnError};
+use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, TtlExpired};
+use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError};
 use queue::SpscRing;
+use routing::{Decision, DropCounters, DropReason, PortId, Router};
 
 pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
-pub use wire::Descriptor;
+pub use wire::{Descriptor, Verdict};
 
 pub const POOL_BUFFERS: usize = 64;
 
@@ -143,9 +154,9 @@ fn bump(counter: &mut u64) {
 /// The forwarder's region: the two rings a descriptor crosses on its way from
 /// the receiving driver to the transmitting one.
 ///
-/// This is the whole of what the forwarder is granted. The pool those
-/// descriptors index and the ring the buffers come back on are separate
-/// regions, which it never maps.
+/// The ring the buffers come back on is a separate region, which the forwarder
+/// never maps; the [`Pool`] those descriptors index is a third, and it is
+/// mapped, because the routed frame's headers are rewritten in place.
 ///
 /// A zeroed region is the valid empty state, so no domain constructs one; each
 /// attaches to the mapped frames with [`attach_region!`].
@@ -174,13 +185,13 @@ pub struct ReturnRing {
 // together also prove each layout carries no padding.
 const _: () = {
     assert!(size_of::<Ring>() == 8 + RING_SLOTS * size_of::<Descriptor>());
-    assert!(size_of::<Ring>() == 1544);
+    assert!(size_of::<Ring>() == 2056);
     assert!(size_of::<Pool>() == POOL_BUFFERS * BUFFER_SIZE);
     assert!(size_of::<Pool>() == 0x20000);
     assert!(offset_of!(ForwardRings, rx) == 0);
     assert!(offset_of!(ForwardRings, tx) == size_of::<Ring>());
     assert!(size_of::<ForwardRings>() == 2 * size_of::<Ring>());
-    assert!(size_of::<ForwardRings>() == 3088);
+    assert!(size_of::<ForwardRings>() == 4112);
     assert!(offset_of!(ReturnRing, free) == 0);
     assert!(size_of::<ReturnRing>() == size_of::<Ring>());
     // Exactly four, not merely "within a page": the rings' `AtomicU32`s are the
@@ -196,7 +207,7 @@ const _: () = {
 // type by less than one page, so no unaddressed slack can return unnoticed.
 const _: () = {
     assert!(POOL_REGION_SIZE == 0x20000);
-    assert!(FORWARD_REGION_SIZE == 0x1000);
+    assert!(FORWARD_REGION_SIZE == 0x2000);
     assert!(RETURN_REGION_SIZE == 0x1000);
     assert!(POOL_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
     assert!(FORWARD_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
@@ -205,13 +216,14 @@ const _: () = {
     assert!(POOL_REGION_SIZE == size_of::<Pool>());
     assert!(FORWARD_REGION_SIZE - size_of::<ForwardRings>() < MAPPING_ALIGN);
     assert!(RETURN_REGION_SIZE - size_of::<ReturnRing>() < MAPPING_ALIGN);
-    // Splitting the pipeline cost no page: the three regions together are
-    // exactly what one region holding all four components rounded up to. A
-    // change that made the cut expensive fails here rather than in a report
-    // nobody diffed.
+    // What the split costs, stated here rather than left to a report nobody
+    // diffed: one mapping page. It was nothing while a descriptor was 12 bytes;
+    // a 16-byte one pushes `ForwardRings` past a page. The page is what buys
+    // the grant separation, and a cut that cost *more* fails here.
     assert!(
         POOL_REGION_SIZE + FORWARD_REGION_SIZE + RETURN_REGION_SIZE
             == (size_of::<Pool>() + 3 * size_of::<Ring>()).next_multiple_of(MAPPING_ALIGN)
+                + MAPPING_ALIGN
     );
 };
 
@@ -441,8 +453,8 @@ impl<'ring> PoolOwner<'ring> {
             .expect("a held token names an outstanding, unlent buffer");
     }
 
-    /// Publish `len` bytes at `offset` of an already-filled buffer on `ring`,
-    /// handing it to the next domain without copying.
+    /// Publish `len` bytes at `offset` of an already-filled buffer on `ring`
+    /// under `verdict`, handing it to the next domain without copying.
     ///
     /// The token is consumed and only a bare index crosses onto the shared
     /// ring, a move-only token being unable to cross a protection-domain
@@ -460,10 +472,11 @@ impl<'ring> PoolOwner<'ring> {
         buffer: OwnedBuffer<POOL_BUFFERS>,
         offset: u32,
         len: u32,
+        verdict: Verdict,
     ) -> Result<(), OwnedBuffer<POOL_BUFFERS>> {
         let index = buffer.index();
         if ring
-            .try_enqueue(Descriptor::new(index, offset, len))
+            .try_enqueue(Descriptor::new(index, offset, len, verdict))
             .is_err()
         {
             return Err(buffer);
@@ -522,44 +535,112 @@ impl<'ring> PoolOwner<'ring> {
     }
 }
 
+/// The bytes a forwarding rewrite can touch, and so the whole of what
+/// [`RouteStage`] puts back into the pool: the Ethernet header and the IPv4
+/// header, never a payload byte.
+///
+/// The IPv4 header sits at [`ETHERNET_HEADER_LEN`] with nothing in between,
+/// because a frame that reaches a rewrite is never 802.1Q-tagged: `Router`
+/// answers a tagged frame with `DropReason::VlanTagged` before it resolves
+/// anything, proved by `routing`'s
+/// `a_tagged_frame_is_dropped_for_want_of_a_sub_interface`. A tag would move
+/// the L3 header four bytes along and this window would then write the wrong
+/// bytes back over the right ones.
+const REWRITTEN_HEADER_LEN: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+
+// What makes the fixed-range write-back slice of `scratch` unable to leave it:
+// a build error rather than a bounds check on the per-frame path.
+const _: () = assert!(REWRITTEN_HEADER_LEN <= BUFFER_SIZE);
+
 /// Monotonic and saturating for the reasons given on [`PoolCounters`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ForwardCounters {
-    /// Descriptors moved onward, ownership and all.
+pub struct RouteCounters {
+    /// Frames rewritten for their next hop and handed to the transmitting
+    /// driver.
     pub forwarded: u64,
-    /// Descriptors dropped because the destination ring would not take them.
-    /// Each loses its buffer to the pool for good — see the crate header — so
-    /// a rising count is a shrinking pool.
-    pub dropped: u64,
+    /// Descriptors the destination ring would not take. Each loses its buffer
+    /// to the pool for good — see the crate header — so a rising count is a
+    /// shrinking pool.
+    pub egress_full: u64,
+    /// Descriptors naming a span outside the pool. Such a descriptor names no
+    /// buffer the transmitting driver could return, so handing it on would be
+    /// inventing a return rather than granting one; it is dropped instead.
+    pub malformed_descriptor: u64,
+    /// Spans the pool refused to snapshot, leaving nothing to route on.
+    pub snapshot_failed: u64,
+    /// Frames that are not the IPv4-over-Ethernet packet they would have to be
+    /// to be routed. One counter for every [`net_headers::ParseError`]: this
+    /// domain has no surface to report which (MONITORING.md — a drop is
+    /// currently unobservable), so a finer split would be numbers nobody reads.
+    pub unparsable: u64,
+    /// Frames the router would forward out of a port this stage is not wired
+    /// to. A stage is a fixed cross-connect between one ingress and one egress
+    /// port, so such a decision cannot be carried out here at all.
+    pub misrouted: u64,
+    /// Rewritten headers the pool refused to take back. The buffer then still
+    /// holds the frame as it arrived, so it is discarded rather than
+    /// transmitted with its original MACs and TTL — which would loop it.
+    pub writeback_failed: u64,
+    /// Why the router refused a frame, one counter per reason.
+    pub drops: DropCounters,
 }
 
-/// One direction of the forwarding chain: it moves descriptors from a
-/// pipeline's `rx` ring to its `tx` ring, transferring buffer ownership onward
-/// without touching the bytes.
+/// One direction of the routed dataplane: it snapshots each frame a pipeline's
+/// `rx` ring names, decides on it, rewrites the headers of the ones it
+/// forwards, and hands every descriptor on under the verdict the transmitting
+/// driver acts on.
 ///
-/// [`ForwardRings`] is the only region it borrows, and the whole of what its
-/// domain is granted.
-pub struct ForwardStage<'ring> {
+/// A discarded frame's descriptor travels onward exactly as a forwarded one's
+/// does. This domain maps no `free` ring — that is what denies it the ability
+/// to forge a return — so the transmitting driver is the only domain that can
+/// give the buffer back, and the verdict is how it is told to.
+pub struct RouteStage<'ring, const INTERFACES: usize, const NEIGHBOURS: usize> {
+    ingress: PortId,
+    egress: PortId,
     from: RingConsumer<'ring, RING_SLOTS>,
     to: RingProducer<'ring, RING_SLOTS>,
-    counters: ForwardCounters,
+    pool: &'ring Pool,
+    router: &'ring Router<INTERFACES, NEIGHBOURS>,
+    /// Private storage the frame is snapshotted into. A field rather than a
+    /// `poll` local because the protection domain's stack is 16 KiB and this is
+    /// 2 KiB per stage.
+    scratch: [u8; BUFFER_SIZE],
+    counters: RouteCounters,
 }
 
-impl<'ring> ForwardStage<'ring> {
+impl<'ring, const INTERFACES: usize, const NEIGHBOURS: usize>
+    RouteStage<'ring, INTERFACES, NEIGHBOURS>
+{
     /// Take `rings`' `rx` consumer and `tx` producer handles — once per
-    /// protection domain per pipeline; see the crate header.
+    /// protection domain per pipeline; see the crate header — and borrow the
+    /// pool those descriptors index together with the static configuration
+    /// every decision is made against.
     #[must_use]
-    pub fn attach(rings: &'ring ForwardRings) -> Self {
+    pub fn attach(
+        rings: &'ring ForwardRings,
+        pool: &'ring Pool,
+        router: &'ring Router<INTERFACES, NEIGHBOURS>,
+        ingress: PortId,
+        egress: PortId,
+    ) -> Self {
         Self {
+            ingress,
+            egress,
             from: rings.rx.consumer(),
             to: rings.tx.producer(),
-            counters: ForwardCounters::default(),
+            pool,
+            router,
+            scratch: [0; BUFFER_SIZE],
+            counters: RouteCounters::default(),
         }
     }
 
-    /// Move descriptors onward until the source ring is observed empty, the
-    /// destination refuses one, or [`DRAIN_LIMIT`] descriptors have been moved.
-    /// Returns how many moved.
+    /// Route descriptors onward until the source ring is observed empty, the
+    /// destination refuses one, or [`DRAIN_LIMIT`] have been handled. Returns
+    /// how many reached the destination ring under either verdict — which is
+    /// the number of buffers that are on their way back to their owner, and so
+    /// the quantity a caller can act on; how many were forwarded is
+    /// [`RouteCounters::forwarded`].
     ///
     /// The rings are sized above the pool, so along a correctly accounted chain
     /// the destination can always take what the source held. A refusal means
@@ -569,22 +650,184 @@ impl<'ring> ForwardStage<'ring> {
     /// Stopping on the first refusal is deliberate: every further dequeue into
     /// a full destination would lose another buffer.
     pub fn poll(&mut self) -> usize {
-        let Self { from, to, counters } = self;
-        let mut moved = 0;
+        let Self {
+            ingress,
+            egress,
+            from,
+            to,
+            pool,
+            router,
+            scratch,
+            counters,
+        } = self;
+        let mut handed_on = 0;
         for descriptor in from.drain(DRAIN_LIMIT) {
-            if to.try_enqueue(descriptor).is_err() {
-                bump(&mut counters.dropped);
+            // Unconditionally, and before the buffer is touched: the descriptor
+            // is peer input, and this is the span the two pool accessors below
+            // are argued from.
+            if !descriptor_in_bounds(&descriptor) {
+                bump(&mut counters.malformed_descriptor);
+                continue;
+            }
+            let verdict = match snapshot(pool, &descriptor, scratch) {
+                Ok(frame_bytes) => route_frame(router, *ingress, *egress, frame_bytes, counters),
+                Err(_) => {
+                    bump(&mut counters.snapshot_failed);
+                    Verdict::Discard
+                }
+            };
+            let verdict = match verdict {
+                Verdict::Transmit => write_back(pool, &descriptor, scratch, counters),
+                Verdict::Discard => Verdict::Discard,
+            };
+            if to
+                .try_enqueue(Descriptor {
+                    verdict: verdict.to_bits(),
+                    ..descriptor
+                })
+                .is_err()
+            {
+                bump(&mut counters.egress_full);
                 break;
             }
-            moved += 1;
+            handed_on += 1;
+            if verdict == Verdict::Transmit {
+                bump(&mut counters.forwarded);
+            }
         }
-        counters.forwarded = counters.forwarded.saturating_add(moved as u64);
-        moved
+        handed_on
     }
 
     #[must_use]
-    pub fn counters(&self) -> ForwardCounters {
+    pub fn counters(&self) -> RouteCounters {
         self.counters
+    }
+}
+
+/// Snapshot the frame `descriptor` names into `scratch`, yielding the exactly
+/// `len`-byte prefix that holds it.
+///
+/// The copy is what makes a decision defensible at all: bytes left in the pool
+/// are free to change under the decision that inspected them
+/// (`packet_buffer`'s crate header), so what is parsed and rewritten is this
+/// domain's own memory, and only the finished header goes back.
+///
+/// # Errors
+/// [`CopyOutError`], carrying the span that was refused: `scratch` shorter than
+/// the frame, or a span that leaves its buffer.
+fn snapshot<'scratch>(
+    pool: &Pool,
+    descriptor: &Descriptor,
+    scratch: &'scratch mut [u8],
+) -> Result<&'scratch mut [u8], CopyOutError> {
+    let len = descriptor.len as usize;
+    let capacity = scratch.len();
+    let Some(frame_bytes) = scratch.get_mut(..len) else {
+        return Err(CopyOutError::DestinationTooSmall { len, capacity });
+    };
+    // SAFETY: `copy_out`'s one clause is that the caller currently owns the
+    // index, and this domain does not: it holds a descriptor in transit, not a
+    // buffer. That clause has no enforcer anywhere in the system and is not
+    // claimed here; `packet_buffer`'s own header states what violating it
+    // yields — "a snapshot of bytes another domain was writing, which the
+    // caller already treats as untrusted, and never a dangling or aliased
+    // reference" — and the crate header above records it as accepted residue.
+    // What makes the call sound is guaranteed: the mapping is the
+    // `<map mr="pool0"/"pool1" perms="rw" cached="true">` grant to the
+    // forwarder in systems/qemu-x86_64/librefirewall.system, taken through
+    // `attach_region!`; the span is bounded by `descriptor_in_bounds` in
+    // `RouteStage::poll` and again, unconditionally, by the pool's own span
+    // check, which answers in the return value rather than faulting; and
+    // `frame_bytes` is the caller's own storage, which cannot alias a pool it
+    // holds no reference into.
+    unsafe {
+        pool.copy_out(
+            descriptor.buffer as usize,
+            descriptor.offset as usize,
+            descriptor.len,
+            frame_bytes,
+        )
+    }?;
+    Ok(frame_bytes)
+}
+
+/// The verdict on one snapshotted frame, rewritten in place for its next hop
+/// when the verdict is to forward it.
+fn route_frame<const INTERFACES: usize, const NEIGHBOURS: usize>(
+    router: &Router<INTERFACES, NEIGHBOURS>,
+    ingress: PortId,
+    egress: PortId,
+    frame_bytes: &mut [u8],
+    counters: &mut RouteCounters,
+) -> Verdict {
+    let mut frame = match Frame::parse(frame_bytes) {
+        Ok(frame) => frame,
+        Err(_) => {
+            bump(&mut counters.unparsable);
+            return Verdict::Discard;
+        }
+    };
+    match router.decide(ingress, &frame) {
+        Decision::Drop(reason) => {
+            counters.drops.record(reason);
+            Verdict::Discard
+        }
+        Decision::Forward {
+            egress: decided, ..
+        } if decided != egress => {
+            bump(&mut counters.misrouted);
+            Verdict::Discard
+        }
+        Decision::Forward {
+            source,
+            destination,
+            ..
+        } => match frame.rewrite_for_forwarding(source, destination) {
+            Ok(()) => Verdict::Transmit,
+            // The router refuses a TTL that cannot survive a hop before it
+            // resolves a route, so this is one rejection reached through the
+            // second of two enforcers. Recording it under the reason the first
+            // would have used keeps one refused packet to one drop.
+            Err(TtlExpired { .. }) => {
+                counters.drops.record(DropReason::TtlExpired);
+                Verdict::Discard
+            }
+        },
+    }
+}
+
+/// Put the rewritten headers back into the pool buffer, and answer whether the
+/// frame may still be transmitted.
+///
+/// Only [`REWRITTEN_HEADER_LEN`] bytes go back. The payload is never written:
+/// it is the sender's, this stage does not alter it, and copying it back would
+/// overwrite whatever the peer has legitimately done to those bytes since.
+fn write_back(
+    pool: &Pool,
+    descriptor: &Descriptor,
+    scratch: &[u8; BUFFER_SIZE],
+    counters: &mut RouteCounters,
+) -> Verdict {
+    // SAFETY: the ownership clause, the mapping and the span are exactly as
+    // `snapshot` states them for the same buffer, `write_at` differing only in
+    // direction; the source is this domain's own storage, so it cannot alias
+    // the pool. The written window is a fixed range of a fixed-size array,
+    // bounded by the `REWRITTEN_HEADER_LEN <= BUFFER_SIZE` assertion above at
+    // build time, and where it lands in the buffer is `write_at`'s own business
+    // — it bounds that unconditionally and answers in its return value.
+    let placed = unsafe {
+        pool.write_at(
+            descriptor.buffer as usize,
+            descriptor.offset as usize,
+            &scratch[..REWRITTEN_HEADER_LEN],
+        )
+    };
+    match placed {
+        Ok(()) => Verdict::Transmit,
+        Err(_) => {
+            bump(&mut counters.writeback_failed);
+            Verdict::Discard
+        }
     }
 }
 
@@ -592,11 +835,64 @@ impl<'ring> ForwardStage<'ring> {
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
+    use net_headers::{EtherType, Ipv4Address, MacAddress, Protocol, Transport, UDP_HEADER_LEN};
     use proptest::prelude::*;
+    use routing::{Interface, Neighbour};
     use std::boxed::Box;
     use std::collections::BTreeSet;
     use std::thread;
     use std::vec::Vec;
+
+    const PORT0: PortId = PortId(0);
+    const PORT1: PortId = PortId(1);
+    const GATEWAY0_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]);
+    const GATEWAY1_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]);
+    const HOST_A_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]);
+    const HOST_B_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]);
+    const HOST_A: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 2]);
+    const HOST_B: Ipv4Address = Ipv4Address::from_octets([10, 0, 1, 2]);
+
+    /// The offset a published frame sits at, as the receiving driver publishes
+    /// it: the device's own 12-byte header occupies the front of the buffer, so
+    /// a stage that assumed a frame starts at zero would rewrite the header's
+    /// bytes and read the frame's as headers.
+    const DEVICE_HEADER_LEN: u32 = 12;
+
+    /// Bytes of UDP payload the concurrent chain carries its sequence number
+    /// in — a `u64`, so half a million frames are all distinguishable.
+    const SEQUENCE_LEN: usize = 8;
+
+    /// The configuration `pds/forwarder` compiles in, so what these tests hold
+    /// the stage to is the appliance's own topology rather than one invented
+    /// here.
+    static ROUTER: Router<2, 2> = Router::new(
+        [
+            Interface {
+                port: PORT0,
+                mac: GATEWAY0_MAC,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 24,
+            },
+            Interface {
+                port: PORT1,
+                mac: GATEWAY1_MAC,
+                address: Ipv4Address::from_octets([10, 0, 1, 1]),
+                prefix_length: 24,
+            },
+        ],
+        [
+            Neighbour {
+                port: PORT0,
+                address: HOST_A,
+                mac: HOST_A_MAC,
+            },
+            Neighbour {
+                port: PORT1,
+                address: HOST_B,
+                mac: HOST_B_MAC,
+            },
+        ],
+    );
 
     /// One pipeline's three regions, allocated the way a protection domain is
     /// handed them: separate mappings that share nothing.
@@ -632,22 +928,109 @@ mod tests {
         }
     }
 
+    /// One frame an endpoint puts on the wire, in the shape the tests vary it:
+    /// every field a routing decision reads, and nothing else.
+    struct FrameSpec {
+        destination_mac: MacAddress,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        ttl: u8,
+        tagged: bool,
+        payload_len: usize,
+    }
+
+    impl FrameSpec {
+        /// Host A to host B across the appliance: the frame the whole dataplane
+        /// exists to carry, and the base every rejection below is one edit from.
+        fn a_to_b() -> Self {
+            Self {
+                destination_mac: GATEWAY0_MAC,
+                source: HOST_A,
+                destination: HOST_B,
+                ttl: 64,
+                tagged: false,
+                payload_len: 24,
+            }
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&self.destination_mac.0);
+            frame.extend_from_slice(&HOST_A_MAC.0);
+            if self.tagged {
+                frame.extend_from_slice(&EtherType::VLAN.0.to_be_bytes());
+                frame.extend_from_slice(&0x0064u16.to_be_bytes());
+            }
+            frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
+
+            let total_length = (IPV4_HEADER_LEN + UDP_HEADER_LEN + self.payload_len) as u16;
+            let mut ip = [0u8; IPV4_HEADER_LEN];
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&total_length.to_be_bytes());
+            ip[8] = self.ttl;
+            ip[9] = Protocol::UDP.0;
+            ip[12..16].copy_from_slice(&self.source.octets());
+            ip[16..20].copy_from_slice(&self.destination.octets());
+            let checksum = ipv4_checksum(&ip);
+            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            frame.extend_from_slice(&ip);
+
+            frame.extend_from_slice(&4444u16.to_be_bytes());
+            frame.extend_from_slice(&5000u16.to_be_bytes());
+            frame.extend_from_slice(&((UDP_HEADER_LEN + self.payload_len) as u16).to_be_bytes());
+            frame.extend_from_slice(&0u16.to_be_bytes());
+            frame.extend(payload_pattern(self.payload_len));
+            frame
+        }
+    }
+
+    /// A recognisable payload, so "the payload was not touched" is a claim
+    /// about bytes that could have been changed rather than about a run of
+    /// zeroes that would look untouched however it were corrupted.
+    fn payload_pattern(len: usize) -> impl Iterator<Item = u8> {
+        (0..len).map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+    }
+
+    /// The RFC 1071 header checksum, written the naive way rather than reusing
+    /// `net_headers`: a builder that computed it the way the parser verifies it
+    /// would agree with itself no matter which of the two was wrong.
+    fn ipv4_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
+        let mut sum = 0u32;
+        for (index, pair) in header.chunks(2).enumerate() {
+            if index == 5 {
+                continue;
+            }
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
     /// Stand in for the receiving NIC: take a free buffer, fill it as a DMA
-    /// would, and publish the span on the pipeline's `rx` ring. Returns the
-    /// buffer index published, or `None` when the pool is momentarily empty.
+    /// would — behind the device header, where a real frame lands — and publish
+    /// the span on the pipeline's `rx` ring. Returns the buffer index
+    /// published, or `None` when the pool is momentarily empty.
     fn receive(
         pool: &Pool,
         owner: &mut PoolOwner<'_>,
         rx: &mut RingProducer<'_, RING_SLOTS>,
-        payload: &[u8],
+        frame: &[u8],
     ) -> Option<u32> {
         let buffer = owner.alloc()?;
         let index = buffer.index();
         // SAFETY: `buffer` came from our ledger, so we own it exclusively until
-        // `lend` transfers it; `payload` is a local, not a pool borrow.
-        let len = unsafe { pool.write(index as usize, payload) }
-            .expect("the test payloads are far smaller than a buffer");
-        match owner.lend(rx, buffer, 0, len) {
+        // `lend` transfers it; `frame` is a local, not a pool borrow.
+        unsafe { pool.write_at(index as usize, DEVICE_HEADER_LEN as usize, frame) }
+            .expect("the test frames are far smaller than a buffer");
+        match owner.lend(
+            rx,
+            buffer,
+            DEVICE_HEADER_LEN,
+            frame.len() as u32,
+            Verdict::Transmit,
+        ) {
             Ok(()) => Some(index),
             Err(buffer) => {
                 owner.release(buffer);
@@ -663,18 +1046,18 @@ mod tests {
         pool: &Pool,
         tx: &mut RingConsumer<'_, RING_SLOTS>,
         free: &mut RingProducer<'_, RING_SLOTS>,
-        mut on_payload: impl FnMut(&[u8]),
+        mut on_frame: impl FnMut(&Descriptor, &[u8]),
     ) -> usize {
         let mut count = 0;
         // One buffer's worth of private storage, reused across the drain: what
-        // `on_payload` inspects is a snapshot here, never a borrow of the pool.
+        // `on_frame` inspects is a snapshot here, never a borrow of the pool.
         let mut storage = [0u8; BUFFER_SIZE];
         for descriptor in tx.drain(DRAIN_LIMIT) {
             {
                 // SAFETY: we dequeued this descriptor, so we own its buffer
                 // until it is returned below. The data is the `len` bytes at
                 // `offset` the rx side published, and the snapshot lands in
-                // `storage`, so the borrow handed to `on_payload` is of this
+                // `storage`, so the borrow handed to `on_frame` is of this
                 // frame's own memory and ends before the buffer is returned.
                 let bytes = unsafe {
                     pool.copy_out(
@@ -685,8 +1068,10 @@ mod tests {
                     )
                 }
                 .expect("`receive` published a span within one buffer");
-                on_payload(bytes);
+                on_frame(&descriptor, bytes);
             }
+            // Under either verdict: this is the only domain that can return the
+            // buffer, which is what the verdict rides in the descriptor for.
             free.try_enqueue(descriptor)
                 .expect("free ring has a slot for every pool buffer");
             count += 1;
@@ -743,15 +1128,19 @@ mod tests {
         assert_eq!(align_of::<ReturnRing>(), 4);
         // The three grants the system description must declare, as values.
         assert_eq!(size_of::<Pool>(), 0x20000);
-        assert_eq!(size_of::<ForwardRings>(), 3088);
-        assert_eq!(size_of::<ReturnRing>(), 1544);
+        assert_eq!(size_of::<ForwardRings>(), 4112);
+        assert_eq!(size_of::<ReturnRing>(), 2056);
         assert_eq!(POOL_REGION_SIZE, 0x20000);
-        assert_eq!(FORWARD_REGION_SIZE, 0x1000);
+        assert_eq!(FORWARD_REGION_SIZE, 0x2000);
         assert_eq!(RETURN_REGION_SIZE, 0x1000);
-        // And the reason the split is free: three regions, the same 0x22000 one
-        // region holding all four components rounded up to.
+        // And what the split costs, as values: 0x23000 against the 0x22000 one
+        // region holding all four components rounds up to — one page.
         assert_eq!(
             POOL_REGION_SIZE + FORWARD_REGION_SIZE + RETURN_REGION_SIZE,
+            0x23000
+        );
+        assert_eq!(
+            (size_of::<Pool>() + 3 * size_of::<Ring>()).next_multiple_of(MAPPING_ALIGN),
             0x22000
         );
     }
@@ -759,26 +1148,44 @@ mod tests {
     #[test]
     fn descriptor_bounds_reject_out_of_pool_spans() {
         let max = BUFFER_SIZE as u32;
-        assert!(descriptor_in_bounds(&Descriptor::new(0, 0, max)));
+        assert!(descriptor_in_bounds(&Descriptor::new(
+            0,
+            0,
+            max,
+            Verdict::Transmit
+        )));
         assert!(descriptor_in_bounds(&Descriptor::new(
             POOL_BUFFERS as u32 - 1,
             max - 1,
-            1
+            1,
+            Verdict::Transmit
         )));
-        assert!(descriptor_in_bounds(&Descriptor::new(0, max, 0)));
+        assert!(descriptor_in_bounds(&Descriptor::new(
+            0,
+            max,
+            0,
+            Verdict::Transmit
+        )));
         // Buffer index outside the pool.
         assert!(!descriptor_in_bounds(&Descriptor::new(
             POOL_BUFFERS as u32,
             0,
-            1
+            1,
+            Verdict::Transmit
         )));
         // Span runs past the buffer end.
-        assert!(!descriptor_in_bounds(&Descriptor::new(0, 1, max)));
+        assert!(!descriptor_in_bounds(&Descriptor::new(
+            0,
+            1,
+            max,
+            Verdict::Transmit
+        )));
         // Offset + len overflows.
         assert!(!descriptor_in_bounds(&Descriptor::new(
             0,
             u32::MAX,
-            u32::MAX
+            u32::MAX,
+            Verdict::Transmit
         )));
     }
 
@@ -833,72 +1240,219 @@ mod tests {
     }
 
     #[test]
-    fn forward_moves_descriptors_in_order() {
+    fn a_routable_packet_is_rewritten_in_the_pool_and_marked_for_transmission() {
+        // The whole of what the stage is for, asserted on the bytes the
+        // transmitting NIC will read rather than on the verdict alone: a frame
+        // marked `Transmit` whose pool buffer still held the arriving MACs
+        // would be sent straight back to the subnet it came from.
         let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = ForwardStage::attach(&r.rings);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
-        for i in 0..5 {
-            rx_in.try_enqueue(Descriptor::new(i, 12, i)).unwrap();
-        }
-        assert_eq!(stage.poll(), 5);
-        assert_eq!(
-            stage.counters(),
-            ForwardCounters {
-                forwarded: 5,
-                dropped: 0
-            }
-        );
-        for i in 0..5 {
-            assert_eq!(tx_out.try_dequeue(), Some(Descriptor::new(i, 12, i)));
-        }
-        // A second poll on a drained ring moves nothing and counts nothing.
-        assert_eq!(stage.poll(), 0);
+        let mut free_in = r.returns.free.producer();
+
+        let sent = FrameSpec::a_to_b().build();
+        receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+        assert_eq!(stage.poll(), 1);
+        assert_eq!(stage.counters().forwarded, 1);
+        assert_eq!(stage.counters().drops.total(), 0);
+
+        let mut seen = 0;
+        transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+            seen += 1;
+            assert_eq!(
+                Verdict::from_bits(descriptor.verdict),
+                Some(Verdict::Transmit)
+            );
+            assert_eq!(
+                descriptor.offset, DEVICE_HEADER_LEN,
+                "the span must be the one published"
+            );
+            assert_eq!(descriptor.len as usize, sent.len());
+
+            // Re-parsed rather than compared byte-wise, so what is asserted is
+            // what the next hop will make of the frame.
+            let mut copy = bytes.to_vec();
+            let frame = Frame::parse(&mut copy).expect("a rewritten frame stays well-formed");
+            assert_eq!(
+                frame.source_mac(),
+                GATEWAY1_MAC,
+                "the egress interface's own MAC"
+            );
+            assert_eq!(frame.destination_mac(), HOST_B_MAC, "the next hop's MAC");
+            assert_eq!(frame.ipv4().ttl, 63);
+            assert_eq!(frame.ipv4().source, HOST_A);
+            assert_eq!(frame.ipv4().destination, HOST_B);
+            assert!(matches!(frame.transport(), Transport::Udp(_)));
+
+            // Everything past the two rewritten headers is the sender's, and
+            // is byte-identical to what arrived.
+            assert_eq!(
+                &bytes[REWRITTEN_HEADER_LEN..],
+                &sent[REWRITTEN_HEADER_LEN..]
+            );
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(owner.reclaim(), 1);
+        assert_eq!(owner.owned(), POOL_BUFFERS);
     }
 
     #[test]
-    fn forward_drops_and_counts_instead_of_panicking_when_the_destination_is_full() {
-        // A byzantine rx peer over-fills `rx` while the tx driver stalls. The
-        // old code panicked here, taking a well-behaved PD down on peer input.
+    fn a_forwarded_frame_is_rewritten_where_the_producer_published_it() {
+        // The frame sits behind the device's own header, so the rewrite must
+        // land at the descriptor's `offset`. A stage that wrote back at the
+        // buffer's front would corrupt that header and leave the frame's own
+        // first 34 bytes as they arrived — which still parses, still routes,
+        // and loops.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+
+        let sent = FrameSpec::a_to_b().build();
+        let index =
+            receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+        assert_eq!(stage.poll(), 1);
+
+        let mut whole = [0u8; BUFFER_SIZE];
+        // SAFETY: the buffer is lent, and this test is the only other party to
+        // the pool; the snapshot lands in this function's own storage.
+        let buffer = unsafe {
+            r.pool
+                .copy_out(index as usize, 0, BUFFER_SIZE as u32, &mut whole)
+        }
+        .expect("a whole buffer is in bounds");
+        assert_eq!(
+            &buffer[..DEVICE_HEADER_LEN as usize],
+            &[0u8; DEVICE_HEADER_LEN as usize],
+            "the device header space was written over"
+        );
+        let mut frame_bytes = buffer[DEVICE_HEADER_LEN as usize..][..sent.len()].to_vec();
+        let frame = Frame::parse(&mut frame_bytes).expect("the rewritten frame parses");
+        assert_eq!(frame.destination_mac(), HOST_B_MAC);
+    }
+
+    #[test]
+    fn lend_publishes_the_verdict_it_was_given() {
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut rx_out = r.rings.rx.consumer();
+        for verdict in [Verdict::Transmit, Verdict::Discard] {
+            let buffer = owner.alloc().expect("a full pool has buffers");
+            let index = buffer.index();
+            owner
+                .lend(&mut rx_in, buffer, 4, 8, verdict)
+                .expect("the ring is empty");
+            assert_eq!(
+                rx_out.try_dequeue(),
+                Some(Descriptor::new(index, 4, 8, verdict))
+            );
+        }
+    }
+
+    #[test]
+    fn the_verdict_a_producer_published_is_replaced_by_this_stages_own_decision() {
+        // The rx driver's verdict word is peer input: a byzantine one can mark
+        // a perfectly routable frame `Discard`, or write a word that decodes to
+        // nothing at all. Neither may decide anything here — this stage is the
+        // domain that judges the frame, and it overwrites the word it was
+        // handed with what it concluded.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut tx_out = r.rings.tx.consumer();
+
+        let sent = FrameSpec::a_to_b().build();
+        for forged in [Verdict::Discard.to_bits(), 0xDEAD_BEEF] {
+            let buffer = owner.alloc().expect("a full pool has buffers");
+            let index = buffer.index();
+            // SAFETY: the token is ours, and `sent` is a local rather than a
+            // pool borrow.
+            unsafe {
+                r.pool
+                    .write_at(index as usize, DEVICE_HEADER_LEN as usize, &sent)
+            }
+            .expect("a frame is far smaller than a buffer");
+            // A field-wise literal, not `Descriptor::new`: `lend` takes a
+            // `Verdict`, so a word decoding to nothing can only be published by
+            // a peer writing the slot itself — which is what this is.
+            rx_in
+                .try_enqueue(Descriptor {
+                    buffer: index,
+                    offset: DEVICE_HEADER_LEN,
+                    len: sent.len() as u32,
+                    verdict: forged,
+                })
+                .expect("the ring is empty");
+            drop(buffer);
+
+            assert_eq!(stage.poll(), 1);
+            let handed_on = tx_out.try_dequeue().expect("the frame was handed on");
+            assert_eq!(
+                Verdict::from_bits(handed_on.verdict),
+                Some(Verdict::Transmit),
+                "a routable frame must be transmitted whatever the producer claimed"
+            );
+        }
+        assert_eq!(stage.counters().forwarded, 2);
+    }
+
+    #[test]
+    fn a_full_destination_ring_is_counted_and_stops_the_drain() {
+        // A byzantine rx peer over-fills `rx` while the tx driver stalls.
         // The destination is filled *through the stage itself*, since a second
-        // producer handle would restart at slot zero and prove nothing.
+        // producer handle would restart at slot zero and prove nothing. The
+        // buffers those refused descriptors named are lost to the pool, which
+        // is the residue the crate header records.
         let r = Regions::new();
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = ForwardStage::attach(&r.rings);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
 
+        // Descriptors naming empty buffers: in bounds, so they reach the
+        // destination ring under a `Discard` verdict and fill it.
         let capacity = r.rings.tx.capacity();
-        for i in 0..capacity as u32 {
-            rx_in.try_enqueue(Descriptor::new(i, 0, i)).unwrap();
+        for index in 0..capacity as u32 {
+            rx_in
+                .try_enqueue(Descriptor::new(
+                    index % POOL_BUFFERS as u32,
+                    0,
+                    64,
+                    Verdict::Transmit,
+                ))
+                .unwrap();
         }
         assert_eq!(stage.poll(), capacity, "the destination is now full");
+        assert_eq!(stage.counters().egress_full, 0);
 
-        for i in 0..4 {
-            rx_in.try_enqueue(Descriptor::new(i, 0, i)).unwrap();
+        for index in 0..4 {
+            rx_in
+                .try_enqueue(Descriptor::new(index, 0, 64, Verdict::Transmit))
+                .unwrap();
         }
         assert_eq!(stage.poll(), 0);
-        assert_eq!(
-            stage.counters(),
-            ForwardCounters {
-                forwarded: capacity as u64,
-                dropped: 1
-            }
-        );
+        assert_eq!(stage.counters().egress_full, 1);
         // Draining stopped at the first refusal rather than emptying `rx` into
         // a full destination and losing every buffer with it.
         assert_eq!(r.rings.rx.consumer().len(), 3);
     }
 
     #[test]
-    fn forward_is_bounded_when_a_peer_keeps_the_source_ring_non_empty() {
+    fn poll_is_bounded_when_a_peer_keeps_the_source_ring_non_empty() {
         // A peer that keeps advancing its published `tail` makes the source
         // look permanently non-empty. Work per poll must still be finite.
         let r = Regions::new();
-        let mut stage = ForwardStage::attach(&r.rings);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         for round in 0..8u32 {
             forge_cursors(&r.rings.rx, 0, round.wrapping_mul(37).wrapping_add(11));
-            let moved = stage.poll();
-            assert!(moved <= DRAIN_LIMIT, "poll moved {moved} descriptors");
+            let handed_on = stage.poll();
+            assert!(
+                handed_on <= DRAIN_LIMIT,
+                "poll handled {handed_on} descriptors"
+            );
             // Keep the destination drained so the bound, not fullness, is what
             // stops the loop.
             let _ = tx_out.drain(DRAIN_LIMIT).count();
@@ -906,29 +1460,328 @@ mod tests {
     }
 
     #[test]
-    fn single_threaded_pipeline_round_trip_preserves_payloads() {
-        // The three-PD forwarding chain in one thread: receive two frames,
-        // forward them, transmit them, then reclaim — full pool ownership must
-        // return and both payloads must survive intact and in order.
+    fn a_descriptor_naming_no_pool_buffer_is_counted_and_never_dereferenced() {
+        // The forged descriptor is the one thing the stage may not hand on:
+        // it names no buffer the transmitting driver could return, so passing
+        // it along would be inventing a return rather than granting one. It is
+        // also the case where a missing bounds check would have the stage read
+        // outside the pool.
+        let r = Regions::new();
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut tx_out = r.rings.tx.consumer();
+
+        for forged in [
+            Descriptor::new(POOL_BUFFERS as u32, 0, 64, Verdict::Transmit),
+            Descriptor::new(u32::MAX, 0, 64, Verdict::Transmit),
+            Descriptor::new(0, 1, BUFFER_SIZE as u32, Verdict::Transmit),
+            Descriptor::new(0, u32::MAX, u32::MAX, Verdict::Transmit),
+        ] {
+            rx_in.try_enqueue(forged).expect("the ring has room");
+        }
+
+        assert_eq!(stage.poll(), 0, "nothing may be handed on");
+        assert_eq!(stage.counters().malformed_descriptor, 4);
+        assert_eq!(stage.counters().snapshot_failed, 0);
+        assert_eq!(tx_out.try_dequeue(), None);
+    }
+
+    #[test]
+    fn every_reason_the_router_refuses_a_frame_for_still_hands_the_buffer_back() {
+        // The property the verdict mechanism exists for, over every drop the
+        // router can reach: this domain maps no `free` ring, so a frame it
+        // decides against must still travel to the transmitting driver — the
+        // only domain that can give the buffer back. A stage that dropped the
+        // descriptor instead would shrink the pool by one buffer per hostile
+        // packet, which is a denial of service with no counter attached.
+        for (reason, ingress, spec) in [
+            (
+                DropReason::UnconfiguredIngressPort,
+                PortId(7),
+                FrameSpec::a_to_b(),
+            ),
+            (
+                DropReason::NotAddressedToUs,
+                PORT0,
+                FrameSpec {
+                    destination_mac: MacAddress::BROADCAST,
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::VlanTagged,
+                PORT0,
+                FrameSpec {
+                    tagged: true,
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::MartianSource,
+                PORT0,
+                FrameSpec {
+                    source: Ipv4Address::from_octets([224, 0, 0, 1]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::UnroutableDestination,
+                PORT0,
+                FrameSpec {
+                    destination: Ipv4Address::from_octets([255, 255, 255, 255]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::AddressedToThisRouter,
+                PORT0,
+                FrameSpec {
+                    destination: Ipv4Address::from_octets([10, 0, 1, 1]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::TtlExpired,
+                PORT0,
+                FrameSpec {
+                    ttl: 1,
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::NoRoute,
+                PORT0,
+                FrameSpec {
+                    destination: Ipv4Address::from_octets([192, 0, 2, 9]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::EgressIsIngress,
+                PORT0,
+                FrameSpec {
+                    destination: Ipv4Address::from_octets([10, 0, 0, 9]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+            (
+                DropReason::NoNeighbour,
+                PORT0,
+                FrameSpec {
+                    destination: Ipv4Address::from_octets([10, 0, 1, 77]),
+                    ..FrameSpec::a_to_b()
+                },
+            ),
+        ] {
+            let r = Regions::new();
+            let mut owner = PoolOwner::attach(&r.returns);
+            let mut rx_in = r.rings.rx.producer();
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, ingress, PORT1);
+            let mut tx_out = r.rings.tx.consumer();
+            let mut free_in = r.returns.free.producer();
+
+            let sent = spec.build();
+            receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+            assert_eq!(stage.poll(), 1, "{reason}: the descriptor must travel on");
+
+            let counters = stage.counters();
+            assert_eq!(counters.drops.get(reason), 1, "{reason}: not counted");
+            assert_eq!(
+                counters.drops.total(),
+                1,
+                "{reason}: counted as something else too"
+            );
+            assert_eq!(counters.forwarded, 0, "{reason}");
+
+            let mut seen = 0;
+            transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+                seen += 1;
+                assert_eq!(
+                    Verdict::from_bits(descriptor.verdict),
+                    Some(Verdict::Discard),
+                    "{reason}: a refused frame must not be transmitted"
+                );
+                assert_eq!(bytes, sent, "{reason}: a refused frame was rewritten");
+            });
+            assert_eq!(seen, 1, "{reason}");
+            // The buffer is back where it started: nothing leaked.
+            assert_eq!(owner.reclaim(), 1, "{reason}");
+            assert_eq!(owner.owned(), POOL_BUFFERS, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_routable_packet_is_discarded_and_handed_back() {
+        // Arbitrary bytes on the wire: not IPv4, not long enough, and a frame
+        // whose IPv4 header contradicts itself. None of them is attributable to
+        // a routing decision, so none of them may be counted as one.
         let r = Regions::new();
         let mut owner = PoolOwner::attach(&r.returns);
         let mut rx_in = r.rings.rx.producer();
-        let mut stage = ForwardStage::attach(&r.rings);
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
         let mut tx_out = r.rings.tx.consumer();
         let mut free_in = r.returns.free.producer();
 
-        assert!(receive(&r.pool, &mut owner, &mut rx_in, &7u64.to_le_bytes()).is_some());
-        assert!(receive(&r.pool, &mut owner, &mut rx_in, &8u64.to_le_bytes()).is_some());
+        let mut truncated_ip = FrameSpec::a_to_b().build();
+        truncated_ip.truncate(ETHERNET_HEADER_LEN + 4);
+        let mut bad_checksum = FrameSpec::a_to_b().build();
+        bad_checksum[ETHERNET_HEADER_LEN + 10] ^= 0xff;
+        let unroutable = [
+            std::vec![0xAA; 64],
+            std::vec![0x00; 10],
+            truncated_ip,
+            bad_checksum,
+        ];
+        for frame in &unroutable {
+            receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
+        }
+
+        assert_eq!(stage.poll(), unroutable.len());
+        assert_eq!(stage.counters().unparsable, unroutable.len() as u64);
+        assert_eq!(
+            stage.counters().drops.total(),
+            0,
+            "no routing decision was made"
+        );
+        assert_eq!(stage.counters().forwarded, 0);
+
+        let returned = transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, _| {
+            assert_eq!(
+                Verdict::from_bits(descriptor.verdict),
+                Some(Verdict::Discard)
+            );
+        });
+        assert_eq!(returned, unroutable.len());
+        assert_eq!(owner.reclaim(), unroutable.len());
+        assert_eq!(owner.owned(), POOL_BUFFERS);
+    }
+
+    #[test]
+    fn a_route_out_of_a_port_this_stage_is_not_wired_to_is_discarded() {
+        // A stage is a fixed cross-connect. This one is wired ingress port 0 to
+        // egress port 0, so the router's decision — out of port 1 — names a
+        // ring this stage does not hold, and carrying it out would put the
+        // frame back on the subnet it arrived from.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT0);
+        let mut tx_out = r.rings.tx.consumer();
+
+        let sent = FrameSpec::a_to_b().build();
+        receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+
+        assert_eq!(stage.poll(), 1);
+        assert_eq!(stage.counters().misrouted, 1);
+        assert_eq!(stage.counters().forwarded, 0);
+        assert_eq!(
+            stage.counters().drops.total(),
+            0,
+            "the router had no objection; this stage did"
+        );
+        let handed_on = tx_out.try_dequeue().expect("the buffer must travel back");
+        assert_eq!(
+            Verdict::from_bits(handed_on.verdict),
+            Some(Verdict::Discard)
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_taken_names_what_it_refused() {
+        // Both refusals `snapshot` can answer with, neither of which
+        // `RouteStage::poll` can reach: `descriptor_in_bounds` rules out the
+        // span, and the stage's own storage is a whole buffer. They exist
+        // because the alternative to answering is a truncated frame that still
+        // parses — a decision made on bytes that are not the packet.
+        let r = Regions::new();
+        let mut short = [0u8; 8];
+        assert_eq!(
+            snapshot(
+                &r.pool,
+                &Descriptor::new(0, 0, 16, Verdict::Transmit),
+                &mut short
+            ),
+            Err(CopyOutError::DestinationTooSmall {
+                len: 16,
+                capacity: 8
+            })
+        );
+
+        let mut whole = [0u8; BUFFER_SIZE];
+        assert_eq!(
+            snapshot(
+                &r.pool,
+                &Descriptor::new(POOL_BUFFERS as u32, 0, 4, Verdict::Transmit),
+                &mut whole
+            ),
+            Err(CopyOutError::SpanOutsideBuffer {
+                index: POOL_BUFFERS,
+                offset: 0,
+                len: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_write_back_the_pool_refuses_discards_the_frame_rather_than_transmitting_it() {
+        // The header window is written at the descriptor's own offset, so a
+        // span the descriptor validator passes can still leave no room for it.
+        // Transmitting anyway would put the frame on the wire with the MACs and
+        // the TTL it arrived with, which is a loop rather than a hop.
+        let r = Regions::new();
+        let mut counters = RouteCounters::default();
+        let scratch = [0u8; BUFFER_SIZE];
+        let no_room = Descriptor::new(0, BUFFER_SIZE as u32 - 4, 4, Verdict::Transmit);
+        assert!(
+            descriptor_in_bounds(&no_room),
+            "the span itself is in bounds"
+        );
+        assert_eq!(
+            write_back(&r.pool, &no_room, &scratch, &mut counters),
+            Verdict::Discard
+        );
+        assert_eq!(counters.writeback_failed, 1);
+    }
+
+    #[test]
+    fn single_threaded_pipeline_round_trip_forwards_both_frames_in_order() {
+        // The three-PD routed chain in one thread: receive two frames, route
+        // them, transmit them, then reclaim — full pool ownership must return
+        // and both payloads must survive intact and in order.
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+        let mut tx_out = r.rings.tx.consumer();
+        let mut free_in = r.returns.free.producer();
+
+        let frames: Vec<Vec<u8>> = [7usize, 8]
+            .into_iter()
+            .map(|payload_len| {
+                FrameSpec {
+                    payload_len,
+                    ..FrameSpec::a_to_b()
+                }
+                .build()
+            })
+            .collect();
+        for frame in &frames {
+            assert!(receive(&r.pool, &mut owner, &mut rx_in, frame).is_some());
+        }
         assert_eq!(owner.owned(), POOL_BUFFERS - 2);
 
         assert_eq!(stage.poll(), 2);
 
         let mut seen = Vec::new();
-        let transmitted = transmit(&r.pool, &mut tx_out, &mut free_in, |bytes| {
-            seen.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+        let transmitted = transmit(&r.pool, &mut tx_out, &mut free_in, |_, bytes| {
+            seen.push(bytes[REWRITTEN_HEADER_LEN..].to_vec());
         });
         assert_eq!(transmitted, 2);
-        assert_eq!(seen, std::vec![7, 8]);
+        let expected: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|frame| frame[REWRITTEN_HEADER_LEN..].to_vec())
+            .collect();
+        assert_eq!(seen, expected, "payloads must arrive intact and in order");
 
         // Buffers are back on the free ring; reclaiming restores full ownership.
         assert_eq!(owner.reclaim(), 2);
@@ -952,7 +1805,7 @@ mod tests {
         }
         let buffer = owner.alloc().expect("a full pool has buffers");
         let index = buffer.index();
-        let Err(returned) = owner.lend(&mut rx_in, buffer, 0, 0) else {
+        let Err(returned) = owner.lend(&mut rx_in, buffer, 0, 0, Verdict::Transmit) else {
             panic!("a full ring must refuse the lend");
         };
         assert_eq!(returned.index(), index);
@@ -962,7 +1815,7 @@ mod tests {
         // Having never been lent, that index cannot be returned by the peer.
         let mut free_in = r.returns.free.producer();
         free_in
-            .try_enqueue(Descriptor::new(index, 0, 0))
+            .try_enqueue(Descriptor::new(index, 0, 0, Verdict::Transmit))
             .expect("the free ring is empty");
         assert_eq!(owner.reclaim(), 0);
         assert_eq!(owner.counters().reclaim_not_lent, 1);
@@ -979,7 +1832,7 @@ mod tests {
         let mut free_in = r.returns.free.producer();
         for forged in [POOL_BUFFERS as u32, 999, u32::MAX] {
             free_in
-                .try_enqueue(Descriptor::new(forged, 0, 0))
+                .try_enqueue(Descriptor::new(forged, 0, 0, Verdict::Transmit))
                 .expect("the free ring has room");
         }
 
@@ -1007,11 +1860,11 @@ mod tests {
         let buffer = owner.alloc().expect("a full pool has buffers");
         let index = buffer.index();
         owner
-            .lend(&mut rx_in, buffer, 0, 0)
+            .lend(&mut rx_in, buffer, 0, 0, Verdict::Transmit)
             .expect("the ring is empty");
         for _ in 0..3 {
             free_in
-                .try_enqueue(Descriptor::new(index, 0, 0))
+                .try_enqueue(Descriptor::new(index, 0, 0, Verdict::Transmit))
                 .expect("the free ring has room");
         }
 
@@ -1033,7 +1886,7 @@ mod tests {
         let posted = owner.alloc().expect("a full pool has buffers");
         let index = posted.index();
         free_in
-            .try_enqueue(Descriptor::new(index, 0, 0))
+            .try_enqueue(Descriptor::new(index, 0, 0, Verdict::Transmit))
             .expect("the free ring is empty");
 
         assert_eq!(owner.reclaim(), 0);
@@ -1055,7 +1908,7 @@ mod tests {
         let mut free_in = r.returns.free.producer();
         owner.lent[3] = true;
         free_in
-            .try_enqueue(Descriptor::new(3, 0, 0))
+            .try_enqueue(Descriptor::new(3, 0, 0, Verdict::Transmit))
             .expect("the free ring is empty");
 
         assert_eq!(owner.reclaim(), 0);
@@ -1073,7 +1926,12 @@ mod tests {
         let mut free_in = r.returns.free.producer();
         let mut offered = 0u64;
         while free_in
-            .try_enqueue(Descriptor::new(offered as u32 % POOL_BUFFERS as u32, 0, 0))
+            .try_enqueue(Descriptor::new(
+                offered as u32 % POOL_BUFFERS as u32,
+                0,
+                0,
+                Verdict::Transmit,
+            ))
             .is_ok()
         {
             offered += 1;
@@ -1124,12 +1982,12 @@ mod tests {
             let buffer = owner.alloc().expect("a full pool has buffers");
             lent.push(buffer.index());
             owner
-                .lend(&mut rx_in, buffer, 0, 0)
+                .lend(&mut rx_in, buffer, 0, 0, Verdict::Transmit)
                 .expect("the ring is empty");
         }
         for index in &lent {
             free_in
-                .try_enqueue(Descriptor::new(*index, 0, 0))
+                .try_enqueue(Descriptor::new(*index, 0, 0, Verdict::Transmit))
                 .expect("the free ring has room");
         }
         assert_eq!(owner.reclaim(), 3, "the legitimate returns are accepted");
@@ -1178,12 +2036,12 @@ mod tests {
             let buffer = owner.alloc().expect("a full pool has buffers");
             indices.push(buffer.index());
             owner
-                .lend(&mut rx_in, buffer, 0, 0)
+                .lend(&mut rx_in, buffer, 0, 0, Verdict::Transmit)
                 .expect("the ring is empty");
         }
         for index in &indices {
             free_in
-                .try_enqueue(Descriptor::new(*index, 0, 0))
+                .try_enqueue(Descriptor::new(*index, 0, 0, Verdict::Transmit))
                 .expect("the free ring has room");
         }
         assert_eq!(owner.reclaim(), 4);
@@ -1201,18 +2059,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_pipeline_chain_transfers_every_buffer_in_order() {
-        // The three-PD forwarding scenario end to end under real threads: an
-        // rx-driver thread fills and publishes buffers, a forwarder thread moves
-        // them onward, and a tx-driver thread consumes and returns them, so
-        // every buffer cycles rx -> forward -> tx -> free far more times than
+    fn concurrent_pipeline_chain_routes_every_buffer_in_order() {
+        // The three-PD routed scenario end to end under real threads: an
+        // rx-driver thread fills and publishes buffers, a forwarder thread
+        // routes them onward, and a tx-driver thread consumes and returns them,
+        // so every buffer cycles rx -> route -> tx -> free far more times than
         // the pool holds. Both rings wrap repeatedly and every buffer is reused;
-        // the sequence-numbered payloads must arrive intact and in order, and
-        // full pool ownership must return to the rx driver.
+        // the sequence-numbered payloads must arrive intact and in order under
+        // rewritten headers, and full pool ownership must return to the rx
+        // driver.
         //
-        // The forwarder thread borrows `rings` alone, which is the grant the
-        // system description gives that domain: it can reach neither `pool` nor
-        // `returns` here for the same reason it cannot there.
+        // The forwarder thread borrows `rings` and `pool`, which is the grant
+        // the system description gives that domain: it can reach `returns` here
+        // no more than it can there.
         const TOTAL: u64 = 500_000;
         let r = Regions::new();
         let pool: &Pool = &r.pool;
@@ -1227,10 +2086,21 @@ mod tests {
             scope.spawn(move || {
                 let mut owner = PoolOwner::attach(returns);
                 let mut rx_in = rings.rx.producer();
+                // One frame, its payload patched per send: the IPv4 checksum
+                // covers the header alone, so a sequence number written into
+                // the payload leaves the frame exactly as well-formed and the
+                // 500,000 sends cost no rebuilding.
+                let mut frame = FrameSpec {
+                    payload_len: SEQUENCE_LEN,
+                    ..FrameSpec::a_to_b()
+                }
+                .build();
+                let sequence_at = frame.len() - SEQUENCE_LEN;
                 let mut sent = 0u64;
                 while sent < TOTAL {
                     owner.reclaim();
-                    if receive(pool, &mut owner, &mut rx_in, &sent.to_le_bytes()).is_some() {
+                    frame[sequence_at..].copy_from_slice(&sent.to_le_bytes());
+                    if receive(pool, &mut owner, &mut rx_in, &frame).is_some() {
                         sent += 1;
                     } else {
                         std::hint::spin_loop();
@@ -1248,13 +2118,16 @@ mod tests {
             });
 
             scope.spawn(move || {
-                let mut stage = ForwardStage::attach(rings);
-                let mut moved = 0u64;
-                while moved < TOTAL {
-                    moved += stage.poll() as u64;
+                let mut stage = RouteStage::attach(rings, pool, &ROUTER, PORT0, PORT1);
+                let mut handed_on = 0u64;
+                while handed_on < TOTAL {
+                    handed_on += stage.poll() as u64;
                     std::hint::spin_loop();
                 }
-                assert_eq!(stage.counters().dropped, 0);
+                let counters = stage.counters();
+                assert_eq!(counters.egress_full, 0);
+                assert_eq!(counters.forwarded, TOTAL, "every frame was routable");
+                assert_eq!(counters.drops.total(), 0);
             });
 
             scope.spawn(move || {
@@ -1262,8 +2135,21 @@ mod tests {
                 let mut free_in = returns.free.producer();
                 let mut expected = 0u64;
                 while expected < TOTAL {
-                    transmit(pool, &mut tx_out, &mut free_in, |bytes| {
-                        let value = u64::from_le_bytes(bytes.try_into().unwrap());
+                    transmit(pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+                        assert_eq!(
+                            Verdict::from_bits(descriptor.verdict),
+                            Some(Verdict::Transmit)
+                        );
+                        // The rewrite happened, and it happened to this frame:
+                        // a stage that wrote one buffer's header into another's
+                        // would show up here as the wrong sequence number under
+                        // a correct MAC, or the reverse.
+                        assert_eq!(&bytes[..6], &HOST_B_MAC.0, "the next hop's MAC");
+                        let value = u64::from_le_bytes(
+                            bytes[bytes.len() - SEQUENCE_LEN..]
+                                .try_into()
+                                .expect("the payload is the sequence number"),
+                        );
                         assert_eq!(value, expected, "out-of-order or corrupted buffer");
                         expected += 1;
                     });
@@ -1273,16 +2159,49 @@ mod tests {
         });
     }
 
+    /// The traffic mix both properties below draw from: every shape the stage
+    /// answers differently, in the proportions that keep each answer frequent.
+    /// The unroutable ones are not decoration — a stage that leaked a buffer
+    /// would leak it on exactly these.
+    fn any_frame() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // Routable in the direction under test, and its reverse, which this
+            // stage must refuse rather than send back out of its ingress port.
+            4 => Just(FrameSpec::a_to_b().build()),
+            2 => Just(FrameSpec {
+                destination_mac: GATEWAY1_MAC,
+                source: HOST_B,
+                destination: HOST_A,
+                ..FrameSpec::a_to_b()
+            }.build()),
+            // One frame per family of router rejection.
+            1 => Just(FrameSpec { ttl: 1, ..FrameSpec::a_to_b() }.build()),
+            1 => Just(FrameSpec { tagged: true, ..FrameSpec::a_to_b() }.build()),
+            1 => Just(FrameSpec {
+                destination: Ipv4Address::from_octets([203, 0, 113, 4]),
+                ..FrameSpec::a_to_b()
+            }.build()),
+            1 => Just(FrameSpec {
+                destination_mac: MacAddress::BROADCAST,
+                ..FrameSpec::a_to_b()
+            }.build()),
+            // And what the wire really carries: bytes of any length that were
+            // never a frame at all.
+            3 => prop::collection::vec(any::<u8>(), 0..600),
+        ]
+    }
+
     /// One move a byzantine neighbour can make against the pool owner and the
-    /// forwarding stage.
+    /// routing stage.
     #[derive(Clone, Debug)]
     enum PeerStep {
-        /// Take a buffer and publish it, as the driver legitimately would.
-        Receive,
+        /// Take a buffer, fill it with a frame, and publish it as the receiving
+        /// driver legitimately would.
+        Receive(Vec<u8>),
         /// Take a buffer and keep it, as a buffer posted to the NIC is kept.
         Hold,
-        /// Move descriptors along the chain.
-        Forward,
+        /// Route what is queued.
+        Route,
         /// Push an arbitrary descriptor onto the `free` ring, as a byzantine tx
         /// driver does: forged indices, duplicates, buffers never lent.
         ReturnBare(u32),
@@ -1290,13 +2209,17 @@ mod tests {
         Reclaim,
         /// Scribble a ring's shared cursors.
         ForgeCursors(u8, u32, u32),
+        /// Overwrite a pool buffer's bytes, which every domain mapping the pool
+        /// can do at any instant — including between this stage's snapshot and
+        /// the transmitting NIC's read.
+        ScribblePool(u32, u8),
     }
 
     fn any_peer_step() -> impl Strategy<Value = PeerStep> {
         prop_oneof![
-            4 => Just(PeerStep::Receive),
+            4 => any_frame().prop_map(PeerStep::Receive),
             1 => Just(PeerStep::Hold),
-            3 => Just(PeerStep::Forward),
+            3 => Just(PeerStep::Route),
             // Biased towards real indices so duplicate and never-lent returns
             // are reached, with arbitrary values keeping forged ones in the mix.
             3 => (0..POOL_BUFFERS as u32).prop_map(PeerStep::ReturnBare),
@@ -1304,20 +2227,22 @@ mod tests {
             3 => Just(PeerStep::Reclaim),
             2 => (0u8..3, any::<u32>(), any::<u32>())
                 .prop_map(|(ring, head, tail)| PeerStep::ForgeCursors(ring, head, tail)),
+            2 => (0..POOL_BUFFERS as u32, any::<u8>())
+                .prop_map(|(index, byte)| PeerStep::ScribblePool(index, byte)),
         ]
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(96))]
 
-        /// The whole `alloc -> lend -> forward -> reclaim` chain driven by an
-        /// arbitrary hostile neighbour: forged and duplicated indices on the
-        /// `free` ring, scribbled cursors on every ring, and arbitrary
-        /// interleaving. Nothing may panic, every step must do bounded work,
-        /// and the owner set must stay conserved — the ledger may only ever
-        /// hand out real, distinct pool indices, and the buffers it holds free
-        /// plus those it has lent or that are held in hand can never exceed the
-        /// pool.
+        /// The whole `alloc -> lend -> route -> reclaim` chain driven by an
+        /// arbitrary hostile neighbour: arbitrary frames, forged and duplicated
+        /// indices on the `free` ring, scribbled cursors on every ring,
+        /// rewritten pool bytes, and arbitrary interleaving. Nothing may panic,
+        /// every step must do bounded work, and the owner set must stay
+        /// conserved — the ledger may only ever hand out real, distinct pool
+        /// indices, and the buffers it holds free plus those it has lent or that
+        /// are held in hand can never exceed the pool.
         #[test]
         fn a_byzantine_neighbour_cannot_panic_or_double_own_a_buffer(
             steps in prop::collection::vec(any_peer_step(), 0..250),
@@ -1325,7 +2250,7 @@ mod tests {
             let r = Regions::new();
             let mut owner = PoolOwner::attach(&r.returns);
             let mut rx_in = r.rings.rx.producer();
-            let mut stage = ForwardStage::attach(&r.rings);
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
             let mut tx_out = r.rings.tx.consumer();
             let mut free_in = r.returns.free.producer();
             // Tokens this domain holds, standing in for buffers posted to a NIC.
@@ -1333,19 +2258,15 @@ mod tests {
 
             for step in steps {
                 match step {
-                    PeerStep::Receive => {
-                        if let Some(buffer) = owner.alloc()
-                            && let Err(returned) = owner.lend(&mut rx_in, buffer, 0, 4)
-                        {
-                            owner.release(returned);
-                        }
+                    PeerStep::Receive(frame) => {
+                        let _ = receive(&r.pool, &mut owner, &mut rx_in, &frame);
                     }
                     PeerStep::Hold => {
                         if let Some(buffer) = owner.alloc() {
                             held.push(buffer);
                         }
                     }
-                    PeerStep::Forward => {
+                    PeerStep::Route => {
                         prop_assert!(stage.poll() <= DRAIN_LIMIT);
                         // Play the tx driver: take what arrived and hand each
                         // buffer straight back, as a well-behaved peer would.
@@ -1354,7 +2275,7 @@ mod tests {
                         }
                     }
                     PeerStep::ReturnBare(index) => {
-                        let _ = free_in.try_enqueue(Descriptor::new(index, 0, 0));
+                        let _ = free_in.try_enqueue(Descriptor::new(index, 0, 0, Verdict::Transmit));
                     }
                     PeerStep::Reclaim => {
                         prop_assert!(owner.reclaim() <= DRAIN_LIMIT);
@@ -1366,6 +2287,16 @@ mod tests {
                             _ => &r.returns.free,
                         };
                         forge_cursors(ring, head, tail);
+                    }
+                    PeerStep::ScribblePool(index, byte) => {
+                        // SAFETY: `write_at`'s ownership clause is exactly the
+                        // one a byzantine peer disregards, which is what this
+                        // step reproduces; the source is a local, so it cannot
+                        // alias the pool, and the span is the accessor's own
+                        // business — it answers in its return value.
+                        let _ = unsafe {
+                            r.pool.write_at(index as usize, 0, &[byte; BUFFER_SIZE])
+                        };
                     }
                 }
                 // Nothing was invented: free plus held can never exceed the
@@ -1389,6 +2320,73 @@ mod tests {
             prop_assert!(handed_out.len() + still_held.len() <= POOL_BUFFERS);
         }
 
+        /// The no-leak invariant the whole verdict mechanism exists for: over
+        /// any mix of routable, unroutable, malformed and garbage traffic,
+        /// every descriptor that enters the stage leaves it, so every buffer
+        /// reaches the one domain that can return it and the pool comes back
+        /// whole.
+        ///
+        /// Forged descriptors are in the mix and are the one exception, stated
+        /// as such rather than excluded: they name no buffer, so there is
+        /// nothing to hand back and nothing to lose. The pool is what proves
+        /// the difference — a stage that silently dropped a real descriptor
+        /// would leave the ledger short, whatever its counters said.
+        #[test]
+        fn no_frame_the_stage_accepts_costs_the_pool_a_buffer(
+            frames in prop::collection::vec(any_frame(), 1..40),
+            forged in prop::collection::vec(any::<u32>(), 0..8),
+        ) {
+            let r = Regions::new();
+            let mut owner = PoolOwner::attach(&r.returns);
+            let mut rx_in = r.rings.rx.producer();
+            let mut stage = RouteStage::attach(&r.rings, &r.pool, &ROUTER, PORT0, PORT1);
+            let mut tx_out = r.rings.tx.consumer();
+            let mut free_in = r.returns.free.producer();
+
+            let mut published = 0usize;
+            for frame in &frames {
+                if receive(&r.pool, &mut owner, &mut rx_in, frame).is_some() {
+                    published += 1;
+                }
+            }
+            // Descriptors naming no buffer, interleaved after the real ones so
+            // they cannot be dismissed as a prefix the stage never reached.
+            for index in &forged {
+                let _ = rx_in.try_enqueue(Descriptor::new(
+                    index.saturating_add(POOL_BUFFERS as u32),
+                    0,
+                    64,
+                    Verdict::Transmit,
+                ));
+            }
+
+            // Fewer than the pool holds and far fewer than a ring, so nothing
+            // here can be refused for want of room: what the stage does with a
+            // descriptor is the only thing under test.
+            let handed_on = stage.poll();
+            let counters = stage.counters();
+            prop_assert_eq!(counters.egress_full, 0);
+            prop_assert_eq!(handed_on, published, "a real descriptor did not travel on");
+            prop_assert_eq!(counters.malformed_descriptor, forged.len() as u64);
+
+            // Every verdict is one of the two, and the tallies account for
+            // every frame exactly once.
+            let discarded = counters.drops.total()
+                + counters.unparsable
+                + counters.misrouted
+                + counters.snapshot_failed
+                + counters.writeback_failed;
+            prop_assert_eq!(counters.forwarded + discarded, published as u64);
+
+            // The tx driver takes them all and returns each buffer, whichever
+            // verdict it carries; the pool must then be whole again.
+            let returned = transmit(&r.pool, &mut tx_out, &mut free_in, |_, _| {});
+            prop_assert_eq!(returned, published);
+            prop_assert_eq!(owner.reclaim(), published);
+            prop_assert_eq!(owner.owned(), POOL_BUFFERS);
+            prop_assert_eq!(owner.counters(), PoolCounters::default());
+        }
+
         /// The untrusted-descriptor validator accepts exactly the triples that
         /// name a span within one pool buffer and rejects the rest, computed
         /// against a widened-arithmetic reference so it never disagrees and never
@@ -1404,7 +2402,7 @@ mod tests {
             offset in prop_oneof![any::<u32>(), (BUFFER_SIZE as u32 - 2)..=(BUFFER_SIZE as u32 + 2)],
             len in prop_oneof![any::<u32>(), 0u32..=(BUFFER_SIZE as u32 + 2)],
         ) {
-            let descriptor = Descriptor::new(buffer, offset, len);
+            let descriptor = Descriptor::new(buffer, offset, len, Verdict::Transmit);
             // Reference in `usize`, which cannot overflow for two `u32`s on a
             // 64-bit host — the authority the checked-arithmetic implementation
             // must match exactly.

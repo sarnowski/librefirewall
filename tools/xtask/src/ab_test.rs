@@ -24,11 +24,12 @@
 //! separates them.
 //!
 //! **That the chosen slot is healthy** is asserted by the system's real
-//! observable contract — frames forwarded between the two NIC ports — or, for
-//! the scenarios where nothing may boot, by its negative: no frame forwarded
-//! and GRUB's halt record on the channel. Because a frame can only be forwarded
-//! after seL4 has started, and seL4 only starts after GRUB's last record, the
-//! record sequence is always complete by the time it is judged.
+//! observable contract — a datagram routed between the two NIC ports in each
+//! direction — or, for the scenarios where nothing may boot, by its negative:
+//! nothing comes back off either port and GRUB's halt record is on the channel.
+//! Because a packet can only be routed after seL4 has started, and seL4 only
+//! starts after GRUB's last record, the record sequence is always complete by
+//! the time it is judged.
 
 use std::{fs, path::Path, process::Command};
 
@@ -50,11 +51,12 @@ const HALT_RECORD: &str = "LFW-BOOT slot=none state=halted";
 
 /// How a scenario's boot must end.
 enum Outcome {
-    /// A slot boots and the system forwards a frame in each direction, so
-    /// "booted" means the whole stack came up, not merely that GRUB spoke.
-    Forwards,
+    /// A slot boots and the appliance routes a datagram in each direction, so
+    /// "booted" means the whole stack came up — firmware, boot manager, seL4,
+    /// both NIC drivers and the routing stage — not merely that GRUB spoke.
+    Routes,
     /// No slot is bootable: GRUB must reach its halt path and no injected
-    /// frame may come back.
+    /// packet may come back.
     Halts,
 }
 
@@ -97,7 +99,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=A B", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=A state=confirmed"],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: None,
         },
         // 2. A staged, unconfirmed B is tried once and boots. The absence of
@@ -108,7 +110,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=B state=trying"],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: Some("B_TRY=1"),
         },
         // 3. A broken (signature-failing) pending B is rejected and the boot
@@ -123,7 +125,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
                 "LFW-BOOT slot=B state=rejected",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: Some("B_TRY=1"),
         },
         // 4. A pending B that was already tried but never confirmed (the
@@ -136,7 +138,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
                 "LFW-BOOT slot=B state=exhausted",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: None,
         },
         // 5. Once B is confirmed healthy (the update is committed), B boots
@@ -146,7 +148,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=B A", "A_OK=0", "A_TRY=0", "B_OK=1", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=B state=confirmed"],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: None,
         },
         // 6. An ORDER naming a slot that does not exist is corrupt state, not
@@ -160,7 +162,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
                 "LFW-BOOT slot=none state=bad-order",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Forwards,
+            outcome: Outcome::Routes,
             expect_grubenv_after: None,
         },
         // 7. Both slots carry a broken payload: each is offered, rejected, and
@@ -228,7 +230,7 @@ fn run_scenario(
 
     let log_name = format!("ab-{name}.log");
     let output = match scenario.outcome {
-        Outcome::Forwards => boot_and_forward(root, work, &log_name),
+        Outcome::Routes => boot_and_forward(root, work, &log_name),
         Outcome::Halts => boot_and_halt(root, work, &log_name, HALT_RECORD),
     }
     .map_err(|error| format!("scenario {name}: {error}"))?;

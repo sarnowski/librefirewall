@@ -92,7 +92,7 @@ use nic_driver_core::bringup::QUEUE_SIZE;
 use nic_driver_core::{Counters, InvariantFaults, RxPath, TxPath};
 use pd_runtime::{
     BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, POOL_BUFFERS, Pool, PoolOwner, RING_SLOTS,
-    ReturnRing, attach_region, descriptor_in_bounds,
+    ReturnRing, Verdict, attach_region, descriptor_in_bounds,
 };
 use virtio::net::VirtioNetHdr;
 use virtio::queue::SplitVirtqueue;
@@ -114,6 +114,31 @@ const RX_POOL_PADDR: u64 = 0x3100_0000;
 /// Physical address of the pool this driver transmits out of, which it does
 /// map — `TxPath::post` writes the virtio-net header into it.
 const TX_POOL_PADDR: u64 = 0x3200_0000;
+
+/// One descriptor as either adversary writes it into a shared slot.
+///
+/// A field-wise literal and not `Descriptor::new`, whose `Verdict` argument
+/// would confine the verdict word to the two values that decode. That word is
+/// plain shared memory to a peer, and the values that decode to *nothing* are
+/// precisely the ones the transmit path has to account for separately — so the
+/// draw weights the two decodable values against the rest of the space rather
+/// than excluding either side of it (TEST-8).
+fn any_descriptor(unstructured: &mut Unstructured<'_>) -> Descriptor {
+    let buffer = any_u32(unstructured);
+    let offset = any_u32(unstructured);
+    let len = any_u32(unstructured);
+    let verdict = match any_u32(unstructured) % 4 {
+        0 => Verdict::Transmit.to_bits(),
+        1 => Verdict::Discard.to_bits(),
+        _ => any_u32(unstructured),
+    };
+    Descriptor {
+        buffer,
+        offset,
+        len,
+        verdict,
+    }
+}
 
 /// The device's side of one virtqueue: it may write any byte of the region, and
 /// publishes completions naming whatever descriptor it likes.
@@ -424,15 +449,17 @@ pub fn driver_paths_harness(data: &[u8]) {
                 // span, and freely repeated. Half the stream is biased into the
                 // pool's index range so the duplicate and header-room
                 // rejections come up often rather than by chance.
-                let mut descriptor = Descriptor::new(
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                );
+                let mut descriptor = any_descriptor(&mut unstructured);
                 if any_u32(&mut unstructured) & 1 == 0 {
                     descriptor.buffer %= POOL_BUFFERS as u32 + 1;
                     descriptor.offset %= (BUFFER_SIZE + 1) as u32;
                     descriptor.len %= (BUFFER_SIZE + 1) as u32;
+                    // The span is biased so the valid path is reached; the
+                    // verdict is not, because the two values that decode are
+                    // two of four billion and a bias towards them is exactly
+                    // what would delete the undecodable case (TEST-8). It is
+                    // instead drawn from a distribution that weights all three
+                    // outcomes, in `any_descriptor`.
                 }
                 let _full = forwarder_queues_tx.try_enqueue(descriptor);
             }
@@ -458,6 +485,13 @@ pub fn driver_paths_harness(data: &[u8]) {
                         "the driver published a frame that does not start after the header"
                     );
                     assert!(descriptor.len > 0, "a runt frame reached the forwarder");
+                    assert_eq!(
+                        Verdict::from_bits(descriptor.verdict),
+                        Some(Verdict::Transmit),
+                        "the driver published {descriptor:?} under a verdict that is not \
+                         Transmit — a received frame is a real frame, and anything else here \
+                         is traffic dropped on a decision no domain made"
+                    );
                     let buffer = descriptor.buffer as usize;
                     // Only for a buffer whose ownership the peer has not
                     // deliberately confused. Once op 9 has queued a return
@@ -482,11 +516,7 @@ pub fn driver_paths_harness(data: &[u8]) {
                 // A return of the far driver's choosing on the receive
                 // pipeline's free ring: forged indices, duplicates, and returns
                 // of buffers this driver still has posted to its own NIC.
-                let mut descriptor = Descriptor::new(
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                );
+                let mut descriptor = any_descriptor(&mut unstructured);
                 if any_u32(&mut unstructured) & 1 == 0 {
                     descriptor.buffer %= POOL_BUFFERS as u32 + 1;
                 }
@@ -531,11 +561,7 @@ pub fn driver_paths_harness(data: &[u8]) {
                 let head = any_u32(&mut unstructured);
                 let tail = any_u32(&mut unstructured);
                 let slot = any_u32(&mut unstructured) as usize;
-                let descriptor = Descriptor::new(
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                    any_u32(&mut unstructured),
-                );
+                let descriptor = any_descriptor(&mut unstructured);
                 match any_u32(&mut unstructured) % 4 {
                     // This driver produces on `rx`; only the cursor it *reads*
                     // is the peer's to forge. See the module header.

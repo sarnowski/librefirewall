@@ -24,22 +24,23 @@ Statuses are **done**, **partial**, or **open**; every *partial* capability is b
 below into what exists and what remains, so the work can be picked up without re-deriving it from
 the code.
 
-**The current deployable system** is a two-dataplane-port zero-copy forwarding slice: one virtio-net
-driver protection domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4
-capabilities alone, and an isolated forwarder protection domain moves frames between the two ports
-without copying them.
+**The current deployable system** is a two-dataplane-port routed IPv4 slice: one virtio-net driver
+protection domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4
+capabilities alone, and an isolated forwarder protection domain routes frames between the two ports
+— parsing each one, deciding on it against a static configuration, and rewriting its Ethernet and
+IPv4 headers in place, so the payload is never copied.
 
-There is, as yet, **no packet parsing of any kind** — not even Ethernet. Frames are opaque spans
-that are never interpreted; the only header the code understands is virtio-net's 12-byte device
-transport header, and only as a length to skip. What exists is a transport substrate for a firewall,
-not yet a firewall.
+Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
+forwarded because it is routable, never because a policy allowed it. There is no connection
+tracking, no NAT, no ARP, and no ICMP. What exists is a router on a firewall's substrate, not yet a
+firewall.
 
 ### Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
 | Stateful L2–L4 filtering and connection tracking | **open** | |
-| Routing, ARP, ICMP | **open** | |
+| Routing, ARP, ICMP | **partial** | [detail](#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | CONCEPT §6.4 |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | CONCEPT §6.5 |
 | Flow classifier (cut-through vs. proxy path) | **open** | |
@@ -116,18 +117,52 @@ not yet a firewall.
 
 What each partial capability already has, and what specifically remains to finish it.
 
+### Routed IPv4 forwarding
+
+**Done.** Two host-tested `no_std` crates carry the whole decision. `crates/net-headers` parses
+Ethernet, one optional 802.1Q tag, IPv4 and UDP, and applies the four edits a hop requires — both
+MACs, the TTL decrement, and the header checksum — as one operation that cannot be performed in
+part. `crates/routing` turns a parsed frame and its ingress port into a verdict: forward out of a
+named port under a named MAC pair, or one of ten named drop reasons, each with its own counter.
+`pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of the pool, decide,
+rewrite, and write back the 34 header bytes — and marks every frame it refuses `Verdict::Discard`
+so the transmitting driver returns the buffer instead of transmitting it.
+
+Held by 41 unit and property tests across the two crates, by the stage's own tests in
+`crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
+and garbage traffic through it and asserts the pool comes back whole — and by a persistent fuzz
+target (`route_frame`) whose input is the frame itself.
+
+**Missing.**
+
+- **No ARP and no ICMP**, so neighbours are a static table and a drop is silent. Both need a domain
+  that can *originate* a frame, which none can: the pools are owned by the receiving drivers, and a
+  frame can only leave the port opposite the one it arrived on.
+- **No configuration.** The interfaces and neighbours are a `const` table compiled into the
+  forwarder PD. The two interface MACs must equal the ones QEMU gives the guest NICs
+  (`tools/xtask/src/qemu.rs`), and nothing checks that they do.
+- **Connected routes only.** A destination is routable exactly when an interface prefix covers it;
+  no route table, no default route, no gateway indirection.
+- **IPv4 only, and no options**: `IHL != 5` is refused rather than skipped, IPv6 is absent, and a
+  VLAN tag is parsed but never acted on — a tagged frame is dropped for want of a sub-interface.
+- **No fragment reassembly.** A non-initial fragment is forwarded without a transport header being
+  read, which is correct for routing and insufficient for anything that must see the whole datagram.
+
 ### Zero-copy dataplane
 
 **Done.** The substrate exists as four host-tested `no_std` crates: `crates/queue` (the lock-free
 SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership ledger), `crates/wire`
 (the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
-(the pipeline, pool owner and forwarding stage the protection domains are assembled from).
+(the pipeline, pool owner and routing stage the protection domains are assembled from).
 
-Correctness is held by 73 unit and property tests across those four crates — including hostile-peer
+Correctness is held by 86 unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
-500,000-frame three-thread pipeline test that cycles every buffer through `rx → forward → tx → free`
-far more times than the pool holds, and end-to-end by byte-identical bidirectional forwarding in
-QEMU.
+500,000-frame three-thread pipeline test that cycles every buffer through `rx → route → tx → free`
+far more times than the pool holds.
+
+A frame is copied twice per hop and never more: once out of the pool into the routing domain's own
+memory, because a decision made on bytes a peer may rewrite underneath it is no decision at all, and
+once back — 34 bytes of header, never the payload.
 
 **Missing.**
 
@@ -137,13 +172,9 @@ QEMU.
 - Fixed 2048-byte buffers: no jumbo frames, no scatter-gather, no descriptor chaining.
 - Exactly two pipelines, hard-coded in the forwarder PD. No per-core sharding, no multi-queue.
 - No backpressure policy beyond releasing the buffer. A peer that stalls a destination ring makes
-  `ForwardStage::poll` drop a descriptor it has already dequeued, and the buffer that descriptor
+  `RouteStage::poll` drop a descriptor it has already dequeued, and the buffer that descriptor
   named is then lost to its owner's ledger permanently. It is counted, and nothing is double-owned
   — but the pool shrinks, and no component reclaims it.
-- The `.system` `<memory_region>` sizes and the Rust constants they must equal (`REGION_SIZE`,
-  `BAR_WINDOW_SIZE`, `VQ_REGION_SIZE`) have **no build-time cross-check**. Nothing reads the XML
-  back into Rust, so a divergence surfaces as a truncated mapping at boot rather than as a build
-  error. This is a documented precondition with no enforcer.
 
 ### virtio-net driver
 
@@ -153,12 +184,12 @@ BAR relocation, feature negotiation, queue programming, doorbells, and a split-v
 the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupError`, `NotifyError`,
 `CapError`) instead of panicking.
 
-`crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 60 further tests.
+`crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 67 further tests.
 Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
 every peer transmit descriptor.
 
-Six persistent fuzz targets cover this surface and the peer-facing one (see *Engineering
-foundations*).
+Seven persistent fuzz targets cover this surface, the peer-facing one, and the network-facing
+parser (see *Engineering foundations*).
 
 **Missing.**
 
@@ -185,8 +216,11 @@ foundations*).
 ### Protection-domain decomposition
 
 **Done.** Three protection domains (one forwarder, two driver instances of one binary) with real,
-verifiable least privilege: the forwarder holds no device capability at all, and each driver sees
-only its own ECAM page, BAR, virtqueue region, and its two pipelines. Two notification channels,
+verifiable least privilege: the forwarder holds no device capability at all and neither pipeline's
+`free` ring — so it cannot hand a live DMA target back to be issued a second time — and each driver
+sees only its own ECAM page, BAR, virtqueue region, and its two pipelines. Each pipeline is three
+memory regions rather than one precisely so that those grants can differ; the forwarder maps the
+buffer pools, because a domain that rewrites a header must reach the bytes. Two notification channels,
 each granted in **one direction only** — the drivers may signal the forwarder, and the forwarder's
 two send capabilities do not exist rather than merely going unexercised. Zero IRQs. The capability
 grant is machine-checkable in the Microkit capability/memory report the build generates.
@@ -197,13 +231,8 @@ parsers, DPI engine, content scanner, CA signing PD, management API PD, configur
 HA state-sync PD, and the update/health PD. There is no fault handler and no PD restart, one system
 description, and no SMP variant.
 
-Two grants are also wider than the code needs, and neither is closed:
+One grant is also wider than the code needs, and it is not closed:
 
-- **The forwarder is over-granted.** It maps each 136 KiB pipeline read-write although
-  `ForwardStage` touches only that pipeline's rx and tx rings — roughly 3 KiB. The 128 KiB buffer
-  pool in the same region is never read or written by the forwarder, and it is the part a
-  compromised forwarder could corrupt. Splitting the pool from the rings into separate memory
-  regions is not done.
 - **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what keeps the virtqueue
   and pipeline regions inside RAM while leaving the BAR window above RAM in the q35 PCI hole. The
   window either side is narrow: below roughly 785 MiB the DMA regions leave RAM, at 1280 MiB or more
@@ -245,8 +274,9 @@ refuses to reclaim an index that is out of range or not outstanding, and `pd_run
 refuses one this domain never lent. A *local* double return is not representable, `pop` minting a
 non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
-Every rejection is a **counted drop**, never a fault: `PoolCounters` and `ForwardCounters` record
-them. Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit
+Every rejection is a **counted drop**, never a fault: `PoolCounters` and `RouteCounters` record
+them, the latter attributing every refused frame to one of ten named routing reasons or to the stage
+check that caught it. Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit
 header-room check) and checked against the driver's in-flight set before any span is touched. Every
 peer-fed loop is bounded by `DRAIN_LIMIT`.
 
@@ -257,6 +287,11 @@ peer-fed loop is bounded by `DRAIN_LIMIT`.
   virtio-net header write then races the DMA. The damage stays inside the shared region, but
   exclusive ownership across domains is a protocol claim no single domain can verify. Closing it
   needs an IOMMU (CONCEPT §7.2) or a cross-domain per-buffer ownership epoch; neither exists.
+- **A verdict rests on a snapshot, not on the frame.** `RouteStage` decides on a copy in its own
+  memory, so a peer cannot change the frame under the decision — but it can change it *after*, and
+  before the transmitting NIC reads it. What leaves the port may differ from what was decided on in
+  every field the rewrite does not overwrite. The same IOMMU or ownership epoch is what would close
+  it.
 - **Buffer loss is not recovered.** A peer that stalls a destination ring costs the pool one buffer
   per dropped descriptor, permanently (see *[Zero-copy dataplane](#zero-copy-dataplane)*). It is
   counted, and nothing reclaims it.
@@ -317,11 +352,11 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the six library crates, `xtask`, and both protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.54% combined, weakest crate `pd-runtime` at 98.62%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (byte-identical forwarding, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
-| Criterion benchmarks | **partial** | `queue`, `packet-buffer` and `virtio` only; `pd-runtime`'s forwarding stage and `nic-driver-core`'s poll pass are hot paths with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | six persistent targets covering every crate that interprets untrusted input; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eight library crates, `xtask`, and both protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate; measured 99.26% combined, weakest crate `routing` at 98.17%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
+| QEMU end-to-end gate (the forwarding contract, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
+| Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
+| Fuzzing | **partial** | seven persistent targets covering every crate that interprets untrusted input; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
@@ -336,7 +371,7 @@ and their trees — appear in the inventory. And the third-party components that
 inside the disk — the seL4 kernel from the Microkit SDK and the GRUB core image — are absent; they
 are recorded as version-verified provenance in the release manifest instead.
 
-**Live fuzzing is conditional.** All six targets always build under AddressSanitizer, and the
+**Live fuzzing is conditional.** All seven targets always build under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
 run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
 probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
@@ -357,7 +392,7 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the signed A/B disk + release bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot the image in QEMU and assert byte-identical forwarding on both ports
+make test-system    # boot the image in QEMU and assert the forwarding contract on both ports
 make ci             # the complete gate (host gate + fuzz + image + system + A/B scenarios)
 ```
 

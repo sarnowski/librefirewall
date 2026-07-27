@@ -10,11 +10,12 @@
 //! double-owned buffer are `PoolOwner`'s *lent* set and `packet_buffer`'s
 //! ledger beneath it.
 //!
-//! The forwarder is granted strictly less than this harness gives its peer: it
-//! maps `ForwardRings` alone. That is a property of the system description, not
-//! of `pd_runtime`, so this harness keeps modelling the *widest* peer any
-//! region has — narrowing it to what one domain happens to map would delete
-//! adversary authority the protocol must still withstand (TEST-8).
+//! The forwarder is granted less than this harness gives its peer: it maps the
+//! pool and both rings of a pipeline, and neither `free` ring. That is a
+//! property of the system description, not of `pd_runtime`, so this harness
+//! keeps modelling the *widest* peer any region has — narrowing it to what one
+//! domain happens to map would delete adversary authority the protocol must
+//! still withstand (TEST-8).
 //!
 //! The worst outcome this guards is not a crash. It is a forged index reaching
 //! the free stack, being handed back out by `alloc`, and turned into a physical
@@ -30,8 +31,8 @@
 //!
 //! | ring | producer | consumer |
 //! |---|---|---|
-//! | `rx` | the rx driver — under test, through `PoolOwner::lend` | the forwarder — under test, inside `ForwardStage` |
-//! | `tx` | the forwarder — under test, inside `ForwardStage` | the tx driver — **the adversary** |
+//! | `rx` | the rx driver — under test, through `PoolOwner::lend` | the forwarder — under test, inside `RouteStage` |
+//! | `tx` | the forwarder — under test, inside `RouteStage` | the tx driver — **the adversary** |
 //! | `free` | the tx driver — **the adversary** | the rx driver — under test, inside `PoolOwner` |
 //!
 //! # What the adversary may express here
@@ -39,9 +40,21 @@
 //! Arbitrary descriptors on the `free` ring — forged indices, indices never
 //! lent, duplicates of a return already accepted, indices this domain still
 //! holds posted to its own NIC — arbitrary cursors on every ring, and arbitrary
-//! slot contents on the rings this side consumes. The spans a lend publishes
-//! are arbitrary too, because from `ForwardStage`'s point of view the rx driver
-//! is itself a peer.
+//! slot contents on the rings this side consumes, **verdict word included**:
+//! it is one more shared `u32`, and the values it may hold are not confined to
+//! the two a `Verdict` encodes. The spans a lend publishes are arbitrary too,
+//! because from `RouteStage`'s point of view the rx driver is itself a peer;
+//! its *verdict* is not, because `PoolOwner::lend` takes a `Verdict` and so a
+//! first-party producer can only publish one of the two — which is the point of
+//! the type, and why the undecodable case arrives here by a peer slot store.
+//!
+//! The **frame bytes** are the adversary's too, and they are now interpreted:
+//! `RouteStage` parses every buffer it is handed and rewrites the ones it
+//! forwards. This harness therefore writes arbitrary bytes over pool buffers at
+//! arbitrary moments — including between a snapshot and the transmit that
+//! follows it — because every domain mapping the pool can, and because a
+//! harness that only ever placed well-formed frames would exercise the parser
+//! on the one input shape it was written for.
 //!
 //! # What is asserted
 //!
@@ -51,7 +64,7 @@
 //! * **No double ownership.** `alloc` never hands out an index this side is
 //!   already holding, and the final drain of the ledger yields pairwise
 //!   distinct indices — no buffer invented, none free twice.
-//! * **Bounded work.** `PoolOwner::reclaim` and `ForwardStage::poll` each move
+//! * **Bounded work.** `PoolOwner::reclaim` and `RouteStage::poll` each move
 //!   at most `DRAIN_LIMIT` descriptors per call, whatever cursor the peer
 //!   publishes.
 //! * **The delegated precondition terminates, and its two ends agree.**
@@ -68,11 +81,13 @@
 use std::collections::BTreeSet;
 
 use arbitrary::Unstructured;
+use net_headers::{Ipv4Address, MacAddress};
 use packet_buffer::CopyOutError;
 use pd_runtime::{
-    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, ForwardStage, OwnedBuffer, POOL_BUFFERS,
-    Pool, PoolOwner, RING_SLOTS, ReturnRing, attach_region, buffer_paddr, descriptor_in_bounds,
+    BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS, Pool, PoolOwner,
+    RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr, descriptor_in_bounds,
 };
+use routing::{Interface, Neighbour, PortId, Router};
 
 use crate::region::ZeroedRegion;
 use crate::ring_abi::PeerView;
@@ -82,13 +97,63 @@ use crate::{MAX_OPERATIONS, any_index, any_u32, next_op};
 /// guarantees, because the pool's own DMA-alignment argument rests on it.
 const POOL_PADDR: u64 = 0x3100_0000;
 
-/// One descriptor whose three fields the peer chose freely.
+const PORT0: PortId = PortId(0);
+const PORT1: PortId = PortId(1);
+
+/// The configuration `pds/forwarder` compiles in. The routing decision is not
+/// what this harness is aimed at — `routing` is total over every header by its
+/// own property tests — but it must be the real table, or the frames the
+/// adversary happens to produce would be judged against a topology nothing
+/// runs.
+static ROUTER: Router<2, 2> = Router::new(
+    [
+        Interface {
+            port: PORT0,
+            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
+            address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            prefix_length: 24,
+        },
+        Interface {
+            port: PORT1,
+            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x51]),
+            address: Ipv4Address::from_octets([10, 0, 1, 1]),
+            prefix_length: 24,
+        },
+    ],
+    [
+        Neighbour {
+            port: PORT0,
+            address: Ipv4Address::from_octets([10, 0, 0, 2]),
+            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
+        },
+        Neighbour {
+            port: PORT1,
+            address: Ipv4Address::from_octets([10, 0, 1, 2]),
+            mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
+        },
+    ],
+);
+
+/// One descriptor whose four fields the peer chose freely — a field-wise
+/// literal and not `Descriptor::new`, whose `Verdict` argument would confine
+/// the one word this harness must be able to make undecodable.
 fn any_descriptor(unstructured: &mut Unstructured<'_>) -> Descriptor {
-    Descriptor::new(
-        any_u32(unstructured),
-        any_u32(unstructured),
-        any_u32(unstructured),
-    )
+    Descriptor {
+        buffer: any_u32(unstructured),
+        offset: any_u32(unstructured),
+        len: any_u32(unstructured),
+        verdict: any_u32(unstructured),
+    }
+}
+
+/// Either verdict a first-party producer can publish; see the module header on
+/// why the undecodable word does not come from here.
+fn any_verdict(unstructured: &mut Unstructured<'_>) -> Verdict {
+    if any_u32(unstructured) & 1 == 0 {
+        Verdict::Transmit
+    } else {
+        Verdict::Discard
+    }
 }
 
 /// Drive the pool ownership protocol and the forwarding stage against a peer
@@ -116,7 +181,7 @@ pub fn pipeline_harness(data: &[u8]) {
 
     let mut owner = PoolOwner::attach(returns);
     let mut rx_producer = rings.rx.producer();
-    let mut stage = ForwardStage::attach(rings);
+    let mut stage = RouteStage::attach(rings, pool, &ROUTER, PORT0, PORT1);
     let mut peer_free = returns.free.producer();
     let mut peer_tx = rings.tx.consumer();
     let rx_view = PeerView::<RING_SLOTS>::new(&rings.rx);
@@ -129,13 +194,13 @@ pub fn pipeline_harness(data: &[u8]) {
     let mut held: Vec<OwnedBuffer<POOL_BUFFERS>> = Vec::new();
     let mut holding = [false; POOL_BUFFERS];
     let mut previous_pool = owner.counters();
-    let mut previous_forward = stage.counters();
+    let mut previous_route = stage.counters();
 
     for _ in 0..MAX_OPERATIONS {
         let Some(op) = next_op(&mut unstructured) else {
             break;
         };
-        match op % 9 {
+        match op % 10 {
             0 => {
                 if let Some(buffer) = owner.alloc() {
                     let index = buffer.index();
@@ -170,7 +235,8 @@ pub fn pipeline_harness(data: &[u8]) {
                 // peer of the forwarder, so it is not constrained here.
                 let offset = any_u32(&mut unstructured);
                 let len = any_u32(&mut unstructured);
-                match owner.lend(&mut rx_producer, buffer, offset, len) {
+                let verdict = any_verdict(&mut unstructured);
+                match owner.lend(&mut rx_producer, buffer, offset, len, verdict) {
                     Ok(()) => holding[index as usize] = false,
                     Err(returned) => {
                         assert_eq!(
@@ -198,10 +264,10 @@ pub fn pipeline_harness(data: &[u8]) {
                 );
             }
             4 => {
-                let moved = stage.poll();
+                let handed_on = stage.poll();
                 assert!(
-                    moved <= DRAIN_LIMIT,
-                    "the forwarder moved {moved} descriptors, past the {DRAIN_LIMIT} bound"
+                    handed_on <= DRAIN_LIMIT,
+                    "the forwarder handed on {handed_on} descriptors, past the {DRAIN_LIMIT} bound"
                 );
             }
             // The trust boundary: a return of the peer's choosing. Half the
@@ -210,7 +276,7 @@ pub fn pipeline_harness(data: &[u8]) {
             // wholly unreduced descriptor.
             5 | 6 => {
                 let mut descriptor = any_descriptor(&mut unstructured);
-                if op % 9 == 6 {
+                if op % 10 == 6 {
                     descriptor.buffer %= POOL_BUFFERS as u32 + 2;
                 }
                 let _full = peer_free.try_enqueue(descriptor);
@@ -296,6 +362,22 @@ pub fn pipeline_harness(data: &[u8]) {
                 }
                 assert!(taken <= limit);
             }
+            8 => {
+                // The pool bytes, which every domain mapping the region may
+                // rewrite at any instant — this one included, between the
+                // stage's snapshot and the transmit that follows it. A frame
+                // the stage decided on is not the frame that leaves.
+                let index = any_u32(&mut unstructured) as usize % POOL_BUFFERS;
+                let offset = any_u32(&mut unstructured) as usize % BUFFER_SIZE;
+                let byte = any_u32(&mut unstructured) as u8;
+                let len = any_u32(&mut unstructured) as usize % (BUFFER_SIZE + 1);
+                // SAFETY: `write_at`'s ownership clause is exactly the one a
+                // byzantine peer disregards, which is what this step is; the
+                // source is a local and cannot alias the pool, and the span is
+                // the accessor's own business — it bounds it unconditionally
+                // and answers in its return value rather than faulting.
+                let _refused = unsafe { pool.write_at(index, offset, &vec![byte; len]) };
+            }
             _ => {
                 // Cursors and slots, on whichever ring the peer feels like.
                 let head = any_u32(&mut unstructured);
@@ -324,13 +406,19 @@ pub fn pipeline_harness(data: &[u8]) {
         // Counters are monotonic and saturating for the domain's life; a
         // rejection that stopped being counted would hide a byzantine peer.
         let pool_counters = owner.counters();
-        let forward_counters = stage.counters();
+        let route_counters = stage.counters();
         assert!(pool_counters.reclaim_not_lent >= previous_pool.reclaim_not_lent);
         assert!(pool_counters.reclaim_refused >= previous_pool.reclaim_refused);
-        assert!(forward_counters.forwarded >= previous_forward.forwarded);
-        assert!(forward_counters.dropped >= previous_forward.dropped);
+        assert!(route_counters.forwarded >= previous_route.forwarded);
+        assert!(route_counters.egress_full >= previous_route.egress_full);
+        assert!(route_counters.malformed_descriptor >= previous_route.malformed_descriptor);
+        assert!(route_counters.snapshot_failed >= previous_route.snapshot_failed);
+        assert!(route_counters.unparsable >= previous_route.unparsable);
+        assert!(route_counters.misrouted >= previous_route.misrouted);
+        assert!(route_counters.writeback_failed >= previous_route.writeback_failed);
+        assert!(route_counters.drops.total() >= previous_route.drops.total());
         previous_pool = pool_counters;
-        previous_forward = forward_counters;
+        previous_route = route_counters;
     }
 
     // Definitive conservation, read out of the ledger: hand every token back,

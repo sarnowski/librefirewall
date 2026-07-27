@@ -39,6 +39,8 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "wire",
     "queue",
     "packet-buffer",
+    "net-headers",
+    "routing",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
@@ -58,6 +60,8 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "wire",
     "queue",
     "packet-buffer",
+    "net-headers",
+    "routing",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
@@ -80,7 +84,7 @@ const LIBRARY_PER_CRATE_COVERAGE_FLOOR_PCT: u32 = 90;
 /// Crates carrying criterion microbenchmarks, run by `bench`. These are the
 /// perf-sensitive dataplane substrate crates whose hot operations the 10 Gbit/s
 /// budget depends on.
-const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio"];
+const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio", "pd-runtime"];
 
 /// The seL4 kernel configurations the protection domains are linted in.
 ///
@@ -108,6 +112,7 @@ const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFI
 /// narrowest one that reproduces it is the one worth reading, so it runs first.
 const FUZZ_TARGETS: &[&str] = &[
     "free_list_ownership",
+    "route_frame",
     "spsc_ring_peer",
     "virtqueue_poll",
     "pd_runtime_pipeline",
@@ -272,8 +277,8 @@ fn enforce_budgets(root: &Path) -> Result<(), String> {
     budgets::enforce(root)
 }
 
-/// Enforce the library coverage floors: the combined floor across all six
-/// [`LIBRARY_PACKAGES`] AND a per-crate floor on each one, so a regression
+/// Enforce the library coverage floors: the combined floor across every
+/// [`LIBRARY_PACKAGES`] member AND a per-crate floor on each one, so a regression
 /// concentrated in a single crate cannot hide behind the high-coverage crates.
 ///
 /// The library tests are instrumented once with `--no-report`; the combined and
@@ -580,12 +585,13 @@ mod tests {
             CoverageExclusion::OnlyObservableUnderSel4 {
                 qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
                                 forwarding contract — a frame injected into each virtio port \
-                                must egress byte-identical on the other — which no frame can \
-                                satisfy unless this domain's whole bring-up ran against the \
-                                device (identify, place_bar, map, acknowledge, \
-                                negotiate_features, configure_queues, go_live) and then primed \
-                                and polled. `xtask test-ab` re-asserts the same contract on the \
-                                slot it selected in six of its eight scenarios.",
+                                must egress on the other, rewritten for its next hop and with \
+                                its payload intact — which no frame can satisfy unless this \
+                                domain's whole bring-up ran against the device (identify, \
+                                place_bar, map, acknowledge, negotiate_features, \
+                                configure_queues, go_live) and then primed and polled. `xtask \
+                                test-ab` re-asserts the same contract on the slot it selected \
+                                in six of its eight scenarios.",
                 residue: Some(
                     "`PoolDmaBase::new`'s rejecting branches and the `StartupError` console \
                      path are reached by no QEMU test: every scenario boots the one correct \
@@ -605,11 +611,15 @@ mod tests {
             CoverageExclusion::OnlyObservableUnderSel4 {
                 qemu_evidence: "`xtask test-system` boots the deployable disk and asserts the \
                                 forwarding contract in both directions at once; a frame \
-                                egresses on the opposite port only if this domain attached both \
-                                `ForwardRings` regions in `init` and moved the descriptor in \
-                                `notified`, which is every statement it has. `xtask test-ab` \
-                                re-asserts it on the selected slot in six of its eight \
-                                scenarios.",
+                                egresses on the opposite port, rewritten for its next hop, only \
+                                if this domain attached both `ForwardRings` regions and both \
+                                pools in `init` and drove both `RouteStage`s in `notified`, \
+                                which is every statement it has. What that cannot reach is the \
+                                routing configuration itself: a wrong MAC or prefix in the \
+                                `const` table is a `Router::decide` drop, which this evidence \
+                                sees as no frame at all rather than as a misconfiguration. \
+                                `xtask test-ab` re-asserts it on the selected slot in six of \
+                                its eight scenarios.",
                 residue: None,
             },
         ),

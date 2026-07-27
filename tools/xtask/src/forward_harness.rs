@@ -1,16 +1,21 @@
-//! QEMU two-port virtio-net forwarding harness.
+//! QEMU two-port virtio-net routing harness.
 //!
 //! Attaches two `virtio-net-pci` NICs whose backends are host-controlled TCP
 //! sockets to a caller-built QEMU invocation (the OVMF/GRUB boot of the
-//! deployable disk), injects one Ethernet frame into each port, and judges the
-//! boot against a [`BootContract`].
+//! deployable disk), plays one host endpoint on each port, and judges the boot
+//! against a [`BootContract`].
 //!
-//! The primary contract, [`BootContract::Forwarding`], is the system's real
-//! observable behaviour: each injected frame must egress — byte-identical — on
-//! the *other* port. Nothing about it involves serial text. Its negative,
-//! [`BootContract::Halted`], proves the opposite for a disk with no bootable
-//! slot: the same frames are injected and *none* may come back, while the boot
-//! manager's structured halt record must appear on the serial channel.
+//! The primary contract, [`BootContract::Routed`], is the system's real
+//! observable behaviour. The guest is an IPv4 router between two directly
+//! attached subnets, so a datagram from the endpoint on one port must reach the
+//! endpoint on the other rewritten for its next hop — new MAC pair, one less
+//! TTL, header checksum redone — and unchanged in every other byte. The same
+//! boot injects the packets the appliance must refuse, and success needs both
+//! deliveries *and* the absence of every refusal. Nothing about it involves
+//! serial text. Its negative, [`BootContract::Halted`], proves the opposite for
+//! a disk with no bootable slot: the same packets are injected and nothing at
+//! all may come back, while the boot manager's structured halt record must
+//! appear on the serial channel.
 //!
 //! The captured serial output is always written to the run log — behind a
 //! harness-generated header describing how QEMU was configured — and returned
@@ -19,7 +24,7 @@
 //! match something the harness itself wrote.
 
 use std::{
-    fs,
+    fmt, fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
@@ -28,6 +33,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use crate::qemu::PORT_MACS;
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
 /// TCG (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
@@ -40,8 +47,15 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cadence of re-injection. virtio-net silently drops received frames while
 /// the guest driver has not yet posted RX buffers, so a single early frame can
-/// be lost; we resend until the guest forwards or the test times out.
+/// be lost; we resend until the packet is delivered or the test times out.
 const REINJECT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long the refused packets are watched for after both routed packets have
+/// arrived. Both directions having completed is what proves the guest is taking
+/// frames off both ports at all, so this window is not a guess about boot
+/// progress — it is the round trip a delivery would need, and the two
+/// deliveries already observed within one [`REINJECT_INTERVAL`] bound that.
+const SETTLE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Minimum Ethernet frame size on the wire without FCS.
 const MIN_ETHERNET_FRAME: usize = 60;
@@ -50,15 +64,663 @@ const MIN_ETHERNET_FRAME: usize = 60;
 /// larger means a corrupt stream, not a jumbo frame.
 const MAX_WIRE_FRAME: usize = 65535;
 
-/// What a boot must prove. Both variants inject the same frame into each port;
-/// they differ in which observation is success.
+const ETHERNET_HEADER_LEN: usize = 14;
+const IPV4_HEADER_LEN: usize = 20;
+const UDP_HEADER_LEN: usize = 8;
+const MIN_UDP_FRAME: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN;
+const IPV4_ETHERTYPE: u16 = 0x0800;
+const UDP_PROTOCOL: u8 = 17;
+
+/// The EtherType of the frame the retired L2 contract required to be forwarded
+/// byte-identical; see [`legacy_broadcast_frame`].
+const LOCAL_EXPERIMENTAL_ETHERTYPE: u16 = 0x88b5;
+
+/// One host station on one dataplane port: the address the harness injects as,
+/// and the address a packet routed towards it must be addressed to.
+#[derive(Clone, Copy)]
+struct Endpoint {
+    /// Names this endpoint in a verdict.
+    name: &'static str,
+    port: usize,
+    mac: [u8; 6],
+    address: [u8; 4],
+}
+
+impl Endpoint {
+    /// The MAC of the appliance interface this endpoint's subnet terminates on
+    /// — the destination a packet must carry to be routed, and the source it
+    /// carries once it has been. Taken from [`PORT_MACS`] rather than written
+    /// out, so what the contract expects the appliance to answer to is by
+    /// construction the MAC QEMU puts on that port's NIC.
+    fn gateway_mac(self) -> [u8; 6] {
+        PORT_MACS[self.port]
+    }
+}
+
+/// The two endpoints the routed contract is stated between, one per dataplane
+/// port:
+///
+/// ```text
+///   A 10.0.0.2                    appliance                   B 10.0.1.2
+///   52:54:00:00:00:0a ── port 0 ── 10.0.0.1/24 ┊ 10.0.1.1/24 ── port 1 ── 52:54:00:00:00:0b
+///                                  52:54:00:12:34:50 ┊ 52:54:00:12:34:51
+/// ```
+///
+/// A cross-artifact fact no build step checks: these four addresses must equal
+/// the `Router<2, 2>` compiled into `pds/forwarder/src/main.rs`, whose own
+/// header records what silently happens if they diverge.
+const ENDPOINTS: [Endpoint; PORT_MACS.len()] = [
+    Endpoint {
+        name: "A",
+        port: 0,
+        mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x0a],
+        address: [10, 0, 0, 2],
+    },
+    Endpoint {
+        name: "B",
+        port: 1,
+        mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x0b],
+        address: [10, 0, 1, 2],
+    },
+];
+
+/// The UDP port pair every probe uses. Fixed rather than varied per probe: the
+/// payload marker is what attributes a delivery, so a second varying field
+/// would only add a way for two probes to become confusable.
+const SOURCE_PORT: u16 = 4444;
+const DESTINATION_PORT: u16 = 5000;
+
+/// The TTL a routed probe is injected with, chosen well above the one hop it
+/// takes so the decrement is visible rather than decisive.
+const INJECTED_TTL: u8 = 64;
+
+/// A UDP-over-IPv4 Ethernet frame as fields: what an endpoint puts on the wire,
+/// and — with the next hop's MAC pair and one less TTL — the shape the routed
+/// result must have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UdpPacket {
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    source: [u8; 4],
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    ttl: u8,
+    payload: Vec<u8>,
+}
+
+impl UdpPacket {
+    /// Serialize to the bytes an endpoint's NIC would put on the wire, padded
+    /// to the 60-byte Ethernet minimum. The IPv4 total length counts only the
+    /// datagram, so any padding is bytes L3 disclaims — which is what a real
+    /// endpoint emits and what a router must carry unread.
+    fn build(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(MIN_UDP_FRAME + self.payload.len());
+        frame.extend_from_slice(&self.destination_mac);
+        frame.extend_from_slice(&self.source_mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+
+        let datagram_len = IPV4_HEADER_LEN + UDP_HEADER_LEN + self.payload.len();
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(datagram_len as u16).to_be_bytes());
+        ip[8] = self.ttl;
+        ip[9] = UDP_PROTOCOL;
+        ip[12..16].copy_from_slice(&self.source);
+        ip[16..20].copy_from_slice(&self.destination);
+        let checksum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+
+        frame.extend_from_slice(&self.source_port.to_be_bytes());
+        frame.extend_from_slice(&self.destination_port.to_be_bytes());
+        frame.extend_from_slice(&((UDP_HEADER_LEN + self.payload.len()) as u16).to_be_bytes());
+        // No UDP checksum, which IPv4 permits and which keeps the datagram's
+        // correctness a property of the header this harness recomputes alone.
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&self.payload);
+
+        if frame.len() < MIN_ETHERNET_FRAME {
+            frame.resize(MIN_ETHERNET_FRAME, 0);
+        }
+        frame
+    }
+
+    /// Read `frame` back into its fields, validating the header checksum and
+    /// every length the field view rests on.
+    ///
+    /// # Errors
+    /// [`FrameDefect`], carrying the values that made the frame something other
+    /// than the UDP-over-IPv4 packet the routed contract is stated in.
+    fn decode(frame: &[u8]) -> Result<Self, FrameDefect> {
+        let too_short = FrameDefect::TooShort {
+            needed: MIN_UDP_FRAME,
+            got: frame.len(),
+        };
+        let Some((ethernet, after_ethernet)) = frame.split_first_chunk::<ETHERNET_HEADER_LEN>()
+        else {
+            return Err(too_short);
+        };
+        let [
+            dm0,
+            dm1,
+            dm2,
+            dm3,
+            dm4,
+            dm5,
+            sm0,
+            sm1,
+            sm2,
+            sm3,
+            sm4,
+            sm5,
+            et_high,
+            et_low,
+        ] = *ethernet;
+        let ether_type = u16::from_be_bytes([et_high, et_low]);
+        if ether_type != IPV4_ETHERTYPE {
+            return Err(FrameDefect::NotIpv4 { ether_type });
+        }
+
+        let Some((ip, after_ip)) = after_ethernet.split_first_chunk::<IPV4_HEADER_LEN>() else {
+            return Err(too_short);
+        };
+        let [
+            version_ihl,
+            _dscp_ecn,
+            tl_high,
+            tl_low,
+            _id_high,
+            _id_low,
+            _flags_high,
+            _flags_low,
+            ttl,
+            protocol,
+            ck_high,
+            ck_low,
+            s0,
+            s1,
+            s2,
+            s3,
+            d0,
+            d1,
+            d2,
+            d3,
+        ] = *ip;
+        let version = version_ihl >> 4;
+        if version != 4 {
+            return Err(FrameDefect::VersionNotFour { version });
+        }
+        let ihl = version_ihl & 0x0f;
+        if ihl != 5 {
+            return Err(FrameDefect::OptionsPresent { ihl });
+        }
+        let found = u16::from_be_bytes([ck_high, ck_low]);
+        let computed = header_checksum(ip);
+        if found != computed {
+            return Err(FrameDefect::HeaderChecksumInvalid { found, computed });
+        }
+        if protocol != UDP_PROTOCOL {
+            return Err(FrameDefect::NotUdp { protocol });
+        }
+
+        let total_length = u16::from_be_bytes([tl_high, tl_low]);
+        let Some(payload_len) =
+            usize::from(total_length).checked_sub(IPV4_HEADER_LEN + UDP_HEADER_LEN)
+        else {
+            return Err(FrameDefect::TotalLengthBelowHeaders { total_length });
+        };
+        let Some((udp, after_udp)) = after_ip.split_first_chunk::<UDP_HEADER_LEN>() else {
+            return Err(too_short);
+        };
+        let [
+            sp_high,
+            sp_low,
+            dp_high,
+            dp_low,
+            ul_high,
+            ul_low,
+            uc_high,
+            uc_low,
+        ] = *udp;
+        let udp_length = u16::from_be_bytes([ul_high, ul_low]);
+        let expected_udp_length = (UDP_HEADER_LEN + payload_len) as u16;
+        if udp_length != expected_udp_length {
+            return Err(FrameDefect::UdpLengthDisagrees {
+                udp_length,
+                total_length,
+            });
+        }
+        let udp_checksum = u16::from_be_bytes([uc_high, uc_low]);
+        if udp_checksum != 0 {
+            return Err(FrameDefect::UdpChecksumAdded { udp_checksum });
+        }
+        let Some(payload) = after_udp.get(..payload_len) else {
+            return Err(FrameDefect::TotalLengthBeyondFrame {
+                total_length,
+                frame_len: frame.len(),
+            });
+        };
+
+        Ok(Self {
+            destination_mac: [dm0, dm1, dm2, dm3, dm4, dm5],
+            source_mac: [sm0, sm1, sm2, sm3, sm4, sm5],
+            source: [s0, s1, s2, s3],
+            destination: [d0, d1, d2, d3],
+            source_port: u16::from_be_bytes([sp_high, sp_low]),
+            destination_port: u16::from_be_bytes([dp_high, dp_low]),
+            ttl,
+            payload: payload.to_vec(),
+        })
+    }
+}
+
+/// Why a delivered frame is not the UDP-over-IPv4 packet the routed contract is
+/// stated in. Each variant carries the values that made it one, so a delivery
+/// that never reaches the field comparison still names what was wrong with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameDefect {
+    TooShort { needed: usize, got: usize },
+    NotIpv4 { ether_type: u16 },
+    VersionNotFour { version: u8 },
+    OptionsPresent { ihl: u8 },
+    HeaderChecksumInvalid { found: u16, computed: u16 },
+    NotUdp { protocol: u8 },
+    TotalLengthBelowHeaders { total_length: u16 },
+    TotalLengthBeyondFrame { total_length: u16, frame_len: usize },
+    UdpLengthDisagrees { udp_length: u16, total_length: u16 },
+    UdpChecksumAdded { udp_checksum: u16 },
+}
+
+impl fmt::Display for FrameDefect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::TooShort { needed, got } => {
+                write!(f, "{got} bytes is short of the {needed} a datagram needs")
+            }
+            Self::NotIpv4 { ether_type } => write!(f, "EtherType 0x{ether_type:04x} is not IPv4"),
+            Self::VersionNotFour { version } => write!(f, "IP version {version} is not 4"),
+            Self::OptionsPresent { ihl } => write!(f, "IHL {ihl} carries options"),
+            Self::HeaderChecksumInvalid { found, computed } => write!(
+                f,
+                "header checksum 0x{found:04x} should have been 0x{computed:04x}"
+            ),
+            Self::NotUdp { protocol } => write!(f, "IP protocol {protocol} is not UDP"),
+            Self::TotalLengthBelowHeaders { total_length } => write!(
+                f,
+                "total length {total_length} is below the {} bytes of IPv4 and UDP header",
+                IPV4_HEADER_LEN + UDP_HEADER_LEN
+            ),
+            Self::TotalLengthBeyondFrame {
+                total_length,
+                frame_len,
+            } => write!(
+                f,
+                "total length {total_length} exceeds the {frame_len}-byte frame"
+            ),
+            Self::UdpLengthDisagrees {
+                udp_length,
+                total_length,
+            } => write!(
+                f,
+                "UDP length {udp_length} contradicts the IPv4 total length {total_length}"
+            ),
+            Self::UdpChecksumAdded { udp_checksum } => write!(
+                f,
+                "UDP checksum 0x{udp_checksum:04x} was added to a datagram sent without one"
+            ),
+        }
+    }
+}
+
+/// The RFC 1071 ones' complement sum, folded and inverted, over a header whose
+/// own checksum field is treated as zero — so this yields what the field must
+/// hold whatever it currently holds.
+///
+/// Written straightforwardly and independently of the guest's implementation:
+/// the value of the check is that the two were arrived at separately.
+fn header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
+    let mut zeroed = *header;
+    zeroed[10] = 0;
+    zeroed[11] = 0;
+    let mut sum: u32 = 0;
+    for pair in zeroed.chunks(2) {
+        let value = match pair {
+            [high, low] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            _ => 0,
+        };
+        sum += u32::from(value);
+    }
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// What must become of one injected packet.
+enum Expectation {
+    /// It must arrive on `egress`, and be exactly `packet`.
+    Routed { egress: usize, packet: UdpPacket },
+    /// It must never arrive anywhere; `because` names the rule that forbids it,
+    /// so a wrongly delivered packet says which one the guest broke.
+    Dropped { because: &'static str },
+}
+
+/// One injected packet and the single thing it proves.
+struct Probe {
+    /// Names the probe in a verdict.
+    name: &'static str,
+    /// The bytes that distinguish this probe's frames from every other probe's,
+    /// so a delivery is attributed to the packet that caused it and a stray can
+    /// never satisfy the wrong assertion.
+    marker: &'static [u8],
+    ingress: usize,
+    frame: Vec<u8>,
+    expectation: Expectation,
+}
+
+impl Probe {
+    /// Judge one frame that carried this probe's marker back to the harness.
+    ///
+    /// # Errors
+    /// The verdict, naming this probe and — where the delivery differs from the
+    /// contract — every field it differs in. A hex dump would say the frame was
+    /// wrong; naming the field says whether the router rewrote the wrong MAC,
+    /// failed to decrement, or corrupted the payload.
+    fn judge(&self, egress: usize, frame: &[u8]) -> Result<(), String> {
+        let name = self.name;
+        let (expected_egress, expected) = match &self.expectation {
+            Expectation::Dropped { because } => {
+                return Err(format!(
+                    "probe {name} came back on port{egress}, but {because}, so the appliance \
+                     must never put it on a wire"
+                ));
+            }
+            Expectation::Routed { egress, packet } => (*egress, packet),
+        };
+        if egress != expected_egress {
+            return Err(format!(
+                "probe {name} was delivered on port{egress}, but the route it takes puts it on \
+                 port{expected_egress}"
+            ));
+        }
+
+        let expected_bytes = expected.build();
+        if frame == expected_bytes {
+            return Ok(());
+        }
+        let observed = match UdpPacket::decode(frame) {
+            Ok(packet) => packet,
+            Err(defect) => {
+                return Err(format!(
+                    "probe {name}: the frame delivered on port{egress} is not a well-formed \
+                     datagram: {defect}"
+                ));
+            }
+        };
+        let fields = differences(expected, &observed);
+        if fields.is_empty() {
+            // Every field the contract is written in agrees, so what differs is
+            // a byte the field view does not model — Ethernet padding, an IPv4
+            // identification or flag the router must carry through untouched.
+            return Err(format!(
+                "probe {name}: the frame delivered on port{egress} carries every field of the \
+                 routed contract but differs outside them: {}",
+                byte_difference(&expected_bytes, frame)
+            ));
+        }
+        Err(format!(
+            "probe {name}: the frame delivered on port{egress} departs from the routed contract \
+             in {}",
+            fields.join("; ")
+        ))
+    }
+}
+
+/// Name every field in which `observed` departs from `expected`.
+fn differences(expected: &UdpPacket, observed: &UdpPacket) -> Vec<String> {
+    let mut found = Vec::new();
+    if observed.destination_mac != expected.destination_mac {
+        found.push(format!(
+            "destination MAC {} (expected {})",
+            mac(observed.destination_mac),
+            mac(expected.destination_mac)
+        ));
+    }
+    if observed.source_mac != expected.source_mac {
+        found.push(format!(
+            "source MAC {} (expected {})",
+            mac(observed.source_mac),
+            mac(expected.source_mac)
+        ));
+    }
+    if observed.source != expected.source {
+        found.push(format!(
+            "source address {} (expected {})",
+            ipv4(observed.source),
+            ipv4(expected.source)
+        ));
+    }
+    if observed.destination != expected.destination {
+        found.push(format!(
+            "destination address {} (expected {})",
+            ipv4(observed.destination),
+            ipv4(expected.destination)
+        ));
+    }
+    if observed.source_port != expected.source_port {
+        found.push(format!(
+            "source port {} (expected {})",
+            observed.source_port, expected.source_port
+        ));
+    }
+    if observed.destination_port != expected.destination_port {
+        found.push(format!(
+            "destination port {} (expected {})",
+            observed.destination_port, expected.destination_port
+        ));
+    }
+    if observed.ttl != expected.ttl {
+        found.push(format!("TTL {} (expected {})", observed.ttl, expected.ttl));
+    }
+    if observed.payload != expected.payload {
+        found.push(format!(
+            "payload: {}",
+            byte_difference(&expected.payload, &observed.payload)
+        ));
+    }
+    found
+}
+
+/// Describe how two byte strings differ without printing either: the length,
+/// and the offset where they part company.
+fn byte_difference(expected: &[u8], observed: &[u8]) -> String {
+    let at = expected
+        .iter()
+        .zip(observed)
+        .position(|(left, right)| left != right);
+    match at {
+        Some(offset) => format!(
+            "{} bytes differing from the expected {} at offset {offset}",
+            observed.len(),
+            expected.len()
+        ),
+        None => format!(
+            "{} bytes against the expected {}, agreeing as far as the shorter runs",
+            observed.len(),
+            expected.len()
+        ),
+    }
+}
+
+fn mac(address: [u8; 6]) -> String {
+    let [a, b, c, d, e, f] = address;
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
+fn ipv4(address: [u8; 4]) -> String {
+    let [a, b, c, d] = address;
+    format!("{a}.{b}.{c}.{d}")
+}
+
+/// The packets one boot injects, and what each of them proves.
+///
+/// Two must be routed, in opposite directions, and four must be refused: a
+/// packet that cannot survive a hop, one not addressed to the ingress port,
+/// one for a destination no interface prefix covers, and the broadcast frame
+/// the retired L2 contract required to be forwarded byte-identical.
+fn probes() -> Vec<Probe> {
+    let [a, b] = ENDPOINTS;
+    let a_to_b = datagram(a, b, INJECTED_TTL, b"LFW-PROBE/routed-a-to-b");
+    vec![
+        routed(
+            "routed-a-to-b",
+            b"LFW-PROBE/routed-a-to-b",
+            a,
+            b,
+            a_to_b.clone(),
+        ),
+        routed(
+            "routed-b-to-a",
+            b"LFW-PROBE/routed-b-to-a",
+            b,
+            a,
+            datagram(b, a, INJECTED_TTL, b"LFW-PROBE/routed-b-to-a"),
+        ),
+        dropped(
+            "ttl-one-a-to-b",
+            b"LFW-PROBE/ttl-one-a-to-b",
+            a,
+            "a TTL of 1 cannot survive a hop",
+            UdpPacket {
+                ttl: 1,
+                payload: b"LFW-PROBE/ttl-one-a-to-b".to_vec(),
+                ..a_to_b.clone()
+            },
+        ),
+        dropped(
+            "not-our-mac",
+            b"LFW-PROBE/not-our-mac",
+            a,
+            "its destination MAC is another station's, so it is not addressed to the appliance",
+            UdpPacket {
+                destination_mac: [0x52, 0x54, 0x00, 0x99, 0x99, 0x99],
+                payload: b"LFW-PROBE/not-our-mac".to_vec(),
+                ..a_to_b.clone()
+            },
+        ),
+        dropped(
+            "no-route",
+            b"LFW-PROBE/no-route",
+            a,
+            "no interface prefix covers 192.0.2.9",
+            UdpPacket {
+                destination: [192, 0, 2, 9],
+                payload: b"LFW-PROBE/no-route".to_vec(),
+                ..a_to_b
+            },
+        ),
+        Probe {
+            name: "legacy-l2-broadcast",
+            marker: b"LFW-PROBE/legacy-l2-broadcast",
+            ingress: a.port,
+            frame: legacy_broadcast_frame(b"LFW-PROBE/legacy-l2-broadcast"),
+            expectation: Expectation::Dropped {
+                because: "it is neither IPv4 nor addressed to the port's own MAC",
+            },
+        },
+    ]
+}
+
+/// The datagram `from` sends `to`: addressed at L2 to the appliance interface
+/// it is attached to, and at L3 to the far endpoint.
+fn datagram(from: Endpoint, to: Endpoint, ttl: u8, marker: &[u8]) -> UdpPacket {
+    UdpPacket {
+        destination_mac: from.gateway_mac(),
+        source_mac: from.mac,
+        source: from.address,
+        destination: to.address,
+        source_port: SOURCE_PORT,
+        destination_port: DESTINATION_PORT,
+        ttl,
+        payload: marker.to_vec(),
+    }
+}
+
+/// A probe the appliance must route, and the delivery it must produce: the
+/// packet as injected with exactly the three changes a hop makes — the far
+/// endpoint's MAC, the far interface's MAC, and one less TTL. Deriving the
+/// expectation from the injection rather than writing it out is what makes
+/// "every other byte unchanged" the default the contract has to break.
+fn routed(
+    name: &'static str,
+    marker: &'static [u8],
+    from: Endpoint,
+    to: Endpoint,
+    sent: UdpPacket,
+) -> Probe {
+    let delivered = UdpPacket {
+        destination_mac: to.mac,
+        source_mac: to.gateway_mac(),
+        ttl: sent.ttl - 1,
+        ..sent.clone()
+    };
+    Probe {
+        name,
+        marker,
+        ingress: from.port,
+        frame: sent.build(),
+        expectation: Expectation::Routed {
+            egress: to.port,
+            packet: delivered,
+        },
+    }
+}
+
+fn dropped(
+    name: &'static str,
+    marker: &'static [u8],
+    from: Endpoint,
+    because: &'static str,
+    sent: UdpPacket,
+) -> Probe {
+    Probe {
+        name,
+        marker,
+        ingress: from.port,
+        frame: sent.build(),
+        expectation: Expectation::Dropped { because },
+    }
+}
+
+/// The frame the retired L2 contract required to be forwarded byte-identical: a
+/// broadcast frame under the local-experimental EtherType 0x88B5. It is kept
+/// precisely because it must now be refused — a router carries what is
+/// addressed to it and carries IPv4, and this is neither — so the change of
+/// contract is a test rather than a note.
+fn legacy_broadcast_frame(marker: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(MIN_ETHERNET_FRAME);
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]);
+    frame.extend_from_slice(&LOCAL_EXPERIMENTAL_ETHERTYPE.to_be_bytes());
+    frame.extend_from_slice(marker);
+    if frame.len() < MIN_ETHERNET_FRAME {
+        frame.resize(MIN_ETHERNET_FRAME, 0);
+    }
+    frame
+}
+
+/// What a boot must prove. Both variants inject the same packets into the same
+/// ports; they differ in which observation is success.
 pub enum BootContract<'a> {
-    /// Both injected frames must egress byte-identical on the opposite port —
-    /// the two-port zero-copy forwarding contract, in both directions at once.
-    Forwarding,
-    /// No injected frame may be forwarded (nothing bootable may have started)
-    /// and the guest must emit `marker` on the serial channel. Used for the
-    /// boot manager's halt path, where the absence of forwarding is the point.
+    /// Both routed packets must arrive on the far port rewritten exactly for
+    /// their next hop, and no refused packet may arrive at all.
+    Routed,
+    /// No injected packet may come back in any form (nothing bootable may have
+    /// started) and the guest must emit `marker` on the serial channel. Used
+    /// for the boot manager's halt path, where the absence of a dataplane is
+    /// the point.
     Halted {
         /// The structured record whose presence proves the halt path was
         /// reached. It is matched as an exact byte substring, never as prose.
@@ -83,7 +745,7 @@ pub struct BootTest<'a> {
 /// QEMU's `socket` netdevs dial into, so the port identity of each accepted
 /// stream is unambiguous.
 pub struct NicBackends {
-    listeners: [TcpListener; 2],
+    listeners: [TcpListener; ENDPOINTS.len()],
 }
 
 impl NicBackends {
@@ -110,6 +772,48 @@ impl NicBackends {
                 .arg(crate::qemu::nic_device(port));
         }
         Ok(())
+    }
+}
+
+/// An [`Endpoint`] joined to the QEMU socket that carries its port's traffic.
+struct AttachedEndpoint {
+    endpoint: Endpoint,
+    wire: TcpStream,
+    /// Why injection into this endpoint stopped, if it ever did.
+    injection_failure: Option<io::Error>,
+}
+
+impl AttachedEndpoint {
+    /// Put one frame on the wire in QEMU's `net_socket` STREAM framing.
+    ///
+    /// Losing one port's socket says nothing about the other direction, so a
+    /// failure retires this endpoint and keeps its reason: it is reported with
+    /// whatever verdict the exit and timeout checks eventually reach.
+    fn inject(&mut self, frame: &[u8]) {
+        if self.injection_failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.wire.write_all(&encode_wire(frame)) {
+            self.injection_failure = Some(error);
+        }
+    }
+}
+
+/// Inject every probe the `wanted` predicate selects, from the endpoint whose
+/// port it enters on.
+fn inject_probes(
+    endpoints: &mut [AttachedEndpoint],
+    probes: &[Probe],
+    wanted: impl Fn(&Probe) -> bool,
+) {
+    for attached in endpoints.iter_mut() {
+        let port = attached.endpoint.port;
+        for probe in probes
+            .iter()
+            .filter(|probe| probe.ingress == port && wanted(probe))
+        {
+            attached.inject(&probe.frame);
+        }
     }
 }
 
@@ -171,7 +875,7 @@ fn run_boot(
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept both of QEMU's socket dial-ins.
-        let mut streams: [Option<TcpStream>; 2] = [None, None];
+        let mut streams: [Option<TcpStream>; ENDPOINTS.len()] = [None, None];
         while streams.iter().any(Option::is_none) {
             drain(&serial_receiver, &mut output);
             for (port, listener) in backends.listeners.iter().enumerate() {
@@ -209,8 +913,8 @@ fn run_boot(
         // frames into one channel; draining continuously also keeps QEMU's TX
         // path from blocking on a full host socket buffer.
         let (frame_sender, frame_receiver) = mpsc::channel();
-        let mut writers = Vec::new();
-        for (port, stream) in streams.into_iter().enumerate() {
+        let mut endpoints: Vec<AttachedEndpoint> = Vec::new();
+        for (endpoint, stream) in ENDPOINTS.into_iter().zip(streams) {
             if let Err(error) = stream.set_nonblocking(false) {
                 break 'run Err(format!("set NIC socket blocking: {error}"));
             }
@@ -218,58 +922,76 @@ fn run_boot(
                 Ok(handle) => handle,
                 Err(error) => break 'run Err(format!("clone NIC socket: {error}")),
             };
-            frame_readers.push(spawn_frame_decoder(port, read_half, frame_sender.clone()));
-            writers.push(stream);
+            frame_readers.push(spawn_frame_decoder(
+                endpoint.port,
+                read_half,
+                frame_sender.clone(),
+            ));
+            endpoints.push(AttachedEndpoint {
+                endpoint,
+                wire: stream,
+                injection_failure: None,
+            });
         }
         drop(frame_sender);
 
-        // Distinct frames per direction; each must egress on the other port.
-        let frames = [
-            build_injection_frame(b"LIBREFIREWALL-FWD-P0-TO-P1"),
-            build_injection_frame(b"LIBREFIREWALL-FWD-P1-TO-P0"),
-        ];
-        let wires = [encode_wire(&frames[0]), encode_wire(&frames[1])];
-
+        let probes = probes();
         // Inject immediately; the drivers may not be ready yet, which is
         // exactly why we also re-inject on a fixed cadence below.
         let mut last_injection = Instant::now();
-        let mut injection_failures: [Option<io::Error>; 2] = [None, None];
-        for (writer, wire) in writers.iter_mut().zip(&wires) {
-            if let Err(error) = writer.write_all(wire) {
-                break 'run Err(format!("inject first frames: {error}"));
-            }
-        }
+        inject_probes(&mut endpoints, &probes, |_| true);
 
-        // Phase 2: watch the ports and the serial channel, re-injecting
+        // Phase 2: watch both ports and the serial channel, re-injecting
         // periodically, until the contract is decided.
-        let mut forwarded = [false, false];
+        let mut delivered = vec![false; probes.len()];
+        // Set once both routed packets have arrived, starting the window in
+        // which a refused packet would still have time to come back.
+        let mut settling_since: Option<Instant> = None;
         loop {
             drain(&serial_receiver, &mut output);
-            while let Ok((egress_port, frame)) = frame_receiver.try_recv() {
-                // The frame injected into a port must egress on the other
-                // port, byte-identical — the zero-copy path may not alter it.
-                let ingress_port = 1 - egress_port;
-                if frame == frames[ingress_port] {
-                    forwarded[ingress_port] = true;
+            while let Ok((egress, frame)) = frame_receiver.try_recv() {
+                for (probe, seen) in probes.iter().zip(delivered.iter_mut()) {
+                    if !contains(&frame, probe.marker) {
+                        continue;
+                    }
+                    match &test.contract {
+                        BootContract::Routed => match probe.judge(egress, &frame) {
+                            Ok(()) => *seen = true,
+                            Err(verdict) => {
+                                break 'run Err(format!("{verdict}; see {}", log_path.display()));
+                            }
+                        },
+                        // Any frame at all means something booted and is moving
+                        // traffic, which is precisely what must not happen. No
+                        // amount of further draining can undo that, so fail now.
+                        BootContract::Halted { .. } => {
+                            break 'run Err(format!(
+                                "probe {} came back on port{egress}, so a slot booted where none \
+                                 may be bootable; see {}",
+                                probe.name,
+                                log_path.display()
+                            ));
+                        }
+                    }
                 }
             }
             match &test.contract {
-                BootContract::Forwarding => {
-                    if forwarded.iter().all(|seen| *seen) {
-                        break 'run Ok(());
+                BootContract::Routed => match settling_since {
+                    None if all_routed(&probes, &delivered) => {
+                        // Both directions have completed, so the guest is
+                        // demonstrably taking frames off both ports: a refused
+                        // packet injected now is one that reached the driver.
+                        // Send them once more and give a delivery the window it
+                        // would need to come back.
+                        inject_probes(&mut endpoints, &probes, |probe| {
+                            matches!(probe.expectation, Expectation::Dropped { .. })
+                        });
+                        settling_since = Some(Instant::now());
                     }
-                }
+                    Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
+                    _ => {}
+                },
                 BootContract::Halted { marker } => {
-                    // A forwarded frame means something booted and is moving
-                    // traffic, which is precisely what must not happen. No
-                    // amount of further draining can undo that, so fail now.
-                    if let Some(port) = forwarded.iter().position(|seen| *seen) {
-                        break 'run Err(format!(
-                            "a frame injected into port{port} was forwarded, so a slot booted \
-                             where none may be bootable; see {}",
-                            log_path.display()
-                        ));
-                    }
                     if contains(&output, marker.as_bytes()) {
                         break 'run Ok(());
                     }
@@ -277,10 +999,12 @@ fn run_boot(
             }
             match child.try_wait() {
                 Ok(Some(status)) => match &test.contract {
-                    BootContract::Forwarding => {
+                    BootContract::Routed => {
                         break 'run Err(format!(
-                            "QEMU exited before both frames were forwarded ({status}){}; see {}",
-                            describe_injection_failures(&injection_failures),
+                            "QEMU exited before the routed contract was met ({status}); {}{}; \
+                             see {}",
+                            describe_pending(&probes, &delivered),
+                            describe_injection_failures(&endpoints),
                             log_path.display()
                         ));
                     }
@@ -295,42 +1019,31 @@ fn run_boot(
             }
             if start.elapsed() >= total_timeout {
                 break 'run Err(match &test.contract {
-                    BootContract::Forwarding => format!(
-                        "timed out after {}s waiting for forwarded frames \
-                         (port0->port1 seen: {}, port1->port0 seen: {}){}; see {}",
+                    BootContract::Routed => format!(
+                        "timed out after {}s waiting for the routed contract; {}{}; see {}",
                         total_timeout.as_secs(),
-                        forwarded[0],
-                        forwarded[1],
-                        describe_injection_failures(&injection_failures),
+                        describe_pending(&probes, &delivered),
+                        describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
                     BootContract::Halted { marker } => format!(
                         "timed out after {}s waiting for {marker:?} on the serial channel{}; \
                          see {}",
                         total_timeout.as_secs(),
-                        describe_injection_failures(&injection_failures),
+                        describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
                 });
             }
-            if last_injection.elapsed() >= REINJECT_INTERVAL {
+            if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
-                for (port, writer) in writers.iter_mut().enumerate() {
-                    if forwarded[port] || injection_failures[port].is_some() {
-                        continue;
-                    }
-                    if let Err(error) = writer.write_all(&wires[port]) {
-                        // Losing one port's socket says nothing about the
-                        // other direction, so retire only this port and keep
-                        // the reason: it is reported with whatever verdict the
-                        // exit and timeout checks above eventually reach.
-                        injection_failures[port] = Some(error);
-                    }
-                }
+                inject_probes(&mut endpoints, &probes, |probe| {
+                    !is_delivered(&probes, &delivered, probe)
+                });
             }
             thread::sleep(Duration::from_millis(25));
         }
-        // `writers` drop here, closing our write sides of the NIC sockets.
+        // `endpoints` drop here, closing our write sides of the NIC sockets.
     };
 
     // Reliable shutdown: kill and reap QEMU on every path before joining the
@@ -368,10 +1081,50 @@ fn run_boot(
     Ok(output)
 }
 
+/// Whether every probe that must be routed has arrived and been accepted.
+fn all_routed(probes: &[Probe], delivered: &[bool]) -> bool {
+    probes
+        .iter()
+        .zip(delivered)
+        .filter(|(probe, _)| matches!(probe.expectation, Expectation::Routed { .. }))
+        .all(|(_, seen)| *seen)
+}
+
+/// Whether this probe has already been accepted, so re-injecting it would only
+/// add traffic the contract no longer needs.
+fn is_delivered(probes: &[Probe], delivered: &[bool], probe: &Probe) -> bool {
+    probes
+        .iter()
+        .zip(delivered)
+        .any(|(candidate, seen)| candidate.name == probe.name && *seen)
+}
+
+/// Name which routed probes arrived and which never did. A run that timed out
+/// has to say which direction failed, not that something did.
+fn describe_pending(probes: &[Probe], delivered: &[bool]) -> String {
+    let mut arrived = Vec::new();
+    let mut missing = Vec::new();
+    for (probe, seen) in probes.iter().zip(delivered) {
+        if !matches!(probe.expectation, Expectation::Routed { .. }) {
+            continue;
+        }
+        if *seen {
+            arrived.push(probe.name);
+        } else {
+            missing.push(probe.name);
+        }
+    }
+    format!(
+        "routed: [{}], never arrived: [{}]",
+        arrived.join(", "),
+        missing.join(", ")
+    )
+}
+
 /// Apply the parts of a contract that can only be judged once the serial
-/// capture is complete. [`BootContract::Forwarding`] is decided entirely by
-/// frames on the sockets, so its loop verdict already stands; a halt is decided
-/// by a record the guest may have emitted in the same breath as powering off.
+/// capture is complete. [`BootContract::Routed`] is decided entirely by frames
+/// on the sockets, so its loop verdict already stands; a halt is decided by a
+/// record the guest may have emitted in the same breath as powering off.
 fn decide(
     loop_outcome: Result<(), String>,
     contract: &BootContract,
@@ -399,19 +1152,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// Render the per-port injection failures as a clause to append to a verdict,
-/// or the empty string when injection ran cleanly. A test that timed out
-/// because it silently stopped feeding one port must say so.
-fn describe_injection_failures(failures: &[Option<io::Error>; 2]) -> String {
-    let reasons: Vec<String> = failures
+/// Render the per-endpoint injection failures as a clause to append to a
+/// verdict, or the empty string when injection ran cleanly. A test that timed
+/// out because it silently stopped feeding one port must say so.
+fn describe_injection_failures(endpoints: &[AttachedEndpoint]) -> String {
+    let reasons: Vec<String> = endpoints
         .iter()
-        .enumerate()
-        .filter_map(|(port, failure)| failure.as_ref().map(|error| format!("port{port}: {error}")))
+        .filter_map(|attached| {
+            attached.injection_failure.as_ref().map(|error| {
+                format!(
+                    "endpoint {} on port{}: {error}",
+                    attached.endpoint.name, attached.endpoint.port
+                )
+            })
+        })
         .collect();
     if reasons.is_empty() {
         String::new()
     } else {
-        format!("; frame injection stopped on {}", reasons.join(", "))
+        format!("; frame injection stopped for {}", reasons.join(", "))
     }
 }
 
@@ -424,21 +1183,6 @@ fn bind_listener() -> Result<TcpListener, String> {
         .set_nonblocking(true)
         .map_err(|error| format!("set listener non-blocking: {error}"))?;
     Ok(listener)
-}
-
-/// Build a broadcast frame to inject: a minimum-size Ethernet frame carrying
-/// `marker` under the local-experimental EtherType 0x88B5.
-fn build_injection_frame(marker: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(MIN_ETHERNET_FRAME);
-    frame.extend_from_slice(&[0xff; 6]); // dst: broadcast
-    frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // src
-    frame.extend_from_slice(&[0x88, 0xB5]); // ethertype: experimental 0x88B5
-    frame.extend_from_slice(marker);
-    // Zero-pad to the 60-byte minimum L2 frame (FCS excluded on this backend).
-    if frame.len() < MIN_ETHERNET_FRAME {
-        frame.resize(MIN_ETHERNET_FRAME, 0);
-    }
-    frame
 }
 
 /// Encode a frame for QEMU's `net_socket` STREAM backend: a 4-byte big-endian
@@ -561,46 +1305,479 @@ mod tests {
 
     const HEADER: &str = "# test header\n";
 
-    fn forwarding(log: &Path) -> BootTest<'_> {
+    fn routed_test(log: &Path) -> BootTest<'_> {
         BootTest {
-            contract: BootContract::Forwarding,
+            contract: BootContract::Routed,
             log_path: log,
             log_header: HEADER,
         }
     }
 
-    #[test]
-    fn injection_frames_and_wire_encoding_are_well_formed() {
-        let frame = build_injection_frame(b"LIBREFIREWALL-FWD-P0-TO-P1");
+    /// The A->B packet as injected, and the delivery it must produce.
+    fn a_to_b() -> (UdpPacket, UdpPacket) {
+        let [a, b] = ENDPOINTS;
+        let sent = datagram(a, b, INJECTED_TTL, b"marker-a-to-b");
+        let delivered = UdpPacket {
+            destination_mac: b.mac,
+            source_mac: b.gateway_mac(),
+            ttl: INJECTED_TTL - 1,
+            ..sent.clone()
+        };
+        (sent, delivered)
+    }
 
+    #[test]
+    fn the_topology_names_the_gateway_macs_qemu_puts_on_the_ports() {
+        // The contract expects the appliance to answer to these, and QEMU is
+        // what actually assigns them: a harness that expected a MAC no port
+        // carries would fail with every frame refused and no reason visible.
+        for endpoint in ENDPOINTS {
+            assert!(
+                crate::qemu::nic_device(endpoint.port).contains(&mac(endpoint.gateway_mac())),
+                "endpoint {} expects a gateway MAC port{} does not carry",
+                endpoint.name,
+                endpoint.port
+            );
+            assert_ne!(endpoint.mac, endpoint.gateway_mac());
+        }
+        assert_ne!(ENDPOINTS[0].mac, ENDPOINTS[1].mac);
+        assert_ne!(ENDPOINTS[0].address, ENDPOINTS[1].address);
+    }
+
+    #[test]
+    fn a_built_datagram_decodes_back_to_the_fields_it_was_built_from() {
+        // Round trip over payloads either side of the 60-byte Ethernet
+        // minimum, so the padding path is covered by the identity it must not
+        // break: padding is bytes L3 disclaims and may not become payload.
+        for length in [0usize, 1, 17, 18, 19, 64, 512] {
+            let (sent, delivered) = a_to_b();
+            for packet in [
+                UdpPacket {
+                    payload: vec![0xa5; length],
+                    ..sent.clone()
+                },
+                UdpPacket {
+                    payload: vec![0x5a; length],
+                    ..delivered.clone()
+                },
+            ] {
+                let frame = packet.build();
+                assert!(frame.len() >= MIN_ETHERNET_FRAME, "{length}");
+                assert_eq!(UdpPacket::decode(&frame), Ok(packet), "payload of {length}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_built_header_carries_the_checksum_an_independent_sum_computes() {
+        // The decoder validates the checksum with the same routine that wrote
+        // it, so the value itself is pinned here against a differently written
+        // sum over the wire bytes.
+        let (sent, _) = a_to_b();
+        let frame = sent.build();
+        let header = &frame[ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_HEADER_LEN];
+
+        let mut total: u32 = 0;
+        for index in 0..IPV4_HEADER_LEN / 2 {
+            total += u32::from(u16::from_be_bytes([
+                header[index * 2],
+                header[index * 2 + 1],
+            ]));
+        }
+        while total > 0xffff {
+            total = (total & 0xffff) + (total >> 16);
+        }
+        assert_eq!(
+            total, 0xffff,
+            "a header carrying its own checksum sums to all ones"
+        );
+    }
+
+    #[test]
+    fn the_matcher_accepts_only_the_packet_the_route_produces() {
+        let (sent, delivered) = a_to_b();
+        let probe = routed(
+            "under-test",
+            b"marker-a-to-b",
+            ENDPOINTS[0],
+            ENDPOINTS[1],
+            sent,
+        );
+
+        probe
+            .judge(ENDPOINTS[1].port, &delivered.build())
+            .expect("the delivery the route produces is the one the matcher accepts");
+
+        // One mutation per field the contract names; each must be refused, and
+        // the verdict must name the field rather than merely the frame.
+        let mutations: [(&str, UdpPacket); 7] = [
+            (
+                "destination MAC",
+                UdpPacket {
+                    destination_mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x0c],
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "source MAC",
+                UdpPacket {
+                    source_mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x50],
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "TTL",
+                UdpPacket {
+                    ttl: INJECTED_TTL,
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "source address",
+                UdpPacket {
+                    source: [10, 0, 0, 3],
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "destination address",
+                UdpPacket {
+                    destination: [10, 0, 1, 3],
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "source port",
+                UdpPacket {
+                    source_port: SOURCE_PORT + 1,
+                    ..delivered.clone()
+                },
+            ),
+            (
+                "destination port",
+                UdpPacket {
+                    destination_port: DESTINATION_PORT + 1,
+                    ..delivered.clone()
+                },
+            ),
+        ];
+        for (field, mutated) in mutations {
+            let verdict = probe
+                .judge(ENDPOINTS[1].port, &mutated.build())
+                .expect_err("a mutated field must be refused");
+            assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
+        }
+
+        // The payload is compared as bytes, so an altered marker is refused as
+        // a payload difference rather than as an unattributable frame.
+        let altered = UdpPacket {
+            payload: b"marker-a-to-C".to_vec(),
+            ..delivered.clone()
+        };
+        let verdict = probe
+            .judge(ENDPOINTS[1].port, &altered.build())
+            .expect_err("an altered payload must be refused");
+        assert!(verdict.contains("payload"), "{verdict}");
+
+        // A stale checksum never reaches the field comparison: it is refused
+        // with the value it should have carried.
+        let mut stale = delivered.build();
+        stale[ETHERNET_HEADER_LEN + 10] ^= 0xff;
+        let verdict = probe
+            .judge(ENDPOINTS[1].port, &stale)
+            .expect_err("a stale checksum must be refused");
         assert!(
-            frame.len() >= 60,
-            "frame must meet the 60-byte minimum Ethernet size, got {}",
-            frame.len()
+            verdict.contains("header checksum") && verdict.contains("not a well-formed"),
+            "{verdict}"
+        );
+
+        // A trailing byte changes nothing the field view models, so it must be
+        // caught by the whole-frame comparison behind it.
+        let mut padded = delivered.build();
+        padded.push(0x99);
+        let verdict = probe
+            .judge(ENDPOINTS[1].port, &padded)
+            .expect_err("a frame longer than the contract must be refused");
+        assert!(verdict.contains("differs outside them"), "{verdict}");
+
+        // The right packet on the wrong port is not a delivery.
+        let verdict = probe
+            .judge(ENDPOINTS[0].port, &delivered.build())
+            .expect_err("the far port is part of the contract");
+        assert!(
+            verdict.contains("port0") && verdict.contains("port1"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn every_defect_renders_as_the_values_that_caused_it() {
+        // A delivery refused before the field comparison has only this line to
+        // explain itself, so each rendering must be distinct and carry numbers.
+        let renderings = [
+            format!("{}", FrameDefect::TooShort { needed: 42, got: 9 }),
+            format!("{}", FrameDefect::NotIpv4 { ether_type: 0x88b5 }),
+            format!("{}", FrameDefect::VersionNotFour { version: 6 }),
+            format!("{}", FrameDefect::OptionsPresent { ihl: 6 }),
+            format!(
+                "{}",
+                FrameDefect::HeaderChecksumInvalid {
+                    found: 0x1234,
+                    computed: 0x5678,
+                }
+            ),
+            format!("{}", FrameDefect::NotUdp { protocol: 6 }),
+            format!(
+                "{}",
+                FrameDefect::TotalLengthBelowHeaders { total_length: 8 }
+            ),
+            format!(
+                "{}",
+                FrameDefect::TotalLengthBeyondFrame {
+                    total_length: 9000,
+                    frame_len: 60,
+                }
+            ),
+            format!(
+                "{}",
+                FrameDefect::UdpLengthDisagrees {
+                    udp_length: 1000,
+                    total_length: 48,
+                }
+            ),
+            format!(
+                "{}",
+                FrameDefect::UdpChecksumAdded {
+                    udp_checksum: 0xbeef,
+                }
+            ),
+        ];
+        assert!(renderings[0].contains("42") && renderings[0].contains('9'));
+        assert!(renderings[4].contains("0x1234") && renderings[4].contains("0x5678"));
+
+        let mut distinct: Vec<&str> = renderings.iter().map(String::as_str).collect();
+        distinct.sort_unstable();
+        let count = distinct.len();
+        distinct.dedup();
+        assert_eq!(distinct.len(), count, "two defects read alike");
+    }
+
+    #[test]
+    fn a_malformed_frame_is_refused_by_the_defect_it_carries() {
+        let (_, delivered) = a_to_b();
+
+        assert_eq!(
+            UdpPacket::decode(&[0u8; 8]),
+            Err(FrameDefect::TooShort {
+                needed: MIN_UDP_FRAME,
+                got: 8,
+            })
         );
         assert_eq!(
-            &frame[0..6],
-            [0xff_u8; 6].as_slice(),
-            "destination MAC must be broadcast"
+            UdpPacket::decode(&legacy_broadcast_frame(b"legacy")),
+            Err(FrameDefect::NotIpv4 {
+                ether_type: LOCAL_EXPERIMENTAL_ETHERTYPE,
+            })
         );
+
+        // Each remaining defect is one edited byte, resealed where the edit is
+        // not itself the checksum, so the checksum is never what refuses it.
+        let ip = ETHERNET_HEADER_LEN;
+        let mut version = delivered.build();
+        version[ip] = 0x65;
+        reseal(&mut version);
+        assert_eq!(
+            UdpPacket::decode(&version),
+            Err(FrameDefect::VersionNotFour { version: 6 })
+        );
+
+        let mut options = delivered.build();
+        options[ip] = 0x46;
+        reseal(&mut options);
+        assert_eq!(
+            UdpPacket::decode(&options),
+            Err(FrameDefect::OptionsPresent { ihl: 6 })
+        );
+
+        let mut protocol = delivered.build();
+        protocol[ip + 9] = 6;
+        reseal(&mut protocol);
+        assert_eq!(
+            UdpPacket::decode(&protocol),
+            Err(FrameDefect::NotUdp { protocol: 6 })
+        );
+
+        let mut short = delivered.build();
+        short[ip + 2..ip + 4].copy_from_slice(&8u16.to_be_bytes());
+        reseal(&mut short);
+        assert_eq!(
+            UdpPacket::decode(&short),
+            Err(FrameDefect::TotalLengthBelowHeaders { total_length: 8 })
+        );
+
+        let mut beyond = delivered.build();
+        let frame_len = beyond.len();
+        beyond[ip + 2..ip + 4].copy_from_slice(&9000u16.to_be_bytes());
+        beyond[ip + IPV4_HEADER_LEN + 4..ip + IPV4_HEADER_LEN + 6]
+            .copy_from_slice(&8980u16.to_be_bytes());
+        reseal(&mut beyond);
+        assert_eq!(
+            UdpPacket::decode(&beyond),
+            Err(FrameDefect::TotalLengthBeyondFrame {
+                total_length: 9000,
+                frame_len,
+            })
+        );
+
+        let mut udp_length = delivered.build();
+        let udp = ip + IPV4_HEADER_LEN;
+        udp_length[udp + 4..udp + 6].copy_from_slice(&1000u16.to_be_bytes());
+        assert!(matches!(
+            UdpPacket::decode(&udp_length),
+            Err(FrameDefect::UdpLengthDisagrees {
+                udp_length: 1000,
+                ..
+            })
+        ));
+
+        let mut udp_checksum = delivered.build();
+        udp_checksum[udp + 6..udp + 8].copy_from_slice(&0xbeefu16.to_be_bytes());
+        assert_eq!(
+            UdpPacket::decode(&udp_checksum),
+            Err(FrameDefect::UdpChecksumAdded {
+                udp_checksum: 0xbeef,
+            })
+        );
+    }
+
+    /// Rebuild the header checksum after an edit, so a rejection that only
+    /// fired because the checksum went stale proves nothing about the field the
+    /// case is aimed at.
+    fn reseal(frame: &mut [u8]) {
+        let header: &mut [u8; IPV4_HEADER_LEN] = (&mut frame
+            [ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_HEADER_LEN])
+            .try_into()
+            .expect("a 20-byte window");
+        let checksum = header_checksum(header);
+        header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    #[test]
+    fn every_probe_is_attributable_to_itself_alone() {
+        let probes = probes();
+        assert_eq!(probes.len(), 6);
+        for probe in &probes {
+            assert!(
+                contains(&probe.frame, probe.marker),
+                "probe {} does not carry its own marker",
+                probe.name
+            );
+            for other in &probes {
+                if other.name == probe.name {
+                    continue;
+                }
+                assert!(
+                    !contains(&other.frame, probe.marker),
+                    "probe {}'s marker also appears in {}",
+                    probe.name,
+                    other.name
+                );
+                assert_ne!(other.name, probe.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_routed_probes_cross_the_appliance_in_opposite_directions() {
+        let probes = probes();
+        let routes: Vec<(usize, usize)> = probes
+            .iter()
+            .filter_map(|probe| match probe.expectation {
+                Expectation::Routed { egress, .. } => Some((probe.ingress, egress)),
+                Expectation::Dropped { .. } => None,
+            })
+            .collect();
+        assert_eq!(routes, [(0, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn every_refused_probe_is_refused_wherever_it_surfaces() {
+        // The negatives carry no egress port, so a delivery on either port is a
+        // failure — and the verdict has to name the rule that was broken.
+        for probe in probes() {
+            let Expectation::Dropped { because } = probe.expectation else {
+                continue;
+            };
+            for port in 0..ENDPOINTS.len() {
+                let verdict = probe
+                    .judge(port, &probe.frame)
+                    .expect_err("a refused probe must never be accepted");
+                assert!(
+                    verdict.contains(probe.name) && verdict.contains(because),
+                    "{verdict}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_retired_l2_frame_is_the_one_the_old_contract_required_to_be_forwarded() {
+        // Kept as a negative precisely because it used to be the positive: if
+        // it ever became routable again the change would be silent otherwise.
+        let frame = legacy_broadcast_frame(b"legacy");
+        assert_eq!(frame.len(), MIN_ETHERNET_FRAME);
+        assert_eq!(&frame[0..6], [0xff_u8; 6].as_slice());
         assert_eq!(
             &frame[12..14],
-            [0x88_u8, 0xB5].as_slice(),
-            "EtherType must be the experimental 0x88B5"
+            LOCAL_EXPERIMENTAL_ETHERTYPE.to_be_bytes().as_slice()
         );
+        assert!(frame[14..].starts_with(b"legacy"));
+    }
+
+    #[test]
+    fn the_routed_contract_is_only_met_once_both_directions_have_arrived() {
+        let probes = probes();
+        let at = |name: &str| {
+            probes
+                .iter()
+                .position(|probe| probe.name == name)
+                .expect("the probe set names this probe")
+        };
+
+        // Marking every refused probe cannot satisfy the contract: only the two
+        // routed ones count towards it.
+        let mut delivered: Vec<bool> = probes
+            .iter()
+            .map(|probe| matches!(probe.expectation, Expectation::Dropped { .. }))
+            .collect();
+        assert!(!all_routed(&probes, &delivered));
+
+        delivered = vec![false; probes.len()];
+        delivered[at("routed-a-to-b")] = true;
+        assert!(!all_routed(&probes, &delivered));
+        let pending = describe_pending(&probes, &delivered);
         assert!(
-            frame[14..].starts_with(b"LIBREFIREWALL-FWD-P0-TO-P1"),
-            "payload must begin with the direction marker"
+            pending.contains("routed: [routed-a-to-b]")
+                && pending.contains("never arrived: [routed-b-to-a]"),
+            "{pending}"
         );
 
-        // The two directions must be distinguishable by exact frame bytes.
-        let reverse = build_injection_frame(b"LIBREFIREWALL-FWD-P1-TO-P0");
-        assert_ne!(frame, reverse);
+        // Re-injection stops for what has arrived and continues for the rest,
+        // so a delivered direction is not re-sent while the other is waited on.
+        assert!(is_delivered(
+            &probes,
+            &delivered,
+            &probes[at("routed-a-to-b")]
+        ));
+        assert!(!is_delivered(
+            &probes,
+            &delivered,
+            &probes[at("routed-b-to-a")]
+        ));
+        assert!(!is_delivered(&probes, &delivered, &probes[at("no-route")]));
 
-        // Wire form is the big-endian u32 length prefix followed by the frame.
-        let wire = encode_wire(&frame);
-        assert_eq!(&wire[0..4], (frame.len() as u32).to_be_bytes().as_slice());
-        assert_eq!(&wire[4..], frame.as_slice());
+        delivered[at("routed-b-to-a")] = true;
+        assert!(all_routed(&probes, &delivered));
     }
 
     #[test]
@@ -641,8 +1818,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let decoder = spawn_frame_decoder(1, stream, sender);
 
-        let first = build_injection_frame(b"FIRST");
-        let second = build_injection_frame(b"SECOND");
+        let first = legacy_broadcast_frame(b"FIRST");
+        let second = legacy_broadcast_frame(b"SECOND");
         writer.write_all(&encode_wire(&first)).unwrap();
         for byte in encode_wire(&second) {
             writer.write_all(&[byte]).unwrap();
@@ -680,21 +1857,24 @@ mod tests {
     #[test]
     fn frame_decoder_decodes_a_zero_length_frame_as_empty() {
         // A zero-length frame is accepted (not rejected) and surfaces as an
-        // empty vec; it can never equal an injected frame, so it is harmless.
+        // empty vec; it carries no marker, so it is attributed to no probe.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let mut writer = TcpStream::connect(address).unwrap();
         let (stream, _peer) = listener.accept().unwrap();
 
         let (sender, receiver) = mpsc::channel();
-        let decoder = spawn_frame_decoder(2, stream, sender);
+        let decoder = spawn_frame_decoder(0, stream, sender);
 
         writer.write_all(&0u32.to_be_bytes()).unwrap();
         drop(writer);
 
-        assert_eq!(receiver.recv().unwrap(), (2, Vec::new()));
+        assert_eq!(receiver.recv().unwrap(), (0, Vec::new()));
         assert!(receiver.recv().is_err(), "decoder closes after EOF");
         decoder.join().unwrap().unwrap();
+        for probe in probes() {
+            assert!(!contains(&[], probe.marker));
+        }
     }
 
     #[test]
@@ -709,24 +1889,59 @@ mod tests {
     }
 
     #[test]
-    fn injection_failures_are_named_per_port_in_a_verdict() {
-        assert_eq!(describe_injection_failures(&[None, None]), "");
+    fn injection_failures_are_named_per_endpoint_in_a_verdict() {
+        assert_eq!(describe_injection_failures(&[]), "");
 
-        let only_port1 = [
-            None,
-            Some(io::Error::new(io::ErrorKind::BrokenPipe, "gone")),
-        ];
-        let described = describe_injection_failures(&only_port1);
+        let described = describe_injection_failures(&[
+            attached(ENDPOINTS[0], None),
+            attached(
+                ENDPOINTS[1],
+                Some(io::Error::new(io::ErrorKind::BrokenPipe, "gone")),
+            ),
+        ]);
         assert!(described.contains("port1"), "unexpected: {described}");
         assert!(!described.contains("port0"), "unexpected: {described}");
         assert!(described.contains("gone"), "the cause must survive");
+        assert!(described.contains('B'), "the endpoint must be named");
 
-        let both = [
-            Some(io::Error::new(io::ErrorKind::BrokenPipe, "left")),
-            Some(io::Error::new(io::ErrorKind::BrokenPipe, "right")),
-        ];
-        let described = describe_injection_failures(&both);
+        let described = describe_injection_failures(&[
+            attached(
+                ENDPOINTS[0],
+                Some(io::Error::new(io::ErrorKind::BrokenPipe, "left")),
+            ),
+            attached(
+                ENDPOINTS[1],
+                Some(io::Error::new(io::ErrorKind::BrokenPipe, "right")),
+            ),
+        ]);
         assert!(described.contains("port0") && described.contains("port1"));
+    }
+
+    /// An [`AttachedEndpoint`] over a connected loopback socket, so the failure
+    /// reporting can be exercised without QEMU.
+    fn attached(endpoint: Endpoint, injection_failure: Option<io::Error>) -> AttachedEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wire = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        AttachedEndpoint {
+            endpoint,
+            wire,
+            injection_failure,
+        }
+    }
+
+    #[test]
+    fn a_retired_endpoint_is_never_written_to_again() {
+        // A broken socket must not be retried on every cadence tick, and the
+        // first reason must be the one reported rather than the last.
+        let mut endpoint = attached(
+            ENDPOINTS[0],
+            Some(io::Error::new(io::ErrorKind::BrokenPipe, "first")),
+        );
+        endpoint.inject(b"anything");
+        assert_eq!(
+            endpoint.injection_failure.as_ref().unwrap().to_string(),
+            "first"
+        );
     }
 
     #[test]
@@ -754,9 +1969,9 @@ mod tests {
         let error = decide(Err("real failure".to_owned()), &contract, b"", log).unwrap_err();
         assert_eq!(error, "real failure");
 
-        // The forwarding contract is decided by frames alone, so serial text
-        // must not enter into it either way.
-        decide(Ok(()), &BootContract::Forwarding, b"", log).unwrap();
+        // The routed contract is decided by frames alone, so serial text must
+        // not enter into it either way.
+        decide(Ok(()), &BootContract::Routed, b"", log).unwrap();
     }
 
     #[test]
@@ -786,7 +2001,7 @@ mod tests {
         let error = run_boot(
             Command::new("true"),
             backends,
-            forwarding(&log),
+            routed_test(&log),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )
@@ -813,7 +2028,7 @@ mod tests {
         let error = run_boot(
             child,
             backends,
-            forwarding(&log),
+            routed_test(&log),
             Duration::from_millis(300),
             Duration::from_millis(600),
         )
@@ -837,7 +2052,7 @@ mod tests {
         let error = run_boot(
             Command::new("true"),
             backends,
-            forwarding(log),
+            routed_test(log),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )

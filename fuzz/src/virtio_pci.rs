@@ -581,7 +581,10 @@ struct ScriptedDoorbell {
 
 impl QueueDoorbell for ScriptedDoorbell {
     fn ring(&self, queue: u16) {
-        self.record.borrow_mut().events.push(DeviceEvent::Rang(queue));
+        self.record
+            .borrow_mut()
+            .events
+            .push(DeviceEvent::Rang(queue));
     }
 }
 
@@ -840,11 +843,18 @@ fn assert_outcome_matches_the_device(record: &DeviceRecord, outcome: SeamOutcome
                 "a device that refused the feature set reached DRIVER_OK"
             );
             assert!(
-                record.queues_reported.first().is_some_and(|n| *n > TX_QUEUE),
+                record
+                    .queues_reported
+                    .first()
+                    .is_some_and(|n| *n > TX_QUEUE),
                 "a device with no transmit queue reached DRIVER_OK"
             );
             assert_eq!(record.queue_answers.len(), 2, "both queues are programmed");
-            assert_eq!(record.doorbell_answers.len(), 2, "both doorbells are placed");
+            assert_eq!(
+                record.doorbell_answers.len(),
+                2,
+                "both doorbells are placed"
+            );
             assert!(record.queue_answers.iter().all(Result::is_ok));
             assert!(record.doorbell_answers.iter().all(Result::is_ok));
             assert!(!signalled, "a live device was told the driver had failed");
@@ -861,7 +871,10 @@ fn assert_outcome_matches_the_device(record: &DeviceRecord, outcome: SeamOutcome
         error.signalled_to_device(),
         "{error:?} was raised past the mapped BAR yet claims no signal"
     );
-    assert!(signalled, "{error:?} claims a STATUS_FAILED it did not write");
+    assert!(
+        signalled,
+        "{error:?} claims a STATUS_FAILED it did not write"
+    );
 
     match error {
         BringUpError::ResetRefused(ResetError::NotAcknowledged { .. }) => {

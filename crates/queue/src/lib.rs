@@ -66,9 +66,10 @@
 //!   still costs the consumer one step of its own position, so no peer write
 //!   makes one slot deliver twice in a row.
 //! * **Slot contents are untrusted input.** Per-field atomics mean a concurrent
-//!   peer write can yield a descriptor whose three fields come from different
+//!   peer write can yield a descriptor whose four fields come from different
 //!   writes: always a well-formed value, never undefined behaviour, and to be
-//!   range-validated like any peer input before the span it names is touched.
+//!   range-validated and decoded like any peer input before the span it names
+//!   is touched or the verdict it carries is acted on.
 //! * **Ownership is not accounted here.** [`Descriptor`] is `Copy` and a slot
 //!   is peer-writable memory rather than a Rust value whose moves the compiler
 //!   follows, so nothing in this crate can tell a first hand-over from a
@@ -87,13 +88,14 @@ use wire::Descriptor;
 
 /// One ring slot.
 ///
-/// Per-field rather than one wider atomic because a `Descriptor` is 12 bytes
+/// Per-field rather than one wider atomic because a `Descriptor` is 16 bytes
 /// and no atomic of that width exists.
 #[repr(C)]
 struct Slot {
     buffer: AtomicU32,
     offset: AtomicU32,
     len: AtomicU32,
+    verdict: AtomicU32,
 }
 
 impl Slot {
@@ -105,6 +107,7 @@ impl Slot {
             buffer: AtomicU32::new(0),
             offset: AtomicU32::new(0),
             len: AtomicU32::new(0),
+            verdict: AtomicU32::new(0),
         }
     }
 
@@ -112,14 +115,18 @@ impl Slot {
         self.buffer.store(descriptor.buffer, Ordering::Relaxed);
         self.offset.store(descriptor.offset, Ordering::Relaxed);
         self.len.store(descriptor.len, Ordering::Relaxed);
+        self.verdict.store(descriptor.verdict, Ordering::Relaxed);
     }
 
+    /// A field-wise literal and not `Descriptor::new`, whose `Verdict` argument
+    /// would rule on a word this crate only moves.
     fn load(&self) -> Descriptor {
-        Descriptor::new(
-            self.buffer.load(Ordering::Relaxed),
-            self.offset.load(Ordering::Relaxed),
-            self.len.load(Ordering::Relaxed),
-        )
+        Descriptor {
+            buffer: self.buffer.load(Ordering::Relaxed),
+            offset: self.offset.load(Ordering::Relaxed),
+            len: self.len.load(Ordering::Relaxed),
+            verdict: self.verdict.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -152,6 +159,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Slot, buffer) == core::mem::offset_of!(Descriptor, buffer));
     assert!(core::mem::offset_of!(Slot, offset) == core::mem::offset_of!(Descriptor, offset));
     assert!(core::mem::offset_of!(Slot, len) == core::mem::offset_of!(Descriptor, len));
+    assert!(core::mem::offset_of!(Slot, verdict) == core::mem::offset_of!(Descriptor, verdict));
 };
 
 impl<const CAP: usize> SpscRing<CAP> {
@@ -390,11 +398,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::vec::Vec;
+    use wire::Verdict;
 
-    /// A descriptor whose three fields all carry `value`, so a dequeued
+    /// A descriptor whose three span fields all carry `value`, so a dequeued
     /// descriptor identifies which enqueue produced it.
     fn tagged(value: u32) -> Descriptor {
-        Descriptor::new(value, value, value)
+        Descriptor::new(value, value, value, Verdict::Transmit)
     }
 
     #[test]
@@ -406,6 +415,27 @@ mod tests {
         assert_eq!(Slot::zero().load(), Descriptor::ZERO);
         let ring = SpscRing::<4>::new();
         assert_eq!(ring.slots[0].load(), Descriptor::ZERO);
+    }
+
+    #[test]
+    fn a_slot_carries_the_verdict_word_verbatim_including_undecodable_bits() {
+        // The ring moves descriptors and rules on nothing, so the verdict word
+        // must cross unchanged — an undecodable one included. Sanitising it
+        // here would hand the consumer a decision no producer made and put the
+        // rejection of a byzantine peer's bits out of that consumer's reach.
+        let ring = SpscRing::<4>::new();
+        let mut producer = ring.producer();
+        let mut consumer = ring.consumer();
+        for bits in [0, 1, 2, u32::MAX] {
+            let descriptor = Descriptor {
+                buffer: 1,
+                offset: 2,
+                len: 3,
+                verdict: bits,
+            };
+            producer.try_enqueue(descriptor).expect("the ring is empty");
+            assert_eq!(consumer.try_dequeue(), Some(descriptor));
+        }
     }
 
     #[test]
@@ -450,13 +480,17 @@ mod tests {
         let mut producer = ring.producer();
         assert_eq!(producer.capacity(), 7);
         for i in 0..7 {
-            assert!(producer.try_enqueue(Descriptor::new(i, 0, i)).is_ok());
+            assert!(
+                producer
+                    .try_enqueue(Descriptor::new(i, 0, i, Verdict::Transmit))
+                    .is_ok()
+            );
         }
         assert_eq!(producer.len(), 7);
         // The eighth enqueue must fail and hand the descriptor back.
         assert_eq!(
-            producer.try_enqueue(Descriptor::new(99, 0, 99)),
-            Err(Descriptor::new(99, 0, 99))
+            producer.try_enqueue(Descriptor::new(99, 0, 99, Verdict::Transmit)),
+            Err(Descriptor::new(99, 0, 99, Verdict::Transmit))
         );
     }
 

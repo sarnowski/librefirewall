@@ -19,6 +19,8 @@ cargo-fuzz = true
 # added, and a crate on an untrusted-input path without an entry is a finding.
 #
 #   wire            the descriptor ABI a peer PD writes
+#   net-headers     the Ethernet/IPv4/UDP headers a wire carries
+#   routing         the forwarding decision made from those headers
 #   queue           the shared ring whose cursors and slots a peer PD owns
 #   packet-buffer   the ownership ledger a peer PD's buffer returns cross
 #   virtio          the device's PCI config space and virtqueue
@@ -28,6 +30,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
 wire = { path = "../crates/wire" }
+net-headers = { path = "../crates/net-headers" }
+routing = { path = "../crates/routing" }
 queue = { path = "../crates/queue" }
 packet-buffer = { path = "../crates/packet-buffer" }
 virtio = { path = "../crates/virtio" }
@@ -81,6 +85,13 @@ bench = false
 [[bin]]
 name = "spsc_ring_peer"
 path = "fuzz_targets/spsc_ring_peer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_frame"
+path = "fuzz_targets/route_frame.rs"
 test = false
 doc = false
 bench = false

@@ -27,7 +27,7 @@
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
 
-         * vq0/vq1 and the six pipeline regions (0x30000000..0x31044000) must
+         * vq0/vq1 and the six pipeline regions (0x30000000..0x31046000) must
            lie INSIDE RAM. They are ordinary memory, and seL4 zeroes a frame
            retyped from a general-purpose untyped but not one retyped from a
            device untyped — which is what an address outside RAM yields. That
@@ -45,7 +45,7 @@
          Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
          which puts the first group inside it and the second above it. The
          window either side is narrow and nothing checks it: below ~785 MiB RAM
-         ends short of 0x31044000 and the DMA regions leave RAM, while at
+         ends short of 0x31046000 and the DMA regions leave RAM, while at
          1280 MiB or more RAM reaches 0x50000000 and swallows the BAR window.
          Changing `-m`, or targeting hardware with a different memory map,
          means re-deriving this map.
@@ -89,31 +89,46 @@
          shrinking either side alone silently either truncates the mapping or
          re-widens the grant. They move together or not at all.
 
-         Splitting cost no memory. `ForwardRings` is 3088 bytes and `ReturnRing`
-         1544; each rounds up to one page, and 0x20000 + 0x1000 + 0x1000 is
-         exactly the 0x22000 a single region holding all four components rounded
-         up to. `pd_runtime` asserts that equality at build time.
+         Splitting the pool from the rings costs one page. `ForwardRings` is
+         4112 bytes and `ReturnRing` 2056; the first needs two pages and the
+         second one, so 0x20000 + 0x2000 + 0x1000 is one page more than the
+         0x22000 a single region holding all four components rounds up to.
+         `pd_runtime` asserts that equality at build time, and that page is what
+         keeps the `free` ring out of the forwarder's address space entirely.
 
-         The regions stay packed back to back over the same span as the two
-         they replace: 0x31000000 through 0x31044000. -->
+         The regions stay packed back to back: 0x31000000 through 0x31046000. -->
     <memory_region name="pool0" size="0x20000" phys_addr="0x31000000" />
-    <memory_region name="fwd0" size="0x1000" phys_addr="0x31020000" />
-    <memory_region name="free0" size="0x1000" phys_addr="0x31021000" />
-    <memory_region name="pool1" size="0x20000" phys_addr="0x31022000" />
-    <memory_region name="fwd1" size="0x1000" phys_addr="0x31042000" />
-    <memory_region name="free1" size="0x1000" phys_addr="0x31043000" />
+    <memory_region name="fwd0" size="0x2000" phys_addr="0x31020000" />
+    <memory_region name="free0" size="0x1000" phys_addr="0x31022000" />
+    <memory_region name="pool1" size="0x20000" phys_addr="0x31023000" />
+    <memory_region name="fwd1" size="0x2000" phys_addr="0x31043000" />
+    <memory_region name="free1" size="0x1000" phys_addr="0x31045000" />
 
-    <!-- The forwarder maps two pages and holds no device capability at all.
-         `ForwardStage` moves descriptors from a pipeline's `rx` ring to its
-         `tx` ring and touches nothing else, so it is granted nothing else: not
-         the 128 KiB pool the descriptors index — which it could otherwise
-         corrupt frame by frame — and not the `free` ring, on which a forged
-         return would put a live DMA target back onto an owner's free stack.
-         8 KiB mapped in place of 278528. -->
+    <!-- The forwarder maps four regions and holds no device capability at all.
+         `RouteStage` decides on each frame and rewrites its Ethernet and IPv4
+         headers in the buffer the receiving NIC DMA'd it into, so it is granted
+         the two pools as well as the two ring pairs: a domain that rewrites a
+         header must reach the bytes, and that authority is the price of routing
+         in place rather than copying every frame between two pools.
+
+         What stays withheld is the `free` ring of either pipeline, and it
+         matters more than the pool ever did. A forged return puts a live DMA
+         target back onto an owner's free stack, to be handed out a second time
+         while the first NIC is still writing it; and the forwarder cannot
+         produce onto that ring in any case without being a second producer on
+         an SPSC ring that admits exactly one. Corrupting a frame in flight —
+         which the pool grant does permit — damages one packet, inside a region
+         both drivers already share.
+
+         272 KiB mapped: the same byte count as the two undivided pipeline
+         regions this replaced, and deliberately not the same bytes. What the
+         split buys is no longer a smaller grant but a different one. -->
     <protection_domain name="forwarder" priority="2" stack_size="0x4000">
         <program_image path="forwarder.elf" />
         <map mr="fwd0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="fwd0_vaddr" />
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="fwd1_vaddr" />
+        <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="pool0_vaddr" />
+        <map mr="pool1" vaddr="0x2_300_000" perms="rw" cached="true" setvar_vaddr="pool1_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -134,9 +149,9 @@
         <map mr="bar0" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
         <map mr="vq0" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
         <map mr="fwd0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="rx_fwd_vaddr" />
-        <map mr="free0" vaddr="0x2_001_000" perms="rw" cached="true" setvar_vaddr="rx_free_vaddr" />
+        <map mr="free0" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="rx_free_vaddr" />
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
-        <map mr="free1" vaddr="0x2_101_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
+        <map mr="free1" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool1" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar0" />
         <setvar symbol="vq_paddr" region_paddr="vq0" />
@@ -150,9 +165,9 @@
         <map mr="bar1" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
         <map mr="vq1" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
         <map mr="fwd1" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="rx_fwd_vaddr" />
-        <map mr="free1" vaddr="0x2_001_000" perms="rw" cached="true" setvar_vaddr="rx_free_vaddr" />
+        <map mr="free1" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="rx_free_vaddr" />
         <map mr="fwd0" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
-        <map mr="free0" vaddr="0x2_101_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
+        <map mr="free0" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar1" />
         <setvar symbol="vq_paddr" region_paddr="vq1" />

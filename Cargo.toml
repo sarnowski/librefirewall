@@ -4,6 +4,8 @@ members = [
     "crates/wire",
     "crates/queue",
     "crates/packet-buffer",
+    "crates/net-headers",
+    "crates/routing",
     "crates/virtio",
     "crates/pd-runtime",
     "crates/nic-driver-core",

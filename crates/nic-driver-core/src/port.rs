@@ -218,7 +218,7 @@ mod tests {
     use crate::fake_device::{Event, FakeDevice, Log};
     use core::sync::atomic::{Ordering, fence};
     use pd_runtime::{
-        BUFFER_SIZE, Descriptor, POOL_BUFFERS, RING_SLOTS, RingConsumer, RingProducer,
+        BUFFER_SIZE, Descriptor, POOL_BUFFERS, RING_SLOTS, RingConsumer, RingProducer, Verdict,
     };
     use proptest::prelude::*;
     use std::boxed::Box;
@@ -443,7 +443,12 @@ mod tests {
         /// Queue a frame on the transmit pipeline as the forwarder would.
         fn queue_transmit(&mut self, buffer: u32) {
             self.peer
-                .try_enqueue(Descriptor::new(buffer, VirtioNetHdr::LEN as u32, 8))
+                .try_enqueue(Descriptor::new(
+                    buffer,
+                    VirtioNetHdr::LEN as u32,
+                    8,
+                    Verdict::Transmit,
+                ))
                 .expect("the tx ring has room");
         }
     }
@@ -659,11 +664,15 @@ mod tests {
             for (head, used_len, buffer, queue) in events {
                 fx.complete_receive(head % (QUEUE_SIZE as u16 + 4), used_len);
                 if queue {
-                    let descriptor = Descriptor::new(
-                        buffer % (POOL_BUFFERS as u32 + 2),
-                        VirtioNetHdr::LEN as u32,
-                        (used_len % (BUFFER_SIZE as u32)).max(1),
-                    );
+                    // The verdict is the peer's word to choose, undecodable
+                    // values included, so it comes from the same arbitrary
+                    // input as the span rather than from a valid variant.
+                    let descriptor = Descriptor {
+                        buffer: buffer % (POOL_BUFFERS as u32 + 2),
+                        offset: VirtioNetHdr::LEN as u32,
+                        len: (used_len % (BUFFER_SIZE as u32)).max(1),
+                        verdict: used_len,
+                    };
                     // A full ring is one of the states under test, so a refused
                     // enqueue is part of the scenario rather than a failure.
                     let _ring_may_be_full = fx.peer.try_enqueue(descriptor);
