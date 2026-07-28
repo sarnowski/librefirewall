@@ -9,8 +9,10 @@ operator can rely on it as a stable contract.
 
 > **Status.** The conventions below are settled and binding. The concrete inventories are populated
 > as each signal is implemented. The **console** inventory below is complete and is a contract as of
-> the configuration-management build; the OpenTelemetry, local-buffer and metric inventories are
-> still empty, and a section marked *“None implemented yet”* states the current truth of the
+> the console-domain build, in which the serial device acquired a single owning protection domain and
+> the records other domains emit began crossing to it as structured records rather than as text; the
+> OpenTelemetry, local-buffer and metric inventories are still empty, and a section marked
+> *“None implemented yet”* states the current truth of the
 > contract, not a gap in it. Nothing is named in an empty inventory ahead of time: a name published
 > before the signal it belongs to exists is a guess an operator would go on to build against.
 
@@ -18,7 +20,9 @@ operator can rely on it as a stable contract.
 
 - **Console** — a last-resort, human-readable channel carrying **system state only**. It exists so a
   node whose log streaming is down can still be diagnosed. It never carries traffic or per-request
-  data.
+  data. It is a physical device — a 16550 UART at `0x3F8` (COM1) at 115200 8N1 — owned by exactly
+  one protection domain, which is the sole writer of the line and renders the records every other
+  domain publishes to it.
 - **OpenTelemetry logs** — the structured log stream to an external receiver. Everything the console
   says is also emitted here, plus audit, traffic, and per-subsystem logs. This is the only log
   transport; there is no syslog. There is no distributed tracing.
@@ -93,6 +97,15 @@ implementation and binds the two that follow.
   console this is structural rather than a rule to remember: the only value type that can carry text
   out of a configuration document is an identifier validated to `[a-z0-9-]{1,16}`, and a refusal
   names a *location* in the document and never the bytes at it.
+- **The console alphabet is a guarantee, not a convention.** Every value that reaches a console line
+  is restricted to `[a-z0-9-]`, and the rendered line as a whole is printable ASCII — no control
+  character, no ESC, and no newline but the single terminator the console appends. That is what
+  stops a peer painting terminal escape sequences onto an operator's terminal, and it is checked
+  *twice against two different adversaries*: once where a call site mints a value, and again in the
+  console domain where a record arrives out of a region another domain owns and every byte of it was
+  that domain's choice. Neither check stands in for the other. The property is asserted by a
+  persistent fuzz target over arbitrary record bytes, so a record that carried an escape sequence
+  into a line would fail the gate rather than reach a terminal.
 
 ### Ordering and time
 
@@ -101,11 +114,32 @@ source. Nothing is therefore timestamped. A record carries the **configuration `
 belongs to and, where one generation produces several change records, a **`seq`** numbering them
 from 0 in emission order.
 `(generation, seq)` is the whole of a record's ordering, and generations are monotonic within a
-boot, so it totally orders one boot's change records.
+boot, so it totally orders one boot's change records. `seq` appears on `LFW-CFG` change records and
+on no other shape: it numbers a generation's diff, and is neither a per-domain counter nor a
+sequence number for the console stream as a whole.
 
-That is exact ordering and exact attribution, which is what a configuration audit needs, and it is
-preferred to inventing a time base a reader would then trust. What it costs is not small and is
-stated rather than left to be discovered:
+**Ordering across domains is not defined, and this is structural.** Every domain but the console
+publishes its records into a single-producer ring of its own, and the console domain drains the
+rings, renders each record and writes the line. Two guarantees follow, and no third:
+
+- **Within one domain, order is exact.** One writer publishes into its ring in order and the console
+  takes them in that order, so a domain's own records reach the line in the order that domain
+  emitted them. This is what makes `(generation, seq)` reliable: one domain produces a commit's
+  change records, so their order is that domain's order.
+- **Across domains, nothing is ordered at all.** The console serves the rings round-robin with a
+  rotating start and takes at most a bounded burst from each, which is the fairness rule that stops
+  a flooding ring starving another. *Which* domain's record reaches the line first is therefore
+  decided by where that rotation stood when the console next ran — not by which event happened
+  first — and there is no clock to appeal to.
+
+A concrete consequence an operator will meet on every boot: the forwarding domain's
+`generation=1 outcome=applied changes=0` routinely prints **before** the change records that
+generation is made of, which the publishing domain emitted first. That is the rotation, not a fault.
+A reader that infers causality from console order is inferring it from the fairness rule.
+
+Within a domain, then, `(generation, seq)` is exact ordering and exact attribution, which is what a
+configuration audit needs, and it is preferred to inventing a time base a reader would then trust.
+What the absence of a clock costs is not small and is stated rather than left to be discovered:
 
 - **Nothing correlates outside the node.** Not a neighbour's log, not an operator's action, not a
   packet capture — there is no shared time base to correlate on.
@@ -149,8 +183,8 @@ LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ cause=<
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
-**`nic-driver`**, **`config`** — the domain names in the Microkit system description. `state=` is
-one of **`starting`**, **`negotiated`**, **`ready`**, **`refused`**.
+**`nic-driver`**, **`config`**, **`console`** — the domain names in the Microkit system description.
+`state=` is one of **`starting`**, **`negotiated`**, **`ready`**, **`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
 written waits forever:
@@ -160,6 +194,25 @@ written waits forever:
 | `config` | `starting`, then `ready` **or** `refused` | none |
 | `forwarder` | `starting` only | none |
 | `nic-driver` (once per port, two instances) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
+| `console` | `starting`, then `ready` — and **never** `refused` | none |
+
+`console` is the domain that owns the serial device and renders every other domain's records, which
+makes its two records mean something different from the rest: they are the console reporting that it
+can report. Both are written *through the device it has just programmed*, so the first of them is
+also the proof that there is a console at all. The absence of `refused` is not an omission — it is
+the shape of the failure. A console that cannot program its controller has no way to say so, the
+reporting mechanism being what failed, so **a node whose console never came up is silent rather than
+apologetic**: no `LFW-PD domain=console` record, and no other record either, because nothing drains
+the rings the other domains are publishing into.
+
+An entirely empty serial line after the boot manager's `LFW-BOOT` record is therefore ambiguous, and
+this document previously told an operator to read it as a refused console first. That was wrong, and
+was found to be wrong the first time a release image was booted: the same silence is what a node
+that never reached userspace at all looks like, because on the release kernel nothing between GRUB
+and the console domain can print. The two are not distinguishable **on this surface**, and there is
+no second channel yet that would separate them (no `GET /logs`, no metrics endpoint). Distinguishing
+them today is an external act — attaching a debugger, or booting the debug profile, whose kernel
+narrates its own start-up.
 
 - `features=0x<hex>` — the feature bitmap the driver and its device settled on. Which bit means what
   is virtio's vocabulary and is deliberately not decoded here.
@@ -281,26 +334,64 @@ distinguishes them is that a document refusal is emitted before any generation i
 
 ### Reading records off the wire
 
-The serial console is one unsynchronised device shared by every protection domain, and a record is
-written with no lock. Two consequences, both observable in a normal boot capture:
+The serial device has **exactly one writer**: the `console` protection domain holds the only
+I/O-port capability in the system, and every other domain reaches the line by publishing a record
+into a single-producer ring that domain drains and renders. A record is therefore **whole or
+absent**, never spliced with another domain's — and that is a property of the capability grant, not
+of scheduling or of a lock.
 
-- **Records interleave.** The two `nic-driver` instances run at equal priority and write during
-  bring-up, so their `LFW-PD` records are routinely torn into one another —
-  `LFW-PD domain=nic-driver state=staLFW-PD domain=nic-driver state=starting` is ordinary output,
-  not a fault. Nothing structurally prevents the same happening to an `LFW-CFG` record; it is not
-  seen today only because the publishing domain runs to completion above every other priority and
-  the forwarding domain preempts the drivers rather than being preempted by them. **A reader must
-  recover records by scanning for the `LFW-` prefix anywhere in the stream, not by assuming one line
-  is one record.** What that scan recovers is a record that did not *begin* a line; what nothing can
-  recover is a record whose own bytes were split, the continuation carrying no marker and two
-  concurrent writers leaving a reader nothing to decide which fragment continues which by. Such a
-  record presents as a short fragment ending where the interrupting one began, plus unmarked text
-  after it — matching no grammar above, which is the whole of the guarantee available here.
-- **A record that will not render is reported, not dropped.** Where the 192-byte line cannot be
-  produced, the domain writes `LFW-PD unrendered=<debug form>` instead — under the `LFW-PD` prefix
-  whatever channel the event belonged to, and following no grammar above. It is a defect in this
-  contract wherever it appears, and it is written rather than swallowed so that it is visible as
-  one.
+That guarantee is exact **in the release profile**, and one caveat qualifies it in the other:
+
+- **The debug kernel writes the same port.** It is built with `CONFIG_PRINTING` and is handed
+  `debug_port = 0x3f8` on its Multiboot2 command line, so in a debug image it emits its own boot
+  banner and its fault reports onto the line the console domain owns. That output is prose and
+  carries no contract, but it can land *inside* a line — a record preceded on its line by kernel
+  text, or followed by it. **A reader must therefore still recover records by scanning for the
+  `LFW-` prefix anywhere in the stream, not by assuming one line is one record.** Every QEMU capture
+  in this repository is a debug boot and shows exactly this. The kernel prints on boot and on
+  faults, never per record, so the interleaving is bounded and occasional rather than routine.
+- **What no reader can recover** is a record whose own bytes were split. Nothing in the release
+  profile splits one; in debug, a kernel fault report arriving mid-line leaves a fragment with no
+  marker on its continuation, and such a fragment matches no grammar above. That is the whole of the
+  guarantee available: a torn record fails to parse rather than parsing into something false.
+- **A record that will not render is dropped and counted, not reported.** There is no
+  `LFW-PD unrendered=…` line and no other escape hatch: a record whose bytes the ABI refuses, whose
+  vocabulary token this build does not know, or that will not fit the 192-byte line is counted and
+  discarded silently. Those counters are described below and **nothing exposes them**, so an
+  operator reading the console cannot currently tell a record that was never emitted from one that
+  was emitted and lost.
+
+### What the console loses, and what counts it
+
+The path from a call site to the line is bounded at every step — encoding the event, publishing it
+into a ring, decoding it, rendering it, handing the bytes to the device — and every one of those
+bounds is lossy. Each has its own counter, because they accuse different parties. Every counter
+below follows the counter semantics under *Prometheus metrics* — monotonic for its domain's life,
+saturating, no reset — and follows the **attribution** rule stated there: a drop names who
+misbehaved, and the three classes never merge. **None of them is exposed on any surface today.**
+
+| counter | kept by | accuses | what it means |
+|---|---|---|---|
+| `dropped` | each writing domain | itself, or the console | the ring had no slot, so the **newest** record was refused. A flood, or a console that is not draining |
+| `refused` | each writing domain | *our own* invariant | an event this build minted that the record ABI cannot carry. Expected to read zero forever |
+| `malformed` | the console | the **peer that sent it** | the bytes in the slot are no record at all — the writing domain published something the ABI cannot carry, or wrote a slot it had not been given |
+| `unknown` | the console | the **peer that sent it** | the record decoded, but its vocabulary token names no variant this build has: the two halves of the ABI have parted, which means the two domains are different builds |
+| `unrenderable` | the console | *our own* invariant | the event decoded and would not fit the 192-byte line. No peer can cause this; it is a defect in this build's renderer, and it is an alert rather than a statistic |
+| `write_failed` | the console | the **device** | the controller would not take the line. Console output has been lost, and this is the one counter with nowhere to be reported *to* — the console is the reporting mechanism |
+| `printed` | the console | — | lines rendered and handed to the device in full |
+| `bytes_written`, `thre_timeouts`, `init_failures` | the UART driver | the **device** | bytes handed to the transmitter; bytes dropped because it never reported itself empty; refused initialisations |
+
+Two properties of a full ring are worth stating because they are the opposite of what a log buffer
+usually does:
+
+- **A full ring refuses the newest record, not the oldest.** The ring carries the boot transcript,
+  and when a domain parks the *earliest* records are the ones that say why; dropping the oldest
+  would discard exactly those and keep the repetitive tail. This is the opposite bias from the
+  `GET /logs` retention buffer specified below, which drops the oldest because it answers "what is
+  this node doing *right now*". Both are bounded and lossy and each counts what it dropped.
+- **A writer's drop count is that writer's claim about itself.** It lives in the region that writer
+  owns, so it is a number to expose and never one to decide under, and it restarts at zero when that
+  domain does — the one discontinuity the counter semantics admit.
 
 ### Boot-manager records (pre-kernel)
 
@@ -315,6 +406,11 @@ LFW-BOOT slot=<A|B|none> state=<confirmed|trying|rejected|exhausted|unpersisted|
 One record per decision, in decision order; the seven states above are the complete set. The
 human-readable `librefirewall: …` lines printed beside each record are prose and carry no contract —
 a reader must key on the `LFW-BOOT ` prefix alone.
+
+`state=halted` has two causes and does not distinguish them: no slot was bootable, or the boot
+manager could not reserve the low memory that keeps the Microkit system image from being loaded
+below the seL4 kernel (see README, *Signed boot chain*). Both are terminal and both need the same
+external action, which is why they share a state; the prose line beside the record says which.
 
 ## OpenTelemetry logs
 
@@ -401,8 +497,12 @@ one published before the metric exists would be a guess an operator had already 
 
 The dataplane already tallies its drops and faults in memory under the semantics above — eleven
 named routing drop reasons, the pool ownership faults, and the configuration handover's applied and
-refused counts — but no surface reads any of them out: **a drop is currently unobservable from
-outside the node**, on this surface or any other.
+refused counts — as does the console path: each writing domain's `dropped` and `refused`, the
+console's `printed`, `malformed`, `unknown`, `unrenderable` and `write_failed`, and the UART's
+`bytes_written`, `thre_timeouts` and `init_failures` (see *What the console loses, and what counts
+it*). No surface reads any of them out: **a drop is currently unobservable from outside the node**,
+on this surface or any other. The console-path counters are the sharper case, because the console is
+itself the last-resort surface — a node quietly losing records has no way to say so.
 
 ## Configuration read endpoint
 

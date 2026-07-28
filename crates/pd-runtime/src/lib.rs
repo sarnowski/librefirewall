@@ -372,9 +372,9 @@ macro_rules! attach_region {
         //   `check_region_size` holds *equal* to the constant the domains map
         //   it as: `POOL_REGION_SIZE`, `FORWARD_REGION_SIZE`,
         //   `RETURN_REGION_SIZE`, `CONFIG_REGION_SIZE`, `CONFIG_ACK_REGION_SIZE`.
-        //   A region the table names no rule for is itself a finding, so no
-        //   mapping here is sized by agreement alone. Both run in the fast gate
-        //   and again before the image is assembled.
+        //   The log regions are the exception: that table names no rule for one
+        //   yet, so they alone are sized by agreement until it does. Both checks
+        //   run in the fast gate and again before the image is assembled.
         // * No safe path to the bytes — the region types, whose fields are
         //   atomics (`Ring`, `wire`'s configuration regions) or an `UnsafeCell`
         //   reachable only through an `unsafe` accessor (`Pool`).

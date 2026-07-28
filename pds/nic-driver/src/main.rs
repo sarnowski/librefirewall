@@ -63,6 +63,18 @@
 //! The forwarder runs at **priority 2** and preempts on notification, so the
 //! busy loop cannot starve it.
 //!
+//! # The console is a domain, not a print statement
+//!
+//! Nothing here writes to a serial port. A record is a typed [`Event`] put into
+//! this instance's own log ring — one region, this domain the only writer —
+//! and the console domain renders it. The rejected alternative is the obvious
+//! one, `sel4_microkit::debug_println!`: it compiles to `seL4_DebugPutChar`, a
+//! kernel *debug* syscall the release kernel does not implement, so a driver
+//! that failed bring-up would park silently in exactly the profile that ships.
+//! A ring in a shared region behaves identically in both kernel configurations,
+//! and it is drained whenever the console domain comes up, so the records this
+//! domain writes during its own `init` survive to be printed.
+//!
 //! # Channel 0 sends and never receives
 //!
 //! [`NicDriver`]'s `notified` entrypoint is unreachable by *capability* rather
@@ -75,16 +87,15 @@
 //! the forwarder holds none on either driver. The entrypoint satisfies
 //! `sel4_microkit::Handler`.
 
-use lfw_log::{
-    Domain, DomainDetail, DomainState, Event, MAX_LINE_LEN, Refusal, RefusalDetail, Sink, render,
-};
+use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use nic_driver_core::bringup::{
     self, BringUpError, DriverVirtqueue, Live, MappedDevice, QUEUE_SIZE, TX_VQ_OFFSET,
 };
 use nic_driver_core::port::{DataplanePort, ForwarderSignal, ReceiveSide, TransmitSide};
 use pd_runtime::{ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, Pool, ReturnRing, attach_region};
-use sel4_microkit::{Channel, debug_println, memory_region_symbol, protection_domain, var};
+use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
+use wire::{LogConsume, LogRecords};
 
 /// The forwarder. Send-only; see the crate header on channel 0.
 const FORWARDER: Channel = Channel::new(0);
@@ -155,31 +166,8 @@ impl StartupError {
     }
 }
 
-/// The console as a [`Sink`].
-///
-/// It is the last-resort channel and the only one this build has (CONCEPT §11),
-/// so a line that cannot be rendered is reported as the event it came from
-/// rather than dropped (ENG-12).
-struct Console;
-
-impl Sink for Console {
-    fn emit(&self, event: &Event) {
-        let mut line = [0u8; MAX_LINE_LEN];
-        let rendered = render(event, &mut line)
-            .ok()
-            .and_then(|written| line.get(..written))
-            .and_then(|bytes| core::str::from_utf8(bytes).ok());
-        match rendered {
-            Some(text) => debug_println!("{text}"),
-            None => debug_println!("LFW-PD unrendered={event:?}"),
-        }
-    }
-}
-
-const CONSOLE: Console = Console;
-
-fn announce(state: DomainState, detail: DomainDetail) {
-    CONSOLE.emit(&Event::Domain {
+fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
+    sink.emit(&Event::Domain {
         domain: Domain::NicDriver,
         state,
         detail,
@@ -225,10 +213,19 @@ impl PoolDmaBase {
 
 #[protection_domain]
 fn init() -> NicDriver {
-    announce(DomainState::Starting, DomainDetail::None);
-    match bring_up() {
+    // Before anything else that could have something to say. The region is
+    // zeroed by the kernel, so it is a valid empty ring the moment it is
+    // mapped, and the console domain drains it whenever it comes up — which is
+    // what lets a record written here survive to be printed.
+    let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
+    let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let sink = RingSink::new(log.writer(log_consume));
+
+    announce(&sink, DomainState::Starting, DomainDetail::None);
+    match bring_up(&sink) {
         Ok((device, mut port)) => {
             announce(
+                &sink,
                 DomainState::Ready,
                 DomainDetail::ReceivePosted(QUEUE_SIZE as u32),
             );
@@ -239,15 +236,19 @@ fn init() -> NicDriver {
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
-            // (CONCEPT §11) this line is all an operator gets.
-            announce(DomainState::Refused, DomainDetail::Refusal(error.refusal()));
+            // (CONCEPT §11) this record is all an operator gets.
+            announce(
+                &sink,
+                DomainState::Refused,
+                DomainDetail::Refusal(error.refusal()),
+            );
             NicDriver
         }
     }
 }
 
 /// Map this domain's regions and bring its device up, receive queue primed.
-fn bring_up() -> Result<(Live<MappedDevice>, DataplanePort<'static>), StartupError> {
+fn bring_up(sink: &dyn Sink) -> Result<(Live<MappedDevice>, DataplanePort<'static>), StartupError> {
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();
     let vq = memory_region_symbol!(vq_vaddr: *mut u8).as_ptr();
@@ -283,6 +284,7 @@ fn bring_up() -> Result<(Live<MappedDevice>, DataplanePort<'static>), StartupErr
         .acknowledge()?
         .negotiate_features()?;
     announce(
+        sink,
         DomainState::Negotiated,
         DomainDetail::Features(negotiated.features()),
     );

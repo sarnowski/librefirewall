@@ -15,6 +15,8 @@
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
 //! | [`spsc_ring`] | `queue::SpscRing` cursors and slots | a byzantine neighbour PD |
+//! | [`log_record`] | `wire`'s log record, and the `lfw_log` event and console line above it | a byzantine neighbour PD |
+//! | [`log_ring`] | `wire`'s log records and consume regions, from both sides | a byzantine neighbour PD |
 //! | [`pipeline`] | `pd_runtime` pool ownership and forwarding | a byzantine neighbour PD |
 //! | [`driver`] | `nic_driver_core` rx/tx paths | a hostile device **and** a byzantine neighbour PD |
 //!
@@ -125,6 +127,9 @@ pub mod driver;
 pub mod frame;
 pub mod free_list;
 pub mod handover;
+pub mod log_record;
+pub mod log_ring;
+pub mod log_ring_abi;
 pub mod pipeline;
 pub mod region;
 pub mod ring_abi;
@@ -196,10 +201,11 @@ mod tests {
     /// Ordered from the smallest, most self-contained surface to the deepest
     /// composite one, and `tools/xtask`'s `FUZZ_TARGETS` matches. A defect in
     /// the ledger shows up in `free_list_ownership`, in `pd_runtime_pipeline`,
-    /// and in `nic_driver_paths` alike, and one in the handover image shows up
-    /// in `config_image` and again in `config_document`, which builds one; the
-    /// narrowest of those is the one worth reading — so it is the one that
-    /// fails first. It also means a
+    /// and in `nic_driver_paths` alike; one in the handover image shows up
+    /// in `config_image` and again in `config_document`, which builds one; and
+    /// one in the log record shows up in `log_record` and again in `log_ring`,
+    /// which carries records through a ring. The narrowest of those is the one
+    /// worth reading — so it is the one that fails first. It also means a
     /// harness whose failure aborts the process (a violated `unsafe`
     /// precondition does, being non-unwinding) takes the fewest other harnesses
     /// down with it.
@@ -209,10 +215,12 @@ mod tests {
     )]
     const HARNESSES: &[(&str, fn(&[u8]))] = &[
         ("config_image", crate::handover::handover_harness),
+        ("log_record", crate::log_record::log_record_harness),
         ("free_list_ownership", crate::free_list::free_list_harness),
         ("route_frame", crate::frame::frame_routing_harness),
         ("config_document", crate::document::document_harness),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
+        ("log_ring", crate::log_ring::log_ring_harness),
         ("virtqueue_poll", crate::virtqueue::virtqueue_poll_harness),
         ("pd_runtime_pipeline", crate::pipeline::pipeline_harness),
         ("nic_driver_paths", crate::driver::driver_paths_harness),

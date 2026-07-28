@@ -8,13 +8,13 @@
 //!
 //! # Adversary
 //!
-//! None reaches this crate directly (CONCEPT §7.1). It is, however, the surface
-//! on which values derived from the management-plane attacker's configuration
-//! document are rendered, which is what shapes [`Value`]: a closed set of
-//! already-parsed domain types with no arbitrary-bytes variant, so a byte
-//! string out of a document has no representation that reaches a console line
-//! (OBS-5). [`Identifier`] is the single exception and carries an alphabet
-//! narrow enough to print.
+//! The byzantine peer protection domain (CONCEPT §7.1), on one path: a record
+//! decoded out of a shared region was written by another domain, and `record.rs`
+//! is where that is refused. Everything else faces the management-plane attacker
+//! at one remove — values derived from a configuration document are rendered
+//! here, which is what shapes [`Value`]: already-parsed domain types with no
+//! arbitrary-bytes variant, so a byte string out of a document reaches no
+//! console line as itself (OBS-5), [`Identifier`] excepted for its alphabet.
 //!
 //! # No timestamps
 //!
@@ -40,31 +40,39 @@
 //! the caller owns and refuses one too small rather than truncating a line an
 //! operator would read as complete.
 //!
-//! # No console backend here
+//! # The console backend, less its device
 //!
-//! Writing to the console needs `sel4_microkit::debug_println`, which would
-//! make this crate un-testable on the host and drag the Microkit target into
-//! every consumer. The [`Sink`] implementation that prints therefore belongs in
-//! a protection domain rather than here; [`RecordingSink`] is what a host test
-//! uses in its place.
+//! Writing to the console needs a serial device, which one domain owns. Every
+//! other domain puts the typed event in a shared region through [`RingSink`]
+//! and that domain renders it, so the structure crosses and the text is
+//! produced once — one grammar rather than one per writer. What that domain
+//! then *decides* is here too, in [`ConsolePrinter`]: how it shares attention
+//! between the rings, and what becomes of a record that decodes to nothing.
+//! Only bytes leave, through [`ByteSink`], so the path stays host-testable.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+mod console;
 mod detail;
 mod event;
 mod identifier;
+mod record;
 mod render;
+mod ring;
 
 use core::cell::Cell;
 
-pub use detail::{DomainDetail, MAX_CAUSE_LEN, Refusal, RefusalDetail};
+pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter};
+pub use detail::{Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, Refusal, RefusalDetail};
 pub use event::{
     ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, RejectReason,
     Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
+pub use record::{DecodeError, Vocabulary};
 pub use render::{MAX_LINE_LEN, RenderError, render};
+pub use ring::RingSink;
 
 /// Where events go.
 ///

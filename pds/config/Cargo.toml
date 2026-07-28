@@ -9,6 +9,7 @@ sel4-microkit.workspace = true
 config = { path = "../../crates/config" }
 lfw-log = { path = "../../crates/log" }
 pd-runtime = { path = "../../crates/pd-runtime" }
+wire = { path = "../../crates/wire" }
 
 [lints]
 workspace = true

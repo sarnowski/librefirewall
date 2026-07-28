@@ -179,6 +179,19 @@ dependencies = [
  "lfw-log",
  "pd-runtime",
  "sel4-microkit",
+ "wire",
+]
+
+[[package]]
+name = "console"
+version = "0.1.0"
+dependencies = [
+ "lfw-log",
+ "pd-runtime",
+ "sel4",
+ "sel4-microkit",
+ "uart-16550",
+ "wire",
 ]
 
 [[package]]
@@ -298,6 +311,7 @@ dependencies = [
  "pd-runtime",
  "routing",
  "sel4-microkit",
+ "wire",
 ]
 
 [[package]]
@@ -402,6 +416,7 @@ version = "0.1.0"
 dependencies = [
  "net-headers",
  "proptest",
+ "wire",
 ]
 
 [[package]]
@@ -469,6 +484,7 @@ dependencies = [
  "pd-runtime",
  "sel4-microkit",
  "virtio",
+ "wire",
 ]
 
 [[package]]
@@ -1144,6 +1160,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "uart-16550"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1321,6 +1344,7 @@ dependencies = [
  "lfw-log",
  "nic-driver-core",
  "pd-runtime",
+ "uart-16550",
  "virtio",
  "wire",
 ]

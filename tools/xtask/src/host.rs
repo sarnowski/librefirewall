@@ -45,6 +45,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "virtio",
     "pd-runtime",
     "nic-driver-core",
+    "uart-16550",
     "config",
     "xtask",
 ];
@@ -68,6 +69,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "virtio",
     "pd-runtime",
     "nic-driver-core",
+    "uart-16550",
     "config",
 ];
 
@@ -95,9 +97,13 @@ const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio", "pd-runtim
 /// Both, because they are two different compilations of the same source rather
 /// than two optimisation levels of one. `sel4-config` derives its `sel4_cfg`
 /// flags from the board's generated kernel headers, and the two boards differ:
-/// `CONFIG_PRINTING` is set in `debug` and cleared in `release`, which selects
-/// a different `sel4_microkit::debug_println!` — the real one, or a no-op —
-/// and every PD uses it.
+/// `CONFIG_PRINTING` is set in `debug` and cleared in `release`, so the two
+/// build different `sel4_microkit` internals and different kernel bindings
+/// under every protection domain. That difference used to be visible in PD
+/// source, back when a domain reported through `debug_println!` and the release
+/// kernel had no `seL4_DebugPutChar` to answer it — the defect the console
+/// domain exists to fix. Now it is not, which makes this second run more
+/// load-bearing rather than less: nothing but a compilation shows it.
 ///
 /// What makes the second run worth its third of a second is where the release
 /// configuration is otherwise compiled at all: [`crate::ci`] assembles the
@@ -116,10 +122,12 @@ const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFI
 /// the one worth reading, so it runs first.
 const FUZZ_TARGETS: &[&str] = &[
     "config_image",
+    "log_record",
     "free_list_ownership",
     "route_frame",
     "config_document",
     "spsc_ring_peer",
+    "log_ring",
     "virtqueue_poll",
     "pd_runtime_pipeline",
     "nic_driver_paths",
@@ -307,6 +315,23 @@ fn enforce_budgets(root: &Path) -> Result<(), String> {
 /// generation, not extra test runs. `--fail-under-lines` makes each report exit
 /// non-zero below its floor, so a regression fails here and identically in CI.
 fn enforce_coverage(root: &Path) -> Result<(), String> {
+    // `--no-report` adds to whatever profile data is already in the target
+    // directory rather than replacing it, and a report merged from a previous
+    // run's `.profraw` describes neither run. Observed both ways in this tree:
+    // a crate measured at 54.81% against a clean 94.97%, and — the direction
+    // that matters — a stale profile can as easily carry a floor a change no
+    // longer meets. A gate that can report a number the tree does not have is
+    // not a gate, so the profile is discarded first and every run measures only
+    // what it just executed.
+    run_command(
+        Command::new("cargo").current_dir(root).args([
+            "llvm-cov",
+            "clean",
+            "--workspace",
+            "--locked",
+        ]),
+        "discard stale coverage profile data",
+    )?;
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -689,6 +714,50 @@ mod tests {
                      `commit_and_report`, returning whether anything was offered and leaving the \
                      domain with the publish call alone, which puts the branch under the host \
                      coverage floor.",
+                ),
+            },
+        ),
+        (
+            "console",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and \
+                                `config_transcript.rs` scans its serial output for the `LFW-` \
+                                records the configuration handover produces. Those records now \
+                                reach that output only through this domain: every other domain \
+                                writes a typed record into a log ring and nothing else in the \
+                                system touches the serial port, so a transcript containing a \
+                                single `LFW-` line proves this domain proved its `<ioport>` \
+                                capability through `Com1::claim` and drove it by invocation \
+                                (`seL4_X86_IOPort_In8`/`Out8` — an `in`/`out` instruction would \
+                                fault the domain instead), programmed the controller through \
+                                `Uart::initialise`, took a reader on the peer's region, decoded \
+                                a record and wrote the rendered bytes — `init` and the drain \
+                                loop, which is every statement it has. `xtask test-ab` boots the \
+                                slot it selected through the same path.",
+                residue: Some(
+                    "Both REFUSED branches — `Com1::claim` answering `Err` because the \
+                     capability is not what `BASE_IOPORT_SLOT` and the `<ioport>` element say, \
+                     and `Uart::initialise` answering `Err`, each followed by this domain's \
+                     decision to park rather than retry — are reached by no QEMU test: every \
+                     scenario boots the one correct system description against QEMU's q35, \
+                     which always presents a conforming 16550A at 0x3F8, so only the accepting \
+                     branch ever runs, and the six ways a controller can refuse are \
+                     distinguished by `uart_16550` (whose own host tests cover all six) and \
+                     then discarded here, a console with no controller having nowhere to report \
+                     that it has no console. The capability refusal is the one of the two that \
+                     does reach an operator, and only in the `debug` kernel configuration, \
+                     through the `debug_println!` the release build compiles away. What to do \
+                     about a refused device is first-party \
+                     decision logic sitting in a PD, where neither the host floor nor the QEMU \
+                     gate reaches it — the layering defect LAY-2 names — and not a covered \
+                     path. Closing it needs both halves: a reporting channel that does not \
+                     depend on the console (the `GET /logs` ring MONITORING.md specifies, or \
+                     the metrics endpoint of CONCEPT §11), and the park-or-retry decision moved \
+                     beside `Uart::initialise` so a host test can drive it. The same second \
+                     channel is what would expose `ConsolePrinter`'s malformed, unknown, \
+                     unrenderable and write_failed counters, which are floored in `crates/log` \
+                     but unobservable from here, so no QEMU assertion today can tell a console \
+                     that printed everything from one that silently refused half of it.",
                 ),
             },
         ),

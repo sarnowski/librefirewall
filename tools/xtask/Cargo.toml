@@ -32,6 +32,10 @@ config = { path = "../../crates/config" }
 # the expectation and the appliance cannot come to describe one commit in two
 # different languages — the drift above, in the one place a test would hide it.
 lfw-log = { path = "../../crates/log" }
+# The COM1 window, for the same reason as every constant above it: the
+# `<ioport>` grant and the addresses the driver forms inside it are two
+# statements of one fact, and `sysdesc` is where they are compared.
+uart-16550 = { path = "../../crates/uart-16550" }
 
 [lints]
 workspace = true

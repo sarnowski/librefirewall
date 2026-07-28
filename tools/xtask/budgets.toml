@@ -17,23 +17,26 @@
 
 [comment-ratio]
 "crates/config/src/diff.rs" = 0.1864
-"crates/config/src/hash.rs" = 0.2990
-"crates/config/src/lib.rs" = 0.5354
-"crates/config/src/model.rs" = 0.2519
-"crates/config/src/report.rs" = 0.2368
-"crates/config/src/runtime.rs" = 0.1650
-"crates/config/src/schema.rs" = 0.1518
+"crates/config/src/hash.rs" = 0.2917
+"crates/config/src/lib.rs" = 0.5044
+"crates/config/src/model.rs" = 0.2398
+"crates/config/src/report.rs" = 0.2291
+"crates/config/src/runtime.rs" = 0.1538
+"crates/config/src/schema.rs" = 0.1506
 "crates/config/src/store.rs" = 0.3136
 "crates/config/src/validate.rs" = 0.1392
 "crates/config/src/value.rs" = 0.2615
 "crates/config/src/xml.rs" = 0.1947
-"crates/log/src/detail.rs" = 0.5902
-"crates/log/src/event.rs" = 0.2070
+"crates/log/src/console.rs" = 0.5310
+"crates/log/src/detail.rs" = 0.4061
+"crates/log/src/event.rs" = 0.2043
 "crates/log/src/identifier.rs" = 0.2121
-"crates/log/src/lib.rs" = 0.4225
-"crates/log/src/render.rs" = 0.1622
+"crates/log/src/lib.rs" = 0.4118
+"crates/log/src/record.rs" = 0.1832
+"crates/log/src/render.rs" = 0.1597
+"crates/log/src/ring.rs" = 0.3721
 "crates/net-headers/src/lib.rs" = 0.1925
-"crates/nic-driver-core/src/bringup.rs" = 0.3693
+"crates/nic-driver-core/src/bringup.rs" = 0.3404
 "crates/nic-driver-core/src/lib.rs" = 0.4926
 "crates/nic-driver-core/src/port.rs" = 0.4575
 "crates/packet-buffer/src/lib.rs" = 0.4529
@@ -41,14 +44,20 @@
 "crates/pd-runtime/src/lib.rs" = 0.4954
 "crates/queue/src/lib.rs" = 0.4260
 "crates/routing/src/lib.rs" = 0.2725
+"crates/uart-16550/src/lib.rs" = 0.5239
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
-"crates/wire/src/lib.rs" = 0.2040
-"pds/config/src/main.rs" = 0.4518
-"pds/forwarder/src/main.rs" = 0.3898
-"pds/nic-driver/src/main.rs" = 0.4844
+"crates/wire/src/lib.rs" = 0.1941
+"crates/wire/src/log_record.rs" = 0.2216
+"crates/wire/src/log_ring.rs" = 0.4120
+"crates/wire/src/log_slot.rs" = 0.1254
+"pds/config/src/main.rs" = 0.4511
+"pds/console/src/com1.rs" = 0.6400
+"pds/console/src/main.rs" = 0.5694
+"pds/forwarder/src/main.rs" = 0.3878
+"pds/nic-driver/src/main.rs" = 0.4675
 
 [unsafe-blocks]
 "crates/config" = 0
@@ -59,9 +68,11 @@
 "crates/pd-runtime" = 4
 "crates/queue" = 0
 "crates/routing" = 0
+"crates/uart-16550" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
 "pds/config" = 0
+"pds/console" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 4
 
@@ -74,9 +85,11 @@
 "crates/pd-runtime" = 1
 "crates/queue" = 0
 "crates/routing" = 0
+"crates/uart-16550" = 0
 "crates/virtio" = 4
 "crates/wire" = 0
 "pds/config" = 0
+"pds/console" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0
 
@@ -89,8 +102,10 @@
 "crates/pd-runtime" = 0
 "crates/queue" = 0
 "crates/routing" = 0
+"crates/uart-16550" = 0
 "crates/virtio" = 0
 "crates/wire" = 0
 "pds/config" = 0
+"pds/console" = 0
 "pds/forwarder" = 0
 "pds/nic-driver" = 0

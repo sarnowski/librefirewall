@@ -10,10 +10,12 @@ members = [
     "crates/virtio",
     "crates/pd-runtime",
     "crates/nic-driver-core",
+    "crates/uart-16550",
     "crates/config",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",
+    "pds/console",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]
@@ -25,6 +27,11 @@ version = "0.1.0"
 
 [workspace.dependencies]
 sel4-microkit = { path = "/opt/rust-sel4/crates/sel4-microkit" }
+# The raw seL4 API, for the one thing `sel4-microkit` does not wrap: invoking an
+# x86 I/O-port capability (`pds/console/src/com1.rs`). Same pinned tree as
+# `sel4-microkit`, which already depends on it, so this adds no input to pin —
+# only a name to reach it by.
+sel4 = { path = "/opt/rust-sel4/crates/sel4" }
 # Property-testing framework, dev-dependency only (host test builds are `std`;
 # it never enters a `no_std`/PD build). Pinned here and resolved exactly through
 # Cargo.lock so the offline builder can fetch it.

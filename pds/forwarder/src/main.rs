@@ -17,20 +17,19 @@
 //!
 //! # Constraints
 //!
-//! Two [`ForwardRings`] regions, the two [`Pool`]s they index, and the two
-//! configuration regions are the entire grant — no device capability, and of
-//! each pipeline not the `free` ring, on which a forged return would put a live
-//! DMA target back onto an owner's free stack. The pool is mapped because a
-//! routed frame's L2/L3 headers are rewritten in place, so a compromised
-//! forwarder can corrupt a frame in flight; it still cannot forge a return,
-//! which is the isolation the region split exists for. The handover region is
-//! read-only, so it cannot rewrite the configuration it is judged by either.
+//! Two [`ForwardRings`] regions, the two [`Pool`]s they index, the two
+//! configuration regions and its own log ring are the entire grant — no device
+//! capability, and of each pipeline not the `free` ring, on which a forged
+//! return would put a live DMA target back onto an owner's free stack. The pool
+//! is mapped because a routed frame's headers are rewritten in place, so a
+//! compromised forwarder can corrupt a frame in flight; it still cannot forge a
+//! return. The handover region is read-only, so it cannot rewrite the
+//! configuration it is judged by either.
 //!
 //! Ring handles are taken once and kept for the domain's life, a handle being
 //! this domain's position: one per notification would restart at slot zero and
-//! re-deliver. Microkit coalesces notifications and a wakeup names no port, so
-//! both pipelines drain unconditionally; the drivers poll, so nothing is
-//! notified onward.
+//! re-deliver. A wakeup names no port, so both pipelines drain unconditionally;
+//! the drivers poll, so nothing is notified onward.
 //!
 //! # There is no configuration in this file
 //!
@@ -38,58 +37,33 @@
 //! generation 0 — no interfaces, no neighbours, nothing forwarded — is what
 //! this domain runs under until one does. That is the absence of policy rather
 //! than a default: an appliance whose configuration was refused forwards
-//! nothing and says so, instead of carrying traffic under a table nobody wrote.
-//! What is still compiled in is the *wiring* — which ports exist and which
-//! pipeline joins which pair — fixed by the system description (CONCEPT §12.3).
+//! nothing and says so. What is still compiled in is the *wiring* — which ports
+//! exist and which pipeline joins which pair (CONCEPT §12.3).
 //!
-//! # Why the console `Sink` is written here and not once in `crates/log`
+//! # Records go to a ring, not to `debug_println!`
 //!
-//! Printing needs `sel4_microkit::debug_println`, and everything under
-//! `crates/` is deliberately free of Microkit so that it can be host-tested, so
-//! each protection domain carries its own dozen lines of backend.
+//! That macro compiles to `seL4_DebugPutChar`, absent from the release kernel.
 
-use lfw_log::{
-    Domain, DomainDetail, DomainState, Event, GenerationOutcome, MAX_LINE_LEN, Sink, render,
-};
+use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
 use pd_runtime::{
     ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch, ForwardRings, MAX_INTERFACES,
     MAX_NEIGHBOURS, Offer, Pool, RouteStage, attach_region,
 };
 use routing::PortId;
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
+use wire::{LogConsume, LogRecords};
 
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
 
 /// How many dataplane ports this domain is wired to — the same build fact
 /// [`PORT0`] and [`PORT1`] express. An offered configuration is held to it, so
-/// a table naming a port with no driver is refused here too, not only where it
-/// was written.
+/// a table naming a port with no driver is refused here too.
 const PORTS: u8 = 2;
 
 /// The configuration domain. Unlike the driver channels, this one carries
 /// notifications both ways; see the system description on why.
 const CONFIG: Channel = Channel::new(2);
-
-const CONSOLE: Console = Console;
-
-/// The console as a [`Sink`]: the only channel this build has (CONCEPT §11), so
-/// a line that will not render is reported as the event it came from (ENG-12).
-struct Console;
-
-impl Sink for Console {
-    fn emit(&self, event: &Event) {
-        let mut line = [0u8; MAX_LINE_LEN];
-        let rendered = render(event, &mut line)
-            .ok()
-            .and_then(|written| line.get(..written))
-            .and_then(|bytes| core::str::from_utf8(bytes).ok());
-        match rendered {
-            Some(text) => debug_println!("{text}"),
-            None => debug_println!("LFW-PD unrendered={event:?}"),
-        }
-    }
-}
 
 #[protection_domain]
 fn init() -> Forwarder {
@@ -99,15 +73,18 @@ fn init() -> Forwarder {
     let pool1: &'static Pool = attach_region!(pool1_vaddr: Pool);
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
     let ack: &'static ConfigAck = attach_region!(cfgack_vaddr: ConfigAck);
+    let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
+    let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let sink = RingSink::new(log.writer(log_consume));
 
-    CONSOLE.emit(&Event::Domain {
+    sink.emit(&Event::Domain {
         domain: Domain::Forwarder,
         state: DomainState::Starting,
         detail: DomainDetail::None,
     });
     // Recorded, so a node that never leaves the fail-closed generation is
     // distinguishable from one that was never configured at all.
-    CONSOLE.emit(&applied(0));
+    sink.emit(&applied(0));
 
     Forwarder {
         stages: [
@@ -117,6 +94,7 @@ fn init() -> Forwarder {
         switch: ConfigurationSwitch::new(PORTS),
         handover,
         ack,
+        sink,
     }
 }
 
@@ -124,8 +102,7 @@ const fn applied(generation: u32) -> Event {
     Event::ConfigGeneration {
         generation,
         outcome: GenerationOutcome::Applied,
-        // The diff is the publishing domain's record; this one says which
-        // generation is now carrying traffic.
+        // The diff is the publisher's record; this says what carries traffic.
         changes: 0,
     }
 }
@@ -135,6 +112,8 @@ struct Forwarder {
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,
+    /// Kept for the domain's life; a second half would restart at slot zero.
+    sink: RingSink<'static>,
 }
 
 impl Handler for Forwarder {
@@ -142,15 +121,13 @@ impl Handler for Forwarder {
 
     /// A wakeup names neither a port nor a reason, so every question is asked
     /// of the regions: take a newly offered configuration, switch to one the
-    /// publisher has released, then drain both pipelines.
-    ///
-    /// The order is what makes a commit atomic: the switch happens before the
-    /// first poll of this wakeup and cannot happen during one, so a frame is
-    /// decided entirely under one generation.
+    /// publisher has released, then drain both pipelines. The order is what
+    /// makes a commit atomic — the switch cannot happen during a poll, so a
+    /// frame is decided entirely under one generation.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         if let Some(offer) = self.switch.take_offer(self.handover, self.ack) {
             if let Some(event) = offer.event() {
-                CONSOLE.emit(&event);
+                self.sink.emit(&event);
             }
             if matches!(offer, Offer::Staged { .. }) {
                 // The publisher commits nothing until it sees this.
@@ -158,7 +135,7 @@ impl Handler for Forwarder {
             }
         }
         if let Some(generation) = self.switch.take_commit(self.handover, self.ack) {
-            CONSOLE.emit(&applied(generation));
+            self.sink.emit(&applied(generation));
         }
         let configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS> =
             self.switch.configuration();

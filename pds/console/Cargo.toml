@@ -1,0 +1,16 @@
+[package]
+name = "console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sel4.workspace = true
+sel4-microkit.workspace = true
+lfw-log = { path = "../../crates/log" }
+pd-runtime = { path = "../../crates/pd-runtime" }
+uart-16550 = { path = "../../crates/uart-16550" }
+wire = { path = "../../crates/wire" }
+
+[lints]
+workspace = true

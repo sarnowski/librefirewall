@@ -76,7 +76,7 @@ pub(crate) const CONFIG_PATH_VAR: &str = "LIBREFIREWALL_CONFIG_PATH";
 /// The single owner of that list: [`crate::host::test_host`] lints exactly these
 /// packages for the seL4 target, so a PD added here is linted by the same edit
 /// that makes it shippable and cannot slip through unlinted.
-pub(crate) const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder", "config-pd"];
+pub(crate) const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder", "config-pd", "console"];
 
 /// The pinned SDK's include directory for one seL4 kernel configuration.
 ///
@@ -241,6 +241,12 @@ fn assemble(
             .arg(build.join(BUILD_MICROKIT_REPORT)),
         "assemble Microkit image",
     )?;
+
+    // Held here rather than beside the other input checks above because it is
+    // the assembled image that is judged, and it does not exist until the line
+    // above has run. What it rejects is an image GRUB could place below the
+    // seL4 kernel; the whole argument is on the function.
+    grub::check_boot_module_placement(root, &build.join(BUILD_SYSTEM_IMAGE))?;
 
     // The loose kernel/system pair is published as the update input; the disk
     // below is the deployable artifact. The 32-bit kernel ELF is the Multiboot2

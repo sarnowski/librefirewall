@@ -68,6 +68,7 @@ name = "lfw-log"
 version = "0.1.0"
 dependencies = [
  "net-headers",
+ "wire",
 ]
 
 [[package]]
@@ -92,6 +93,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "config",
+ "lfw-log",
  "libfuzzer-sys",
  "net-headers",
  "nic-driver-core",

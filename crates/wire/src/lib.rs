@@ -38,13 +38,38 @@
 //! copies out. Its words move `Relaxed` under the generation that publishes
 //! them `Release`, and nothing stops the writer rewriting them afterwards,
 //! which is why a [`CheckedConfig`] owns decoded values rather than borrowing.
+//!
+//! The log transport is a third object of the same kind, and the reason it is
+//! here rather than beside the events it carries is the dependency direction: a
+//! region's layout cannot be expressed in terms of the crate that reads it. A
+//! [`LogRecord`] is `lfw_log::Event` reduced to integers and fixed byte arrays,
+//! [`LogRecords`] and [`LogConsume`] are the ring's two halves — one region per
+//! direction, as the handover is — and [`LogRecord::check`] turns peer-written
+//! bytes back into fields a console may render, text included, because this
+//! decode is the last thing between a hostile writer and a serial line (OBS-5).
 
 #![cfg_attr(not(test), no_std)]
+
+mod log_record;
+mod log_ring;
+mod log_slot;
 
 use core::{
     fmt,
     mem::{align_of, offset_of, size_of},
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
+};
+
+pub use log_record::{
+    CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,
+    CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT,
+    LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT,
+    LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT, LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind,
+    LogRecord, LogRecordError, LogText, LogValueKind, TextImage, ValueImage,
+};
+pub use log_ring::{
+    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
+    LogReader, LogRecords, LogRingFull, LogWriter,
 };
 
 /// The producing domain's decision about the frame a [`Descriptor`] names.
@@ -274,14 +299,14 @@ impl ConfigImage {
 
 /// Copies `bytes` into the cells that hold them, one cell at a time. Bounded
 /// by the arrays, which are the same length by the signature.
-fn store_bytes<const N: usize>(cells: &[AtomicU8; N], bytes: [u8; N]) {
+pub(crate) fn store_bytes<const N: usize>(cells: &[AtomicU8; N], bytes: [u8; N]) {
     for (cell, byte) in cells.iter().zip(bytes) {
         cell.store(byte, Ordering::Relaxed);
     }
 }
 
 /// The inverse of [`store_bytes`].
-fn load_bytes<const N: usize>(cells: &[AtomicU8; N]) -> [u8; N] {
+pub(crate) fn load_bytes<const N: usize>(cells: &[AtomicU8; N]) -> [u8; N] {
     let mut bytes = [0; N];
     for (byte, cell) in bytes.iter_mut().zip(cells) {
         *byte = cell.load(Ordering::Relaxed);

@@ -21,19 +21,36 @@
 //!
 //! # The ordering it asserts, and the ordering it does not
 //!
-//! Three records are the protocol's, not one domain's, and only the ordering
-//! the protocol guarantees is asserted:
+//! Two domains write this channel, each into its own ring, and the console
+//! domain decides what reaches the line: `log::console::ConsolePrinter::drain`
+//! takes at most `BURST_PER_RING` records from a ring per pass and starts each
+//! pass one ring further along than the last, which is the fairness rule that
+//! stops a flooding ring starving another
+//! (`console::tests::each_pass_starts_one_ring_further_along` and
+//! `console::tests::the_rotation_serves_the_later_ring_first_when_its_turn_comes`
+//! hold it). So *which* domain's record reaches the line first is decided by
+//! where that rotation stood, not by which event happened first, and the
+//! records carry no clock to appeal to (MONITORING.md). Production order is not
+//! emission order, and asserting one as the other asserts against the rotation.
 //!
-//! * The change records and the publishing domain's `outcome=applied` summary
-//!   come from one domain in one call, in `seq` order.
-//! * The forwarding domain's own `outcome=applied` for that generation can only
-//!   follow it: the domain switches when the publisher has committed, and the
-//!   publisher commits only after the commit that produced the summary.
-//! * The fail-closed `generation=0` record comes from the forwarding domain's
-//!   `init`, so it precedes that domain's switch — and nothing orders it
-//!   against the publishing domain's records at all. Its position among them is
-//!   therefore *not* asserted; only that there is exactly one of it and that it
-//!   is not seen after the switch.
+//! The transcript is therefore judged as the merge of two chains — each totally
+//! ordered, because one ring has one writer publishing into it in order — with
+//! nothing asserted across them:
+//!
+//! * **The publishing domain's chain.** The change records in `seq` order, then
+//!   its own `outcome=applied` summary, which the same call writes after the
+//!   last of them. Asserted as a *subsequence*, not a contiguous block: the
+//!   chain is longer than one burst, so another domain's records may fall
+//!   inside it.
+//! * **The forwarding domain's chain.** The fail-closed `generation=0` record
+//!   its `init` writes, then its own `outcome=applied` for the generation it
+//!   switched to.
+//!
+//! Everything else is a set: these two chains are the whole of what the channel
+//! carried, each record exactly once, and no `rejected=` record among them.
+//! Either domain's block may lead, and either may sit inside the other; a
+//! record that is missing, doubled, invented, or out of its *own* domain's
+//! order is refused.
 
 use std::path::Path;
 
@@ -227,30 +244,42 @@ impl ConfigContract {
             ));
         };
 
-        // Every other record, in the order it was emitted. The fail-closed one
-        // is lifted out because nothing orders it against the publishing
-        // domain's records; everything left is one ordered chain.
-        let rest: Vec<&str> = observed
+        // The publishing domain's chain: its change records in `seq` order and
+        // then its own summary, all written into one ring by one call.
+        let mut published: Vec<&str> = self.changes.iter().map(String::as_str).collect();
+        published.push(&committed);
+
+        // The whole of what the channel must have carried. Only the set is
+        // asserted here — which domain's records the rotation put first is not
+        // this contract's to decide — and each chain's own order below.
+        let expected: Vec<&str> = published
             .iter()
-            .enumerate()
-            .filter(|(index, _)| index != fail_closed_at)
-            .map(|(_, line)| *line)
+            .copied()
+            .chain([fail_closed.as_str(), switched.as_str()])
             .collect();
-        let mut expected: Vec<&str> = self.changes.iter().map(String::as_str).collect();
-        expected.push(&committed);
-        expected.push(&switched);
-        if rest != expected {
+        if let Some(mismatch) = set_mismatch(&expected, &observed) {
             return Err(format!(
-                "the configuration channel did not carry the transcript this document \
-                 describes\n{}\n  full run log: {}",
-                describe(&expected, &rest),
+                "the configuration channel did not carry the records this document \
+                 describes\n{mismatch}\n  observed: {observed:#?}\n  full run log: {}",
                 log.display()
             ));
         }
 
-        // The forwarding domain emits the fail-closed record in `init` and the
-        // switch in a later wakeup, both from one single-threaded domain, so
-        // the first may never be seen after the second.
+        // One ring, one writer, published in order, so the reader sees that
+        // order — as a subsequence rather than a contiguous run, the chain
+        // being longer than the console's per-ring burst.
+        if let Some(inversion) = chain_inversion(&published, &observed) {
+            return Err(format!(
+                "the configuration domain's records did not reach the line in the `seq` order \
+                 one ring with one writer publishes them in\n{inversion}\n  observed: \
+                 {observed:#?}\n  full run log: {}",
+                log.display()
+            ));
+        }
+
+        // The forwarding domain's own chain, by the same argument: it emits the
+        // fail-closed record in `init` and the switch in a later wakeup, both
+        // into one ring, so the first may never be seen after the second.
         match observed.iter().rposition(|line| *line == switched) {
             Some(switch_at) if *fail_closed_at < switch_at => Ok(()),
             _ => Err(format!(
@@ -341,27 +370,66 @@ fn records_in_line(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Name the first place two transcripts part company, then print both. The
-/// index alone is what makes a sixteen-record diff readable; the two lists
-/// behind it are what makes it actionable.
-fn describe(expected: &[&str], observed: &[&str]) -> String {
-    let first = expected
+/// Name the records the channel did not carry exactly once and those it carried
+/// that the document describes none of. `None` where the two sets agree.
+///
+/// Two lists rather than a positional diff, because the two domains' blocks may
+/// interleave in any way: a record's *index* in the observed stream carries no
+/// verdict, so reporting one as the difference would name the rotation rather
+/// than the defect.
+fn set_mismatch(expected: &[&str], observed: &[&str]) -> Option<String> {
+    let carried = |record: &str| observed.iter().filter(|line| **line == record).count();
+    let absent: Vec<&str> = expected
         .iter()
-        .zip(observed)
-        .position(|(left, right)| left != right);
-    let head = match first {
-        Some(index) => format!(
-            "  first difference at record {index}:\n    expected: {:?}\n    observed: {:?}",
-            expected.get(index),
-            observed.get(index),
-        ),
-        None => format!(
-            "  the shorter transcript is a prefix of the longer: {} records expected, {} observed",
-            expected.len(),
-            observed.len(),
-        ),
-    };
-    format!("{head}\n  expected: {expected:#?}\n  observed: {observed:#?}")
+        .copied()
+        .filter(|record| carried(record) == 0)
+        .collect();
+    let repeated: Vec<(usize, &str)> = expected
+        .iter()
+        .map(|record| (carried(record), *record))
+        .filter(|(times, _)| *times > 1)
+        .collect();
+    let unexpected: Vec<&str> = observed
+        .iter()
+        .copied()
+        .filter(|line| !expected.iter().any(|record| record == line))
+        .collect();
+    if absent.is_empty() && repeated.is_empty() && unexpected.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  absent, and the document describes one of each: {absent:#?}\n  \
+         carried this many times, where the document describes one: {repeated:#?}\n  \
+         carried, and the document describes no such record: {unexpected:#?}"
+    ))
+}
+
+/// Name the first record of `chain` that reached the line before the record it
+/// was published after. `None` where the chain is a subsequence of `observed`.
+///
+/// It reads a position per record rather than walking the stream once, which
+/// [`set_mismatch`] having already passed is what makes sound: every record of
+/// `chain` then sits at exactly one position, so the chain is in order exactly
+/// when those positions rise. The records are pairwise distinct — the change
+/// records by their `seq`, the two summaries by a change count that
+/// [`ContractError::MovesNothing`] keeps non-zero — so no position is shared.
+fn chain_inversion(chain: &[&str], observed: &[&str]) -> Option<String> {
+    let mut previous: Option<(usize, &str)> = None;
+    for record in chain {
+        let Some(at) = observed.iter().position(|line| line == record) else {
+            return Some(format!("  the channel carried no {record:?} at all"));
+        };
+        if let Some((published_at, published)) = previous
+            && at < published_at
+        {
+            return Some(format!(
+                "  {record:?} reached the line at record {at}, before {published:?} at record \
+                 {published_at} — which the domain published first"
+            ));
+        }
+        previous = Some((at, record));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -399,25 +467,46 @@ mod tests {
             .collect()
     }
 
-    /// The serial capture a boot from `document` must produce, in the order the
-    /// appliance was observed to produce it: the publishing domain runs at the
-    /// highest priority in the system, so it commits before the forwarding
-    /// domain's `init` runs at all.
-    fn capture(contract: &ConfigContract) -> String {
-        let mut text =
-            String::from("Bootstrapping kernel\r\nLFW-PD domain=config state=starting\r\n");
+    /// Which domain's ring the console's rotation served first, and therefore
+    /// which of the two blocks leads the capture.
+    #[derive(Clone, Copy, Debug)]
+    enum Leading {
+        Publisher,
+        Forwarder,
+    }
+
+    /// The serial capture a boot from `document` produces when the rotation put
+    /// `leading`'s ring first. Both orders are the same boot: the two domains
+    /// write two rings and the console decides what reaches the line, so this
+    /// is the one axis the appliance may vary without anything having gone
+    /// wrong.
+    fn capture_with(contract: &ConfigContract, leading: Leading) -> String {
+        let mut publisher = String::from("LFW-PD domain=config state=starting\r\n");
         for record in &contract.changes {
-            text.push_str(record);
-            text.push_str("\r\n");
+            publisher.push_str(record);
+            publisher.push_str("\r\n");
         }
-        text.push_str(&contract.committed().unwrap());
-        text.push_str("\r\nLFW-PD domain=config state=ready\r\n");
-        text.push_str("LFW-PD domain=forwarder state=starting\r\n");
-        text.push_str(&ConfigContract::fail_closed().unwrap());
-        text.push_str("\r\n");
-        text.push_str(&ConfigContract::switched().unwrap());
-        text.push_str("\r\nLFW-PD domain=nic-driver state=ready rx-posted=16\r\n");
-        text
+        publisher.push_str(&contract.committed().unwrap());
+        publisher.push_str("\r\nLFW-PD domain=config state=ready\r\n");
+
+        let forwarder = format!(
+            "LFW-PD domain=forwarder state=starting\r\n{}\r\n{}\r\nLFW-PD domain=nic-driver \
+             state=ready rx-posted=16\r\n",
+            ConfigContract::fail_closed().unwrap(),
+            ConfigContract::switched().unwrap()
+        );
+
+        let (first, second) = match leading {
+            Leading::Publisher => (publisher, forwarder),
+            Leading::Forwarder => (forwarder, publisher),
+        };
+        format!("Bootstrapping kernel\r\n{first}{second}")
+    }
+
+    /// The publisher-first capture, which every test that edits one record of a
+    /// transcript builds on.
+    fn capture(contract: &ConfigContract) -> String {
+        capture_with(contract, Leading::Publisher)
     }
 
     #[test]
@@ -475,6 +564,77 @@ mod tests {
     }
 
     #[test]
+    fn either_domains_block_may_lead_and_both_orders_are_the_same_boot() {
+        // The defect this replaced: the merged stream was asserted as one total
+        // order, so the transcript passed only if the publishing domain's
+        // records reached the line before the forwarding domain's switch. The
+        // console provides no such order — `ConsolePrinter::drain` rotates
+        // which ring it serves first on every pass, which
+        // `console::tests::the_rotation_serves_the_later_ring_first_when_its_turn_comes`
+        // holds as a contract because it is what stops a flooding ring starving
+        // another. A real boot took the other rotation
+        // (`build/image/qemu-generation-swap.log` carries the forwarding
+        // domain's two records ahead of all seventeen of the publisher's) and
+        // was judged a failure with every record present and byte-correct.
+        let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
+        for leading in [Leading::Publisher, Leading::Forwarder] {
+            let text = capture_with(&contract, leading);
+            contract
+                .judge(text.as_bytes(), log())
+                .unwrap_or_else(|verdict| panic!("{leading:?} first is a passing boot: {verdict}"));
+        }
+    }
+
+    #[test]
+    fn a_publishers_record_out_of_seq_order_is_still_refused() {
+        // What keeps the contract above from being a set comparison that any
+        // permutation satisfies. The two blocks may interleave, but one ring
+        // has one writer publishing in order, so a change record that reached
+        // the line before the record published ahead of it did not come off
+        // that ring in the order the domain wrote it.
+        let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
+        let (earlier, later) = (&contract.changes[3], &contract.changes[4]);
+        let text = capture(&contract).replace(
+            &format!("{earlier}\r\n{later}\r\n"),
+            &format!("{later}\r\n{earlier}\r\n"),
+        );
+        let verdict = contract
+            .judge(text.as_bytes(), log())
+            .expect_err("two change records swapped");
+        assert!(verdict.contains("seq=4"), "{verdict}");
+        assert!(verdict.contains("seq=3"), "{verdict}");
+        assert!(
+            verdict.contains("which the domain published first"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn a_summary_ahead_of_the_changes_it_counts_is_still_refused() {
+        // The other half of the publishing domain's chain: the summary is
+        // written by the same call, after the last change record, so a capture
+        // that carries it first describes a domain that counted a diff it had
+        // not yet recorded.
+        let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
+        let committed = contract.committed().unwrap();
+        let first = &contract.changes[0];
+        let text = capture(&contract)
+            .replace(&format!("{committed}\r\n"), "")
+            .replace(
+                &format!("{first}\r\n"),
+                &format!("{committed}\r\n{first}\r\n"),
+            );
+        let verdict = contract
+            .judge(text.as_bytes(), log())
+            .expect_err("the summary ahead of the records it summarises");
+        assert!(verdict.contains("changes=16"), "{verdict}");
+        assert!(
+            verdict.contains("which the domain published first"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
     fn a_boot_carrying_another_documents_transcript_is_refused() {
         let shipped = ConfigContract::from_document(SHIPPED).expect("the shipped document");
         let alternate = ConfigContract::from_document(ALTERNATE).expect("the alternate document");
@@ -484,8 +644,10 @@ mod tests {
         let verdict = alternate
             .judge(capture(&shipped).as_bytes(), log())
             .expect_err("the wrong document's transcript");
+        // Both halves of the set verdict: this document's records absent, the
+        // other document's carried in their place.
         assert!(
-            verdict.contains("first difference at record 0"),
+            verdict.contains("did not carry the records this document describes"),
             "{verdict}"
         );
         assert!(verdict.contains("dataplane-0"), "{verdict}");
@@ -517,10 +679,10 @@ mod tests {
         let verdict = contract
             .judge(text.as_bytes(), log())
             .expect_err("a value that moved with no record of it");
-        assert!(
-            verdict.contains("first difference at record 7"),
-            "{verdict}"
-        );
+        // The verdict names the record itself, which is what an operator needs:
+        // its index in a merged stream two rotations can order two ways is not.
+        assert!(verdict.contains("absent"), "{verdict}");
+        assert!(verdict.contains(&dropped), "{verdict}");
     }
 
     #[test]
@@ -552,6 +714,34 @@ mod tests {
             .judge(text.as_bytes(), log())
             .expect_err("the fail-closed record after the switch");
         assert!(verdict.contains("after the switch"), "{verdict}");
+    }
+
+    #[test]
+    fn a_boot_whose_console_said_nothing_at_all_is_refused() {
+        // The defect `xtask release` now asserts against, reduced to what the
+        // reader sees. A release image whose domains logged through a kernel
+        // debug syscall the release kernel does not carry emits not one byte on
+        // the serial line, while forwarding exactly as it should — so the only
+        // thing that separates it from a healthy node is an empty capture, and
+        // this is the reader that must refuse one.
+        //
+        // A boot that produced no serial output whatsoever, and one that
+        // produced a kernel banner and no `LFW-` record, are the same verdict
+        // here: neither carried the transcript.
+        let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
+        for silent in [
+            b"".as_slice(),
+            b"Bootstrapping kernel\r\nAvailable phys memory regions: 1\r\n".as_slice(),
+        ] {
+            let verdict = contract
+                .judge(silent, log())
+                .expect_err("a boot whose console carried nothing");
+            assert!(verdict.contains("appears 0 times"), "{verdict}");
+            assert!(
+                verdict.contains("never running the empty table"),
+                "{verdict}"
+            );
+        }
     }
 
     #[test]
@@ -702,10 +892,15 @@ mod tests {
         let verdict = contract
             .judge(text.as_bytes(), log())
             .expect_err("a record torn through its middle");
-        // Sixteen change records, the publisher's summary, and the switch that
-        // was torn: the first difference is the last of them.
+        // The switch record is absent, and the head fragment the tear left
+        // behind is reported as a record nothing describes — never read as the
+        // switch having happened.
+        let (missing, carried) = verdict
+            .split_once("carried this many times")
+            .expect("the set verdict names what the channel did not carry");
+        assert!(missing.contains(&switched), "{verdict}");
         assert!(
-            verdict.contains("first difference at record 17"),
+            carried.contains(&format!("{:?}", head.trim_end())),
             "{verdict}"
         );
     }

@@ -18,11 +18,12 @@
 //! edited by the same people who edit the constants it must agree with, so
 //! CON-2 names no CONCEPT §7.1 adversary for this path. What it defends against
 //! is the ordinary edit that moves one side and not the other — which is why
-//! [`REGIONS`], [`DOMAINS`], [`CHANNEL_ENDS`] and [`MODELLED_TAGS`] are
-//! *exhaustive* rather than best-effort. A region, a domain, a channel end, or
-//! an element type this module does not name is a finding, not a silent skip: a
-//! region nothing claims is a grant nothing compares, and it would enter the
-//! description already exempt from the check that exists to judge it.
+//! [`REGIONS`], [`IO_PORTS`], [`DOMAINS`], [`CHANNEL_ENDS`] and
+//! [`MODELLED_TAGS`] are *exhaustive* rather than best-effort. A region, an
+//! I/O-port window, a domain, a channel end, or an element type this module
+//! does not name is a finding, not a silent skip: a region nothing claims is a
+//! grant nothing compares, and it would enter the description already exempt
+//! from the check that exists to judge it.
 //!
 //! # The grant is a set, and both directions of it are checked
 //!
@@ -32,6 +33,17 @@
 //! read: the forwarder maps two ring regions, and mapping a buffer pool into it
 //! — the one edit that would hand a compromised forwarder every frame in flight
 //! — fails here, at the point the edit is made.
+//!
+//! # A memory mapping is not the only authority a description grants
+//!
+//! `<ioport>` hands a protection domain a window of the x86 I/O permission
+//! bitmap, which is authority over a device on exactly the footing a `<map>` is
+//! authority over memory: `in` and `out` are privileged instructions, and a
+//! domain holding a port executes them against whatever decodes it. [`IO_PORTS`]
+//! is therefore judged the way [`REGIONS`] is, in both directions and against
+//! the crate constants the driver forms its addresses from — a grant no rule
+//! names, a rule no grant matches, and a window that moved or widened are four
+//! separate findings rather than four silences.
 //!
 //! # Why the scanner is a scanner and not a substring search
 //!
@@ -58,8 +70,11 @@ use std::{fs, path::Path};
 
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
+use uart_16550::{COM1_BASE, PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
-use wire::{CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE};
+use wire::{
+    CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
+};
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
 
@@ -216,6 +231,19 @@ const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It ha
      device writes would additionally become reachable from the CPU side of the same domain. The \
      forwarder's own pool mapping is not an exclusion this rule defends: it is granted, because a \
      domain that rewrites a header must reach the bytes";
+
+/// As [`POOL_WITHHELD`], for the log transport — the exclusion that holds
+/// between the four writing domains, and the one thing about a log region that
+/// is a mapping rather than an authority.
+///
+/// What each pair's *perms* withhold is a different argument and is not stated
+/// here: it lives in the [`Grant`]s, exactly as `cfg`/`cfgack`'s does, because
+/// both domains map both regions of a pair and only the authority differs.
+const LOG_WITHHELD: &str = "no writing domain maps another writing domain's ring, in either \
+     direction. A compromised parser domain cannot read what a driver has said about itself, \
+     cannot rewrite it, and cannot silence it by advancing a consume cursor that is not its own \
+     — every pair of writing domains is disjoint here, and this row is what makes that true \
+     (systems/qemu-x86_64/librefirewall.system, beside the log regions)";
 
 /// As [`POOL_WITHHELD`], for the return rings — the exclusion the forwarder's
 /// isolation now rests on entirely.
@@ -402,14 +430,199 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("config"), read_write("forwarder")],
         withheld: None,
     },
+    // The log transport: one ring per writing domain, split into two regions so
+    // the two directions can carry opposite authority. Every pair below is the
+    // same two rows twice over, and the pattern is the whole of the design:
+    //
+    //  * `log_<domain>` holds the slots and the producer cursor. The writer has
+    //    it read-write and the console read-only, so the console cannot store
+    //    into a slot, cannot advance the cursor that publishes one, and cannot
+    //    rewrite the count of what that domain says it lost. A console that
+    //    could would attribute a line to a domain that never emitted it — and
+    //    it is the one domain whose output an operator reads as testimony about
+    //    the others.
+    //  * `log_<domain>_consume` holds the console's consume cursor and nothing
+    //    else. The console has it read-write and the writer read-only, so a
+    //    writer cannot forge how much of its own ring has been read: one that
+    //    could would move the cursor forward to reuse slots the console had not
+    //    rendered, discarding records while its own drop count stayed at zero —
+    //    silent loss reported as none.
+    //
+    // Neither property survives the two being one region, and neither is
+    // visible in a mapper set: both domains map both halves, so only the perms
+    // differ, which is why a rule's perms are per grant. The two rows of a pair
+    // therefore read as each other's mirror, and a pair that stopped mirroring
+    // is exactly the edit these rules exist to refuse.
+    RegionRule {
+        name: "log_forwarder",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("forwarder"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_forwarder_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("forwarder"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver0",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver0"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver0_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("nic_driver0"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver1",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver1"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver1_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("nic_driver1"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_config",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("config"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_config_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("config"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
 ];
+
+/// What an I/O-port grant withholds, quoted into the finding that reports one
+/// being widened, moved, or handed to a second domain.
+///
+/// Not [`Option`] as a region's is: a port window is carved out of a 65536-port
+/// space in which every other port is refused, so a rule that withheld nothing
+/// would be a rule granting the whole space. There is no shape of this table
+/// that has nothing to say here, and making it unrepresentable is cheaper than
+/// a test asserting it (DOC-9).
+const COM1_WITHHELD: &str = "every other port in the 65536-port space stays refused, and to every \
+     domain: no PCI configuration address/data pair at 0xCF8/0xCFC — a second path to every \
+     device's configuration space, beside the ECAM mappings the drivers hold — no PS/2 \
+     controller, no PIC, no PIT, no CMOS/RTC and no debug port. The drivers, the forwarder and \
+     the configuration domain hold zero I/O ports between them, so an attacker who reaches one \
+     of them reaches no port instruction that will execute. This is also what makes the console \
+     the sole writer of the device: several writers on one unsynchronised register file splice \
+     their bytes into one another, and a capability held by exactly one domain is what makes \
+     that unrepresentable rather than unlikely";
+
+/// The exported Rust constant one attribute of an `<ioport>` must equal.
+///
+/// [`ExpectedSize`] is this shape for a region's extent, and is deliberately
+/// not reused: a port window is two facts rather than one, and neither of them
+/// is a byte count. Both come from `crates/uart-16550`, whose header takes the
+/// window as the premise its addressing rests on — "every address as
+/// `COM1_BASE | offset` with the base's alignment to an eight-port window
+/// asserted at build time, so no address it can form leaves this row". This is
+/// where that delegated precondition is enforced (DOC-7).
+struct ExpectedPort {
+    /// Carried beside the value so a disagreement names both sides rather than
+    /// printing two numbers.
+    rust_name: &'static str,
+    value: u64,
+}
+
+/// One `<ioport>` the description may declare: which domain may hold which
+/// window of the x86 I/O permission bitmap.
+///
+/// An I/O-port grant is authority exactly as a `<map>` is. On x86 `in` and
+/// `out` are privileged and seL4 gates them per port, so a window handed to a
+/// domain is that domain's licence to drive whatever decodes it — and a window
+/// that widened, moved, or turned up in a second domain is a capability change
+/// on the same footing as a widened memory grant (ENG-1, SCM-6).
+struct IoPortRule {
+    domain: &'static str,
+    /// The `id` attribute — the grant's identifier *within* the domain, and the
+    /// granularity the authority exists at, exactly as a [`ChannelEnd`]'s is. A
+    /// domain may hold several windows, so "which window" is a question about
+    /// one id and never about the domain, and keying on the domain alone would
+    /// judge the first grant and exempt every later one.
+    id: &'static str,
+    /// The first port in the window, and how many consecutive ports follow it.
+    /// Held as the two attributes the description writes rather than as a
+    /// range, because those two are what an edit moves.
+    addr: ExpectedPort,
+    size: ExpectedPort,
+    withheld: &'static str,
+}
+
+/// Every I/O-port grant the description may declare. One grant on one domain is
+/// the whole table, and that is the property rather than an accident of how
+/// little the system does today: a second row here is a second domain able to
+/// execute a port instruction, and adding one is the review ENG-1 requires.
+const IO_PORTS: &[IoPortRule] = &[IoPortRule {
+    domain: "console",
+    id: "0",
+    addr: ExpectedPort {
+        rust_name: "uart_16550::COM1_BASE",
+        value: COM1_BASE as u64,
+    },
+    size: ExpectedPort {
+        rust_name: "uart_16550::PORT_COUNT",
+        value: PORT_COUNT as u64,
+    },
+    withheld: COM1_WITHHELD,
+}];
 
 /// Every protection domain the description may declare. Exhaustive in both
 /// directions like the rest: the domain names are what [`RegionRule::mappers`]
 /// and [`CHANNEL_ENDS`] are written in, so a domain renamed here and not there
 /// would leave both tables judging a domain that no longer exists while the one
 /// that replaced it is judged by nothing.
-const DOMAINS: &[&str] = &["forwarder", "config", "nic_driver0", "nic_driver1"];
+const DOMAINS: &[&str] = &[
+    "forwarder",
+    "config",
+    "nic_driver0",
+    "nic_driver1",
+    "console",
+];
 
 /// Whether a protection domain may hold a send capability on one channel it is
 /// an end of.
@@ -504,6 +717,12 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
 /// stops the gate rather than being skipped: `<irq>`, `<virtual_machine>` and
 /// `<vcpu>` are all authority grants, and one arriving unnoticed is precisely
 /// the capability change ENG-1 says must be looked at.
+///
+/// `ioport` was the case that proved the point: it entered the description as a
+/// new capability class and stopped the gate here, unmodelled, rather than
+/// being granted quietly. Listing a tag is therefore only half of admitting it
+/// — [`IO_PORTS`] is the other half, and a tag listed with no table behind it
+/// would turn this check from a stop into a silence.
 const MODELLED_TAGS: &[&str] = &[
     "system",
     "memory_region",
@@ -511,6 +730,7 @@ const MODELLED_TAGS: &[&str] = &[
     "program_image",
     "map",
     "setvar",
+    "ioport",
     "channel",
     "end",
 ];
@@ -528,13 +748,16 @@ pub(crate) fn check(root: &Path) -> Result<(), Error> {
 
     let findings = findings(&elements);
     if findings.is_empty() {
+        let tally =
+            |tag: &str, noun| counted(elements.iter().filter(|e| e.tag == tag).count(), noun);
         println!(
-            "sysdesc: {} declares {} memory regions granted by {} mappings and {} channel ends, \
-             each sized, mapped and withheld as the code that maps it requires",
+            "sysdesc: {} agrees with the code that holds it: {} granted by {}, {}, and {} — each \
+             sized, mapped and withheld as that code requires",
             path.display(),
-            elements.iter().filter(|e| e.tag == "memory_region").count(),
-            elements.iter().filter(|e| e.tag == "map").count(),
-            elements.iter().filter(|e| e.tag == "end").count(),
+            tally("memory_region", "memory region"),
+            tally("map", "mapping"),
+            tally("ioport", "I/O-port window"),
+            tally("end", "channel end"),
         );
         return Ok(());
     }
@@ -568,6 +791,7 @@ fn findings(elements: &[Element]) -> Vec<String> {
     let domains_agree = check_domains(elements, &mut findings);
     let regions = check_regions(elements, &mut findings);
     check_maps(elements, &regions, domains_agree, &mut findings);
+    check_io_ports(elements, domains_agree, &mut findings);
     check_channel_ends(elements, &mut findings);
     findings
 }
@@ -848,6 +1072,104 @@ fn check_map_cacheability(site: &str, rule: &RegionRule, cached: &str, findings:
         rule.cacheability.attribute(),
         rule.cacheability.premise()
     ));
+}
+
+/// The I/O-port grants, against [`IO_PORTS`], in both directions — the same
+/// shape [`check_region_mappers`] holds a memory grant to, for the same reason:
+/// a window that appeared is authority nobody granted, and one that vanished
+/// leaves the domain written to drive it faulting on its first `out`.
+fn check_io_ports(elements: &[Element], domains_agree: bool, findings: &mut Vec<String>) {
+    // Every (domain, id) an `<ioport>` grants. The pair rather than the domain,
+    // because a domain may hold several windows and each is its own authority.
+    let mut held: Vec<(String, &str)> = Vec::new();
+    for element in elements.iter().filter(|e| e.tag == "ioport") {
+        let domain = element.owner();
+        let Some(id) = required(element, "id", findings) else {
+            continue;
+        };
+        let site = format!("line {}: <ioport id={id:?}> in {domain}", element.line);
+
+        if held
+            .iter()
+            .any(|(holder, seen)| *holder == domain && *seen == id)
+        {
+            findings.push(format!(
+                "{site} is a second grant under an id this domain already holds, and which of \
+                 the two Microkit installs in the I/O permission bitmap is not something this \
+                 gate may assume"
+            ));
+        }
+        held.push((domain.clone(), id));
+
+        let Some(rule) = IO_PORTS
+            .iter()
+            .find(|rule| rule.domain == domain && rule.id == id)
+        else {
+            findings.push(format!(
+                "{site} is an I/O-port grant no rule in sysdesc.rs names, so the window it hands \
+                 this domain is compared against nothing. `in` and `out` are privileged and seL4 \
+                 gates them per port, so this is a domain newly able to drive whatever decodes \
+                 that window — a capability change, reviewed and approved rather than merged \
+                 (ENG-1, SCM-6). Record it in IO_PORTS once it is"
+            ));
+            continue;
+        };
+        check_port_window(&site, rule, element, findings);
+    }
+
+    // As in [`check_maps`]: while the domain vocabularies disagree, every rule
+    // here would report a grant that vanished, restating one rename once per
+    // row.
+    if !domains_agree {
+        return;
+    }
+    for rule in IO_PORTS {
+        if !held
+            .iter()
+            .any(|(domain, id)| domain == rule.domain && *id == rule.id)
+        {
+            findings.push(format!(
+                "sysdesc.rs records {:?} as holding I/O-port grant id {:?}, and the description \
+                 declares no such <ioport>. Either the grant was dropped — and that domain \
+                 faults on its first port instruction, taking with it the one device an operator \
+                 watches a failed boot on — or the rule is stale and still judging a topology \
+                 this file left behind",
+                rule.domain, rule.id
+            ));
+        }
+    }
+}
+
+/// The window one `<ioport>` grants, against the window its rule admits.
+///
+/// Both attributes, because the two ways a grant stops being the one that was
+/// approved are opposite and neither implies the other: a larger `size` widens
+/// it over ports nobody reviewed, and a moved `addr` leaves the reviewed device
+/// altogether for whatever decodes the new base.
+fn check_port_window(site: &str, rule: &IoPortRule, element: &Element, findings: &mut Vec<String>) {
+    for (attribute, expected) in [("addr", &rule.addr), ("size", &rule.size)] {
+        let Some(raw) = required(element, attribute, findings) else {
+            continue;
+        };
+        let value = match parse_int(raw) {
+            Ok(value) => value,
+            Err(why) => {
+                findings.push(format!("{site} has {attribute}={raw:?}, which {why}"));
+                continue;
+            }
+        };
+        if value == expected.value {
+            continue;
+        }
+        findings.push(format!(
+            "{site} grants {attribute}={value:#x} and {} is {:#x}. The description and the \
+             driver state one window between them — the driver forms every address inside the \
+             one it compiled against — so a window this file moved or widened is authority \
+             nobody reviewed, and it is a capability change reviewed and approved rather than \
+             merged (ENG-1, SCM-6). What the grant as approved withholds: {}",
+            expected.rust_name, expected.value, rule.withheld
+        ));
+    }
 }
 
 fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
@@ -1249,6 +1571,20 @@ fn skip_whitespace(text: &[u8], mut at: usize) -> usize {
     at
 }
 
+/// A count and its noun, agreeing in number.
+///
+/// Worth four lines rather than an `s` in the format string: the description is
+/// expected to declare exactly one I/O-port window and to go on declaring
+/// exactly one, that being the property [`IO_PORTS`] holds it to — so the
+/// passing gate would otherwise report "1 I/O-port windows" on every run for as
+/// long as the system is in the shape it is supposed to be in.
+fn counted(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
+}
+
 /// The 1-based line `at` falls on.
 fn line_of(text: &[u8], at: usize) -> usize {
     1 + text[..at.min(text.len())]
@@ -1555,6 +1891,244 @@ mod tests {
             );
             assert!(finding.contains("ENG-1"), "{region}: {finding}");
         }
+    }
+
+    /// The console's `<ioport>` as the description writes it, and the anchor
+    /// every I/O-port test edits.
+    const COM1_GRANT: &str = "<ioport id=\"0\" addr=\"0x3f8\" size=\"8\" />";
+
+    /// The PCI configuration address/data pair — the port grant the description
+    /// names first among the ones it withholds, being a second path to every
+    /// device's configuration space beside the ECAM mappings the drivers hold.
+    /// Every negative test below moves or duplicates the window onto it, so
+    /// what each one proves is that a *plausible* widening fails, not that a
+    /// nonsense number does.
+    const PCI_CONFIG_PORTS: &str = "0xcf8";
+
+    #[test]
+    fn an_io_port_grant_no_rule_names_is_reported() {
+        // The shape the console change itself arrived in, on the domain it
+        // would matter most: `<ioport>` is authority no `<map>` expresses, so a
+        // driver that acquired one would hold a port instruction that executes
+        // against whatever decodes the window — and every other check in this
+        // module would pass over a well-formed element it does not model.
+        let findings = findings_after(
+            "<map mr=\"ecam0\" vaddr=\"0x10_000_000\" perms=\"rw\" cached=\"false\" setvar_vaddr=\"ecam_vaddr\" />",
+            &format!(
+                "<map mr=\"ecam0\" vaddr=\"0x10_000_000\" perms=\"rw\" cached=\"false\" setvar_vaddr=\"ecam_vaddr\" />\n        \
+                 <ioport id=\"0\" addr=\"{PCI_CONFIG_PORTS}\" size=\"8\" />"
+            ),
+        );
+        let finding = only_finding(&findings);
+        assert!(finding.contains("nic_driver0"), "{finding}");
+        assert!(finding.contains("no rule in sysdesc.rs names"), "{finding}");
+        assert!(finding.contains("ENG-1"), "{finding}");
+    }
+
+    #[test]
+    fn a_widened_or_moved_io_port_window_is_reported_against_the_constant_the_driver_uses() {
+        // The two ways one granted window stops being the window that was
+        // approved, and neither implies the other. A larger `size` keeps the
+        // device and adds ports nobody reviewed; a moved `addr` keeps the count
+        // and leaves the device entirely — here for the PCI configuration pair,
+        // which is the one the description names as withheld.
+        for (attribute, from, to, constant) in [
+            ("size", "8", "16", "uart_16550::PORT_COUNT"),
+            ("addr", "0x3f8", PCI_CONFIG_PORTS, "uart_16550::COM1_BASE"),
+        ] {
+            let findings = findings_after(
+                COM1_GRANT,
+                &COM1_GRANT.replace(
+                    &format!("{attribute}=\"{from}\""),
+                    &format!("{attribute}=\"{to}\""),
+                ),
+            );
+            let finding = only_finding(&findings);
+            assert!(finding.contains(constant), "{attribute}: {finding}");
+            assert!(finding.contains("ENG-1"), "{attribute}: {finding}");
+            // And it says what the approved grant withholds, rather than only
+            // which number to type back.
+            assert!(
+                finding.contains("0xCF8/0xCFC"),
+                "the claim is quoted: {finding}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_io_port_grant_is_reported_as_loudly_as_a_widened_one() {
+        // The other direction of the same table. A console with no port faults
+        // on its first `out`, and takes with it the only device an operator
+        // watches a failed boot on — so the silence would be reported by
+        // nothing else at all.
+        let findings = findings_after(COM1_GRANT, "");
+        let finding = only_finding(&findings);
+        assert!(
+            finding.contains("\"console\"") && finding.contains("no such <ioport>"),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn one_domain_holding_two_grants_under_one_id_is_reported() {
+        // A duplicate leaves the held *set* identical, so the set comparison
+        // alone would pass it, and which of the two Microkit installs in the
+        // I/O permission bitmap is not something this gate may assume.
+        let findings = findings_after(
+            COM1_GRANT,
+            &format!(
+                "{COM1_GRANT}\n        <ioport id=\"0\" addr=\"{PCI_CONFIG_PORTS}\" size=\"8\" />"
+            ),
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains("a second grant under an id"), "{joined}");
+    }
+
+    #[test]
+    fn every_io_port_rule_names_a_domain_that_exists_and_an_id_once() {
+        // The same hazard the region and channel tables carry, for the same
+        // reason: `check_io_ports` answers with the first rule matching the
+        // pair, so a second row under one id would be a window recorded,
+        // believed, and never compared against anything.
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for rule in IO_PORTS {
+            assert!(
+                DOMAINS.contains(&rule.domain),
+                "the I/O-port rule for {:?} names no protection domain",
+                rule.domain
+            );
+            assert!(
+                !seen.contains(&(rule.domain, rule.id)),
+                "{:?} carries two rules for I/O-port id {:?}, so only the first window is ever \
+                 compared",
+                rule.domain,
+                rule.id
+            );
+            seen.push((rule.domain, rule.id));
+        }
+    }
+
+    #[test]
+    fn a_console_that_could_write_a_domains_ring_is_reported() {
+        // Half of what the split into two regions per ring buys, and the half
+        // no mapper set can see: both domains map both halves, the sizes are
+        // right and the cacheability is right, so only the authority moved. A
+        // console able to store into a slot or advance the cursor that
+        // publishes one could attribute a line to a domain that never emitted
+        // it — and it is the one domain whose output an operator reads as
+        // testimony about the others.
+        for (region, vaddr) in [
+            ("log_forwarder", "0x4_000_000"),
+            ("log_nic_driver0", "0x4_100_000"),
+            ("log_nic_driver1", "0x4_200_000"),
+            ("log_config", "0x4_300_000"),
+        ] {
+            let findings = findings_after(
+                &format!(
+                    "<map mr=\"{region}\" vaddr=\"{vaddr}\" perms=\"r\" cached=\"true\" \
+                     setvar_vaddr=\"{region}_vaddr\" />"
+                ),
+                &format!(
+                    "<map mr=\"{region}\" vaddr=\"{vaddr}\" perms=\"rw\" cached=\"true\" \
+                     setvar_vaddr=\"{region}_vaddr\" />"
+                ),
+            );
+            let finding = only_finding(&findings);
+            assert!(
+                finding.contains("\"console\"") && finding.contains("\"rw\""),
+                "{region}: {finding}"
+            );
+            assert!(finding.contains("ENG-1"), "{region}: {finding}");
+        }
+    }
+
+    #[test]
+    fn a_writer_that_could_forge_its_own_consume_cursor_is_reported() {
+        // The other half, in the other direction. A writer able to move the
+        // console's consume cursor would reuse slots the console had not
+        // rendered, discarding records while its own drop count stayed at zero
+        // — silent loss reported as none, which is worse than loss.
+        for domain in ["forwarder", "config"] {
+            let findings = findings_after(
+                &format!(
+                    "<map mr=\"log_{domain}_consume\" vaddr=\"0x4_010_000\" perms=\"r\" \
+                     cached=\"true\" setvar_vaddr=\"log_consume_vaddr\" />"
+                ),
+                &format!(
+                    "<map mr=\"log_{domain}_consume\" vaddr=\"0x4_010_000\" perms=\"rw\" \
+                     cached=\"true\" setvar_vaddr=\"log_consume_vaddr\" />"
+                ),
+            );
+            let finding = only_finding(&findings);
+            assert!(
+                finding.contains(&format!("{domain:?}")) && finding.contains("\"rw\""),
+                "{domain}: {finding}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_writer_reaching_another_writers_ring_is_reported() {
+        // What the eight rows isolate *between* writers, which is a mapping
+        // rather than an authority and so is the one thing about a log region
+        // the `withheld` claim has to say. A compromised parser domain that
+        // could read a driver's ring would learn what it had said about itself;
+        // one that could write it could rewrite or silence it.
+        let findings = findings_after(
+            "<map mr=\"log_nic_driver0\" vaddr=\"0x4_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"log_records_vaddr\" />",
+            "<map mr=\"log_nic_driver0\" vaddr=\"0x4_000_000\" perms=\"rw\" cached=\"true\" setvar_vaddr=\"log_records_vaddr\" />\n        \
+             <map mr=\"log_config\" vaddr=\"0x4_400_000\" perms=\"r\" cached=\"true\" setvar_vaddr=\"peer_records_vaddr\" />",
+        );
+        let finding = only_finding(&findings);
+        assert!(
+            finding.contains("\"nic_driver0\"") && finding.contains("log_config"),
+            "{finding}"
+        );
+        assert!(
+            finding.contains("cannot silence it"),
+            "the claim is quoted: {finding}"
+        );
+    }
+
+    #[test]
+    fn each_half_of_a_log_ring_is_measured_against_its_own_constant() {
+        // Two region types whose rules are otherwise each other's mirror, and
+        // the pair is interchangeable by inspection in exactly the way `fwd`
+        // and `free` are: a rule that named the wrong one of
+        // LOG_RECORDS_REGION_SIZE and LOG_CONSUME_REGION_SIZE would still be
+        // wrong the moment either type grew.
+        for (region, size, constant) in [
+            ("log_forwarder", "0x4000", "wire::LOG_RECORDS_REGION_SIZE"),
+            (
+                "log_config_consume",
+                "0x1000",
+                "wire::LOG_CONSUME_REGION_SIZE",
+            ),
+        ] {
+            let findings = findings_after(
+                &format!("<memory_region name=\"{region}\" size=\"{size}\""),
+                &format!("<memory_region name=\"{region}\" size=\"0x9000\""),
+            );
+            let finding = only_finding(&findings);
+            assert!(finding.contains(constant), "{region}: {finding}");
+        }
+    }
+
+    #[test]
+    fn a_channel_end_on_the_console_is_reported() {
+        // The four channels to the console were removed with the machinery that
+        // fed them: a domain that never leaves `init` cannot observe a
+        // notification, so a send capability on it is authority granted for
+        // nothing. Their absence is a decision, and this is what holds it —
+        // re-declaring one lands as an end no rule covers.
+        let findings = findings_after(
+            "<end pd=\"config\" id=\"0\" notify=\"true\" />",
+            "<end pd=\"config\" id=\"0\" notify=\"true\" />\n    </channel>\n    <channel>\n        \
+             <end pd=\"config\" id=\"1\" />\n        <end pd=\"console\" id=\"0\" notify=\"false\" />",
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains("\"console\""), "{joined}");
+        assert!(joined.contains("no rule in sysdesc.rs covers"), "{joined}");
     }
 
     #[test]
@@ -1957,6 +2531,13 @@ mod tests {
                 "size={size:?} produced {findings:#?}"
             );
         }
+    }
+
+    #[test]
+    fn a_passing_gate_counts_one_window_in_the_singular() {
+        assert_eq!(counted(1, "I/O-port window"), "1 I/O-port window");
+        assert_eq!(counted(0, "memory region"), "0 memory regions");
+        assert_eq!(counted(22, "memory region"), "22 memory regions");
     }
 
     #[test]

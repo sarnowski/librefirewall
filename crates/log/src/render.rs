@@ -9,7 +9,7 @@ use crate::event::Event;
 /// once and is done with it. Held by
 /// `the_widest_line_of_each_shape_fits_the_maximum`, which renders the widest
 /// value of every field of every shape against it, a refusal's `cause` at
-/// [`crate::MAX_CAUSE_LEN`] — the one field this crate cannot itself bound.
+/// [`crate::MAX_CAUSE_LEN`] — which [`Cause`](crate::Cause) now holds it to.
 pub const MAX_LINE_LEN: usize = 192;
 
 /// The buffer could not hold the line.
@@ -35,7 +35,7 @@ impl fmt::Display for RenderError {
 ///
 /// There is no allocator, so the buffer is the caller's and the length comes
 /// back rather than a string.
-pub fn render(event: &Event, out: &mut [u8]) -> Result<usize, RenderError> {
+pub fn render<C: fmt::Display>(event: &Event<C>, out: &mut [u8]) -> Result<usize, RenderError> {
     let mut cursor = Cursor {
         out,
         written: 0usize,
@@ -48,7 +48,7 @@ pub fn render(event: &Event, out: &mut [u8]) -> Result<usize, RenderError> {
     }
 }
 
-fn write_line(event: &Event, cursor: &mut Cursor<'_>) -> fmt::Result {
+fn write_line<C: fmt::Display>(event: &Event<C>, cursor: &mut Cursor<'_>) -> fmt::Result {
     match event {
         Event::Domain {
             domain,
@@ -102,7 +102,7 @@ fn write_line(event: &Event, cursor: &mut Cursor<'_>) -> fmt::Result {
 
 /// The tail of an `LFW-PD` line, absent for the lifecycle points that carry
 /// nothing: a record ending in an empty field reads as a missing value.
-fn write_detail(detail: &DomainDetail, cursor: &mut Cursor<'_>) -> fmt::Result {
+fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'_>) -> fmt::Result {
     match detail {
         DomainDetail::None => Ok(()),
         DomainDetail::Features(bits) => write!(cursor, " features={bits:#x}"),

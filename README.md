@@ -37,6 +37,23 @@ generation 0, forwarding nothing — and switches to a generation only after re-
 of it itself, so every boot performs a live configuration swap on a running dataplane. There is
 still no way to *submit* a document to a running node: it is embedded at build time.
 
+A fifth protection domain owns the console. It holds the only I/O-port capability in the system —
+the eight ports at `0x3F8`, the PC-compatible COM1 window — and every other domain reaches an
+operator by publishing a typed record into a single-producer ring of its own, which that domain
+drains, renders, and puts on the line. It replaced `sel4_microkit::debug_println!`, which compiles
+to `seL4_DebugPutChar`, a kernel *debug* syscall the release kernel is not built with: until this
+landed, a **release image printed nothing at all**, so a node that parked on a refused NIC or came
+up fail-closed on a refused document said so only in the profile nobody ships.
+
+Booting that release image for the first time found a second, deeper defect underneath the first,
+which had been latent since the boot chain was written: GRUB was free to place the Microkit system
+image in the 640 KiB below 1 MiB, seL4's x86 boot derives the userland load address from the end of
+the last boot module, and a module below the kernel therefore made seL4 load the userland image over
+its own running kernel — a triple fault before any protection domain executed. Whether it happened
+was decided by whether the system image happened to fit down there, so **the debug profile was green
+by luck**. `third-party/grub/grub.cfg` now denies GRUB that memory and the build refuses an image
+small enough to fit what remains; see *[Signed boot chain](#signed-boot-chain)*.
+
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection
 tracking, no NAT, no ARP, and no ICMP. What exists is a router on a firewall's substrate, not yet a
@@ -95,9 +112,10 @@ firewall.
 | Schema-validated XML configuration, hardened validator PD | **partial** | [detail](#configuration-management) |
 | Candidate/commit-confirm transactions, versioning, rollback | **partial** | the candidate/running split and monotonic generations exist; neither rollback nor commit-confirm does — [detail](#configuration-management) |
 | Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
+| Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](#console-system-state-events) |
-| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`) and the console is one rendering of them; no transport, exporter or receiver exists |
-| Prometheus `/metrics` | **open** | groundwork only: the dataplane crates tally drops and faults in memory; nothing exposes, reads or names them as metrics |
+| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists |
+| Prometheus `/metrics` | **open** | groundwork only: the dataplane crates, the log rings, the console renderer and the UART all tally drops and faults in memory; nothing exposes, reads or names them as metrics |
 | Local log buffer (`GET /logs`) | **open** | |
 
 ### Lifecycle, boot and trust
@@ -169,7 +187,7 @@ SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership led
 (the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
 (the pipeline, pool owner and routing stage the protection domains are assembled from).
 
-Correctness is held by 136 unit and property tests across those four crates — including hostile-peer
+Correctness is held by 191 unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
 500,000-frame three-thread pipeline test that cycles every buffer through `rx → route → tx → free`
 far more times than the pool holds, exchanging the forwarding table at poll boundaries as it goes.
@@ -202,8 +220,9 @@ the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupEr
 Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
 every peer transmit descriptor.
 
-Nine persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
-and the configuration document and the handover image (see *Engineering foundations*).
+Eleven persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
+the configuration document and the handover image, and the log record and its ring (see
+*Engineering foundations*).
 
 **Missing.**
 
@@ -279,7 +298,7 @@ as generation 1, **every boot performs a live configuration swap on a running fo
 changed value reaches the console as a structured `LFW-CFG` record (see
 [MONITORING.md](MONITORING.md)).
 
-Held by 170 tests in `crates/config` and 38 in `crates/log`, by the handover's own tests in
+Held by 170 tests in `crates/config` and 96 in `crates/log`, by the handover's own tests in
 `crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
@@ -324,12 +343,122 @@ document that shares no address and no MAC with the first.
   forwarding nothing and says so once, on a serial line, and nothing else can be asked. There is no
   `GET /config`, no health signal, and no metric.
 
+### Console device and log transport
+
+**Done.** The console is a device with exactly one owner. `pds/console` holds the system's only
+I/O-port capability — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible COM1 window — and
+is the sole writer of the line; every other domain publishes a typed record into a single-producer
+ring of its own and that domain drains, renders and transmits it. A record is therefore whole or
+absent rather than spliced with another domain's, which is a property of the capability grant rather
+than of scheduling.
+
+`crates/uart-16550` carries the register protocol: interrupts off, 115200 8N1, FIFOs enabled and
+emptied, each of the six steps confirmed by a readback before the next is attempted, so an absent
+controller (`0xFF` everywhere) and one that took the divisor and then refused the word format are
+two different typed errors rather than a node that prints nothing and says why nowhere. Every wait
+is bounded by a named constant *of the crate's own* — 1,000 reads for the FIFO confirmation, 10,000
+for the transmitter-empty poll — so a UART that never asserts THRE costs the domain its output and
+never its liveness. It is driven on the host against a fake that misbehaves on demand, including the
+property that initialisation and a write both terminate within their advertised operation bounds for
+*any* sequence of device answers; a device that could make either spin would hang that test rather
+than fail it, which is the failure being excluded.
+
+Reaching a port is an **invocation of a capability**, not an `in`/`out` instruction: seL4 leaves the
+TSS I/O permission bitmap denying every port and never edits it, so the `<ioport>` grant makes the
+invocation legal and never the instruction. The first implementation read it the other way, held a
+correct grant, and faulted with #GP on `out %al,(%dx)` against `0x3F9` at boot. The
+`seL4_X86_IOPort_In8`/`Out8` invocations are the way through and `rust-sel4` exposes both as safe
+Rust, so the driver and the domain each carry **zero** `unsafe` blocks — the ENG-13 budget records a
+0 for both. `Com1::claim` then reads every register the driver can address before the domain relies
+on the capability, so a grant that no longer covers what the driver reaches is a named refusal
+rather than a fault in the middle of a console line.
+
+`crates/wire` carries the transport: a 192-byte fixed-layout `LogRecord` whose every offset is a
+static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
+records region (slots, producer cursor, the writer's drop count) is read-write to the writing domain
+and read-only to the console, so the console cannot forge a line attributed to a domain that never
+emitted one — it is the domain whose output is read as testimony about the others. The consume
+region (the console's cursor, one word) is read-write to the console and read-only to the writer, so
+a writer cannot forge how much of its own ring has been read and quietly reuse slots the console
+never rendered. Eight regions, 80 KiB, one pair per writing domain; no writer maps another writer's.
+
+The console busy-polls and never leaves `init`, exactly as the NIC drivers do — Microkit has no
+periodic wakeup, so a `notified`-driven console would stall a boot transcript longer than the
+16-byte FIFO until some unrelated domain happened to log again. Its priority is 1, *equal* to the
+drivers rather than above them, so a 115200-baud write cannot preempt the dataplane. Attention is
+shared round-robin with a rotating start and at most eight records taken from any one ring per pass,
+both constants of this build: a domain that fills its ring faster than the line drains costs the
+others a delay and never their records.
+
+Two persistent fuzz targets drive it (`log_record`, `log_ring`), the second modelling both sides as
+independently hostile — a forged cursor arriving between two steps of one drain, a slot rewritten
+one atomic at a time, which is the only granularity at which a torn record is expressible. One
+asserts OBS-5 directly: no record the ABI accepts can put a byte outside printable ASCII into a
+rendered console line, and no text value can carry one outside `[a-z0-9-]`, so a hostile peer cannot
+paint terminal escape sequences onto an operator's console.
+
+`make release` now asserts the `LFW-CFG` console contract on the **release** boot, against the same
+transcript derived from the same document the debug scenarios use. That is the part that makes the
+defect non-recurring: a missing console went unnoticed precisely because the one gate that touched
+the release artifact asserted forwarding alone, and a dataplane is indifferent to whether anything
+is printed.
+
+**Missing.**
+
+- **No interrupt.** The transmitter is polled, and the domain never blocks, so the console burns a
+  share of a core for as long as the node runs. An interrupt-driven transmitter would remove the
+  polling entirely; it needs the system's first `<irq>` element — a second new capability class in
+  one change — and was deliberately not bundled with the first `<ioport>`.
+- **No `GET /logs` retention ring.** The log rings are a transport to the line, not storage: a
+  record the console has rendered is gone. There is no second reader, no retention, and nothing to
+  query after the fact — the transcript exists only in whatever captured the serial port.
+- **No flow control, in either sense.** The link has none — nothing on either end asserts DTR/RTS,
+  and a console that blocked on a peer's readiness would stop reporting exactly when the node is in
+  trouble. Nor does the ring throttle a writer: a full ring refuses the *newest* record and counts
+  it, so a domain that outruns the line loses records with nothing slowing it down.
+- **One port, one baud, both compiled in.** `0x3F8` and a divisor of 1 (115200) are build-time
+  constants matched to the `<ioport>` grant, because a runtime base is a value the capability could
+  not follow. There is no second console, no second UART, and no way to move either without a
+  rebuild.
+- **No Azure hardware has ever run this.** Azure Serial Console attaches to "ttyS0 or COM1" and QEMU
+  q35 exposes COM1 as a 16550A, so this is the same device *by documentation* — which is why there
+  is one driver and not two. It is not the same device by test: nothing in this repository has ever
+  booted on an Azure VM, and the differences Microsoft documents are about availability (boot
+  diagnostics enabled; the serial console possibly unavailable after live-migrating a Generation 2
+  Trusted Launch VM with Secure Boot) rather than about registers.
+- **The I/O-port CNode slot is hand-rolled and unchecked at build time.** Microkit publishes a base
+  slot constant for every capability class a domain can hold *except* this one, so the slot number
+  is written out in `pds/console/src/com1.rs` as a cross-artifact fact. Its only detection is the
+  pinned SDK version (`MICROKIT_VERSION=2.3.0`, checksum-verified, moved only through the full gate)
+  read against the generated capability report; nothing compares the two automatically. What limits
+  the damage is enforcement rather than detection: `Com1::claim` invokes the capability first, so a
+  slot the tool moved is refused by name.
+- **The single-writer property is exact only in release.** The debug kernel is built with
+  `CONFIG_PRINTING` and writes the *same* port for its boot banner and its fault reports — it is
+  handed `debug_port = 0x3f8` on the Multiboot2 command line, and every QEMU capture in this
+  repository shows it. That is accepted, the kernel printing on boot and on faults rather than per
+  record, and it is why the claim is stated of the shipped profile.
+- **The console cannot report its own failure to start.** From entry into `init` until the register
+  sequence returns, the reporting mechanism is what is being started. A refused *capability* is named
+  on the debug kernel's channel, which does not exist in a release image; a refused *controller* — one
+  of six distinct errors the driver distinguishes — reaches nothing at all, and the node prints
+  nothing. Diagnosing that is one bit where the driver has six. Closing it needs a reporting channel
+  independent of the console.
+- **Every counter here is in memory and unexposed.** The UART's bytes written, THRE timeouts and
+  init failures; the renderer's printed, malformed, unknown, unrenderable and write-failed; each
+  writer's dropped and refused. Nothing reads any of them out (see *Prometheus `/metrics`*), so a
+  console that is silently dropping records is indistinguishable from one with nothing to say.
+- **A record that will not render is now dropped, not reported.** It is counted as `unrenderable`
+  and nothing is written. The previous transport wrote a `LFW-PD unrendered=<debug form>` line
+  instead; that line is gone, and MONITORING.md no longer promises it.
+
 ### Console system-state events
 
-**Done.** The five ad-hoc bring-up markers are gone. Call sites in all three protection-domain
-binaries emit **typed events** — a closed set of named fields — and a backend renders them, so the
-attribute structure an OpenTelemetry record needs is produced at the call site rather than thrown
-away in a format string. The console backend writes two channels of closed vocabulary,
+**Done.** The five ad-hoc bring-up markers are gone. Call sites in all four protection-domain
+binaries emit **typed events** — a closed set of named fields — and rendering happens once, in the
+console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
+site rather than thrown away in a format string, and the structure is what crosses between domains
+rather than the text. Two channels of closed vocabulary reach the line,
 `LFW-PD domain=… state=…` for a domain's lifecycle and `LFW-CFG generation=… …` for configuration,
 both specified field for field in [MONITORING.md](MONITORING.md) and matching the existing
 `LFW-BOOT` convention, so a reader keys on the `LFW-` prefix alone.
@@ -348,26 +477,31 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 - **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
   no `ready`, no failure — so MONITORING.md's "each stage reporting healthy or the specific fault"
   holds for the driver and configuration domains and not for the one that carries traffic.
-- **Records interleave, and nothing in the system prevents it.** The console is one unsynchronised
-  device written without a lock, and the two driver instances run at equal priority, so their
-  `LFW-PD` records are torn into one another in every normal boot capture. MONITORING.md answers
-  this by putting the obligation on the reader — recover a record by scanning for the `LFW-` prefix
-  anywhere in the stream — and the transcript assertion does exactly that, so a record that did not
-  begin its line is still judged. What no reader can do is reassemble a record torn through its own
-  middle: the continuation carries no marker, and two concurrent writers leave nothing to decide
-  which fragment continues which by. `LFW-CFG` records are not seen to tear today, and only because
-  the publishing domain runs to completion above every other priority; nothing structural holds
-  that, and the day it stops holding, a torn record is a loud transcript mismatch rather than a
-  recovered one.
+- **Nothing orders one domain's records against another's.** Within a domain they are totally
+  ordered — one writer per ring, drained in the order it wrote them — and a `generation`/`seq` pair
+  totally orders one commit's change records. Across domains there is no order at all: which ring is
+  served first is decided by where the console's rotation stood, and there is no clock to appeal to.
+  The boot capture above shows the forwarding domain's `generation=1 outcome=applied` printed
+  *before* the change records that generation is made of, which is not a fault. A reader that infers
+  causality from console order is inferring it from the fairness rule.
+- **Interleaving is prevented in the shipped profile only.** Records no longer tear: the port has one
+  owner and one writer, so a line is whole or absent. That holds exactly in release. The debug
+  kernel is built with `CONFIG_PRINTING` and writes the same port for its boot banner and fault
+  reports, so a debug capture can still carry kernel prose across a record — which is why
+  MONITORING.md still obliges a reader to recover records by scanning for the `LFW-` prefix rather
+  than by assuming one line is one record.
 - **No fault or restart events**, because there is no fault handler and no PD restart to report.
+- **A record that cannot be rendered or encoded is counted and lost**, where it used to be written
+  out in a debug form. See *[Console device and log transport](#console-device-and-log-transport)*.
 - **Nothing beyond the console.** These are the OTEL log stream's System category by construction,
   but no transport exists (see the status table), so the records reach an operator only over a
   serial line, on a node they are already attached to.
 
 ### Protection-domain decomposition
 
-**Done.** Four protection domains (one forwarder, one configuration domain, two driver instances of
-one binary) with real, verifiable least privilege: the forwarder holds no device capability at all
+**Done.** Five protection domains from four binaries (one forwarder, one configuration domain, one
+console, two driver instances of one driver binary) with real, verifiable least privilege: the
+forwarder holds no device capability at all
 and neither pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a second
 time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two pipelines.
 Each pipeline is three memory regions rather than one precisely so that those grants can differ; the
@@ -384,11 +518,23 @@ than merely going unexercised. The third, between the configuration domain and t
 one granted in **both**, and stated as a decision at both ends rather than inherited from Microkit's
 default: applying a configuration is a two-phase commit and each phase is a signal the other end
 cannot infer. The forwarder therefore holds exactly one send capability in the whole system, on the
-configuration domain alone. Zero IRQs. The capability grant is machine-checkable in the Microkit
-capability/memory report the build generates.
+configuration domain alone. The console holds none in either direction — it never reaches the event
+loop, so a notification on it would be authority granted for nothing. Zero IRQs. The capability
+grant is machine-checkable in the Microkit capability/memory report the build generates.
 
-**Missing.** Two of the fourteen component classes in CONCEPT §6.3 exist: the NIC driver PDs, and —
-with this change — the configuration validator PD. Absent: Rx/Tx virtualisers, classifier,
+One **new capability class** appears here for the first time: an `<ioport>` grant, held by the
+console domain alone. It admits eight ports (`0x3F8`–`0x3FF`) and withholds the other 65,528 —
+notably the `0xCF8`/`0xCFC` PCI configuration pair, which would be a second path to every device's
+configuration space beside the ECAM mappings the drivers hold. No other domain holds any I/O port at
+all, so an attacker who reaches one of them reaches no port invocation the kernel will accept. The
+console in turn holds no pool, no dataplane ring, no configuration region, no ECAM page and no BAR
+window, so a compromised console reaches no frame, no NIC and no configuration.
+
+**Missing.** Two of the fourteen component classes in CONCEPT §6.3 exist: the NIC driver PDs and the
+configuration validator PD. The console domain is a third domain and *not* a third class — §6.3 does
+not enumerate one, the console being described there as a surface rather than as a component — so it
+adds a domain to the decomposition without closing any of the gap below. Absent: Rx/Tx virtualisers,
+classifier,
 filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7 parsers, DPI engine,
 content scanner, CA signing PD, management API PD, HA state-sync PD, and the update/health PD. The
 routing/ARP/ICMP class is the one that is neither: routing exists as a *stage inside* the forwarder
@@ -421,6 +567,12 @@ device-facing persistent fuzz targets (`find_virtio_caps`, `virtqueue_poll`) and
 (`nic_driver_paths`) that drives a hostile device and a byzantine forwarder at once. Each models the
 device's full authority over the shared region rather than a well-behaved subset of it.
 
+`crates/uart-16550` is the second device this applies to and the smaller one: every byte it reads
+back is the controller's choice, a controller that never answers is indistinguishable from one that
+answers wrongly, and both are met the same way — every wait bounded by a constant of the crate's
+own, every refusal a typed error and a counter, and a property test asserting that initialisation
+and a write each terminate within their advertised bound for *any* sequence of device answers.
+
 **Missing.**
 
 - **The device's DMA is not confined.** Bus-master DMA is enabled against fixed physical addresses
@@ -451,6 +603,16 @@ read-only, its image is copied out before anything is decided on it, and every f
 counts, the `enabled` byte, ports, prefix lengths, MACs — is re-checked in the consumer, which is
 the domain that has to live with the result. A refused image is counted, leaves the running
 configuration exactly as it was, and is never acknowledged, so the publisher cannot commit it.
+
+The log ring is the same treatment applied to a third peer, and to a peer on **both** sides at once.
+Every field of a record the console reads was chosen by another domain, so the record is decoded
+before anything is rendered — a kind naming no event, a vocabulary token past its cardinality, a
+text length past its own storage, a byte outside `[a-z0-9-]` are each a typed refusal and a counted
+drop, never a line. Neither published cursor is ever read back by the side that owns it, so a peer
+forging one costs that peer's own records and nobody else's; a drain is bounded by the console's own
+burst constant and by the ring capacity rather than by anything a writer publishes; and a refusal on
+one ring does not stop the pass, because the records worth reading when a domain fills its ring with
+rubbish are the *other* domains'.
 
 **Missing.**
 
@@ -511,6 +673,18 @@ Signing is key-explicit and self-checked: each signature names the exact fingerp
 GRUB, and the build verifies what it just signed against that public key before anything is written
 into a slot, so a mis-keyed payload fails the build rather than the appliance.
 
+The hand-off also holds seL4's one unchecked expectation of its bootloader. seL4's x86 boot places
+the userland image at `MAX(first available region's start, ROUND_UP(end of the last boot module))`,
+and its available-region list is the firmware's — it still contains the memory the kernel image
+occupies — so the end of the last boot module is the only thing keeping the userland image off the
+running kernel. GRUB's relocator takes the lowest range that fits and, on `x86_64-efi`, the 640 KiB
+below 1 MiB is free, so it will place the module *below* the kernel whenever the image is small
+enough to fit there. `grub.cfg` therefore cuts conventional memory between 64 KiB and 1 MiB — 64 KiB
+is left because GRUB allocates its own hand-off trampoline from low memory — and refuses to boot at
+all if that reservation is itself refused. Because what remains is a window an image could still
+shrink into, `xtask::grub::check_boot_module_placement` fails the **build** when the assembled system
+image would fit it, reading the bound out of `grub.cfg` rather than restating it.
+
 **Missing.** UEFI Secure Boot is not enrolled — the manifest hard-codes `secure_boot: false`, and
 `BOOTX64.EFI` itself is unsigned in the Authenticode sense (no shim, MOK, or PK/KEK/db hierarchy).
 There is no TPM anywhere: no vTPM in the QEMU harness, no measured boot, no PCR policy, and no
@@ -524,11 +698,11 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the ten library crates, `xtask`, and all three protection domains in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eleven library crates, `xtask`, and all four protection-domain binaries in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.32% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
 | QEMU end-to-end gate (three system scenarios, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | nine persistent targets, between them covering every crate that interprets bytes it did not write; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | eleven persistent targets, between them covering every crate that interprets bytes it did not write; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
@@ -557,7 +731,7 @@ prefix-length rule from `ConfigImage::check`, and the port-range rule from `crat
 fails the seed-corpus smoke test on the committed seed named after it, so the corpus alone catches a
 lost rule with no live fuzzing at all.
 
-**Live fuzzing is conditional.** All nine targets always build under AddressSanitizer, and the
+**Live fuzzing is conditional.** All eleven targets always build under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
 run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
 probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
@@ -609,8 +783,10 @@ and a non-IPv4 broadcast frame — and each must reach nobody. The traffic verdi
 sockets and nothing else; the transcript verdict is the structured `LFW-CFG` channel and nothing
 else. Neither is read from timing, and neither is read from prose — the channel being recovered the
 way MONITORING.md obliges every reader to, by scanning for the `LFW-` marker anywhere in the stream
-rather than assuming a record begins a line, because on an unsynchronised console it routinely does
-not. The one thing that scan cannot tell apart from a record is prose *quoting* one, which is the
+rather than assuming a record begins a line. Records no longer tear into one another, the port
+having one owner; what these scenarios boot is the *debug* kernel, which writes the same port for
+its own banner and faults, so a record can still be preceded on its line by kernel prose. The one
+thing that scan cannot tell apart from a record is prose *quoting* one, which is the
 marker's price and fails closed: the quotation comes with its surrounding words, so it lands as a
 mismatch rather than as a pass. The guest's serial output is captured to
 `build/image/qemu-<scenario>.log` for reading after a failure. A failing run prints the
@@ -638,7 +814,7 @@ make fuzz                 # run the seed smoke tests, build every fuzz target, e
 make test-system          # boot the three QEMU system scenarios and assert on each
 make test-ab              # boot the eight A/B state-machine scenarios and assert on each
 make ci                   # the complete gate: host gate, fuzz, image, system and A/B
-make release              # run CI, then assemble AND boot the Microkit release payload
+make release              # run CI, then assemble AND boot the release payload (forwarding + console)
 make verify-reproducible  # build twice in isolation and compare artifacts
 make hooks                # install the pre-commit and pre-push git hooks
 make clean                # remove generated output only
@@ -667,11 +843,28 @@ enabled for every download. Do not commit the certificate.
 ## Release artifacts
 
 `make release` runs the complete acceptance gate, then assembles the production-oriented Microkit
-release configuration into `dist/` — **and then boots that release artifact against the same
-forwarding contract** before it counts as a release. The release configuration is a different kernel
-build from the one the gate exercises, so passing the gate on the debug image says nothing about it;
-if the release disk fails the contract, `dist/` is emptied rather than left holding an unproven image
-that looks finished.
+release configuration into `dist/` — **and then boots that release artifact against the forwarding
+contract *and* the console contract** before it counts as a release. The release configuration is a
+different kernel build from the one the gate exercises, so passing the gate on the debug image says
+nothing about it; if the release disk fails either contract, `dist/` is emptied rather than left
+holding an unproven image that looks finished.
+
+The console half is there because its absence is what let a release be published with no console at
+all: `debug_println!` compiles to a kernel debug syscall the release kernel is not built with, `ci`
+boots only the debug image, and this stage asserted forwarding alone — and a dataplane is
+indifferent to whether anything is printed. The release boot is now judged on the same `LFW-CFG`
+transcript derived from the same shipped document that the debug system scenarios use, so passing
+means bytes a domain published reached the serial line *in the release kernel*: through the log
+ring, through the console domain, out of the UART, in order and with the right values. It does not
+enumerate the `LFW-PD` lifecycle channel, and it is not a claim that every record renders correctly.
+It defends the one property that was silently false — that the shipped profile has a console at all.
+
+Its first run found more than that. The release image did not boot: GRUB had placed the Microkit
+system image below the seL4 kernel and seL4 loaded the userland image over its own page tables,
+triple-faulting before any protection domain ran (see *[Signed boot chain](#signed-boot-chain)*).
+That defect was latent in every commit that built this boot chain and was invisible to every gate,
+because no gate had ever booted a release artifact. It is the concrete answer to why BLD-3 requires
+the shipped profile to be the tested profile.
 
 The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
 through OVMF and GRUB. Alongside it, `dist/` carries five product-prefixed pieces of release

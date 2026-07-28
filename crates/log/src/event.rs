@@ -28,7 +28,6 @@ macro_rules! closed_vocabulary {
             /// Every variant, in discriminant order.
             pub const ALL: [Self; [$(stringify!($variant),)+].len()] = [$(Self::$variant,)+];
 
-            /// The token this variant occupies in the console grammar.
             #[must_use]
             pub const fn name(self) -> &'static str {
                 match self {
@@ -53,6 +52,7 @@ closed_vocabulary! {
         Forwarder => "forwarder",
         NicDriver => "nic-driver",
         Config => "config",
+        Console => "console",
     }
 }
 
@@ -191,19 +191,20 @@ impl fmt::Display for Value {
 /// alternative — a call site that formats its own line — throws away the
 /// attribute structure an OpenTelemetry record is, and there is no way to
 /// recover it afterwards short of rewriting every site.
+///
+/// `C` is the refusal cause text in the two forms [`Refusal`](crate::Refusal)
+/// documents; the default is the one a call site mints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<C = &'static str> {
     Domain {
         domain: Domain,
         state: DomainState,
-        detail: DomainDetail,
+        detail: DomainDetail<C>,
     },
     /// One configuration value changed as part of a commit. Unchanged values
     /// produce no record, so the volume of a commit is the size of its diff.
     ConfigChange {
         generation: u32,
-        /// Position within the generation's records. There is no clock, so this
-        /// and `generation` are the whole of a record's ordering.
         sequence: u32,
         change: ChangeKind,
         object: ObjectKind,

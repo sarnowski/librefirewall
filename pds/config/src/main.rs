@@ -7,20 +7,18 @@
 //!
 //! # Adversary
 //!
-//! The management-plane attacker (CONCEPT §7.1). The document is compiled into
-//! this domain today, which makes the threat theoretical; the reader that
-//! judges it is written against a fully attacker-controlled byte string anyway,
-//! because the reason the reader is isolated in a domain of its own is that the
-//! document will one day arrive over a network, and a parser hardened
-//! afterwards is a parser rewritten.
+//! The management-plane attacker (CONCEPT §7.1). The document is compiled in
+//! today, which makes the threat theoretical; the reader is written against a
+//! fully attacker-controlled byte string anyway, because the document will one
+//! day arrive over a network and a parser hardened afterwards is a rewrite.
 //!
 //! # What this domain holds, and what that leaves it unable to do
 //!
 //! No device capability, no buffer pool, no dataplane ring: the entire grant is
-//! the handover region it writes and the acknowledgement region it reads. A
-//! compromised reader therefore reaches no frame and no NIC, and the worst it
-//! can produce is a configuration — which is exactly what the consumer
-//! re-checks field by field before running (`pd_runtime::handover`).
+//! the handover region it writes, the acknowledgement region it reads and its
+//! own log ring. A compromised reader reaches no frame and no NIC, and the
+//! worst it produces is a configuration — which the consumer re-checks field by
+//! field before running (`pd_runtime::handover`).
 //!
 //! # Nothing is published unless everything passed
 //!
@@ -37,19 +35,20 @@
 //! domain with an empty or default document. Which file it names is the build's
 //! decision and not this domain's.
 //!
-//! # Why the console `Sink` is written here and not once in `crates/log`
+//! # Records go to a ring, not to `debug_println!`
 //!
-//! Printing needs `sel4_microkit::debug_println`, and everything under
-//! `crates/` is deliberately free of Microkit so that it can be host-tested. A
-//! backend that prints therefore cannot live there, and each protection domain
-//! carries the dozen lines that render an event to its own console.
+//! That macro compiles to `seL4_DebugPutChar`, absent from the release kernel,
+//! so the refusal above — only safe while visible — would reach nobody in the
+//! profile that ships. A typed [`Event`] in this domain's own ring, rendered by
+//! the console, works in both.
 
 use config::{Change, Datastore};
-use lfw_log::{Domain, DomainDetail, DomainState, Event, Field, MAX_LINE_LEN, Sink, render};
+use lfw_log::{Domain, DomainDetail, DomainState, Event, Field, RingSink, Sink};
 use pd_runtime::{
     ConfigAck, ConfigHandover, ConfigPublisher, MAX_INTERFACES, MAX_NEIGHBOURS, attach_region,
 };
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
+use wire::{LogConsume, LogRecords};
 
 /// The configuration document this appliance runs, as bytes.
 ///
@@ -61,57 +60,35 @@ const CONFIG_XML: &[u8] = include_bytes!(env!("LIBREFIREWALL_CONFIG_PATH"));
 /// notifications both ways; see the system description on why.
 const CONSUMER: Channel = Channel::new(0);
 
-const CONSOLE: Console = Console;
-
 /// Room for every record one commit can produce: every object the handover
 /// image holds, in every field a record can name. Sized from the same two
-/// constants the image is, so a document the image can carry cannot produce a
-/// diff this buffer cannot.
+/// constants, so a document the image can carry cannot overrun this buffer.
 const MAX_CHANGES: usize = (MAX_INTERFACES + MAX_NEIGHBOURS) * Field::ALL.len();
-
-/// The console as a [`Sink`].
-///
-/// It is the last-resort channel and the only one this build has (CONCEPT §11),
-/// so a line that cannot be rendered is reported as the event it came from
-/// rather than dropped (ENG-12).
-struct Console;
-
-impl Sink for Console {
-    fn emit(&self, event: &Event) {
-        let mut line = [0u8; MAX_LINE_LEN];
-        let rendered = render(event, &mut line)
-            .ok()
-            .and_then(|written| line.get(..written))
-            .and_then(|bytes| core::str::from_utf8(bytes).ok());
-        match rendered {
-            Some(text) => debug_println!("{text}"),
-            None => debug_println!("LFW-PD unrendered={event:?}"),
-        }
-    }
-}
 
 #[protection_domain]
 fn init() -> ConfigDomain {
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
     let ack: &'static ConfigAck = attach_region!(cfgack_vaddr: ConfigAck);
-    announce(DomainState::Starting);
+    let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
+    let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let sink = RingSink::new(log.writer(log_consume));
+    announce(&sink, DomainState::Starting);
 
-    // Both live only as long as this call: the datastore is what a second
-    // commit would need, and there is no path to one. Keeping them would put
-    // several kilobytes of model in a domain that reads neither again.
+    // Both live only as long as this call: a second commit would need the
+    // datastore and there is no path to one, so keeping it would leave several
+    // kilobytes of model in a domain that reads it again never.
     let mut store = Datastore::new();
     let mut changes = [None::<Change>; MAX_CHANGES];
     let mut publisher = ConfigPublisher::new();
 
     // Which state each outcome is, and whether there is anything to offer, are
-    // both decided in `config` where they are host-tested (LAY-2); the records
-    // that say why have already been written by the time this returns.
-    let report = config::commit_and_report(&mut store, CONFIG_XML, &mut changes, &CONSOLE);
+    // decided in `config` where they are host-tested (LAY-2).
+    let report = config::commit_and_report(&mut store, CONFIG_XML, &mut changes, &sink);
     if let Some(image) = report.image() {
         publisher.offer(handover, &image);
         CONSUMER.notify();
     }
-    announce(report.state());
+    announce(&sink, report.state());
 
     ConfigDomain {
         handover,
@@ -120,16 +97,15 @@ fn init() -> ConfigDomain {
     }
 }
 
-fn announce(state: DomainState) {
-    CONSOLE.emit(&Event::Domain {
+fn announce(sink: &dyn Sink, state: DomainState) {
+    sink.emit(&Event::Domain {
         domain: Domain::Config,
         state,
         detail: DomainDetail::None,
     });
 }
 
-/// What survives `init`: the two regions and where the offered generation has
-/// got to.
+/// What survives `init`: the two regions and where the offer has got to.
 struct ConfigDomain {
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,

@@ -139,6 +139,93 @@
     <memory_region name="cfg" size="0x1000" />
     <memory_region name="cfgack" size="0x1000" />
 
+    <!-- The log transport: one ring per WRITING domain, and TWO REGIONS PER
+         RING, one for each direction.
+
+         The console is a device with one owner (see the console domain below),
+         so every other domain reaches it by publishing a typed record into a
+         ring of its own and letting that domain render it. One ring per writer
+         rather than one shared ring is the same argument the pipeline and the
+         configuration handover make, sharpened by what a single writer buys
+         here: the ring is single-producer/single-consumer, so one writer per
+         ring makes a torn record — two domains' bytes interleaved into one
+         console line — unrepresentable rather than prevented by scheduling. It
+         is also the only shape the ring protocol admits at all; a second
+         producer on one of these is two writers racing for the same slot.
+
+         THE SPLIT EXISTS SO THE TWO DIRECTIONS CARRY OPPOSITE PERMISSIONS, and
+         that is the whole reason there are eight rows here rather than four. A
+         region is the unit of grant, so only two regions can give each domain
+         write access to exactly the direction it speaks in — the same reason
+         `cfg`/`cfgack` are two regions and each dataplane pipeline is three.
+
+         `log_<domain>` carries the slots, the producer cursor and the writer's
+         drop count. The writing domain maps it READ-WRITE and the console maps
+         it READ-ONLY, so THE CONSOLE CANNOT FORGE A RECORD INTO A DOMAIN'S
+         RING: it cannot store into a slot, cannot advance the cursor that
+         publishes one, and cannot rewrite the count of what that domain says it
+         lost. A console that could would be able to attribute a line to a
+         domain that never emitted it — and it is the one domain in the system
+         whose output an operator reads as testimony about the others.
+
+         `log_<domain>_consume` carries the console's consume cursor and nothing
+         else. The console maps it READ-WRITE and the writing domain maps it
+         READ-ONLY, so A WRITER CANNOT FORGE THE CURSOR THAT SAYS HOW MUCH OF
+         ITS RING HAS BEEN READ. A writer that could would move it forward to
+         reuse slots the console has not rendered, discarding records while its
+         own drop count stayed at zero — silent loss reported as none, which is
+         worse than loss.
+
+         A single region could carry neither property. `wire`'s
+         `LogReader::read` publishes its consume position on every record it
+         takes (crates/wire/src/log_ring.rs), and that word is the writer's only
+         flow control: mapped read-only the console would fault on the first
+         record it consumed, and mapped read-write it would hold write access to
+         every slot in the ring. Two regions is what removes the choice between
+         those two.
+
+         What the rows isolate BETWEEN writers is unchanged and still worth
+         stating: no writer maps another writer's region in either direction, so
+         a compromised parser domain cannot read what a driver has said about
+         itself, cannot rewrite it, and cannot silence it. Every pair of writing
+         domains is disjoint here, and that is enforced by these rows and by
+         `xtask::sysdesc`'s per-mapper grant set.
+
+         The residue, named rather than left to be discovered: the console still
+         decides what reaches the line, so it can decline to print any record
+         and can emit any line it likes as itself — it owns the port and is the
+         sole renderer. What it can no longer do is put words in another
+         domain's mouth, or make that domain lose records it will report as
+         delivered.
+
+         Sizes are `wire::LOG_RECORDS_REGION_SIZE` and
+         `wire::LOG_CONSUME_REGION_SIZE`, each its type's `size_of` rounded up
+         to the mapping granularity, on the same footing as every constant above
+         and held to it the same way — `xtask::sysdesc` carries a rule per
+         region and compares it. `LogRecords` is 12296 bytes (64 slots of a
+         192-byte record, plus the producer cursor and the drop count) so each
+         is four pages; `LogConsume` is one word and so costs the page a region
+         costs, exactly as `cfgack` does. The eight together are 80 KiB.
+
+         None carries phys_addr, for the reason the address-map block above
+         gives for `cfg` and `cfgack`: no device DMAs into a log region, so no
+         domain needs its physical address, so the tool has no reason to demand
+         a fixed one — and an unplaced region is allocated from general-purpose
+         untyped memory, which is precisely the retyping seL4 zeroes. That is
+         what makes `attach_region!`'s zero-initialisation precondition hold by
+         construction here, and it is also what makes the boot transcript work:
+         a zeroed pair is a valid empty ring, so a domain may publish records
+         during its own `init`, before the console domain has run at all, and
+         they are still there when it comes up. -->
+    <memory_region name="log_forwarder" size="0x4000" />
+    <memory_region name="log_forwarder_consume" size="0x1000" />
+    <memory_region name="log_nic_driver0" size="0x4000" />
+    <memory_region name="log_nic_driver0_consume" size="0x1000" />
+    <memory_region name="log_nic_driver1" size="0x4000" />
+    <memory_region name="log_nic_driver1_consume" size="0x1000" />
+    <memory_region name="log_config" size="0x4000" />
+    <memory_region name="log_config_consume" size="0x1000" />
+
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all.
          `RouteStage` decides on each frame and rewrites its Ethernet and IPv4
@@ -178,6 +265,8 @@
         <map mr="pool1" vaddr="0x2_300_000" perms="rw" cached="true" setvar_vaddr="pool1_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_001_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
     <!-- The configuration domain: it reads the document compiled into it,
@@ -209,6 +298,8 @@
         <program_image path="config-pd.elf" />
         <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_001_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -233,6 +324,8 @@
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free1" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool1" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="log_nic_driver0" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_nic_driver0_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar0" />
         <setvar symbol="vq_paddr" region_paddr="vq0" />
         <setvar symbol="rx_pool_paddr" region_paddr="pool0" />
@@ -249,10 +342,120 @@
         <map mr="fwd0" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free0" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="log_nic_driver1" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_nic_driver1_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar1" />
         <setvar symbol="vq_paddr" region_paddr="vq1" />
         <setvar symbol="rx_pool_paddr" region_paddr="pool1" />
         <setvar symbol="tx_pool_paddr" region_paddr="pool0" />
+    </protection_domain>
+
+    <!-- The console domain: the one holder of the serial controller, and the
+         only domain in this system with an I/O-PORT capability.
+
+         =================================================================
+         `<ioport>` IS A NEW CAPABILITY CLASS IN THIS SYSTEM (ENG-1, SCM-6)
+         =================================================================
+
+         Every grant above this point is a memory mapping or a notification
+         channel. This row is neither: it places an X86IOPort CAPABILITY in the
+         console domain's CNode, and a capability is a thing the domain
+         INVOKES. It does not unlock an instruction. seL4 leaves the TSS I/O
+         permission bitmap denying every port and never edits it, so `in` and
+         `out` executed inside any protection domain raise #GP however this
+         file is written; the ports below are reached only by invoking this
+         capability through `seL4_X86_IOPort_In8` / `seL4_X86_IOPort_Out8`,
+         which is what `pds/console/src/com1.rs` does and why that file needs
+         no `unsafe`.
+
+         READ THAT BEFORE ADDING THE NEXT `<ioport>`. The console driver was
+         first built on the opposite reading — that this element hands a domain
+         a window of the I/O permission bitmap — so it held the capability and
+         executed `out %al,(%dx)` against 0x3F9, the first write of the UART
+         init sequence. It faulted with #GP, on a grant that was present and
+         correct. The grant makes the invocation legal, never the instruction.
+
+         The three attributes are exactly what the Microkit 2.3.0 tool accepts
+         — `id`, `addr`, `size`, and nothing else — and the tool refuses the
+         element outright off x86, which is the platform assumption CONCEPT §3
+         already fixes.
+
+         WHAT IT GRANTS: eight consecutive I/O ports, 0x3F8 through 0x3FF, the
+         PC-compatible COM1 window. That is the whole of the first 16550
+         controller: its data register, interrupt enable, FIFO control /
+         interrupt identification, line control, modem control, line status,
+         modem status and scratch. `crates/uart-16550` uses five of the eight
+         and forms every address as `COM1_BASE | offset` with the base's
+         alignment to an eight-port window asserted at build time, so no address
+         it can form leaves this row.
+
+         WHAT STAYS WITHHELD, and it is nearly everything an I/O-port grant
+         could be: no other port in the 65536-port space, so no PCI
+         configuration address/data pair at 0xCF8/0xCFC (which would be a second
+         path to every device's configuration space, next to the ECAM mappings
+         the drivers hold), no PS/2 controller, no PIC, no PIT, no CMOS/RTC, no
+         debug port. And no other domain holds any I/O port at all: the drivers,
+         the forwarder and the configuration domain each hold zero, so an
+         attacker who reaches one of them reaches no port instruction that will
+         execute.
+
+         WHY ONE DOMAIN OWNS IT. The device is unsynchronised and has one
+         register file, so several writers interleave their bytes into one
+         another and a console line arrives spliced with a second domain's. A
+         capability held by exactly one domain is what makes that
+         unrepresentable rather than unlikely. In the RELEASE kernel
+         configuration this domain is then the only writer of 0x3F8 in the whole
+         system and the property is exact. In the DEBUG configuration it is not:
+         that kernel is built with CONFIG_PRINTING and writes the same port for
+         its own boot banner and fault reports. That is accepted — the kernel
+         prints on boot and on faults, not per record — but it is the reason the
+         single-writer claim is stated of the shipped profile.
+
+         WHAT IT MAPS: eight log regions in four pairs, and the perms are the
+         whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
+         Each `log_<domain>` is READ-ONLY here: this domain renders those
+         records and must read them, and a console that could also write one
+         could attribute a line to a domain that never emitted it. Each
+         `log_<domain>_consume` is read-write because how far the console has
+         read is this domain's own statement about itself, and it is the only
+         domain that may make it. See the note beside those regions.
+
+         It holds no pool, no dataplane ring, no configuration region, no ECAM
+         page and no BAR window, so a compromised console reaches no frame, no
+         NIC, and no configuration — the same shape of isolation the
+         configuration domain has, in the other direction.
+
+         PRIORITY 1, EQUAL TO THE DRIVERS, and that is a decision rather than a
+         leftover. This domain never leaves `init` for the same reason the
+         drivers do not: Microkit has no periodic wakeup, and a `notified`-driven
+         console would have to return to the event loop after each activation,
+         so a boot transcript longer than the UART's 16-byte FIFO would stall
+         until some unrelated domain happened to log again — and the boot
+         transcript is the whole purpose of a console. It therefore busy-polls,
+         which makes its priority a scheduling question rather than a
+         formality. Above the drivers it would preempt the dataplane for as long
+         as it held the CPU, and at 115200 baud a byte occupies the line for
+         about 87 microseconds, so a burst of a few lines is milliseconds of
+         stalled forwarding. Equal to them, seL4 round-robins the three at
+         priority 1 and the console's share is a slice rather than a stall. The
+         forwarder at 2 and the configuration domain at 3 still preempt it, so
+         nothing on a notification path is delayed by it at all.
+
+         The improvement, recorded rather than built: an interrupt-driven
+         transmitter, which would remove the polling entirely. It needs the
+         system's first `<irq>` — another new capability class — and is not
+         worth bundling into the change that introduces the first `<ioport>`. -->
+    <protection_domain name="console" priority="1" stack_size="0x4000">
+        <program_image path="console.elf" />
+        <ioport id="0" addr="0x3f8" size="8" />
+        <map mr="log_forwarder" vaddr="0x4_000_000" perms="r" cached="true" setvar_vaddr="log_forwarder_vaddr" />
+        <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="rw" cached="true" setvar_vaddr="log_forwarder_consume_vaddr" />
+        <map mr="log_nic_driver0" vaddr="0x4_100_000" perms="r" cached="true" setvar_vaddr="log_nic_driver0_vaddr" />
+        <map mr="log_nic_driver0_consume" vaddr="0x4_110_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver0_consume_vaddr" />
+        <map mr="log_nic_driver1" vaddr="0x4_200_000" perms="r" cached="true" setvar_vaddr="log_nic_driver1_vaddr" />
+        <map mr="log_nic_driver1_consume" vaddr="0x4_210_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver1_consume_vaddr" />
+        <map mr="log_config" vaddr="0x4_300_000" perms="r" cached="true" setvar_vaddr="log_config_vaddr" />
+        <map mr="log_config_consume" vaddr="0x4_310_000" perms="rw" cached="true" setvar_vaddr="log_config_consume_vaddr" />
     </protection_domain>
 
     <!-- Both channels carry notifications in one direction only, so only that
@@ -297,4 +500,32 @@
         <end pd="config" id="0" notify="true" />
         <end pd="forwarder" id="2" notify="true" />
     </channel>
+
+    <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS
+         ABSENCE IS A DECISION.
+
+         A DOMAIN THAT NEVER BLOCKS NEEDS NO WAKEUP. The console busy-polls the
+         four rings and never leaves `init`, for the reason set out above it, so
+         it never reaches the Microkit event loop and could not observe a
+         notification if one were sent. It discovers work the only way a polling
+         domain can: by reading the cursor each writing domain publishes, which
+         it does on every pass regardless. A send capability on this domain
+         would therefore be authority granted for nothing — a widening of four
+         writers' reach with no path that consumes it (ENG-1) — so no channel is
+         declared, and the machinery that fed one is gone rather than left
+         dormant (ENG-7).
+
+         The direction that stays refused on its own terms: nothing here grants
+         the console a send capability on any domain. A console that could
+         notify a driver would hold a wakeup capability on the domain it is
+         supposed to be reporting about, and a domain woken by whatever is
+         printing about it is a control path dressed as a diagnostic one. That
+         remains true whatever replaces the polling.
+
+         When the console becomes interrupt-driven — the improvement recorded
+         above it — the wakeup it needs is an `<irq>` from the controller, not a
+         notification from a writer: what a transmitter-empty interrupt says is
+         "the line can take more bytes", which is the thing the polling loop is
+         actually waiting for. A writer's notification would say only "a record
+         exists", which the cursor already says. -->
 </system>

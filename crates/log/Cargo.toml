@@ -8,6 +8,10 @@ license.workspace = true
 
 [dependencies]
 net-headers = { path = "../net-headers" }
+# The shared-memory record and ring an event crosses a domain boundary as. The
+# dependency runs this way and never back: `wire` lays out regions and depends
+# on nothing, and turning a region's bytes into an event is this crate's.
+wire = { path = "../wire" }
 
 [dev-dependencies]
 proptest = { workspace = true }

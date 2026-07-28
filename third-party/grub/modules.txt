@@ -8,6 +8,9 @@
 #   fat           read the FAT filesystems on ESP/STATE/slot partitions
 #   normal        GRUB's normal mode; runs the embedded grub.cfg
 #   multiboot2    the multiboot2/module2 loader seL4's x86 boot path requires
+#   mmap          the `cutmem` that keeps the boot module out of low memory,
+#                 without which seL4 loads the userland image over its own
+#                 kernel; see the reservation in grub.cfg
 #   test          the `[ ... ]` conditionals in grub.cfg's slot logic
 #   echo          the `LFW-BOOT slot=… state=…` records the A/B test asserts on
 #   halt          halt on the no-bootable-slot recovery path
@@ -19,6 +22,7 @@ part_gpt
 fat
 normal
 multiboot2
+mmap
 test
 echo
 halt

@@ -18,7 +18,10 @@ cargo-fuzz = true
 # AGENTS.md TEST-7: this list is diffed against `crates/` whenever a crate is
 # added, and a crate on an untrusted-input path without an entry is a finding.
 #
-#   wire            the descriptor ABI and the config handover image a peer PD writes
+#   wire            the descriptor ABI, the config handover image and the log
+#                   record and ring a peer PD writes
+#   lfw-log         the event a peer PD's log record decodes to, and the console
+#                   line it renders to
 #   config          the configuration document, whose every byte is the
 #                   management-plane attacker's, and the model read out of it
 #   net-headers     the Ethernet/IPv4/UDP headers a wire carries
@@ -32,6 +35,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
 wire = { path = "../crates/wire" }
+lfw-log = { path = "../crates/log" }
 config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
 routing = { path = "../crates/routing" }
@@ -123,6 +127,20 @@ bench = false
 [[bin]]
 name = "config_document"
 path = "fuzz_targets/config_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_record"
+path = "fuzz_targets/log_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_ring"
+path = "fuzz_targets/log_ring.rs"
 test = false
 doc = false
 bench = false
