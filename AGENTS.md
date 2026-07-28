@@ -369,11 +369,17 @@ and PD with locked dependencies, validate and assemble the Microkit system descr
 x86_64 Multiboot2 kernel and system image, package only deployable outputs into `dist/`, and emit
 checksums and an SBOM.
 
-**The shipped profile is the tested profile (BLD-3).** `make release` runs the full acceptance gate,
-assembles the release configuration, *and boots that release artifact against the same forwarding
-contract* before it counts as a release; if it fails, `dist/` is emptied rather than left holding an
-unproven image that looks finished. The release configuration is a different kernel build from the
-one the gate exercises, so passing the gate on the debug image says nothing about it.
+**The shipped profile is the tested profile (BLD-3).** *Every* end-to-end scenario boots the release
+configuration: `make ci` assembles it and holds that disk to the forwarding contract across the
+system and A/B scenarios, and to the configuration transcript where a scenario states one. `make
+release` adds the other half of the rule — if anything in that run failed, `dist/` is emptied rather
+than left holding an unproven image that looks finished.
+
+It was not always so, and the reason it is now is worth keeping. The gate used to boot the debug
+configuration and only `make release` touched the release one, which nothing ran on push; two
+consecutive changes then shipped defects reachable only in release — a console that emitted nothing,
+and a boot chain that loaded userland over the kernel's own page tables. A gate that boots something
+other than the artifact says nothing about the artifact.
 
 The build container is a tool, not the product. The deployable output is the signed Microkit boot
 payload and its versioned machine contract (BLD-6). A cache may accelerate a build but must never be
@@ -383,11 +389,20 @@ required for correctness (BLD-4).
 
 Two profiles exist today (BLD-5):
 
-- `debug` — functional development with serial diagnostics and assertions. System tests use it so
-  diagnostics survive a failure; success is still the machine-observable contract, not console text.
-- `release` — production-oriented kernel and optimized PDs, with no dependence on debug output.
-  Booted and proven by `make release` (BLD-3). A production health/attestation mechanism is still
-  open (README status).
+There is no debug *binary*: the protection domains compile under the `--release` Cargo profile in
+both, so first-party code is one compilation. What differs is the seL4 kernel build, which is why
+"debug" is better read as "release plus kernel diagnostics".
+
+- `release` — the artifact. Every gate that boots anything boots this one (BLD-3), and it is what
+  `make image` builds with no flag. A production health/attestation mechanism is still open
+  (README status).
+- `debug` — a diagnostic tool, not a test target. The kernel prints, so a fault reports itself
+  instead of vanishing into an empty serial log. Reached three ways: `make run`, `make image-debug`,
+  and automatically when an end-to-end scenario fails — the harness re-runs that one scenario on it
+  and surfaces the result as evidence, never letting it change the verdict. A scenario that fails on
+  release and passes on debug is a divergence worth naming, and it is the signature both defects
+  above carried. The two-kernel-configuration Clippy pass is the only thing keeping this
+  configuration buildable, so it is load-bearing rather than incidental.
 
 Two more are **intended and do not exist**. Nothing in `Cargo.toml`, `xtask`, or `systems/` wires
 them, and no rule here should be read as describing a present capability:
@@ -688,7 +703,7 @@ a command finds *candidates*, not violations — it makes the review reproducibl
 |---|---|---|---|
 | BLD-1 | The `Makefile` is the stable, thin interface; orchestration lives in `xtask` | MIN | REVIEW |
 | BLD-2 | `make image` works from a clean checkout and performs the full documented sequence | MAJ | GATE · `xtask image` |
-| BLD-3 | The shipped profile is the tested profile: `make release` gates, assembles, **and boots** the release artifact against the forwarding contract, or empties `dist/` | CRIT | GATE · `xtask release` |
+| BLD-3 | The shipped profile is the tested profile: **every** end-to-end scenario boots the release artifact, and `make release` empties `dist/` when the run did not prove it | CRIT | GATE · `xtask ci`, `xtask release` |
 | BLD-4 | A cache may accelerate a build but is never required for correctness | MAJ | REVIEW |
 | BLD-5 | Only `debug` and `release` exist; `benchmark` and `smp-*` are intended and unimplemented — do not document them as present | MAJ | REVIEW · `rg -n -e benchmark -e 'smp-' Cargo.toml tools/ systems/` |
 | BLD-6 | The deployable output is the signed boot payload and its versioned machine contract; the builder is a tool, not the product | MAJ | REVIEW · `dist/` contents |

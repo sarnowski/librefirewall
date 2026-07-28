@@ -15,17 +15,28 @@ else
 CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
 endif
 
-.PHONY: image run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean
+.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean
 
 # `image` provisions the pinned builder and is therefore the ONLY target that
 # reaches the network. Every other target requires that image to already exist
 # and refuses to build it, so no gate command can quietly turn into an OCI
 # build — and the offline guarantee is enforced here rather than asserted in
 # prose.
+#
+# It builds the RELEASE seL4 kernel configuration: the artifact a deployment
+# gets, and the one every end-to-end scenario in `ci` boots (BLD-3).
 image:
 	$(provision_builder)
 	$(call xtask,image)
 
+# The debug kernel as an explicit opt-in, for hand inspection of a build
+# nothing ships. No gate reaches it; `ci` boots the release image.
+image-debug:
+	$(require_builder)
+	$(call xtask,image-debug)
+
+# Interactive development, and the one place the debug kernel still earns its
+# place: a human is reading the serial output as it happens.
 run:
 	$(require_builder)
 	$(call xtask_interactive,run)

@@ -25,12 +25,14 @@
 //! - [`forward_harness`] — the two-port socket-backed forwarding harness.
 //! - [`topology`] — the bench read out of the configuration document under test.
 //! - [`config_transcript`] — the `LFW-CFG` console channel one boot must carry.
+//! - [`diagnose`] — re-run a failed release scenario on the debug kernel.
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
-//! composes the two gates — [`ci`] is the complete pull-request gate, and
-//! [`release`] is that gate plus an acceptance run of the release configuration
-//! itself, held to the forwarding *and* the console contract because it is the
-//! only stage that boots the kernel build a release actually ships.
+//! composes the two gates. [`ci`] is the complete pull-request gate, and every
+//! end-to-end scenario in it boots the RELEASE configuration — the image a
+//! release publishes (BLD-3). [`release`] is that gate plus the guarantee
+//! `dist/` never survives a run that failed to prove what it holds; it boots
+//! nothing of its own, because there is nothing left for it to prove.
 
 use std::{env, error::Error, fmt, fs, io, path::Path, process::ExitCode};
 
@@ -38,6 +40,7 @@ mod ab_test;
 mod artifacts;
 mod budgets;
 mod config_transcript;
+mod diagnose;
 mod disk;
 mod evidence;
 mod forward_harness;
@@ -70,8 +73,23 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let root = util::workspace_root()?;
     match command.as_str() {
-        "image" => image::image(&root, image::DEBUG_CONFIG)?,
+        // The shipping artifact. `image` is what an operator runs to get
+        // something deployable, and what a deployment gets is the release
+        // configuration — so that is what it builds, with no flag to remember.
+        "image" => image::image(&root, image::RELEASE_CONFIG)?,
+        // The debug kernel as an explicit opt-in, for hand inspection of a
+        // build nothing ships. Nothing in any gate reaches it: `ci` boots
+        // release, and the only other thing that compiles this configuration
+        // is `host`'s two-configuration PD lint.
+        "image-debug" => image::image(&root, image::DEBUG_CONFIG)?,
         "run" => {
+            // The DEBUG kernel, deliberately, and the one place that choice is
+            // still right: an interactive run is the command whose serial
+            // output a human is sitting and reading, so the kernel's own
+            // diagnostics (PRINTING, IRQ_REPORTING, the user stack traces) are
+            // worth their cost here exactly as they are not in a gate that
+            // asserts on machine-observable contracts. Nothing is proved here,
+            // so nothing about BLD-3 is at stake.
             image::image(&root, image::DEBUG_CONFIG)?;
             qemu::run_system(&root)?;
         }
@@ -81,14 +99,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         "fuzz" => host::fuzz(&root)?,
         "verify-reproducible" => reproducible::verify_reproducible(&root)?,
         "test-system" => {
-            image::image(&root, image::DEBUG_CONFIG)?;
-            qemu::test_system(&root)?;
+            image::image(&root, image::RELEASE_CONFIG)?;
+            println!("system tests passed: {}", qemu::test_system(&root)?);
         }
         "test-ab" => {
-            image::image(&root, image::DEBUG_CONFIG)?;
-            ab_test::test_ab(&root)?;
+            image::image(&root, image::RELEASE_CONFIG)?;
+            println!("A/B fallback tests passed: {}", ab_test::test_ab(&root)?);
         }
-        "ci" => ci(&root)?,
+        "ci" => {
+            println!("ci passed: {}", ci(&root)?);
+        }
         "release" => release(&root)?,
         "clean" => host::clean(&root)?,
         _ => return Err(usage().into()),
@@ -97,122 +117,75 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 /// The complete pull-request gate: the fast host gate, the fuzz targets, and
-/// the assembled debug image proved against the QEMU system and A/B contracts.
-fn ci(root: &Path) -> Result<(), Box<dyn Error>> {
+/// the assembled RELEASE image proved against the QEMU system and A/B
+/// contracts. Returns what those boots proved.
+///
+/// # Why every end-to-end scenario boots the release configuration
+///
+/// Because it is the image a release publishes, and BLD-3 is that the shipped
+/// profile is the tested profile. The arrangement this replaced booted the
+/// debug image here and left the release image to `release`, which nothing runs
+/// on push — and two consecutive changes shipped defects reachable only in the
+/// configuration no gate touched: a console that emitted nothing, because
+/// `debug_println!` compiles to a kernel debug syscall the release kernel is
+/// not built with; and a Multiboot2 module GRUB placed below 1 MiB, which the
+/// debug image survived only by being too large to fit down there.
+///
+/// It costs nothing in coverage of our own code. `image` passes `--release` to
+/// the protection-domain build in both configurations, so there is no debug
+/// binary and the Rust compiled here is the Rust that ships; the difference is
+/// the seL4 kernel build alone. What it does cost is the debug kernel's serial
+/// diagnostics on a failure, and [`diagnose`] buys those back for the one
+/// scenario that failed rather than for every scenario that did not.
+fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
     host::test_host(root)?;
     host::fuzz(root)?;
-    image::image(root, image::DEBUG_CONFIG)?;
-    qemu::test_system(root)?;
-    ab_test::test_ab(root)?;
-    Ok(())
+    image::image(root, image::RELEASE_CONFIG)?;
+    let system = qemu::test_system(root)?;
+    let ab = ab_test::test_ab(root)?;
+    Ok(format!("{system}; and {ab}"))
 }
 
-/// Run the full acceptance gate and then assemble *and prove* the release
-/// configuration.
+/// Run the full acceptance gate and publish what it proved.
 ///
-/// The release configuration is a different kernel build from the one [`ci`]
-/// exercises, so passing the gate on the debug image says nothing about it.
-/// Publishing an artifact no test has booted is how a broken release ships, so
-/// the release disk must satisfy the forwarding *and* the console contract
-/// before it counts as a release; when it does not, `dist/` is emptied rather
-/// than left holding an unproven image that looks finished.
+/// [`ci`] already assembles the release configuration into `dist/` — manifest,
+/// SBOM, checksums and the signed A/B disk — and already boots that disk
+/// through every system and A/B scenario. So `release` adds no boot of its
+/// own; what it adds is BLD-3's other half: when the gate did not prove the
+/// artifact, `dist/` is emptied rather than left holding an unproven image that
+/// looks finished.
 ///
-/// The emptying covers the *whole* of [`prove_release_configuration`], not the
-/// boot alone: assembly populates `dist/` partway through, so a failure after
-/// that point leaves an incomplete release behind exactly as a failed boot
-/// leaves an unproven one, and BLD-3 does not distinguish the two.
+/// # Why there is nothing left here to prove
+///
+/// There used to be. `ci` booted the debug image, so the release disk was
+/// booted exactly once — here — and the contracts asserted against it were this
+/// function's alone. Both of those contracts are now asserted inside `ci`,
+/// against the same release disk: the routed contract by every system and
+/// routing A/B scenario, and the `LFW-CFG` console transcript by two of the
+/// three system scenarios (`generation-swap` on the published disk and
+/// `alternate-configuration` on a second document's). Re-booting the same disk
+/// a twelfth time to re-assert a subset of what eleven boots just asserted
+/// would cost an image build and a QEMU run and establish nothing.
+///
+/// The emptying covers the whole of [`ci`], not a boot alone: assembly
+/// populates `dist/` partway through, so a failure after that point leaves an
+/// incomplete release behind exactly as a failed boot leaves an unproven one,
+/// and BLD-3 does not distinguish the two. A failure *before* assembly is
+/// covered for the same reason — `dist/` may still hold a previous build, and
+/// a release run that did not prove an artifact must not leave one publishable.
 fn release(root: &Path) -> Result<(), Box<dyn Error>> {
-    ci(root)?;
     let dist = root.join("dist");
-    match prove_release_configuration(root, &dist) {
+    match ci(root) {
         Ok(proof) => {
-            println!("release image proved against the forwarding and console contracts: {proof}");
+            println!(
+                "release image proved against the forwarding and console contracts: {proof}; \
+                 published in {}",
+                dist.display()
+            );
             Ok(())
         }
         Err(failure) => Err(discard_dist(&dist, &failure).into()),
     }
-}
-
-/// Assemble the release configuration into `dist/` and hold the disk it
-/// produced to both contracts a booted appliance owes, returning what that boot
-/// was observed to do. A release that says only "proved" cannot be told from
-/// one whose contracts had grown empty; the counts say how much the claim rests
-/// on.
-///
-/// # Why the console is asserted here and not only in [`ci`]
-///
-/// It was not, and that omission is what would have let a release be published
-/// with no console at all. `debug_println!` compiles to `seL4_DebugPutChar`, a
-/// kernel *debug* syscall the release kernel is not built with — the SDK's
-/// release `sel4.elf` carries no `putchar` and no printf symbol where the debug
-/// one carries both — so every record a domain emitted through it in a release
-/// image reached nothing. `ci` went on passing, because it boots the debug
-/// image; and this function went on passing too, because it asserted forwarding
-/// alone. A dataplane is indifferent to whether anything is printed, so the one
-/// gate that touched the release artifact was the one gate that could not see
-/// the difference.
-///
-/// # What the assertion proves, and what it does not
-///
-/// It judges the `LFW-CFG` channel of the release boot against the transcript
-/// the shipped document describes — the same [`config_transcript::ConfigContract`]
-/// the debug system scenarios use, so there is one reader of the console and
-/// one statement of what a boot must say. Passing it means bytes a domain
-/// published reached the serial line *in the release kernel*: through the log
-/// ring, through the console domain, out of the UART, in the right order and
-/// with the right values. It is a structured channel and nothing else — no
-/// prose, no timing (TEST-13).
-///
-/// It does not enumerate the `LFW-PD` lifecycle channel, and it is not a claim
-/// that every record any domain can emit renders correctly. The property it
-/// defends is the one that was silently false: that the release profile has a
-/// working console at all.
-fn prove_release_configuration(root: &Path, dist: &Path) -> Result<String, Box<dyn Error>> {
-    image::image(root, image::RELEASE_CONFIG)?;
-    // The bench the release disk's own configuration document describes, and
-    // the transcript that same document obliges it to print. The release build
-    // embeds this document and both contracts are stated against it, so neither
-    // can disagree with the appliance about what it answers to or what it says.
-    // Both are derived before the boot: a document describing no transcript is
-    // a fault in the release, and finding that out costs nothing here and a
-    // whole QEMU run afterwards.
-    let path = root.join(image::CONFIGURATION_DOCUMENT);
-    let document = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let topology =
-        topology::Topology::from_document(&document).map_err(|error| error.to_string())?;
-    let contract = config_transcript::ConfigContract::from_document(&document)
-        .map_err(|error| error.to_string())?;
-
-    let log_name = "qemu-release.log";
-    let booted =
-        qemu::boot_and_forward(root, &dist.join(artifacts::DIST_DISK), log_name, &topology)?;
-    contract
-        .judge(&booted.serial, &root.join("build/image").join(log_name))
-        .map_err(silent_release)?;
-    Ok(format!(
-        "{}, and {}",
-        booted.traffic.summary(),
-        contract.summary()
-    ))
-}
-
-/// Frame a release boot's console verdict as the thing it most often is.
-///
-/// A transcript mismatch on the debug image is a configuration defect; on the
-/// release image the first thing to suspect is that the console is not there at
-/// all, because the release kernel is the profile where that has already
-/// happened once. Naming it costs one sentence and is the difference between an
-/// operator reading "the records are wrong" and reading "the records never left
-/// the domain that wrote them" (ENG-12).
-fn silent_release(verdict: String) -> String {
-    format!(
-        "the release image booted and forwarded, and its console did not carry the transcript \
-         the shipped configuration document describes. Suspect the console path before the \
-         configuration: the release kernel is built without CONFIG_PRINTING, so any record still \
-         written through the kernel debug syscall reaches nothing, and a release that forwards \
-         perfectly while saying nothing is precisely what this assertion exists to refuse. The \
-         verdict: {verdict}"
-    )
 }
 
 /// Empty `dist/` after a release attempt that did not prove its artifact, and
@@ -244,8 +217,8 @@ fn discard_dist(dist: &Path, failure: &dyn fmt::Display) -> String {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask \
-     <image|run|test|coverage|bench|fuzz|verify-reproducible|test-system|test-ab|ci|release|clean>"
+    "usage: cargo xtask <image|image-debug|run|test|coverage|bench|fuzz|verify-reproducible\
+     |test-system|test-ab|ci|release|clean>"
         .to_owned()
 }
 
@@ -317,25 +290,6 @@ mod tests {
         );
 
         fs::remove_file(&dist).unwrap();
-    }
-
-    #[test]
-    fn a_release_console_verdict_names_the_cause_before_the_symptom() {
-        // The operator-facing half of the assertion. The verdict it wraps says
-        // which records were missing; on the release profile the reason is far
-        // more often that none were emitted at all, and an operator who reads
-        // "the configuration transcript is wrong" goes looking in the
-        // configuration domain.
-        let message = silent_release("the fail-closed record appears 0 times".to_owned());
-        assert!(message.contains("CONFIG_PRINTING"), "got: {message}");
-        assert!(
-            message.contains("forwards perfectly while saying nothing"),
-            "the defect it refuses must be named: {message}"
-        );
-        assert!(
-            message.contains("the fail-closed record appears 0 times"),
-            "the underlying verdict must survive the framing: {message}"
-        );
     }
 
     #[test]

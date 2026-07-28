@@ -19,12 +19,20 @@
 //! Which document that is, and where the disk it produces goes, are the two
 //! things one build varies from another ([`Destination`]). The published build
 //! is the appliance's own document into `dist/`; a [`Destination::Scenario`]
-//! build is a second document into the build tree, for the QEMU scenario that
-//! proves the dataplane reads its table from the document rather than carrying
-//! one compiled in. Both walk the identical pipeline — same pinned-input check,
+//! build goes into the build tree instead, for a QEMU scenario that must not
+//! disturb what `dist/` holds. Two kinds of scenario need that: the one proving
+//! the dataplane reads its table from the document rather than carrying one
+//! compiled in (a second document), and every [`crate::diagnose`] re-run of a
+//! failed scenario on the debug kernel (the same document, the other kernel
+//! configuration). Both walk the identical pipeline — same pinned-input check,
 //! same validator, same protection domains, same signed A/B disk — because a
 //! scenario disk assembled by a shorter path would prove something about that
 //! path rather than about the appliance.
+//!
+//! The kernel configuration is the caller's, and the gate's callers all pass
+//! `release`: that is the image a release publishes, so that is the image every
+//! end-to-end scenario boots (BLD-3). `debug` reaches this module from the
+//! `image-debug` opt-in, from `run`, and from a diagnostic re-run.
 
 use std::{
     fs,
@@ -136,12 +144,16 @@ pub(crate) fn image(root: &Path, config: &str) -> Result<(), Error> {
     .map(|_disk| ())
 }
 
-/// Assemble a disk from `document` for one QEMU scenario, returning its path.
+/// Assemble a disk from `document` in kernel configuration `config` for one
+/// QEMU scenario, returning its path.
 ///
 /// The published `dist/` is left exactly as it was: a scenario image is
 /// evidence for a test and never something to ship, and a gate that overwrote
-/// the artifact under test with one built from a different document would prove
-/// the wrong disk.
+/// the artifact under test with one built from a different document — or in a
+/// different kernel configuration — would prove the wrong disk. That is why a
+/// [`crate::diagnose`] re-run of a failed release scenario comes through here
+/// and never through [`image`]: the release disk in `dist/` is the thing under
+/// judgement, and a debug disk published over it would destroy it.
 pub(crate) fn scenario_image(
     root: &Path,
     config: &str,

@@ -1,6 +1,10 @@
 //! `verify-reproducible`: build the image twice from scratch and prove the
 //! deployable boot payload is byte-identical.
 //!
+//! It builds the RELEASE configuration, because the claim worth making is about
+//! the artifact that ships: a payload nothing deploys reproducing bit for bit
+//! is evidence about a build nobody runs.
+//!
 //! Only the loose boot payload — the seL4 kernel and the Microkit system image
 //! — is compared. It carries no signature, key, or SBOM timestamp, so it must
 //! reproduce exactly from the same pinned inputs (and empirically does, even
@@ -18,7 +22,7 @@ use std::{
 
 use crate::{
     artifacts::{DIST_KERNEL, DIST_SYSTEM},
-    image::{self, DEBUG_CONFIG},
+    image::{self, RELEASE_CONFIG},
     util::{Error, copy_file, recreate_dir},
 };
 
@@ -74,8 +78,8 @@ pub(crate) fn verify_reproducible(root: &Path) -> Result<(), Error> {
 /// recompile and repackage rather than reusing cached outputs) and copy the
 /// compared artifacts out of `dist/` into `scratch/<tag>`.
 fn build_and_capture(root: &Path, scratch: &Path, tag: &str) -> Result<PathBuf, Error> {
-    recreate_dir(&root.join("target").join(DEBUG_CONFIG))?;
-    image::image(root, DEBUG_CONFIG)?;
+    recreate_dir(&root.join("target").join(RELEASE_CONFIG))?;
+    image::image(root, RELEASE_CONFIG)?;
 
     let out = scratch.join(tag);
     recreate_dir(&out)?;

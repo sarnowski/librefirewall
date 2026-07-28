@@ -212,7 +212,12 @@ that never reached userspace at all looks like, because on the release kernel no
 and the console domain can print. The two are not distinguishable **on this surface**, and there is
 no second channel yet that would separate them (no `GET /logs`, no metrics endpoint). Distinguishing
 them today is an external act — attaching a debugger, or booting the debug profile, whose kernel
-narrates its own start-up.
+narrates its own start-up. In the QEMU gate that act is automated: a scenario that fails on the
+release image is re-run once on the debug kernel by `tools/xtask/src/diagnose.rs`, which reports the
+empty release capture as the expected silence of a kernel built without `CONFIG_PRINTING` rather
+than as a second fault, and surfaces the debug boot's serial output beside it. That is a harness
+convenience for this repository's own scenarios, not a channel on a deployed node: an operator
+holding a silent appliance still has only the external act.
 
 - `features=0x<hex>` — the feature bitmap the driver and its device settled on. Which bit means what
   is virtio's vocabulary and is deliberately not decoded here.
@@ -347,8 +352,10 @@ That guarantee is exact **in the release profile**, and one caveat qualifies it 
   banner and its fault reports onto the line the console domain owns. That output is prose and
   carries no contract, but it can land *inside* a line — a record preceded on its line by kernel
   text, or followed by it. **A reader must therefore still recover records by scanning for the
-  `LFW-` prefix anywhere in the stream, not by assuming one line is one record.** Every QEMU capture
-  in this repository is a debug boot and shows exactly this. The kernel prints on boot and on
+  `LFW-` prefix anywhere in the stream, not by assuming one line is one record.** The captures the
+  gate writes are release boots and carry none of this; a debug boot is reached only by a diagnostic
+  re-run of a failed scenario (`build/image/*-debug.log`), by `make run`, or from a `make
+  image-debug` build, and it is those captures the caveat is about. The kernel prints on boot and on
   faults, never per record, so the interleaving is bounded and occasional rather than routine.
 - **What no reader can recover** is a record whose own bytes were split. Nothing in the release
   profile splits one; in debug, a kernel fault report arriving mid-line leaves a fragment with no

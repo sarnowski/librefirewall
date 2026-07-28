@@ -54,6 +54,10 @@ was decided by whether the system image happened to fit down there, so **the deb
 by luck**. `third-party/grub/grub.cfg` now denies GRUB that memory and the build refuses an image
 small enough to fit what remains; see *[Signed boot chain](#signed-boot-chain)*.
 
+Both defects were reachable only in the configuration no gate booted, and both are the reason the
+gate now boots the shipped one: every QEMU scenario in `make ci` runs the release image, and the
+only debug kernel any gate boots is the one re-run to diagnose a scenario that has already failed.
+
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection
 tracking, no NAT, no ARP, and no ICMP. What exists is a router on a firewall's substrate, not yet a
@@ -397,11 +401,12 @@ asserts OBS-5 directly: no record the ABI accepts can put a byte outside printab
 rendered console line, and no text value can carry one outside `[a-z0-9-]`, so a hostile peer cannot
 paint terminal escape sequences onto an operator's console.
 
-`make release` now asserts the `LFW-CFG` console contract on the **release** boot, against the same
-transcript derived from the same document the debug scenarios use. That is the part that makes the
-defect non-recurring: a missing console went unnoticed precisely because the one gate that touched
-the release artifact asserted forwarding alone, and a dataplane is indifferent to whether anything
-is printed.
+Every end-to-end scenario now boots the **release** image, and two of the three system scenarios
+assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
+image under test was built from. Both halves were needed to make the defect non-recurring: a missing
+console went unnoticed because no gate on the push path booted a release artifact at all, and
+because the one stage that did booted it against the forwarding contract alone — and a dataplane is
+indifferent to whether anything is printed.
 
 **Missing.**
 
@@ -435,9 +440,10 @@ is printed.
   slot the tool moved is refused by name.
 - **The single-writer property is exact only in release.** The debug kernel is built with
   `CONFIG_PRINTING` and writes the *same* port for its boot banner and its fault reports — it is
-  handed `debug_port = 0x3f8` on the Multiboot2 command line, and every QEMU capture in this
-  repository shows it. That is accepted, the kernel printing on boot and on faults rather than per
-  record, and it is why the claim is stated of the shipped profile.
+  handed `debug_port = 0x3f8` on the Multiboot2 command line, which is visible in the capture of any
+  debug boot (a diagnostic re-run's `build/image/*-debug.log`, or `make run`) and in none of the
+  captures the gate writes, those being release boots. That is accepted, the kernel printing on boot
+  and on faults rather than per record, and it is why the claim is stated of the shipped profile.
 - **The console cannot report its own failure to start.** From entry into `init` until the register
   sequence returns, the reporting mechanism is what is being started. A refused *capability* is named
   on the debug kernel's channel, which does not exist in a release image; a refused *controller* — one
@@ -698,13 +704,13 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eleven library crates, `xtask`, and all four protection-domain binaries in each of the two seL4 kernel configurations. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the eleven library crates, `xtask`, and all four protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.32% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (three system scenarios, A/B scenarios) | **partial** | single vCPU, two ports; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | eleven persistent targets, between them covering every crate that interprets bytes it did not write; a sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
-| Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image; not a CI gate |
+| Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
 | Build input pinning | **partial** | every apt package — QEMU and OVMF included — is pinned to an exact version against a dated snapshot, but no sha256 for one is recorded here, so apt's own archive signature is the integrity root; the `cargo install`ed developer tools are version-exact and `--locked`, but their integrity rests on the crates.io index rather than on a checksum in this repository |
 
@@ -750,11 +756,19 @@ the snapshot that file freezes. Nothing outside the builder is required beyond P
 From a clean checkout:
 
 ```sh
-make image          # build the OCI builder, then assemble the signed A/B disk + release bundle
+make image          # build the OCI builder, then assemble the release A/B disk + bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
 make test-system    # boot three QEMU scenarios: forwarding, generation swap, alternate config
-make ci             # the complete gate (host gate + fuzz + image + system + A/B scenarios)
+make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
 ```
+
+**Every end-to-end scenario boots the release image** — the kernel configuration a deployment gets,
+which is what BLD-3 asks of a gate. `make image` therefore builds that configuration with no flag to
+remember, and the debug kernel is an explicit opt-in (`make image-debug`), the interactive `make
+run`, and the diagnostic re-run described below. What that costs is nothing in coverage of this
+project's own code: the protection domains are compiled with the `--release` Cargo profile in both
+configurations, so there is no debug binary and the Rust under test is the Rust that ships. Only the
+seL4 kernel build differs.
 
 `make test-system` is also the smoke test. It runs **three scenarios**, each a full boot of a signed
 disk through OVMF and GRUB with a host-controlled endpoint attached to each NIC port, and each
@@ -784,14 +798,33 @@ sockets and nothing else; the transcript verdict is the structured `LFW-CFG` cha
 else. Neither is read from timing, and neither is read from prose — the channel being recovered the
 way MONITORING.md obliges every reader to, by scanning for the `LFW-` marker anywhere in the stream
 rather than assuming a record begins a line. Records no longer tear into one another, the port
-having one owner; what these scenarios boot is the *debug* kernel, which writes the same port for
-its own banner and faults, so a record can still be preceded on its line by kernel prose. The one
-thing that scan cannot tell apart from a record is prose *quoting* one, which is the
-marker's price and fails closed: the quotation comes with its surrounding words, so it lands as a
-mismatch rather than as a pass. The guest's serial output is captured to
-`build/image/qemu-<scenario>.log` for reading after a failure. A failing run prints the
-same table with the offending probe marked, ahead of the diagnostic naming the field that departed
-from the contract.
+having one owner, and what these scenarios boot is the release kernel, which prints nothing of its
+own — so no capture the gate writes carries kernel prose at all, only the firmware's and GRUB's,
+both of which finish before the first domain starts. The scan is kept because it is what
+MONITORING.md obliges of every reader and because the debug kernel does write that port, for its
+banner and its faults, so a record preceded on its line by kernel prose remains reachable in a
+diagnostic re-run, under `make run`, and in a `make image-debug` build. The one thing that scan
+cannot tell apart from a record is prose *quoting* one, which is the marker's price and fails
+closed: the quotation comes with its surrounding words, so it lands as a mismatch rather than as a
+pass. The guest's serial output is captured to `build/image/qemu-<scenario>.log` for reading after a
+failure. A failing run prints the same table with the offending probe marked, ahead of the
+diagnostic naming the field that departed from the contract.
+
+**Fail on release, diagnose on debug.** The release kernel is built without `CONFIG_PRINTING`, so a
+boot that dies before the console domain claims the UART leaves an empty capture and a bare timeout
+with no diagnosis in it. When a scenario fails, the harness therefore re-runs *that one scenario* —
+never the others — on the debug kernel, and reports what happened beside the failure. It has three
+outcomes: the scenario **passes on debug**, reported as a divergence and pointing at the kernel
+configuration and the size and layout of the image GRUB has to place, which is the signature both
+defects above had; it **fails on both**, in which case the debug kernel's serial output is the
+diagnosis and its tail is quoted verbatim; or the debug image **could not be assembled**, reported
+as its own outcome rather than as evidence of anything. The re-run never changes the verdict — a
+scenario that fails on the image that ships has failed — and its artifacts are written under
+separate `-debug` names so they cannot overwrite the failing run's evidence or the release artifact
+in `dist/`. The operational cost is disk: a failure leaves a second, debug-configuration build tree
+and scenario disk beside the release ones, so the image build tree roughly doubles at its peak —
+measured here at 138 MiB for each configuration's protection-domain tree, plus about 90 MiB per
+scenario disk.
 
 `make image` is the only network-enabled phase (the OCI build). Every target that runs a build or a
 gate — `make clean` included — checks that the pinned builder image already exists and refuses with
@@ -805,17 +838,18 @@ for an accelerated run.
 The full command surface:
 
 ```sh
-make image                # build the OCI builder, then `xtask image`
-make run                  # boot the image interactively in QEMU
+make image                # build the OCI builder, then `xtask image` — the RELEASE configuration
+make image-debug          # assemble the debug kernel instead; an opt-in no gate reaches
+make run                  # boot the image interactively in QEMU (debug kernel, for its diagnostics)
 make test                 # fast host gate (format, clippy, tests, coverage floor, lint, dependency policy)
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
-make test-system          # boot the three QEMU system scenarios and assert on each
-make test-ab              # boot the eight A/B state-machine scenarios and assert on each
-make ci                   # the complete gate: host gate, fuzz, image, system and A/B
-make release              # run CI, then assemble AND boot the release payload (forwarding + console)
-make verify-reproducible  # build twice in isolation and compare artifacts
+make test-system          # boot the three QEMU system scenarios on the release image
+make test-ab              # boot the eight A/B state-machine scenarios on the release image
+make ci                   # the complete gate: host gate, fuzz, release image, system and A/B
+make release              # run CI, then keep `dist/` only if it proved what it holds
+make verify-reproducible  # build the release payload twice in isolation and compare artifacts
 make hooks                # install the pre-commit and pre-push git hooks
 make clean                # remove generated output only
 ```
@@ -823,9 +857,10 @@ make clean                # remove generated output only
 Commits go straight to `trunk`. Install the git hooks once with `make hooks`: the pre-commit hook
 runs the fast host gate (`make test`) and the pre-push hook runs the full `make ci`, so every commit
 that reaches `trunk` has passed formatting, lints, tests, coverage, dependency policy, the fuzz
-targets, image assembly, and the QEMU system and A/B gates. That is what a machine can check, and it
-is less than the rules the project holds itself to; [AGENTS.md](AGENTS.md) marks each rule `GATE` or
-`REVIEW` so it is never ambiguous which of the two a given property rests on.
+targets, release image assembly, and the QEMU system and A/B gates on that release image. That is
+what a machine can check, and it is less than the rules the project holds itself to;
+[AGENTS.md](AGENTS.md) marks each rule `GATE` or `REVIEW` so it is never ambiguous which of the two
+a given property rests on.
 
 On a development machine behind a TLS-inspecting proxy, the build automatically detects an installed
 inspection CA (a `*-dpi-ca.crt` under `/usr/local/share/ca-certificates/`) and provides it as a
@@ -842,29 +877,35 @@ enabled for every download. Do not commit the certificate.
 
 ## Release artifacts
 
-`make release` runs the complete acceptance gate, then assembles the production-oriented Microkit
-release configuration into `dist/` — **and then boots that release artifact against the forwarding
-contract *and* the console contract** before it counts as a release. The release configuration is a
-different kernel build from the one the gate exercises, so passing the gate on the debug image says
-nothing about it; if the release disk fails either contract, `dist/` is emptied rather than left
-holding an unproven image that looks finished.
+`make release` runs the complete acceptance gate and **boots nothing of its own**. It has nothing
+left to boot: `ci` already assembles the production-oriented Microkit release configuration into
+`dist/` and already holds that disk to both contracts a booted appliance owes — the forwarding
+contract on all three system scenarios and all eight A/B scenarios, and the `LFW-CFG` console
+transcript on two of the three system scenarios. What `make release` adds is the other half of
+BLD-3: if the gate did not prove the artifact, `dist/` is emptied rather than left holding an
+unproven image that looks finished. That covers a failure anywhere in the run, not a failed boot
+alone, because assembly populates `dist/` partway through and an incomplete release is no more
+publishable than an unproven one.
 
-The console half is there because its absence is what let a release be published with no console at
-all: `debug_println!` compiles to a kernel debug syscall the release kernel is not built with, `ci`
-boots only the debug image, and this stage asserted forwarding alone — and a dataplane is
-indifferent to whether anything is printed. The release boot is now judged on the same `LFW-CFG`
-transcript derived from the same shipped document that the debug system scenarios use, so passing
-means bytes a domain published reached the serial line *in the release kernel*: through the log
-ring, through the console domain, out of the UART, in order and with the right values. It does not
-enumerate the `LFW-PD` lifecycle channel, and it is not a claim that every record renders correctly.
-It defends the one property that was silently false — that the shipped profile has a console at all.
+The console assertion exists because its absence is what let a release be published with no console
+at all: `debug_println!` compiles to a kernel debug syscall the release kernel is not built with, no
+gate on the push path booted a release image, and the one stage that did asserted forwarding alone —
+and a dataplane is indifferent to whether anything is printed. A scenario judging the transcript
+derives it from the document its own image was built from, by the same calls and the same renderer
+the appliance uses, so passing means bytes a domain published reached the serial line *in the release
+kernel*: through the log ring, through the console domain, out of the UART, in order and with the
+right values. It does not enumerate the `LFW-PD` lifecycle channel, and it is not a claim that every
+record renders correctly. It defends the one property that was silently false — that the shipped
+profile has a console at all.
 
-Its first run found more than that. The release image did not boot: GRUB had placed the Microkit
-system image below the seL4 kernel and seL4 loaded the userland image over its own page tables,
-triple-faulting before any protection domain ran (see *[Signed boot chain](#signed-boot-chain)*).
-That defect was latent in every commit that built this boot chain and was invisible to every gate,
-because no gate had ever booted a release artifact. It is the concrete answer to why BLD-3 requires
-the shipped profile to be the tested profile.
+The first release boot found more than that. The image did not boot at all: GRUB had placed the
+Microkit system image below the seL4 kernel and seL4 loaded the userland image over its own page
+tables, triple-faulting before any protection domain ran (see
+*[Signed boot chain](#signed-boot-chain)*). That defect was latent in every commit that built this
+boot chain and was invisible to every gate, because no gate had ever booted a release artifact. It
+is the concrete answer to why BLD-3 requires the shipped profile to be the tested profile, and the
+reason the release image is no longer something one stage boots at the end but the only image any
+end-to-end scenario boots at all.
 
 The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
 through OVMF and GRUB. Alongside it, `dist/` carries five product-prefixed pieces of release

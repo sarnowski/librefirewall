@@ -105,14 +105,19 @@ const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio", "pd-runtim
 /// domain exists to fix. Now it is not, which makes this second run more
 /// load-bearing rather than less: nothing but a compilation shows it.
 ///
-/// What makes the second run worth its third of a second is where the release
-/// configuration is otherwise compiled at all: [`crate::ci`] assembles the
-/// debug image only, so before this step the release-configuration PD build
-/// happened for the first time inside `release`, after the whole gate had
-/// passed. A PD change that does not compile, or does not lint, against the
-/// shipped kernel configuration was therefore discoverable only at release
-/// time. Both configurations are now checked at every commit, which is BLD-3's
-/// "the shipped profile is the tested profile" applied one stage earlier.
+/// # This is now the only thing keeping the `debug` configuration buildable
+///
+/// Every gate boots the release image: [`crate::ci`] assembles that
+/// configuration and the QEMU system and A/B scenarios boot it (BLD-3). The
+/// debug kernel survives in exactly three places — this lint, the `image-debug`
+/// opt-in, and `run` — and of the three only this one runs in a gate. So a PD
+/// change that compiles under the release headers and not under the debug ones
+/// is caught here or nowhere, and the debug configuration would otherwise rot
+/// undetected until the moment [`crate::diagnose`] tried to build it to explain
+/// a release failure. That is the worst possible moment for it to be broken.
+///
+/// It costs a third of a second, and it is compile-time: nothing about it
+/// reaches a booted image.
 const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFIG];
 
 /// The persistent fuzz targets under `fuzz/`, driven by [`fuzz`], ordered from

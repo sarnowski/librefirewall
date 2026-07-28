@@ -21,16 +21,26 @@
 //! additionally judge the `LFW-CFG` console channel through
 //! [`crate::config_transcript`].
 //!
+//! Every scenario boots the RELEASE kernel configuration, because that is the
+//! image a release publishes (BLD-3). A scenario that fails there is re-run
+//! once against the debug kernel by [`crate::diagnose`], whose verdict reports
+//! the divergence; that re-run is evidence and never changes the outcome.
+//!
 //! Every address in all of that comes from the configuration document the image
 //! under test was built from, read by [`crate::topology`]. Nothing in this
 //! module names an address, and the MAC it hands each guest NIC is the MAC an
 //! interface in that document claims.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use crate::{
     artifacts::DIST_DISK,
     config_transcript::ConfigContract,
+    diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted},
     image,
     topology::{PORTS, Topology},
@@ -120,7 +130,10 @@ struct Invocation {
     acceleration: Acceleration,
 }
 
-/// Which disk a scenario boots.
+/// Which disk a scenario boots on a [`Run::Shipping`] run.
+///
+/// It does not decide a [`Run::Diagnostic`] re-run, which always assembles its
+/// own disk into the build tree — see [`scenario_disk`].
 enum ImageUnderTest {
     /// The disk `dist/` already holds — what `image` published and what an
     /// operator would deploy. `dist/` is left exactly as it is.
@@ -150,7 +163,8 @@ struct Scenario {
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour across three scenarios.
+/// behaviour across three scenarios, in the kernel configuration a release
+/// ships. Returns what the run proved.
 ///
 /// 1. **routed-forwarding** — the published disk, judged by the routed contract
 ///    alone. It is the regression guard: exactly the contract that existed
@@ -167,7 +181,7 @@ struct Scenario {
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
 ///    table would satisfy scenarios 1 and 2 and fail every probe here.
-pub(crate) fn test_system(root: &Path) -> Result<(), String> {
+pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     let scenarios = [
         Scenario {
             name: "routed-forwarding",
@@ -189,14 +203,65 @@ pub(crate) fn test_system(root: &Path) -> Result<(), String> {
         },
     ];
 
+    let judged = scenarios
+        .iter()
+        .filter(|scenario| matches!(scenario.transcript, Transcript::Judged))
+        .count();
+
     for scenario in &scenarios {
-        run_scenario(root, scenario)?;
+        if let Err(verdict) = run_scenario(root, scenario, Run::Shipping) {
+            return Err(diagnose::after_shipping_failure(
+                &format!("system scenario {}", scenario.name),
+                verdict,
+                &scenario_log(root, scenario, Run::Shipping),
+                &scenario_log(root, scenario, Run::Diagnostic),
+                || run_scenario(root, scenario, Run::Diagnostic),
+            ));
+        }
     }
-    println!("system tests passed ({} scenarios)", scenarios.len());
-    Ok(())
+    Ok(format!(
+        "{} system scenarios on the {} kernel, {judged} of them judged against the \
+         configuration transcript",
+        scenarios.len(),
+        Run::Shipping.config(),
+    ))
 }
 
-fn run_scenario(root: &Path, scenario: &Scenario) -> Result<(), String> {
+/// Where one scenario's serial capture goes, per run. The two runs never share
+/// a path, so a diagnostic re-run cannot overwrite the failing shipping run's
+/// log — which is the evidence it was called to explain.
+fn scenario_log(root: &Path, scenario: &Scenario, run: Run) -> PathBuf {
+    root.join("build/image")
+        .join(format!("qemu-{}{}.log", scenario.name, run.name_suffix()))
+}
+
+/// The disk a scenario boots.
+///
+/// A [`Run::Diagnostic`] re-run always assembles its own disk into the build
+/// tree, `ImageUnderTest::Published` scenarios included. It may not call
+/// [`image::image`]: that publishes into `dist/`, which holds the release
+/// artifact the failing run was judging, and overwriting it with a debug disk
+/// would destroy the thing under assessment (BLD-3).
+fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, String> {
+    let name = scenario.name;
+    match (&scenario.image, run) {
+        (ImageUnderTest::Published, Run::Shipping) => Ok(root.join("dist").join(DIST_DISK)),
+        (ImageUnderTest::BuiltForTheScenario, Run::Shipping) => Ok(image::scenario_image(
+            root,
+            run.config(),
+            Path::new(scenario.document),
+            name,
+        )?),
+        (_, Run::Diagnostic) => Ok(image::scenario_image(
+            root,
+            run.config(),
+            Path::new(scenario.document),
+            &format!("{name}{}", run.name_suffix()),
+        )?),
+    }
+}
+
+fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String> {
     let name = scenario.name;
     let path = root.join(scenario.document);
     let document = fs::read(&path)
@@ -204,17 +269,9 @@ fn run_scenario(root: &Path, scenario: &Scenario) -> Result<(), String> {
     let topology = Topology::from_document(&document)
         .map_err(|error| format!("scenario {name}: {}: {error}", path.display()))?;
 
-    let disk = match scenario.image {
-        ImageUnderTest::Published => root.join("dist").join(DIST_DISK),
-        ImageUnderTest::BuiltForTheScenario => image::scenario_image(
-            root,
-            image::DEBUG_CONFIG,
-            Path::new(scenario.document),
-            name,
-        )?,
-    };
+    let disk = scenario_disk(root, scenario, run)?;
 
-    let log_name = format!("qemu-{name}.log");
+    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
     let booted = boot_and_forward(root, &disk, &log_name, &topology)
         .map_err(|error| format!("scenario {name}: {error}"))?;
 
@@ -224,7 +281,7 @@ fn run_scenario(root: &Path, scenario: &Scenario) -> Result<(), String> {
     // where a reader sees the second document's addresses on the wire.
     print!("{}", booted.traffic.render());
 
-    let log = root.join("build/image").join(&log_name);
+    let log = scenario_log(root, scenario, run);
     let judged = match scenario.transcript {
         Transcript::Ignored => String::new(),
         Transcript::Judged => {
@@ -237,7 +294,8 @@ fn run_scenario(root: &Path, scenario: &Scenario) -> Result<(), String> {
         }
     };
     println!(
-        "  system scenario ok: {name} ({}{judged}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}{judged}); QEMU output is in {}",
+        run.config(),
         booted.traffic.summary(),
         log.display()
     );
@@ -298,10 +356,14 @@ fn boot(
     let description = acceleration.describe();
     println!("  QEMU {run_label}: {description}");
     let log = root.join("build/image").join(log_name);
+    // The marker closing the header is [`GUEST_OUTPUT_MARKER`] rather than a
+    // literal, because `diagnose` splits a run log on it to tell the harness's
+    // own words from the guest's — and a release capture with nothing after it
+    // is the finding that note exists for.
     let header = format!(
         "# librefirewall QEMU run: {run_label}\n\
          # {description}\n\
-         # --- captured guest serial output follows ---\n"
+         {GUEST_OUTPUT_MARKER}"
     );
     forward_harness::run_boot_test(
         command,
@@ -315,6 +377,12 @@ fn boot(
     )
 }
 
+/// Boot the disk `dist/` holds interactively, on QEMU's own user-mode network.
+///
+/// The caller assembles that disk in the DEBUG kernel configuration (see
+/// `main`'s `run` arm): this is the one command whose output a human reads as
+/// it happens, so the kernel's serial diagnostics are worth their cost here
+/// exactly as they are not in the gate.
 pub(crate) fn run_system(root: &Path) -> Result<(), String> {
     let disk = root.join("dist").join(DIST_DISK);
     let path = root.join(image::CONFIGURATION_DOCUMENT);

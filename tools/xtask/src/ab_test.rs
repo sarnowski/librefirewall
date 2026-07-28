@@ -8,10 +8,19 @@
 //! would hang is represented by its persistent aftermath (TRY set, OK unset) —
 //! exactly what a watchdog reset leaves behind.
 //!
-//! Each [`Scenario`] starts from a fresh copy of the pristine release disk, sets
+//! Each [`Scenario`] starts from a fresh copy of a pristine disk built in the
+//! RELEASE kernel configuration — the image a release publishes (BLD-3) — sets
 //! the boot-selection state (and, where relevant, breaks a slot or tears the
 //! env block) exactly as the real update flow or a failed boot would leave it,
 //! then boots through OVMF/GRUB and asserts two independent things.
+//!
+//! The kernel configuration is load-bearing for only one of the two. GRUB emits
+//! its records before any kernel is entered, so the slot half reads identically
+//! under either build; the *health* half is the whole booted stack behind that
+//! choice, and reads identically under neither. A scenario that fails is
+//! therefore re-run once against the debug kernel by [`crate::diagnose`], whose
+//! verdict reports the divergence; that re-run is evidence and never changes
+//! the outcome.
 //!
 //! **Which slot was chosen** is asserted against the boot manager's structured
 //! channel: GRUB emits one `LFW-BOOT slot=… state=…` record per selection
@@ -31,10 +40,15 @@
 //! starts after GRUB's last record, the record sequence is always complete by
 //! the time it is judged.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use crate::{
     artifacts::DIST_DISK,
+    diagnose::{self, Run},
     disk::disk_at,
     image,
     qemu::{boot_and_forward, boot_and_halt},
@@ -84,18 +98,38 @@ struct Scenario<'a> {
     expect_grubenv_after: Option<&'a str>,
 }
 
+/// The pristine disk every scenario is seeded from, for one kind of run.
+///
+/// A [`Run::Diagnostic`] re-run assembles its own into the build tree; it may
+/// not call [`image::image`], which publishes into `dist/` and would overwrite
+/// the release artifact the failing run was judging (BLD-3).
+fn pristine_disk(root: &Path, run: Run) -> Result<PathBuf, String> {
+    match run {
+        Run::Shipping => {
+            let disk = root.join("dist").join(DIST_DISK);
+            require_file(&disk)?;
+            Ok(disk)
+        }
+        Run::Diagnostic => Ok(image::scenario_image(
+            root,
+            run.config(),
+            Path::new(image::CONFIGURATION_DOCUMENT),
+            &format!("ab{}", run.name_suffix()),
+        )?),
+    }
+}
+
 /// Exercise the A/B boot state machine end to end: the five scenarios spanning
 /// the update flow (confirmed A, a first try of staged B, fallback from a
 /// signature-broken B, skipping an exhausted B, a committed B), the recovery of
 /// an uninterpretable `ORDER`, and the two ways every slot can become
 /// unbootable — a broken payload, and boot state that cannot record an attempt.
-pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
-    let dist_disk = root.join("dist").join(DIST_DISK);
-    require_file(&dist_disk)?;
-    let work = root.join("build/image/ab-test.img");
-    // Every scenario boots the published disk, so the bench is the one the
-    // appliance's own configuration document describes. Read once: which slot
-    // GRUB chose is what varies here, never the addressing behind it.
+///
+/// Returns what the run proved.
+pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
+    // Every scenario boots a disk built from the appliance's own configuration
+    // document, so the bench is the one that document describes. Read once:
+    // which slot GRUB chose is what varies here, never the addressing behind it.
     let document = root.join(image::CONFIGURATION_DOCUMENT);
     let topology =
         Topology::read(&document).map_err(|error| format!("{}: {error}", document.display()))?;
@@ -212,35 +246,62 @@ pub(crate) fn test_ab(root: &Path) -> Result<(), String> {
         },
     ];
 
+    let pristine = pristine_disk(root, Run::Shipping)?;
     for scenario in &scenarios {
-        run_scenario(root, &dist_disk, &work, scenario, &topology)?;
+        if let Err(verdict) = run_scenario(root, &pristine, scenario, &topology, Run::Shipping) {
+            return Err(diagnose::after_shipping_failure(
+                &format!("A/B scenario {}", scenario.name),
+                verdict,
+                &scenario_log(root, scenario.name, Run::Shipping),
+                &scenario_log(root, scenario.name, Run::Diagnostic),
+                || {
+                    let pristine = pristine_disk(root, Run::Diagnostic)?;
+                    run_scenario(root, &pristine, scenario, &topology, Run::Diagnostic)
+                },
+            ));
+        }
     }
 
-    println!("A/B fallback tests passed ({} scenarios)", scenarios.len());
-    Ok(())
+    Ok(format!(
+        "{} A/B scenarios on the {} kernel",
+        scenarios.len(),
+        Run::Shipping.config()
+    ))
+}
+
+/// Where one scenario's serial capture goes, per run — never the same path for
+/// both, so a diagnostic re-run cannot overwrite the failing shipping run's log.
+fn scenario_log(root: &Path, name: &str, run: Run) -> PathBuf {
+    root.join("build/image")
+        .join(format!("ab-{name}{}.log", run.name_suffix()))
 }
 
 fn run_scenario(
     root: &Path,
-    dist_disk: &Path,
-    work: &Path,
+    pristine: &Path,
     scenario: &Scenario,
     topology: &Topology,
+    run: Run,
 ) -> Result<(), String> {
     let name = scenario.name;
-    copy_file(dist_disk, work)?;
+    // Per run, for the same reason the log is: the seeded and corrupted disk a
+    // shipping scenario failed on is evidence, and a re-run must not eat it.
+    let work = root
+        .join("build/image")
+        .join(format!("ab-test{}.img", run.name_suffix()));
+    copy_file(pristine, &work)?;
     match scenario.grubenv {
-        GrubenvSeed::Entries(entries) => set_grubenv(work, entries)?,
-        GrubenvSeed::Torn => tear_grubenv(root, work)?,
+        GrubenvSeed::Entries(entries) => set_grubenv(&work, entries)?,
+        GrubenvSeed::Torn => tear_grubenv(root, &work)?,
     }
     for slot in scenario.corrupt_slots {
-        corrupt_slot_signature(root, work, slot)?;
+        corrupt_slot_signature(root, &work, slot)?;
     }
 
-    let log_name = format!("ab-{name}.log");
+    let log_name = format!("ab-{name}{}.log", run.name_suffix());
     let booted = match scenario.outcome {
-        Outcome::Routes => boot_and_forward(root, work, &log_name, topology),
-        Outcome::Halts => boot_and_halt(root, work, &log_name, HALT_RECORD, topology),
+        Outcome::Routes => boot_and_forward(root, &work, &log_name, topology),
+        Outcome::Halts => boot_and_halt(root, &work, &log_name, HALT_RECORD, topology),
     }
     .map_err(|error| format!("scenario {name}: {error}"))?;
 
@@ -252,12 +313,12 @@ fn run_scenario(
              decisions\n  expected: {:#?}\n  observed: {:#?}\n  full run log: {}",
             scenario.records,
             observed,
-            root.join("build/image").join(&log_name).display()
+            scenario_log(root, name, run).display()
         ));
     }
 
     if let Some(entry) = scenario.expect_grubenv_after {
-        let env = read_grubenv(work)?;
+        let env = read_grubenv(&work)?;
         if !env.lines().any(|line| line == entry) {
             return Err(format!(
                 "scenario {name}: expected grubenv to contain {entry:?} after boot, got:\n{env}"
@@ -272,7 +333,10 @@ fn run_scenario(
         Outcome::Routes => format!(" ({})", booted.traffic.summary()),
         Outcome::Halts => String::new(),
     };
-    println!("  A/B scenario ok: {name}{traffic}");
+    println!(
+        "  A/B scenario ok: {name} on the {} kernel{traffic}",
+        run.config()
+    );
     Ok(())
 }
 

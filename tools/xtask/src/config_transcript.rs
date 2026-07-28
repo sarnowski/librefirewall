@@ -313,22 +313,32 @@ impl From<ContractError> for String {
 ///
 /// # Why a line is not a record
 ///
-/// The console is one unsynchronised device shared by every protection domain
-/// and a record is written with no lock, so a record does not reliably *begin*
-/// a line. Every boot capture under `build/image/qemu-*.log` carries the shape
-/// `LFW-PD domain=nic-driverLFW-PD domain=nic-driver state=starting`: one
-/// domain's whole record written inside another's, mid-record. MONITORING.md
-/// therefore states the reader's obligation as part of the contract — recover
-/// records by scanning for the `LFW-` prefix anywhere in the stream — and
-/// [`records_in_line`] is that scan.
+/// A record reaches the line through one writer — the console domain renders it
+/// and puts the whole line on the port it alone holds — so records no longer
+/// splice into one another: no capture under `build/image/` shows the shape
+/// `LFW-PD domain=nic-driverLFW-PD domain=nic-driver state=starting`, in either
+/// kernel configuration. That is recent. Before the console domain existed
+/// every domain wrote its own records through `debug_println!` with nothing
+/// serialising them, and one domain's whole record written inside another's,
+/// mid-record, is what a capture then routinely carried.
+///
+/// The reader's obligation outlived the defect, and MONITORING.md still states
+/// it as part of the contract — recover records by scanning for the `LFW-`
+/// prefix anywhere in the stream, never by assuming a line is a record.
+/// [`records_in_line`] is that scan, held to what the contract obliges rather
+/// than to what the current captures happen to contain. The single-writer
+/// property is exact only in release: the debug kernel writes the same port for
+/// its banner and its fault reports, so a record preceded on its line by kernel
+/// prose stays reachable there.
 ///
 /// Splitting on newlines and matching a prefix, which this did before, was not
-/// merely fragile but *asymmetrically* so. Only `LFW-PD` records are seen to
-/// tear today, so the transcript comparison went on passing; but a
-/// `LFW-CFG … rejected=` record written after another domain's on one line
-/// fails a `starts_with` filter, and [`ConfigContract::judge`]'s refusal guard
-/// would then read a node that had refused its own configuration as a clean
-/// boot. A guard that fails open on the case it exists for is worse than none.
+/// merely fragile but *asymmetrically* so — and that argument rests on the
+/// grammar rather than on what any capture shows, so it did not weaken when the
+/// tearing stopped. A `LFW-CFG … rejected=` record written after another
+/// domain's on one line fails a `starts_with` filter, and
+/// [`ConfigContract::judge`]'s refusal guard would then read a node that had
+/// refused its own configuration as a clean boot. A guard that fails open on
+/// the case it exists for is worse than none.
 ///
 /// # What this deliberately does not do, and what it costs
 ///
@@ -439,10 +449,16 @@ mod tests {
     const SHIPPED: &[u8] = include_bytes!("../../../systems/qemu-x86_64/configuration.xml");
     const ALTERNATE: &[u8] = include_bytes!("../scenarios/alternate-addressing.xml");
 
-    /// The two halves a `nic-driver` record is torn into when another domain
-    /// writes between them, verbatim from `build/image/qemu-generation-swap.log`
-    /// — the head that ends a line another domain's record is spliced onto, and
-    /// the tail that resumes on the line after.
+    /// The two halves a `nic-driver` record splits into when a second writer
+    /// lands between them — the head that ends a line another domain's record
+    /// is spliced onto, and the tail that resumes on the line after.
+    ///
+    /// The record is `build/image/qemu-generation-swap.log`'s own, which that
+    /// capture carries whole; the split is this test's, made where a second
+    /// writer would have fallen. Nothing in the tree tears a record any more,
+    /// the port having one writer, so the input the reader is held to has to be
+    /// constructed rather than quoted — which is the point, the contract in
+    /// MONITORING.md being what this reader answers to.
     const TORN_HEAD: &str = "LFW-PD domain=nic-driver sta";
     const TORN_TAIL: &str = "te=ready rx-posted=16";
 
@@ -450,10 +466,11 @@ mod tests {
         Path::new("/nonexistent/qemu.log")
     }
 
-    /// Rewrite a capture the way the console really tears one: every `LFW-CFG`
-    /// record is written *inside* a `nic-driver` record, which resumes on the
-    /// line after. Nothing about the configuration channel changes — the same
-    /// records in the same order — only where the line breaks fall.
+    /// Rewrite a capture the way an unserialised console tore one: every
+    /// `LFW-CFG` record is written *inside* a `nic-driver` record, which
+    /// resumes on the line after. Nothing about the configuration channel
+    /// changes — the same records in the same order — only where the line
+    /// breaks fall.
     fn tear_every_config_record(text: &str) -> String {
         text.lines()
             .map(str::trim_end)
@@ -818,10 +835,12 @@ mod tests {
 
     #[test]
     fn a_record_written_inside_another_domains_record_is_still_recovered() {
-        // The shape every capture under build/image/qemu-*.log carries: one
-        // domain's whole record spliced into another's, and the interrupted
+        // One domain's whole record spliced into another's, and the interrupted
         // record's tail — which carries no marker of its own — on the next
-        // line. MONITORING.md makes recovering the first the reader's job.
+        // line. No capture under build/image/ carries this shape now that the
+        // port has a single writer; it is what captures carried before, and it
+        // is what MONITORING.md still makes the reader's job to recover, so the
+        // reader is held to the contract rather than to the console of the day.
         let capture = "LFW-PD domain=nic-driver staLFW-CFG generation=0 outcome=applied \
                        changes=0\r\nte=ready rx-posted=16\r\n";
         assert_eq!(
@@ -831,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_torn_the_way_a_real_boot_tears_it_is_still_judged() {
+    fn a_transcript_torn_the_way_an_unserialised_console_tore_it_is_still_judged() {
         let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
         let text = tear_every_config_record(&capture(&contract));
         // The premise, asserted rather than assumed: not one line of this
