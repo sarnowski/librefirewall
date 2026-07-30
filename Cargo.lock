@@ -411,12 +411,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-clock"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
+name = "lfw-hpet"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "proptest",
+]
+
+[[package]]
 name = "lfw-log"
 version = "0.1.0"
 dependencies = [
  "net-headers",
  "proptest",
  "wire",
+]
+
+[[package]]
+name = "lfw-rtc"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "proptest",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+[package]
+# `clock` is a common crate name; the directory keeps the short name and the
+# package carries the project prefix, so the lib target is `lfw_clock` — the
+# same split `crates/log` makes for `lfw-log`.
+name = "lfw-clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -47,6 +47,9 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "nic-driver-core",
     "uart-16550",
     "config",
+    "lfw-clock",
+    "lfw-hpet",
+    "lfw-rtc",
     "xtask",
 ];
 
@@ -71,6 +74,9 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "nic-driver-core",
     "uart-16550",
     "config",
+    "lfw-clock",
+    "lfw-hpet",
+    "lfw-rtc",
 ];
 
 /// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced

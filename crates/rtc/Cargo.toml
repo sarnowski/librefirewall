@@ -1,0 +1,19 @@
+[package]
+# `rtc` names the part; the package carries the project prefix, so the lib
+# target is `lfw_rtc` — the same split `crates/clock` makes for `lfw-clock`.
+name = "lfw-rtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# For `CivilTime` alone: the civil-to-epoch conversion and the calendar ranges
+# it enforces belong to the crate that owns time arithmetic, so the leap rule is
+# stated once rather than restated beside a register decoder.
+lfw-clock = { path = "../clock" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

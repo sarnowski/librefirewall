@@ -1,0 +1,19 @@
+[package]
+# `hpet` names the part; the package carries the project prefix, so the lib
+# target is `lfw_hpet` — the same split `crates/clock` makes for `lfw-clock`.
+name = "lfw-hpet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# For `Duration` alone: `ticks_for` is the translation between a span a caller
+# authors and a count of this device's ticks, and the span type belongs to the
+# crate that owns time arithmetic rather than being restated here.
+lfw-clock = { path = "../clock" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
