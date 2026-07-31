@@ -658,7 +658,7 @@ mod tests {
                      logic sitting in a PD, where neither the host floor nor the QEMU gate can \
                      reach it — and not a covered path. Closing it means moving the newtype \
                      into `pd_runtime`, beside the `MAPPING_ALIGN` and `POOL_REGION_SIZE` it \
-                     checks against, and having `DataplanePort::attach` take it, which puts the \
+                     checks against, and having `NicPort::attach` take it, which puts the \
                      check under the host coverage floor.",
                 ),
             },
@@ -805,6 +805,41 @@ mod tests {
                      describe: a refusal type owning its own console mapping, which cannot live \
                      in `lfw-clock` (the dependency would cycle through `lfw-log`) and so needs \
                      a crate of its own the day a second consumer of these three exists.",
+                ),
+            },
+        ),
+        (
+            "management",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk, injects frames of \
+                                four different lengths into the management port, and \
+                                `management_contract.rs` judges the `LFW-PD domain=management` \
+                                record its serial output carries: the frame count must be exactly \
+                                what was injected and the byte total exactly their summed lengths. \
+                                No boot can produce that record without this domain having \
+                                attached both pipeline regions, been woken on its channel, drained \
+                                the ring `nic_driver2` published into, counted each descriptor and \
+                                published a record of its own — `init` and `notified`, which is \
+                                every statement it has. The same scenario asserts that no frame \
+                                ever comes back on that port, which is the isolation half: this \
+                                domain cannot transmit and the forwarder cannot reach the port. \
+                                `xtask test-ab` boots the slot it selected through the same path.",
+                residue: Some(
+                    "One branch is reached by no QEMU test: the wakeup that moved no frame, where \
+                     this domain decides to say nothing. Whether it happens at all is the \
+                     scheduler's — the driver signals once per batch and a drain may take the \
+                     whole batch, so a second signal for the same frames may or may not arrive — \
+                     which is precisely a decision that cannot be asserted from outside. It is \
+                     first-party logic sitting in a PD, where neither the host floor nor the QEMU \
+                     gate reaches it, and that is the layering defect LAY-2 names rather than a \
+                     covered path. Closing it means moving the report-or-stay-silent decision \
+                     beside `TerminalStage::poll`, answering the totals to report or nothing, \
+                     which leaves the domain a call and an `announce` and puts the branch under \
+                     the host coverage floor. What no arrangement of this domain closes is \
+                     `TerminalCounters::malformed_descriptor` and `return_ring_full`: no scenario \
+                     has a byzantine driver to raise either and no surface exposes them \
+                     (MONITORING.md — the counts reach the console only as the frames/bytes \
+                     pair), which needs the metrics endpoint of CONCEPT §11.",
                 ),
             },
         ),

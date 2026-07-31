@@ -4,7 +4,7 @@
 //! [`RxPath`] and [`TxPath`] (the crate root) each answer for one direction's
 //! distrust boundaries. What is left is the *sequence* a driver runs them in,
 //! which used to live inside the protection domain's `loop` where no host test
-//! could reach it. [`DataplanePort`] owns it, so it is asserted here rather
+//! could reach it. [`NicPort`] owns it, so it is asserted here rather
 //! than believed.
 //!
 //! # Why the order is the order
@@ -21,7 +21,7 @@
 //!   every burst.
 //!
 //! Each signal is raised once per batch, not once per frame: a notification is
-//! an seL4 system call and the forwarder rereads the ring until it is empty, so
+//! an seL4 system call and the peer rereads the ring until it is empty, so
 //! a second one for the same batch buys nothing and costs a context switch. A
 //! doorbell is rung only when its step produced work, so an idle port performs
 //! no MMIO write at all.
@@ -31,7 +31,7 @@
 //! This module adds no distrust boundary of its own; it composes two that
 //! already exist. The **hostile or malfunctioning device** (CONCEPT §7.1) is
 //! answered by `virtio::queue` and [`RxPath`], the **byzantine neighbour PD**
-//! (the forwarder) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
+//! (the peer) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
 //! must not do is reintroduce an unbounded loop between them.
 
 use pd_runtime::{ForwardRings, Pool, PoolOwner, ReturnRing};
@@ -39,14 +39,14 @@ use pd_runtime::{ForwardRings, Pool, PoolOwner, ReturnRing};
 use crate::bringup::{DriverVirtqueue, Live, QUEUE_SIZE, VirtioDevice};
 use crate::{Counters, DriverStats, RxPath, TxPath};
 
-/// How a poll pass tells the forwarder that frames are waiting.
+/// How a poll pass tells the peer that frames are waiting.
 ///
 /// A trait so the poll sequence is host-testable: `sel4_microkit::Channel`
 /// cannot be constructed off seL4, and a notification is invisible from inside
 /// the domain that sends it, so a test asserting "notified exactly once, after
 /// `drain` and before the receive doorbell" has nothing else to observe.
-pub trait ForwarderSignal {
-    /// Signal the forwarder. Called at most once per poll pass.
+pub trait PeerSignal {
+    /// Signal the peer. Called at most once per poll pass.
     fn notify(&self);
 }
 
@@ -55,10 +55,10 @@ pub trait ForwarderSignal {
 /// Exists so a test can assert which steps produced work without reading the
 /// device's MMIO, and so a caller can tell a pass that moved traffic from an
 /// idle one. It is not a tally: the counts an operator wants are the
-/// [`Counters`] and `DeviceFaults` that [`stats`](DataplanePort::stats) samples.
+/// [`Counters`] and `DeviceFaults` that [`stats`](NicPort::stats) samples.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PollOutcome {
-    pub notified_forwarder: bool,
+    pub notified_peer: bool,
     pub rang_receive_doorbell: bool,
     pub rang_transmit_doorbell: bool,
 }
@@ -80,7 +80,7 @@ impl PollOutcome {
 /// same shapes in the same order; being a distinct type is what makes passing
 /// the two the wrong way round a compile error.
 pub struct ReceiveSide<'ring> {
-    /// Shared with the forwarder; this port produces on `rx`.
+    /// Shared with the peer; this port produces on `rx`.
     pub rings: &'ring ForwardRings,
     /// Where the transmitting driver hands buffers back; consumed here.
     pub returns: &'ring ReturnRing,
@@ -91,7 +91,7 @@ pub struct ReceiveSide<'ring> {
 /// the peer driver and is mapped here: writing the virtio-net header in front
 /// of a frame is the only production dereference of pool bytes in the system.
 pub struct TransmitSide<'ring> {
-    /// Shared with the forwarder; this port consumes `tx`.
+    /// Shared with the peer; this port consumes `tx`.
     pub rings: &'ring ForwardRings,
     /// Where this port hands buffers back to their owner.
     pub returns: &'ring ReturnRing,
@@ -106,7 +106,7 @@ pub struct TransmitSide<'ring> {
 /// descriptors are free, which are published, and what length each was posted
 /// with — so a second view of the same ring would hand out descriptors the
 /// first still considers the device's.
-pub struct DataplanePort<'ring> {
+pub struct NicPort<'ring> {
     receive_queue: DriverVirtqueue,
     transmit_queue: DriverVirtqueue,
     pool: PoolOwner<'ring>,
@@ -115,7 +115,7 @@ pub struct DataplanePort<'ring> {
     counters: Counters,
 }
 
-impl<'ring> DataplanePort<'ring> {
+impl<'ring> NicPort<'ring> {
     /// Take every handle this port needs and move both virtqueues in.
     ///
     /// **Unenforced precondition (DOC-7):** call once per protection domain.
@@ -166,11 +166,11 @@ impl<'ring> DataplanePort<'ring> {
     /// order and why it is that order.
     ///
     /// Each step is bounded per call by a driver-owned quantity, so neither the
-    /// device nor the forwarder can extend a pass.
+    /// device nor the peer can extend a pass.
     pub fn poll_once<D: VirtioDevice>(
         &mut self,
         device: &Live<D>,
-        forwarder: &impl ForwarderSignal,
+        peer: &impl PeerSignal,
     ) -> PollOutcome {
         self.pool.reclaim();
         let reposted =
@@ -180,7 +180,7 @@ impl<'ring> DataplanePort<'ring> {
             self.receive
                 .drain(&mut self.receive_queue, &mut self.pool, &mut self.counters);
         if forwarded {
-            forwarder.notify();
+            peer.notify();
         }
         if reposted {
             device.ring_receive();
@@ -196,7 +196,7 @@ impl<'ring> DataplanePort<'ring> {
         }
 
         PollOutcome {
-            notified_forwarder: forwarded,
+            notified_peer: forwarded,
             rang_receive_doorbell: reposted,
             rang_transmit_doorbell: transmitted,
         }
@@ -226,15 +226,15 @@ mod tests {
     use std::vec::Vec;
     use virtio::net::VirtioNetHdr;
 
-    /// A forwarder that records its notification into the shared log, so a
+    /// A peer that records its notification into the shared log, so a
     /// notification and a doorbell ring land in one ordered sequence.
-    struct RecordingForwarder {
+    struct RecordingPeer {
         log: Log,
     }
 
-    impl ForwarderSignal for RecordingForwarder {
+    impl PeerSignal for RecordingPeer {
         fn notify(&self) {
-            self.log.record(Event::ForwarderNotified);
+            self.log.record(Event::PeerNotified);
         }
     }
 
@@ -297,19 +297,19 @@ mod tests {
     struct PortFixture {
         receive_region: VqRegion,
         transmit_region: VqRegion,
-        port: DataplanePort<'static>,
+        port: NicPort<'static>,
         device: Live<FakeDevice>,
-        forwarder: RecordingForwarder,
+        peer: RecordingPeer,
         log: Log,
-        /// The forwarder's end of the receive pipeline's `rx` ring: what this
+        /// The peer's end of the receive pipeline's `rx` ring: what this
         /// port publishes completed frames onto.
         forwarded: RingConsumer<'static, RING_SLOTS>,
-        /// The forwarder's end of the receive pipeline's `free` ring: how a
+        /// The peer's end of the receive pipeline's `free` ring: how a
         /// buffer comes back to this port, which owns that pool.
         returns: RingProducer<'static, RING_SLOTS>,
-        /// The forwarder's end of the transmit pipeline's `tx` ring: how frames
+        /// The peer's end of the transmit pipeline's `tx` ring: how frames
         /// are queued for this port to send.
-        peer: RingProducer<'static, RING_SLOTS>,
+        to_transmit: RingProducer<'static, RING_SLOTS>,
         /// The device's used-ring index for the receive virtqueue.
         receive_used_idx: u16,
     }
@@ -349,7 +349,7 @@ mod tests {
 
             // Each pool region's real host address stands in for its physical
             // one, so a buffer address the port derives resolves to real bytes.
-            let mut port = DataplanePort::attach(
+            let mut port = NicPort::attach(
                 ReceiveSide {
                     rings: receive_rings,
                     returns: receive_returns,
@@ -371,17 +371,17 @@ mod tests {
                 transmit_region,
                 port,
                 device: configured.go_live(),
-                forwarder: RecordingForwarder { log: log.clone() },
+                peer: RecordingPeer { log: log.clone() },
                 log,
                 forwarded: receive_rings.rx.consumer(),
                 returns: receive_returns.free.producer(),
-                peer: transmit_rings.tx.producer(),
+                to_transmit: transmit_rings.tx.producer(),
                 receive_used_idx: 0,
             }
         }
 
         fn poll(&mut self) -> PollOutcome {
-            self.port.poll_once(&self.device, &self.forwarder)
+            self.port.poll_once(&self.device, &self.peer)
         }
 
         /// Publish a receive completion for descriptor `head` reporting
@@ -440,9 +440,9 @@ mod tests {
             }
         }
 
-        /// Queue a frame on the transmit pipeline as the forwarder would.
+        /// Queue a frame on the transmit pipeline as the peer would.
         fn queue_transmit(&mut self, buffer: u32) {
-            self.peer
+            self.to_transmit
                 .try_enqueue(Descriptor::new(
                     buffer,
                     VirtioNetHdr::LEN as u32,
@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_received_frame_notifies_the_forwarder_and_the_freed_descriptor_rings_next_pass() {
+    fn a_received_frame_notifies_the_peer_and_the_freed_descriptor_rings_next_pass() {
         // The consequence of refilling *before* draining: the descriptor a
         // completion frees goes back to the device on the following pass, and
         // the pass that forwarded the frame raises the notification alone.
@@ -481,22 +481,22 @@ mod tests {
         assert_eq!(
             first,
             PollOutcome {
-                notified_forwarder: true,
+                notified_peer: true,
                 rang_receive_doorbell: false,
                 rang_transmit_doorbell: false,
             }
         );
-        assert_eq!(fx.log.take(), vec![Event::ForwarderNotified]);
+        assert_eq!(fx.log.take(), vec![Event::PeerNotified]);
 
         let second = fx.poll();
         assert!(second.rang_receive_doorbell);
-        assert!(!second.notified_forwarder);
+        assert!(!second.notified_peer);
         assert_eq!(fx.log.take(), vec![Event::Rang(RX_QUEUE)]);
     }
 
     #[test]
-    fn the_forwarder_is_notified_once_per_pass_however_many_frames_arrive() {
-        // A notification is a system call and the forwarder drains the ring, so
+    fn the_peer_is_notified_once_per_pass_however_many_frames_arrive() {
+        // A notification is a system call and the peer drains the ring, so
         // a second one for the same batch costs a context switch and buys
         // nothing. A device completing every posted descriptor at once must
         // still produce exactly one.
@@ -511,7 +511,7 @@ mod tests {
             .log
             .take()
             .iter()
-            .filter(|event| **event == Event::ForwarderNotified)
+            .filter(|event| **event == Event::PeerNotified)
             .count();
         assert_eq!(notifications, 1);
     }
@@ -526,7 +526,7 @@ mod tests {
         assert_eq!(
             outcome,
             PollOutcome {
-                notified_forwarder: false,
+                notified_peer: false,
                 rang_receive_doorbell: false,
                 rang_transmit_doorbell: true,
             }
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(
             outcome,
             PollOutcome {
-                notified_forwarder: true,
+                notified_peer: true,
                 rang_receive_doorbell: true,
                 rang_transmit_doorbell: true,
             }
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(
             fx.log.take(),
             vec![
-                Event::ForwarderNotified,
+                Event::PeerNotified,
                 Event::Rang(RX_QUEUE),
                 Event::Rang(TX_QUEUE),
             ],
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn reclaim_precedes_refill_so_a_returned_buffer_is_reposted_in_the_same_pass() {
         // Why `reclaim` is first. With the pool empty, only a buffer the
-        // forwarder returns can refill the receive queue — and it can only do
+        // peer returns can refill the receive queue — and it can only do
         // so in the same pass if the return is reclaimed before the refill
         // runs. Reversing the two would leave the queue a descriptor short for
         // a whole pass on every return.
@@ -582,13 +582,13 @@ mod tests {
 
         fx.complete_receive(0, FRAME_LEN);
         let first = fx.poll();
-        assert!(first.notified_forwarder);
+        assert!(first.notified_peer);
         assert!(
             !first.rang_receive_doorbell,
             "the pool is empty, so nothing can be reposted yet"
         );
 
-        // The forwarder finishes with the frame and hands the buffer back.
+        // The peer finishes with the frame and hands the buffer back.
         let descriptor = fx.forwarded.try_dequeue().expect("a frame was forwarded");
         fx.returns
             .try_enqueue(descriptor)
@@ -646,7 +646,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
 
-        /// A hostile device and a byzantine forwarder driving the pass
+        /// A hostile device and a byzantine peer driving the pass
         /// together: arbitrary completions with arbitrary reported lengths, and
         /// arbitrary descriptors — forged indices included — queued for
         /// transmit. No pass may panic, each pass raises each signal at most
@@ -675,15 +675,15 @@ mod tests {
                     };
                     // A full ring is one of the states under test, so a refused
                     // enqueue is part of the scenario rather than a failure.
-                    let _ring_may_be_full = fx.peer.try_enqueue(descriptor);
+                    let _ring_may_be_full = fx.to_transmit.try_enqueue(descriptor);
                 }
                 fx.log.take();
                 let outcome = fx.poll();
                 let raised = fx.log.take();
 
                 prop_assert_eq!(
-                    raised.contains(&Event::ForwarderNotified),
-                    outcome.notified_forwarder
+                    raised.contains(&Event::PeerNotified),
+                    outcome.notified_peer
                 );
                 prop_assert_eq!(
                     raised.contains(&Event::Rang(RX_QUEUE)),

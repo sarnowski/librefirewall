@@ -16,7 +16,7 @@
 //!
 //! The record is a fixed-layout POD with no implicit padding — the `const _`
 //! block at the foot of `crates/wire/src/log_record.rs` asserts the fields sum
-//! to the whole 208 bytes — so the fuzzer's bytes *are* the region.
+//! to the whole [`RECORD_BYTES`] — so the fuzzer's bytes *are* the region.
 //! [`record_from_region`] lays the input over the ABI field for field and
 //! zeroes what the input does not reach, which is what a partially written
 //! region holds. Nothing is reduced into a plausible range on the way (TEST-8):
@@ -91,7 +91,7 @@ use wire::{
 /// Restated from the ABI contract rather than taken from `size_of`, so a record
 /// that changed size would show up as a seed that no longer means what it was
 /// committed for rather than as a silently re-laid-out input.
-pub const RECORD_BYTES: usize = 208;
+pub const RECORD_BYTES: usize = 224;
 
 /// The four record kinds, as the ABI numbers them. Restated here rather than
 /// reached for through `LogKind::to_bits`, which is the code under test.
@@ -102,13 +102,14 @@ const KIND_CONFIG_REJECTED: u32 = 3;
 /// One past the last kind: the smallest `kind` no event has.
 const KIND_COUNT: u32 = 4;
 
-/// The five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The six `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
 const DETAIL_REFUSAL: u8 = 3;
 const DETAIL_ESTABLISHED: u8 = 4;
-const DETAIL_COUNT: u8 = 5;
+const DETAIL_RECEIVED: u8 = 5;
+const DETAIL_COUNT: u8 = 6;
 
 /// The nine `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -438,6 +439,10 @@ const POISON: LogRecord = LogRecord {
     // And no value of this one is refused, so the pattern is only here to be
     // visible if a decode read it under a detail that never named it.
     unix_nanos: 0xAAAA_AAAA_AAAA_AAAA,
+    // Nor of these two: `Received` refuses nothing, so the pattern is here for
+    // the same reason.
+    frames: 0xAAAA_AAAA_AAAA_AAAA,
+    frame_bytes: 0xAAAA_AAAA_AAAA_AAAA,
 };
 
 /// A text nothing admits: a length past its own storage, and every byte an ESC
@@ -480,6 +485,10 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 DETAIL_ESTABLISHED => {
                     kept.tsc_hz = record.tsc_hz;
                     kept.unix_nanos = record.unix_nanos;
+                }
+                DETAIL_RECEIVED => {
+                    kept.frames = record.frames;
+                    kept.frame_bytes = record.frame_bytes;
                 }
                 DETAIL_REFUSAL => {
                     kept.cause = record.cause;
@@ -592,7 +601,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         )
     })
     .or_else(|| match record.detail {
-        DETAIL_NONE | DETAIL_FEATURES | DETAIL_RECEIVE_POSTED => None,
+        // `Received` joins these three: two counts, neither ranged, so the
+        // detail carries nothing a rule can refuse it for.
+        DETAIL_NONE | DETAIL_FEATURES | DETAIL_RECEIVE_POSTED | DETAIL_RECEIVED => None,
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.
@@ -732,6 +743,8 @@ pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
         operands: [quad(unstructured), quad(unstructured)],
         tsc_hz: quad(unstructured),
         unix_nanos: quad(unstructured),
+        frames: quad(unstructured),
+        frame_bytes: quad(unstructured),
         kind: word(unstructured),
         generation: word(unstructured),
         sequence: word(unstructured),
@@ -817,6 +830,8 @@ pub(crate) fn region_from_record(record: &LogRecord) -> Vec<u8> {
     }
     out.extend_from_slice(&record.tsc_hz.to_le_bytes());
     out.extend_from_slice(&record.unix_nanos.to_le_bytes());
+    out.extend_from_slice(&record.frames.to_le_bytes());
+    out.extend_from_slice(&record.frame_bytes.to_le_bytes());
     for word in [
         record.kind,
         record.generation,
@@ -1030,6 +1045,19 @@ mod tests {
                 region_from_record(&LogRecord {
                     tsc_hz: 0,
                     ..established_record()
+                }),
+            ),
+            // The management port's counts, which no rule refuses — so the
+            // seed is here for the render path rather than for a refusal, and
+            // for the same reason the two above are: a pair of interesting
+            // `u64`s is not something a uniform draw produces.
+            (
+                "valid_domain_received",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_RECEIVED,
+                    frames: 4,
+                    frame_bytes: 352,
+                    ..domain_record()
                 }),
             ),
             // Every byte the writer could set, set.

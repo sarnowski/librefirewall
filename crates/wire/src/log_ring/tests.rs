@@ -75,9 +75,9 @@ fn generation_of(body: &Result<CheckedBody, LogRecordError>) -> Option<u32> {
 #[test]
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(LOG_RING_SLOTS, 64);
-    assert_eq!(size_of::<LogRecord>(), 208);
-    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 208);
-    assert_eq!(size_of::<LogRecords>(), 13_320);
+    assert_eq!(size_of::<LogRecord>(), 224);
+    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 224);
+    assert_eq!(size_of::<LogRecords>(), 14_344);
     assert_eq!(LOG_RECORDS_REGION_SIZE, 0x4000);
     assert!(LOG_RECORDS_REGION_SIZE >= size_of::<LogRecords>());
     assert!(LOG_RECORDS_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));

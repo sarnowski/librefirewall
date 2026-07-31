@@ -115,6 +115,8 @@ pub(crate) struct LogSlot {
     operands: [AtomicU64; 2],
     tsc_hz: AtomicU64,
     unix_nanos: AtomicU64,
+    frames: AtomicU64,
+    frame_bytes: AtomicU64,
     kind: AtomicU32,
     generation: AtomicU32,
     sequence: AtomicU32,
@@ -145,6 +147,8 @@ impl LogSlot {
             operands: [const { AtomicU64::new(0) }; 2],
             tsc_hz: AtomicU64::new(0),
             unix_nanos: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            frame_bytes: AtomicU64::new(0),
             kind: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             sequence: AtomicU32::new(0),
@@ -176,6 +180,9 @@ impl LogSlot {
         }
         self.tsc_hz.store(record.tsc_hz, Ordering::Relaxed);
         self.unix_nanos.store(record.unix_nanos, Ordering::Relaxed);
+        self.frames.store(record.frames, Ordering::Relaxed);
+        self.frame_bytes
+            .store(record.frame_bytes, Ordering::Relaxed);
         self.kind.store(record.kind, Ordering::Relaxed);
         self.generation.store(record.generation, Ordering::Relaxed);
         self.sequence.store(record.sequence, Ordering::Relaxed);
@@ -212,6 +219,8 @@ impl LogSlot {
             operands,
             tsc_hz: self.tsc_hz.load(Ordering::Relaxed),
             unix_nanos: self.unix_nanos.load(Ordering::Relaxed),
+            frames: self.frames.load(Ordering::Relaxed),
+            frame_bytes: self.frame_bytes.load(Ordering::Relaxed),
             kind: self.kind.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
             sequence: self.sequence.load(Ordering::Relaxed),
@@ -272,6 +281,8 @@ const _: () = {
     assert!(offset_of!(LogSlot, operands) == offset_of!(LogRecord, operands));
     assert!(offset_of!(LogSlot, tsc_hz) == offset_of!(LogRecord, tsc_hz));
     assert!(offset_of!(LogSlot, unix_nanos) == offset_of!(LogRecord, unix_nanos));
+    assert!(offset_of!(LogSlot, frames) == offset_of!(LogRecord, frames));
+    assert!(offset_of!(LogSlot, frame_bytes) == offset_of!(LogRecord, frame_bytes));
     assert!(offset_of!(LogSlot, kind) == offset_of!(LogRecord, kind));
     assert!(offset_of!(LogSlot, generation) == offset_of!(LogRecord, generation));
     assert!(offset_of!(LogSlot, sequence) == offset_of!(LogRecord, sequence));

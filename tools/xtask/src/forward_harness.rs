@@ -1,9 +1,24 @@
-//! QEMU two-port virtio-net routing harness.
+//! QEMU virtio-net routing harness: two dataplane ports and a management one.
 //!
-//! Attaches two `virtio-net-pci` NICs whose backends are host-controlled TCP
-//! sockets to a caller-built QEMU invocation (the OVMF/GRUB boot of the
-//! deployable disk), plays one host endpoint on each port, and judges the boot
-//! against a [`BootContract`].
+//! Attaches a `virtio-net-pci` NIC per port whose backend is a host-controlled
+//! TCP socket to a caller-built QEMU invocation (the OVMF/GRUB boot of the
+//! deployable disk), plays one host endpoint on each dataplane port and one
+//! station on the management port, and judges the boot against a
+//! [`BootContract`].
+//!
+//! # The management port is a different kind of thing, not a third port
+//!
+//! It is not in [`PORTS`], carries no [`Endpoint`], and no probe crosses it: the
+//! routed contract must never expect it to forward anything, because CONCEPT
+//! §9.1 says it carries no forwarded traffic. What it gets instead is
+//! [`MANAGEMENT_FRAMES`] injected once — at the point the capture proves every
+//! port is up, so an exact count is possible — and one standing prohibition that
+//! holds for every boot: **no frame may ever come back on it**. Nothing in the
+//! appliance produces onto that port's transmit pipeline, so a frame arriving
+//! there would mean either that something does or that the forwarder has reached
+//! a port it is granted no region of. What was injected travels back to the
+//! caller as a [`ManagementInjection`] for `management_contract` to judge the
+//! console against.
 //!
 //! The primary contract, [`BootContract::Routed`], is the system's real
 //! observable behaviour. The guest is an IPv4 router between two directly
@@ -53,6 +68,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::management_contract::{self, ManagementInjection};
+use crate::qemu::{MANAGEMENT_MAC, every_guest_nic};
 use crate::topology::{Endpoint, PORTS, Topology};
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
@@ -114,6 +131,29 @@ const UNROUTED_DESTINATION: [u8; 4] = [192, 0, 2, 9];
 /// on this bench, so a frame addressed to it is addressed to nobody the
 /// appliance is. Checked against the bench for the same reason as above.
 const FOREIGN_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x99, 0x99, 0x99];
+
+/// The station the harness plays on the management wire.
+///
+/// A constant here rather than a document entry for the same reason
+/// `crate::qemu::MANAGEMENT_MAC` is: the port has no `<interface>`, so it has no
+/// `<neighbour>` either. It moves into the document beside that one.
+const MANAGEMENT_STATION_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x0c];
+
+/// The lengths of the frames injected into the management port, and the whole of
+/// what the console's byte total is judged against.
+///
+/// **Four different lengths, none of them a multiple of another**, because that
+/// is what makes the byte total evidence: a domain that summed a constant, or
+/// summed the descriptor's offset, or counted notifications rather than frames,
+/// reproduces the frame count and cannot reproduce 352. All four are at or above
+/// the 60-byte Ethernet minimum, so nothing pads them and the length QEMU
+/// delivers is the length written.
+const MANAGEMENT_FRAMES: [usize; 4] = [60, 64, 100, 128];
+
+/// The marker every management frame carries, so a frame of this harness's on
+/// that wire is never confused with a dataplane probe's — and so a frame coming
+/// back on the management port is attributable rather than merely unexpected.
+const MANAGEMENT_MARKER: &[u8] = b"LFW-PROBE/management";
 
 /// The UDP port pair every probe uses. Fixed rather than varied per probe: the
 /// payload marker is what attributes a delivery, so a second varying field
@@ -969,39 +1009,90 @@ pub struct BootTest<'a> {
     pub topology: &'a Topology,
 }
 
-/// The host side of the two NIC ports: one loopback listener per port that
-/// QEMU's `socket` netdevs dial into, so the port identity of each accepted
-/// stream is unambiguous.
+/// The host side of every NIC port: one loopback listener per port that QEMU's
+/// `socket` netdevs dial into, so the port identity of each accepted stream is
+/// unambiguous.
+///
+/// Indexed by [`GuestNic::slot`], so the dataplane ports come first and the
+/// management port is the last — which is what makes `MANAGEMENT_SLOT` a valid
+/// index into every array in this file that is keyed by it.
 pub struct NicBackends {
-    listeners: [TcpListener; PORTS],
+    listeners: Vec<TcpListener>,
 }
+
+/// Where the management port sits in every slot-keyed array here: one past the
+/// dataplane ports, exactly as `GuestNic::Management` sits one past them in the
+/// PCI slots and the ECAM grants.
+const MANAGEMENT_SLOT: usize = PORTS;
 
 impl NicBackends {
     pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            listeners: [bind_listener()?, bind_listener()?],
-        })
+        let mut listeners = Vec::with_capacity(MANAGEMENT_SLOT + 1);
+        for _ in 0..=MANAGEMENT_SLOT {
+            listeners.push(bind_listener()?);
+        }
+        Ok(Self { listeners })
     }
 
-    /// Append the two socket-backed virtio NICs to a QEMU invocation. Each
-    /// port's `socket` netdev dials the corresponding host listener; the
-    /// `-device` string (PCI address, MAC, no option ROM) is the single
-    /// definition shared with interactive runs via [`crate::qemu::nic_device`],
-    /// which takes the MAC from `topology`'s interface on that port.
+    /// Append every socket-backed virtio NIC to a QEMU invocation. Each port's
+    /// `socket` netdev dials the corresponding host listener; the `-device`
+    /// string (PCI address, MAC, no option ROM) is the single definition shared
+    /// with interactive runs via [`crate::qemu::nic_device`], which takes a
+    /// dataplane port's MAC from `topology`'s interface on it and the management
+    /// port's from `crate::qemu::MANAGEMENT_MAC`.
     pub fn apply(&self, command: &mut Command, topology: &Topology) -> Result<(), String> {
-        for (port, listener) in self.listeners.iter().enumerate() {
+        for (nic, listener) in every_guest_nic().into_iter().zip(&self.listeners) {
             let tcp = listener
                 .local_addr()
                 .map_err(|error| format!("read listener port: {error}"))?
                 .port();
             command
                 .arg("-netdev")
-                .arg(format!("socket,id=n{port},connect=127.0.0.1:{tcp}"))
+                .arg(format!(
+                    "socket,id={},connect=127.0.0.1:{tcp}",
+                    nic.netdev_id()
+                ))
                 .arg("-device")
-                .arg(crate::qemu::nic_device(topology, port)?);
+                .arg(crate::qemu::nic_device(topology, nic)?);
         }
         Ok(())
     }
+}
+
+/// One frame for the management port: addressed at L2 to the port's own MAC from
+/// the harness's station, carrying the marker and padded to `len`.
+///
+/// It is deliberately not IPv4. Nothing in the appliance parses a management
+/// frame yet — the domain counts descriptors — so a datagram here would be a
+/// shape the contract implied a meaning for and nothing read. The EtherType is
+/// the same local-experimental one [`legacy_broadcast_frame`] uses, for the same
+/// reason: it names no protocol anything will one day route by accident.
+fn management_frame(len: usize) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(len);
+    frame.extend_from_slice(&MANAGEMENT_MAC);
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&LOCAL_EXPERIMENTAL_ETHERTYPE.to_be_bytes());
+    frame.extend_from_slice(MANAGEMENT_MARKER);
+    frame.resize(len, 0);
+    frame
+}
+
+/// The frames one boot puts on the management wire, and what they oblige the
+/// appliance to report.
+///
+/// Every length is at or above the Ethernet minimum, so `resize` only ever pads
+/// and the byte total is exactly the sum of [`MANAGEMENT_FRAMES`] — which is the
+/// number `management_contract` holds the console to.
+fn management_probe() -> (Vec<Vec<u8>>, ManagementInjection) {
+    let frames: Vec<Vec<u8>> = MANAGEMENT_FRAMES
+        .iter()
+        .map(|len| management_frame(*len))
+        .collect();
+    let injection = ManagementInjection {
+        frames: frames.len(),
+        bytes: frames.iter().map(|frame| frame.len() as u64).sum(),
+    };
+    (frames, injection)
 }
 
 /// An [`Endpoint`] joined to the QEMU socket that carries its port's traffic.
@@ -1028,6 +1119,56 @@ impl AttachedEndpoint {
     }
 }
 
+/// The harness's end of the management wire.
+///
+/// Not an [`AttachedEndpoint`]: that carries an [`Endpoint`] read out of the
+/// configuration document, and the management port has no interface and no
+/// neighbour in one. What is left is a socket and the reason injection stopped,
+/// if it ever did.
+struct ManagementWire {
+    wire: TcpStream,
+    injection_failure: Option<io::Error>,
+}
+
+impl ManagementWire {
+    /// Put one frame on the wire, on [`AttachedEndpoint::inject`]'s terms: a
+    /// failure retires the wire and keeps its reason for whichever verdict the
+    /// exit and timeout checks eventually reach.
+    fn inject(&mut self, frame: &[u8]) {
+        if self.injection_failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.wire.write_all(&encode_wire(frame)) {
+            self.injection_failure = Some(error);
+        }
+    }
+}
+
+/// Why the management half of a timed-out run had not finished, as a clause to
+/// append to the verdict. A run that timed out with the management frames never
+/// sent failed for a different reason from one that sent them and heard nothing,
+/// and the two must not read alike.
+fn describe_management(
+    output: &[u8],
+    injected: &ManagementInjection,
+    wire: &ManagementWire,
+) -> String {
+    if let Some(error) = &wire.injection_failure {
+        return format!("management injection stopped: {error}");
+    }
+    if injected.is_empty() {
+        return format!(
+            "the management frames were never injected: the capture does not yet show every port \
+             up (ports_are_ready is {})",
+            management_contract::ports_are_ready(output)
+        );
+    }
+    format!(
+        "{} management frames of {} bytes were injected",
+        injected.frames, injected.bytes
+    )
+}
+
 /// Inject every probe the `wanted` predicate selects, from the endpoint whose
 /// port it enters on.
 fn inject_probes(
@@ -1046,12 +1187,18 @@ fn inject_probes(
     }
 }
 
-/// What one boot yielded: the guest's serial output, and what the probes
-/// injected into it were observed to do.
+/// What one boot yielded: the guest's serial output, what the probes injected
+/// into it were observed to do, and what reached the management port.
 #[derive(Debug)]
 pub struct Booted {
     pub serial: Vec<u8>,
     pub traffic: TrafficReport,
+    /// What was put on the management wire, which is what the console's own
+    /// count is judged against. Empty on a boot that never reached the point
+    /// where injecting an exact number was possible — a halted slot, or a routed
+    /// contract that failed first — and `management_contract::judge` refuses an
+    /// empty one rather than reading two zeroes as agreement.
+    pub management: ManagementInjection,
 }
 
 /// Spawn the prepared QEMU `command` (which must carry this harness's NIC
@@ -1122,18 +1269,22 @@ fn run_boot(
     // can be built on every exit path rather than only where the run succeeded.
     let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
     let mut broke: Option<usize> = None;
+    // What reached the management wire, which stays empty on every path that
+    // never got as far as sending it.
+    let (management_frames, injection) = management_probe();
+    let mut injected = ManagementInjection::default();
 
     let outcome: Result<(), String> = 'run: {
-        // Phase 1: accept both of QEMU's socket dial-ins.
-        let mut streams: [Option<TcpStream>; PORTS] = [None, None];
+        // Phase 1: accept every one of QEMU's socket dial-ins.
+        let mut streams: Vec<Option<TcpStream>> = (0..=MANAGEMENT_SLOT).map(|_| None).collect();
         while streams.iter().any(Option::is_none) {
             drain(&serial_receiver, &mut output);
-            for (port, listener) in backends.listeners.iter().enumerate() {
-                if streams[port].is_some() {
+            for (slot, listener) in backends.listeners.iter().enumerate() {
+                if streams.get(slot).is_some_and(Option::is_some) {
                     continue;
                 }
                 match listener.accept() {
-                    Ok((stream, _peer)) => streams[port] = Some(stream),
+                    Ok((stream, _peer)) => streams[slot] = Some(stream),
                     Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) => break 'run Err(format!("accept QEMU NIC socket: {error}")),
                 }
@@ -1149,13 +1300,23 @@ fn run_boot(
             }
             if start.elapsed() >= accept_timeout {
                 break 'run Err(format!(
-                    "QEMU did not connect both NIC sockets within {}s",
+                    "QEMU did not connect all {} NIC sockets within {}s",
+                    MANAGEMENT_SLOT + 1,
                     accept_timeout.as_secs()
                 ));
             }
             thread::sleep(Duration::from_millis(25));
         }
-        let streams = streams.map(|stream| stream.expect("both streams accepted"));
+        let mut accepted: Vec<TcpStream> = Vec::with_capacity(streams.len());
+        for stream in streams {
+            match stream {
+                Some(stream) => accepted.push(stream),
+                // Unreachable: the loop above only leaves when none is `None`.
+                None => break 'run Err("a NIC socket was never accepted".to_owned()),
+            }
+        }
+        let management_stream = accepted.pop().expect("the management slot is last");
+        let streams = accepted;
 
         // Each stream carries QEMU's `net_socket` STREAM framing in both
         // directions: a 4-byte big-endian length header followed by the raw L2
@@ -1163,6 +1324,26 @@ fn run_boot(
         // frames into one channel; draining continuously also keeps QEMU's TX
         // path from blocking on a full host socket buffer.
         let (frame_sender, frame_receiver) = mpsc::channel();
+        // The management wire, drained like the others so QEMU's TX path cannot
+        // block on a full host buffer, and watched for the one thing that must
+        // never arrive on it.
+        if let Err(error) = management_stream.set_nonblocking(false) {
+            break 'run Err(format!("set the management NIC socket blocking: {error}"));
+        }
+        let management_read = match management_stream.try_clone() {
+            Ok(handle) => handle,
+            Err(error) => break 'run Err(format!("clone the management NIC socket: {error}")),
+        };
+        frame_readers.push(spawn_frame_decoder(
+            MANAGEMENT_SLOT,
+            management_read,
+            frame_sender.clone(),
+        ));
+        let mut management = ManagementWire {
+            wire: management_stream,
+            injection_failure: None,
+        };
+
         let mut endpoints: Vec<AttachedEndpoint> = Vec::new();
         for (endpoint, stream) in stations.into_iter().zip(streams) {
             if let Err(error) = stream.set_nonblocking(false) {
@@ -1187,7 +1368,9 @@ fn run_boot(
 
         // Inject immediately: a station does not wait to be told its peer is
         // ready, and a packet sent into an unbooted appliance is lost rather
-        // than queued. That is why sending continues on a cadence below.
+        // than queued. That is why sending continues on a cadence below. The
+        // management frames are the exception and wait, for the reason given at
+        // the point they are sent.
         let mut last_injection = Instant::now();
         inject_probes(&mut endpoints, &probes, |_| true);
 
@@ -1200,6 +1383,20 @@ fn run_boot(
         loop {
             drain(&serial_receiver, &mut output);
             while let Ok((egress, frame)) = frame_receiver.try_recv() {
+                // The management port's standing prohibition, checked before any
+                // probe is matched because it holds under BOTH contracts and for
+                // any frame at all: nothing in the appliance produces onto that
+                // port's transmit pipeline, and the forwarder is granted no
+                // region of it, so a frame here means one of those two facts has
+                // stopped being true (CONCEPT §9.1).
+                if egress == MANAGEMENT_SLOT {
+                    break 'run Err(format!(
+                        "{} bytes came back on the management port, which carries no forwarded \
+                         traffic and has no producer on its transmit pipeline; see {}",
+                        frame.len(),
+                        log_path.display()
+                    ));
+                }
                 for (index, (probe, seen)) in probes.iter().zip(deliveries.iter_mut()).enumerate() {
                     if !contains(&frame, probe.marker) {
                         continue;
@@ -1228,15 +1425,25 @@ fn run_boot(
             }
             match &test.contract {
                 BootContract::Routed => match settling_since {
-                    None if all_routed(&probes, &deliveries) => {
-                        // Both directions have completed, so the guest is
-                        // demonstrably taking frames off both ports: a refused
-                        // packet injected now is one that reached the driver.
-                        // Send them once more and give a delivery the window it
-                        // would need to come back.
+                    // Both directions have completed AND the capture says every
+                    // port is up. The first says a refused packet injected now is
+                    // one that reached a driver; the second is what makes an
+                    // *exact* management count possible, a frame put on a wire
+                    // before its port has posted a receive buffer being lost
+                    // rather than queued. Neither implies the other: the
+                    // management port takes no part in forwarding.
+                    None if all_routed(&probes, &deliveries)
+                        && management_contract::ports_are_ready(&output) =>
+                    {
                         inject_probes(&mut endpoints, &probes, |probe| {
                             matches!(probe.expectation, Expectation::Dropped { .. })
                         });
+                        // Once, and never retransmitted: a retransmission is a
+                        // second frame, and the contract is an equality.
+                        for frame in &management_frames {
+                            management.inject(frame);
+                        }
+                        injected = injection;
                         settling_since = Some(Instant::now());
                     }
                     Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
@@ -1271,9 +1478,10 @@ fn run_boot(
             if start.elapsed() >= total_timeout {
                 break 'run Err(match &test.contract {
                     BootContract::Routed => format!(
-                        "timed out after {}s waiting for the routed contract; {}{}; see {}",
+                        "timed out after {}s waiting for the routed contract; {}; {}{}; see {}",
                         total_timeout.as_secs(),
                         describe_pending(&probes, &deliveries),
+                        describe_management(&output, &injected, &management),
                         describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
@@ -1346,6 +1554,7 @@ fn run_boot(
     Ok(Booted {
         serial: output,
         traffic,
+        management: injected,
     })
 }
 
@@ -1571,6 +1780,8 @@ fn write_capture(path: &Path, header: &str, output: &[u8]) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qemu::GuestNic;
+    use std::collections::BTreeSet;
 
     const HEADER: &str = "# test header\n";
 
@@ -1622,7 +1833,7 @@ mod tests {
         let topology = bench();
         for endpoint in topology.endpoints() {
             assert!(
-                crate::qemu::nic_device(&topology, endpoint.port)
+                crate::qemu::nic_device(&topology, GuestNic::Dataplane(endpoint.port))
                     .unwrap()
                     .contains(&mac(endpoint.gateway_mac)),
                 "endpoint {} expects a gateway MAC port{} does not carry",
@@ -2341,15 +2552,81 @@ mod tests {
             .iter()
             .filter(|arg| arg.starts_with("virtio-net-pci"))
             .collect();
-        assert_eq!(devices.len(), 2);
+        // Every port the image expects a device on, the management one included:
+        // a driver instance with no device at its ECAM page parks on a refusal,
+        // which is a boot no shipped image performs.
+        assert_eq!(devices.len(), MANAGEMENT_SLOT + 1);
         assert!(devices[0].contains("addr=02.0") && devices[0].contains("romfile="));
         assert!(devices[1].contains("addr=03.0") && devices[1].contains("romfile="));
+        assert!(
+            devices[MANAGEMENT_SLOT].contains("addr=04.0")
+                && devices[MANAGEMENT_SLOT].contains(&mac(MANAGEMENT_MAC))
+        );
         let netdevs: Vec<&String> = args
             .iter()
             .filter(|arg| arg.starts_with("socket,id="))
             .collect();
-        assert_eq!(netdevs.len(), 2);
-        assert_ne!(netdevs[0], netdevs[1], "each port needs its own listener");
+        assert_eq!(netdevs.len(), MANAGEMENT_SLOT + 1);
+        let distinct: BTreeSet<&&String> = netdevs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            netdevs.len(),
+            "each port needs its own listener"
+        );
+    }
+
+    /// The management frames are what the console's count is judged against, so
+    /// the two must be derived from one place. This is that derivation: four
+    /// lengths, none of them padded, summing to the byte total the contract
+    /// expects — and none of them a multiple of another, which is what stops a
+    /// domain that summed a constant from reproducing the total.
+    #[test]
+    fn the_management_probe_reports_exactly_the_frames_it_built() {
+        let (frames, injection) = management_probe();
+        assert_eq!(frames.len(), MANAGEMENT_FRAMES.len());
+        assert_eq!(injection.frames, frames.len());
+        assert_eq!(
+            injection.bytes,
+            MANAGEMENT_FRAMES.iter().map(|len| *len as u64).sum::<u64>()
+        );
+        assert!(!injection.is_empty());
+
+        let mut lengths = Vec::new();
+        for (frame, len) in frames.iter().zip(MANAGEMENT_FRAMES) {
+            // Nothing pads: every length is at or above the Ethernet minimum,
+            // so the length QEMU delivers is the length written and the byte
+            // total is the sum of these and not of something wider.
+            assert_eq!(frame.len(), len);
+            assert!(len >= MIN_ETHERNET_FRAME);
+            assert!(contains(frame, MANAGEMENT_MARKER));
+            // Addressed to the management port from the harness's station, so a
+            // frame on that wire is attributable in a capture.
+            assert!(frame.starts_with(&MANAGEMENT_MAC));
+            assert!(frame[6..12] == MANAGEMENT_STATION_MAC);
+            lengths.push(len);
+        }
+        for pair in lengths.windows(2) {
+            if let [shorter, longer] = pair {
+                assert!(longer > shorter, "the lengths must be distinct and ordered");
+                assert!(
+                    !longer.is_multiple_of(*shorter),
+                    "a length that is a multiple of another lets a constant sum agree"
+                );
+            }
+        }
+    }
+
+    /// No dataplane probe may carry the management marker and no management
+    /// frame a probe's, or a delivery would be attributed to the wrong wire.
+    #[test]
+    fn no_management_frame_carries_a_dataplane_probes_marker() {
+        let (frames, _) = management_probe();
+        for probe in probes(&bench()).expect("the shipped bench") {
+            assert!(!contains(&probe.frame, MANAGEMENT_MARKER), "{}", probe.name);
+            for frame in &frames {
+                assert!(!contains(frame, probe.marker), "{}", probe.name);
+            }
+        }
     }
 
     #[test]
@@ -2585,7 +2862,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.contains("did not connect both NIC sockets"),
+            error.contains("did not connect all"),
             "unexpected error: {error}"
         );
         assert!(log.is_file(), "the run log must be written on failure");

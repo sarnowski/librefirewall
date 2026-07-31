@@ -112,23 +112,23 @@ impl Width {
 /// location naturally aligned. A field that moved without this moving would
 /// fail there rather than silently putting a peer store in the wrong place.
 ///
-/// The runs, in order: `features`, the two `operands` and the two quads a
-/// measured clock carries; the six `u32` counters from `kind` to
-/// `receive_posted`; the ten vocabulary bytes, the six pad bytes and the whole
-/// of `cause` and `key`; `from.number`; the rest of `from`; `to.number`; the
-/// rest of `to`.
+/// The runs, in order: `features`, the two `operands`, the two quads a measured
+/// clock carries and the two a terminal endpoint's counts do; the six `u32`
+/// counters from `kind` to `receive_posted`; the ten vocabulary bytes, the six
+/// pad bytes and the whole of `cause` and `key`; `from.number`; the rest of
+/// `from`; `to.number`; the rest of `to`.
 const SEGMENTS: &[(usize, usize, usize, Width)] = &[
-    (0, 0, 5, Width::Quad),
-    (5, 40, 6, Width::Word),
-    (11, 64, 80, Width::Byte),
-    (91, 144, 1, Width::Word),
-    (92, 148, 28, Width::Byte),
-    (120, 176, 1, Width::Word),
-    (121, 180, 28, Width::Byte),
+    (0, 0, 7, Width::Quad),
+    (7, 56, 6, Width::Word),
+    (13, 80, 80, Width::Byte),
+    (93, 160, 1, Width::Word),
+    (94, 164, 28, Width::Byte),
+    (122, 192, 1, Width::Word),
+    (123, 196, 28, Width::Byte),
 ];
 
 /// How many separately writable atomics one slot holds.
-pub const LOCATION_COUNT: usize = 149;
+pub const LOCATION_COUNT: usize = 151;
 
 /// Which atomic of a slot a peer store lands in.
 ///

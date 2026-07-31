@@ -54,6 +54,7 @@ closed_vocabulary! {
         Config => "config",
         Console => "console",
         Clock => "clock",
+        Management => "management",
     }
 }
 

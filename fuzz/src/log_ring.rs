@@ -847,9 +847,9 @@ mod tests {
     fn torn_record_from_two_writes() -> Vec<u8> {
         Input::default()
             .write(&stamped(9))
-            // Location 5 is `kind`, the word that decides what every other
-            // field of the record means.
-            .store_location(0, 5, u64::from(u32::MAX))
+            // Location 7 is `kind`, the word that decides what every other
+            // field of the record means: the seven quads come first.
+            .store_location(0, 7, u64::from(u32::MAX))
             .read()
             .bytes()
     }
@@ -891,6 +891,8 @@ mod tests {
             to: all_set_value(),
             tsc_hz: u64::MAX,
             unix_nanos: u64::MAX,
+            frames: u64::MAX,
+            frame_bytes: u64::MAX,
         };
         // Every slot, not a sample of them: the seed stands for a region pair
         // in which the peer has set every byte it can reach, and a drain that

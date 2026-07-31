@@ -209,10 +209,21 @@ impl RegionRule {
         self.grants.iter().find(|grant| grant.domain == domain)
     }
 
-    /// The domains this rule grants the region to, for a finding that has to
-    /// name the set the description departed from.
-    fn granted_to(&self) -> Vec<&'static str> {
-        self.grants.iter().map(|grant| grant.domain).collect()
+    /// The domains this rule grants the region to, as a finding has to read it.
+    /// The empty set is spelled out rather than printed as `[]`: a region
+    /// reachable by no domain is the interesting case, and a bare pair of
+    /// brackets reads as a rule with something missing.
+    fn granted_to(&self) -> String {
+        if self.grants.is_empty() {
+            return "no protection domain at all".to_owned();
+        }
+        format!(
+            "{:?}",
+            self.grants
+                .iter()
+                .map(|grant| grant.domain)
+                .collect::<Vec<_>>()
+        )
     }
 }
 
@@ -246,6 +257,26 @@ const LOG_WITHHELD: &str = "no writing domain maps another writing domain's ring
      cannot rewrite it, and cannot silence it by advancing a consume cursor that is not its own \
      — every pair of writing domains is disjoint here, and this row is what makes that true \
      (systems/qemu-x86_64/librefirewall.system, beside the log regions)";
+
+/// What the management port's regions withhold, and it is the isolation
+/// CONCEPT §9.1 requires of a port that carries no forwarded traffic: the
+/// mutual exclusion between that port and the dataplane. Quoted into the
+/// finding on either half being widened, because either half alone would leave
+/// the property untrue.
+const MANAGEMENT_WITHHELD: &str = "the forwarder maps no management region and the management      domain maps no dataplane one. CONCEPT §9.1 isolates the management port from the dataplane      and gives it no forwarded traffic, and that isolation is exactly this mutual exclusion — a      frame cannot cross between the two because no domain is granted a region on both sides of      it. A dataplane grant appearing on the management domain would put the domain that will one      day terminate an operator's session on the path of every frame in flight; a management grant      appearing on the forwarder would let the routing stage reach a port that is meant to be      unreachable from it";
+
+/// As [`MANAGEMENT_WITHHELD`], for the management port's transmit pipeline —
+/// the three regions the port-agnostic driver binary requires and no other
+/// domain has any use for.
+const MANAGEMENT_TRANSMIT_WITHHELD: &str = "the driver instance is the only domain that maps any      of the management port's transmit pipeline, and nothing in this system produces onto it. The      three regions exist because that binary takes a transmit side whatever port it drives      (pds/nic-driver's crate header) — not because anything transmits. A grant to the management      domain would be authority over a buffer pool with no code that writes one and no frame to      send, which is authority for nothing (ENG-1) and arrives with the code that originates a      management response rather than before it (ENG-7); a grant to the forwarder would put a      dataplane domain on a port CONCEPT §9.1 makes unreachable from it";
+
+/// As [`POOL_WITHHELD`], for the management port's receive pool: the one region
+/// in this description that NO protection domain maps.
+///
+/// A rule with an empty grant set is admissible only with a claim like this
+/// one, because "reachable by no domain" is otherwise indistinguishable from a
+/// rule whose grants were forgotten — see [`check_region_mappers`].
+const DMA_ONLY_WITHHELD: &str = "no protection domain maps this region at all. The driver      receives into it and is granted its physical address alone (pds/nic-driver's crate header),      and the management domain counts frames off their descriptors without dereferencing one, so      it maps no pool either — which leaves the region reachable by the management NIC's DMA and      by nothing with a CPU. Any mapping here is therefore a new authority over a live DMA target,      and it is the grant that arrives with the code that reads a frame, not before it (ENG-7)";
 
 /// As [`POOL_WITHHELD`], for the return rings — the exclusion the forwarder's
 /// isolation now rests on entirely.
@@ -288,6 +319,16 @@ const REGIONS: &[RegionRule] = &[
         withheld: None,
     },
     RegionRule {
+        name: "ecam2",
+        size: ExpectedSize {
+            rust_name: "virtio::pci::PCI_CONFIG_LEN",
+            bytes: PCI_CONFIG_LEN,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("nic_driver2")],
+        withheld: None,
+    },
+    RegionRule {
         name: "bar0",
         size: ExpectedSize {
             rust_name: "nic_driver_core::bringup::BAR_WINDOW_SIZE",
@@ -305,6 +346,16 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Uncached,
         grants: &[read_write("nic_driver1")],
+        withheld: None,
+    },
+    RegionRule {
+        name: "bar2",
+        size: ExpectedSize {
+            rust_name: "nic_driver_core::bringup::BAR_WINDOW_SIZE",
+            bytes: BAR_WINDOW_SIZE,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("nic_driver2")],
         withheld: None,
     },
     // The timer block, and the one region whose rule cites a constant that is
@@ -346,6 +397,16 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Cached,
         grants: &[read_write("nic_driver1")],
+        withheld: None,
+    },
+    RegionRule {
+        name: "vq2",
+        size: ExpectedSize {
+            rust_name: "nic_driver_core::bringup::VQ_REGION_SIZE",
+            bytes: VQ_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2")],
         withheld: None,
     },
     // The six regions one pipeline each direction is granted as. Port 0
@@ -421,6 +482,80 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_write("nic_driver0"), read_write("nic_driver1")],
         withheld: Some(RETURN_WITHHELD),
+    },
+    // The management port's two pipelines. The shapes are the dataplane's and
+    // the constants are the same three, and what differs is the far end of the
+    // receive one: there is no egress driver, so the management domain is what
+    // produces the returns and mgmt_rx_free is granted to it read-write. That is
+    // the same producer/consumer split free0 and free1 already have between two
+    // drivers — which is why this rule's exclusion is MANAGEMENT_WITHHELD, the
+    // dataplane mutual exclusion, and not RETURN_WITHHELD.
+    //
+    // mgmt_rx_pool is the one region here granted to nobody, and DMA_ONLY_WITHHELD
+    // is what makes that a checked claim rather than a rule somebody forgot to
+    // finish. The transmit three are the driver binary's alone: it takes a
+    // transmit side whatever port it drives, and nothing produces onto that
+    // pipeline, so this is the narrowest grant set that lets one binary serve
+    // three ports.
+    RegionRule {
+        name: "mgmt_rx_pool",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::POOL_REGION_SIZE",
+            bytes: POOL_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[],
+        withheld: Some(DMA_ONLY_WITHHELD),
+    },
+    RegionRule {
+        name: "mgmt_rx_fwd",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::FORWARD_REGION_SIZE",
+            bytes: FORWARD_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2"), read_write("management")],
+        withheld: Some(MANAGEMENT_WITHHELD),
+    },
+    RegionRule {
+        name: "mgmt_rx_free",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::RETURN_REGION_SIZE",
+            bytes: RETURN_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2"), read_write("management")],
+        withheld: Some(MANAGEMENT_WITHHELD),
+    },
+    RegionRule {
+        name: "mgmt_tx_pool",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::POOL_REGION_SIZE",
+            bytes: POOL_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2")],
+        withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
+    },
+    RegionRule {
+        name: "mgmt_tx_fwd",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::FORWARD_REGION_SIZE",
+            bytes: FORWARD_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2")],
+        withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
+    },
+    RegionRule {
+        name: "mgmt_tx_free",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::RETURN_REGION_SIZE",
+            bytes: RETURN_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2")],
+        withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
     },
     // The configuration handover, and the one place in this description where
     // what a rule withholds is an authority rather than a mapping: both domains
@@ -554,6 +689,46 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Cached,
         grants: &[read_only("clock"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver2",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("nic_driver2"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_nic_driver2_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("nic_driver2"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_management",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("management"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_management_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("management"), read_write("console")],
         withheld: Some(LOG_WITHHELD),
     },
     RegionRule {
@@ -696,8 +871,10 @@ const DOMAINS: &[&str] = &[
     "config",
     "nic_driver0",
     "nic_driver1",
+    "nic_driver2",
     "console",
     "clock",
+    "management",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is
@@ -740,6 +917,13 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
      one end this domain may send on, and it was granted deliberately (ENG-1, SCM-6); these two \
      were not";
 
+/// As [`DRIVER_CHANNEL_ONE_WAY`], for the management port's channel. A claim of
+/// its own rather than a third use of that one, because what it protects is not
+/// the same thing: the forwarder's two ends are about a domain that holds one
+/// send capability and must hold no more, and this end is about a domain that
+/// holds none at all.
+const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds NO send capability on      anything, in this system or on this channel, and this is the end that says so. It is a      notified-driven consumer: it is woken, it drains, it returns. A send capability here would be      one on a driver that never leaves `init` and so could never observe it — authority for      nothing (ENG-1) — and it would make pds/nic-driver's claim that its `notified` entrypoint is      unreachable by *capability* false for the third instance while staying true for the other two";
+
 /// Every `<end>` the description may declare, and the direction that one
 /// channel is granted in. An end absent from this table fails the gate, and so
 /// does a row here that matches no `<end>` — the second is what stops a rule
@@ -767,6 +951,22 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         id: "1",
         notification: Notification::MayNotSend {
             claim: DRIVER_CHANNEL_ONE_WAY,
+        },
+    },
+    // The management port's channel, one-directional for the same reason and
+    // with a claim of its own: the driver's `notified` is unreachable by
+    // capability only while the far end of every one of its channels carries
+    // notify="false", and this is the third such end.
+    ChannelEnd {
+        domain: "nic_driver2",
+        id: "0",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "management",
+        id: "0",
+        notification: Notification::MayNotSend {
+            claim: MANAGEMENT_CHANNEL_ONE_WAY,
         },
     },
     // The one channel granted in both directions, and the two rows that say so.
@@ -1063,11 +1263,18 @@ fn check_region_mappers(rule: &RegionRule, granted: &[(&str, String)], findings:
         .map(|(_, domain)| domain.as_str())
         .collect();
 
-    if rule.grants.is_empty() {
+    // An empty grant set is a real shape — a region reachable only by a device's
+    // DMA — but it is also what a rule whose grants were forgotten looks like,
+    // and the two must not be the same thing. The claim is what separates them:
+    // a rule may say "nobody maps this" only by saying why, in which case every
+    // holder below is a finding and the loop over `grants` has nothing to check.
+    if rule.grants.is_empty() && rule.withheld.is_none() {
         findings.push(format!(
-            "sysdesc.rs grants <memory_region name={:?}> to no protection domain, so whichever \
-             domains map it are compared against nothing. Name them in `grants` — the empty set \
-             says the region is reachable by nobody, which is not what a declared region is for",
+            "sysdesc.rs grants <memory_region name={:?}> to no protection domain and gives no \
+             `withheld` claim saying why. A region reachable by no domain is admissible — a DMA \
+             target the owning driver is handed the physical address of, and nothing else — but \
+             it is a deliberate property to state, not the shape a rule takes when its grants \
+             were left out. Name the domains that map it, or record the claim its emptiness makes",
             rule.name
         ));
         return;
@@ -1078,7 +1285,7 @@ fn check_region_mappers(rule: &RegionRule, granted: &[(&str, String)], findings:
         if rule.grant(domain).is_none() {
             let mut finding = format!(
                 "{domain:?} maps <memory_region name={:?}>, which sysdesc.rs grants to \
-                 {granted_to:?} and to nothing else. A domain reaching a region it was withheld \
+                 {granted_to} and to nothing else. A domain reaching a region it was withheld \
                  is a capability change, reviewed and approved rather than merged (ENG-1, SCM-6)",
                 rule.name
             );
@@ -2357,6 +2564,50 @@ mod tests {
         }
     }
 
+    /// The management port's receive pool is reachable by no domain, and a
+    /// mapping of it is therefore a capability change like any other. This is
+    /// the check on the check: the empty grant set must refuse a holder rather
+    /// than pass over one, which is exactly what an unclaimed region would do.
+    #[test]
+    fn a_domain_mapping_a_region_no_domain_may_map_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"mgmt_rx_fwd\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" \
+             setvar_vaddr=\"mgmt_rx_fwd_vaddr\" />\n        <map mr=\"mgmt_rx_free\"",
+            "<map mr=\"mgmt_rx_pool\" vaddr=\"0x2_300_000\" perms=\"rw\" cached=\"true\" \
+             setvar_vaddr=\"mgmt_rx_pool_vaddr\" />\n        <map mr=\"mgmt_rx_free\"",
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains("mgmt_rx_pool"), "{joined}");
+        assert!(
+            joined.contains("grants to no protection domain at all"),
+            "{joined}"
+        );
+        // And the finding quotes what the emptiness was worth, rather than
+        // telling the author which domain list to add a name to.
+        assert!(
+            joined.contains("no protection domain maps this region at all"),
+            "{joined}"
+        );
+        // The rule for the region whose mapping was replaced is now matching
+        // nothing, which is the other half of the same edit.
+        assert!(joined.contains("mgmt_rx_fwd"), "{joined}");
+    }
+
+    /// The mutual exclusion CONCEPT §9.1 asks for, in the direction that would
+    /// put the routing stage on the management port.
+    #[test]
+    fn the_forwarder_reaching_a_management_region_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"cfg\" vaddr=\"0x3_000_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"cfg_vaddr\" />",
+            "<map mr=\"mgmt_rx_fwd\" vaddr=\"0x3_000_000\" perms=\"rw\" cached=\"true\" \
+             setvar_vaddr=\"mgmt_vaddr\" />",
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains("\"forwarder\" maps"), "{joined}");
+        assert!(joined.contains("CONCEPT §9.1"), "{joined}");
+    }
+
     #[test]
     fn every_rule_grants_its_region_to_domains_that_exist_and_each_of_them_once() {
         // A grant naming a domain outside DOMAINS could never match a `<map>`,
@@ -2369,8 +2620,9 @@ mod tests {
         // recorded, believed, and never compared against anything.
         for rule in REGIONS {
             assert!(
-                !rule.grants.is_empty(),
-                "{} is granted to no domain at all",
+                !rule.grants.is_empty() || rule.withheld.is_some(),
+                "{} is granted to no domain at all and says nothing about why — the shape a \
+                 rule takes when its grants were left out",
                 rule.name
             );
             let mut seen: Vec<&str> = Vec::new();

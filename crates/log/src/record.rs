@@ -323,6 +323,11 @@ impl Event<Cause> {
                     record.tsc_hz = tsc_hz.get();
                     record.unix_nanos = utc.as_nanos();
                 }
+                DomainDetail::Received { frames, bytes } => {
+                    record.detail = LogDetailKind::Received.to_bits();
+                    record.frames = *frames;
+                    record.frame_bytes = *bytes;
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -421,6 +426,10 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             tsc_hz: *tsc_hz,
             utc: UtcNanos::from_unix_nanos(*unix_nanos),
         },
+        CheckedDetail::Received { frames, bytes } => DomainDetail::Received {
+            frames: *frames,
+            bytes: *bytes,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -458,6 +467,9 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::ReceivePosted(count) => DomainDetail::ReceivePosted(count),
                     DomainDetail::Established { tsc_hz, utc } => {
                         DomainDetail::Established { tsc_hz, utc }
+                    }
+                    DomainDetail::Received { frames, bytes } => {
+                        DomainDetail::Received { frames, bytes }
                     }
                     DomainDetail::Refusal(Refusal {
                         cause,

@@ -15,7 +15,7 @@
 //! Neither is judged in this file: `wire` and `lfw_log` refuse a record and
 //! `uart_16550` bounds every wait.
 //!
-//! # Ten regions, not five
+//! # Fourteen regions, not seven
 //!
 //! Each writing domain's ring is two regions carrying opposite grants. This
 //! domain maps the records read-only, so it cannot forge a line attributed to a
@@ -70,7 +70,7 @@
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
 //! drives them (LAY-2); the register protocol and every bounded wait are in
-//! `uart_16550`. This file maps ten regions, claims one port window, and
+//! `uart_16550`. This file maps fourteen regions, claims one port window, and
 //! calls one function in a loop.
 //!
 //! # Why the port access is here and not in `uart_16550`
@@ -103,10 +103,10 @@ use uart_16550::{Transmitter, Uart, WriteError};
 use wire::{LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
-/// per writing domain, matching the five pairs of `<map>` rows on the console
+/// per writing domain, matching the seven pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
 /// fixed by the system description (CONCEPT §12.3), so this is a build fact.
-const RINGS: usize = 5;
+const RINGS: usize = 7;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
 /// the trait and the transmitter are foreign here, and that is all it adds.
@@ -136,6 +136,8 @@ fn init() -> Console {
     let nic_driver1: &'static LogRecords = attach_region!(log_nic_driver1_vaddr: LogRecords);
     let config: &'static LogRecords = attach_region!(log_config_vaddr: LogRecords);
     let clock: &'static LogRecords = attach_region!(log_clock_vaddr: LogRecords);
+    let nic_driver2: &'static LogRecords = attach_region!(log_nic_driver2_vaddr: LogRecords);
+    let management: &'static LogRecords = attach_region!(log_management_vaddr: LogRecords);
     let forwarder_consume: &'static LogConsume =
         attach_region!(log_forwarder_consume_vaddr: LogConsume);
     let nic_driver0_consume: &'static LogConsume =
@@ -144,6 +146,10 @@ fn init() -> Console {
         attach_region!(log_nic_driver1_consume_vaddr: LogConsume);
     let config_consume: &'static LogConsume = attach_region!(log_config_consume_vaddr: LogConsume);
     let clock_consume: &'static LogConsume = attach_region!(log_clock_consume_vaddr: LogConsume);
+    let nic_driver2_consume: &'static LogConsume =
+        attach_region!(log_nic_driver2_consume_vaddr: LogConsume);
+    let management_consume: &'static LogConsume =
+        attach_region!(log_management_consume_vaddr: LogConsume);
 
     let port = match Com1::claim() {
         Ok(port) => port,
@@ -186,6 +192,8 @@ fn init() -> Console {
         nic_driver1_consume.reader(nic_driver1),
         config_consume.reader(config),
         clock_consume.reader(clock),
+        nic_driver2_consume.reader(nic_driver2),
+        management_consume.reader(management),
     ];
     printer.print(&announce(DomainState::Ready));
 

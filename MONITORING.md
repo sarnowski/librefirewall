@@ -182,8 +182,17 @@ traffic or user interactions except where those trigger a system-state change.
 **Event inventory.** Two record channels are emitted from inside seL4 by the protection domains:
 `LFW-PD` for a domain's own lifecycle, and `LFW-CFG` for configuration. A third, `LFW-BOOT`, is
 written before the kernel starts and is documented under *Boot-manager records* below. All three are
-system state. None is traffic: no per-frame or per-packet record appears on this surface at all, and
-a dropped frame is counted in memory instead (see *Prometheus metrics*).
+system state. **No per-frame or per-packet record appears on this surface at all**, and a dropped
+frame is counted in memory instead (see *Prometheus metrics*).
+
+One record sits at the edge of that and is stated here rather than left to be discovered: the
+management port's `frames=`/`bytes=` pair is a *cumulative count of traffic*, emitted per drain and
+never per frame. It is on this surface because it is the only evidence a node offers that its
+management port is receiving at all, and because there is nowhere else yet — `/metrics` does not
+exist. It carries no address, no port, no length of any individual frame and no byte of one, so
+nothing about a packet is observable through it; what it says is "this port is up and taking
+traffic", which is system state. It moves to the metrics endpoint when there is one, and this
+document's inventory is where that move will be recorded.
 
 Everything below is what the renderer writes, field for field. Every record of the grammars below is
 one line of at most **192 bytes**, and a line is never truncated — see *Reading records off the
@@ -192,12 +201,13 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ### `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
-**`nic-driver`**, **`config`**, **`console`**, **`clock`** — the domain names in the Microkit system
-description. `state=` is one of **`starting`**, **`negotiated`**, **`ready`**, **`refused`**.
+**`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`** — the domain names in the
+Microkit system description. `state=` is one of **`starting`**, **`negotiated`**, **`ready`**,
+**`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
 written waits forever:
@@ -209,6 +219,7 @@ written waits forever:
 | `nic-driver` (once per port, two instances) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused` | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -248,6 +259,25 @@ holding a silent appliance still has only the external act.
   read exactly once; a node whose firmware set it to local time reports an instant this appliance
   cannot tell from a correct one. Nothing consumes either value, so neither is a claim about
   anything else the node did.
+- `frames=<n> bytes=<n>` — what a terminal port has received since the domain started: frames taken
+  off its pipeline, and the bytes they carried, both decimal and both **cumulative and monotonic for
+  the domain's life**. They are the management port's, and they are counts of what arrived — never any
+  part of a frame (OBS-5). The pair travels together because a frame count with no byte count cannot
+  be told from one carrying nothing.
+
+  **This is a record about system state, not a traffic log.** It says "this port is receiving" and
+  the numbers are the evidence; it is emitted once per *drain* that moved a frame, never once per
+  frame, so a burst of a hundred frames produces as few records as the scheduler allows and a reader
+  must not infer a frame boundary from a record. The counts belong on the metrics endpoint of
+  CONCEPT §11 and will move there when it exists; until then this record is where they live, and it
+  is the only place. Two counters behind them reach no surface at all — descriptors naming a span
+  outside the pool, and returns the pool owner's ring would not take — so a management port whose
+  driver is misbehaving is not distinguishable here from one that is idle.
+
+  `management` never reports `refused`, and unlike the console's silence that is not the shape of a
+  failure: the domain has no device to answer it and no build datum to judge, so there is no third
+  outcome for a refusal to name. It reaches its event loop or it faults, and a fault is the Microkit
+  monitor's to report.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. `signalled` says whether the
   device was told to stop (`STATUS_FAILED` written) or was left decoding nothing, which depends on
   whether its BAR had been placed when the rejection happened. `detail=` carries up to two numbers,
@@ -273,7 +303,8 @@ holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the two tables together are the complete set: 23 the
 `nic-driver` domain raises and 25 the `clock` domain raises, with no token shared between them. A
-token outside both is a defect, not an extension.
+token outside both is a defect, not an extension. The `forwarder`, `console` and `management` domains
+raise none: the first two have no `refused` record and the third has no refusal path at all.
 
 **`nic-driver`.** The first two are the domain's own, raised before the device is touched at all;
 the rest are the driver's bring-up tree.

@@ -40,13 +40,13 @@ pub(crate) enum Event {
     DoorbellPlaced(u16),
     /// This virtqueue's doorbell was rung.
     Rang(u16),
-    /// The forwarder was notified that frames are waiting.
-    ForwarderNotified,
+    /// The peer was notified that frames are waiting.
+    PeerNotified,
 }
 
 /// The shared, ordered record every fake in a test appends to. Cloning shares
 /// the same log, which is what lets a device, its two doorbells, and the
-/// forwarder signal all land in one sequence.
+/// peer signal all land in one sequence.
 #[derive(Clone, Default)]
 pub(crate) struct Log(Rc<RefCell<Vec<Event>>>);
 

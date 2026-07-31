@@ -26,6 +26,8 @@
 //! - [`topology`] — the bench read out of the configuration document under test.
 //! - [`config_transcript`] — the `LFW-CFG` console channel one boot must carry.
 //! - [`clock_contract`] — the clock domain's own record on the `LFW-PD` channel.
+//! - [`management_contract`] — the management port's count on the same channel.
+//! - [`console_records`] — recovering structured records out of a serial capture.
 //! - [`diagnose`] — re-run a failed release scenario on the debug kernel.
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
@@ -42,6 +44,7 @@ mod artifacts;
 mod budgets;
 mod clock_contract;
 mod config_transcript;
+mod console_records;
 mod diagnose;
 mod disk;
 mod evidence;
@@ -49,6 +52,7 @@ mod forward_harness;
 mod grub;
 mod host;
 mod image;
+mod management_contract;
 mod pins;
 mod qemu;
 mod reproducible;

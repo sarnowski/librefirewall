@@ -604,7 +604,7 @@ pub fn driver_paths_harness(data: &[u8]) {
         // rejected — but never to fall, which would hide a flood.
         let input = counters.input;
         assert!(input.rx_runt_dropped >= previous_input.rx_runt_dropped);
-        assert!(input.rx_forwarder_ring_full >= previous_input.rx_forwarder_ring_full);
+        assert!(input.rx_peer_ring_full >= previous_input.rx_peer_ring_full);
         assert!(input.tx_malformed >= previous_input.tx_malformed);
         assert!(input.tx_duplicate >= previous_input.tx_duplicate);
         assert!(input.tx_free_ring_full >= previous_input.tx_free_ring_full);

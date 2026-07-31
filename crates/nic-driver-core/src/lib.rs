@@ -23,7 +23,7 @@
 //!   length must be clamped to the *pool buffer* behind the descriptor before a
 //!   downstream domain reads it, and a completion with nothing past the
 //!   virtio-net header carries no frame.
-//! - The **byzantine neighbour PD** (the forwarder). Every transmit descriptor
+//! - The **byzantine neighbour PD** (the peer). Every transmit descriptor
 //!   it queues is range-validated ([`pd_runtime::descriptor_in_bounds`], plus
 //!   header room) before the span is touched, and checked against this driver's
 //!   own in-flight set so the same buffer cannot be posted to the device twice.
@@ -40,7 +40,7 @@
 //! to be exclusively this driver's for the duration. That is a *protocol*
 //! claim, not one this domain can verify: the buffer belongs to the transmit
 //! pipeline's pool, whose ledger lives in the peer driver that owns it. A
-//! byzantine forwarder can still name a buffer the pool owner has posted as its
+//! byzantine peer can still name a buffer the pool owner has posted as its
 //! own NIC's receive DMA target, in which case the 12-byte header write races
 //! that DMA. Closing that needs either an IOMMU confining NIC DMA (CONCEPT
 //! §7.2) or a cross-domain per-buffer ownership epoch; neither exists yet, and
@@ -94,8 +94,8 @@ pub struct InputDrops {
     /// instead of forwarded as a header-only frame.
     pub rx_runt_dropped: u64,
     /// The buffer is returned to the pool, so nothing is lost but the frame —
-    /// the forwarder is not keeping up, or is stalled deliberately.
-    pub rx_forwarder_ring_full: u64,
+    /// the peer is not keeping up, or is stalled deliberately.
+    pub rx_peer_ring_full: u64,
     /// Transmit descriptors that failed span or header-room validation, or
     /// whose header the pool refused to place. All three name somewhere this
     /// driver may not write, which is one misbehaviour and so one counter.
@@ -205,7 +205,7 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
     /// **Unenforced precondition (DOC-7):** call once per protection domain.
     /// The handle is this domain's publish position, so a second path over the
     /// same pipeline overwrites slots the first has already handed to the
-    /// forwarder. No type refuses the second call; `queue`'s crate header
+    /// peer. No type refuses the second call; `queue`'s crate header
     /// states that single-handle rule and why nothing enforces it. Treat it as
     /// unenforced rather than as checked elsewhere.
     #[must_use]
@@ -258,8 +258,8 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
     }
 
     /// Drain completed receive descriptors, handing each valid frame to the
-    /// forwarder with no copy. Returns whether any frame was submitted, which
-    /// is how the caller knows whether to notify the forwarder.
+    /// peer with no copy. Returns whether any frame was submitted, which
+    /// is how the caller knows whether to notify the peer.
     ///
     /// At most `Q` completions are processed per call: a conformant device never
     /// has more than `Q` buffers outstanding, so the cap costs nothing, while a
@@ -309,7 +309,7 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
             ) {
                 Ok(()) => received = true,
                 Err(buffer) => {
-                    bump(&mut counters.input.rx_forwarder_ring_full);
+                    bump(&mut counters.input.rx_peer_ring_full);
                     pool.release(buffer);
                 }
             }
@@ -398,7 +398,7 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
         }
     }
 
-    /// Post frames the forwarder queued to the device while descriptors are
+    /// Post frames the peer queued to the device while descriptors are
     /// free. Returns whether any frame was posted, which is how the caller
     /// knows whether to ring the transmit doorbell.
     ///
@@ -571,7 +571,7 @@ mod tests {
     }
 
     /// Overwrite the verdict word of ring slot `slot`, the way a byzantine
-    /// forwarder that maps the region read-write does. It is the one descriptor
+    /// peer that maps the region read-write does. It is the one descriptor
     /// field no first-party producer can put an undecodable value in —
     /// `PoolOwner::lend` takes a `Verdict` — so a test that wants one has to
     /// reach the shared image, exactly as the peer does. The route is the
@@ -753,12 +753,12 @@ mod tests {
         device: FakeDevice,
         owner: PoolOwner<'static>,
         rx: RxPath<'static, Q>,
-        /// The forwarder's end of the `rx` ring, taken once for the fixture's
+        /// The peer's end of the `rx` ring, taken once for the fixture's
         /// life — a fresh handle per assertion would restart at slot zero and
         /// re-deliver descriptors already consumed.
-        forwarder: RingConsumer<'static, RING_SLOTS>,
+        peer: RingConsumer<'static, RING_SLOTS>,
         /// The far transmitting driver's end of the `free` ring, taken once for
-        /// the same reason as `forwarder`. It is how a peer's returns reach
+        /// the same reason as `peer`. It is how a peer's returns reach
         /// this domain, legitimate or forged.
         peer_returns: RingProducer<'static, RING_SLOTS>,
         counters: Counters,
@@ -788,7 +788,7 @@ mod tests {
                 device,
                 owner: PoolOwner::attach(returns),
                 rx: RxPath::attach(rings, pool_paddr),
-                forwarder: rings.rx.consumer(),
+                peer: rings.rx.consumer(),
                 peer_returns: returns.free.producer(),
                 counters: Counters::default(),
             }
@@ -849,9 +849,9 @@ mod tests {
                 .drain(&mut self.vq, &mut self.owner, &mut self.counters)
         }
 
-        /// What the forwarder sees next on the `rx` ring.
+        /// What the peer sees next on the `rx` ring.
         fn forwarded(&mut self) -> Option<Descriptor> {
-            self.forwarder.try_dequeue()
+            self.peer.try_dequeue()
         }
     }
 
@@ -865,10 +865,10 @@ mod tests {
         vq: Vq,
         device: FakeDevice,
         tx: TxPath<'static, Q>,
-        /// The forwarder's end of the `tx` ring and the pool owner's end of the
+        /// The peer's end of the `tx` ring and the pool owner's end of the
         /// `free` ring, each taken once for the fixture's life; see
-        /// [`RxFixture::forwarder`].
-        forwarder: RingProducer<'static, RING_SLOTS>,
+        /// [`RxFixture::peer`].
+        peer: RingProducer<'static, RING_SLOTS>,
         returns: RingConsumer<'static, RING_SLOTS>,
         counters: Counters,
     }
@@ -896,7 +896,7 @@ mod tests {
                 vq,
                 device,
                 tx: TxPath::attach(rings, free, pool, pool_paddr),
-                forwarder: rings.tx.producer(),
+                peer: rings.tx.producer(),
                 returns: free.free.consumer(),
                 counters: Counters::default(),
             }
@@ -916,11 +916,9 @@ mod tests {
             self.vq.device_faults()
         }
 
-        /// Queue a raw descriptor as the forwarder would, valid or not.
+        /// Queue a raw descriptor as the peer would, valid or not.
         fn queue(&mut self, descriptor: Descriptor) {
-            self.forwarder
-                .try_enqueue(descriptor)
-                .expect("tx ring has room");
+            self.peer.try_enqueue(descriptor).expect("tx ring has room");
         }
 
         /// What the pool owner sees next on the `free` ring.
@@ -928,7 +926,7 @@ mod tests {
             self.returns.try_dequeue()
         }
 
-        /// Place a frame the forwarder would have queued: write `payload` at
+        /// Place a frame the peer would have queued: write `payload` at
         /// `offset` (with a non-zero 12-byte header in front, so the header
         /// zeroing is observable) into pool buffer `buffer`, and enqueue the
         /// matching descriptor on the tx ring.
@@ -1106,9 +1104,9 @@ mod tests {
     }
 
     #[test]
-    fn a_full_forwarder_ring_releases_the_buffer_and_counts_the_drop() {
+    fn a_full_peer_ring_releases_the_buffer_and_counts_the_drop() {
         let mut fx = RxFixture::new();
-        // A stalled or hostile forwarder: it publishes a `head` one slot ahead
+        // A stalled or hostile peer: it publishes a `head` one slot ahead
         // of where the driver's own (private) publish position sits, so the
         // ring looks full to this side and every hand-off is refused. Filling
         // the ring with a second producer handle would prove nothing — that
@@ -1123,13 +1121,13 @@ mod tests {
 
         assert!(!fx.drain());
         // The drop is counted: the old code released the buffer silently and a
-        // stalled or hostile forwarder left no trace at all.
-        assert_eq!(fx.counters.input.rx_forwarder_ring_full, 1);
+        // stalled or hostile peer left no trace at all.
+        assert_eq!(fx.counters.input.rx_peer_ring_full, 1);
         assert_eq!(
             fx.counters,
             Counters {
                 input: InputDrops {
-                    rx_forwarder_ring_full: 1,
+                    rx_peer_ring_full: 1,
                     ..InputDrops::default()
                 },
                 invariant: InvariantFaults::default(),
@@ -1183,7 +1181,7 @@ mod tests {
     fn a_peer_restart_with_buffers_in_flight_never_double_owns_one() {
         // The peer crashes and comes back with every shared cursor re-zeroed
         // while this driver has buffers posted at its NIC *and* frames lent to
-        // the forwarder. Both of this domain's positions and both halves of its
+        // the peer. Both of this domain's positions and both halves of its
         // ownership record are private, so the restart can replay and lose
         // descriptors but must never make one buffer answer to two owners.
         let mut fx = RxFixture::new();
@@ -1194,7 +1192,7 @@ mod tests {
         }
         assert!(fx.drain());
         let lent: Vec<Descriptor> = core::iter::from_fn(|| fx.forwarded()).collect();
-        assert_eq!(lent.len(), 4, "four frames reached the forwarder");
+        assert_eq!(lent.len(), 4, "four frames reached the peer");
 
         // The restart: every cursor of both rings back to zero, mid-stream.
         forge_cursors(&fx.rings.rx, 0, 0);
@@ -1310,7 +1308,7 @@ mod tests {
     fn an_undecodable_verdict_returns_the_buffer_under_its_own_counter() {
         // A peer defect rather than a decision. The buffer is handled exactly as
         // a discard's — nothing may leak on a value nobody chose — while the
-        // tally stays separate, or a forwarder writing garbage would hide
+        // tally stays separate, or a peer writing garbage would hide
         // inside a routing-drop rate that is expected to be non-zero.
         let mut fx = TxFixture::new();
         let forged = Descriptor {
@@ -1360,7 +1358,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_is_refused_before_a_discard_can_make_it_a_second_return() {
-        // A buffer is in flight at the device and the forwarder queues it again,
+        // A buffer is in flight at the device and the peer queues it again,
         // this time marked against the wire. Acting on the mark would produce
         // the second return for a buffer that was lent once — which is why the
         // duplicate check sits ahead of the verdict branch and not beside it.
@@ -1440,7 +1438,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_transmit_descriptor_is_dropped_without_a_second_post_or_return() {
-        // A byzantine forwarder hands the same buffer over twice. Posting both
+        // A byzantine peer hands the same buffer over twice. Posting both
         // would put two virtqueue entries on one buffer and produce two returns
         // for a buffer that was lent once — the second of which the pool owner
         // would refuse, losing it.
@@ -1530,7 +1528,7 @@ mod tests {
 
     #[test]
     fn a_full_free_ring_drops_and_counts_rather_than_faulting() {
-        // The peer-reachable panic this replaces: a forwarder queues more
+        // The peer-reachable panic this replaces: a peer queues more
         // malformed-but-in-range descriptors than the free ring can hold, every
         // one takes the return path, and the ring fills.
         let mut fx = TxFixture::new();
@@ -1762,10 +1760,10 @@ mod tests {
 
     /// One whole transmit pipeline with the buffer cycle closed: the
     /// pool-owning peer at one end, this driver's transmit path at the other,
-    /// and a byzantine forwarder between them choosing the verdict word.
+    /// and a byzantine peer between them choosing the verdict word.
     ///
-    /// The publishing driver and the forwarder are collapsed into one
-    /// [`publish`](Self::publish), since the descriptor a forwarder emits is
+    /// The publishing driver and the peer are collapsed into one
+    /// [`publish`](Self::publish), since the descriptor a peer emits is
     /// what this fixture is about and the `rx` ring in between moves it
     /// unchanged. It is the only fixture here that closes the cycle, which is
     /// what makes "no buffer is leaked" observable at all: with the pool owner
@@ -1777,9 +1775,9 @@ mod tests {
         vq: Vq,
         device: FakeDevice,
         owner: PoolOwner<'static>,
-        /// The forwarder's end of the `tx` ring, taken once for the fixture's
-        /// life; see [`RxFixture::forwarder`].
-        forwarder: RingProducer<'static, RING_SLOTS>,
+        /// The peer's end of the `tx` ring, taken once for the fixture's
+        /// life; see [`RxFixture::peer`].
+        peer: RingProducer<'static, RING_SLOTS>,
         tx: TxPath<'static, Q>,
         /// How many descriptors that handle has published, and so which slot
         /// the next one lands in — the producer starts at zero and advances one
@@ -1806,7 +1804,7 @@ mod tests {
                 vq,
                 device,
                 owner: PoolOwner::attach(returns),
-                forwarder: rings.tx.producer(),
+                peer: rings.tx.producer(),
                 tx: TxPath::attach(rings, returns, pool, pool_paddr),
                 published: 0,
                 counters: Counters::default(),
@@ -1816,15 +1814,15 @@ mod tests {
         /// Take a buffer from the pool and queue it for transmit under a verdict
         /// word wholly of the peer's choosing.
         ///
-        /// `lend` cannot mint an undecodable word, so the forwarder writes it
-        /// into the shared slot afterwards — which is what the forwarder really
+        /// `lend` cannot mint an undecodable word, so the peer writes it
+        /// into the shared slot afterwards — which is what the peer really
         /// does, and the only way this case is expressible at all.
         fn publish(&mut self, len: u32, verdict_bits: u32) {
             let Some(buffer) = self.owner.alloc() else {
                 return;
             };
             if let Err(returned) = self.owner.lend(
-                &mut self.forwarder,
+                &mut self.peer,
                 buffer,
                 VirtioNetHdr::LEN as u32,
                 len,
@@ -1861,7 +1859,7 @@ mod tests {
         }
     }
 
-    /// One move the byzantine forwarder makes against a closed pipeline.
+    /// One move the byzantine peer makes against a closed pipeline.
     #[derive(Clone, Debug)]
     enum TxStep {
         /// Publish a buffer under a verdict word of the peer's choosing.
@@ -1874,7 +1872,7 @@ mod tests {
         Reclaim,
     }
 
-    /// A verdict word as a byzantine forwarder writes it: both values that
+    /// A verdict word as a byzantine peer writes it: both values that
     /// decode, and the whole of the space that does not. The undecodable case
     /// is not a rare accident of `any::<u32>()` here — it is weighted in, so a
     /// strategy edit cannot quietly stop generating it (TEST-8).
@@ -1968,7 +1966,7 @@ mod tests {
         /// order, interleaved with refills. Nothing may panic, work per call
         /// stays bounded, and no pool buffer may ever be owned twice — the
         /// buffers still posted plus those the owner holds free plus those
-        /// handed to the forwarder must never exceed the pool.
+        /// handed to the peer must never exceed the pool.
         #[test]
         fn arbitrary_device_completions_never_panic_or_double_own_a_buffer(
             events in prop::collection::vec((any::<u16>(), any::<u32>(), any::<bool>()), 0..200),
@@ -1985,7 +1983,7 @@ mod tests {
                 if do_refill {
                     fx.refill();
                 }
-                forwarded += fx.forwarder.drain(DRAIN_LIMIT).count();
+                forwarded += fx.peer.drain(DRAIN_LIMIT).count();
                 let posted = fx.rx.posted.iter().filter(|slot| slot.is_some()).count();
                 prop_assert!(
                     posted + fx.owner.owned() <= POOL_BUFFERS,
@@ -1998,7 +1996,7 @@ mod tests {
                 prop_assert_eq!(fx.counters.invariant, InvariantFaults::default());
             }
             // Nothing returns a buffer to the pool in this scenario, so the
-            // whole run can hand the forwarder at most one frame per buffer.
+            // whole run can hand the peer at most one frame per buffer.
             prop_assert!(forwarded <= POOL_BUFFERS, "more frames than the pool has buffers");
         }
 
@@ -2036,7 +2034,7 @@ mod tests {
                     len: len % (BUFFER_SIZE as u32 + 2),
                     verdict,
                 };
-                if fx.forwarder.try_enqueue(descriptor).is_ok() {
+                if fx.peer.try_enqueue(descriptor).is_ok() {
                     offered += 1;
                 }
                 fx.post();

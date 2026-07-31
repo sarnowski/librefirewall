@@ -2,15 +2,16 @@
 <system>
     <!-- The librefirewall system description for the current QEMU q35
          bring-up: the two-dataplane-port zero-copy virtio-net forwarding slice
-         (virtio 1.0 PCI). Two instances of the same driver binary, one per
-         dataplane port, joined through a forwarder PD by one pipeline per
-         direction — three memory regions each. Each pipeline's buffer pool is
-         DMA'd into by the receiving NIC and out of by the transmitting NIC, so
-         a frame crosses the whole system without ever being copied. The
-         management,
-         session-replication, and mirror ports of the full port model
-         (CONCEPT.md §9) are not part of this slice. The protection domains are
-         documented in pds/nic-driver and pds/forwarder. -->
+         (virtio 1.0 PCI), plus a dedicated management port. THREE instances of
+         the same driver binary, one per port; the two dataplane ones are joined
+         through a forwarder PD by one pipeline per direction — three memory
+         regions each — and the third hands its frames to a management PD that
+         forwards nothing. Each dataplane pipeline's buffer pool is DMA'd into by
+         the receiving NIC and out of by the transmitting NIC, so a frame crosses
+         the whole system without ever being copied. The session-replication and
+         mirror ports of the full port model (CONCEPT.md §9) are not part of this
+         slice. The protection domains are documented in pds/nic-driver,
+         pds/forwarder and pds/management. -->
 
     <!-- ===================================================================
          The physical address map is a contract, and this is where it is
@@ -26,7 +27,8 @@
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
 
-         * vq0/vq1 and the six pipeline regions (0x30000000..0x31046000) must
+         * vq0..vq2 and the twelve pipeline regions
+           (0x30000000..0x3108C000) must
            lie INSIDE RAM. They are ordinary memory, and seL4 zeroes a frame
            retyped from a general-purpose untyped but not one retyped from a
            device untyped — which is what an address outside RAM yields. That
@@ -36,21 +38,25 @@
            first-party code re-checks it, and a region placed outside RAM would
            fail as unbacked reads at run time rather than as a build or boot
            error.
-         * bar0/bar1 (0x50000000..0x50008000) must lie OUTSIDE RAM, in the q35
+         * bar0..bar2 (0x50000000..0x5000C000) must lie OUTSIDE RAM, in the q35
            32-bit PCI hole: each driver reprograms its device's 64-bit MMIO BAR
            to that address, so RAM underneath it would be shadowed by the
            device's decode.
 
          Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
          which puts the first group inside it and the second above it. The
-         window either side is narrow and nothing checks it: below ~785 MiB RAM
-         ends short of 0x31046000 and the DMA regions leave RAM, while at
-         1280 MiB or more RAM reaches 0x50000000 and swallows the BAR window.
-         Changing `-m`, or targeting hardware with a different memory map,
-         means re-deriving this map.
+         window either side is narrow and nothing checks it: RAM must now reach
+         past 0x3108C000 — 784.55 MiB rather than the 784.27 MiB the dataplane
+         alone needed, so the management pipelines NARROW the lower end of that
+         unasserted window by 280 KiB and every further port narrows it again —
+         while at 1280 MiB or more RAM reaches 0x50000000 and swallows the BAR
+         window. Changing `-m`, or targeting hardware with a different memory
+         map, means re-deriving this map. README's status records the window as
+         load-bearing and unasserted, and this is the change that made it
+         tighter rather than the change that closed it.
 
          The two configuration regions (cfg, cfgack) are the exception and are
-         deliberately NOT in the packed range, which still ends at 0x31046000.
+         deliberately NOT in the packed range, which now ends at 0x3108C000.
          No device DMAs into them, so no driver needs their physical address, so
          no `setvar region_paddr` names them and the tool has no reason to
          demand a fixed one. Leaving it out is not a convenience: an unplaced
@@ -63,16 +69,22 @@
          that a device has to be told where they are.
          =================================================================== -->
 
-    <!-- PCI ECAM pages for the pinned devices 00:02.0 and 00:03.0. The
-         deployable image boots through OVMF, which programs the q35 PCIEXBAR
-         (MMCONFIG base) to 0xE0000000; the page of device D is at
-         base + (D << 15). Device MMIO: uncached. -->
+    <!-- PCI ECAM pages for the pinned devices 00:02.0, 00:03.0 and 00:04.0 —
+         the two dataplane ports and the management port. The deployable image
+         boots through OVMF, which programs the q35 PCIEXBAR (MMCONFIG base) to
+         0xE0000000; the page of device D is at base + (D << 15), which is what
+         makes these three addresses a derivation rather than three choices.
+         Device MMIO: uncached. -->
     <memory_region name="ecam0" size="0x1000" phys_addr="0xE0010000" />
     <memory_region name="ecam1" size="0x1000" phys_addr="0xE0018000" />
+    <memory_region name="ecam2" size="0x1000" phys_addr="0xE0020000" />
     <!-- Where each driver relocates its device's modern MMIO BAR (patched into
-         the driver via region_paddr). Device MMIO: uncached. -->
+         the driver via region_paddr). Packed back to back from the base of the
+         q35 32-bit PCI hole, so the three together are 0x50000000..0x5000C000.
+         Device MMIO: uncached. -->
     <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />
     <memory_region name="bar1" size="0x4000" phys_addr="0x50004000" />
+    <memory_region name="bar2" size="0x4000" phys_addr="0x50008000" />
 
     <!-- The High Precision Event Timer's register block, and the third device
          region in this system.
@@ -115,6 +127,7 @@
          inherited from a default that can move. -->
     <memory_region name="vq0" size="0x1000" phys_addr="0x30000000" />
     <memory_region name="vq1" size="0x1000" phys_addr="0x30001000" />
+    <memory_region name="vq2" size="0x1000" phys_addr="0x30002000" />
 
     <!-- Three regions per forwarding direction (rx driver -> forwarder -> tx
          driver), because a region is the unit of grant: what a domain can reach
@@ -145,6 +158,44 @@
     <memory_region name="pool1" size="0x20000" phys_addr="0x31023000" />
     <memory_region name="fwd1" size="0x2000" phys_addr="0x31043000" />
     <memory_region name="free1" size="0x1000" phys_addr="0x31045000" />
+
+    <!-- The MANAGEMENT PORT'S two pipelines, the same three regions each and the
+         same `pd_runtime` constants, packed immediately after the dataplane's:
+         0x31046000 through 0x3108C000.
+
+         Why a port that forwards nothing needs two pipelines at all: the driver
+         binary is port-agnostic and takes a receive side *and* a transmit side
+         (pds/nic-driver's crate header), so the transmit three exist because the
+         third instance of that binary maps them, and for no other reason. What
+         differs from the dataplane is the far end of the receive pipeline. There
+         is no egress driver to hand a descriptor onward to, so the management
+         domain is the end of the journey and produces the return itself onto
+         mgmt_rx_free — the same producer/consumer split the dataplane already
+         has between its two drivers, with that domain standing where the egress
+         driver stands. See the management domain below on why it is the returner
+         and not the pool's owner.
+
+         mgmt_rx_pool IS MAPPED BY NO PROTECTION DOMAIN. The driver receives into
+         it and takes its physical address alone, exactly as a dataplane driver
+         does with the pool it receives into; and the management domain counts
+         frames off their descriptors without dereferencing one, so it maps no
+         pool either. The region therefore exists solely as the management NIC's
+         DMA target, and `xtask::sysdesc` carries that empty grant set as a rule
+         — a region reachable by no CPU in the system is a claim worth checking
+         rather than an oversight worth tolerating. It stops being true the day
+         this port needs to *read* a frame, which is what ARP and IP will need.
+
+         mgmt_tx_pool by contrast is mapped, by the driver alone, for the reason
+         every transmit pool is: `TxPath::post` writes the 12-byte virtio-net
+         header in front of the frame. Nothing produces onto mgmt_tx_fwd yet, so
+         nothing is ever transmitted on this port — which is the property the
+         QEMU harness asserts by requiring that no frame ever comes back on it. -->
+    <memory_region name="mgmt_rx_pool" size="0x20000" phys_addr="0x31046000" />
+    <memory_region name="mgmt_rx_fwd" size="0x2000" phys_addr="0x31066000" />
+    <memory_region name="mgmt_rx_free" size="0x1000" phys_addr="0x31068000" />
+    <memory_region name="mgmt_tx_pool" size="0x20000" phys_addr="0x31069000" />
+    <memory_region name="mgmt_tx_fwd" size="0x2000" phys_addr="0x31089000" />
+    <memory_region name="mgmt_tx_free" size="0x1000" phys_addr="0x3108B000" />
 
     <!-- The configuration handover, one region per direction.
 
@@ -184,7 +235,7 @@
          producer on one of these is two writers racing for the same slot.
 
          THE SPLIT EXISTS SO THE TWO DIRECTIONS CARRY OPPOSITE PERMISSIONS, and
-         that is the whole reason there are ten rows here rather than five. A
+         that is the whole reason there are fourteen rows here rather than seven. A
          region is the unit of grant, so only two regions can give each domain
          write access to exactly the direction it speaks in — the same reason
          `cfg`/`cfgack` are two regions and each dataplane pipeline is three.
@@ -257,9 +308,19 @@
     <memory_region name="log_config_consume" size="0x1000" />
     <memory_region name="log_clock" size="0x4000" />
     <memory_region name="log_clock_consume" size="0x1000" />
+    <memory_region name="log_nic_driver2" size="0x4000" />
+    <memory_region name="log_nic_driver2_consume" size="0x1000" />
+    <memory_region name="log_management" size="0x4000" />
+    <memory_region name="log_management_consume" size="0x1000" />
 
     <!-- The forwarder maps four dataplane regions and two configuration ones,
-         and holds no device capability at all.
+         and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
+         REGION, in either direction and of either pipeline, and the management
+         domain below is granted no dataplane region — the mutual exclusion
+         CONCEPT §9.1 requires of a management port that carries no forwarded
+         traffic. Neither half is a comment: `xtask::sysdesc` names the mapper
+         set of every region exactly, so either grant appearing fails the gate at
+         the point the edit is made (ENG-1, SCM-6).
          `RouteStage` decides on each frame and rewrites its Ethernet and IPv4
          headers in the buffer the receiving NIC DMA'd it into, so it is granted
          the two pools as well as the two ring pairs: a domain that rewrites a
@@ -425,6 +486,77 @@
         <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
+    <!-- The management domain: the end of the management port's receive
+         pipeline. It counts what that port receives and reports the running
+         total; it forwards nothing, and nothing in this description gives it the
+         means to.
+
+         =================================================================
+         WHY THIS DOMAIN IS THE RETURNER AND NOT THE POOL'S OWNER
+         (ENG-1, SCM-6)
+         =================================================================
+
+         The forwarder maps NEITHER dataplane `free` ring, and the note beside
+         those regions says why: a forged return puts a live DMA target back onto
+         an owner's free stack to be handed out a second time while a NIC is
+         still writing it. That withholding is affordable there because a
+         dataplane descriptor travels ONWARD — the egress driver is what returns
+         the buffer, and it is the only domain that can.
+
+         A terminal port has no egress driver, so that argument does not
+         transfer, and the choice is not between granting the ring and
+         withholding it. It is between granting it and leaking the pool: a
+         consumed buffer with no path back is a buffer gone from the driver's
+         ledger for good, and 64 frames later the port stops receiving. So
+         mgmt_rx_free is granted READ-WRITE here, and what keeps that from being
+         the authority the forwarder was refused is WHICH SIDE OF THE RING it is:
+         this domain PRODUCES returns and nic_driver2 CONSUMES them as the pool's
+         owner (`pd_runtime::PoolOwner::reclaim`), which accepts an index only if
+         it is in that driver's own lent set and its ledger agrees. This domain
+         holds no ledger and decides nothing about ownership; a return it forges
+         names a buffer the driver never lent and is refused and counted there.
+         The dataplane already has exactly this split between its two drivers —
+         the transmitting one produces onto the ring the receiving one consumes —
+         and this is that shape with the management domain standing where the
+         transmitting driver stands.
+
+         WHAT IT MAPS: mgmt_rx_fwd, to consume the descriptors, and mgmt_rx_free,
+         to produce the returns. Two regions and nothing else beyond its own log
+         ring.
+
+         WHAT STAYS WITHHELD, and it is the whole of the isolation CONCEPT §9.1
+         asks for: NO dataplane region of any kind — not a pool, not a
+         `ForwardRings`, not a return ring — NO buffer pool at all, not even the
+         management port's own, NO configuration region, NO ECAM page, NO BAR
+         window, NO virtqueue and NO ioport. A compromise of the domain that will
+         one day terminate an operator's TLS session therefore reaches no frame
+         in flight, no NIC, and no configuration.
+
+         NO POOL IS THE ONE WORTH DWELLING ON. Frames and bytes are counted off
+         the descriptors, so nothing here dereferences a frame byte and a pool
+         mapping would be authority with no use — the same argument the receiving
+         driver's withheld pool makes, from the other end of the pipeline. It is
+         also why mgmt_rx_pool is mapped by nobody at all. The day this port
+         parses ARP or IP, that grant arrives with the code that consumes it and
+         is reviewed then (ENG-7).
+
+         PRIORITY 2, EQUAL TO THE FORWARDER, and for the forwarder's reason: this
+         is a `notified`-driven domain among three drivers that busy-loop forever
+         at priority 1, so at or below them a wakeup would wait on seL4's
+         round-robin against domains that never yield. Above them it preempts on
+         notification, drains, and returns to the event loop. Equal to the
+         forwarder rather than above or below it because neither can starve the
+         other — each runs to completion per wakeup — and an ordering between the
+         two would be a claim nothing needs: no frame crosses from one to the
+         other, which is the point of the port. -->
+    <protection_domain name="management" priority="2" stack_size="0x4000">
+        <program_image path="management.elf" />
+        <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_fwd_vaddr" />
+        <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_free_vaddr" />
+        <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+    </protection_domain>
+
     <!-- Each driver maps five of its six pipeline regions. The exception is the
          pool it receives INTO: it hands that pool's physical address to its NIC
          as a DMA target and never dereferences a byte of it, so it takes the
@@ -471,6 +603,38 @@
         <setvar symbol="vq_paddr" region_paddr="vq1" />
         <setvar symbol="rx_pool_paddr" region_paddr="pool1" />
         <setvar symbol="tx_pool_paddr" region_paddr="pool0" />
+    </protection_domain>
+
+    <!-- The third instance of the same binary, driving the MANAGEMENT port. It
+         differs from the two above in its regions and its peer and in nothing
+         else: no `nic-driver.elf` byte distinguishes a management port from a
+         dataplane one, which is why this row exists rather than a fourth
+         program image (pds/nic-driver's crate header).
+
+         The two pipelines are the management port's own, so no dataplane region
+         appears here and this driver can reach no frame belonging to either
+         dataplane pipeline. Its receive pool is the one region in this
+         description no domain maps: it takes `rx_pool_paddr` and hands it to the
+         NIC, exactly as the two above do with theirs. Its transmit pool IS
+         mapped, for the header write, and nothing ever queues a frame onto
+         mgmt_tx_fwd — so the mapping and the paddr are the price of one binary
+         rather than authority anything exercises. -->
+    <protection_domain name="nic_driver2" priority="1" stack_size="0x8000">
+        <program_image path="nic-driver.elf" />
+        <map mr="ecam2" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
+        <map mr="bar2" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
+        <map mr="vq2" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="vq_vaddr" />
+        <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="rx_fwd_vaddr" />
+        <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="rx_free_vaddr" />
+        <map mr="mgmt_tx_fwd" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
+        <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
+        <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="log_nic_driver2" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_nic_driver2_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <setvar symbol="bar_paddr" region_paddr="bar2" />
+        <setvar symbol="vq_paddr" region_paddr="vq2" />
+        <setvar symbol="rx_pool_paddr" region_paddr="mgmt_rx_pool" />
+        <setvar symbol="tx_pool_paddr" region_paddr="mgmt_tx_pool" />
     </protection_domain>
 
     <!-- The console domain: the one holder of the serial controller.
@@ -536,7 +700,7 @@
          prints on boot and on faults, not per record — but it is the reason the
          single-writer claim is stated of the shipped profile.
 
-         WHAT IT MAPS: ten log regions in five pairs, and the perms are the
+         WHAT IT MAPS: fourteen log regions in seven pairs, and the perms are the
          whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
          Each `log_<domain>` is READ-ONLY here: this domain renders those
          records and must read them, and a console that could also write one
@@ -583,11 +747,15 @@
         <map mr="log_config_consume" vaddr="0x4_310_000" perms="rw" cached="true" setvar_vaddr="log_config_consume_vaddr" />
         <map mr="log_clock" vaddr="0x4_400_000" perms="r" cached="true" setvar_vaddr="log_clock_vaddr" />
         <map mr="log_clock_consume" vaddr="0x4_410_000" perms="rw" cached="true" setvar_vaddr="log_clock_consume_vaddr" />
+        <map mr="log_nic_driver2" vaddr="0x4_500_000" perms="r" cached="true" setvar_vaddr="log_nic_driver2_vaddr" />
+        <map mr="log_nic_driver2_consume" vaddr="0x4_510_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver2_consume_vaddr" />
+        <map mr="log_management" vaddr="0x4_600_000" perms="r" cached="true" setvar_vaddr="log_management_vaddr" />
+        <map mr="log_management_consume" vaddr="0x4_610_000" perms="rw" cached="true" setvar_vaddr="log_management_consume_vaddr" />
     </protection_domain>
 
-    <!-- Both channels carry notifications in one direction only, so only that
-         direction is granted: a driver signals the forwarder that frames are
-         queued (pds/nic-driver, `FORWARDER.notify()`), and the forwarder
+    <!-- Both dataplane channels carry notifications in one direction only, so
+         only that direction is granted: a driver signals the forwarder that
+         frames are queued (pds/nic-driver, `PEER.notify()`), and the forwarder
          answers nothing back — it drains both pipelines on any wakeup and
          returns, and the drivers could not receive a notification anyway, since
          they never leave `init` and so never reach the Microkit event loop.
@@ -601,6 +769,18 @@
     <channel>
         <end pd="nic_driver1" id="0" />
         <end pd="forwarder" id="1" notify="false" />
+    </channel>
+
+    <!-- The management port's channel, granted in one direction for exactly the
+         reason the two driver channels above are: nic_driver2 signals that
+         frames are queued, and the management domain answers nothing back — it
+         drains the pipeline on any wakeup and returns, and the driver could not
+         receive a notification anyway, never leaving `init`. `notify` defaults to
+         true on an `<end>`, which would leave the management domain holding a
+         send capability on a driver that has no event loop to observe it. -->
+    <channel>
+        <end pd="nic_driver2" id="0" />
+        <end pd="management" id="0" notify="false" />
     </channel>
 
     <!-- The one channel in this system granted in BOTH directions, and it is a

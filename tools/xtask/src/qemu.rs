@@ -43,7 +43,7 @@ use crate::{
     config_transcript::ConfigContract,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted},
-    image,
+    image, management_contract,
     topology::{PORTS, Topology},
     util::{copy_file, locate, require_file, run_command},
 };
@@ -146,12 +146,13 @@ enum ImageUnderTest {
 
 /// Whether a scenario reads the console beside the traffic.
 ///
-/// One flag for both channels rather than two, because it is one decision: a
-/// scenario either judges what the appliance said or is left to report a
+/// One flag for every channel rather than one each, because it is one decision:
+/// a scenario either judges what the appliance said or is left to report a
 /// forwarding failure as a forwarding failure and nothing else. What
 /// [`Console::Judged`] covers is the `LFW-CFG` transcript
-/// ([`crate::config_transcript`]) and the clock domain's record on the
-/// `LFW-PD` channel ([`crate::clock_contract`]).
+/// ([`crate::config_transcript`]) and two records on the `LFW-PD` channel — the
+/// clock domain's ([`crate::clock_contract`]) and the management port's count
+/// ([`crate::management_contract`]).
 enum Console {
     Ignored,
     Judged,
@@ -190,6 +191,11 @@ struct Scenario {
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
 ///    table would satisfy scenarios 1 and 2 and fail every probe here.
+///
+/// Every scenario additionally injects frames into the dedicated management port
+/// and holds that port to carrying nothing back, whatever else it judges; the
+/// two that read the console also hold the management domain's own count to the
+/// frames and bytes injected.
 pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     let scenarios = [
         Scenario {
@@ -230,7 +236,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     }
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript and the clock record",
+         configuration transcript, the clock record and the management port's count",
         scenarios.len(),
         Run::Shipping.config(),
     ))
@@ -305,7 +311,12 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String
             // its configuration is the larger finding.
             let clock = clock_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!("; {}; {clock}", contract.summary())
+            // And the record whose content the build knows exactly: the frames
+            // the harness put on the management wire, which the appliance must
+            // report to the frame and to the byte.
+            let management = management_contract::judge(&booted.serial, &log, booted.management)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {}; {clock}; {management}", contract.summary())
         }
     };
     println!(
@@ -407,41 +418,110 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
         acceleration,
     } = qemu_base(root, "mon:stdio", &disk, "run")?;
     println!("QEMU run: {}", acceleration.describe());
-    // Interactive runs have no harness peer to dial into, so back the two NIC
-    // ports with QEMU's self-contained user-mode stack instead.
-    for port in 0..PORTS {
+    // Interactive runs have no harness peer to dial into, so back every NIC
+    // port with QEMU's self-contained user-mode stack instead. The management
+    // port is attached like the others: without it the third driver instance
+    // finds no device at 00:04.0 and parks on a refusal, which is a boot no
+    // shipped image would ever perform.
+    for nic in every_guest_nic() {
         command
             .arg("-netdev")
-            .arg(format!("user,id=n{port}"))
+            .arg(format!("user,id={}", nic.netdev_id()))
             .arg("-device")
-            .arg(nic_device(&topology, port)?);
+            .arg(nic_device(&topology, nic)?);
     }
     run_command(&mut command, "run QEMU")?;
     Ok(())
 }
 
-/// The virtio-net-pci `-device` argument for dataplane port `port`, pinned to
-/// the PCI address the system description assigns (00:02.0, 00:03.0) with the
-/// MAC the configuration document's interface on that port claims and no option
-/// ROM (so the firmware gains no PXE payload).
+/// The MAC the management port's guest NIC carries.
 ///
-/// The MAC is the derivation this function exists for. It used to be a literal
-/// here that had to equal a literal in the harness and a third in the document,
-/// with nothing comparing the three; now a guest NIC can only be given a MAC an
-/// interface claims, and the address the routed contract expects the appliance
-/// to answer to is that same interface's. The netdev backend (`socket` under
-/// the routing harness, `user` for interactive runs) is joined separately by
-/// the id `n{port}`.
+/// It is a constant here and not a derivation, because the configuration
+/// document has no management interface to derive it from: the port has no
+/// address, no ARP and no IP in this increment, so nothing about it is
+/// configurable yet (README's port-role-model row). **It moves into the document
+/// as that interface's `mac=` the day one exists**, and this constant goes with
+/// it — at which point `nic_device` reads it out of the topology like every
+/// other port's and `a_managed_port_carries_a_mac_no_dataplane_port_claims`
+/// stops being a test about a literal.
+///
+/// Its value is chosen to sit one past the two the shipped document gives the
+/// dataplane ports, so a capture or a `tcpdump` reads in port order; that is
+/// convention and nothing depends on it. What *is* depended on is that it
+/// belongs to no interface and no station on either bench, which the tests
+/// below hold it to: two NICs answering to one address would have a routed
+/// frame accepted by whichever saw it first.
+pub(crate) const MANAGEMENT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x52];
+
+/// Which guest NIC a `-device` argument is for.
+///
+/// A type rather than a port number, because the two are not the same kind of
+/// thing: a dataplane port's MAC comes out of the configuration document and the
+/// management port's cannot, so a bare `usize` would have to mean "index into
+/// the document" and "the one past the end" at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuestNic {
+    /// Dataplane port `n`, whose MAC the document's interface on it claims.
+    Dataplane(usize),
+    /// The management port, carrying [`MANAGEMENT_MAC`].
+    Management,
+}
+
+impl GuestNic {
+    /// The slot this NIC occupies, which decides both its netdev id and its PCI
+    /// address. One derivation for both kinds: the management port sits one past
+    /// the dataplane ports, so `addr=0{slot+2}.0` reproduces 00:02.0, 00:03.0
+    /// and 00:04.0 — and 00:04.0 is the device whose ECAM page the system
+    /// description grants as `ecam2` at PCIEXBAR + (4 << 15).
+    const fn slot(self) -> usize {
+        match self {
+            Self::Dataplane(port) => port,
+            Self::Management => PORTS,
+        }
+    }
+
+    /// The netdev id the backend is joined by, `socket` under the harness and
+    /// `user` for interactive runs.
+    pub(crate) fn netdev_id(self) -> String {
+        format!("n{}", self.slot())
+    }
+}
+
+/// The virtio-net-pci `-device` argument for one guest NIC, pinned to the PCI
+/// address the system description assigns it, with no option ROM (so the
+/// firmware gains no PXE payload).
+///
+/// The MAC is the derivation this function exists for. A dataplane port's used to
+/// be a literal here that had to equal a literal in the harness and a third in
+/// the document, with nothing comparing the three; now such a NIC can only be
+/// given a MAC an interface claims, and the address the routed contract expects
+/// the appliance to answer to is that same interface's. The management port has
+/// no interface to claim one, so it carries [`MANAGEMENT_MAC`] and the tests hold
+/// that constant to belonging to nothing else on the bench.
 ///
 /// # Errors
-/// The port has no interface in the document, which the topology names.
-pub(crate) fn nic_device(topology: &Topology, port: usize) -> Result<String, String> {
-    let [a, b, c, d, e, f] = topology.port_mac(port).map_err(|error| error.to_string())?;
+/// A dataplane port with no interface in the document, which the topology names.
+pub(crate) fn nic_device(topology: &Topology, nic: GuestNic) -> Result<String, String> {
+    let [a, b, c, d, e, f] = match nic {
+        GuestNic::Dataplane(port) => topology.port_mac(port).map_err(|error| error.to_string())?,
+        GuestNic::Management => MANAGEMENT_MAC,
+    };
     Ok(format!(
-        "virtio-net-pci,netdev=n{port},disable-legacy=on,disable-modern=off,\
+        "virtio-net-pci,netdev={},disable-legacy=on,disable-modern=off,\
          mac={a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x},bus=pcie.0,addr=0{}.0,romfile=",
-        port + 2
+        nic.netdev_id(),
+        nic.slot() + 2
     ))
+}
+
+/// Every NIC the image expects to find, in slot order: one per dataplane port,
+/// then the management port. A shorter list is a boot with a driver instance
+/// staring at an absent device.
+pub(crate) fn every_guest_nic() -> Vec<GuestNic> {
+    (0..PORTS)
+        .map(GuestNic::Dataplane)
+        .chain([GuestNic::Management])
+        .collect()
 }
 
 /// Build the shared QEMU invocation that boots the deployable disk through
@@ -589,13 +669,49 @@ mod tests {
     #[test]
     fn each_port_gets_its_pinned_pci_address_and_no_option_rom() {
         let topology = bench();
-        assert!(nic_device(&topology, 0).unwrap().contains("addr=02.0"));
-        assert!(nic_device(&topology, 1).unwrap().contains("addr=03.0"));
-        for port in 0..PORTS {
+        // The three addresses the system description grants an ECAM page for,
+        // and the management port is the third: `ecam2` is the page of device 4.
+        assert!(
+            nic_device(&topology, GuestNic::Dataplane(0))
+                .unwrap()
+                .contains("addr=02.0")
+        );
+        assert!(
+            nic_device(&topology, GuestNic::Dataplane(1))
+                .unwrap()
+                .contains("addr=03.0")
+        );
+        assert!(
+            nic_device(&topology, GuestNic::Management)
+                .unwrap()
+                .contains("addr=04.0")
+        );
+        for nic in every_guest_nic() {
             assert!(
-                nic_device(&topology, port).unwrap().ends_with("romfile="),
+                nic_device(&topology, nic).unwrap().ends_with("romfile="),
                 "an option ROM would give the firmware a PXE payload"
             );
+        }
+        // Every NIC on its own netdev id and its own slot, or two would share a
+        // backend and a PCI function.
+        let slots: Vec<usize> = every_guest_nic().iter().map(|nic| nic.slot()).collect();
+        assert_eq!(slots, (0..=PORTS).collect::<Vec<_>>());
+    }
+
+    /// The management port answers to an address nothing else on either bench
+    /// does. Two NICs sharing one would have a routed frame accepted by
+    /// whichever saw it first, and the document cannot refuse a collision it
+    /// does not know about.
+    #[test]
+    fn a_managed_port_carries_a_mac_no_dataplane_port_claims() {
+        for topology in [bench(), alternate()] {
+            assert!(
+                !topology.carries_mac(MANAGEMENT_MAC),
+                "the management MAC belongs to something on the bench"
+            );
+            for port in 0..PORTS {
+                assert_ne!(topology.port_mac(port), Ok(MANAGEMENT_MAC));
+            }
         }
     }
 
@@ -609,9 +725,11 @@ mod tests {
         for port in 0..PORTS {
             let [a, b, c, d, e, f] = topology.port_mac(port).expect("a claimed port");
             assert!(
-                nic_device(&topology, port).unwrap().contains(&format!(
-                    "mac={a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}"
-                )),
+                nic_device(&topology, GuestNic::Dataplane(port))
+                    .unwrap()
+                    .contains(&format!(
+                        "mac={a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}"
+                    )),
                 "port {port}"
             );
         }
@@ -623,24 +741,37 @@ mod tests {
 
     #[test]
     fn a_port_this_build_has_none_of_yields_no_device_argument() {
-        let error = nic_device(&bench(), PORTS).expect_err("there is no such port");
+        let error = nic_device(&bench(), GuestNic::Dataplane(PORTS))
+            .expect_err("there is no such dataplane port");
         assert!(error.contains(&format!("{PORTS}")), "{error}");
     }
 
     /// The alternate scenario's document is a different bench, and the device
     /// arguments it produces must differ in every MAC — the property scenario 3
     /// rests on.
+    fn alternate() -> Topology {
+        Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
+            .expect("the alternate document describes a bench")
+    }
+
     #[test]
     fn the_alternate_document_puts_different_macs_on_the_same_ports() {
-        let alternate =
-            Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
-                .expect("the alternate document describes a bench");
         let shipped = bench();
+        let alternate = alternate();
         for port in 0..PORTS {
+            let nic = GuestNic::Dataplane(port);
             assert_ne!(
-                nic_device(&shipped, port).unwrap(),
-                nic_device(&alternate, port).unwrap()
+                nic_device(&shipped, nic).unwrap(),
+                nic_device(&alternate, nic).unwrap()
             );
         }
+        // The management port is the exception, and deliberately: its MAC is not
+        // in either document, so both benches present the same one — which is
+        // what makes it the one NIC argument the alternate scenario does not
+        // re-derive.
+        assert_eq!(
+            nic_device(&shipped, GuestNic::Management).unwrap(),
+            nic_device(&alternate, GuestNic::Management).unwrap()
+        );
     }
 }

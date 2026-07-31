@@ -61,12 +61,6 @@ use lfw_log::{Event, Field, GenerationOutcome, MAX_LINE_LEN, render};
 /// than console prose. The grammar is fixed in `crates/log/src/render.rs`.
 const CONFIG_RECORD_PREFIX: &str = "LFW-CFG ";
 
-/// What opens a record on any channel, and therefore what closes the one
-/// before it. MONITORING.md makes this the reader's only handle: a record is
-/// recognised by this prefix appearing anywhere in the stream, never by a line
-/// boundary.
-const RECORD_MARKER: &str = "LFW-";
-
 /// The first generation a commit can assign: the datastore starts running
 /// generation 0 — the fail-closed empty configuration — and the document a
 /// domain is built with is the next one.
@@ -325,8 +319,8 @@ impl From<ContractError> for String {
 /// The reader's obligation outlived the defect, and MONITORING.md still states
 /// it as part of the contract — recover records by scanning for the `LFW-`
 /// prefix anywhere in the stream, never by assuming a line is a record.
-/// [`records_in_line`] is that scan, held to what the contract obliges rather
-/// than to what the current captures happen to contain. The single-writer
+/// [`crate::console_records`] is that scan, held to what the contract obliges
+/// rather than to what the current captures happen to contain. The single-writer
 /// property is exact only in release: the debug kernel writes the same port for
 /// its banner and its fault reports, so a record preceded on its line by kernel
 /// prose stays reachable there.
@@ -340,44 +334,10 @@ impl From<ContractError> for String {
 /// refused its own configuration as a clean boot. A guard that fails open on
 /// the case it exists for is worse than none.
 ///
-/// # What this deliberately does not do, and what it costs
-///
-/// It does not reassemble. A record torn through its own middle leaves a head
-/// fragment here and a tail carrying no marker, which is discarded — so the
-/// transcript comparison reports a mismatch rather than silently accepting one.
-/// That is the honest limit of the contract rather than an omission: two
-/// concurrent writers leave a reader nothing to decide which fragment continues
-/// which by, and a harness that guessed would be inventing records.
-///
-/// It also gives up one property the line-splitting reader had: prose that
-/// *quotes* a record now reads as one, the marker being the only handle the
-/// contract offers. That is the right way to be wrong, and is asserted as such
-/// — a quoted record carries its prose with it, so it lands as a mismatch or a
-/// refusal verdict and stops the gate, where a torn record went unseen.
+/// What that scan does not do — reassemble a torn record — and what giving up
+/// the line boundary costs, are stated where it lives.
 fn config_records(text: &str) -> Vec<&str> {
-    text.lines().flat_map(records_in_line).collect()
-}
-
-/// The records one captured line carries, in the order they were written: each
-/// [`RECORD_MARKER`] opens a candidate that runs to the next marker or to the
-/// end of the line, and only the candidates on the `LFW-CFG` channel are kept.
-/// GRUB's prose, seL4's boot chatter and the `LFW-PD` lifecycle channel
-/// therefore cannot be mistaken for a configuration decision wherever in a line
-/// they sit.
-fn records_in_line(line: &str) -> Vec<&str> {
-    let markers: Vec<usize> = line
-        .match_indices(RECORD_MARKER)
-        .map(|(at, _)| at)
-        .collect();
-    markers
-        .iter()
-        .enumerate()
-        .filter_map(|(position, start)| {
-            let end = markers.get(position + 1).copied().unwrap_or(line.len());
-            line.get(*start..end).map(str::trim)
-        })
-        .filter(|record| record.starts_with(CONFIG_RECORD_PREFIX))
-        .collect()
+    crate::console_records::records_on(text, CONFIG_RECORD_PREFIX)
 }
 
 /// Name the records the channel did not carry exactly once and those it carried

@@ -156,7 +156,7 @@ pub fn descriptor_in_bounds(descriptor: &Descriptor) -> bool {
 
 /// Saturating rather than wrapping: the rate is attacker-controlled, and a
 /// wrapped counter turns a sustained flood back into a small number.
-fn bump(counter: &mut u64) {
+pub(crate) fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
@@ -389,8 +389,10 @@ macro_rules! attach_region {
 }
 
 pub mod handover;
+pub mod terminal;
 
 pub use handover::{ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer, router_from};
+pub use terminal::{TerminalCounters, TerminalStage};
 pub use wire::{ConfigAck, ConfigHandover, ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS};
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise

@@ -13,9 +13,8 @@
 //! is `&'static str` and is the whole reason a byte an adversary chose cannot
 //! reach the field (OBS-5). A console domain reconstructs one from a shared
 //! region, where the bytes are a peer's and there is no allocator to own them,
-//! so it is [`Cause`] — fixed storage this crate holds to the alphabet and the
-//! length the ABI carries. The type parameter on [`Refusal`] is that seam, and
-//! its default keeps every minting call site writing what it wrote before.
+//! so it is [`Cause`]. The type parameter on [`Refusal`] is that seam, and its
+//! default keeps every minting call site writing what it wrote before.
 //!
 //! Both forms print through [`fmt::Display`], which is what lets the renderer
 //! stay one function: a line an operator reads cannot depend on which side of a
@@ -141,6 +140,13 @@ pub enum DomainDetail<C = &'static str> {
     Established {
         tsc_hz: NonZeroU64,
         utc: UtcNanos,
+    },
+    /// What a terminal endpoint has taken off its pipeline since it started,
+    /// cumulative and monotonic. Counts and nothing else: no byte an adversary
+    /// put on a wire has a representation here (OBS-5).
+    Received {
+        frames: u64,
+        bytes: u64,
     },
 }
 
@@ -287,12 +293,23 @@ mod tests {
         );
     }
 
+    /// Every shape, and each at the zero its neighbours also carry: a payload
+    /// is what the *variant* names, so two shapes holding the same number must
+    /// still not compare equal.
     #[test]
-    fn the_four_detail_shapes_are_distinguishable() {
+    fn every_detail_shape_is_distinguishable() {
         let shapes = [
             DomainDetail::None,
             DomainDetail::Features(0),
             DomainDetail::ReceivePosted(0),
+            DomainDetail::Received {
+                frames: 0,
+                bytes: 0,
+            },
+            DomainDetail::Established {
+                tsc_hz: NonZeroU64::MIN,
+                utc: lfw_clock::UtcNanos::from_unix_nanos(0),
+            },
             DomainDetail::Refusal(Refusal {
                 cause: "",
                 detail: RefusalDetail::None,

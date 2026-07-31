@@ -74,10 +74,15 @@ fn every_vocabulary_is_as_wide_here_as_the_abi_says() {
 }
 
 #[test]
-fn the_console_domain_is_in_the_vocabulary_the_abi_carries() {
-    assert!(Domain::ALL.contains(&Domain::Console));
-    assert_eq!(Domain::Console.name(), "console");
-    assert!((Domain::Console as usize) < usize::from(wire::LOG_DOMAIN_COUNT));
+fn every_domain_the_system_declares_is_in_the_vocabulary_the_abi_carries() {
+    for (domain, token) in [
+        (Domain::Console, "console"),
+        (Domain::Management, "management"),
+    ] {
+        assert!(Domain::ALL.contains(&domain));
+        assert_eq!(domain.name(), token);
+        assert!((domain as usize) < usize::from(wire::LOG_DOMAIN_COUNT));
+    }
 }
 
 #[test]
@@ -177,7 +182,7 @@ fn every_value_variant_survives_both_ends_of_a_change() {
     }
 }
 
-/// The five detail shapes and all three refusal widths, each with both
+/// Every detail shape and all three refusal widths, each with both
 /// `signalled` values and with the empty cause the ABI admits.
 #[test]
 fn every_domain_detail_shape_survives_the_crossing() {
@@ -188,6 +193,14 @@ fn every_domain_detail_shape_survives_the_crossing() {
         DomainDetail::ReceivePosted(u32::MAX),
         established(1, 0),
         established(u64::MAX, u64::MAX),
+        DomainDetail::Received {
+            frames: 0,
+            bytes: 0
+        },
+        DomainDetail::Received {
+            frames: u64::MAX,
+            bytes: u64::MAX,
+        },
     ];
     for operands in [
         RefusalDetail::None,
@@ -643,6 +656,7 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
         Just(DomainDetail::None),
         any::<u64>().prop_map(DomainDetail::Features),
         any::<u32>().prop_map(DomainDetail::ReceivePosted),
+        any::<(u64, u64)>().prop_map(|(frames, bytes)| DomainDetail::Received { frames, bytes }),
         (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
         (
             any_cause(),
@@ -795,8 +809,10 @@ proptest! {
         key_len in any::<u8>(),
         tsc_hz in any::<u64>(),
         unix_nanos in any::<u64>(),
+        counts in any::<[u64; 2]>(),
     ) {
         let [generation, sequence, changes, reject_offset, receive_posted] = numbers;
+        let [frames, frame_bytes] = counts;
         let [domain, state, detail, operand_count, signalled, change, object, field, outcome, reason] =
             tokens;
         let record = LogRecord {
@@ -825,6 +841,8 @@ proptest! {
             to: ValueImage::ZERO,
             tsc_hz,
             unix_nanos,
+            frames,
+            frame_bytes,
         };
         match record.check() {
             Err(_) => {}

@@ -79,7 +79,7 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
     assert_eq!(size_of::<IdentifierImage>(), 20);
     assert_eq!(size_of::<CauseImage>(), 44);
     assert_eq!(size_of::<ValueImage>(), 32);
-    assert_eq!(size_of::<LogRecord>(), 208);
+    assert_eq!(size_of::<LogRecord>(), 224);
     assert_eq!(align_of::<LogRecord>(), 8);
     assert_eq!(
         [
@@ -87,13 +87,15 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
             offset_of!(LogRecord, operands),
             offset_of!(LogRecord, tsc_hz),
             offset_of!(LogRecord, unix_nanos),
+            offset_of!(LogRecord, frames),
+            offset_of!(LogRecord, frame_bytes),
             offset_of!(LogRecord, kind),
             offset_of!(LogRecord, cause),
             offset_of!(LogRecord, key),
             offset_of!(LogRecord, from),
             offset_of!(LogRecord, to),
         ],
-        [0, 8, 24, 32, 40, 80, 124, 144, 176]
+        [0, 8, 24, 32, 40, 48, 56, 96, 140, 160, 192]
     );
 }
 
@@ -111,7 +113,7 @@ fn a_record_has_a_stable_little_endian_byte_image() {
         &bytes[0..8],
         &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
     );
-    assert_eq!(&bytes[40..44], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(&bytes[56..60], &[0xff, 0x00, 0x00, 0x00]);
     assert_eq!(record_from_bytes(bytes), record);
 }
 
@@ -180,6 +182,23 @@ fn a_domain_record_carries_each_detail_shape() {
     };
     assert_eq!(tsc_hz.get(), 2_999_998_000);
     assert_eq!(unix_nanos, u64::MAX);
+
+    let received = LogRecord {
+        detail: LogDetailKind::Received.to_bits(),
+        frames: 4,
+        frame_bytes: 352,
+        ..domain_record()
+    };
+    assert!(matches!(
+        received.check(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Received {
+                frames: 4,
+                bytes: 352,
+            },
+            ..
+        })
+    ));
 
     let Ok(CheckedBody::Domain {
         detail:
@@ -551,10 +570,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 5,
+                detail: 6,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 5 },
+            LogRecordError::DetailKindUnknown { detail: 6 },
         ),
         // The one detail whose own field can refuse it: a frequency of zero
         // scales no reading, so it is refused rather than carried on as a
@@ -784,7 +803,7 @@ fn every_refusal_names_the_field_and_the_value() {
         LogRecordError::KindUnknown { kind: 9 },
         LogRecordError::DomainUnknown { domain: 4 },
         LogRecordError::DomainStateUnknown { state: 4 },
-        LogRecordError::DetailKindUnknown { detail: 5 },
+        LogRecordError::DetailKindUnknown { detail: 6 },
         LogRecordError::ClockFrequencyZero,
         LogRecordError::OperandCountUnknown { operands: 3 },
         LogRecordError::SignalledNotBoolean { signalled: 2 },
@@ -823,9 +842,9 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 5",
+            "domain token 4 is not below 6",
             "state token 4 is not below 4",
-            "detail kind 5 names no payload",
+            "detail kind 6 names no payload",
             "the established counter frequency is zero, which scales no reading",
             "operand count 3 exceeds the 2 the record holds",
             "signalled byte 2 is not 0 or 1",
@@ -864,10 +883,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::ReceivePosted,
         LogDetailKind::Refusal,
         LogDetailKind::Established,
+        LogDetailKind::Received,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(5), None);
+    assert_eq!(LogDetailKind::from_bits(6), None);
 
     for value in [
         LogValueKind::Absent,
@@ -903,7 +923,7 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
     (
         prop_oneof![9 => 0u32..=3, 1 => any::<u32>()],
         prop_oneof![9 => 0u8..=3, 1 => any::<u8>()],
-        prop_oneof![9 => 0u8..=4, 1 => any::<u8>()],
+        prop_oneof![9 => 0u8..=5, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![7 => 1u8..=16, 2 => 0u8..=40, 1 => any::<u8>()],
@@ -968,6 +988,13 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
                     },
                     tsc_hz,
                     unix_nanos: u64::from(token) * u64::from(len),
+                    // Derived from the arbitrary frequency rather than drawn
+                    // separately: `Received` has no field that can refuse a
+                    // record, so what matters is that the arm is reached with
+                    // two different values, and the tuple above is already at
+                    // the width proptest generates for.
+                    frames: tsc_hz,
+                    frame_bytes: !tsc_hz,
                     ..LogRecord::ZERO
                 }
             },

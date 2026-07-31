@@ -37,7 +37,15 @@ generation 0, forwarding nothing — and switches to a generation only after re-
 of it itself, so every boot performs a live configuration swap on a running dataplane. There is
 still no way to *submit* a document to a running node: it is embedded at build time.
 
-A fifth protection domain owns the console. It holds the first of the system's two I/O-port
+A **dedicated management port** is now the third NIC. It is a third instance of the same driver
+binary — the binary is port-agnostic, so driving a management port took no code change to it — handing
+its frames to a `management` protection domain that counts them and reports the running total, and
+forwards nothing. The isolation CONCEPT §9.1 asks for is a grant set rather than a rule: the
+management domain holds no dataplane region and the forwarder holds no management region, and
+`xtask::sysdesc` names the mapper set of every region exactly, so either grant appearing fails the
+gate. The port has no address, no ARP and no IP — it receives and counts, and that is all.
+
+Another protection domain owns the console. It holds the first of the system's two I/O-port
 capabilities — the eight ports at `0x3F8`, the PC-compatible COM1 window — and every other domain
 reaches an operator by publishing a typed record into a single-producer ring of its own, which that
 domain drains, renders, and puts on the line. It replaced `sel4_microkit::debug_println!`, which compiles
@@ -102,7 +110,7 @@ firewall.
 | Proxy TCP stack (smoltcp, SACK) | **open** | |
 | 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
 | IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
-| Full port role model (management, session-replication, mirror, multiple pairs) | **open** | two dataplane ports exist; no other role |
+| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists and is isolated from the dataplane; it receives and counts and does nothing else — [detail](#full-port-role-model) |
 | Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
 | ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
 | Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
@@ -385,14 +393,14 @@ Rust, so the driver and the domain each carry **zero** `unsafe` blocks — the E
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`crates/wire` carries the transport: a 208-byte fixed-layout `LogRecord` whose every offset is a
+`crates/wire` carries the transport: a 224-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
 records region (slots, producer cursor, the writer's drop count) is read-write to the writing domain
 and read-only to the console, so the console cannot forge a line attributed to a domain that never
 emitted one — it is the domain whose output is read as testimony about the others. The consume
 region (the console's cursor, one word) is read-write to the console and read-only to the writer, so
 a writer cannot forge how much of its own ring has been read and quietly reuse slots the console
-never rendered. Ten regions, 100 KiB, one pair per writing domain; no writer maps another writer's.
+never rendered. Fourteen regions, 140 KiB, one pair per writing domain; no writer maps another writer's.
 
 The console busy-polls and never leaves `init`, exactly as the NIC drivers do — Microkit has no
 periodic wakeup, so a `notified`-driven console would stall a boot transcript longer than the
@@ -411,7 +419,8 @@ paint terminal escape sequences onto an operator's console.
 
 Every end-to-end scenario now boots the **release** image, and two of the three system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
-image under test was built from. Both halves were needed to make the defect non-recurring: a missing
+image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
+the harness injected. Both halves were needed to make the defect non-recurring: a missing
 console went unnoticed because no gate on the push path booted a release artifact at all, and
 because the one stage that did booted it against the forwarding contract alone — and a dataplane is
 indifferent to whether anything is printed.
@@ -473,7 +482,7 @@ indifferent to whether anything is printed.
 
 ### Console system-state events
 
-**Done.** The five ad-hoc bring-up markers are gone. Call sites in all five protection-domain
+**Done.** The five ad-hoc bring-up markers are gone. Call sites in all six protection-domain
 binaries emit **typed events** — a closed set of named fields — and rendering happens once, in the
 console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
 site rather than thrown away in a format string, and the structure is what crosses between domains
@@ -516,6 +525,56 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 - **Nothing beyond the console.** These are the OTEL log stream's System category by construction,
   but no transport exists (see the status table), so the records reach an operator only over a
   serial line, on a node they are already attached to.
+
+### Full port role model
+
+**Done.** One of the four roles CONCEPT §9.1 names exists: a **dedicated management port**, isolated
+from the dataplane and carrying no forwarded traffic. It is a third `virtio-net-pci` device at
+00:04.0, driven by a third instance of the same `nic-driver.elf` the two dataplane ports use — the
+binary turned out to be port-agnostic already, so the third port cost it no code change, only new
+regions and a different peer — and its frames end at a `management` protection domain that counts
+them and reports the running total on the console.
+
+The isolation is a grant set, not a rule anybody has to remember. The management domain holds **no**
+dataplane region, no buffer pool at all, no configuration region, no device capability and no I/O
+port; the forwarder holds no management region; and `xtask::sysdesc` names the mapper set of every
+region *exactly*, so either grant appearing fails the gate at the point the edit is made. The
+management port is not in the router's port set and no configuration document can put it there —
+`config::PORT_COUNT` is 2 and the forwarder refuses a table naming a port it has no driver for.
+
+`crates/pd-runtime`'s `TerminalStage` is the mechanism, and it exists because the dataplane's does
+not transfer: a routed descriptor travels *onward* and the egress driver returns the buffer, which is
+what lets the forwarder be denied both `free` rings. A terminal port has no egress driver, so this
+domain produces the returns itself while the driver consumes them as the pool's owner — the same
+producer/consumer split the two drivers already have, which keeps a forged return refused by the
+ledger rather than believed. It is host-tested against a byzantine driver: forged indices,
+unbelievable spans, a stalled return ring, and a pool-sized run proving every buffer comes back.
+
+The QEMU gate asserts both halves on the release image. Every system scenario injects four frames of
+four different lengths into the management port once the capture proves every port is up, and holds
+that port to carrying **nothing** back — nothing produces onto its transmit pipeline and the
+forwarder cannot reach it, so a frame arriving there means one of those two facts has stopped being
+true. Two of the three scenarios additionally hold the console's own record to the frames and the
+bytes injected, to the frame and to the byte: `LFW-PD domain=management state=ready frames=4
+bytes=352`.
+
+**Missing** — and it is nearly everything a management port is for:
+
+- **The port has no address.** No ARP, no IPv4, no TCP, no TLS, no HTTP, and nothing in the
+  configuration document describes it: it has no `<interface>`, so its MAC is a constant in
+  `tools/xtask/src/qemu.rs` rather than a configured value, and the harness's station MAC is a
+  constant beside it. Both move into the document the day it gains a management interface.
+- **It reads no frame.** Frames and bytes are counted off the descriptors the driver publishes, so
+  the domain maps no pool and its receive pool is mapped by no protection domain at all. Parsing a
+  frame needs that mapping, and it arrives with the code that does the parsing.
+- **It transmits nothing.** The transmit pipeline exists because the port-agnostic driver binary
+  takes a transmit side whatever port it drives; no domain produces onto it, so the port is
+  receive-only in fact as well as in intent.
+- **The counts are on the console and nowhere else.** They belong on `/metrics` (CONCEPT §11), which
+  does not exist, and `TerminalCounters::malformed_descriptor` and `return_ring_full` reach no
+  surface at all — so a management port whose driver is misbehaving is invisible.
+- **No other role.** Session-replication, mirror and multiple port pairs are open, and so are the
+  3/4/6/7-NIC hardware image variants: there is one system description with three ports in it.
 
 ### Trusted time source
 
@@ -563,11 +622,13 @@ accepts, and that its year is inside the band the RTC reader accepts.
 
 ### Protection-domain decomposition
 
-**Done.** Six protection domains from five binaries (one forwarder, one configuration domain, one
-console, one clock, two driver instances of one driver binary) with real, verifiable least
+**Done.** Eight protection domains from six binaries (one forwarder, one configuration domain, one
+console, one clock, one management endpoint, three driver instances of one driver binary) with real,
+verifiable least
 privilege: the
 forwarder holds no device capability at all
-and neither pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a second
+and neither dataplane pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a
+second
 time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two pipelines.
 Each pipeline is three memory regions rather than one precisely so that those grants can differ; the
 forwarder maps the buffer pools, because a domain that rewrites a header must reach the bytes. The
@@ -577,13 +638,14 @@ direction, and their perms are the argument — the forwarder maps the handover 
 cannot rewrite the configuration it is about to be judged by, and the publisher maps the
 acknowledgement read-only, so it cannot forge the consent that releases its own generation.
 
-Three notification channels. The two driver channels are granted in **one direction only** — the
-drivers may signal the forwarder, and the forwarder's send capability on each does not exist rather
-than merely going unexercised. The third, between the configuration domain and the forwarder, is the
+Four notification channels. The three driver channels are granted in **one direction only** — a driver
+may signal its consumer, and that consumer's send capability on the driver does not exist rather
+than merely going unexercised. The fourth, between the configuration domain and the forwarder, is the
 one granted in **both**, and stated as a decision at both ends rather than inherited from Microkit's
 default: applying a configuration is a two-phase commit and each phase is a signal the other end
 cannot infer. The forwarder therefore holds exactly one send capability in the whole system, on the
-configuration domain alone. The console holds none in either direction — it never reaches the event
+configuration domain alone, and the management domain holds none at all. The console holds none in
+either direction — it never reaches the event
 loop, so a notification on it would be authority granted for nothing. Zero IRQs. The capability
 grant is machine-checkable in the Microkit capability/memory report the build generates.
 
@@ -594,10 +656,23 @@ address and data registers); the other 65,526 are refused to every domain — no
 space beside the ECAM mappings the drivers hold. The two windows are disjoint and neither domain
 holds the other's, so the domain that renders an operator's only output cannot read or stop the
 clock and the domain that reads a battery-backed register file cannot write the line its result
-appears on. The drivers and the forwarder hold zero ports between them. Each of the two in turn
+appears on. The drivers, the forwarder and the management domain hold zero ports between them. Each of the two in
+turn
 holds no pool, no dataplane ring and no configuration region, and the clock additionally holds no
 ECAM page and no BAR window beyond the single timer page it maps — so a compromise of either reaches
 no frame, no NIC and no configuration.
+
+The management domain's grant is two regions plus its own log ring, and what it withholds is the
+whole of the port isolation: no dataplane region of any kind, **no buffer pool at all** — not even
+its own port's, frames being counted off their descriptors and never read — no configuration region,
+no ECAM page, no BAR window, no virtqueue and no I/O port. Its receive pool is consequently mapped by
+**no protection domain in the system**: the driver takes its physical address alone and nothing with
+a CPU reaches it, which `xtask::sysdesc` carries as a rule with an empty grant set and a claim saying
+why. The one region it is granted read-write that the forwarder is refused is that pipeline's `free`
+ring, and it is the side of it that differs: a terminal port has no egress driver to return its
+buffers, so this domain **produces** returns while the driver **consumes** them as the pool's owner —
+the split the dataplane already has between its two drivers, which is what keeps a forged return
+refused by the ledger rather than believed.
 
 Reaching a port is an **invocation**, never an `in`/`out` instruction; that lesson was paid for once
 on the console's first boot and `pds/clock/src/cmos.rs` is written from it. Both domains prove the
@@ -605,10 +680,12 @@ capability answers before relying on it, so a slot the Microkit tool moved is a 
 than a fault mid-sequence.
 
 **Missing.** Two of the fourteen component classes in CONCEPT §6.3 exist: the NIC driver PDs and the
-configuration validator PD. The console and clock domains are two further domains and *not* two
+configuration validator PD. The console, clock and management domains are three further domains and
+*not* three
 further classes — §6.3 enumerates neither, describing the console as a surface and leaving the
 trusted-time mechanism open (§13.1) — so they add domains to the decomposition without closing any
-of the gap below. Absent: Rx/Tx virtualisers,
+of the gap below — the management domain is the endpoint of a port, not the management API PD, which
+needs ARP, IP, TCP, TLS and HTTP that do not exist. Absent: Rx/Tx virtualisers,
 classifier,
 filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7 parsers, DPI engine,
 content scanner, CA signing PD, management API PD, HA state-sync PD, and the update/health PD. The
@@ -620,9 +697,10 @@ One grant is also wider than the code needs, and it is not closed:
 
 - **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what keeps the virtqueue
   and pipeline regions inside RAM while leaving the BAR window above RAM in the q35 PCI hole. The
-  window either side is narrow: below roughly 785 MiB the DMA regions leave RAM, at 1280 MiB or more
-  RAM swallows the BAR window. The reasoning is recorded in the system description; no code enforces
-  it.
+  window either side is narrow, and the management port's two pipelines have just **narrowed it
+  further**: RAM must now reach past 784.55 MiB rather than 784.27 MiB, and every port added narrows
+  it again; at 1280 MiB or more RAM swallows the BAR window. The reasoning is recorded in the system
+  description; no code enforces it.
 
 ### Untrusted-device hardening
 
@@ -773,9 +851,9 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fourteen library crates, `xtask`, and all five protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fourteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two ports; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | eleven persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
@@ -841,7 +919,7 @@ seL4 kernel build differs.
 
 `make test-system` is also the smoke test. It runs **three scenarios**, each a full boot of a signed
 disk through OVMF and GRUB with a host-controlled endpoint attached to each NIC port, and each
-asserting the routed contract in both directions:
+asserting the routed contract in both directions, plus the management port's count and its silence:
 
 1. **routed-forwarding** — the published disk, judged on traffic alone. It is the regression guard,
    reporting a forwarding failure as a forwarding failure and nothing else.

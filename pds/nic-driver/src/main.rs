@@ -1,8 +1,8 @@
 #![no_main]
 #![no_std]
 
-//! virtio-net driver protection domain: it drives one dataplane port (QEMU
-//! q35, virtio 1.0 PCI), one instance per port.
+//! virtio-net driver protection domain: it drives one port (QEMU q35, virtio
+//! 1.0 PCI), one instance per port, dataplane or management alike.
 //!
 //! # Adversary
 //!
@@ -19,19 +19,20 @@
 //! them against a stand-in device (LAY-2). [`PoolDmaBase`] deviates from that
 //! and is recorded here as the deviation it is: the value it guards enters
 //! `nic_driver_core` through
-//! [`DataplanePort::attach`](nic_driver_core::port::DataplanePort::attach) as a
-//! plain `u64`, so no type can refuse an unchecked address there — only this
-//! call site can, and a check in this file cannot be host-tested. Moving the
-//! newtype into `pd_runtime`, beside the [`MAPPING_ALIGN`] and
-//! [`POOL_REGION_SIZE`] it checks against, closes the gap.
+//! [`NicPort::attach`](nic_driver_core::port::NicPort::attach) as a plain
+//! `u64`, so only this call site can refuse an unchecked address and a check in
+//! this file cannot be host-tested. Moving the newtype into `pd_runtime`, beside
+//! the [`MAPPING_ALIGN`] and [`POOL_REGION_SIZE`] it checks against, closes it.
 //!
 //! # Everything this domain touches is patched in at build time
 //!
 //! Hardware topology is static (CONCEPT §12.3), so this driver performs no PCI
 //! enumeration: it never scans a bus and holds capabilities for exactly one
-//! function's ECAM page, and two instances of one binary drive two devices with
-//! no code difference. Each port joins two pipelines of three regions each —
-//! pool, forwarder rings, return ring — and maps five of the six. The sixth,
+//! function's ECAM page, and three instances of one binary drive three devices
+//! with no code difference — nothing below distinguishes a dataplane port from
+//! the management one, whose peer is a different domain and nothing else. Each
+//! port joins two pipelines of three regions each —
+//! pool, pipeline rings, return ring — and maps five of the six. The sixth,
 //! **the pool this port receives into**, is an address and nothing more: it
 //! goes to the NIC as a DMA target and no byte of it is dereferenced here, so a
 //! mapping would be authority with no use. Microkit patches a `setvar
@@ -47,33 +48,31 @@
 //! | `rx_fwd_vaddr` / `tx_fwd_vaddr` | the `ForwardRings` region of each pipeline |
 //! | `rx_free_vaddr` / `tx_free_vaddr` | the `ReturnRing` region of each |
 //! | `tx_pool_vaddr` | the pool this port transmits out of — the only pool it maps |
-//! | `bar_paddr`, `vq_paddr` | the physical addresses of those two device regions |
-//! | `rx_pool_paddr`, `tx_pool_paddr` | the physical bases of both pools, for the device |
+//! | `bar_paddr`, `vq_paddr`, `rx_pool_paddr`, `tx_pool_paddr` | those physical bases, for the device |
 //!
-//! # Scheduling: two drivers busy-loop at equal priority
+//! # Scheduling: every driver busy-loops at equal priority
 //!
 //! Microkit has no periodic wakeup and this driver takes no interrupt (no
 //! MSI-X, no INTx) by design, so it polls by never returning from `init`. The
 //! system description fixes what follows, and it is not visible from this file:
-//! the two driver instances share **priority 1** and both loop forever, so
+//! every driver instance shares **priority 1** and each loops forever, so
 //! their mutual progress rests entirely on seL4's round-robin scheduling of
 //! equal-priority threads. On the single-core bring-up this is why a driver
 //! must never spin on a device-controlled condition — a device that withholds
-//! an answer would deny the timeslice to the other port, not merely to itself.
-//! The forwarder runs at **priority 2** and preempts on notification, so the
-//! busy loop cannot starve it.
+//! an answer would deny the timeslice to every other port, not merely to
+//! itself. Each consuming peer runs at **priority 2** and preempts on
+//! notification, so the busy loop cannot starve one.
 //!
 //! # The console is a domain, not a print statement
 //!
 //! Nothing here writes to a serial port. A record is a typed [`Event`] put into
-//! this instance's own log ring — one region, this domain the only writer —
-//! and the console domain renders it. The rejected alternative is the obvious
-//! one, `sel4_microkit::debug_println!`: it compiles to `seL4_DebugPutChar`, a
-//! kernel *debug* syscall the release kernel does not implement, so a driver
-//! that failed bring-up would park silently in exactly the profile that ships.
-//! A ring in a shared region behaves identically in both kernel configurations,
-//! and it is drained whenever the console domain comes up, so the records this
-//! domain writes during its own `init` survive to be printed.
+//! this instance's own log ring — one region, this domain the only writer — and
+//! the console domain renders it. The rejected alternative,
+//! `sel4_microkit::debug_println!`, compiles to `seL4_DebugPutChar`, a kernel
+//! *debug* syscall the release kernel does not implement, so a driver that
+//! failed bring-up would park silently in exactly the profile that ships. A ring
+//! behaves identically in both kernel configurations and is drained whenever the
+//! console comes up, so a record written during `init` survives to be printed.
 //!
 //! # Channel 0 sends and never receives
 //!
@@ -81,30 +80,31 @@
 //! than by control flow — a property of the system, not of this file. Microkit's
 //! optional `notify` attribute on a `<channel>`'s `<end>` "indicates that the
 //! protection domain for this end can send a notification to the other end;
-//! defaults to **true**" (Microkit 2.3.0 user manual §7.6). The forwarder's end
-//! of each of the two driver channels is marked `notify="false"` in the system
-//! description, so each driver keeps its send capability on the forwarder while
-//! the forwarder holds none on either driver. The entrypoint satisfies
-//! `sel4_microkit::Handler`.
+//! defaults to **true**" (Microkit 2.3.0 user manual §7.6). The peer's end of
+//! every driver channel is marked `notify="false"` in the system description, so
+//! each driver keeps its send capability on its peer while no peer holds one on
+//! a driver. The entrypoint satisfies `sel4_microkit::Handler`.
 
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use nic_driver_core::bringup::{
     self, BringUpError, DriverVirtqueue, Live, MappedDevice, QUEUE_SIZE, TX_VQ_OFFSET,
 };
-use nic_driver_core::port::{DataplanePort, ForwarderSignal, ReceiveSide, TransmitSide};
+use nic_driver_core::port::{NicPort, PeerSignal, ReceiveSide, TransmitSide};
 use pd_runtime::{ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, Pool, ReturnRing, attach_region};
 use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
 use wire::{LogConsume, LogRecords};
 
-/// The forwarder. Send-only; see the crate header on channel 0.
-const FORWARDER: Channel = Channel::new(0);
+/// The domain this port's received frames go to — the forwarder for a dataplane
+/// port, the management domain for the management port, and this file cannot
+/// tell which. Send-only; see the crate header on channel 0.
+const PEER: Channel = Channel::new(0);
 
-struct ForwarderChannel;
+struct PeerChannel;
 
-impl ForwarderSignal for ForwarderChannel {
+impl PeerSignal for PeerChannel {
     fn notify(&self) {
-        FORWARDER.notify();
+        PEER.notify();
     }
 }
 
@@ -181,7 +181,7 @@ fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
 /// or misspelled `setvar` leaves the symbol at its `var!` default instead of
 /// failing the build — so zero is what a *missing* patch produces, and is
 /// refused first. What makes the check worth a type is that DMA is unconfined
-/// (see the crate header): [`DataplanePort::attach`] turns this into the
+/// (see the crate header): [`NicPort::attach`] turns this into the
 /// address of every buffer the device is programmed with. `rx_pool_paddr` has
 /// nothing else checking it at all, that region never being mapped here, so a
 /// wrong value cannot surface as a fault on a load.
@@ -197,7 +197,7 @@ impl PoolDmaBase {
         if paddr == 0 || !paddr.is_multiple_of(MAPPING_ALIGN) {
             return Err(unusable);
         }
-        // `DataplanePort` derives every buffer's DMA address by adding an
+        // `NicPort` derives every buffer's DMA address by adding an
         // offset within `POOL_REGION_SIZE`; a sum that wraps leaves the region.
         let base = paddr as u64;
         if base.checked_add(POOL_REGION_SIZE as u64).is_none() {
@@ -230,7 +230,7 @@ fn init() -> NicDriver {
                 DomainDetail::ReceivePosted(QUEUE_SIZE as u32),
             );
             loop {
-                port.poll_once(&device, &ForwarderChannel);
+                port.poll_once(&device, &PeerChannel);
                 core::hint::spin_loop();
             }
         }
@@ -248,7 +248,7 @@ fn init() -> NicDriver {
 }
 
 /// Map this domain's regions and bring its device up, receive queue primed.
-fn bring_up(sink: &dyn Sink) -> Result<(Live<MappedDevice>, DataplanePort<'static>), StartupError> {
+fn bring_up(sink: &dyn Sink) -> Result<(Live<MappedDevice>, NicPort<'static>), StartupError> {
     let ecam = memory_region_symbol!(ecam_vaddr: *mut u8).as_ptr();
     let bar = memory_region_symbol!(bar_vaddr: *mut u8).as_ptr();
     let vq = memory_region_symbol!(vq_vaddr: *mut u8).as_ptr();
@@ -303,7 +303,7 @@ fn bring_up(sink: &dyn Sink) -> Result<(Live<MappedDevice>, DataplanePort<'stati
     // it, and `configure_queues` programmed the device from the same constants.
     let transmit_queue = unsafe { DriverVirtqueue::new(vq.add(TX_VQ_OFFSET)) };
 
-    let mut port = DataplanePort::attach(
+    let mut port = NicPort::attach(
         ReceiveSide {
             rings: rx_fwd,
             returns: rx_free,

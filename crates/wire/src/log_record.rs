@@ -20,9 +20,8 @@
 //!
 //! * **Record shape is this crate's.** Which variant a record is, which detail
 //!   it carries, how many operands that detail names, and which kind a value
-//!   slot holds are all statements about what the other bytes *mean*. Nothing
-//!   downstream can read the record without them, so an undecodable one is
-//!   refused here rather than passed on as a shape nobody agreed to.
+//!   slot holds are all statements about what the other bytes *mean*, so an
+//!   undecodable one is refused here rather than passed on.
 //! * **Text is this crate's**, because the console writes it to a UART. A byte
 //!   a hostile writer put in an identifier reaches an operator's terminal
 //!   unless something between the two refuses it, and this decode is that
@@ -30,9 +29,8 @@
 //!   way in; the two checks face different adversaries and neither stands in
 //!   for the other.
 //! * **Vocabulary cardinality is shared.** A token is bounded here by the
-//!   `LOG_*_COUNT` consts and mapped to a variant there. Adding a variant to a
-//!   console vocabulary widens the set of tokens on the wire, which is a change
-//!   to this ABI, so the count moves here in the same change.
+//!   `LOG_*_COUNT` consts and mapped to a variant there, so a variant added to
+//!   a console vocabulary moves its count here in the same change.
 
 use core::{
     fmt,
@@ -51,7 +49,7 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 5;
+pub const LOG_DOMAIN_COUNT: u8 = 6;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -120,6 +118,7 @@ pub enum LogDetailKind {
     ReceivePosted,
     Refusal,
     Established,
+    Received,
 }
 
 impl LogDetailKind {
@@ -131,6 +130,7 @@ impl LogDetailKind {
             Self::ReceivePosted => 2,
             Self::Refusal => 3,
             Self::Established => 4,
+            Self::Received => 5,
         }
     }
 
@@ -142,6 +142,7 @@ impl LogDetailKind {
             2 => Some(Self::ReceivePosted),
             3 => Some(Self::Refusal),
             4 => Some(Self::Established),
+            5 => Some(Self::Received),
             _ => None,
         }
     }
@@ -260,9 +261,8 @@ pub type CauseImage = TextImage<LOG_CAUSE_BYTES>;
 pub struct ValueImage {
     /// The numeric payload of [`LogValueKind::Port`],
     /// [`LogValueKind::PrefixLength`], [`LogValueKind::Bool`],
-    /// [`LogValueKind::Generation`] and [`LogValueKind::Count`]. The first
-    /// three are narrower than the field, so the decode refuses a value that
-    /// does not fit rather than truncating one.
+    /// [`LogValueKind::Generation`] and [`LogValueKind::Count`]. The first three
+    /// are narrower than the field, so a value that does not fit is refused.
     pub number: u32,
     /// Which [`LogValueKind`] this slot holds, as raw bits.
     pub kind: u8,
@@ -311,6 +311,13 @@ pub struct LogRecord {
     /// Nanoseconds since the Unix epoch, under the same detail, and unranged —
     /// every `u64` names a civil time, so believability is a reader's question.
     pub unix_nanos: u64,
+    /// Frames a terminal endpoint has taken off its pipeline, under
+    /// [`LogDetailKind::Received`], and unranged: it is the emitting domain's
+    /// claim about itself, comparable only against an earlier such record.
+    pub frames: u64,
+    /// Bytes those frames carried. `frame_bytes` rather than `bytes` so it
+    /// cannot read as a size of this record.
+    pub frame_bytes: u64,
     /// Which [`LogKind`] this record is, as raw bits.
     pub kind: u32,
     /// The configuration generation of a [`LogKind::ConfigChange`],
@@ -318,13 +325,12 @@ pub struct LogRecord {
     pub generation: u32,
     /// Position within the generation's records, for a
     /// [`LogKind::ConfigChange`]. Nothing is timestamped, so this and
-    /// `generation` are the whole of a record's ordering.
+    /// `generation` order a record and nothing else does.
     pub sequence: u32,
     /// How many values a [`LogKind::ConfigGeneration`] commit changed.
     pub changes: u32,
     /// Byte offset into the refused document, for a [`LogKind::ConfigRejected`].
-    /// Named rather than `offset` so it does not read as a position in this
-    /// record.
+    /// Named so it cannot read as a position in this record.
     pub reject_offset: u32,
     /// Receive descriptors primed before a driver entered its poll loop, under
     /// [`LogDetailKind::ReceivePosted`].
@@ -351,8 +357,7 @@ pub struct LogRecord {
     pub outcome: u8,
     /// `lfw_log::RejectReason` as a token below [`LOG_REJECT_REASON_COUNT`].
     pub reason: u8,
-    /// Explicit rather than implied, so the whole record is fields and a writer
-    /// in another language computes these offsets from the same declaration.
+    /// Explicit rather than implied, so the whole record is fields.
     pub _pad: [u8; 6],
     /// What was refused, under [`LogDetailKind::Refusal`]. A literal on the
     /// writing side and arbitrary bytes on this one, so the decode holds it to
@@ -375,6 +380,8 @@ impl LogRecord {
         operands: [0; 2],
         tsc_hz: 0,
         unix_nanos: 0,
+        frames: 0,
+        frame_bytes: 0,
         kind: 0,
         generation: 0,
         sequence: 0,
@@ -465,6 +472,13 @@ impl LogRecord {
             Some(LogDetailKind::Established) => CheckedDetail::Established {
                 tsc_hz: NonZeroU64::new(self.tsc_hz).ok_or(LogRecordError::ClockFrequencyZero)?,
                 unix_nanos: self.unix_nanos,
+            },
+            // Nothing to refuse: every `u64` pair is a pair of counts, and
+            // whether they are *plausible* counts is a question only a reader
+            // holding an earlier record of the same pair can ask.
+            Some(LogDetailKind::Received) => CheckedDetail::Received {
+                frames: self.frames,
+                bytes: self.frame_bytes,
             },
         };
         Ok(CheckedBody::Domain {
@@ -696,6 +710,11 @@ pub enum CheckedDetail {
         tsc_hz: NonZeroU64,
         unix_nanos: u64,
     },
+    /// What a terminal endpoint has taken off its pipeline, cumulatively.
+    Received {
+        frames: u64,
+        bytes: u64,
+    },
 }
 
 /// Everything a [`LogRecord`] said, decoded and owned.
@@ -891,33 +910,35 @@ const _: () = {
     assert!(offset_of!(ValueImage, _pad) == 11);
     assert!(offset_of!(ValueImage, id) == 12);
 
-    assert!(size_of::<LogRecord>() == 208);
+    assert!(size_of::<LogRecord>() == 224);
     assert!(align_of::<LogRecord>() == 8);
     assert!(offset_of!(LogRecord, features) == 0);
     assert!(offset_of!(LogRecord, operands) == 8);
     assert!(offset_of!(LogRecord, tsc_hz) == 24);
     assert!(offset_of!(LogRecord, unix_nanos) == 32);
-    assert!(offset_of!(LogRecord, kind) == 40);
-    assert!(offset_of!(LogRecord, generation) == 44);
-    assert!(offset_of!(LogRecord, sequence) == 48);
-    assert!(offset_of!(LogRecord, changes) == 52);
-    assert!(offset_of!(LogRecord, reject_offset) == 56);
-    assert!(offset_of!(LogRecord, receive_posted) == 60);
-    assert!(offset_of!(LogRecord, domain) == 64);
-    assert!(offset_of!(LogRecord, state) == 65);
-    assert!(offset_of!(LogRecord, detail) == 66);
-    assert!(offset_of!(LogRecord, operand_count) == 67);
-    assert!(offset_of!(LogRecord, signalled) == 68);
-    assert!(offset_of!(LogRecord, change) == 69);
-    assert!(offset_of!(LogRecord, object) == 70);
-    assert!(offset_of!(LogRecord, field) == 71);
-    assert!(offset_of!(LogRecord, outcome) == 72);
-    assert!(offset_of!(LogRecord, reason) == 73);
-    assert!(offset_of!(LogRecord, _pad) == 74);
-    assert!(offset_of!(LogRecord, cause) == 80);
-    assert!(offset_of!(LogRecord, key) == 124);
-    assert!(offset_of!(LogRecord, from) == 144);
-    assert!(offset_of!(LogRecord, to) == 176);
+    assert!(offset_of!(LogRecord, frames) == 40);
+    assert!(offset_of!(LogRecord, frame_bytes) == 48);
+    assert!(offset_of!(LogRecord, kind) == 56);
+    assert!(offset_of!(LogRecord, generation) == 60);
+    assert!(offset_of!(LogRecord, sequence) == 64);
+    assert!(offset_of!(LogRecord, changes) == 68);
+    assert!(offset_of!(LogRecord, reject_offset) == 72);
+    assert!(offset_of!(LogRecord, receive_posted) == 76);
+    assert!(offset_of!(LogRecord, domain) == 80);
+    assert!(offset_of!(LogRecord, state) == 81);
+    assert!(offset_of!(LogRecord, detail) == 82);
+    assert!(offset_of!(LogRecord, operand_count) == 83);
+    assert!(offset_of!(LogRecord, signalled) == 84);
+    assert!(offset_of!(LogRecord, change) == 85);
+    assert!(offset_of!(LogRecord, object) == 86);
+    assert!(offset_of!(LogRecord, field) == 87);
+    assert!(offset_of!(LogRecord, outcome) == 88);
+    assert!(offset_of!(LogRecord, reason) == 89);
+    assert!(offset_of!(LogRecord, _pad) == 90);
+    assert!(offset_of!(LogRecord, cause) == 96);
+    assert!(offset_of!(LogRecord, key) == 140);
+    assert!(offset_of!(LogRecord, from) == 160);
+    assert!(offset_of!(LogRecord, to) == 192);
 
     // Every byte of the record belongs to a declared field: the fields sum to
     // the whole size, so the compiler inserted no padding of its own. That is
@@ -926,7 +947,7 @@ const _: () = {
     // on.
     assert!(
         size_of::<LogRecord>()
-            == 5 * size_of::<u64>()
+            == 7 * size_of::<u64>()
                 + 6 * size_of::<u32>()
                 + 10
                 + 6

@@ -41,15 +41,7 @@ use lfw_clock::{MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ};
 use lfw_log::{Domain, DomainState};
 use lfw_rtc::{MAX_PLAUSIBLE_YEAR, MIN_PLAUSIBLE_YEAR};
 
-/// What opens a record on any channel, and therefore what closes the one before
-/// it — [`crate::config_transcript`]'s marker, for the reason stated there:
-/// MONITORING.md makes this a reader's only handle, and a record is never
-/// recognised by a line boundary.
-const RECORD_MARKER: &str = "LFW-";
-
-/// The prefix marking a run of serial bytes as a protection-domain lifecycle
-/// record. The grammar is fixed in `crates/log/src/render.rs`.
-const LIFECYCLE_PREFIX: &str = "LFW-PD ";
+use crate::console_records::{LIFECYCLE_PREFIX, field, lifecycle_records, value as field_value};
 
 /// Judge the clock domain's record in one boot's serial capture.
 ///
@@ -122,51 +114,16 @@ pub(crate) fn judge(serial: &[u8], log: &Path) -> Result<String, String> {
     Ok(format!("the clock established {utc} at {tsc_hz} Hz"))
 }
 
-/// One `key=value` field as the console grammar writes it, so a search for one
-/// cannot match a different key ending in the same letters.
-fn field(key: &str, value: &str) -> String {
-    format!(" {key}={value}")
-}
-
-/// The value of `key` in `record`, up to the next space or the end of it.
+/// The value of `key` in `record`, or a verdict naming the field the record is
+/// specified to carry and does not.
 fn value<'a>(record: &'a str, key: &str, log: &Path) -> Result<&'a str, String> {
-    let needle = format!(" {key}=");
-    let at = record.find(&needle).ok_or_else(|| {
+    field_value(record, key).ok_or_else(|| {
         format!(
             "{record:?} carries no `{key}=` field, and the clock domain's ready record is \
              specified with one (MONITORING.md)\n  full run log: {}",
             log.display()
         )
-    })? + needle.len();
-    let rest = record.get(at..).unwrap_or_default();
-    Ok(rest.split(' ').next().unwrap_or(rest))
-}
-
-/// The lifecycle records a capture carries, in emission order.
-///
-/// The scan is [`crate::config_transcript`]'s, and is duplicated in neither
-/// substance nor accident: a record is opened by [`RECORD_MARKER`] anywhere in
-/// a line and runs to the next marker, so a record that did not begin its line
-/// is still recovered and prose that quotes one is read as one — the marker's
-/// price, which fails closed here exactly as it does there.
-fn lifecycle_records(text: &str) -> Vec<&str> {
-    text.lines().flat_map(records_in_line).collect()
-}
-
-fn records_in_line(line: &str) -> Vec<&str> {
-    let markers: Vec<usize> = line
-        .match_indices(RECORD_MARKER)
-        .map(|(at, _)| at)
-        .collect();
-    markers
-        .iter()
-        .enumerate()
-        .filter_map(|(position, start)| {
-            let end = markers.get(position + 1).copied().unwrap_or(line.len());
-            line.get(*start..end).map(str::trim)
-        })
-        .filter(|record| record.starts_with(LIFECYCLE_PREFIX))
-        .collect()
+    })
 }
 
 #[cfg(test)]

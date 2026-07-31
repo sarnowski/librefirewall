@@ -117,6 +117,9 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             render_rfc3339(*utc, &mut instant);
             cursor.write_ascii(&instant)
         }
+        DomainDetail::Received { frames, bytes } => {
+            write!(cursor, " frames={frames} bytes={bytes}")
+        }
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -275,6 +278,28 @@ mod tests {
             }),
             "LFW-PD domain=clock state=ready tsc-hz=18446744073709551615 \
              utc=2554-07-21T23:34:33.709551615Z"
+        );
+    }
+
+    /// The management port's counts, at both ends of what the ABI carries: the
+    /// pair a first frame produces, and the pair a `u64` cannot exceed.
+    #[test]
+    fn a_terminal_endpoint_renders_the_frames_and_bytes_it_has_taken() {
+        let received = |frames, bytes| {
+            rendered(&Event::Domain {
+                domain: Domain::Management,
+                state: DomainState::Ready,
+                detail: DomainDetail::Received { frames, bytes },
+            })
+        };
+        assert_eq!(
+            received(1, 60),
+            "LFW-PD domain=management state=ready frames=1 bytes=60"
+        );
+        assert_eq!(
+            received(u64::MAX, u64::MAX),
+            "LFW-PD domain=management state=ready \
+             frames=18446744073709551615 bytes=18446744073709551615"
         );
     }
 
@@ -592,6 +617,10 @@ mod tests {
             DomainDetail::Features(u64::MAX),
             DomainDetail::ReceivePosted(u32::MAX),
             established(u64::MAX, u64::MAX),
+            DomainDetail::Received {
+                frames: u64::MAX,
+                bytes: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -619,6 +648,8 @@ mod tests {
             any::<u64>().prop_map(DomainDetail::Features),
             any::<u32>().prop_map(DomainDetail::ReceivePosted),
             (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
+            any::<(u64, u64)>()
+                .prop_map(|(frames, bytes)| DomainDetail::Received { frames, bytes }),
             (
                 (0..causes.len()),
                 prop_oneof![
