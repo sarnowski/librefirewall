@@ -275,8 +275,13 @@ All first-party code is Rust. Building blocks:
 - **seL4** microkernel; **Microkit** static component model; **rust-sel4 / sel4-microkit** runtime
   (protection domains written in Rust).
 - **sDDF queue protocol reimplemented in Rust** (zero-copy, lock-free SPSC queues).
-- **TCP:** based on **smoltcp**, hardened/extended as needed (e.g. selective acknowledgements) and
-  sharded per core.
+- **TCP:** a **first-party** stack, owning no socket buffers and sharded per core, with selective
+  acknowledgement and congestion control as intended extensions. smoltcp is rejected on the shape
+  of its API rather than on its quality: its sockets are backed by `RingBuffer<'a, u8>`, so a
+  stream is copied into a socket buffer on receive and out of one on send. A copy per segment is
+  precisely what the zero-copy dataplane of §4 exists to avoid, and no amount of hardening
+  or extension removes it — the buffers *are* the interface. Per-core shardability and the ability
+  to tune the transport for a terminating 10 Gbit/s proxy path point the same way.
 - **TLS:** **rustls**, with a pluggable crypto provider.
 - **QUIC:** a Rust-native QUIC stack (e.g. quinn, s2n-quic, or quiche), used as both server and
   client to terminate and re-originate.
@@ -549,8 +554,12 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 - **No existing 10 Gbit/s or x86 NIC driver.** The public sDDF tree contains only virtio and
   Arm-SoC drivers; all NIC drivers (virtio, SFP+ 10G, netvsc, MANA) are implemented from scratch in
   Rust.
-- **TCP stack effort.** Extending smoltcp into a high-performance proxy TCP stack (SACK, and
-  scaling to many concurrent proxied connections at 10 Gbit/s) is a substantial effort.
+- **TCP stack effort.** Building a first-party proxy TCP stack (§8) is a substantial effort, and it
+  is larger than the one an adopted stack would have left: the correctness of a transport under
+  hostile input, and the years of exposure that establishes it, are what adopting one buys and
+  writing one forgoes. SACK, congestion control, and scaling to many concurrent proxied connections
+  at 10 Gbit/s are each ahead. The trade is deliberate — that effort against a copy per segment —
+  and naming it does not reduce it.
 - **Pure-Rust signature matching at line rate.** Whether the pure-Rust `aho-corasick` /
   `regex-automata` engines sustain line rate with a realistic ruleset is unproven and needs an
   early benchmark (as does the crypto provider).
