@@ -53,13 +53,13 @@ impl<const N: usize> TextSlot<N> {
 
     /// Carries the padding too: this moves an image, and which bytes mean
     /// something is [`LogRecord::check`]'s question rather than this one's.
-    fn store(&self, image: &TextImage<N>) {
+    pub(crate) fn store(&self, image: &TextImage<N>) {
         store_bytes(&self.bytes, image.bytes);
         self.len.store(image.len, Ordering::Relaxed);
         store_bytes(&self._pad, image._pad);
     }
 
-    fn load(&self) -> TextImage<N> {
+    pub(crate) fn load(&self) -> TextImage<N> {
         TextImage {
             bytes: load_bytes(&self.bytes),
             len: self.len.load(Ordering::Relaxed),

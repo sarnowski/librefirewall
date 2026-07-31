@@ -227,6 +227,13 @@ const SCRIBBLED_INTERFACE: InterfaceImage = InterfaceImage {
     mac: [0xFF; 6],
     _pad2: [0xAA; 2],
     address: [0xAA; 4],
+    // A length past the storage and bytes outside the alphabet, so this field is
+    // refused twice over like every other one here.
+    id: wire::TextImage {
+        bytes: [0xAA; wire::LOG_IDENTIFIER_BYTES],
+        len: u8::MAX,
+        _pad: [0xAA; 3],
+    },
 };
 
 /// As [`SCRIBBLED_INTERFACE`], for a neighbour.
@@ -286,6 +293,9 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
                 mac: entry.mac,
             });
         }
+        if let Some(fault) = identifier_fault(&entry.id) {
+            return Some(ConfigImageError::InterfaceIdNotAnIdentifier { index, fault });
+        }
     }
 
     for (index, entry) in image.neighbours.iter().enumerate().take(neighbours) {
@@ -311,6 +321,23 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
 /// the code under test.
 fn is_unicast(mac: [u8; 6]) -> bool {
     mac[0] & 0x01 == 0 && mac != [0; 6]
+}
+
+/// The rule an interface id is held to, restated here for the same reason: the
+/// bytes become a Prometheus label value an operator's dashboard renders, so an
+/// id outside `[a-z0-9-]` is a byte a peer could paint into a scrape (OBS-5).
+fn identifier_fault(id: &wire::IdentifierImage) -> Option<wire::TextFault> {
+    let len = usize::from(id.len);
+    let Some(value) = id.bytes.get(..len) else {
+        return Some(wire::TextFault::TooLong { len });
+    };
+    if value.is_empty() {
+        return Some(wire::TextFault::Empty);
+    }
+    value
+        .iter()
+        .position(|byte| !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        .map(|offset| wire::TextFault::NotInAlphabet { offset })
 }
 
 /// Publish an image into a handover region and read it back, which is the path
@@ -373,6 +400,14 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
             mac: bytes(&mut unstructured),
             _pad2: bytes(&mut unstructured),
             address: bytes(&mut unstructured),
+            // Every byte of the identity, and its stated length, are the peer's:
+            // a harness that only produced admissible ids would never reach the
+            // alphabet check (TEST-8).
+            id: wire::TextImage {
+                bytes: bytes(&mut unstructured),
+                len: byte(&mut unstructured),
+                _pad: bytes(&mut unstructured),
+            },
         };
     }
     for slot in &mut image.neighbours {

@@ -272,6 +272,20 @@ impl<const N: usize> TextImage<N> {
         len: 0,
         _pad: [0; 3],
     };
+
+    /// Lay `text` out as this image carries it. The copy is bounded by the array
+    /// and the length narrows saturatingly, so text this image cannot carry
+    /// produces a length [`check_bounded_text`] refuses rather than one that
+    /// indexes past the bytes (ENG-5).
+    #[must_use]
+    pub fn from_text(text: &[u8]) -> Self {
+        let mut image = Self::ZERO;
+        for (slot, &byte) in image.bytes.iter_mut().zip(text) {
+            *slot = byte;
+        }
+        image.len = u8::try_from(text.len()).unwrap_or(u8::MAX);
+        image
+    }
 }
 
 /// An identifier as it crosses: a configuration object's stable name.
@@ -617,31 +631,84 @@ const fn in_alphabet(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-')
 }
 
+/// Why a byte string in a shared region is not text this ABI carries. Names a
+/// length or a position, never the byte at it (OBS-5). Separate from
+/// [`LogRecordError`] because two ABIs check one alphabet — a record's key and an
+/// interface id — and each maps this onto its own refusals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextFault {
+    /// More bytes than the array holds: the length a writer stated in a shared
+    /// region, or the length of a slice a caller offered.
+    TooLong {
+        len: usize,
+    },
+    Empty,
+    NotInAlphabet {
+        offset: usize,
+    },
+}
+
+impl fmt::Display for TextFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { len } => write!(f, "length {len} exceeds the storage"),
+            Self::Empty => f.write_str("is empty"),
+            Self::NotInAlphabet { offset } => write!(f, "byte {offset} is outside [a-z0-9-]"),
+        }
+    }
+}
+
 /// Copies out `len` bytes of already-checked text, leaving the tail zero so two
 /// values that read the same compare the same however the writer filled it.
-fn check_text<const N: usize>(
+pub(crate) fn check_bounded_text<const N: usize>(
     raw: &TextImage<N>,
-    text: LogText,
     allow_empty: bool,
-) -> Result<CheckedText<N>, LogRecordError> {
+) -> Result<CheckedText<N>, TextFault> {
     let len = usize::from(raw.len);
-    let value = raw
-        .bytes
-        .get(..len)
-        .ok_or(LogRecordError::TextTooLong { text, len: raw.len })?;
+    let value = raw.bytes.get(..len).ok_or(TextFault::TooLong { len })?;
+    check_slice(value, allow_empty)
+}
+
+/// The same rule over a slice a caller holds rather than a region a peer wrote.
+fn check_slice<const N: usize>(
+    value: &[u8],
+    allow_empty: bool,
+) -> Result<CheckedText<N>, TextFault> {
+    let len = value.len();
+    if len > N {
+        return Err(TextFault::TooLong { len });
+    }
     if value.is_empty() && !allow_empty {
-        return Err(LogRecordError::TextEmpty { text });
+        return Err(TextFault::Empty);
     }
     let mut bytes = [0; N];
     for (slot, (offset, &byte)) in bytes.iter_mut().zip(value.iter().enumerate()) {
         if !in_alphabet(byte) {
-            return Err(LogRecordError::TextNotInAlphabet { text, offset });
+            return Err(TextFault::NotInAlphabet { offset });
         }
         *slot = byte;
     }
     Ok(CheckedText {
         bytes,
-        len: raw.len,
+        // Bounded by `N` above, and `N` is 16 or 40, so this cannot lose a byte.
+        len: u8::try_from(len).unwrap_or(u8::MAX),
+    })
+}
+
+/// [`check_bounded_text`] in the record's own vocabulary, which names the field.
+fn check_text<const N: usize>(
+    raw: &TextImage<N>,
+    text: LogText,
+    allow_empty: bool,
+) -> Result<CheckedText<N>, LogRecordError> {
+    check_bounded_text(raw, allow_empty).map_err(|fault| match fault {
+        // Out of the image's own `u8`, so it narrows back exactly.
+        TextFault::TooLong { len } => LogRecordError::TextTooLong {
+            text,
+            len: u8::try_from(len).unwrap_or(u8::MAX),
+        },
+        TextFault::Empty => LogRecordError::TextEmpty { text },
+        TextFault::NotInAlphabet { offset } => LogRecordError::TextNotInAlphabet { text, offset },
     })
 }
 
@@ -687,6 +754,15 @@ pub struct CheckedText<const N: usize> {
 }
 
 impl<const N: usize> CheckedText<N> {
+    /// Check `text` and hold it — the only way to obtain one outside this crate's
+    /// own region readers.
+    ///
+    /// # Errors
+    /// [`TextFault`], naming a length or a position and never a byte (OBS-5).
+    pub fn new(text: &[u8]) -> Result<Self, TextFault> {
+        check_slice(text, false)
+    }
+
     /// The fallback is unreachable: [`LogRecord::check`] is what sets `len`,
     /// and it does so only after indexing the array with it. An empty slice
     /// rather than a panic because a branch safe Rust cannot delete is not a
@@ -704,12 +780,12 @@ impl<const N: usize> CheckedText<N> {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
-        usize::from(self.len)
+    pub const fn len(&self) -> usize {
+        self.len as usize
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 }
@@ -722,6 +798,31 @@ impl<const N: usize> fmt::Display for CheckedText<N> {
 
 /// An identifier that survived the check.
 pub type CheckedIdentifier = CheckedText<LOG_IDENTIFIER_BYTES>;
+
+impl CheckedIdentifier {
+    /// The identity of the `<management>` element, which carries no `id` of its own
+    /// — a document holds exactly one. `lfw_log` holds this equal to its own
+    /// `Identifier::MANAGEMENT`, so the two spellings are one fact.
+    pub const MANAGEMENT: Self = Self {
+        bytes: *b"management\0\0\0\0\0\0",
+        len: 10,
+    };
+}
+
+const _: () = {
+    let CheckedText { bytes, len } = CheckedIdentifier::MANAGEMENT;
+    assert!(len > 0 && (len as usize) <= LOG_IDENTIFIER_BYTES);
+    let mut offset = 0;
+    while offset < LOG_IDENTIFIER_BYTES {
+        let byte = bytes[offset];
+        if offset < len as usize {
+            assert!(in_alphabet(byte));
+        } else {
+            assert!(byte == 0);
+        }
+        offset += 1;
+    }
+};
 
 /// A refusal cause token that survived it.
 pub type CheckedCause = CheckedText<LOG_CAUSE_BYTES>;

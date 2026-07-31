@@ -652,8 +652,8 @@ dataplane verdict and throughput counters; connection/flow-table occupancy and l
 buffer's occupancy and drop count; and the applied-configuration state reflected as metrics.
 
 Of that intent the per-NIC and dataplane verdict and throughput counters, the pool ownership
-faults, the transport's connection accounting and the applied-configuration state are published
-today; the inventory below is the whole of what a scrape returns. Per-*core* counters await the
+faults, the transport's connection accounting, the applied-configuration state and the identity of
+each configured interface are published today; the inventory below is the whole of what a scrape returns. Per-*core* counters await the
 multicore dataplane, queue and ring occupancy and the flow table await the stateful dataplane, and
 the local log buffer awaits the buffer itself — none of those exist to be counted yet.
 
@@ -693,8 +693,10 @@ in the *next* one.
 
 ### Metric inventory
 
-51 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. The whole document is 205 series and about 25 KiB.
+52 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. The whole document is 208 series and about 25 KiB on the shipped
+configuration — 205 counter and gauge series from the eight shards, plus one info series per
+configured interface.
 
 #### Dataplane: what the forwarder decided
 
@@ -771,6 +773,100 @@ domains publishing that family. The whole document is 205 series and about 25 Ki
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
 | `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. |
 | `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
+
+#### What each configured interface is
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_interface_info` | gauge | `nic_driver0`, `nic_driver1`, `nic_driver2` | `interface`, `role`&nbsp;(`dataplane`, `management`), `address`, `prefix_length`, `mac` | The identity of one configured interface. **An info gauge: its value is always `1` and carries nothing at all** — everything it says is in its labels. |
+
+**This is the one family that is not a measurement, and the counter rules above do not apply to it.**
+Monotonicity, saturation and "no reset" are statements about counters; a constant is none of them.
+It is a gauge, it therefore carries no `_total` suffix, and a reader that differenced two scrapes of
+it would be differencing `1` from `1`. What *does* change between two scrapes is which series exist
+and what their labels say — a re-addressed interface is a series that disappears and one that
+appears, which is exactly how Prometheus's own `*_info` families behave.
+
+The labels, one by one:
+
+| Label | What it is |
+|---|---|
+| `domain` | The protection domain driving that port, spelled exactly as every counter family spells it. **This is the join key** and it is the only label here whose value comes from the build rather than from the configuration: which domain drives which port is fixed in the Microkit system description (CONCEPT §12.3), recorded once in `lfw_metrics::PORT_DOMAINS`, and checked against that description at build time by `xtask::sysdesc`. |
+| `interface` | The `id` attribute of the document's `<interface>` — `dataplane-0` on the shipped configuration. The `<management>` element has no `id`, a document holding exactly one, so its series reads `interface="management"`: the same identity a `LFW-CFG` change record about it carries as `key=management`. |
+| `role` | `dataplane` or `management`. CONCEPT §9.1 makes the role the architectural unit rather than the port number, so it is what a query groups by. **The vocabulary is these two today and grows with §9.1's other roles — session replication, mirror — when ports in them exist.** A third token appearing before then is a defect. |
+| `address` | The configured IPv4 address, dotted quad. |
+| `prefix_length` | The prefix length, decimal, as a string — every Prometheus label value is one. |
+| `mac` | The configured MAC, lower case and colon-separated, the same form a console record writes it in. |
+
+**Cardinality: one series per configured interface, and no more.** At most `wire::MAX_INTERFACES` + 1
+= 9 today, which is what the exposition's worst-case bound reserves, and at most 7 under CONCEPT
+§9.2's port model — six dataplane ports and the management one. It does not grow with traffic, with
+connections, or with anything an adversary controls.
+
+**A node that has committed no configuration carries no series of this family**, and the two comment
+lines still appear. That is the truth rather than a gap: generation 0 is the fail-closed empty
+configuration and configures no interface, so a series for one would name an interface the node does
+not have.
+
+**There is no `enabled` label, and the two roles differ in what a disabled interface looks like.**
+This is the one thing about the family an operator will otherwise read wrong:
+
+- A **dataplane** interface has a series whether or not it is enabled. Its addressing is in the
+  configuration image either way, because the router needs the row in order to *refuse* traffic on
+  it — which is visible as `librefirewall_route_drops_total{reason="interface_disabled"}` on the
+  forwarder. So a series here says "the document configures this port", not "this port carries
+  traffic".
+- The **management** interface has a series only when it is addressed. A disabled `<management>`
+  element is indistinguishable from an absent one by the image's own design — its fields are not
+  interpreted at all — so the port is unaddressed and there is nothing to report an identity for.
+
+An `enabled` label is deliberately absent rather than pending. It would have to be ragged across the
+two roles to be truthful, nothing consumes it, and the exact running configuration — enable flags
+included — is what `GET /config` returns. The state that *matters* for reading a counter is already
+observable: an interface configured and refusing traffic shows as an `interface_disabled` drop count
+beside an info series.
+
+#### The join idiom
+
+Counter series carry `domain` and nothing else that identifies a port, deliberately. Putting the
+addressing on every counter instead would multiply five labels across every NIC and endpoint family,
+and — worse — a re-addressed interface would **fork every one of its counter series**, so a `rate()`
+across the change would read as a series ending and a new one starting from zero. The identity lives
+in one place and the join happens in the query:
+
+```promql
+# Received frames per second, by the interface the configuration names.
+rate(librefirewall_receive_frames_total[5m])
+  * on(domain) group_left(interface, role, address, prefix_length)
+    librefirewall_interface_info
+```
+
+`* on(domain) group_left(…)` is the conventional info-metric join: multiplying by a series whose
+value is always `1` leaves the left-hand value untouched and copies the named labels onto it. The
+result is one series per interface, labelled with the id an operator wrote in the document.
+
+Two more, for the shapes an operator actually asks for:
+
+```promql
+# Drop reasons on the dataplane ports alone, excluding the management port:
+# filtering the info series on the right restricts the join to that role.
+sum by (interface, reason) (
+  librefirewall_input_drops_total
+    * on(domain) group_left(interface)
+      librefirewall_interface_info{role="dataplane"}
+)
+
+# What each port is, as a table: one row per interface, whatever it is counting.
+librefirewall_interface_info
+```
+
+Note what the join does **not** give: `librefirewall_forwarded_frames_total` is the forwarder's and
+carries `domain="forwarder"` with a `pipeline` label, so it does not join on `domain` to an
+interface. Pipeline *n* and port *n* are the same index, and nothing on this surface says so — the
+forwarder publishes per pipeline because that is the state it keeps, and the mapping from pipeline to
+port is a build fact this document does not yet expose. Join the *drivers'*
+`librefirewall_transmit_frames_total` instead, which is the same frames one hop later and does carry
+a driver `domain`.
 
 #### Configuration and the clock
 

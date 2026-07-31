@@ -52,6 +52,9 @@ pub(crate) const PORTS: usize = config::PORT_COUNT as usize;
 /// NIC, and the subnet the appliance terminates on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AppliancePort {
+    /// The `<interface>` id — the identity the document gave this port, which is
+    /// what the appliance's own interface info metric must report it under.
+    id: Identifier,
     mac: [u8; 6],
     address: [u8; 4],
     prefix_length: u8,
@@ -84,6 +87,16 @@ impl ManagementPort {
     pub(crate) fn network(&self) -> [u8; 4] {
         (u32::from_be_bytes(self.address) & prefix_mask(self.prefix_length)).to_be_bytes()
     }
+}
+
+/// One dataplane interface as the configuration document describes it — the four
+/// values the appliance must report back under that interface's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConfiguredInterface {
+    pub(crate) id: Identifier,
+    pub(crate) address: [u8; 4],
+    pub(crate) prefix_length: u8,
+    pub(crate) mac: [u8; 6],
 }
 
 /// One host station on one dataplane port: the address the harness injects as,
@@ -159,6 +172,7 @@ impl Topology {
             *slot = Some((
                 entry.id,
                 AppliancePort {
+                    id: entry.id,
                     mac: entry.mac.0,
                     address: entry.address.octets(),
                     prefix_length: entry.prefix_length,
@@ -243,6 +257,22 @@ impl Topology {
 
     pub(crate) fn endpoints(&self) -> [Endpoint; PORTS] {
         self.endpoints
+    }
+
+    /// What the document says each dataplane port *is*, port by port: its id, its
+    /// address, its prefix length and its MAC.
+    ///
+    /// This exists for one caller — [`crate::metrics_contract`], which holds the
+    /// appliance's interface info series to it field by field. That comparison is
+    /// only worth making against the document, so it is read out of the document
+    /// here rather than restated beside the assertion.
+    pub(crate) fn interfaces(&self) -> [ConfiguredInterface; PORTS] {
+        self.ports.map(|appliance| ConfiguredInterface {
+            id: appliance.id,
+            address: appliance.address,
+            prefix_length: appliance.prefix_length,
+            mac: appliance.mac,
+        })
     }
 
     /// The management port, which is not one of [`Topology::endpoints`] and never

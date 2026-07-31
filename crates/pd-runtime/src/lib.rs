@@ -397,7 +397,7 @@ pub use endpoint::{
 };
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
-    endpoint_from, router_from,
+    endpoint_from, interfaces_from, router_from,
 };
 pub use lfw_ip_endpoint::IsnSecret;
 pub use stats::{

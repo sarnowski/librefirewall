@@ -67,7 +67,7 @@ use core::num::NonZeroU64;
 use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
 use lfw_ip_endpoint::{Endpoint, IsnSecret};
 use lfw_log::RejectReason;
-use lfw_metrics::LogSample;
+use lfw_metrics::{InterfaceInventory, LogSample};
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
 use crate::{
@@ -245,6 +245,11 @@ pub struct EndpointStage<'ring> {
     /// picked up and an unchanged one is not re-read.
     clock_generation: u32,
     config: CommittedReader,
+    /// The interface identities the committed generation names, which the metric
+    /// surface reports and nothing else here reads. Held beside `endpoint` rather
+    /// than derived from it: the endpoint is the *management* port's addressing
+    /// alone, and the info series cover every port the document configured.
+    interfaces: InterfaceInventory,
     /// Every stats region this domain is granted: its own, written at the end of
     /// each pass, and the seven it reads to answer a scrape.
     stats: StatsRegions<'ring>,
@@ -304,6 +309,7 @@ impl<'ring> EndpointStage<'ring> {
             calibration: None,
             clock_generation: 0,
             config: CommittedReader::new(),
+            interfaces: InterfaceInventory::EMPTY,
             stats,
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
@@ -330,6 +336,11 @@ impl<'ring> EndpointStage<'ring> {
                 match crate::endpoint_from(&checked, self.secret.clone()) {
                     Ok(endpoint) => {
                         self.endpoint = endpoint;
+                        // Replaced wholesale rather than merged: what the metric
+                        // surface reports is the generation in force, and an
+                        // interface the new document dropped must stop being
+                        // reported rather than linger as a stale series.
+                        self.interfaces = crate::interfaces_from(&checked);
                         self.counters.generation = generation;
                         None
                     }
@@ -476,13 +487,20 @@ impl<'ring> EndpointStage<'ring> {
     /// rather than asserted (`lfw_ip_endpoint::http`).
     fn supply_body(&mut self) {
         let stats = self.stats;
+        let interfaces = self.interfaces;
         let Some(endpoint) = self.endpoint.as_mut() else {
             return;
         };
         if !endpoint.body_wanted() {
             return;
         }
-        endpoint.supply_body(|out| stats.snapshot().render(out).ok());
+        endpoint.supply_body(|out| {
+            stats
+                .snapshot()
+                .with_interfaces(interfaces)
+                .render(out)
+                .ok()
+        });
     }
 
     /// Send whatever the server above the transport now owes.

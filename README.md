@@ -146,7 +146,7 @@ router on a firewall's substrate, not yet a firewall.
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](#console-system-state-events) |
 | OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists |
-| Prometheus `/metrics` | **partial** | `GET /metrics` answers a 51-family, 205-series exposition covering every protection domain, scraped with `curl` in the gate; the endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](#prometheus-metrics) |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers a 52-family, 208-series exposition covering every protection domain, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](#prometheus-metrics) |
 | Local log buffer (`GET /logs`) | **open** | |
 
 ### Lifecycle, boot and trust
@@ -351,7 +351,7 @@ Held by 182 tests in `crates/config` and 99 in `crates/log`, by the handover's o
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the four QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the five QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -449,7 +449,7 @@ asserts OBS-5 directly: no record the ABI accepts can put a byte outside printab
 rendered console line, and no text value can carry one outside `[a-z0-9-]`, so a hostile peer cannot
 paint terminal escape sequences onto an operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the four system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the five system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected. Both halves were needed to make the defect non-recurring: a missing
@@ -655,7 +655,7 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the four scenarios additionally hold the console's own record to the frames and the bytes
+Two of the five scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the three boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -783,10 +783,28 @@ one.
 
 ### Prometheus metrics
 
-**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 51 metric
-families, 205 series, about 25 KiB — covering every one of the eight protection domains, and the
+**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 52 metric
+families, 208 series, about 25 KiB — covering every one of the eight protection domains, and the
 end-to-end gate scrapes it with `curl` off a booted release image and cross-checks a number in it
 against traffic the harness watched cross the wire itself.
+
+**A per-NIC series is joinable to the interface a configuration document names.** Every counter
+family carries `domain`, the protection domain that produced it, and `domain="nic_driver0"` is a name
+out of the Microkit system description that says nothing about what an operator configured. Closing
+that took the conventional Prometheus info metric rather than more labels on the counters:
+`librefirewall_interface_info` is a gauge whose value is always `1`, one series per configured
+interface, carrying the document's own `id`, the port's `role`, its address, prefix length and MAC —
+and carrying `domain` as the join key, so a query multiplies the two together
+(`* on(domain) group_left(interface, role, address)`). Counter cardinality is unchanged and a
+re-addressed interface does not fork every counter series it has. There is deliberately no `enabled`
+label: a dataplane interface has a series whether or not it is enabled — its addressing is in the
+image either way, because the router needs the row to refuse traffic on it — while a disabled
+`<management>` element is indistinguishable from an absent one, so a truthful `enabled` would have to
+be ragged across the two roles and nothing consumes it. MONITORING.md states the family, the
+worked join, the bound on its cardinality and that asymmetry; the interface identity crosses to the management domain
+in the configuration image it already reads, and the port-to-driver mapping the join key rests on is a
+fact of the system description that `xtask::sysdesc` now checks at build time rather than a comment
+delegating it (DOC-7).
 
 The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
 shared table. A shard is a 768-byte, cache-line aligned array of 96 `AtomicU64` slots, mapped
@@ -837,7 +855,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the four QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the five QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts.
 
@@ -1122,7 +1140,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the sixteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (four system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (five system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | thirteen persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
@@ -1174,7 +1192,7 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the release A/B disk + bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot four QEMU scenarios: forwarding, generation swap, alternate config, metrics
+make test-system    # boot five QEMU scenarios: forwarding, generation swap, alternate config, two metrics scrapes
 make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
 ```
 
@@ -1186,7 +1204,7 @@ project's own code: the protection domains are compiled with the `--release` Car
 configurations, so there is no debug binary and the Rust under test is the Rust that ships. Only the
 seL4 kernel build differs.
 
-`make test-system` is also the smoke test. It runs **four scenarios**, each a full boot of a signed
+`make test-system` is also the smoke test. It runs **five scenarios**, each a full boot of a signed
 disk through OVMF and GRUB with a host-controlled endpoint attached to each NIC port, and each
 asserting the routed contract in both directions, plus the management port's count and its silence:
 
@@ -1208,9 +1226,9 @@ asserting the routed contract in both directions, plus the management port's cou
    MAC with the first, judged on both channels. This is what proves the dataplane reads its table
    from the document: a compiled-in table would satisfy the first two scenarios and fail every probe
    here.
-4. **metrics-endpoint** — the published disk, with the management port on QEMU's user-mode stack and
-   a host port forwarded to it, scraped **twice** with `curl` rather than with the harness's own
-   frames. Two scrapes because one cannot contain the response it *is*: the endpoint counts a
+4. **metrics-endpoint** and 5. **metrics-endpoint-alternate** — the published disk and a disk built
+   from the second document, each with the management port on QEMU's user-mode stack and a host port
+   forwarded to it, scraped **twice** with `curl` rather than with the harness's own frames. Two scrapes because one cannot contain the response it *is*: the endpoint counts a
    response as it composes it, which is after the shard the exposition is rendered from is published,
    so the second scrape is what carries the first's request and its `200`. Answering the second at
    all is also what proves the one staged response is released rather than held through the previous
@@ -1277,7 +1295,7 @@ make test                 # fast host gate (format, clippy, tests, coverage floo
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
-make test-system          # boot the four QEMU system scenarios on the release image
+make test-system          # boot the five QEMU system scenarios on the release image
 make test-ab              # boot the eight A/B state-machine scenarios on the release image
 make ci                   # the complete gate: host gate, fuzz, release image, system and A/B
 make release              # run CI, then keep `dist/` only if it proved what it holds
@@ -1312,8 +1330,9 @@ enabled for every download. Do not commit the certificate.
 `make release` runs the complete acceptance gate and **boots nothing of its own**. It has nothing
 left to boot: `ci` already assembles the production-oriented Microkit release configuration into
 `dist/` and already holds that disk to both contracts a booted appliance owes — the forwarding
-contract on all four system scenarios and all eight A/B scenarios, the `LFW-CFG` transcript and
-the clock's established-time record on two of them, and a `curl` scrape of `/metrics` on a fourth. What `make release` adds is the other half of
+contract on all five system scenarios and all eight A/B scenarios, the `LFW-CFG` transcript and
+the clock's established-time record on two of them, and a `curl` scrape of `/metrics` on two more —
+each judged against the configuration document its own image was built from. What `make release` adds is the other half of
 BLD-3: if the gate did not prove the artifact, `dist/` is emptied rather than left holding an
 unproven image that looks finished. That covers a failure anywhere in the run, not a failed boot
 alone, because assembly populates `dist/` partway through and an incomplete release is no more

@@ -68,12 +68,15 @@ pub use log_record::{
     LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT,
     LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT,
     LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind,
-    LogText, LogValueKind, TextImage, ValueImage,
+    LogText, LogValueKind, TextFault, TextImage, ValueImage,
 };
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
     LogReader, LogRecords, LogRingFull, LogWriter,
 };
+
+use log_record::check_bounded_text;
+use log_slot::TextSlot;
 
 /// The producing domain's decision about the frame a [`Descriptor`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +194,9 @@ pub struct InterfaceImage {
     pub _pad2: [u8; 2],
     /// Network order, as the address appears in a header.
     pub address: [u8; 4],
+    /// The `id` of the document's `<interface>`, which nothing else here implies:
+    /// a port is hardware topology (CONCEPT §12.3).
+    pub id: IdentifierImage,
 }
 
 impl InterfaceImage {
@@ -202,6 +208,7 @@ impl InterfaceImage {
         mac: [0; 6],
         _pad2: [0; 2],
         address: [0; 4],
+        id: IdentifierImage::ZERO,
     };
 }
 
@@ -367,6 +374,8 @@ struct InterfaceSlot {
     mac: [AtomicU8; 6],
     _pad2: [AtomicU8; 2],
     address: [AtomicU8; 4],
+    /// The log record ABI's own text slot rather than a second one beside it.
+    id: TextSlot<LOG_IDENTIFIER_BYTES>,
 }
 
 impl InterfaceSlot {
@@ -379,6 +388,7 @@ impl InterfaceSlot {
             mac: [const { AtomicU8::new(0) }; 6],
             _pad2: [const { AtomicU8::new(0) }; 2],
             address: [const { AtomicU8::new(0) }; 4],
+            id: TextSlot::zero(),
         }
     }
 
@@ -393,6 +403,7 @@ impl InterfaceSlot {
         store_bytes(&self.mac, entry.mac);
         store_bytes(&self._pad2, entry._pad2);
         store_bytes(&self.address, entry.address);
+        self.id.store(&entry.id);
     }
 
     fn load(&self) -> InterfaceImage {
@@ -404,6 +415,7 @@ impl InterfaceSlot {
             mac: load_bytes(&self.mac),
             _pad2: load_bytes(&self._pad2),
             address: load_bytes(&self.address),
+            id: self.id.load(),
         }
     }
 }
@@ -704,6 +716,12 @@ pub enum ConfigImageError {
         index: usize,
         mac: [u8; 6],
     },
+    /// The `id` bytes are not an identifier. Checked rather than copied through
+    /// because the id becomes a label value and a console field (OBS-5).
+    InterfaceIdNotAnIdentifier {
+        index: usize,
+        fault: TextFault,
+    },
     /// The management entry's own three rules. They carry no index: the image
     /// holds exactly one management interface, so the value refused is the whole
     /// of what locates the fault.
@@ -761,6 +779,9 @@ impl fmt::Display for ConfigImageError {
                 write_mac(f, *mac)?;
                 write!(f, " is not unicast")
             }
+            Self::InterfaceIdNotAnIdentifier { index, fault } => {
+                write!(f, "interface {index} id {fault}")
+            }
             Self::ManagementEnabledNotBoolean { enabled } => {
                 write!(f, "management enabled byte {enabled} is not 0 or 1")
             }
@@ -803,6 +824,7 @@ fn check_interface(
         prefix_length,
         mac,
         address,
+        id,
         ..
     } = *raw;
 
@@ -828,6 +850,8 @@ fn check_interface(
     if !is_unicast(mac) {
         return Err(ConfigImageError::InterfaceMacNotUnicast { index, mac });
     }
+    let id = check_bounded_text(&id, false)
+        .map_err(|fault| ConfigImageError::InterfaceIdNotAnIdentifier { index, fault })?;
 
     Ok(CheckedInterface {
         port,
@@ -835,6 +859,7 @@ fn check_interface(
         prefix_length,
         mac,
         address,
+        id,
     })
 }
 
@@ -931,12 +956,19 @@ pub struct CheckedInterface {
     prefix_length: u8,
     mac: [u8; 6],
     address: [u8; 4],
+    id: CheckedIdentifier,
 }
 
 impl CheckedInterface {
     #[must_use]
     pub const fn port(&self) -> u8 {
         self.port
+    }
+
+    /// The identity the document gave it; holding one proves `[a-z0-9-]{1,16}`.
+    #[must_use]
+    pub const fn id(&self) -> CheckedIdentifier {
+        self.id
     }
 
     #[must_use]
@@ -1043,7 +1075,7 @@ impl CheckedConfig {
 // reorder or a width change must be a compile error here rather than a silent
 // break of the image the reading domain maps.
 const _: () = {
-    assert!(size_of::<InterfaceImage>() == 16);
+    assert!(size_of::<InterfaceImage>() == 36);
     assert!(align_of::<InterfaceImage>() == 1);
     assert!(offset_of!(InterfaceImage, port) == 0);
     assert!(offset_of!(InterfaceImage, enabled) == 1);
@@ -1052,6 +1084,7 @@ const _: () = {
     assert!(offset_of!(InterfaceImage, mac) == 4);
     assert!(offset_of!(InterfaceImage, _pad2) == 10);
     assert!(offset_of!(InterfaceImage, address) == 12);
+    assert!(offset_of!(InterfaceImage, id) == 16);
 
     assert!(size_of::<NeighbourImage>() == 16);
     assert!(align_of::<NeighbourImage>() == 1);
@@ -1070,7 +1103,7 @@ const _: () = {
     assert!(offset_of!(ManagementImage, _pad2) == 10);
     assert!(offset_of!(ManagementImage, address) == 12);
 
-    assert!(size_of::<ConfigImage>() == 672);
+    assert!(size_of::<ConfigImage>() == 832);
     assert!(align_of::<ConfigImage>() == 4);
     assert!(offset_of!(ConfigImage, generation) == 0);
     assert!(offset_of!(ConfigImage, interface_count) == 4);
@@ -1078,7 +1111,7 @@ const _: () = {
     assert!(offset_of!(ConfigImage, content_hash) == 12);
     assert!(offset_of!(ConfigImage, management) == 16);
     assert!(offset_of!(ConfigImage, interfaces) == 32);
-    assert!(offset_of!(ConfigImage, neighbours) == 160);
+    assert!(offset_of!(ConfigImage, neighbours) == 320);
 
     // Expressing the image as atomics must leave the region the reading domain
     // maps byte-identical to a plain `ConfigImage`: same size, same alignment,
@@ -1092,6 +1125,7 @@ const _: () = {
     assert!(offset_of!(InterfaceSlot, mac) == offset_of!(InterfaceImage, mac));
     assert!(offset_of!(InterfaceSlot, _pad2) == offset_of!(InterfaceImage, _pad2));
     assert!(offset_of!(InterfaceSlot, address) == offset_of!(InterfaceImage, address));
+    assert!(offset_of!(InterfaceSlot, id) == offset_of!(InterfaceImage, id));
 
     assert!(size_of::<NeighbourSlot>() == size_of::<NeighbourImage>());
     assert!(align_of::<NeighbourSlot>() == align_of::<NeighbourImage>());
@@ -1122,7 +1156,7 @@ const _: () = {
     assert!(offset_of!(ConfigSlot, interfaces) == offset_of!(ConfigImage, interfaces));
     assert!(offset_of!(ConfigSlot, neighbours) == offset_of!(ConfigImage, neighbours));
 
-    assert!(size_of::<ConfigHandover>() == 680);
+    assert!(size_of::<ConfigHandover>() == 840);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
     assert!(offset_of!(ConfigHandover, committed) == 4);
@@ -1240,6 +1274,7 @@ mod tests {
             prefix_length: 24,
             mac: UNICAST,
             address: [10, 0, 0, 1],
+            id: IdentifierImage::from_text(b"dataplane-0"),
             ..InterfaceImage::ZERO
         }
     }
@@ -1569,15 +1604,15 @@ mod tests {
 
     #[test]
     fn the_layout_the_reading_domain_maps_is_the_recorded_one() {
-        assert_eq!(size_of::<InterfaceImage>(), 16);
+        assert_eq!(size_of::<InterfaceImage>(), 36);
         assert_eq!(size_of::<NeighbourImage>(), 16);
         assert_eq!(size_of::<ManagementImage>(), 16);
-        assert_eq!(size_of::<ConfigImage>(), 672);
-        assert_eq!(size_of::<ConfigHandover>(), 680);
+        assert_eq!(size_of::<ConfigImage>(), 832);
+        assert_eq!(size_of::<ConfigHandover>(), 840);
         assert_eq!(size_of::<ConfigAck>(), 8);
         assert_eq!(offset_of!(ConfigImage, management), 16);
         assert_eq!(offset_of!(ConfigImage, interfaces), 32);
-        assert_eq!(offset_of!(ConfigImage, neighbours), 160);
+        assert_eq!(offset_of!(ConfigImage, neighbours), 320);
         assert_eq!(offset_of!(ConfigHandover, image), 8);
         assert_eq!(CONFIG_REGION_SIZE, 0x1000);
         assert_eq!(CONFIG_ACK_REGION_SIZE, 0x1000);
@@ -1621,6 +1656,7 @@ mod tests {
                 offset_of!(InterfaceSlot, mac),
                 offset_of!(InterfaceSlot, _pad2),
                 offset_of!(InterfaceSlot, address),
+                offset_of!(InterfaceSlot, id),
             ],
             [
                 offset_of!(InterfaceImage, port),
@@ -1630,6 +1666,7 @@ mod tests {
                 offset_of!(InterfaceImage, mac),
                 offset_of!(InterfaceImage, _pad2),
                 offset_of!(InterfaceImage, address),
+                offset_of!(InterfaceImage, id),
             ]
         );
 
@@ -1754,6 +1791,10 @@ mod tests {
                 index: 6,
                 mac: [0; 6],
             },
+            ConfigImageError::InterfaceIdNotAnIdentifier {
+                index: 7,
+                fault: TextFault::NotInAlphabet { offset: 3 },
+            },
         ]
         .iter()
         .map(|error| format!("{error}"))
@@ -1770,7 +1811,88 @@ mod tests {
                 "interface 4 prefix length 200 exceeds 32",
                 "interface 5 MAC 01:02:03:04:05:06 is not unicast",
                 "neighbour 6 MAC 00:00:00:00:00:00 is not unicast",
+                "interface 7 id byte 3 is outside [a-z0-9-]",
             ]
+        );
+    }
+
+    /// The id is the one field of an interface whose bytes reach a label value
+    /// and a console line, so each of the three ways it can fail is refused by
+    /// name — and a *valid* one survives with the text the document wrote.
+    #[test]
+    fn an_interface_id_is_refused_by_the_fault_it_carries() {
+        let with = |id: IdentifierImage| {
+            let mut raw = image(1, 0);
+            raw.interfaces[0].id = id;
+            raw.check(PORTS).map(|checked| {
+                checked
+                    .interfaces()
+                    .next()
+                    .expect("one interface")
+                    .id()
+                    .as_str()
+                    .to_owned()
+            })
+        };
+
+        assert_eq!(
+            with(IdentifierImage::from_text(b"wan-0")).as_deref(),
+            Ok("wan-0")
+        );
+
+        // A zeroed slot: what a peer that wrote nothing leaves, and what the
+        // proptest oracle's own walk over the bytes calls `Empty`.
+        assert_eq!(
+            with(IdentifierImage::ZERO),
+            Err(ConfigImageError::InterfaceIdNotAnIdentifier {
+                index: 0,
+                fault: TextFault::Empty,
+            })
+        );
+        // A length naming more bytes than the storage holds.
+        assert_eq!(
+            with(IdentifierImage {
+                bytes: [b'a'; LOG_IDENTIFIER_BYTES],
+                len: (LOG_IDENTIFIER_BYTES + 1) as u8,
+                _pad: [0; 3],
+            }),
+            Err(ConfigImageError::InterfaceIdNotAnIdentifier {
+                index: 0,
+                fault: TextFault::TooLong {
+                    len: LOG_IDENTIFIER_BYTES + 1
+                },
+            })
+        );
+        // And a byte outside the alphabet, at the position it sits at. An upper
+        // case letter and a quote are both refused: the second is the one that
+        // would end a label value early and let a document's text become a label
+        // name of its own (OBS-5).
+        for (text, offset) in [(&b"waN"[..], 2), (b"a\"b", 1), (b"a b", 1)] {
+            assert_eq!(
+                with(IdentifierImage::from_text(text)),
+                Err(ConfigImageError::InterfaceIdNotAnIdentifier {
+                    index: 0,
+                    fault: TextFault::NotInAlphabet { offset },
+                })
+            );
+        }
+    }
+
+    /// Exactly the length bound, from both sides.
+    #[test]
+    fn the_longest_admissible_id_crosses_and_one_byte_more_does_not() {
+        let mut raw = image(1, 0);
+        raw.interfaces[0].id = IdentifierImage::from_text(&[b'a'; LOG_IDENTIFIER_BYTES]);
+        let checked = raw.check(PORTS).expect("sixteen bytes fit");
+        assert_eq!(
+            checked.interfaces().next().expect("one").id().len(),
+            LOG_IDENTIFIER_BYTES
+        );
+
+        raw.interfaces[0].id = IdentifierImage::from_text(&[b'a'; LOG_IDENTIFIER_BYTES + 1]);
+        assert!(
+            raw.check(PORTS).is_err(),
+            "`from_text` truncates the bytes and keeps the stated length, so the reader refuses it"
         );
     }
 
@@ -1783,9 +1905,21 @@ mod tests {
             any::<[u8; 6]>(),
             any::<[u8; 2]>(),
             any::<[u8; 4]>(),
+            // The id is the peer's too, bytes and stated length alike (TEST-8).
+            (
+                any::<[u8; LOG_IDENTIFIER_BYTES]>(),
+                any::<u8>(),
+                any::<[u8; 3]>(),
+            ),
         )
             .prop_map(
-                |([port, enabled, prefix_length, pad], mac, pad2, address)| InterfaceImage {
+                |(
+                    [port, enabled, prefix_length, pad],
+                    mac,
+                    pad2,
+                    address,
+                    (id_bytes, id_len, id_pad),
+                )| InterfaceImage {
                     port,
                     enabled,
                     prefix_length,
@@ -1793,6 +1927,11 @@ mod tests {
                     mac,
                     _pad2: pad2,
                     address,
+                    id: TextImage {
+                        bytes: id_bytes,
+                        len: id_len,
+                        _pad: id_pad,
+                    },
                 },
             )
             .boxed()
@@ -1880,18 +2019,56 @@ mod tests {
             prop_oneof![9 => 0u8..=MAX_PREFIX_LENGTH, 1 => any::<u8>()],
             plausible_mac(),
             any::<[u8; 4]>(),
+            plausible_identifier_image(),
         )
             .prop_map(
-                |(port, enabled, prefix_length, mac, address)| InterfaceImage {
+                |(port, enabled, prefix_length, mac, address, id)| InterfaceImage {
                     port,
                     enabled,
                     prefix_length,
                     mac,
                     address,
+                    id,
                     ..InterfaceImage::ZERO
                 },
             )
             .boxed()
+    }
+
+    /// Mostly one the document could hold, sometimes one no reader will take: each
+    /// of the three faults is reachable (TEST-8).
+    fn plausible_identifier_image() -> BoxedStrategy<IdentifierImage> {
+        prop_oneof![
+            8 => prop::collection::vec(
+                prop_oneof![Just(b'a'), Just(b'z'), Just(b'0'), Just(b'9'), Just(b'-')],
+                1..=LOG_IDENTIFIER_BYTES,
+            )
+            .prop_map(|bytes| IdentifierImage::from_text(&bytes)),
+            1 => Just(IdentifierImage::ZERO),
+            1 => (any::<[u8; LOG_IDENTIFIER_BYTES]>(), any::<u8>()).prop_map(
+                |(bytes, len)| IdentifierImage {
+                    bytes,
+                    len,
+                    _pad: [0; 3],
+                }
+            ),
+        ]
+        .boxed()
+    }
+
+    /// The alphabet and length rule, as the oracle's own walk over the bytes.
+    fn identifier_fault(raw: &IdentifierImage) -> Option<TextFault> {
+        let len = usize::from(raw.len);
+        let Some(value) = raw.bytes.get(..len) else {
+            return Some(TextFault::TooLong { len });
+        };
+        if value.is_empty() {
+            return Some(TextFault::Empty);
+        }
+        value
+            .iter()
+            .position(|byte| !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            .map(|offset| TextFault::NotInAlphabet { offset })
     }
 
     /// As [`plausible_interface_image`], for a neighbour.
@@ -1994,6 +2171,9 @@ mod tests {
                     mac: raw.mac,
                 });
             }
+            if let Some(fault) = identifier_fault(&raw.id) {
+                return Some(ConfigImageError::InterfaceIdNotAnIdentifier { index, fault });
+            }
         }
         for (index, raw) in image
             .neighbours
@@ -2066,6 +2246,14 @@ mod tests {
                 prop_assert!(entry.port() < port_count);
                 prop_assert!(entry.prefix_length() <= MAX_PREFIX_LENGTH);
                 prop_assert!(is_unicast(entry.mac()));
+                // Every byte renderable as a label value and a console field.
+                let id = entry.id();
+                prop_assert!(!id.is_empty() && id.len() <= LOG_IDENTIFIER_BYTES);
+                prop_assert!(
+                    id.as_bytes()
+                        .iter()
+                        .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+                );
             }
             for entry in checked.neighbours() {
                 prop_assert!(entry.port() < port_count);
@@ -2110,6 +2298,14 @@ mod tests {
                 prop_assert!(entry.port() < port_count);
                 prop_assert!(entry.prefix_length() <= MAX_PREFIX_LENGTH);
                 prop_assert!(is_unicast(entry.mac()));
+                // Every byte renderable as a label value and a console field.
+                let id = entry.id();
+                prop_assert!(!id.is_empty() && id.len() <= LOG_IDENTIFIER_BYTES);
+                prop_assert!(
+                    id.as_bytes()
+                        .iter()
+                        .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+                );
             }
             for entry in checked.neighbours() {
                 prop_assert!(entry.port() < port_count);

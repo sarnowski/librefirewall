@@ -28,6 +28,7 @@
 
 use lfw_ip_endpoint::{Endpoint, EndpointError, IsnSecret};
 use lfw_log::{Event, RejectReason};
+use lfw_metrics::{InterfaceInfo, InterfaceInventory};
 use net_headers::{Ipv4Address, MacAddress};
 use routing::{CapacityError, Interface, Neighbour, PortId, Router};
 use wire::{
@@ -84,6 +85,45 @@ pub fn router_from<const MAX_I: usize, const MAX_N: usize>(
     Router::from_slices(filled_interfaces, filled_neighbours)
 }
 
+/// The interface identities a checked image names, as the metric surface reports
+/// them.
+///
+/// Every field comes out of the image except the `domain` each entry joins on,
+/// which [`lfw_metrics::port_domain`] supplies from the port — a cross-artifact
+/// fact no configuration carries (CONCEPT §12.3). An interface whose port has no
+/// driver is left out rather than reported under a wrong domain; the image's own
+/// reader has already refused one, so it is unreachable from a commit.
+#[must_use]
+pub fn interfaces_from(checked: &CheckedConfig) -> InterfaceInventory {
+    let mut inventory = InterfaceInventory::EMPTY;
+    for entry in checked.interfaces() {
+        let Some(info) = InterfaceInfo::dataplane(
+            entry.port(),
+            entry.id(),
+            entry.address(),
+            entry.prefix_length(),
+            entry.mac(),
+        ) else {
+            continue;
+        };
+        // `MAX_INTERFACES` plus the management entry is exactly the inventory's
+        // capacity, so this is unreachable — and dropped rather than asserted,
+        // nothing about a metric being worth faulting a domain over (ENG-12).
+        if inventory.push(info).is_err() {
+            return inventory;
+        }
+    }
+    if let Some(management) = checked.management() {
+        let info = InterfaceInfo::management(
+            management.address(),
+            management.prefix_length(),
+            management.mac(),
+        );
+        let _ = inventory.push(info);
+    }
+    inventory
+}
+
 /// Build the endpoint a checked image addresses the management port with, or
 /// `None` where it addresses none. The image's reader has already refused a
 /// prefix length and a group MAC; [`Endpoint::new`] is the third layer, taking
@@ -122,7 +162,10 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         | ConfigImageError::NeighbourCountExceedsCapacity { count } => {
             (RejectReason::CapacityExceeded, count)
         }
-        ConfigImageError::InterfaceEnabledNotBoolean { index, .. } => {
+        // An id no reader will take is a malformed value like any other; the
+        // fault it names is finer than the console's vocabulary and is not carried.
+        ConfigImageError::InterfaceEnabledNotBoolean { index, .. }
+        | ConfigImageError::InterfaceIdNotAnIdentifier { index, .. } => {
             (RejectReason::MalformedValue, index as u32)
         }
         ConfigImageError::InterfacePortUnknown { index, .. }
@@ -497,8 +540,9 @@ impl CommittedReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lfw_metrics::Role;
     use proptest::prelude::*;
-    use wire::{InterfaceImage, NeighbourImage};
+    use wire::{IdentifierImage, InterfaceImage, NeighbourImage};
 
     const PORTS: u8 = 2;
 
@@ -513,6 +557,11 @@ mod tests {
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x50 + port],
             _pad2: [0; 2],
             address: [10, 0, port, last],
+            id: IdentifierImage::from_text(if port == 0 {
+                b"dataplane-0"
+            } else {
+                b"dataplane-1"
+            }),
         }
     }
 
@@ -545,6 +594,130 @@ mod tests {
     /// The two regions a consumer sits between.
     fn regions() -> (ConfigHandover, ConfigAck) {
         (ConfigHandover::zero(), ConfigAck::zero())
+    }
+
+    /// The management addressing the shipped document names, so the inventory
+    /// tests are stated against a real document rather than a shape.
+    fn management_image() -> wire::ManagementImage {
+        wire::ManagementImage {
+            enabled: 1,
+            prefix_length: 24,
+            _pad: [0; 2],
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            _pad2: [0; 2],
+            address: [10, 0, 2, 15],
+        }
+    }
+
+    fn checked(image: &ConfigImage) -> CheckedConfig {
+        image.check(PORTS).expect("a valid image")
+    }
+
+    /// Every label of every info series is the document's own value, and the
+    /// `domain` each joins on is the driver of the port the document put that
+    /// interface on. Nothing here is derived from a build constant except that
+    /// domain, which no configuration carries.
+    #[test]
+    fn the_inventory_reports_each_configured_interface_under_its_ports_driver() {
+        let mut raw = image(1);
+        raw.management = management_image();
+        let inventory = interfaces_from(&checked(&raw));
+
+        let entries: Vec<_> = inventory.entries().copied().collect();
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].domain(), "nic_driver0");
+        assert_eq!(entries[0].interface().as_str(), "dataplane-0");
+        assert_eq!(entries[0].role(), Role::Dataplane);
+        assert_eq!(entries[0].address(), [10, 0, 0, 1]);
+        assert_eq!(entries[0].prefix_length(), 24);
+        assert_eq!(entries[0].mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x50]);
+
+        assert_eq!(entries[1].domain(), "nic_driver1");
+        assert_eq!(entries[1].interface().as_str(), "dataplane-1");
+        assert_eq!(entries[1].role(), Role::Dataplane);
+        assert_eq!(entries[1].address(), [10, 0, 1, 1]);
+
+        assert_eq!(entries[2].domain(), "nic_driver2");
+        assert_eq!(entries[2].interface().as_str(), "management");
+        assert_eq!(entries[2].role(), Role::Management);
+        assert_eq!(entries[2].address(), [10, 0, 2, 15]);
+        assert_eq!(entries[2].prefix_length(), 24);
+        assert_eq!(entries[2].mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+    }
+
+    /// Generation 0 configures nothing, so it reports nothing: an info series for
+    /// a port with no addressing would name an interface the node does not have.
+    #[test]
+    fn the_fail_closed_generation_reports_no_interface() {
+        assert!(interfaces_from(&checked(&ConfigImage::ZERO)).is_empty());
+    }
+
+    /// A document that addresses no management port leaves the dataplane series
+    /// alone: the management entry is a separate element, and its absence is a
+    /// port that answers nothing rather than a configuration that is incomplete.
+    #[test]
+    fn a_document_addressing_no_management_port_reports_only_its_dataplane_interfaces() {
+        let inventory = interfaces_from(&checked(&image(1)));
+        assert_eq!(inventory.len(), 2);
+        assert!(
+            inventory
+                .entries()
+                .all(|info| info.role() == Role::Dataplane)
+        );
+    }
+
+    /// The identity travels from the document's own text, so two documents that
+    /// name the same ports differently produce different series. This is the host
+    /// half of what the QEMU gate asserts against a real scrape.
+    #[test]
+    fn a_renamed_interface_is_reported_under_its_new_name() {
+        let mut raw = image(1);
+        raw.interfaces[0].id = IdentifierImage::from_text(b"uplink");
+        raw.interfaces[1].id = IdentifierImage::from_text(b"downlink");
+        let inventory = interfaces_from(&checked(&raw));
+        let names: Vec<String> = inventory
+            .entries()
+            .map(|info| String::from(info.interface().as_str()))
+            .collect();
+        assert_eq!(names, ["uplink", "downlink"]);
+    }
+
+    proptest! {
+        /// Whatever a checked image holds, the inventory reports one entry per
+        /// interface it names plus the management one, never more than the
+        /// exposition is sized for, and every entry's `domain` is the driver of
+        /// the port that entry sits on.
+        #[test]
+        fn the_inventory_is_bounded_and_attributes_every_entry_to_its_port(
+            count in 0usize..=MAX_INTERFACES,
+            management in any::<bool>(),
+        ) {
+            let mut raw = ConfigImage {
+                interface_count: count as u32,
+                ..ConfigImage::ZERO
+            };
+            for (index, slot) in raw.interfaces.iter_mut().enumerate() {
+                *slot = interface((index % usize::from(PORTS)) as u8, 1);
+            }
+            if management {
+                raw.management = management_image();
+            }
+            let inventory = interfaces_from(&checked(&raw));
+            prop_assert_eq!(inventory.len(), count + usize::from(management));
+            prop_assert!(inventory.len() <= lfw_metrics::MAX_INTERFACE_SERIES);
+            for info in inventory.entries() {
+                match info.role() {
+                    Role::Management => prop_assert_eq!(
+                        info.domain(),
+                        lfw_metrics::MANAGEMENT_PORT_DOMAIN
+                    ),
+                    Role::Dataplane => prop_assert!(
+                        lfw_metrics::PORT_DOMAINS.contains(&info.domain())
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
@@ -1196,6 +1369,7 @@ mod tests {
                     mac,
                     _pad2: [0; 2],
                     address: [10, 0, 0, 1],
+                    id: IdentifierImage::from_text(b"wan"),
                 };
             }
             for slot in &mut raw.neighbours {

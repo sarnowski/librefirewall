@@ -59,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod interfaces;
 mod render;
 mod sample;
 
@@ -67,8 +68,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use wire::MAPPING_ALIGN;
 
 pub use catalog::{
-    ALL_METRICS, FORWARDER_SHARD, Kind, Label, MANAGEMENT_SHARD, Metric, SHARD_COUNT, SHARDS,
-    Series, ShardSpec, metric,
+    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Kind, Label, MANAGEMENT_SHARD, Metric,
+    SHARD_COUNT, SHARDS, Series, ShardSpec, metric,
+};
+pub use interfaces::{
+    InterfaceInfo, InterfaceInventory, InventoryFull, MANAGEMENT_PORT_DOMAIN, MAX_INTERFACE_SERIES,
+    PORT_DOMAINS, Role, port_domain,
 };
 pub use render::{MAX_EXPOSITION_LEN, RenderError, Snapshot};
 pub use sample::{

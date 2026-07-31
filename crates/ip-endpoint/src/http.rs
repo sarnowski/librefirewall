@@ -94,10 +94,14 @@ pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_
 
 // The bound the whole streaming design rests on, stated where both halves are
 // visible: the worst-case exposition and the head in front of it fit the buffer
-// they are composed into, so a scrape is never answered short (TEST-5).
+// they are composed into, so a scrape is never answered short (TEST-5). Both are
+// stated as numbers, so a new family moves this reservation in a diff.
 const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
+
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 30_632);
+    assert!(RESPONSE_CAPACITY == 30_793);
 };
 
 /// What the server has done, in the shape the metrics endpoint scrapes.

@@ -24,7 +24,11 @@
 //! shards within it. That costs a scan of every shard per family and buys an
 //! output a strict parser accepts.
 
-use crate::catalog::{ALL_METRICS, Label, Metric, SHARD_COUNT, SHARDS, Series};
+use crate::catalog::{ALL_METRICS, INTERFACE_INFO, Label, Metric, SHARD_COUNT, SHARDS, Series};
+use crate::interfaces::{
+    InterfaceInfo, InterfaceInventory, MANAGEMENT_PORT_DOMAIN, MAX_INTERFACE_SERIES, PORT_DOMAINS,
+    Role,
+};
 use crate::{STATS_SLOTS, StatsShard};
 
 /// Why an exposition was not written.
@@ -45,6 +49,34 @@ pub enum RenderError {
 /// Digits `u64::MAX` takes, which is what a slot contributes to the worst case.
 const MAX_DIGITS: usize = 20;
 
+/// The value every info series carries — a constant, not a measurement.
+const INFO_VALUE: &[u8] = b"1";
+
+/// One lower-case hexadecimal digit of `nibble`'s low four bits.
+///
+/// Arithmetic rather than an index into a table: the value is bounded by the mask
+/// and the sums cannot leave a `u8`, so there is no index to be out of range and
+/// no addition to overflow (ENG-5).
+const fn hex_digit(nibble: u8) -> u8 {
+    let low = nibble & 0x0f;
+    if low < 10 {
+        b'0'.saturating_add(low)
+    } else {
+        b'a'.saturating_add(low - 10)
+    }
+}
+
+/// Bytes `255.255.255.255` takes — the longest dotted quad.
+const MAX_ADDRESS_LEN: usize = 15;
+
+/// Bytes `ff:ff:ff:ff:ff:ff` takes; a MAC is always written in full.
+const MAC_LEN: usize = 17;
+
+/// Digits a prefix length takes. Three rather than two, a validated document
+/// refusing anything past 32 while this crate's own type takes a `u8`: the bound
+/// is what the *renderer* can be handed.
+const MAX_PREFIX_DIGITS: usize = 3;
+
 /// One reading of every shard, taken before anything is rendered.
 ///
 /// Taken whole so the exposition is one pass over one set of numbers rather than
@@ -54,6 +86,11 @@ const MAX_DIGITS: usize = 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     values: [[u64; STATS_SLOTS]; SHARD_COUNT],
+    /// The configured interfaces, which come from the committed configuration
+    /// and not from a shard: no protection domain counts them, and their
+    /// identity is text rather than a number. Empty is the honest state of a node
+    /// running generation 0.
+    interfaces: InterfaceInventory,
 }
 
 impl Snapshot {
@@ -61,7 +98,20 @@ impl Snapshot {
     /// shared region.
     #[must_use]
     pub const fn new(values: [[u64; STATS_SLOTS]; SHARD_COUNT]) -> Self {
-        Self { values }
+        Self {
+            values,
+            interfaces: InterfaceInventory::EMPTY,
+        }
+    }
+
+    /// The same counters, reporting the interfaces a configuration named.
+    ///
+    /// Separate from the constructors because the two halves have two sources: a
+    /// caller reads the shards whenever it likes and learns of a configuration
+    /// only when one is committed.
+    #[must_use]
+    pub const fn with_interfaces(self, interfaces: InterfaceInventory) -> Self {
+        Self { interfaces, ..self }
     }
 
     /// Read every shard once, in [`SHARDS`] order.
@@ -71,7 +121,10 @@ impl Snapshot {
         for (target, shard) in values.iter_mut().zip(shards) {
             *target = shard.sample();
         }
-        Self { values }
+        Self {
+            values,
+            interfaces: InterfaceInventory::EMPTY,
+        }
     }
 
     /// Write the whole exposition into `out`, answering its length.
@@ -123,7 +176,41 @@ impl Snapshot {
                 writer.bytes(b"\n")?;
             }
         }
+        // One family's samples come from the configuration, so the loop above
+        // contributes nothing to it. Pointer equality rather than a name
+        // comparison: `ALL_METRICS` holds a reference to the one declaration.
+        if core::ptr::eq(metric, &INTERFACE_INFO) {
+            for info in self.interfaces.entries() {
+                Self::render_interface(metric, info, writer)?;
+            }
+        }
         Ok(())
+    }
+
+    /// One interface's series, whose labels are the whole of what it says.
+    fn render_interface(
+        metric: &Metric,
+        info: &InterfaceInfo,
+        writer: &mut Writer<'_>,
+    ) -> Result<(), Full> {
+        writer.bytes(metric.name.as_bytes())?;
+        writer.bytes(b"{")?;
+        writer.label(&Label::new("domain", info.domain()))?;
+        writer.bytes(b",interface=\"")?;
+        // A `CheckedIdentifier` is proof of `[a-z0-9-]{1,16}`, so no byte of it can
+        // close the quoted value early (`wire::ConfigImage::check`).
+        writer.bytes(info.interface().as_bytes())?;
+        writer.bytes(b"\",")?;
+        writer.label(&Label::new("role", info.role().token()))?;
+        writer.bytes(b",address=\"")?;
+        writer.address(info.address())?;
+        writer.bytes(b"\",prefix_length=\"")?;
+        writer.number(u64::from(info.prefix_length()))?;
+        writer.bytes(b"\",mac=\"")?;
+        writer.mac(info.mac())?;
+        writer.bytes(b"\"} ")?;
+        writer.bytes(INFO_VALUE)?;
+        writer.bytes(b"\n")
     }
 }
 
@@ -151,6 +238,29 @@ impl Writer<'_> {
         self.bytes(b"=\"")?;
         self.bytes(label.value.as_bytes())?;
         self.bytes(b"\"")
+    }
+
+    /// A dotted quad, as an address appears in a configuration document.
+    fn address(&mut self, octets: [u8; 4]) -> Result<(), Full> {
+        for (index, octet) in octets.into_iter().enumerate() {
+            if index > 0 {
+                self.bytes(b".")?;
+            }
+            self.number(u64::from(octet))?;
+        }
+        Ok(())
+    }
+
+    /// A MAC in the lower-case colon-separated form every other surface of this
+    /// appliance writes one in, both nibbles always (MONITORING.md's alphabet).
+    fn mac(&mut self, mac: [u8; 6]) -> Result<(), Full> {
+        for (index, octet) in mac.into_iter().enumerate() {
+            if index > 0 {
+                self.bytes(b":")?;
+            }
+            self.bytes(&[hex_digit(octet >> 4), hex_digit(octet)])?;
+        }
+        Ok(())
     }
 
     /// A decimal `u64`, formatted into a fixed array back to front so no
@@ -200,7 +310,63 @@ pub(crate) const fn exposition_bound() -> usize {
         }
         shard += 1;
     }
-    total
+    total + MAX_INTERFACE_SERIES * info_line_len()
+}
+
+/// The longest info series line, and one a full inventory can actually be made of
+/// — which keeps the declared bound reachable, and so testable against a real
+/// render rather than merely safe.
+///
+/// The roles are bounded separately because a role fixes its own `interface`
+/// label: dataplane carries an id of up to [`wire::LOG_IDENTIFIER_BYTES`] bytes
+/// beside the shorter token, management the fixed word beside the longer one.
+/// Maximising each label independently would bound a line no inventory can hold.
+pub(crate) const fn info_line_len() -> usize {
+    let dataplane = info_line_len_for(Role::Dataplane, wire::LOG_IDENTIFIER_BYTES);
+    let management = info_line_len_for(Role::Management, wire::CheckedIdentifier::MANAGEMENT.len());
+    if dataplane > management {
+        dataplane
+    } else {
+        management
+    }
+}
+
+/// One line of a stated role, with an `interface` label of `id_len` bytes and
+/// every other label at its widest.
+const fn info_line_len_for(role: Role, id_len: usize) -> usize {
+    // `{`, the six labels with their separating commas, `}`, the space, the
+    // constant value and the newline.
+    INTERFACE_INFO.name.len()
+        + 1
+        + label_len_of("domain", max_domain_len())
+        + 1
+        + label_len_of("interface", id_len)
+        + 1
+        + label_len_of("role", role.token().len())
+        + 1
+        + label_len_of("address", MAX_ADDRESS_LEN)
+        + 1
+        + label_len_of("prefix_length", MAX_PREFIX_DIGITS)
+        + 1
+        + label_len_of("mac", MAC_LEN)
+        + 1
+        + 1
+        + INFO_VALUE.len()
+        + 1
+}
+
+/// The longest `domain` value an info series can carry, over the driver domains
+/// alone: no other domain drives a port.
+const fn max_domain_len() -> usize {
+    let mut longest = MANAGEMENT_PORT_DOMAIN.len();
+    let mut port = 0;
+    while port < PORT_DOMAINS.len() {
+        if PORT_DOMAINS[port].len() > longest {
+            longest = PORT_DOMAINS[port].len();
+        }
+        port += 1;
+    }
+    longest
 }
 
 /// `# HELP <name> <help>\n# TYPE <name> <kind>\n`.
@@ -225,5 +391,10 @@ pub(crate) const fn series_line_len(series: &Series, domain: &str) -> usize {
 
 /// `<name>="<value>"`.
 pub(crate) const fn label_len(name: &str, value: &str) -> usize {
-    name.len() + 3 + value.len()
+    label_len_of(name, value.len())
+}
+
+/// [`label_len`] for a value whose width is known and whose bytes are not.
+pub(crate) const fn label_len_of(name: &str, value_len: usize) -> usize {
+    name.len() + 3 + value_len
 }

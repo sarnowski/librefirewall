@@ -69,7 +69,7 @@
 use std::{fs, path::Path};
 
 use lfw_hpet::MMIO_REGION_SIZE;
-use lfw_metrics::STATS_REGION_SIZE;
+use lfw_metrics::{MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, STATS_REGION_SIZE};
 use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
@@ -1132,6 +1132,72 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
     },
 ];
 
+/// One port's driver: the receive-pipeline region that port's frames arrive on,
+/// and the protection domain the metric surface attributes them to.
+///
+/// This is the enforcer `lfw_metrics::PORT_DOMAINS`' DOC-7 precondition names.
+/// That table is the join key of the interface info family — a scraper matches
+/// `domain="nic_driver0"` on a counter series against the info series for the
+/// interface the document put on port 0 — and *which domain drives which port* is
+/// a fact of this file alone. Nothing in a configuration document states it and
+/// nothing in a crate can derive it, so before this check it was a comment.
+///
+/// The mapping is read off the description the way the system itself establishes
+/// it: a driver instance receives into the region it maps as `rx_fwd_vaddr`, and
+/// the forwarder reads port *n*'s frames out of `fwd{n}`. So the domain that maps
+/// `fwd{n}` as its own receive pipeline *is* the driver of port *n*, and this
+/// table says which domain that must be.
+struct PortDriverRule {
+    /// How a finding names the port, `port 0` or `the management port`.
+    port: &'static str,
+    /// The `mr` of the region that port's driver maps as `rx_fwd_vaddr`.
+    receive_region: &'static str,
+    /// The domain `lfw_metrics` attributes that port to, taken from the constant
+    /// rather than written again: a literal here would make this check compare
+    /// the description against itself.
+    domain: &'static str,
+}
+
+/// Every port this build has a driver for, dataplane and management alike.
+///
+/// Exhaustive in both directions like every other table here: a
+/// `setvar_vaddr="rx_fwd_vaddr"` mapping no rule names is a fourth port whose
+/// attribution nothing compares, and a rule matching no mapping is a port whose
+/// driver has been renamed out from under the constant.
+fn port_drivers() -> Vec<PortDriverRule> {
+    let mut rules: Vec<PortDriverRule> = PORT_DOMAINS
+        .iter()
+        .enumerate()
+        .map(|(port, domain)| PortDriverRule {
+            port: match port {
+                0 => "port 0",
+                1 => "port 1",
+                // Unreachable while the build has two dataplane ports, and a
+                // name rather than a panic so a third port fails as an
+                // unnamed rule instead of stopping the checker (ENG-5).
+                _ => "a dataplane port this checker cannot name",
+            },
+            receive_region: match port {
+                0 => "fwd0",
+                1 => "fwd1",
+                _ => "an unnamed receive pipeline",
+            },
+            domain,
+        })
+        .collect();
+    rules.push(PortDriverRule {
+        port: "the management port",
+        receive_region: "mgmt_rx_fwd",
+        domain: MANAGEMENT_PORT_DOMAIN,
+    });
+    rules
+}
+
+/// The `setvar_vaddr` a driver instance attaches its receive pipeline at. It is
+/// what makes a mapping *the receive side*: the same region is mapped by the peer
+/// on the other end of the pipeline under a different symbol.
+const RECEIVE_PIPELINE_SYMBOL: &str = "rx_fwd_vaddr";
+
 /// Every element type this module knows how to judge. An element outside it
 /// stops the gate rather than being skipped: `<irq>`, `<virtual_machine>` and
 /// `<vcpu>` are all authority grants, and one arriving unnoticed is precisely
@@ -1212,7 +1278,72 @@ fn findings(elements: &[Element]) -> Vec<String> {
     check_maps(elements, &regions, domains_agree, &mut findings);
     check_io_ports(elements, domains_agree, &mut findings);
     check_channel_ends(elements, &mut findings);
+    check_port_drivers(elements, &mut findings);
     findings
+}
+
+/// Which domain drives which port, against `lfw_metrics::PORT_DOMAINS`.
+///
+/// Both directions: a receive-pipeline mapping no rule names, a rule matching no
+/// mapping, and a mapping whose owning domain is not the one the metric surface
+/// attributes that port to are three separate findings. The third is the one that
+/// matters — it is the shape in which every counter series of one port would be
+/// joined to another port's identity, which is worse than an absent join because
+/// it reads as an answer.
+fn check_port_drivers(elements: &[Element], findings: &mut Vec<String>) {
+    let rules = port_drivers();
+    // Every `<map>` that attaches a receive pipeline, with the domain that makes
+    // it: the pair *is* the port-to-driver mapping this file establishes.
+    let receivers: Vec<(&str, String)> = elements
+        .iter()
+        .filter(|element| element.tag == "map")
+        .filter(|element| element.attribute("setvar_vaddr") == Some(RECEIVE_PIPELINE_SYMBOL))
+        .filter_map(|element| element.attribute("mr").map(|mr| (mr, element.owner())))
+        .collect();
+
+    for rule in &rules {
+        let holders: Vec<&str> = receivers
+            .iter()
+            .filter(|(region, _)| *region == rule.receive_region)
+            .map(|(_, domain)| domain.as_str())
+            .collect();
+        match holders.as_slice() {
+            [domain] if *domain == rule.domain => {}
+            [domain] => findings.push(format!(
+                "<map mr={:?} setvar_vaddr={RECEIVE_PIPELINE_SYMBOL:?}> is made by {domain:?}, so \
+                 {} is driven by that domain — and lfw_metrics::PORT_DOMAINS attributes it to \
+                 {:?}. The interface info metric joins a counter series to a configured interface \
+                 on exactly that name, so a disagreement here does not lose the join: it points \
+                 every one of that port's counters at another port's addressing",
+                rule.receive_region, rule.port, rule.domain
+            )),
+            [] => findings.push(format!(
+                "no <map mr={:?} setvar_vaddr={RECEIVE_PIPELINE_SYMBOL:?}> exists, so nothing in \
+                 this description drives {} — and lfw_metrics::PORT_DOMAINS still attributes it to \
+                 {:?}, which would then be an interface identity joined to counters no domain \
+                 publishes",
+                rule.receive_region, rule.port, rule.domain
+            )),
+            many => findings.push(format!(
+                "{} domains map {:?} as {RECEIVE_PIPELINE_SYMBOL:?} ({many:?}), so which of them \
+                 drives {} is not stated. A receive pipeline admits exactly one consumer",
+                many.len(),
+                rule.receive_region,
+                rule.port
+            )),
+        }
+    }
+
+    for (region, domain) in &receivers {
+        if !rules.iter().any(|rule| rule.receive_region == *region) {
+            findings.push(format!(
+                "{domain:?} maps <memory_region name={region:?}> as \
+                 {RECEIVE_PIPELINE_SYMBOL:?}, so it drives a port no rule in sysdesc.rs names. A \
+                 port whose driver is unnamed is one lfw_metrics cannot attribute a counter series \
+                 to: give it an entry in PORT_DOMAINS and a rule here, in the same change"
+            ));
+        }
+    }
 }
 
 /// The protection domains, against [`DOMAINS`], in both directions. Returns
@@ -3134,5 +3265,101 @@ mod tests {
         assert_eq!(owners("pool1"), ["forwarder", "nic_driver0"]);
         assert_eq!(owners("free0"), ["nic_driver0", "nic_driver1"]);
         assert_eq!(owners("free1"), ["nic_driver0", "nic_driver1"]);
+    }
+
+    /// A description holding exactly the receive-pipeline mappings named, so the
+    /// port-driver check can be driven one shape at a time rather than by editing
+    /// the committed file into something that trips five other rules at once.
+    fn receive_pipelines(mappings: &[(&str, &str)]) -> Vec<String> {
+        let mut text = String::from("<system>");
+        for (domain, region) in mappings {
+            text.push_str(&format!(
+                "<protection_domain name=\"{domain}\">\
+                 <map mr=\"{region}\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" \
+                 setvar_vaddr=\"rx_fwd_vaddr\" />\
+                 </protection_domain>"
+            ));
+        }
+        text.push_str("</system>");
+        let elements = scan(text.as_bytes()).expect("the synthetic description scans");
+        let mut findings = Vec::new();
+        check_port_drivers(&elements, &mut findings);
+        findings
+    }
+
+    /// The committed file, through this check alone: every port is driven by the
+    /// domain `lfw_metrics` attributes it to, so the join key is one word on both
+    /// sides. This is the positive half of the DOC-7 enforcer.
+    #[test]
+    fn every_port_is_driven_by_the_domain_the_metric_surface_attributes_it_to() {
+        let elements = scan(committed().as_bytes()).expect("the description scans");
+        let mut findings = Vec::new();
+        check_port_drivers(&elements, &mut findings);
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    /// The finding that matters: port 0's pipeline consumed by another domain. It
+    /// is invisible in the file — one symbol on one line — and it would point
+    /// every one of port 0's counter series at port 1's addressing.
+    #[test]
+    fn a_port_driven_by_another_domain_is_reported_against_the_metric_surface() {
+        let findings = receive_pipelines(&[
+            ("nic_driver1", "fwd0"),
+            ("nic_driver0", "fwd1"),
+            ("nic_driver2", "mgmt_rx_fwd"),
+        ]);
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        let joined = findings.join("\n");
+        assert!(
+            joined.contains("lfw_metrics::PORT_DOMAINS"),
+            "the finding names the constant it disagrees with: {joined}"
+        );
+        assert!(
+            joined.contains("another port's addressing"),
+            "and what the disagreement costs a scraper: {joined}"
+        );
+    }
+
+    /// A port nothing drives, which is the shape of a dropped mapping: the
+    /// constant still attributes it to a domain, and that identity would be joined
+    /// to counters nobody publishes.
+    #[test]
+    fn a_port_no_domain_drives_is_reported() {
+        let findings =
+            receive_pipelines(&[("nic_driver1", "fwd1"), ("nic_driver2", "mgmt_rx_fwd")]);
+        let finding = only_finding(&findings);
+        assert!(finding.contains("fwd0"), "{finding}");
+        assert!(finding.contains("nic_driver0"), "{finding}");
+        assert!(finding.contains("port 0"), "{finding}");
+    }
+
+    /// Two consumers on one pipeline: which of them drives the port is then not
+    /// stated at all, and a pipeline admits exactly one consumer.
+    #[test]
+    fn two_domains_consuming_one_pipeline_is_reported() {
+        let findings = receive_pipelines(&[
+            ("nic_driver0", "fwd0"),
+            ("console", "fwd0"),
+            ("nic_driver1", "fwd1"),
+            ("nic_driver2", "mgmt_rx_fwd"),
+        ]);
+        let finding = only_finding(&findings);
+        assert!(finding.contains("2 domains map"), "{finding}");
+        assert!(finding.contains("exactly one consumer"), "{finding}");
+    }
+
+    /// A fourth port, which is how a port enters this system with its attribution
+    /// compared against nothing.
+    #[test]
+    fn a_receive_pipeline_no_rule_names_is_reported() {
+        let findings = receive_pipelines(&[
+            ("nic_driver0", "fwd0"),
+            ("nic_driver1", "fwd1"),
+            ("nic_driver2", "mgmt_rx_fwd"),
+            ("clock", "fwd2"),
+        ]);
+        let finding = only_finding(&findings);
+        assert!(finding.contains("fwd2"), "{finding}");
+        assert!(finding.contains("PORT_DOMAINS"), "{finding}");
     }
 }

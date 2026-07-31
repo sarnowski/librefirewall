@@ -88,6 +88,46 @@ fn parse(text: &str) -> (Vec<(String, String, String)>, Vec<Sample>) {
     (families, samples)
 }
 
+/// An identifier of stated text, through the check that is the only way to hold
+/// one.
+fn id(text: &str) -> wire::CheckedIdentifier {
+    wire::CheckedIdentifier::new(text.as_bytes()).expect("the test uses the identifier alphabet")
+}
+
+/// The widest info series this renderer can be handed: a full inventory, every
+/// label at its longest value.
+///
+/// Dataplane entries with sixteen-byte ids, because that is the wider of the two
+/// roles — a management series carries the fixed shorter `management` word as its
+/// `interface`. A prefix length of 255 and an all-`ff` MAC are values a *checked*
+/// configuration refuses and this type accepts, which is the bound the staging
+/// buffer has to survive.
+fn worst_case_interfaces() -> InterfaceInventory {
+    let mut inventory = InterfaceInventory::EMPTY;
+    for _ in 0..MAX_INTERFACE_SERIES {
+        inventory
+            .push(
+                InterfaceInfo::dataplane(
+                    0,
+                    id("abcdefghijklmnop"),
+                    [255, 255, 255, 255],
+                    255,
+                    [0xff; 6],
+                )
+                .expect("port 0 has a driver"),
+            )
+            .expect("exactly the inventory's capacity");
+    }
+    assert_eq!(inventory.len(), MAX_INTERFACE_SERIES);
+    inventory
+}
+
+/// The snapshot the bound is stated against: every counter at `u64::MAX` and
+/// every info label at its widest.
+fn worst_case() -> Snapshot {
+    Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT]).with_interfaces(worst_case_interfaces())
+}
+
 fn render_to_string(snapshot: &Snapshot) -> String {
     let mut out = vec![0u8; MAX_EXPOSITION_LEN];
     let len = snapshot.render(&mut out).expect("the declared bound fits");
@@ -159,13 +199,21 @@ fn each_family_is_declared_once_and_its_samples_are_contiguous() {
     }
 }
 
-/// Every family is reachable from some shard. A family nothing publishes would
-/// render as a HELP/TYPE pair with no samples — legal exposition, and a name an
-/// operator would build an alert against that never moves.
+/// Every family is reachable from some shard, bar the one whose samples come
+/// from the configuration instead. A family nothing publishes would render as a
+/// HELP/TYPE pair with no samples — legal exposition, and a name an operator
+/// would build an alert against that never moves.
 #[test]
 fn every_declared_family_has_at_least_one_series() {
     let published: Vec<&str> = declared().iter().map(|(name, _, _)| *name).collect();
     for metric in ALL_METRICS {
+        if core::ptr::eq(*metric, &INTERFACE_INFO) {
+            // Its source is the committed configuration, and a node running
+            // generation 0 has configured no interface — so this family
+            // legitimately carries no sample, and the test below is what holds it
+            // to carrying one when a configuration names one.
+            continue;
+        }
         assert!(
             published.contains(&metric.name),
             "{} is declared and never published",
@@ -253,7 +301,7 @@ fn a_family_keeps_one_label_shape_across_every_shard() {
 /// `u64::MAX` everywhere is the worst case, and it must fit.
 #[test]
 fn the_declared_bound_holds_the_worst_case_exactly() {
-    let snapshot = Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT]);
+    let snapshot = worst_case();
     let mut out = vec![0u8; MAX_EXPOSITION_LEN];
     let len = snapshot.render(&mut out).expect("the worst case fits");
     assert_eq!(
@@ -264,7 +312,7 @@ fn the_declared_bound_holds_the_worst_case_exactly() {
 
 #[test]
 fn a_buffer_one_byte_short_of_the_worst_case_is_refused_rather_than_truncated() {
-    let snapshot = Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT]);
+    let snapshot = worst_case();
     let mut out = vec![0u8; MAX_EXPOSITION_LEN - 1];
     assert_eq!(
         snapshot.render(&mut out),
@@ -554,6 +602,280 @@ fn the_declared_bound_is_the_sum_of_the_lines_it_bounds() {
             series += bound;
         }
     }
-    assert_eq!(crate::render::exposition_bound(), families + series);
-    assert_eq!(MAX_EXPOSITION_LEN, families + series);
+    let info = MAX_INTERFACE_SERIES * crate::render::info_line_len();
+    let widest = format!(
+        "{}{{domain=\"{}\",interface=\"{}\",role=\"{}\",address=\"{}\",prefix_length=\"{}\",mac=\"{}\"}} 1\n",
+        INTERFACE_INFO.name,
+        "nic_driver0",
+        "abcdefghijklmnop",
+        Role::Dataplane.token(),
+        "255.255.255.255",
+        255,
+        "ff:ff:ff:ff:ff:ff",
+    );
+    assert_eq!(crate::render::info_line_len(), widest.len());
+
+    assert_eq!(crate::render::exposition_bound(), families + series + info);
+    assert_eq!(MAX_EXPOSITION_LEN, families + series + info);
+}
+
+/// The bench the info-family tests are stated against: the shipped document's
+/// two dataplane interfaces and its management port.
+fn shipped_interfaces() -> InterfaceInventory {
+    let mut inventory = InterfaceInventory::EMPTY;
+    inventory
+        .push(
+            InterfaceInfo::dataplane(
+                0,
+                id("dataplane-0"),
+                [10, 0, 0, 1],
+                24,
+                [0x52, 0x54, 0x00, 0x12, 0x34, 0x50],
+            )
+            .expect("port 0 has a driver"),
+        )
+        .expect("capacity");
+    inventory
+        .push(
+            InterfaceInfo::dataplane(
+                1,
+                id("dataplane-1"),
+                [10, 0, 1, 1],
+                24,
+                [0x52, 0x54, 0x00, 0x12, 0x34, 0x51],
+            )
+            .expect("port 1 has a driver"),
+        )
+        .expect("capacity");
+    inventory
+        .push(InterfaceInfo::management(
+            [10, 0, 2, 15],
+            24,
+            [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+        ))
+        .expect("capacity");
+    inventory
+}
+
+/// The exact lines a configured node emits, byte for byte. An operator writes a
+/// join against these label names and values, so a rename or a reordered label
+/// set is a break of the query rather than a cosmetic change.
+#[test]
+fn a_configured_node_renders_one_info_line_per_interface() {
+    let snapshot =
+        Snapshot::new([[0; STATS_SLOTS]; SHARD_COUNT]).with_interfaces(shipped_interfaces());
+    let rendered = render_to_string(&snapshot);
+    let lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with(INTERFACE_INFO.name))
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "librefirewall_interface_info{domain=\"nic_driver0\",interface=\"dataplane-0\",\
+             role=\"dataplane\",address=\"10.0.0.1\",prefix_length=\"24\",\
+             mac=\"52:54:00:12:34:50\"} 1",
+            "librefirewall_interface_info{domain=\"nic_driver1\",interface=\"dataplane-1\",\
+             role=\"dataplane\",address=\"10.0.1.1\",prefix_length=\"24\",\
+             mac=\"52:54:00:12:34:51\"} 1",
+            "librefirewall_interface_info{domain=\"nic_driver2\",interface=\"management\",\
+             role=\"management\",address=\"10.0.2.15\",prefix_length=\"24\",\
+             mac=\"52:54:00:12:34:52\"} 1",
+        ]
+    );
+}
+
+/// The join is what the family exists for, so it is asserted rather than
+/// described: every `domain` an info series carries is a `domain` some counter
+/// series carries, in the same spelling. A value that matched nothing would leave
+/// a query silently empty.
+#[test]
+fn every_info_series_joins_to_a_counter_series_on_domain() {
+    let snapshot =
+        Snapshot::new([[0; STATS_SLOTS]; SHARD_COUNT]).with_interfaces(shipped_interfaces());
+    let (_, samples) = parse(&render_to_string(&snapshot));
+    let info: Vec<&Sample> = samples
+        .iter()
+        .filter(|sample| sample.name == INTERFACE_INFO.name)
+        .collect();
+    assert_eq!(info.len(), 3);
+    for sample in info {
+        let domain = sample
+            .labels
+            .iter()
+            .find(|(key, _)| key == "domain")
+            .map(|(_, value)| value.clone())
+            .expect("an info series carries a domain");
+        assert!(
+            samples
+                .iter()
+                .any(|other| other.name == "librefirewall_receive_frames_total"
+                    && other
+                        .labels
+                        .contains(&("domain".to_owned(), domain.clone()))),
+            "no NIC counter series carries domain={domain:?}, so the join matches nothing"
+        );
+        assert_eq!(sample.value, 1, "an info metric's value is always 1");
+    }
+}
+
+/// A node that has committed no configuration reports no interface, and that is
+/// the truth rather than a gap: generation 0 configures none. The family's two
+/// comment lines still appear, so a scraper sees a declared family with no
+/// series rather than an unknown name.
+#[test]
+fn an_unconfigured_node_declares_the_family_and_carries_no_series() {
+    let snapshot = Snapshot::new([[0; STATS_SLOTS]; SHARD_COUNT]);
+    let rendered = render_to_string(&snapshot);
+    let (families, samples) = parse(&rendered);
+    assert!(
+        families
+            .iter()
+            .any(|(name, kind, _)| name == INTERFACE_INFO.name && kind == "gauge")
+    );
+    assert!(
+        !samples
+            .iter()
+            .any(|sample| sample.name == INTERFACE_INFO.name)
+    );
+}
+
+/// The family is a gauge and carries no `_total`, because MONITORING.md's
+/// counter semantics are statements about counters and a constant is none of
+/// them.
+#[test]
+fn the_info_family_is_a_gauge_without_the_counter_suffix() {
+    assert_eq!(INTERFACE_INFO.kind, Kind::Gauge);
+    assert!(!INTERFACE_INFO.name.ends_with("_total"));
+}
+
+/// The mapping is the join key's source, so it is held to the domains the driver
+/// shards publish under — the other side of the const assertion in
+/// `interfaces.rs`, named here so a failure reads as a mismatch rather than as a
+/// build error.
+#[test]
+fn each_port_maps_to_the_domain_its_driver_shard_publishes_under() {
+    assert_eq!(port_domain(0), Some(SHARDS[1].domain));
+    assert_eq!(port_domain(1), Some(SHARDS[2].domain));
+    assert_eq!(MANAGEMENT_PORT_DOMAIN, SHARDS[3].domain);
+    assert_eq!(port_domain(PORT_DOMAINS.len() as u8), None);
+    assert_eq!(port_domain(u8::MAX), None);
+    assert!(
+        InterfaceInfo::dataplane(
+            PORT_DOMAINS.len() as u8,
+            id("wan"),
+            [10, 0, 0, 1],
+            24,
+            [0x52, 0x54, 0x00, 0x00, 0x00, 0x01]
+        )
+        .is_none(),
+        "a port with no driver has no domain to be joined on"
+    );
+}
+
+/// A full inventory refuses the next entry rather than dropping it silently, and
+/// a checked configuration cannot reach the refusal: it holds at most
+/// `MAX_INTERFACES` interfaces and one management entry.
+#[test]
+fn the_inventory_refuses_one_entry_past_its_capacity() {
+    let mut inventory = InterfaceInventory::EMPTY;
+    assert!(inventory.is_empty());
+    for _ in 0..MAX_INTERFACE_SERIES {
+        inventory
+            .push(InterfaceInfo::management(
+                [10, 0, 2, 15],
+                24,
+                [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            ))
+            .expect("within capacity");
+    }
+    assert_eq!(inventory.len(), MAX_INTERFACE_SERIES);
+    assert_eq!(
+        inventory.push(InterfaceInfo::management(
+            [10, 0, 2, 15],
+            24,
+            [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]
+        )),
+        Err(InventoryFull)
+    );
+    assert_eq!(MAX_INTERFACE_SERIES, wire::MAX_INTERFACES + 1);
+}
+
+proptest! {
+    /// Whatever inventory the renderer is handed, the exposition stays inside the
+    /// declared bound and every info line reads back as one sample with the six
+    /// labels and the value 1. The identifiers are checked ones — that is the only
+    /// shape this renderer can be handed — and every other field is arbitrary.
+    #[test]
+    fn an_arbitrary_inventory_renders_within_the_bound(
+        entries in prop::collection::vec(
+            (
+                0u8..=3,
+                prop::collection::vec(
+                    prop_oneof![Just(b'a'), Just(b'z'), Just(b'0'), Just(b'9'), Just(b'-')],
+                    1..=16,
+                ),
+                any::<[u8; 4]>(),
+                any::<u8>(),
+                any::<[u8; 6]>(),
+                any::<bool>(),
+            ),
+            0..=MAX_INTERFACE_SERIES,
+        ),
+    ) {
+        let mut inventory = InterfaceInventory::EMPTY;
+        let mut expected = 0usize;
+        for (port, text, address, prefix_length, mac, management) in entries {
+            let identifier = wire::CheckedIdentifier::new(&text).expect("the alphabet");
+            let info = if management {
+                Some(InterfaceInfo::management(address, prefix_length, mac))
+            } else {
+                InterfaceInfo::dataplane(port, identifier, address, prefix_length, mac)
+            };
+            if let Some(info) = info {
+                inventory.push(info).expect("bounded by the capacity");
+                expected += 1;
+            }
+        }
+        let snapshot = Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT])
+            .with_interfaces(inventory);
+        let mut out = vec![0u8; MAX_EXPOSITION_LEN];
+        let len = snapshot.render(&mut out).expect("the declared bound holds");
+        prop_assert!(len <= MAX_EXPOSITION_LEN);
+        let text = core::str::from_utf8(&out[..len]).expect("ASCII");
+        let (_, samples) = parse(text);
+        let info: Vec<&Sample> = samples
+            .iter()
+            .filter(|sample| sample.name == INTERFACE_INFO.name)
+            .collect();
+        prop_assert_eq!(info.len(), expected);
+        for sample in info {
+            prop_assert_eq!(sample.value, 1);
+            let keys: Vec<&str> = sample.labels.iter().map(|(key, _)| key.as_str()).collect();
+            prop_assert_eq!(
+                keys,
+                ["domain", "interface", "role", "address", "prefix_length", "mac"]
+            );
+            for (_, value) in &sample.labels {
+                prop_assert!(!value.is_empty());
+                prop_assert!(
+                    value.bytes().all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\'),
+                    "a label value a scraper cannot read: {:?}", value
+                );
+            }
+        }
+    }
+}
+
+/// The exact bound, as a number rather than as a derivation.
+///
+/// The tests above prove the derivation is right; this is the one that makes a
+/// change to it *visible*: the appliance's response staging buffer is sized by
+/// this number (`lfw_ip_endpoint::http::RESPONSE_CAPACITY`), so a family added
+/// here grows a memory reservation in the domain that faces the management-plane
+/// attacker, and that is a number to re-state deliberately rather than to inherit.
+#[test]
+fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
+    assert_eq!(MAX_EXPOSITION_LEN, 30_632);
 }

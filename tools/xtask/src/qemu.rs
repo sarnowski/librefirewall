@@ -13,7 +13,7 @@
 //! printed and written into the run log, so an unnoticed degradation to
 //! emulation cannot pass for an accelerated run.
 //!
-//! [`test_system`] is the black-box system gate. It boots three [`Scenario`]s,
+//! [`test_system`] is the black-box system gate. It boots five [`Scenario`]s,
 //! each of which asserts the machine-observable routed contract — a datagram
 //! sent from the host endpoint on each NIC port reaches the endpoint on the
 //! other rewritten for its next hop, and the packets the appliance must refuse
@@ -167,8 +167,10 @@ enum ManagementRole {
     Station,
     /// QEMU's user-mode stack carries the port and `curl` scrapes `GET /metrics`
     /// through a host port forward. Nothing at frame level is asserted on that
-    /// wire; what is asserted is the HTTP response and one metric value against
-    /// traffic the harness observed on the *dataplane* ports in the same boot.
+    /// wire; what is asserted is the HTTP response, one metric value against
+    /// traffic the harness observed on the *dataplane* ports in the same boot,
+    /// and every label of the interface info family against the configuration
+    /// document this image was built from.
     Scraped,
 }
 
@@ -201,7 +203,7 @@ struct Scenario {
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour across three scenarios, in the kernel configuration a release
+/// behaviour across five scenarios, in the kernel configuration a release
 /// ships. Returns what the run proved.
 ///
 /// 1. **routed-forwarding** — the published disk, judged by the routed contract
@@ -220,6 +222,13 @@ struct Scenario {
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
 ///    table would satisfy scenarios 1 and 2 and fail every probe here.
+/// 4. **metrics-endpoint** and 5. **metrics-endpoint-alternate** — `curl`
+///    scrapes `GET /metrics` through QEMU's own user-mode stack, once against the
+///    published disk and once against a disk built from the second document. Each
+///    is judged against *its own* document, which is what makes the interface
+///    info family a checked statement about the running configuration: the two
+///    documents share no identity, so a label the build carried rather than read
+///    would pass one and fail the other.
 ///
 /// Every scenario additionally injects frames into the dedicated management port
 /// and holds that port to carrying nothing back, whatever else it judges; the
@@ -259,11 +268,34 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             console: Console::Ignored,
             management: ManagementRole::Scraped,
         },
+        // The same scrape against a disk built from the second document, and the
+        // one thing the scenario above cannot show: that the identity the
+        // interface info series carry comes from the document rather than from
+        // the build. Both scrapes are judged against the document their own image
+        // was assembled from, and the two documents share no id, no address and
+        // no MAC — so a label compiled in would satisfy one of the two and fail
+        // the other.
+        //
+        // Its management addressing differs too, which is why this works at all:
+        // QEMU's user-mode stack is told the network, the station and the
+        // endpoint out of the document (`forward_harness::user_netdev`), so the
+        // forward reaches whatever address the document names.
+        Scenario {
+            name: "metrics-endpoint-alternate",
+            document: ALTERNATE_DOCUMENT,
+            image: ImageUnderTest::BuiltForTheScenario,
+            console: Console::Ignored,
+            management: ManagementRole::Scraped,
+        },
     ];
 
     let judged = scenarios
         .iter()
         .filter(|scenario| matches!(scenario.console, Console::Judged))
+        .count();
+    let scraped = scenarios
+        .iter()
+        .filter(|scenario| matches!(scenario.management, ManagementRole::Scraped))
         .count();
 
     // What each boot chose for its one management connection, kept so the
@@ -291,8 +323,8 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     let distinct = judge_sequence_numbers(&sequence_numbers)?;
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript, the clock record and the management port's count, and one \
-         scraped with curl; {distinct}",
+         configuration transcript, the clock record and the management port's count, and \
+         {scraped} scraped with curl against the document each was built from; {distinct}",
         scenarios.len(),
         Run::Shipping.config(),
     ))
@@ -412,13 +444,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             ));
         }
         ManagementRole::Scraped => {
-            let judged = metrics_contract::judge(&booted.scrapes, booted.dataplane_frames)
-                .map_err(|error| {
-                    format!(
-                        "scenario {name}: {error}\n  full run log: {}",
-                        log.display()
-                    )
-                })?;
+            let judged =
+                metrics_contract::judge(&booted.scrapes, booted.dataplane_frames, &topology)
+                    .map_err(|error| {
+                        format!(
+                            "scenario {name}: {error}\n  full run log: {}",
+                            log.display()
+                        )
+                    })?;
             let evidence = metrics_contract::evidence(&booted.scrapes, &judged);
             println!("{evidence}");
             append_evidence(&log, &evidence)

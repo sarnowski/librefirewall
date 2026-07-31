@@ -153,28 +153,14 @@ fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, De
     Identifier::new(text.as_bytes()).map_err(|error| DecodeError::Identifier { text: which, error })
 }
 
-/// The text of a record's key or of an [`Identifier`] value, as the ABI carries
-/// it: the bytes and how many of them are the value.
+/// `Identifier` is bounded by `MAX_IDENTIFIER_LEN`, which the assertion at the
+/// foot of this file holds equal to the image's storage, so this cannot narrow.
 fn identifier_image(id: &Identifier) -> wire::IdentifierImage {
-    let mut image = wire::IdentifierImage::ZERO;
-    for (slot, &byte) in image.bytes.iter_mut().zip(id.as_bytes()) {
-        *slot = byte;
-    }
-    // `Identifier` is bounded by `MAX_IDENTIFIER_LEN`, which the assertion at
-    // the foot of this file holds equal to the image's own storage, so this
-    // conversion cannot narrow. Saturating rather than asserting it: a length
-    // that could not fit is a build that could not have linked.
-    image.len = u8::try_from(id.len()).unwrap_or(u8::MAX);
-    image
+    wire::IdentifierImage::from_text(id.as_bytes())
 }
 
 fn cause_image(cause: &Cause) -> wire::CauseImage {
-    let mut image = wire::CauseImage::ZERO;
-    for (slot, &byte) in image.bytes.iter_mut().zip(cause.as_bytes()) {
-        *slot = byte;
-    }
-    image.len = u8::try_from(cause.len()).unwrap_or(u8::MAX);
-    image
+    wire::CauseImage::from_text(cause.as_bytes())
 }
 
 /// One optional [`Value`] as the ABI carries it: a kind naming which of the

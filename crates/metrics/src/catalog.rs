@@ -152,6 +152,15 @@ pub const CONFIGURATION_IMAGES: Metric = metric(
     "Configuration images this domain applied or refused.",
 );
 
+/// The one family whose samples come from the committed configuration rather than
+/// from a shard. A gauge because none of MONITORING.md's counter semantics applies
+/// to a constant: the value is always `1` and a query joins its labels on `domain`.
+pub const INTERFACE_INFO: Metric = metric(
+    "librefirewall_interface_info",
+    Kind::Gauge,
+    "The identity of each configured interface; always 1, the labels carrying the whole of it.",
+);
+
 // ── The log transport, on every writing domain ──────────────────────────────
 
 pub const LOG_RECORDS_DROPPED: Metric = metric(
@@ -496,6 +505,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &UART_INIT_FAILURES,
     &CONFIGURATION_GENERATION,
     &CONFIGURATION_IMAGES,
+    &INTERFACE_INFO,
     &CLOCK_GENERATION,
     &CLOCK_CALIBRATIONS_REFUSED,
     &CLOCK_FREQUENCY_HERTZ,
@@ -569,3 +579,19 @@ pub const FORWARDER_SHARD: usize = 0;
 /// Where the management endpoint's own shard sits, which is the one the domain
 /// that renders the exposition also writes.
 pub const MANAGEMENT_SHARD: usize = 4;
+
+/// Whether two strings are the same text in a `const` context, which `==` is not.
+pub(crate) const fn same(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < left.len() {
+        if left[at] != right[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}

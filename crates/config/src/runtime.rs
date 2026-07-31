@@ -6,7 +6,7 @@
 //! alternative is a panic reached through a rule enforced in another module.
 
 use lfw_log::Identifier;
-use wire::{ConfigImage, InterfaceImage, ManagementImage, NeighbourImage};
+use wire::{ConfigImage, IdentifierImage, InterfaceImage, ManagementImage, NeighbourImage};
 
 use crate::{
     hash::content_hash,
@@ -58,6 +58,7 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
             mac: entry.mac.0,
             _pad2: [0; 2],
             address: entry.address.octets(),
+            id: IdentifierImage::from_text(entry.id.as_bytes()),
         };
         count = count.saturating_add(1);
     }

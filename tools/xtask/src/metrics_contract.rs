@@ -54,16 +54,23 @@ use std::time::Duration;
 
 use lfw_http::{METRICS_CONTENT_TYPE, Status};
 
+use crate::topology::Topology;
+
 /// How long `curl` may take, end to end. Generous because the guest may be
 /// running under TCG on a loaded runner and the response spans twenty segments,
 /// each of which the appliance sends only when a frame wakes it.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The info family, whose every label value is compared against the
+/// configuration document the image under test was built from.
+const INTERFACE_INFO: &str = "librefirewall_interface_info";
 
 /// Metric families the scrape must carry, one per subsystem this change made
 /// observable. Deliberately not the whole catalogue — `lfw_metrics`' own tests
 /// hold that to itself — but one name from each shard kind, so a shard that
 /// stopped being published fails here.
 const REQUIRED: &[&str] = &[
+    INTERFACE_INFO,
     "librefirewall_forwarded_frames_total",
     "librefirewall_route_drops_total",
     "librefirewall_receive_frames_total",
@@ -295,6 +302,134 @@ fn sample(at: usize, line: &str) -> Result<Sample, String> {
     })
 }
 
+/// Hold the interface info series to the configuration document the image was
+/// built from, label by label.
+///
+/// This is what makes the family a *checked statement about the running
+/// configuration* rather than a decorative label set. Nothing here is matched as
+/// a substring and nothing is compared against a literal: the ids, addresses,
+/// prefix lengths and MACs come out of the document through
+/// [`Topology`](crate::topology::Topology), which is the same text the appliance
+/// was compiled around — so a scrape from an image built from a *different*
+/// document is judged against that document and cannot pass on the first one's
+/// addressing.
+///
+/// The `domain` each series carries is the other half. It is the join key an
+/// operator's query matches on, so it is asserted to be the domain that port's
+/// driver publishes its counters under — read back from `lfw_metrics` rather than
+/// written here, and held to the system description at build time by
+/// `xtask::sysdesc`.
+///
+/// # Errors
+/// The verdict, naming the label and the two values.
+fn judge_interfaces<'a>(
+    exposition: &'a Exposition,
+    topology: &Topology,
+) -> Result<Vec<&'a Sample>, String> {
+    let series = exposition.select(INTERFACE_INFO, &[]);
+    let configured = topology.interfaces();
+    let expected = configured.len() + 1;
+    if series.len() != expected {
+        return Err(format!(
+            "the exposition carries {} {INTERFACE_INFO} series and the document configures {} \
+             dataplane interfaces and one management port. One series per configured interface is \
+             the whole cardinality of this family, so a different count means an interface is \
+             unreported or one is reported twice\n  found: {}",
+            series.len(),
+            configured.len(),
+            render(&series)
+        ));
+    }
+
+    let mut asserted = Vec::new();
+    for (port, interface) in configured.iter().enumerate() {
+        let domain = lfw_metrics::port_domain(port as u8)
+            .ok_or_else(|| format!("lfw_metrics attributes port {port} to no protection domain"))?;
+        asserted.push(judge_one_interface(
+            exposition,
+            domain,
+            &[
+                ("interface", interface.id.as_str().to_owned()),
+                ("role", String::from("dataplane")),
+                ("address", dotted(interface.address)),
+                ("prefix_length", interface.prefix_length.to_string()),
+                ("mac", colons(interface.mac)),
+            ],
+        )?);
+    }
+
+    let management = topology.management();
+    asserted.push(judge_one_interface(
+        exposition,
+        lfw_metrics::MANAGEMENT_PORT_DOMAIN,
+        &[
+            // The `<management>` element carries no id, so the identity is the
+            // word — the same one a console change record about it uses.
+            ("interface", String::from("management")),
+            ("role", String::from("management")),
+            ("address", dotted(management.address)),
+            ("prefix_length", management.prefix_length.to_string()),
+            ("mac", colons(management.mac)),
+        ],
+    )?);
+    Ok(asserted)
+}
+
+/// One info series, found by its `domain` and then compared field by field.
+///
+/// Selected by the join key alone and *then* judged, deliberately: selecting on
+/// every label would find nothing when one is wrong and report "no such series",
+/// which tells an operator neither which label moved nor what it moved to.
+fn judge_one_interface<'a>(
+    exposition: &'a Exposition,
+    domain: &str,
+    expected: &[(&str, String)],
+) -> Result<&'a Sample, String> {
+    let sample = one(exposition, INTERFACE_INFO, &[("domain", domain)])?;
+    if sample.value != 1 {
+        return Err(format!(
+            "{INTERFACE_INFO}{{domain={domain:?}}} reports {}, and an info metric's value is \
+             always 1 — everything it says is in its labels",
+            sample.value
+        ));
+    }
+    for (label, want) in expected {
+        let got = sample.labels.get(*label).map(String::as_str);
+        if got != Some(want.as_str()) {
+            return Err(format!(
+                "{INTERFACE_INFO}{{domain={domain:?}}} carries {label}={got:?} and the \
+                 configuration document the image was built from says {want:?}. The labels of \
+                 this family are the node's statement about its own running configuration, so a \
+                 disagreement is the node reporting a configuration it is not running"
+            ));
+        }
+    }
+    // Exactly these labels and no others: an extra one would be an unbounded
+    // dimension nothing in MONITORING.md's inventory names (OBS-3).
+    let mut names: Vec<&str> = sample.labels.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let mut wanted: Vec<&str> = expected.iter().map(|(label, _)| *label).collect();
+    wanted.push("domain");
+    wanted.sort_unstable();
+    if names != wanted {
+        return Err(format!(
+            "{INTERFACE_INFO}{{domain={domain:?}}} carries labels {names:?} and the contract is \
+             {wanted:?}"
+        ));
+    }
+    Ok(sample)
+}
+
+fn dotted(address: [u8; 4]) -> String {
+    let [a, b, c, d] = address;
+    format!("{a}.{b}.{c}.{d}")
+}
+
+fn colons(mac: [u8; 6]) -> String {
+    let [a, b, c, d, e, f] = mac;
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
 /// Judge two consecutive scrapes, and cross-check one of their values against
 /// traffic the harness observed itself.
 ///
@@ -304,7 +439,11 @@ fn sample(at: usize, line: &str) -> Result<Sample, String> {
 ///
 /// # Errors
 /// The verdict, naming the field and the two values.
-pub fn judge(scrapes: &[Scrape], forwarded_frames: u64) -> Result<String, String> {
+pub fn judge(
+    scrapes: &[Scrape],
+    forwarded_frames: u64,
+    topology: &Topology,
+) -> Result<String, String> {
     let [first, second] = scrapes else {
         return Err(format!(
             "the scenario took {} scrapes and the contract is stated over two: the second is \
@@ -315,8 +454,8 @@ pub fn judge(scrapes: &[Scrape], forwarded_frames: u64) -> Result<String, String
     // Both must be answered, and the first identically to the second: a node
     // that answered one scrape and refused the next has a buffer it does not
     // release.
-    judge_one(first, forwarded_frames)?;
-    let judged = judge_one(second, forwarded_frames)?;
+    judge_one(first, forwarded_frames, topology)?;
+    let judged = judge_one(second, forwarded_frames, topology)?;
     let exposition = parse(&second.body)?;
     let requests = one(&exposition, "librefirewall_http_requests_total", &[])?;
     if requests.value < 2 {
@@ -367,7 +506,11 @@ pub fn judge(scrapes: &[Scrape], forwarded_frames: u64) -> Result<String, String
 ///
 /// # Errors
 /// The verdict, naming the field and the two values.
-fn judge_one(scrape: &Scrape, forwarded_frames: u64) -> Result<String, String> {
+fn judge_one(
+    scrape: &Scrape,
+    forwarded_frames: u64,
+    topology: &Topology,
+) -> Result<String, String> {
     let expected_status = format!("HTTP/1.1 {} {}", Status::Ok.code(), Status::Ok.reason());
     if scrape.status_line != expected_status {
         return Err(format!(
@@ -498,6 +641,11 @@ fn judge_one(scrape: &Scrape, forwarded_frames: u64) -> Result<String, String> {
     }
     asserted.push(requests);
     asserted.push(segments);
+
+    // And what the node says each of its ports *is*, against the document it was
+    // built from. Last, because it is the one assertion that reads the appliance's
+    // own statement of its configuration rather than a count of its traffic.
+    asserted.extend(judge_interfaces(&exposition, topology)?);
 
     Ok(format!(
         "{} families and {} series scraped with curl; {forwarded} forwarded frames reported and \

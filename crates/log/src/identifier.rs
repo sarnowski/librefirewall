@@ -152,6 +152,18 @@ mod tests {
         assert!(!Identifier::MANAGEMENT.is_empty());
     }
 
+    /// The ABI carries its own constant of the same word — a console record's
+    /// key and the interface info metric's `interface` label are the one identity
+    /// of an element that has no `id` — and two spellings of one word drift.
+    /// This is where both are visible, so this is where they are held equal.
+    #[test]
+    fn the_management_key_is_the_word_the_abi_carries_for_it() {
+        assert_eq!(
+            Identifier::MANAGEMENT.as_bytes(),
+            wire::CheckedIdentifier::MANAGEMENT.as_bytes()
+        );
+    }
+
     #[test]
     fn an_empty_identifier_is_refused() {
         assert_eq!(Identifier::new(b""), Err(IdentifierError::Empty));
