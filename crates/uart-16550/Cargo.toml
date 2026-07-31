@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+# The shard the console domain publishes into: this crate fills three of its
+# slots and `lfw_log` fills the rest, and neither depends on the other. The
+# conversion lives here because this is the crate that owns these three numbers.
+lfw-metrics = { path = "../metrics" }
+
 [dev-dependencies]
 proptest = { workspace = true }
 

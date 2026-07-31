@@ -11,6 +11,7 @@ lfw-log = { path = "../../crates/log" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
 nic-driver-core = { path = "../../crates/nic-driver-core" }
+lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]
 workspace = true

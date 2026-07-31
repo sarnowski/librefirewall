@@ -50,6 +50,7 @@ use crate::{
     artifacts::DIST_DISK,
     diagnose::{self, Run},
     disk::disk_at,
+    forward_harness::ManagementBacking,
     image,
     qemu::{boot_and_forward, boot_and_halt},
     topology::Topology,
@@ -300,7 +301,9 @@ fn run_scenario(
 
     let log_name = format!("ab-{name}{}.log", run.name_suffix());
     let booted = match scenario.outcome {
-        Outcome::Routes => boot_and_forward(root, &work, &log_name, topology),
+        Outcome::Routes => {
+            boot_and_forward(root, &work, &log_name, topology, ManagementBacking::Socket)
+        }
         Outcome::Halts => boot_and_halt(root, &work, &log_name, HALT_RECORD, topology),
     }
     .map_err(|error| format!("scenario {name}: {error}"))?;

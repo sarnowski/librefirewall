@@ -13,6 +13,8 @@
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
 //! | [`ip_endpoint`] | `lfw_ip_endpoint`'s ARP and ICMP-echo answers, and the `net_headers` parsers and builders under them | untrusted network traffic **and** a management-plane attacker |
 //! | [`tcp`] | `lfw_tcp`'s segment parser, its option area and the state machine over them, driven as a stack | untrusted network traffic **and** a management-plane attacker |
+//! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
+//! | [`metrics_render`] | `lfw_metrics`' exposition renderer, over arbitrary counters and arbitrary storage | a byzantine neighbour PD **and** a management-plane attacker |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
@@ -129,10 +131,12 @@ pub mod driver;
 pub mod frame;
 pub mod free_list;
 pub mod handover;
+pub mod http_request;
 pub mod ip_endpoint;
 pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
+pub mod metrics_render;
 pub mod pipeline;
 pub mod region;
 pub mod ring_abi;
@@ -224,6 +228,11 @@ mod tests {
         ("route_frame", crate::frame::frame_routing_harness),
         ("ip_endpoint", crate::ip_endpoint::ip_endpoint_harness),
         ("tcp_segments", crate::tcp::tcp_segments_harness),
+        ("http_request", crate::http_request::http_request_harness),
+        (
+            "metrics_render",
+            crate::metrics_render::metrics_render_harness,
+        ),
         ("config_document", crate::document::document_harness),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),

@@ -391,6 +391,80 @@
     <memory_region name="log_management" size="0x4000" />
     <memory_region name="log_management_consume" size="0x1000" />
 
+
+    <!-- THE METRIC SHARDS: one region per protection domain, each written by
+         that domain alone and read by the management domain alone
+         (ENG-1, SCM-6).
+
+         WHY EIGHT REGIONS AND NOT ONE. A region is the unit of grant, and the
+         property worth having here is that a domain's numbers are *its own
+         testimony*: the management domain renders every one of them into the
+         exposition an operator scrapes, so it must read all eight, and a single
+         shared region would make it a writer of all eight too. It could then
+         attribute a driver's dropped frames to another driver, or zero a count
+         that accuses itself — and it is the domain that faces the
+         management-plane attacker. Eight regions with eight writers is what
+         makes each series a claim only its own domain can make, and it is the
+         same argument the fourteen log regions make one step further: there the
+         console cannot forge a *record*, here it cannot forge a *number*.
+
+         PER-DOMAIN SERIES, NO TOTALS. Nothing in this node sums across shards.
+         A summed total is corrupted by a domain restart — one shard goes back to
+         zero, the sum goes backwards, and a scraper differencing two samples
+         forges an enormous rate — whereas a `domain=`-labelled series resets
+         alone, which Prometheus handles by design. MONITORING.md records the
+         decision; this row set is what makes it possible.
+
+         SINGLE WRITER IS THE WHOLE SYNCHRONISATION. Exactly one domain has each
+         region read-write, so an increment is a relaxed 64-bit load, an add and
+         a relaxed store — no `lock` prefix and no contention — and on x86_64 an
+         aligned 64-bit access cannot tear, so the reader never sees half a
+         value. Unlike `clock` this needs no seqlock: a calibration's three words
+         are meaningful only together and a counter is a number in its own right
+         (`lfw_metrics`, crate header).
+
+         WHAT STAYS WITHHELD: every domain but the writer and the reader, in
+         either direction. A driver maps no other driver's shard, the forwarder
+         maps none of them but its own, and the console — which renders an
+         operator's only other output — maps none at all. A domain that could
+         write another's shard could make a port that is dropping every frame
+         report a clean line.
+
+         AND THE READER CANNOT WRITE. Every grant to `management` below is
+         READ-ONLY except its own. That is the same asymmetry `cfg` and `clock`
+         have, and for a sharper reason: this domain is the one an attacker
+         reaches first, and a `/metrics` surface it could edit would let a
+         compromise of it hide the compromise.
+
+         `stats_management` HAS EXACTLY ONE MAPPER, and that is not an oversight.
+         The management domain both writes and reads it, because the renderer
+         walks one uniform array of eight shards rather than seven regions plus a
+         live read of its own counters — one code path, and a set of numbers
+         taken at one publish rather than half of them changing under the render.
+         It costs no cross-domain authority: no other domain maps it.
+
+         Size is `lfw_metrics::STATS_REGION_SIZE`, the type's `size_of` rounded
+         up to the mapping granularity, on the same footing as every constant
+         above and held to it the same way — `xtask::sysdesc` carries a rule per
+         region and compares it. A `StatsShard` is 768 bytes, so each rounds to
+         one page and the eight cost 32 KiB.
+
+         None carries phys_addr, for the reason the address-map block above gives
+         for `cfg`: no device DMAs into a shard, so no domain needs its physical
+         address, and an unplaced region is allocated from general-purpose
+         untyped memory — precisely the retyping seL4 zeroes. A zeroed shard is
+         every counter at zero, which is the state a domain that has done nothing
+         is in, so a scrape taken before a domain has published reads zeroes
+         rather than rubbish. -->
+    <memory_region name="stats_forwarder" size="0x1000" />
+    <memory_region name="stats_nic_driver0" size="0x1000" />
+    <memory_region name="stats_nic_driver1" size="0x1000" />
+    <memory_region name="stats_nic_driver2" size="0x1000" />
+    <memory_region name="stats_management" size="0x1000" />
+    <memory_region name="stats_console" size="0x1000" />
+    <memory_region name="stats_config" size="0x1000" />
+    <memory_region name="stats_clock" size="0x1000" />
+
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
          REGION, in either direction and of either pipeline, and the management
@@ -438,6 +512,7 @@
         <map mr="cfgack" vaddr="0x3_001_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_forwarder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
     <!-- The configuration domain: it reads the document compiled into it,
@@ -471,6 +546,7 @@
         <map mr="cfgack" vaddr="0x3_001_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_config" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
     <!-- The clock domain: it establishes what time it is, once, and says so.
@@ -566,6 +642,7 @@
         <map mr="clock" vaddr="0x3_002_000" perms="rw" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_clock" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_clock" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
     <!-- The management domain: the ADDRESSED endpoint of the management port. It
@@ -665,13 +742,19 @@
          two would be a claim nothing needs: no frame crosses from one to the
          other, which is the point of the port.
 
-         STACK 0x8000, twice the forwarder's, and the reason is one number: this
-         domain holds two `BUFFER_SIZE` scratch buffers rather than one per stage
-         — the received frame is snapshotted out of the pool and the reply is
-         composed into storage of its own, because the pool exposes no safe path
-         to its bytes (`pd_runtime::endpoint`). 4 KiB of a 16 KiB stack is a
-         margin worth not spending. -->
-    <protection_domain name="management" priority="2" stack_size="0x8000">
+         STACK 0x40000, and it is the HTTP server that decides it. This domain
+         holds, in the value `init` returns and therefore on its stack: two
+         `BUFFER_SIZE` scratch buffers (the frame snapshotted out of the pool and
+         the reply composed into storage of its own, the pool exposing no safe
+         path to its bytes), a request slot of `lfw_http::MAX_REQUEST_BYTES` per
+         connection, and one `lfw_ip_endpoint::http::RESPONSE_CAPACITY` staging
+         buffer — about 29 KiB, because a Prometheus exposition of this node's
+         whole metric catalogue is that big and a response composed anywhere else
+         could not be retransmitted. That is roughly 50 KiB live, and `init`
+         moves the endpoint into place once, so the peak is about twice it. A
+         quarter of a mebibyte leaves the margin an unmeasured peak needs; it is
+         memory rather than authority, and no other domain's stack moves. -->
+    <protection_domain name="management" priority="2" stack_size="0x40000">
         <program_image path="management.elf" />
         <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_fwd_vaddr" />
         <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_free_vaddr" />
@@ -683,6 +766,14 @@
         <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_forwarder" vaddr="0x5_000_000" perms="r" cached="true" setvar_vaddr="stats_forwarder_vaddr" />
+        <map mr="stats_nic_driver0" vaddr="0x5_001_000" perms="r" cached="true" setvar_vaddr="stats_nic_driver0_vaddr" />
+        <map mr="stats_nic_driver1" vaddr="0x5_002_000" perms="r" cached="true" setvar_vaddr="stats_nic_driver1_vaddr" />
+        <map mr="stats_nic_driver2" vaddr="0x5_003_000" perms="r" cached="true" setvar_vaddr="stats_nic_driver2_vaddr" />
+        <map mr="stats_management" vaddr="0x5_004_000" perms="rw" cached="true" setvar_vaddr="stats_management_vaddr" />
+        <map mr="stats_console" vaddr="0x5_005_000" perms="r" cached="true" setvar_vaddr="stats_console_vaddr" />
+        <map mr="stats_config" vaddr="0x5_006_000" perms="r" cached="true" setvar_vaddr="stats_config_vaddr" />
+        <map mr="stats_clock" vaddr="0x5_007_000" perms="r" cached="true" setvar_vaddr="stats_clock_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -709,6 +800,7 @@
         <map mr="pool1" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
         <map mr="log_nic_driver0" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver0_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_nic_driver0" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar0" />
         <setvar symbol="vq_paddr" region_paddr="vq0" />
         <setvar symbol="rx_pool_paddr" region_paddr="pool0" />
@@ -727,6 +819,7 @@
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
         <map mr="log_nic_driver1" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver1_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_nic_driver1" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar1" />
         <setvar symbol="vq_paddr" region_paddr="vq1" />
         <setvar symbol="rx_pool_paddr" region_paddr="pool1" />
@@ -761,6 +854,7 @@
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
         <map mr="log_nic_driver2" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver2_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_nic_driver2" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar2" />
         <setvar symbol="vq_paddr" region_paddr="vq2" />
         <setvar symbol="rx_pool_paddr" region_paddr="mgmt_rx_pool" />
@@ -881,6 +975,7 @@
         <map mr="log_nic_driver2_consume" vaddr="0x4_510_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver2_consume_vaddr" />
         <map mr="log_management" vaddr="0x4_600_000" perms="r" cached="true" setvar_vaddr="log_management_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_610_000" perms="rw" cached="true" setvar_vaddr="log_management_consume_vaddr" />
+        <map mr="stats_console" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
     <!-- Both dataplane channels carry notifications in one direction only, so

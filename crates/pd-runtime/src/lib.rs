@@ -368,10 +368,10 @@ macro_rules! attach_region {
         //   `xtask::sysdesc`'s `REGIONS` table names a rule for and
         //   `check_region_size` holds *equal* to the constant the domains map
         //   it as: `POOL_REGION_SIZE`, `FORWARD_REGION_SIZE`,
-        //   `RETURN_REGION_SIZE`, `CONFIG_REGION_SIZE`, `CONFIG_ACK_REGION_SIZE`.
-        //   The log regions are the exception: that table names no rule for one
-        //   yet, so they alone are sized by agreement until it does. Both checks
-        //   run in the fast gate and again before the image is assembled.
+        //   `RETURN_REGION_SIZE`, `CONFIG_REGION_SIZE`, `CONFIG_ACK_REGION_SIZE`,
+        //   `STATS_REGION_SIZE`.
+        //   The log regions alone are sized by agreement, that table naming no
+        //   rule for one. Both checks run in the gate and before image assembly.
         // * No safe path to the bytes — the region types, whose fields are
         //   atomics (`Ring`, `wire`'s configuration regions) or an `UnsafeCell`
         //   reachable only through an `unsafe` accessor (`Pool`).
@@ -387,16 +387,20 @@ macro_rules! attach_region {
 
 pub mod endpoint;
 pub mod handover;
+pub mod stats;
 
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
-    MAX_REPLY_LEN, TIMER_LIMIT, calibration_from,
+    MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,
 };
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
     endpoint_from, router_from,
 };
 pub use lfw_ip_endpoint::IsnSecret;
+pub use stats::{
+    StatsRegions, config_sample, forwarder_sample, log_sample, management_sample, pipeline_sample,
+};
 pub use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
     ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS,
@@ -753,6 +757,14 @@ impl<'ring> RouteStage<'ring> {
     #[must_use]
     pub fn counters(&self) -> RouteCounters {
         self.counters
+    }
+
+    /// The same, borrowed: what a caller assembling a shard out of both stages
+    /// needs, and a copy of a struct holding eleven more would be one per
+    /// wakeup for nothing.
+    #[must_use]
+    pub const fn counters_ref(&self) -> &RouteCounters {
+        &self.counters
     }
 }
 

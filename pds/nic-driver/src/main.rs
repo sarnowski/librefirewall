@@ -86,11 +86,14 @@
 //! a driver. The entrypoint satisfies `sel4_microkit::Handler`.
 
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
+use lfw_metrics::{DriverSample, StatsShard};
 use nic_driver_core::bringup::{
     self, BringUpError, DriverVirtqueue, Live, MappedDevice, QUEUE_SIZE, TX_VQ_OFFSET,
 };
 use nic_driver_core::port::{NicPort, PeerSignal, ReceiveSide, TransmitSide};
-use pd_runtime::{ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, Pool, ReturnRing, attach_region};
+use pd_runtime::{
+    ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, Pool, ReturnRing, attach_region, log_sample,
+};
 use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
 use wire::{LogConsume, LogRecords};
@@ -219,6 +222,7 @@ fn init() -> NicDriver {
     // what lets a record written here survive to be printed.
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let sink = RingSink::new(log.writer(log_consume));
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
@@ -229,8 +233,23 @@ fn init() -> NicDriver {
                 DomainState::Ready,
                 DomainDetail::ReceivePosted(QUEUE_SIZE as u32),
             );
+            // Written once here so a scrape taken before the first frame reads
+            // a port that is up rather than a region nothing has published
+            // into, and thereafter only when something moved.
+            let mut published = publish(stats, &port, &sink);
             loop {
                 port.poll_once(&device, &PeerChannel);
+                let sample = sample(&port, &sink);
+                // Compared rather than stored unconditionally: this is a busy
+                // loop with no wakeup, so an unconditional publish would dirty
+                // the shard's cache line millions of times a second on an idle
+                // port for nothing (OBS-3). The comparison is twenty-five words
+                // in this domain's own memory; the store crosses to another
+                // domain's view.
+                if sample != published {
+                    stats.publish(&sample.values());
+                    published = sample;
+                }
                 core::hint::spin_loop();
             }
         }
@@ -245,6 +264,29 @@ fn init() -> NicDriver {
             NicDriver
         }
     }
+}
+
+/// This port's counters in the shape its shard lays them out.
+///
+/// Assembled in `nic_driver_core`, where a test holds the metric surface's
+/// vocabulary to the enums it names (LAY-2); this file supplies the one thing
+/// only it has, the log ring's own drop counts.
+fn sample(port: &NicPort<'static>, sink: &RingSink<'static>) -> DriverSample {
+    port.stats().to_sample(
+        port.pool_counters(),
+        log_sample(sink.dropped(), sink.refused()),
+    )
+}
+
+/// Write this port's counters into its shard, answering what was written.
+fn publish(
+    stats: &'static StatsShard,
+    port: &NicPort<'static>,
+    sink: &RingSink<'static>,
+) -> DriverSample {
+    let sample = sample(port, sink);
+    stats.publish(&sample.values());
+    sample
 }
 
 /// Map this domain's regions and bring its device up, receive queue primed.

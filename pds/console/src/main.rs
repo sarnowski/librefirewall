@@ -97,6 +97,7 @@ mod com1;
 
 use com1::Com1;
 use lfw_log::{ConsolePrinter, Domain, DomainDetail, DomainState, Event};
+use lfw_metrics::{ConsoleSample, StatsShard};
 use pd_runtime::attach_region;
 use sel4_microkit::{ChannelSet, Handler, Infallible, debug_println, protection_domain};
 use uart_16550::{Transmitter, Uart, WriteError};
@@ -150,6 +151,7 @@ fn init() -> Console {
         attach_region!(log_nic_driver2_consume_vaddr: LogConsume);
     let management_consume: &'static LogConsume =
         attach_region!(log_management_consume_vaddr: LogConsume);
+    let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
 
     let port = match Com1::claim() {
         Ok(port) => port,
@@ -197,10 +199,34 @@ fn init() -> Console {
     ];
     printer.print(&announce(DomainState::Ready));
 
+    // Written once so a scrape taken before the first record reads a console
+    // that is up, and thereafter only when something moved. Compared rather than
+    // stored unconditionally for `pds/nic-driver`'s reason: this is a busy loop,
+    // and an unconditional publish would dirty the shard's cache line millions
+    // of times a second for nothing (OBS-3).
+    let mut published = sample(&printer);
+    stats.publish(&published.values());
     loop {
         printer.drain(&mut readers);
+        let current = sample(&printer);
+        if current != published {
+            stats.publish(&current.values());
+            published = current;
+        }
         core::hint::spin_loop();
     }
+}
+
+/// This domain's counters and its device's, in the shape their shared shard
+/// lays them out.
+///
+/// Assembled in `lfw_log`, where a test holds the metric surface's vocabulary to
+/// the fields it names (LAY-2); this file supplies the one thing only it has,
+/// which is both halves at once.
+fn sample(printer: &ConsolePrinter<SerialLine<'_>>) -> ConsoleSample {
+    printer
+        .counters()
+        .to_sample(printer.writer().0.stats().to_sample())
 }
 
 /// Returned only by a refused controller, where returning parks the domain in

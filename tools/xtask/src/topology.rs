@@ -74,6 +74,18 @@ pub(crate) struct ManagementPort {
     pub(crate) station: [u8; 4],
 }
 
+impl ManagementPort {
+    /// The network this port sits on, which is what QEMU's user-mode stack is
+    /// told to serve when a scenario points a real client at the port.
+    ///
+    /// Derived from the document rather than written beside it, for the reason
+    /// every address here is: a bench cannot then be stated on a network the
+    /// appliance is not on.
+    pub(crate) fn network(&self) -> [u8; 4] {
+        (u32::from_be_bytes(self.address) & prefix_mask(self.prefix_length)).to_be_bytes()
+    }
+}
+
 /// One host station on one dataplane port: the address the harness injects as,
 /// and the address a packet routed towards it must be addressed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

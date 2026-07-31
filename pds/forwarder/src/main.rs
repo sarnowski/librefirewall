@@ -18,13 +18,12 @@
 //! # Constraints
 //!
 //! Two [`ForwardRings`] regions, the two [`Pool`]s they index, the two
-//! configuration regions and its own log ring are the entire grant — no device
-//! capability, and of each pipeline not the `free` ring, on which a forged
-//! return would put a live DMA target back onto an owner's free stack. The pool
-//! is mapped because a routed frame's headers are rewritten in place, so a
-//! compromised forwarder can corrupt a frame in flight; it still cannot forge a
-//! return. The handover region is read-only, so it cannot rewrite the
-//! configuration it is judged by either.
+//! configuration regions, its own log ring and its own metric shard are the
+//! entire grant — no device capability, and of each pipeline not the `free`
+//! ring, on which a forged return would put a live DMA target back onto an
+//! owner's free stack. The pool is mapped because a routed frame's headers are
+//! rewritten in place, so a compromised forwarder can corrupt a frame in flight;
+//! it still cannot forge a return. The handover region is read-only.
 //!
 //! Ring handles are taken once and kept for the domain's life, a handle being
 //! this domain's position: one per notification would restart at slot zero and
@@ -34,20 +33,27 @@
 //! # There is no configuration in this file
 //!
 //! The forwarding table arrives at run time from the configuration domain, and
-//! generation 0 — no interfaces, no neighbours, nothing forwarded — is what
-//! this domain runs under until one does. That is the absence of policy rather
-//! than a default: an appliance whose configuration was refused forwards
-//! nothing and says so. What is still compiled in is the *wiring* — which ports
-//! exist and which pipeline joins which pair (CONCEPT §12.3).
+//! generation 0 — no interfaces, no neighbours, nothing forwarded — is what this
+//! domain runs under until one does: the absence of policy rather than a
+//! default. What is still compiled in is the *wiring* (CONCEPT §12.3).
 //!
 //! # Records go to a ring, not to `debug_println!`
 //!
 //! That macro compiles to `seL4_DebugPutChar`, absent from the release kernel.
+//!
+//! # Numbers go to a shard, once per wakeup
+//!
+//! Every drop this domain counts now reaches one shared region it is the sole
+//! writer of, which the management domain maps read-only and renders into
+//! `GET /metrics`. The write is at the end of a wakeup and not per frame, so a
+//! pass of up to `DRAIN_LIMIT` descriptors costs one bounded run of relaxed
+//! stores (OBS-3).
 
 use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
+use lfw_metrics::StatsShard;
 use pd_runtime::{
     ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch, ForwardRings, MAX_INTERFACES,
-    MAX_NEIGHBOURS, Offer, Pool, RouteStage, attach_region,
+    MAX_NEIGHBOURS, Offer, Pool, RouteStage, attach_region, forwarder_sample, log_sample,
 };
 use routing::PortId;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
@@ -75,6 +81,7 @@ fn init() -> Forwarder {
     let ack: &'static ConfigAck = attach_region!(cfgack_vaddr: ConfigAck);
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let sink = RingSink::new(log.writer(log_consume));
 
     sink.emit(&Event::Domain {
@@ -94,6 +101,7 @@ fn init() -> Forwarder {
         switch: ConfigurationSwitch::new(PORTS),
         handover,
         ack,
+        stats,
         sink,
     }
 }
@@ -112,8 +120,26 @@ struct Forwarder {
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,
+    /// The one region this domain writes its counters into.
+    stats: &'static StatsShard,
     /// Kept for the domain's life; a second half would restart at slot zero.
     sink: RingSink<'static>,
+}
+
+impl Forwarder {
+    /// Write everything this domain counts into its shard. Assembled in
+    /// `pd_runtime::stats`, where a test holds the metric surface's vocabulary
+    /// to the enums it names (LAY-2); this file supplies the log ring's own drop
+    /// counts and the region.
+    fn publish(&self) {
+        let sample = forwarder_sample(
+            [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
+            self.switch.generation(),
+            self.switch.counters(),
+            log_sample(self.sink.dropped(), self.sink.refused()),
+        );
+        self.stats.publish(&sample.values());
+    }
 }
 
 impl Handler for Forwarder {
@@ -142,6 +168,7 @@ impl Handler for Forwarder {
         for stage in &mut self.stages {
             stage.poll(configuration);
         }
+        self.publish();
         Ok(())
     }
 }

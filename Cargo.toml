@@ -17,6 +17,8 @@ members = [
     "crates/hpet",
     "crates/rtc",
     "crates/tcp",
+    "crates/metrics",
+    "crates/http",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",

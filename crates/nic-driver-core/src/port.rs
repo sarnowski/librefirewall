@@ -34,7 +34,7 @@
 //! (the peer) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
 //! must not do is reintroduce an unbounded loop between them.
 
-use pd_runtime::{ForwardRings, Pool, PoolOwner, ReturnRing};
+use pd_runtime::{ForwardRings, Pool, PoolCounters, PoolOwner, ReturnRing};
 
 use crate::bringup::{DriverVirtqueue, Live, QUEUE_SIZE, VirtioDevice};
 use crate::{Counters, DriverStats, RxPath, TxPath};
@@ -202,11 +202,18 @@ impl<'ring> NicPort<'ring> {
         }
     }
 
-    /// Sample this port in the shape the metrics endpoint (CONCEPT §11) will
-    /// scrape.
+    /// Sample this port in the shape the metrics endpoint (CONCEPT §11)
+    /// scrapes.
     #[must_use]
     pub fn stats(&self) -> DriverStats {
         DriverStats::sample(&self.counters, &self.receive_queue, &self.transmit_queue)
+    }
+
+    /// What this port's receive pool owner has seen, which is where a forged
+    /// return from the peer is refused and counted.
+    #[must_use]
+    pub fn pool_counters(&self) -> PoolCounters {
+        self.pool.counters()
     }
 }
 

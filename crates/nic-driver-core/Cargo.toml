@@ -8,6 +8,10 @@ license.workspace = true
 lfw-log = { path = "../log" }
 virtio = { path = "../virtio" }
 pd-runtime = { path = "../pd-runtime" }
+# The shard this driver publishes into, and the sample type that fixes its slot
+# order. The conversion lives here because this is the crate that owns the
+# counters (`DriverStats::to_sample`).
+lfw-metrics = { path = "../metrics" }
 
 [dev-dependencies]
 proptest = { workspace = true }

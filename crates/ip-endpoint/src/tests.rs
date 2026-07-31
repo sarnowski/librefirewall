@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::http::{HttpCounters, REQUEST_CAPACITY, RESPONSE_CAPACITY, Server};
 use net_headers::{
     ARP_FRAME_LEN, ARP_PAYLOAD_LEN, ETHERNET_HEADER_LEN, ICMP_ECHO_HEADER_LEN, IPV4_HEADER_LEN,
     MAC_PAIR_LEN, MIN_ECHO_REPLY_LEN,
@@ -28,8 +29,49 @@ fn secret() -> IsnSecret {
     IsnSecret::from_bytes(SECRET)
 }
 
+/// A body of `len` deterministic bytes, standing in for the metric exposition a
+/// protection domain renders. Deterministic so a response can be compared to it
+/// byte for byte, and sized by the caller so a test can pick one that spans one
+/// segment or twenty.
+#[derive(Clone, Copy, Debug)]
+struct Body(usize);
+
+impl Body {
+    /// Write it into a caller's staging buffer, as the protection domain's own
+    /// renderer does. `None` where it does not fit, which is the one thing about
+    /// a body that is **ours** rather than a client's.
+    fn render(self, out: &mut [u8]) -> Option<usize> {
+        let target = out.get_mut(..self.0)?;
+        for (index, byte) in target.iter_mut().enumerate() {
+            *byte = b'a'.wrapping_add((index % 26) as u8);
+        }
+        Some(self.0)
+    }
+
+    fn bytes(self) -> Vec<u8> {
+        let mut out = vec![0u8; self.0];
+        self.render(&mut out).expect("its own length");
+        out
+    }
+}
+
+/// A body no staging buffer can hold, so the refusal path is reachable at all.
+const UNRENDERABLE: Body = Body(usize::MAX);
+
+/// The body every endpoint below serves unless it says otherwise: bigger than
+/// one segment, so the ordinary case in these tests is the multi-segment one.
+const BODY: Body = Body(4_000);
+
 fn endpoint() -> Endpoint {
     Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, secret()).expect("a unicast pair on a /24")
+}
+
+/// Supply whatever body the endpoint is waiting on, as the protection domain's
+/// poll does between counting a request and answering it.
+fn supply(endpoint: &mut Endpoint, body: Body) {
+    if endpoint.body_wanted() {
+        endpoint.supply_body(|out| body.render(out));
+    }
 }
 
 /// An instant, built the way this crate's callers build one: a `Monotonic` is
@@ -861,133 +903,15 @@ impl Station {
     }
 }
 
-/// The exchange the end-to-end gate performs, driven here through the endpoint's
-/// own surface: a handshake, a payload echoed byte for byte, and a clean close.
-#[test]
-fn a_whole_tcp_exchange_crosses_the_endpoint() {
-    let mut endpoint = endpoint();
-    let mut station = Station::new(40000, 0x1234_5678);
-    let mut out = vec![0u8; ROOMY];
-
-    // SYN -> SYN-ACK.
-    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
-    let outcome = endpoint.handle(Some(at(0)), &syn, &mut out);
-    let len = outcome.reply().expect("a SYN-ACK");
-    assert_eq!(outcome.tcp(), Some(lfw_tcp::Outcome::Accepted));
-    let (flags, _, _) = station.read(&out[..len]);
-    assert!(flags.contains(lfw_tcp::Flags::SYN));
-    assert!(flags.contains(lfw_tcp::Flags::ACK));
-    assert_eq!(endpoint.connections(), 1);
-
-    // ACK completes it, and provokes nothing.
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    let outcome = endpoint.handle(Some(at(1_000)), &ack, &mut out);
-    assert_eq!(outcome.reply(), None);
-    assert_eq!(outcome.tcp(), Some(lfw_tcp::Outcome::Advanced));
-
-    // A payload comes back as itself, in the same call: the echo replaces the
-    // bare acknowledgement with a segment carrying the same acknowledgement
-    // number and the bytes.
-    let payload = b"GET /metrics HTTP/1.1\r\nHost: appliance\r\n\r\n";
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), payload);
-    let outcome = endpoint.handle(Some(at(2_000)), &data, &mut out);
-    let len = outcome.reply().expect("an echo");
-    let (flags, acknowledgement, echoed) = station.read(&out[..len]);
-    assert_eq!(echoed, payload, "the echo is not what was sent");
-    assert!(flags.contains(lfw_tcp::Flags::ACK));
-    assert!(flags.contains(lfw_tcp::Flags::PSH));
-    assert_eq!(
-        acknowledgement,
-        lfw_tcp::SeqNumber::new(0x1234_5678 + 1 + payload.len() as u32)
-    );
-    assert_eq!(endpoint.echo_counters().bytes_echoed, payload.len() as u64);
-    assert_eq!(endpoint.echo_counters().bytes_overrun, 0);
-
-    // The window shrank by what the echo is still holding, which is what keeps a
-    // peer from sending more than it can take.
-
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    let outcome = endpoint.handle(Some(at(3_000)), &ack, &mut out);
-    assert_eq!(outcome.reply(), None, "an acknowledgement was answered");
-
-    // FIN -> FIN-ACK, because the echo has nothing left to send.
-    let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
-    let outcome = endpoint.handle(Some(at(4_000)), &fin, &mut out);
-    let len = outcome.reply().expect("a FIN-ACK");
-    let (flags, _, _) = station.read(&out[..len]);
-    assert!(flags.contains(lfw_tcp::Flags::FIN));
-    assert!(flags.contains(lfw_tcp::Flags::ACK));
-    assert_eq!(endpoint.echo_counters().closes, 1);
-
-    // The final acknowledgement closes it, and the connection's state goes with
-    // it — table slot, return path and held bytes together.
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    let outcome = endpoint.handle(Some(at(5_000)), &ack, &mut out);
-    assert_eq!(outcome.reply(), None);
-    assert_eq!(endpoint.connections(), 0);
-    assert!(endpoint.paths.iter().all(Option::is_none));
-    assert_eq!(endpoint.tcp_counters().connections_closed, 1);
-    assert_eq!(endpoint.tcp_counters().bytes_received, payload.len() as u64);
-}
-
-/// The window this endpoint advertises is the echo's free space, so a peer is
-/// never told it may send more than the endpoint can hold — which is what makes
-/// `bytes_overrun` a number that reads zero.
-#[test]
-fn the_advertised_window_follows_the_echos_free_space() {
-    let mut endpoint = endpoint();
-    let mut station = Station::new(40000, 0x99);
-    let mut out = vec![0u8; ROOMY];
-
-    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
-    let len = endpoint
-        .handle(Some(at(0)), &syn, &mut out)
-        .reply()
-        .expect("a SYN-ACK");
-    station.read(&out[..len]);
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    endpoint.handle(Some(at(0)), &ack, &mut out);
-
-    // A payload the echo holds, unacknowledged: the window that comes back with
-    // it is the room left.
-    let payload = [0x5au8; 300];
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), &payload);
-    let len = endpoint
-        .handle(Some(at(1_000)), &data, &mut out)
-        .reply()
-        .expect("an echo");
-    let window = window_of(&out[..len]);
-    assert_eq!(
-        u32::from(window),
-        (ECHO_CAPACITY - payload.len()) as u32,
-        "the window did not shrink by what the echo holds"
-    );
-
-    // Read, so the station's next acknowledgement covers the echo: an
-    // acknowledgement that did not is what leaves the bytes held.
-    station.read(&out[..len]);
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    endpoint.handle(Some(at(2_000)), &ack, &mut out);
-    let probe = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), b"x");
-    let len = endpoint
-        .handle(Some(at(3_000)), &probe, &mut out)
-        .reply()
-        .expect("an echo");
-    assert_eq!(
-        u32::from(window_of(&out[..len])),
-        (ECHO_CAPACITY - 1) as u32
-    );
-}
-
-/// A bare transport on the management port, for the echo's own tests: they drive
-/// it directly, because a refusal the endpoint's own flow control makes
+/// The bare transport on the management port, for the server's own tests: they
+/// drive it directly, because a refusal the endpoint's own flow control makes
 /// unreachable is one only a direct call reaches.
 fn tcp_stack() -> lfw_tcp::TcpStack<TCP_CONNECTIONS> {
     lfw_tcp::TcpStack::new(
         OUR_ADDRESS,
         MANAGEMENT_PORT,
         TCP_MSS,
-        ECHO_CAPACITY as u32,
+        REQUEST_CAPACITY as u32,
         secret(),
     )
 }
@@ -1017,12 +941,405 @@ fn window_of(frame: &[u8]) -> u16 {
         .window
 }
 
-/// A retransmission is served out of the echo's own held bytes, because the
-/// transport never kept them. This is the crate's central trade, end to end.
+/// A scrape request as a client puts one on the wire.
+const SCRAPE: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: 10.0.2.15\r\nUser-Agent: probe\r\n\r\n";
+
+/// Take one connection from `SYN` to `ESTABLISHED`.
+fn handshake(endpoint: &mut Endpoint, station: &mut Station, out: &mut [u8]) {
+    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
+    let len = endpoint
+        .handle(Some(at(0)), &syn, out)
+        .reply()
+        .expect("a SYN-ACK");
+    let (flags, _, _) = station.read(&out[..len]);
+    assert!(flags.contains(lfw_tcp::Flags::SYN) && flags.contains(lfw_tcp::Flags::ACK));
+    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
+    endpoint.handle(Some(at(0)), &ack, out);
+}
+
+/// What one whole request/response exchange produced.
+struct Answered {
+    /// Every response byte, head and body, in the order the segments carried
+    /// them.
+    bytes: Vec<u8>,
+    /// How many segments carried them.
+    segments: usize,
+    /// Whether the appliance closed its half, as `Connection: close` obliges.
+    closed: bool,
+}
+
+impl Answered {
+    /// The head and body, split at the blank line. Parsed rather than matched:
+    /// the response is what a client reads, so a test reads it the same way.
+    fn split(&self) -> (String, &[u8]) {
+        let at = self
+            .bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a response head ends");
+        let head = String::from_utf8(self.bytes[..at + 4].to_vec()).expect("an ASCII head");
+        (head, &self.bytes[at + 4..])
+    }
+
+    fn status_line(&self) -> String {
+        self.split()
+            .0
+            .lines()
+            .next()
+            .expect("a status line")
+            .to_owned()
+    }
+
+    /// The value of one header field, matched case-insensitively.
+    fn header(&self, name: &str) -> Option<String> {
+        self.split().0.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            key.eq_ignore_ascii_case(name).then(|| value.to_owned())
+        })
+    }
+}
+
+/// Send `request` and collect everything the endpoint answers, acknowledging as
+/// a client does, until the appliance closes.
+///
+/// The loop is what a caller in a protection domain does: take whatever the
+/// frame provoked, then drive [`Endpoint::poll_output`] until the pass has
+/// nothing left, then let the peer's acknowledgement open the window again.
+fn exchange(
+    endpoint: &mut Endpoint,
+    station: &mut Station,
+    body: Body,
+    request: &[u8],
+) -> Answered {
+    let mut out = vec![0u8; ROOMY];
+    let mut answered = Answered {
+        bytes: Vec::new(),
+        segments: 0,
+        closed: false,
+    };
+    let mut clock = 1_000u64;
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), request);
+    let mut pending = endpoint.handle(Some(at(clock)), &data, &mut out).reply();
+    // What the protection domain's poll does between the request and the answer:
+    // publish whatever the body is about, then render it.
+    supply(endpoint, body);
+    if pending.is_none() {
+        clock += 1;
+        pending = endpoint.poll_output(at(clock), &mut out);
+    }
+    for _ in 0..512 {
+        while let Some(len) = pending.take() {
+            let (flags, _, payload) = station.read(&out[..len]);
+            if !payload.is_empty() {
+                answered.segments += 1;
+                answered.bytes.extend_from_slice(&payload);
+            }
+            answered.closed |= flags.contains(lfw_tcp::Flags::FIN);
+            clock += 1;
+            pending = endpoint.poll_output(at(clock), &mut out);
+        }
+        if answered.closed {
+            return answered;
+        }
+        clock += 1;
+        let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
+        pending = endpoint.handle(Some(at(clock)), &ack, &mut out).reply();
+        supply(endpoint, body);
+        if pending.is_none() {
+            clock += 1;
+            pending = endpoint.poll_output(at(clock), &mut out);
+        }
+    }
+    panic!("the appliance never finished answering");
+}
+
+/// The exchange the end-to-end gate performs, driven here through the endpoint's
+/// own surface: a handshake, a scrape answered over several segments, and a
+/// close this end initiates.
 #[test]
-fn a_retransmission_is_served_from_the_echos_held_bytes() {
+fn a_whole_http_exchange_crosses_the_endpoint() {
     let mut endpoint = endpoint();
-    let mut station = Station::new(40000, 0xabcd);
+    let mut station = Station::new(40000, 0x1234_5678);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+    assert_eq!(endpoint.connections(), 1);
+
+    let answered = exchange(&mut endpoint, &mut station, BODY, SCRAPE);
+    assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
+    assert_eq!(
+        answered.header("content-type").as_deref(),
+        Some(lfw_http::METRICS_CONTENT_TYPE)
+    );
+    let (head, body) = answered.split();
+    assert_eq!(body, BODY.bytes(), "the body is not what was rendered");
+    assert_eq!(
+        answered.header("content-length"),
+        Some(body.len().to_string()),
+        "the stated length is not the body's"
+    );
+    assert!(head.contains("Connection: close\r\n"));
+    assert!(
+        answered.segments > 1,
+        "a {}-byte body arrived in one segment",
+        body.len()
+    );
+    assert!(answered.closed, "Connection: close obliges a FIN");
+
+    let counters = endpoint.http_counters();
+    assert_eq!(counters.requests, 1);
+    assert_eq!(counters.responses[lfw_http::Status::Ok.slot()], 1);
+    assert_eq!(counters.response_bytes, answered.bytes.len() as u64);
+    assert_eq!(counters.expositions_refused, 0);
+    assert_eq!(counters.retransmits_unavailable, 0);
+
+    // The station closes its own half, and the connection's whole state goes
+    // with it — table slot, return path and response buffer together.
+    let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
+    let outcome = endpoint.handle(Some(at(9_000)), &fin, &mut out);
+    if let Some(len) = outcome.reply() {
+        station.read(&out[..len]);
+    }
+    let mut settled = 0;
+    let far = at(9_000 + lfw_tcp::TIME_WAIT_DURATION.as_nanos() + 1);
+    while endpoint.connections() > 0 {
+        settled += 1;
+        assert!(settled <= 64, "the connection never closed");
+        if endpoint.poll_timeouts(far, &mut out).is_none() && endpoint.connections() > 0 {
+            break;
+        }
+    }
+    assert_eq!(endpoint.connections(), 0);
+    assert!(endpoint.paths.iter().all(Option::is_none));
+    // The buffer is free again, so a second connection is answered 200 rather
+    // than 503 — which is what proves the release happened.
+    let mut second = Station::new(40001, 0x2222_0000);
+    handshake(&mut endpoint, &mut second, &mut out);
+    let again = exchange(&mut endpoint, &mut second, BODY, SCRAPE);
+    assert_eq!(again.status_line(), "HTTP/1.1 200 OK");
+    assert_eq!(endpoint.http_counters().requests, 2);
+    assert_eq!(
+        endpoint.http_counters().responses[lfw_http::Status::Ok.slot()],
+        2
+    );
+}
+
+/// The staging buffer is released when the response can no longer be asked for
+/// again, not when the connection's slot is finally reaped. A `TIME_WAIT` lasts
+/// a minute, so a buffer held that long would refuse every scrape a
+/// fifteen-second scraper made — which is what this asserts is not the case.
+#[test]
+fn the_staging_buffer_is_free_again_before_the_connection_is_reaped() {
+    let mut endpoint = endpoint();
+    let mut out = vec![0u8; ROOMY];
+    let mut first = Station::new(40000, 0x3131);
+    handshake(&mut endpoint, &mut first, &mut out);
+    let answered = exchange(&mut endpoint, &mut first, BODY, SCRAPE);
+    assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
+
+    // The client closes its own half, and the connection is still very much in
+    // the table: `TIME_WAIT` has not elapsed and nothing has been reaped.
+    let fin = first.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
+    if let Some(len) = endpoint.handle(Some(at(9_000)), &fin, &mut out).reply() {
+        first.read(&out[..len]);
+    }
+    assert_eq!(endpoint.connections(), 1, "the connection was reaped early");
+
+    let mut second = Station::new(40001, 0x3232);
+    handshake(&mut endpoint, &mut second, &mut out);
+    let again = exchange(&mut endpoint, &mut second, BODY, SCRAPE);
+    assert_eq!(
+        again.status_line(),
+        "HTTP/1.1 200 OK",
+        "a scrape inside the first connection's TIME_WAIT was refused"
+    );
+    assert_eq!(again.split().1, BODY.bytes());
+}
+
+/// Every request this server refuses, and the status each is owed. The bodies
+/// are empty, so each is one segment and none of them needs the shared buffer.
+#[test]
+fn every_refused_request_is_answered_by_its_own_status() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"GET /config HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
+        (b"GET /logs HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
+        (b"GET / HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
+        (
+            b"POST /metrics HTTP/1.1\r\n\r\n",
+            "HTTP/1.1 405 Method Not Allowed",
+        ),
+        (
+            b"GET /metrics HTTP/1.0\r\n\r\n",
+            "HTTP/1.1 505 HTTP Version Not Supported",
+        ),
+        (b"GET /metrics\n\n", "HTTP/1.1 400 Bad Request"),
+        (b"nonsense\r\n\r\n", "HTTP/1.1 400 Bad Request"),
+    ];
+    for (request, expected) in cases {
+        let mut endpoint = endpoint();
+        let mut station = Station::new(40000, 0x3333);
+        let mut out = vec![0u8; ROOMY];
+        handshake(&mut endpoint, &mut station, &mut out);
+        let answered = exchange(&mut endpoint, &mut station, BODY, request);
+        assert_eq!(&answered.status_line(), expected, "{request:?}");
+        assert_eq!(answered.split().1, b"", "a refusal carries no body");
+        assert_eq!(answered.header("content-length").as_deref(), Some("0"));
+        assert!(answered.closed);
+    }
+}
+
+/// A target longer than the parser admits is 414, and a head that fills the
+/// request buffer without ending is 431 — the two length refusals, which are the
+/// ones an attacker reaches by sending more rather than by sending nonsense.
+#[test]
+fn the_two_length_refusals_are_answered_by_their_own_statuses() {
+    let mut long = b"GET /".to_vec();
+    long.extend(core::iter::repeat_n(b'a', lfw_http::MAX_TARGET_LEN));
+    long.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+    let mut over_long = endpoint();
+    let mut station = Station::new(40000, 0x4141);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut over_long, &mut station, &mut out);
+    assert_eq!(
+        exchange(&mut over_long, &mut station, BODY, &long).status_line(),
+        "HTTP/1.1 414 URI Too Long"
+    );
+
+    // A head that never ends: sent in windowfuls until the buffer is full.
+    let mut bounded = endpoint();
+    let mut station = Station::new(40001, 0x4242);
+    handshake(&mut bounded, &mut station, &mut out);
+    let mut head = b"GET /metrics HTTP/1.1\r\n".to_vec();
+    while head.len() < REQUEST_CAPACITY {
+        head.extend_from_slice(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    let mut answered = None;
+    let mut clock = 1_000u64;
+    for chunk in head.chunks(TCP_MSS as usize) {
+        let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), chunk);
+        clock += 1;
+        if let Some(len) = bounded.handle(Some(at(clock)), &data, &mut out).reply() {
+            let (_, _, payload) = station.read(&out[..len]);
+            if !payload.is_empty() {
+                answered = Some(String::from_utf8(payload).expect("ASCII"));
+                break;
+            }
+        }
+    }
+    let answered = answered.expect("a head that fills the buffer is answered");
+    assert!(
+        answered.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+        "{answered}"
+    );
+    assert_eq!(bounded.http_counters().overflowed, 1);
+}
+
+/// A request split across segments is answered once, when its last byte arrives
+/// — the property `lfw_http`'s incremental parser exists for, seen from the
+/// endpoint's own surface.
+#[test]
+fn a_request_split_across_segments_is_answered_once_it_ends() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0x5151);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+
+    let mut clock = 1_000u64;
+    for byte in SCRAPE.iter().take(SCRAPE.len() - 1) {
+        let data = station.frame(
+            lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH),
+            core::slice::from_ref(byte),
+        );
+        clock += 1;
+        if let Some(len) = endpoint.handle(Some(at(clock)), &data, &mut out).reply() {
+            let (_, _, payload) = station.read(&out[..len]);
+            assert!(payload.is_empty(), "answered before the request ended");
+        }
+        assert_eq!(endpoint.http_counters().requests, 0);
+    }
+    let answered = exchange(
+        &mut endpoint,
+        &mut station,
+        BODY,
+        &SCRAPE[SCRAPE.len() - 1..],
+    );
+    assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
+    assert_eq!(endpoint.http_counters().requests, 1);
+}
+
+/// One exposition at a time. A second scrape while the first still holds the
+/// staging buffer is refused by name rather than answered with somebody else's
+/// bytes or with a truncated set.
+#[test]
+fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
+    let mut endpoint = endpoint();
+    let mut out = vec![0u8; ROOMY];
+    let mut first = Station::new(40000, 0x6161);
+    handshake(&mut endpoint, &mut first, &mut out);
+
+    // Start the first response and stop before it is acknowledged, so the buffer
+    // stays claimed.
+    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    endpoint.handle(Some(at(1_000)), &data, &mut out);
+    supply(&mut endpoint, BODY);
+    let len = endpoint
+        .poll_output(at(1_001), &mut out)
+        .expect("the first chunk");
+    first.read(&out[..len]);
+
+    // The second connection is answered on the frame that carries its request:
+    // a 503 has no body, so it is one segment and never reaches `poll_output`
+    // — which would otherwise serve whichever connection is pending.
+    let mut second = Station::new(40001, 0x6262);
+    handshake(&mut endpoint, &mut second, &mut out);
+    let data = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let len = endpoint
+        .handle(Some(at(2_000)), &data, &mut out)
+        .reply()
+        .expect("a refusal");
+    let (_, _, payload) = second.read(&out[..len]);
+    let answered = String::from_utf8(payload).expect("ASCII");
+    assert!(
+        answered.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{answered}"
+    );
+    assert_eq!(
+        endpoint.http_counters().responses[lfw_http::Status::ServiceUnavailable.slot()],
+        1
+    );
+    assert_eq!(
+        endpoint.http_counters().expositions_refused,
+        0,
+        "a busy buffer is not a renderer that refused"
+    );
+}
+
+/// A renderer that will not fit its own body is **ours**, and is counted apart
+/// from a busy buffer even though both answer 503. Unreachable while
+/// `RESPONSE_CAPACITY` is derived from the renderer's bound, and driven here
+/// because a defensive path nothing exercises is one nobody knows the shape of.
+#[test]
+fn an_exposition_that_will_not_render_is_counted_as_ours() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0x7171);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+    let answered = exchange(&mut endpoint, &mut station, UNRENDERABLE, SCRAPE);
+    assert_eq!(answered.status_line(), "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(endpoint.http_counters().expositions_refused, 1);
+}
+
+/// The window this endpoint advertises is the request buffer's free space, so a
+/// peer is not told it may send more than the endpoint can hold.
+///
+/// It is the free space **as of the last segment this end composed**, which is
+/// one segment of slack: the acknowledgement of an arriving segment is composed
+/// by the transport before the server has taken its bytes. What that slack can
+/// buy a peer is a head longer than the budget, which is answered 431 — the same
+/// answer a head that long gets anyway (`lfw_ip_endpoint::http`).
+#[test]
+fn the_advertised_window_follows_the_request_buffers_free_space() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0x99);
     let mut out = vec![0u8; ROOMY];
 
     let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
@@ -1030,22 +1347,52 @@ fn a_retransmission_is_served_from_the_echos_held_bytes() {
         .handle(Some(at(0)), &syn, &mut out)
         .reply()
         .expect("a SYN-ACK");
+    assert_eq!(
+        u32::from(window_of(&out[..len])),
+        REQUEST_CAPACITY as u32,
+        "an idle connection is offered the whole slot"
+    );
     station.read(&out[..len]);
     let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
     endpoint.handle(Some(at(0)), &ack, &mut out);
 
-    let payload = b"echo me";
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), payload);
+    // The response's own first segment is composed after the request was taken,
+    // so it carries the window the request left.
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    endpoint.handle(Some(at(1_000)), &data, &mut out);
+    supply(&mut endpoint, Body(16));
     let len = endpoint
-        .handle(Some(at(1_000)), &data, &mut out)
-        .reply()
-        .expect("an echo");
+        .poll_output(at(1_001), &mut out)
+        .expect("a response");
+    assert_eq!(
+        u32::from(window_of(&out[..len])),
+        (REQUEST_CAPACITY - SCRAPE.len()) as u32,
+        "the window did not shrink by what the request buffer holds"
+    );
+}
+
+/// A retransmission is served out of the response buffer, because the transport
+/// never kept the bytes. This is the crate's central trade, end to end.
+#[test]
+fn a_retransmission_is_served_from_the_response_buffer() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0xabcd);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    endpoint.handle(Some(at(1_000)), &data, &mut out);
+    supply(&mut endpoint, Body(64));
+    let len = endpoint
+        .poll_output(at(1_001), &mut out)
+        .expect("the response");
     let (_, _, first) = station.read(&out[..len]);
-    assert_eq!(first, payload);
+    assert!(!first.is_empty());
 
     // The station never acknowledges, so the timer asks for the range again and
-    // the echo supplies it.
-    let due = at(1_000).saturating_add(lfw_tcp::INITIAL_RTO);
+    // the server supplies it out of what it is still holding. The deadline runs
+    // from the instant the range went out, which is the poll after the request.
+    let due = at(1_001).saturating_add(lfw_tcp::INITIAL_RTO);
     let len = endpoint
         .poll_timeouts(due, &mut out)
         .expect("a retransmission");
@@ -1053,8 +1400,8 @@ fn a_retransmission_is_served_from_the_echos_held_bytes() {
     let packet = Ipv4Packet::parse(ethernet.payload).expect("a datagram");
     let segment =
         lfw_tcp::Segment::parse(OUR_ADDRESS, STATION_ADDRESS, packet.payload()).expect("a segment");
-    assert_eq!(segment.payload, payload, "a different range was re-sent");
-    assert_eq!(endpoint.echo_counters().retransmits_served, 1);
+    assert_eq!(segment.payload, first, "a different range was re-sent");
+    assert_eq!(endpoint.http_counters().retransmits_unavailable, 0);
     assert_eq!(endpoint.tcp_counters().retransmits, 1);
     // And it went to the pair the connection's frames arrive from, which is the
     // only address this endpoint has for it.
@@ -1062,7 +1409,7 @@ fn a_retransmission_is_served_from_the_echos_held_bytes() {
     assert_eq!(packet.header().destination, STATION_ADDRESS);
 }
 
-/// Every connection is eventually reaped, and its return path and held bytes go
+/// Every connection is eventually reaped, and its return path and response go
 /// with it: a port that is spoken to and abandoned holds nothing afterwards.
 #[test]
 fn an_abandoned_connection_leaves_nothing_behind() {
@@ -1104,8 +1451,9 @@ fn a_segment_with_no_room_for_its_headers_is_refused() {
         endpoint.handle(Some(at(0)), &syn, &mut tiny),
         Outcome::ReplyRefused(_)
     ));
-    // And a poll into storage that cannot hold a frame answers nothing.
+    // And neither poll into storage that cannot hold a frame answers anything.
     assert_eq!(endpoint.poll_timeouts(at(0), &mut tiny), None);
+    assert_eq!(endpoint.poll_output(at(0), &mut tiny), None);
 }
 
 proptest! {
@@ -1133,77 +1481,101 @@ proptest! {
             prop_assert_eq!(ethernet.header.destination, STATION_MAC);
         }
     }
+
+    /// Arbitrary request bytes over an established connection: whatever they are,
+    /// the connection is answered and closed, and the answer is a response.
+    #[test]
+    fn an_arbitrary_request_is_answered_and_the_connection_closed(
+        request in prop::collection::vec(any::<u8>(), 1..400),
+    ) {
+        let mut endpoint = endpoint();
+        let mut station = Station::new(40000, 0x8181);
+        let mut out = vec![0u8; ROOMY];
+        handshake(&mut endpoint, &mut station, &mut out);
+
+        // A request with no terminator never ends, so the connection is left
+        // open: that is `NeedMore` and not a fault. One that does end is
+        // answered, and every answer is a status line.
+        let mut clock = 1_000u64;
+        let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), &request);
+        let mut pending = endpoint.handle(Some(at(clock)), &data, &mut out).reply();
+        let mut collected: Vec<u8> = Vec::new();
+        for _ in 0..64 {
+            let Some(len) = pending.take() else { break };
+            let (_, _, payload) = station.read(&out[..len]);
+            collected.extend_from_slice(&payload);
+            clock += 1;
+            pending = endpoint.poll_output(at(clock), &mut out);
+        }
+        if collected.is_empty() {
+            prop_assert_eq!(endpoint.http_counters().requests, 0);
+        } else {
+            prop_assert!(collected.starts_with(b"HTTP/1.1 "));
+        }
+    }
 }
 
-/// A response that spans more than the peer's window goes out over several
-/// segments, one per wakeup, and the echo holds what it has not sent. That is the
-/// shift path — the held prefix moving down as it is acknowledged — which the
-/// gate's single round trip never reaches.
+/// A response of many segments goes out over as many, and comes back whole. A
+/// small peer window is what forces the interleaving: each acknowledgement frees
+/// the range it covers and lets the next go.
 #[test]
 fn a_response_larger_than_the_window_leaves_over_several_segments() {
+    let body = Body(6_000);
     let mut endpoint = endpoint();
     let mut station = Station::new(40000, 0x2222);
-    // A window of 100 bytes, so a 250-byte echo takes three segments.
-    station.window = 100;
+    // A window of 200 bytes, so the response takes at least thirty segments.
+    station.window = 200;
     let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
 
-    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
-    let len = endpoint
-        .handle(Some(at(0)), &syn, &mut out)
-        .reply()
-        .expect("a SYN-ACK");
-    station.read(&out[..len]);
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    endpoint.handle(Some(at(0)), &ack, &mut out);
-
-    let payload: Vec<u8> = (0..250u32).map(|index| (index % 251) as u8).collect();
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), &payload);
-    let mut echoed: Vec<u8> = Vec::new();
-    let len = endpoint
-        .handle(Some(at(1_000)), &data, &mut out)
-        .reply()
-        .expect("the first chunk");
-    let (_, _, chunk) = station.read(&out[..len]);
-    assert_eq!(chunk.len(), 100, "more than the window went out at once");
-    echoed.extend_from_slice(&chunk);
-
-    // Each acknowledgement frees the chunk it covers and provokes the next.
-    for round in 0..8u64 {
-        let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-        let outcome = endpoint.handle(Some(at(2_000 + round)), &ack, &mut out);
-        let Some(len) = outcome.reply() else { break };
-        let (_, _, chunk) = station.read(&out[..len]);
-        echoed.extend_from_slice(&chunk);
-    }
-    assert_eq!(echoed, payload, "the stream did not come back whole");
-    assert_eq!(endpoint.echo_counters().bytes_echoed, payload.len() as u64);
+    let answered = exchange(&mut endpoint, &mut station, body, SCRAPE);
+    assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
+    assert_eq!(answered.split().1, body.bytes());
+    assert!(
+        answered.segments >= 30,
+        "only {} segments carried a 6000-byte body through a 200-byte window",
+        answered.segments
+    );
+    assert!(
+        answered.bytes.len() <= RESPONSE_CAPACITY,
+        "a response outgrew the buffer it was composed in"
+    );
 }
 
-/// A peer that sends past the window it was given has the excess counted and
-/// dropped rather than written past the echo's array. It cannot happen while the
-/// window is the room — which is why the count reads zero — and the array is what
-/// makes it safe when it does.
+/// A peer that closes before its request ends gets a close back rather than a
+/// slot held until an idle timer reaps it.
 #[test]
-fn a_peer_that_overruns_the_window_is_counted_rather_than_believed() {
-    let mut echo: Echo<2> = Echo::new();
-    let mut stack = tcp_stack();
+fn a_peer_that_closes_before_its_request_ends_is_closed_on() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0x9191);
     let mut out = vec![0u8; ROOMY];
-    let connection = open(&mut stack, 40000, &mut out);
-    echo.take(connection, &[0x11; ECHO_CAPACITY]);
-    assert_eq!(echo.counters().bytes_taken, ECHO_CAPACITY as u64);
-    assert_eq!(echo.counters().bytes_overrun, 0);
+    handshake(&mut endpoint, &mut station, &mut out);
 
-    echo.take(connection, b"one byte too many");
-    assert_eq!(echo.counters().bytes_taken, ECHO_CAPACITY as u64);
-    assert_eq!(echo.counters().bytes_overrun, 17);
+    let partial = station.frame(
+        lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH),
+        b"GET /metrics HTT",
+    );
+    endpoint.handle(Some(at(1_000)), &partial, &mut out);
+    let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
+    let len = endpoint
+        .handle(Some(at(2_000)), &fin, &mut out)
+        .reply()
+        .expect("an answer to the FIN");
+    let (flags, _, payload) = station.read(&out[..len]);
+    assert!(payload.is_empty(), "an unfinished request was answered");
+    assert!(
+        flags.contains(lfw_tcp::Flags::FIN),
+        "this end did not close its own half"
+    );
+    assert_eq!(endpoint.http_counters().requests, 0);
 }
 
 /// One slot per connection, so a connection that exists always has one. A third
-/// connection against a two-slot echo is what proves the refusal is counted
-/// rather than silently overwriting somebody's bytes.
+/// connection against a two-slot server is what proves the refusal is counted
+/// rather than silently overwriting somebody's request.
 #[test]
-fn an_echo_with_no_slot_left_counts_the_refusal() {
-    let mut echo: Echo<2> = Echo::new();
+fn a_server_with_no_slot_left_counts_the_refusal() {
+    let mut server: Server<2> = Server::new();
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     let ids: Vec<lfw_tcp::ConnectionId> = (0..3u16)
@@ -1211,17 +1583,16 @@ fn an_echo_with_no_slot_left_counts_the_refusal() {
         .collect();
 
     for id in ids.iter().take(2) {
-        echo.take(*id, b"held");
+        server.take(*id, b"GET / HTT");
     }
-    assert_eq!(echo.counters().slots_exhausted, 0);
-    echo.take(ids[2], b"nowhere to go");
-    assert_eq!(echo.counters().slots_exhausted, 1);
-    assert_eq!(echo.counters().bytes_taken, 8);
+    assert_eq!(server.counters().slots_exhausted, 0);
+    server.take(ids[2], b"nowhere to go");
+    assert_eq!(server.counters().slots_exhausted, 1);
 
     // Nothing to drive on a connection with no slot, and nothing to serve.
-    assert_eq!(echo.drive(&mut stack, at(0), ids[2], &mut out), None);
+    assert_eq!(server.drive(&mut stack, at(0), ids[2], &mut out), None);
     assert_eq!(
-        echo.answer(
+        server.answer(
             &mut stack,
             at(0),
             lfw_tcp::Timeout::Retransmit {
@@ -1233,29 +1604,12 @@ fn an_echo_with_no_slot_left_counts_the_refusal() {
         ),
         None
     );
-    assert_eq!(echo.counters().retransmits_unavailable, 0);
-
-    // A range no slot holds is a disagreement between this endpoint and the
-    // transport, and it is counted as ours.
-    assert_eq!(
-        echo.answer(
-            &mut stack,
-            at(0),
-            lfw_tcp::Timeout::Retransmit {
-                connection: ids[0],
-                sequence: lfw_tcp::SeqNumber::new(0x9999),
-                len: 4,
-            },
-            &mut out,
-        ),
-        None
-    );
-    assert_eq!(echo.counters().retransmits_unavailable, 1);
+    assert_eq!(server.counters().retransmits_unavailable, 1);
 
     // The two timeouts that only release a slot, and the one that is already a
     // composed segment.
     assert_eq!(
-        echo.answer(
+        server.answer(
             &mut stack,
             at(0),
             lfw_tcp::Timeout::Resent {
@@ -1267,7 +1621,7 @@ fn an_echo_with_no_slot_left_counts_the_refusal() {
         Some(40)
     );
     assert_eq!(
-        echo.answer(
+        server.answer(
             &mut stack,
             at(0),
             lfw_tcp::Timeout::Abandoned {
@@ -1279,7 +1633,7 @@ fn an_echo_with_no_slot_left_counts_the_refusal() {
         Some(40)
     );
     assert_eq!(
-        echo.answer(
+        server.answer(
             &mut stack,
             at(0),
             lfw_tcp::Timeout::Reaped { connection: ids[1] },
@@ -1288,34 +1642,38 @@ fn an_echo_with_no_slot_left_counts_the_refusal() {
         None
     );
     // Both slots are free again, so the third connection now has one.
-    echo.take(ids[2], b"room at last");
-    assert_eq!(echo.counters().slots_exhausted, 1);
-    assert_eq!(Echo::<2>::default().counters(), EchoCounters::new());
+    server.take(ids[2], b"GET / HTT");
+    assert_eq!(server.counters().slots_exhausted, 1);
+    assert_eq!(Server::<2>::default().counters(), HttpCounters::default());
+    // A peer that closes a connection the server never saw changes nothing.
+    server.note_peer_closed(ids[0]);
+    server.release(ids[0]);
 }
 
-/// A close the transport refuses — because this end has already closed — is held
-/// rather than counted as a close, and a send into storage too small likewise.
+/// A send or a close the transport refuses — because the connection is in a
+/// state that can do neither — leaves the server holding its response rather
+/// than reporting it sent.
 #[test]
-fn a_refused_close_or_send_leaves_the_echo_holding() {
-    let mut echo: Echo<2> = Echo::new();
+fn a_refused_send_or_close_leaves_the_server_holding() {
+    let mut server: Server<2> = Server::new();
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     let id = open(&mut stack, 40000, &mut out);
 
     // A connection still in `SYN_RECEIVED` can neither send nor close, so both
-    // arms of `drive` are refused and the bytes stay held.
-    echo.take(id, b"held");
-    echo.note_peer_closed(id);
-    assert_eq!(echo.drive(&mut stack, at(0), id, &mut out), None);
-    assert_eq!(echo.counters().bytes_echoed, 0);
-    assert_eq!(echo.counters().closes, 0);
+    // arms of `drive` are refused and nothing is counted as having gone out.
+    server.take(id, b"GET /metrics HTTP/1.1\r\n\r\n");
+    server.supply(|out| Body(8).render(out));
+    assert_eq!(server.counters().requests, 1);
+    assert_eq!(server.drive(&mut stack, at(0), id, &mut out), None);
+    assert_eq!(server.counters().response_bytes, 0);
 
-    // A peer that closed with nothing held, on a connection that cannot close:
-    // the close arm is reached and refused.
+    // A peer that closed with no request on a connection that cannot close: the
+    // close arm is reached and refused.
     let other = open(&mut stack, 40001, &mut out);
-    echo.note_peer_closed(other);
-    assert_eq!(echo.drive(&mut stack, at(0), other, &mut out), None);
-    assert_eq!(echo.counters().closes, 0);
+    server.take(other, b"");
+    server.note_peer_closed(other);
+    assert_eq!(server.drive(&mut stack, at(0), other, &mut out), None);
 }
 
 /// A retransmission the transport asks for and this endpoint cannot write —
@@ -1325,24 +1683,17 @@ fn a_retransmission_that_does_not_fit_is_counted_as_unavailable() {
     let mut endpoint = endpoint();
     let mut station = Station::new(40000, 0x5555);
     let mut out = vec![0u8; ROOMY];
-
-    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
-    let len = endpoint
-        .handle(Some(at(0)), &syn, &mut out)
-        .reply()
-        .expect("a SYN-ACK");
-    station.read(&out[..len]);
-    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
-    endpoint.handle(Some(at(0)), &ack, &mut out);
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), b"echo me");
+    handshake(&mut endpoint, &mut station, &mut out);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
+    supply(&mut endpoint, Body(32));
+    endpoint.poll_output(at(1_001), &mut out);
 
     // Storage that holds the two headers and nothing like a segment.
     let mut cramped = [0u8; Ipv4Frame::PAYLOAD_AT + 8];
-    let due = at(1_000).saturating_add(lfw_tcp::INITIAL_RTO);
+    let due = at(1_001).saturating_add(lfw_tcp::INITIAL_RTO);
     assert_eq!(endpoint.poll_timeouts(due, &mut cramped), None);
-    assert_eq!(endpoint.echo_counters().retransmits_unavailable, 1);
-    assert_eq!(endpoint.echo_counters().retransmits_served, 0);
+    assert_eq!(endpoint.http_counters().retransmits_unavailable, 1);
 }
 
 /// The two outcomes that are not a TCP segment answer `None` when asked what the
@@ -1436,5 +1787,117 @@ fn the_return_path_table_is_bounded_by_the_connection_table() {
         endpoint.paths.iter().flatten().count(),
         TCP_CONNECTIONS,
         "the path table grew past the connection table"
+    );
+}
+
+/// The close the end-to-end harness performs, which no other host test reaches:
+/// the appliance closes first (`Connection: close`), and the client answers that
+/// `FIN` with its own `FIN|ACK`. That segment acknowledges the appliance's `FIN`
+/// *and* occupies a sequence number of its own, and the appliance owes a bare
+/// `ACK` for it. A peer that never gets one waits out its close forever.
+#[test]
+fn the_client_s_own_fin_is_acknowledged() {
+    let mut endpoint = endpoint();
+    let mut station = Station::new(40000, 0x5150);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+    let answered = exchange(&mut endpoint, &mut station, BODY, SCRAPE);
+    assert!(answered.closed, "the appliance did not close first");
+
+    // The harness reaches this point over a real socket after tens of segments,
+    // so the gap is milliseconds rather than the microseconds a host test would
+    // otherwise leave: a connection reaped in between would answer nothing.
+    let mut clock = 90_000u64;
+    for _ in 0..64 {
+        clock += 1_000_000;
+        let _ = endpoint.poll_output(at(clock), &mut out);
+    }
+    let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
+    let mut reply = endpoint.handle(Some(at(clock)), &fin, &mut out).reply();
+    if reply.is_none() {
+        clock += 1;
+        reply = endpoint.poll_output(at(clock), &mut out);
+    }
+    let len = reply.expect("the appliance owes a bare ACK for the client's FIN");
+    let (flags, _, payload) = station.read(&out[..len]);
+    assert!(
+        flags.contains(lfw_tcp::Flags::ACK)
+            && !flags.contains(lfw_tcp::Flags::SYN)
+            && !flags.contains(lfw_tcp::Flags::FIN),
+        "a peer that has already closed owes a bare ACK, and this carries {flags:?}"
+    );
+    assert!(payload.is_empty(), "the final acknowledgement carries data");
+}
+
+/// A scraper is periodic, so the second scrape is the normal case and it may not
+/// be decided by timing. This is the release-kernel failure pinned: the previous
+/// connection has closed but the transport still holds its ranges — its peer's
+/// last acknowledgement has not arrived — and the next scrape is answered
+/// nonetheless. Waiting for that acknowledgement is what answered `200, 503` on
+/// the release kernel and `200, 200` on the debug one.
+#[test]
+fn a_second_scrape_is_answered_before_the_first_peer_s_last_acknowledgement() {
+    let mut endpoint = endpoint();
+    let mut out = vec![0u8; ROOMY];
+    let mut first = Station::new(40000, 0x6161);
+    handshake(&mut endpoint, &mut first, &mut out);
+    let answered = exchange(&mut endpoint, &mut first, BODY, SCRAPE);
+    assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
+    assert!(answered.closed, "the appliance did not close its end");
+
+    // Deliberately no acknowledgement of that FIN from `first`: the transport
+    // still holds the ranges it sent, which is exactly the state the release
+    // kernel reached between two `curl` runs.
+    let mut second = Station::new(40001, 0x6262);
+    handshake(&mut endpoint, &mut second, &mut out);
+    let again = exchange(&mut endpoint, &mut second, BODY, SCRAPE);
+    assert_eq!(
+        again.status_line(),
+        "HTTP/1.1 200 OK",
+        "the second scrape was refused for want of a buffer the first no longer needs"
+    );
+    assert_eq!(again.split().1, BODY.bytes());
+    assert_eq!(
+        endpoint.http_counters().responses[lfw_http::Status::ServiceUnavailable.slot()],
+        0,
+        "a scrape was refused 503"
+    );
+}
+
+/// The other half of that trade, stated so it is a decision rather than an
+/// accident: a response still going out is not taken from under the connection
+/// sending it.
+#[test]
+fn a_response_still_being_sent_keeps_its_buffer() {
+    let mut endpoint = endpoint();
+    let mut out = vec![0u8; ROOMY];
+    let mut first = Station::new(40000, 0x7171);
+    handshake(&mut endpoint, &mut first, &mut out);
+
+    // The request is in and the body supplied, but nothing has been read off the
+    // wire, so the response has not finished going out.
+    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let _ = endpoint.handle(Some(at(1_000)), &data, &mut out).reply();
+    supply(&mut endpoint, BODY);
+
+    // Read the refusal straight off this connection's own reply rather than
+    // through `exchange`, which polls whatever output is pending and would pick
+    // up the first connection's segments.
+    let mut second = Station::new(40001, 0x7272);
+    handshake(&mut endpoint, &mut second, &mut out);
+    let ask = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let len = endpoint
+        .handle(Some(at(2_000)), &ask, &mut out)
+        .reply()
+        .expect("the second connection is answered at once");
+    let (_, _, payload) = second.read(&out[..len]);
+    let head = core::str::from_utf8(&payload).expect("a status line");
+    assert!(
+        head.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "a response in flight had its buffer taken: {head:?}"
+    );
+    assert_eq!(
+        endpoint.http_counters().responses[lfw_http::Status::ServiceUnavailable.slot()],
+        1
     );
 }

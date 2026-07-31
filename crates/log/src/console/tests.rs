@@ -563,3 +563,26 @@ proptest! {
         }
     }
 }
+
+/// Every counter this path keeps reaches a slot of the shard the console domain
+/// publishes, and none reaches two. `lfw_metrics` names the vocabulary and
+/// depends on neither this crate nor `uart_16550`, so this is the enforcer that
+/// separation obliges (DOC-7).
+#[test]
+fn every_console_counter_reaches_its_own_slot() {
+    let counters = ConsoleCounters {
+        printed: 1,
+        malformed: 2,
+        unknown: 3,
+        unrenderable: 4,
+        write_failed: 5,
+    };
+    let sample = counters.to_sample(UartSample {
+        bytes_written: 6,
+        thre_timeouts: 7,
+        init_failures: 8,
+    });
+    let values = sample.values();
+    assert_eq!(values.len(), lfw_metrics::CONSOLE_SLOTS);
+    assert_eq!(values.to_vec(), (1..=8).collect::<Vec<u64>>());
+}

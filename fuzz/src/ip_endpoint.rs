@@ -88,6 +88,17 @@ pub fn ip_endpoint_harness(data: &[u8]) {
     .expect("a unicast pair on a /24");
     let mut out = [UNTOUCHED; REPLY_CAPACITY];
     let outcome = endpoint.handle(Some(now()), data, &mut out);
+    // A body of stated bytes rather than the appliance's own renderer: this
+    // harness is about the frame path, and the exposition has a target of its
+    // own. Supplied so a request that reached the server does not leave a
+    // connection waiting on one for ever.
+    if endpoint.body_wanted() {
+        endpoint.supply_body(|out| {
+            let body = b"# HELP x y\n# TYPE x counter\nx 1\n";
+            out.get_mut(..body.len())?.copy_from_slice(body);
+            Some(body.len())
+        });
+    }
 
     // One frame, one recorded outcome: the counters are what a scrape reads, so a
     // path that answered without recording would be invisible.

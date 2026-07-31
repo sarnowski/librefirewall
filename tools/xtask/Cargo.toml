@@ -54,6 +54,15 @@ net-headers = { path = "../../crates/net-headers" }
 # a name this crate may use, and writing the two numbers out here is the drift
 # every dependency above exists to close.
 lfw-clock = { path = "../../crates/clock" }
+# The stats region's extent, and — for the curl scenario's cross-check — the
+# metric names the appliance's own catalogue declares. Restating either here
+# would let the harness agree with itself: the whole point of that scenario is a
+# metric compared against traffic the harness observed independently.
+lfw-metrics = { path = "../../crates/metrics" }
+# The status codes and the content type the management server answers with, so
+# the curl scenario compares fields against the appliance's own vocabulary
+# rather than against literals beside it.
+lfw-http = { path = "../../crates/http" }
 
 [lints]
 workspace = true

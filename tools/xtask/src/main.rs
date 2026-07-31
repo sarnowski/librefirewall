@@ -53,6 +53,7 @@ mod grub;
 mod host;
 mod image;
 mod management_contract;
+mod metrics_contract;
 mod pins;
 mod qemu;
 mod reproducible;

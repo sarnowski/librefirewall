@@ -98,7 +98,7 @@ router on a firewall's substrate, not yet a firewall.
 | Virtual-wire (bump-in-the-wire) operation | **open** | CONCEPT §6.4 |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | CONCEPT §6.5 |
 | Flow classifier (cut-through vs. proxy path) | **open** | |
-| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **open** | a connection on the management port carries a byte stream and echoes it; nothing parses one |
+| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — [detail](#prometheus-metrics) |
 | OT/industrial protocol inspection | **open** | |
 | DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
 | Mirror port | **open** | |
@@ -145,7 +145,7 @@ router on a firewall's substrate, not yet a firewall.
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](#console-system-state-events) |
 | OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists |
-| Prometheus `/metrics` | **open** | groundwork only: the dataplane crates, the log rings, the console renderer and the UART all tally drops and faults in memory; nothing exposes, reads or names them as metrics |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers a 51-family, 205-series exposition covering every protection domain, scraped with `curl` in the gate; the endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](#prometheus-metrics) |
 | Local log buffer (`GET /logs`) | **open** | |
 
 ### Lifecycle, boot and trust
@@ -350,7 +350,7 @@ Held by 182 tests in `crates/config` and 99 in `crates/log`, by the handover's o
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the three QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the four QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -444,7 +444,7 @@ asserts OBS-5 directly: no record the ABI accepts can put a byte outside printab
 rendered console line, and no text value can carry one outside `[a-z0-9-]`, so a hostile peer cannot
 paint terminal escape sequences onto an operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the three system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the four system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected. Both halves were needed to make the defect non-recurring: a missing
@@ -499,10 +499,11 @@ indifferent to whether anything is printed.
   of six distinct errors the driver distinguishes — reaches nothing at all, and the node prints
   nothing. Diagnosing that is one bit where the driver has six. Closing it needs a reporting channel
   independent of the console.
-- **Every counter here is in memory and unexposed.** The UART's bytes written, THRE timeouts and
-  init failures; the renderer's printed, malformed, unknown, unrenderable and write-failed; each
-  writer's dropped and refused. Nothing reads any of them out (see *Prometheus `/metrics`*), so a
-  console that is silently dropping records is indistinguishable from one with nothing to say.
+- **Every counter here is now published rather than only tallied.** The UART's bytes written, THRE
+  timeouts and init failures; the renderer's printed, malformed, unknown, unrenderable and write-failed; each
+  writer's dropped and refused. All of them are now published and scrapable (see *Prometheus
+  `/metrics`*), so a console that is silently dropping records says so on the other surface — which
+  is the whole of what closes this, since the console cannot report its own silence.
 - **A record that will not render is now dropped, not reported.** It is counted as `unrenderable`
   and nothing is written. The previous transport wrote a `LFW-PD unrendered=<debug form>` line
   instead; that line is gone, and MONITORING.md no longer promises it.
@@ -568,8 +569,8 @@ at a `management` protection domain.
 That domain answers three protocols and counts everything: an **ARP request** for its own address is
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
 identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
-is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), which for this
-increment echoes the bytes it is sent. Everything else is refused by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it does
+is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), over which an
+HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)). Everything else is refused by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it does
 not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
 The decision is three host-tested `no_std` crates. `crates/net-headers` gained ARP (IPv4 over Ethernet
@@ -577,8 +578,8 @@ only; any other hardware type, protocol type, address length or operation is a t
 echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
 and one checksum routine. `crates/ip-endpoint` is the endpoint state machine — the appliance answering
 *for itself*, as against `crates/routing`, which forwards for others — with zero `unsafe`, a closed
-`Outcome` vocabulary, and a counter per outcome; it now owns a `crates/tcp` stack and the echo
-application above it, and keeps the transport's advertised window equal to that application's free
+`Outcome` vocabulary, and a counter per outcome; it now owns a `crates/tcp` stack and the HTTP
+server above it, and keeps the transport's advertised window equal to that server's free
 space. `pd_runtime::EndpointStage` joins it to the two
 pipelines: copy the frame out of the receive pool, decide, and where a reply was composed take a
 transmit buffer, write the reply into it and lend it to the driver.
@@ -629,9 +630,11 @@ deterministic client of its own, and then requires:
   checksum, likewise decoded rather than matched as bytes;
 - a **whole TCP exchange**, every step asserted as a field comparison: `SYN` → a `SYN-ACK` whose
   flags and acknowledgement number are checked and whose sequence number is *kept*, → `ACK` carrying
-  a payload → the **payload echoed back byte for byte** at the sequence number expected → `FIN` → a
-  `FIN-ACK` acknowledging it → the final `ACK`. Every segment's pseudo-header checksum is verified by
-  the harness's own summation, and a segment arriving at a step it does not belong to is refused;
+  a `GET /metrics` → the **response as a stream**, fifty-odd segments acknowledged one at a time and
+  reassembled in order, its `Content-Length` held to the bytes that arrived → the appliance's `FIN`,
+  `Connection: close` obliging it to close first → the client's `FIN` → the final `ACK`. Every
+  segment's pseudo-header checksum is verified by the harness's own summation, and a segment arriving
+  at a step it does not belong to is refused;
 - **distinct initial sequence numbers across the boots**, compared between scenarios — two boots of
   one disk are separated only by the per-boot `RDRAND` secret and the time component, so an equal
   pair would mean one of the two is not reaching the generator (RFC 6528);
@@ -640,7 +643,7 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the three scenarios additionally hold the console's own record to the frames and the bytes
+Two of the four scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the three boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -648,9 +651,10 @@ not satisfy it.
 
 **Missing.**
 
-- **No TLS and no HTTP.** TCP carries a stream and the connection echoes it, so there is still no
-  management *plane* — no `GET /metrics`, no `/config`, no `/logs`, no mTLS. The echo is a stand-in
-  that HTTP replaces wholesale rather than builds on.
+- **No TLS.** HTTP now answers `GET /metrics` ([detail](#prometheus-metrics)), but in the clear:
+  CONCEPT §11 requires mutual TLS on the management interface and there is none, so anyone who can
+  reach the port can scrape it. `/config` and `/logs` do not exist either, so the management plane is
+  one endpoint of the three.
 - **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
   there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
@@ -720,9 +724,9 @@ What the passive-open path implements, completely:
 - **MSS clamping** (the peer's offer against this end's own limit, with RFC 1122's default and
   floor), **window scaling** (RFC 7323, negotiated at the `SYN` and clamped to shift 14), and
   correct pseudo-header checksums both ways.
-- **The advertised window is the receiver's free space**, not a constant: `lfw_ip_endpoint`'s echo
-  keeps it equal to the room it has left, so a peer is never told it may send more than the endpoint
-  can take.
+- **The advertised window is the receiver's free space**, not a constant: `lfw_ip_endpoint`'s HTTP
+  server keeps it equal to the room it has left, so a peer is never told it may send more than the
+  endpoint can take.
 
 Every outcome is counted, one field per cause — twenty-five of them — under MONITORING.md's
 attribution rule: what a peer sent that was refused, and separately the one count that accuses this
@@ -761,8 +765,47 @@ one.
 - **Timers advance when the caller polls them.** The management domain is woken by a frame, so a
   `TIME_WAIT` on an otherwise silent port is reaped on the next frame rather than at its deadline.
   Bounded rather than unbounded — the table is also reaped under pressure — but not prompt.
-- **The counters reach no surface.** Twenty-five fields in memory and nothing that exposes them; see
+- **The counters now reach a surface.** All twenty-five are published as
+  `librefirewall_tcp_*` and scrapable; see *[Prometheus metrics](#prometheus-metrics)* and
   [MONITORING.md](MONITORING.md).
+
+### Prometheus metrics
+
+**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 51 metric
+families, 205 series, about 25 KiB — covering every one of the eight protection domains, and the
+end-to-end gate scrapes it with `curl` off a booted release image and cross-checks a number in it
+against traffic the harness watched cross the wire itself.
+
+The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
+shared table. A shard is a 768-byte, cache-line aligned array of 96 `AtomicU64` slots, mapped
+read-write into the one domain that owns it and read-only into the management domain; slot order is
+the catalogue's series order, asserted statically. So a domain publishes by relaxed store into memory
+nobody else may write, and the management domain renders by reading eight regions — no lock, no
+barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are individually
+meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
+last wrote; that is stated as a freshness boundary in MONITORING.md rather than papered over.
+
+The exposition is rendered by `crates/metrics` (`no_std`, panic-free, with a computed
+`MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `crates/http`
+(`no_std`, a bounded server-side HTTP/1.1 head parser that returns a typed error mapping onto one of
+eight statuses). Both are fuzzed. The management domain publishes its own shard *before* rendering,
+so a scrape always reports the request that asked for it.
+
+**Missing.**
+
+- **No mutual TLS — the endpoint is plain HTTP with no client authentication.** CONCEPT §11 requires
+  mTLS on the management interface. Anyone who can reach the port can scrape it, and the exposition
+  names every domain, drop reason and fault class in the node. This is a **deviation from CONCEPT**,
+  recorded here and in `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network
+  the management interface is not already isolated on.
+- **One response is staged at a time.** A scrape arriving while another is still going out is
+  answered `503` and counted. A finished-but-not-yet-reaped connection's buffer is reclaimed rather
+  than waited out, so a periodic scraper is never refused for the previous scrape — but two
+  *concurrent* scrapers can refuse each other.
+- **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, queue
+  and ring occupancy and flow-table numbers await the stateful dataplane, and log-buffer occupancy
+  awaits the buffer. None of them are absent by oversight.
+- **No `/config` and no `/logs`**, so the debug dump has only its state half.
 
 ### Trusted time source
 
@@ -782,7 +825,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the three QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the four QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts.
 
@@ -1049,7 +1092,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the sixteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (four system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | thirteen persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
@@ -1101,7 +1144,7 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the release A/B disk + bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot three QEMU scenarios: forwarding, generation swap, alternate config
+make test-system    # boot four QEMU scenarios: forwarding, generation swap, alternate config, metrics
 make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
 ```
 
@@ -1113,7 +1156,7 @@ project's own code: the protection domains are compiled with the `--release` Car
 configurations, so there is no debug binary and the Rust under test is the Rust that ships. Only the
 seL4 kernel build differs.
 
-`make test-system` is also the smoke test. It runs **three scenarios**, each a full boot of a signed
+`make test-system` is also the smoke test. It runs **four scenarios**, each a full boot of a signed
 disk through OVMF and GRUB with a host-controlled endpoint attached to each NIC port, and each
 asserting the routed contract in both directions, plus the management port's count and its silence:
 
@@ -1135,6 +1178,16 @@ asserting the routed contract in both directions, plus the management port's cou
    MAC with the first, judged on both channels. This is what proves the dataplane reads its table
    from the document: a compiled-in table would satisfy the first two scenarios and fail every probe
    here.
+4. **metrics-endpoint** — the published disk, with the management port on QEMU's user-mode stack and
+   a host port forwarded to it, scraped **twice** with `curl` rather than with the harness's own
+   frames. Two scrapes because one cannot contain the response it *is*: the endpoint counts a
+   response as it composes it, which is after the shard the exposition is rendered from is published,
+   so the second scrape is what carries the first's request and its `200`. Answering the second at
+   all is also what proves the one staged response is released rather than held through the previous
+   connection's `TIME_WAIT` — an endpoint that held it would refuse every scrape a periodic scraper
+   made. The document is parsed as exposition rather than string-matched, and one number in it —
+   frames forwarded — is cross-checked against the frames this same harness watched cross the
+   dataplane, so the scrape is held to the wire and not merely to itself.
 
 Every address in all of that comes from the configuration document the image under test was built
 from, so no part of the bench can hold an address the appliance does not. Each scenario prints what
@@ -1194,7 +1247,7 @@ make test                 # fast host gate (format, clippy, tests, coverage floo
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
-make test-system          # boot the three QEMU system scenarios on the release image
+make test-system          # boot the four QEMU system scenarios on the release image
 make test-ab              # boot the eight A/B state-machine scenarios on the release image
 make ci                   # the complete gate: host gate, fuzz, release image, system and A/B
 make release              # run CI, then keep `dist/` only if it proved what it holds
@@ -1229,8 +1282,8 @@ enabled for every download. Do not commit the certificate.
 `make release` runs the complete acceptance gate and **boots nothing of its own**. It has nothing
 left to boot: `ci` already assembles the production-oriented Microkit release configuration into
 `dist/` and already holds that disk to both contracts a booted appliance owes — the forwarding
-contract on all three system scenarios and all eight A/B scenarios, and the `LFW-CFG` transcript and
-the clock's established-time record on two of the three system scenarios. What `make release` adds is the other half of
+contract on all four system scenarios and all eight A/B scenarios, the `LFW-CFG` transcript and
+the clock's established-time record on two of them, and a `curl` scrape of `/metrics` on a fourth. What `make release` adds is the other half of
 BLD-3: if the gate did not prove the artifact, `dist/` is emptied rather than left holding an
 unproven image that looks finished. That covers a failure anywhere in the run, not a failed boot
 alone, because assembly populates `dist/` partway through and an incomplete release is no more

@@ -68,10 +68,16 @@ name = "lfw-clock"
 version = "0.1.0"
 
 [[package]]
+name = "lfw-http"
+version = "0.1.0"
+
+[[package]]
 name = "lfw-ip-endpoint"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
+ "lfw-http",
+ "lfw-metrics",
  "lfw-tcp",
  "net-headers",
 ]
@@ -81,7 +87,15 @@ name = "lfw-log"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
+ "lfw-metrics",
  "net-headers",
+ "wire",
+]
+
+[[package]]
+name = "lfw-metrics"
+version = "0.1.0"
+dependencies = [
  "wire",
 ]
 
@@ -116,8 +130,10 @@ dependencies = [
  "arbitrary",
  "config",
  "lfw-clock",
+ "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",
+ "lfw-metrics",
  "lfw-tcp",
  "libfuzzer-sys",
  "net-headers",
@@ -139,6 +155,7 @@ name = "nic-driver-core"
 version = "0.1.0"
 dependencies = [
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "virtio",
 ]
@@ -154,6 +171,7 @@ dependencies = [
  "lfw-clock",
  "lfw-ip-endpoint",
  "lfw-log",
+ "lfw-metrics",
  "net-headers",
  "packet-buffer",
  "queue",

@@ -24,9 +24,9 @@ use crate::{
 /// What committing a document did.
 ///
 /// Three outcomes rather than the two an `Option` carries: a commit whose
-/// content was already running assigned nothing and refused nothing, and
-/// folding the two together had a domain announce `state=refused` for a
-/// document it had accepted — one console token with two meanings (OBS-1).
+/// content was already running assigned nothing and refused nothing, and folding
+/// the two together had a domain announce `state=refused` for a document it had
+/// accepted (OBS-1).
 #[expect(
     clippy::large_enum_variant,
     reason = "boxing needs an allocator; the value is a temporary destructured at once"
@@ -50,10 +50,21 @@ impl CommitReport {
         }
     }
 
+    /// The generation now in force from this document, and 0 where none is:
+    /// this type says what *this commit* did, and a commit of content already
+    /// running assigned nothing.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        match self {
+            Self::Published(image) => image.generation,
+            Self::Unchanged | Self::Refused => 0,
+        }
+    }
+
     /// The state the domain announces, decided here so that it is host-tested
     /// (LAY-2). `Unchanged` is `Ready` because the configuration in force *is*
     /// the one the document names; which of the two got there is the `LFW-CFG`
-    /// record before it, which is why MONITORING.md has an operator read both.
+    /// record before it, and MONITORING.md has an operator read both.
     #[must_use]
     pub const fn state(self) -> DomainState {
         match self {
@@ -63,9 +74,8 @@ impl CommitReport {
     }
 }
 
-/// Read `document`, commit it, and report every value it moved.
-///
-/// `sink` is told which of the three outcomes it was before this returns.
+/// Read `document`, commit it, and report every value it moved. `sink` is told
+/// which of the three outcomes it was before this returns.
 pub fn commit_and_report(
     store: &mut Datastore,
     document: &[u8],

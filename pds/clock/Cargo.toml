@@ -18,6 +18,7 @@ lfw-log = { path = "../../crates/log" }
 lfw-rtc = { path = "../../crates/rtc" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
+lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]
 workspace = true

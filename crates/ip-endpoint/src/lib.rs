@@ -15,57 +15,58 @@
 //!   put on a wire by whatever is attached to the port, so each is parsed through
 //!   `net_headers` or `lfw_tcp` and refused by a typed error rather than believed.
 //! * **The management-plane attacker.** The port this runs on is the management port
-//!   (CONCEPT §9.1), so the station on it is the party that will one day open a TLS
-//!   session to the management API, and everything it sends before then arrives
-//!   here. A reply is a frame the appliance originates, and what decides whether one
-//!   is composed is entirely below.
+//!   (CONCEPT §9.1), so the station on it is the party the management API answers,
+//!   and everything it sends arrives here. A reply is a frame the appliance
+//!   originates, and what decides whether one is composed is entirely below.
 //!
 //! # Every reply is a decision, so every decision is counted
 //!
-//! An [`Outcome`] is returned *and* recorded in [`EndpointCounters`], the only
-//! evidence a port with an address is doing anything: a station probing an endpoint
-//! that silently refuses everything looks exactly like an idle link. The counters
-//! follow `routing::DropCounters` — saturating, never reset — because the rate is
-//! the attacker's to choose.
+//! An [`Outcome`] is returned *and* recorded in [`EndpointCounters`]: a station
+//! probing an endpoint that silently refuses everything looks exactly like an
+//! idle link. The counters follow `routing::DropCounters` — saturating, never
+//! reset — because the rate is the attacker's to choose.
 //!
-//! # The transport, and the one thing a connection does today
+//! # The transport, and the service on it
 //!
-//! `lfw_tcp` is the stack; on it sits [`echo::Echo`], which sends back what it was
-//! sent — a complete byte-stream application rather than a stub, because the only
-//! way to know a transport carries a stream is to carry one, and replaced wholesale
-//! by the management HTTP server rather than extended (ENG-6). Two consequences: an
-//! endpoint carries state between frames, so it is no longer `Copy`; and it needs a
-//! clock, every transport deadline being stated against a `lfw_clock::Monotonic` the
-//! caller reads — with none, a segment is [`Outcome::Unclocked`] and ARP and ICMP go
-//! on as before.
+//! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
+//! request per connection, answers `GET /metrics` with the Prometheus exposition
+//! its caller renders, answers everything else with a status, and closes. So an
+//! endpoint carries state between frames and is not `Copy`, and it needs a
+//! clock: with none, a segment is [`Outcome::Unclocked`] and ARP and ICMP go on
+//! as before. A response outgrows one segment by an order of magnitude, so
+//! [`Endpoint::poll_output`] is what a caller drives until a pass has nothing
+//! left to send.
+//!
+//! # Deviation from CONCEPT §11: the service is plain HTTP (CON-1, STA-4)
+//!
+//! CONCEPT §11 requires the management API to carry encryption, authentication
+//! and read/write authorization through an mTLS certificate pair. None of it
+//! exists: there is no TLS in this appliance, this endpoint authenticates
+//! nobody, and **anything that can reach the management port can read every
+//! metric the node exposes**. `GET /config` and `GET /logs` are absent too and
+//! answer 404 rather than being stubbed (ENG-7). README's status records it.
 //!
 //! # Deliberate narrowness, and what each exclusion costs
 //!
-//! * **No ARP cache, and no ARP request is ever sent.** A reply goes to the MAC its
-//!   request arrived from, which is on the frame, and a connection's return path is
-//!   remembered with the connection ([`ReturnPath`]) rather than by address.
-//! * **No address defence.** An RFC 5227 probe — sender address 0.0.0.0 — is
-//!   refused rather than answered, so a second station claiming this address is not
-//!   contradicted; answering one needs conflict state that does not exist.
-//! * **A reply is only ever composed for a neighbour.** The sender must share our
-//!   prefix: with no route table and no gateway, a reply to an off-link source would
-//!   leave under a next hop this endpoint never chose — `routing`'s
-//!   `DropReason::NoRoute`.
-//! * **Unicast only, at both layers.** A group MAC or a non-unicast IPv4 source is
-//!   refused rather than replied to: a reply addressed to a group is a reflector.
-//! * **ICMP is echo and nothing else** — no unreachable, no redirect, no timestamp,
-//!   and no fragment, an echo split across two datagrams being unreassemblable here.
-//! * **One TCP port, and no UDP.** A segment for any other port is refused by
-//!   `lfw_tcp` and counted there; a UDP datagram is [`Unhandled::Protocol`], as is
-//!   every protocol but ICMP and TCP. One service, one port.
+//! Every refusal below is a variant of [`Unhandled`], where it is documented;
+//! what the variants do not say is why the narrowness is deliberate. There is
+//! **no ARP cache and no request is ever sent**, a reply going to the MAC its
+//! request arrived from and a connection's return path being remembered with the
+//! connection ([`ReturnPath`]). There is **no address defence**: an RFC 5227
+//! probe is refused rather than answered, because contradicting a second station
+//! needs conflict state that does not exist. **A reply is only ever composed for
+//! a neighbour and only for a unicast one** — with no route table and no gateway
+//! an off-link reply would leave under a next hop nothing chose, and a reply
+//! addressed to a group is a reflector. And there is **one TCP port and no UDP**:
+//! one service, one port.
 //!
 //! # No allocator, and no buffer this crate owns
 //!
-//! [`Endpoint::handle`] writes its reply into storage the caller owns and returns
-//! its length, so the caller decides where a reply is composed — in the protection
-//! domain that runs this, a buffer it has just taken from a pool. Nothing here
-//! allocates: the connection table and the echo's held bytes are fixed arrays sized
-//! by the constants below.
+//! [`Endpoint::handle`] writes its reply into storage the caller owns, so the
+//! caller decides where a reply is composed — in the protection domain that runs
+//! this, a buffer it has just taken from a pool. The connection table, each
+//! connection's request slot and the one response staging buffer are fixed
+//! arrays sized by the constants below and in [`http`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -75,27 +76,25 @@ use core::fmt;
 use lfw_clock::Monotonic;
 use lfw_tcp::{ConnectionId, Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
 
-/// Re-exported rather than restated: the per-boot secret an initial sequence
-/// number is derived from is obtained by the protection domain, and the segment
-/// types are what a *test* composes one out of. Both reach this crate rather than
-/// the transport under it, so neither caller needs a dependency on both.
-pub use lfw_tcp::{Flags, IsnSecret, Outgoing, SeqNumber};
+/// Re-exported rather than restated: the per-boot secret is obtained by the
+/// protection domain and the segment types are what a *test* composes one out
+/// of, and both reach this crate rather than the transport under it.
+pub use lfw_tcp::{Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber};
 use net_headers::{
     ArpError, ArpOperation, ArpPacket, ArpReply, EchoReply, EtherType, Ethernet, IcmpEcho,
     IcmpError, Ipv4Address, Ipv4Frame, Ipv4Packet, MAX_PREFIX_LENGTH, MacAddress, ParseError,
     Protocol, ReplyError,
 };
 
-pub mod echo;
+pub mod http;
 
-use echo::{ECHO_CAPACITY, Echo, EchoCounters};
+use http::{HttpCounters, REQUEST_CAPACITY, Server};
 
 /// Connections one management port holds at once, and so the bound a connection
 /// flood is answered by (ENG-4).
 ///
-/// Eight rather than one, because an operator's browser opens several at a time;
-/// rather than many, because each carries a slot of [`ECHO_CAPACITY`] bytes in the
-/// protection domain's own memory.
+/// Eight rather than one, because a browser opens several at a time; rather than
+/// many, because each carries a [`REQUEST_CAPACITY`] slot.
 pub const TCP_CONNECTIONS: usize = 8;
 
 /// The port this endpoint listens on: the management HTTP port. A constant rather
@@ -104,19 +103,18 @@ pub const TCP_CONNECTIONS: usize = 8;
 /// document could move is one a scraper could not find.
 pub const MANAGEMENT_PORT: u16 = 80;
 
-/// The largest payload this endpoint composes in one segment. Equal to
-/// [`ECHO_CAPACITY`], so a peer's whole window fits one segment: the two numbers are
-/// one decision, asserted equal below rather than written twice.
-pub const TCP_MSS: u16 = 1024;
+/// The largest payload this endpoint composes in one segment: the classic
+/// Ethernet maximum, and it is the response side that fixes it — the round trips
+/// a scrape costs are its length divided by this.
+pub const TCP_MSS: u16 = 1460;
 
-const _: () = assert!(TCP_MSS as usize == ECHO_CAPACITY);
+// Ethernet, IPv4 and a TCP header with no options, in front of a full segment,
+// against the smallest storage any caller in this workspace offers.
+const _: () = assert!(Ipv4Frame::PAYLOAD_AT + 20 + TCP_MSS as usize <= 2036);
 
-/// Why a configured pair cannot be an endpoint's.
-///
-/// The same three rules `config::validate` holds a `<management>` element to, so a
-/// document that reached the appliance cannot produce one of these — and this type
-/// is what makes that a check rather than an assumption, an image crossing a
-/// protection-domain boundary between the two.
+/// Why a configured pair cannot be an endpoint's: the same three rules
+/// `config::validate` holds a `<management>` element to, re-checked because an
+/// image crosses a protection-domain boundary between the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointError {
     MacNotUnicast { mac: MacAddress },
@@ -140,9 +138,9 @@ impl fmt::Display for EndpointError {
 }
 
 /// Why a well-formed frame addressed to this endpoint went unanswered. Every
-/// variant is one this endpoint *could* have been built to answer and deliberately
-/// is not; one that is simply not ours is [`Outcome::NotForUs`], and one that is not
-/// what it claims is [`Outcome::Malformed`].
+/// variant is one it *could* have been built to answer and deliberately is not;
+/// not ours is [`Outcome::NotForUs`] and not what it claims is
+/// [`Outcome::Malformed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unhandled {
     /// An 802.1Q tag, with no sub-interface to interpret it.
@@ -408,23 +406,20 @@ impl Default for EndpointCounters {
 /// One addressed port, answering for itself. Not `Copy`, and not by omission: it
 /// holds a connection table and the bytes those connections owe, so a copy would
 /// answer on the same address with its own idea of every sequence space.
-#[derive(Clone, Debug)]
 pub struct Endpoint {
     mac: MacAddress,
     address: Ipv4Address,
     prefix_length: u8,
     counters: EndpointCounters,
     tcp: TcpStack<TCP_CONNECTIONS>,
-    echo: Echo<TCP_CONNECTIONS>,
+    http: Server<TCP_CONNECTIONS>,
     paths: [Option<ReturnPath>; TCP_CONNECTIONS],
 }
 
 /// Where one connection's frames arrive from, and so the only pair a segment this
-/// endpoint originates unprompted can be addressed to.
-///
-/// Not an ARP cache and unable to become one: no lookup by address, no ageing, no
-/// request ever sent. It is a connection's return path, learned from the frame that
-/// opened it and forgotten with it, so bounded by the connection table (ENG-4).
+/// endpoint originates unprompted can be addressed to. Not an ARP cache and
+/// unable to become one: learned from the frame that opened the connection and
+/// forgotten with it, so bounded by the connection table (ENG-4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReturnPath {
     connection: ConnectionId,
@@ -453,9 +448,7 @@ fn tcp_payload<'a>(packet: &Ipv4Packet<'a>, len: usize) -> &'a [u8] {
 
 impl Endpoint {
     /// # Errors
-    /// [`EndpointError`], for a pair no endpoint can answer under: a MAC that
-    /// names no single station, an address no host may hold, or a prefix length
-    /// no IPv4 prefix has.
+    /// [`EndpointError`], for a pair no endpoint can answer under.
     pub fn new(
         mac: MacAddress,
         address: Ipv4Address,
@@ -476,17 +469,17 @@ impl Endpoint {
             address,
             prefix_length,
             counters: EndpointCounters::new(),
-            // The window starts at the echo's whole capacity and is kept equal to
-            // its free space from then on, which is what makes it mean what a
-            // window means.
+            // The window starts at a request slot's whole capacity and is kept
+            // equal to its free space from then on, which is what makes it mean
+            // what a window means.
             tcp: TcpStack::new(
                 address,
                 MANAGEMENT_PORT,
                 TCP_MSS,
-                ECHO_CAPACITY as u32,
+                REQUEST_CAPACITY as u32,
                 secret,
             ),
-            echo: Echo::new(),
+            http: Server::new(),
             paths: [None; TCP_CONNECTIONS],
         })
     }
@@ -517,9 +510,10 @@ impl Endpoint {
         self.tcp.counters()
     }
 
+    /// What the server above the transport has done, one field per cause.
     #[must_use]
-    pub const fn echo_counters(&self) -> EchoCounters {
-        self.echo.counters()
+    pub const fn http_counters(&self) -> HttpCounters {
+        self.http.counters()
     }
 
     /// How many connections the port holds, in any state.
@@ -532,9 +526,8 @@ impl Endpoint {
     /// writing the reply into `out` and reporting its length in the outcome.
     ///
     /// `now` is `None` on a node with no time yet: ARP and ICMP are answered
-    /// regardless, and a TCP segment is refused as [`Outcome::Unclocked`] rather
-    /// than processed against a fabricated instant. `out` may be shorter than the
-    /// reply, in which case nothing is sent and the outcome says so.
+    /// regardless, and a TCP segment is refused as [`Outcome::Unclocked`]. `out`
+    /// may be shorter than the reply, and the outcome then says so.
     pub fn handle(&mut self, now: Option<Monotonic>, frame: &[u8], out: &mut [u8]) -> Outcome {
         let outcome = self.decide(now, frame, out);
         self.counters.record(outcome);
@@ -546,9 +539,8 @@ impl Endpoint {
     ///
     /// Called in a loop until it answers `None`: each answer either frees a
     /// connection or moves a deadline, so the loop terminates
-    /// (`lfw_tcp::TcpStack::poll_timeouts`). A caller woken only by traffic
-    /// therefore reaps on the next frame rather than at the deadline, which is
-    /// stated where the protection domain drives it.
+    /// (`lfw_tcp::TcpStack::poll_timeouts`). A caller woken only by traffic reaps
+    /// on the next frame rather than at the deadline.
     pub fn poll_timeouts(&mut self, now: Monotonic, out: &mut [u8]) -> Option<usize> {
         let timeout = {
             let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
@@ -560,12 +552,51 @@ impl Endpoint {
         let path = self.path_of(connection);
         let len = {
             let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
-            self.echo.answer(&mut self.tcp, now, timeout, segment)
+            self.http.answer(&mut self.tcp, now, timeout, segment)
         };
         if matches!(timeout, Timeout::Reaped { .. } | Timeout::Abandoned { .. }) {
             self.forget(connection);
         }
         Some(self.frame_around(path?, len?, out))
+    }
+
+    /// Whether a completed request is waiting on a body.
+    ///
+    /// A caller answers it by publishing whatever the body is *about* and then
+    /// calling [`supply_body`](Self::supply_body): the two steps exist so a
+    /// scrape's own request has been counted before the numbers are read. See
+    /// [`http`]'s header.
+    #[must_use]
+    pub fn body_wanted(&self) -> bool {
+        self.http.pending_body().is_some()
+    }
+
+    /// Render the pending body with `render`, which writes into the server's
+    /// staging buffer and answers its length.
+    pub fn supply_body(&mut self, render: impl FnOnce(&mut [u8]) -> Option<usize>) {
+        self.http.supply(render);
+    }
+
+    /// Compose the next segment any connection's response owes, writing it into
+    /// `out` and answering the frame's length.
+    ///
+    /// Driven in a loop until it answers `None`, which happens as soon as every
+    /// connection is done or blocked on its peer's window; a caller woken by one
+    /// frame would otherwise send one segment per frame received. Each answer
+    /// hands one range to the transport, so the loop is bounded by the response
+    /// length and by `lfw_tcp::MAX_UNACKED`.
+    pub fn poll_output(&mut self, now: Monotonic, out: &mut [u8]) -> Option<usize> {
+        self.http.sweep(&self.tcp);
+        let connection = self.http.pending()?;
+        let path = self.path_of(connection);
+        let len = {
+            let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
+            self.http.drive(&mut self.tcp, now, connection, segment)?
+        };
+        if self.tcp.connection(connection).is_none() {
+            self.forget(connection);
+        }
+        Some(self.frame_around(path?, len, out))
     }
 
     fn decide(&mut self, now: Option<Monotonic>, frame: &[u8], out: &mut [u8]) -> Outcome {
@@ -663,13 +694,12 @@ impl Endpoint {
         }
     }
 
-    /// Hand one segment to the transport, drive the echo over it, and compose
+    /// Hand one segment to the transport, drive the server over it, and compose
     /// whatever leaves.
     ///
     /// The segment is written where it will finally sit — at
-    /// [`Ipv4Frame::PAYLOAD_AT`] — and the two headers are stamped in front of it
-    /// afterwards, so the payload is written exactly once. That is what keeps a
-    /// response zero-copy through this crate.
+    /// [`Ipv4Frame::PAYLOAD_AT`] — and the headers are stamped in front of it
+    /// afterwards, so the payload is written exactly once.
     fn tcp(
         &mut self,
         now: Option<Monotonic>,
@@ -692,8 +722,9 @@ impl Endpoint {
             (
                 received.outcome,
                 received.connection,
-                // Copied out rather than borrowed: the echo takes the bytes, and
-                // the borrow of the segment they point into ends with this block.
+                // Copied out rather than borrowed: the server takes the bytes,
+                // and the borrow of the segment they point into ends with this
+                // block.
                 received.data.len(),
                 received.peer_closed,
                 received.emitted,
@@ -709,13 +740,13 @@ impl Endpoint {
 
         if delivered > 0 {
             let data = tcp_payload(packet, delivered);
-            self.echo.take(connection, data);
+            self.http.take(connection, data);
         }
         if peer_closed {
-            self.echo.note_peer_closed(connection);
+            self.http.note_peer_closed(connection);
         }
         if let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..)
-            && let Some(composed) = self.echo.drive(&mut self.tcp, now, connection, segment)
+            && let Some(composed) = self.http.drive(&mut self.tcp, now, connection, segment)
         {
             // A data segment or a `FIN` carries the acknowledgement a bare one
             // would have, so replacing the transport's answer loses nothing.
@@ -724,6 +755,7 @@ impl Endpoint {
         if self.tcp.connection(connection).is_none() {
             self.forget(connection);
         }
+        self.http.sweep(&self.tcp);
         if len == 0 {
             return Outcome::Tcp { len: 0, outcome };
         }
@@ -737,10 +769,9 @@ impl Endpoint {
     /// [`Ipv4Frame::PAYLOAD_AT`], answering the frame's length.
     ///
     /// It cannot refuse, and the zero is a value rather than an assertion because
-    /// ENG-5 admits none here. The proof: `len` bytes were written into
-    /// `out[PAYLOAD_AT..]`, so `out` is at least `PAYLOAD_AT + len` long, which is
-    /// what the frame needs. A zero would mean this crate wrote a segment somewhere
-    /// other than where it said, and would surface as a lost reply.
+    /// ENG-5 admits none here: `len` bytes were written into `out[PAYLOAD_AT..]`,
+    /// so `out` is at least as long as the frame needs. A zero would mean this
+    /// crate wrote a segment somewhere other than where it said.
     fn frame_around(
         &self,
         (peer_mac, peer): (MacAddress, Ipv4Address),
@@ -792,7 +823,7 @@ impl Endpoint {
                 *slot = None;
             }
         }
-        self.echo.release(connection);
+        self.http.release(connection);
     }
 
     /// The two rules that decide whether a reply can be addressed at all, applied

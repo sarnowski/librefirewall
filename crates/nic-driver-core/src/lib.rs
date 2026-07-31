@@ -56,6 +56,8 @@ pub mod port;
 #[cfg(test)]
 mod fake_device;
 
+use lfw_metrics::{DriverSample, LogSample, PoolSample};
+use pd_runtime::PoolCounters;
 use pd_runtime::{
     BUFFER_SIZE, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS, Pool, PoolOwner,
     RING_SLOTS, ReturnRing, RingConsumer, RingProducer, Verdict, buffer_paddr,
@@ -76,10 +78,34 @@ const _: () = assert!(VirtioNetHdr::LEN == pd_runtime::DEVICE_HEADER_LEN as usiz
 /// [`invariant`](Self::invariant) alone.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counters {
+    /// What the port moved, which is the only thing here that is not a fault.
+    pub traffic: Traffic,
     /// Expected to be non-zero on any network carrying traffic this node drops.
     pub input: InputDrops,
     /// Expected to be zero forever.
     pub invariant: InvariantFaults,
+}
+
+/// What crossed this port in each direction, on the same monotonic, saturating
+/// terms as [`InputDrops`].
+///
+/// Frames *and* bytes in both directions, because neither alone is readable: a
+/// frame count with no byte total cannot be told from one carrying nothing, and
+/// a byte total with no frame count says nothing about the shape of the load.
+/// Both are measured where this driver decides them — the receive length after
+/// the device's own header is subtracted and clamped to the buffer, the transmit
+/// length as the peer's descriptor named it — so neither is a number a device
+/// reported and nobody checked.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Traffic {
+    /// Frames taken off the device and handed to the peer.
+    pub receive_frames: u64,
+    /// Bytes those frames carried.
+    pub receive_bytes: u64,
+    /// Frames posted to the device for transmission.
+    pub transmit_frames: u64,
+    /// Bytes those frames carried.
+    pub transmit_bytes: u64,
 }
 
 /// Counts of frames this driver did not put on the wire for a reason outside
@@ -166,6 +192,47 @@ pub struct DriverStats {
 }
 
 impl DriverStats {
+    /// This port in the shape `lfw_metrics` publishes, slot for slot.
+    ///
+    /// The conversion lives here rather than in that crate because this is where
+    /// both halves are visible: `lfw_metrics` carries plain data and no
+    /// dependency on this crate, and the test below is what holds its vocabulary
+    /// tokens to the fields they name.
+    #[must_use]
+    pub fn to_sample(&self, receive_pool: PoolCounters, log: LogSample) -> DriverSample {
+        let input = &self.counters.input;
+        let invariant = &self.counters.invariant;
+        let traffic = &self.counters.traffic;
+        DriverSample {
+            receive_frames: traffic.receive_frames,
+            receive_bytes: traffic.receive_bytes,
+            transmit_frames: traffic.transmit_frames,
+            transmit_bytes: traffic.transmit_bytes,
+            input_drops: [
+                input.rx_runt_dropped,
+                input.rx_peer_ring_full,
+                input.tx_malformed,
+                input.tx_duplicate,
+                input.tx_discarded,
+                input.tx_verdict_undecodable,
+                input.tx_free_ring_full,
+            ],
+            invariant_faults: [
+                invariant.rx_completion_unmapped,
+                invariant.tx_completion_unmapped,
+                invariant.rx_slot_occupied,
+                invariant.tx_slot_occupied,
+            ],
+            receive_device_faults: device_faults(self.rx_device),
+            transmit_device_faults: device_faults(self.tx_device),
+            receive_pool: PoolSample {
+                not_lent: receive_pool.reclaim_not_lent,
+                ledger_refused: receive_pool.reclaim_refused,
+            },
+            log,
+        }
+    }
+
     #[must_use]
     pub fn sample<const Q: usize>(
         counters: &Counters,
@@ -178,6 +245,15 @@ impl DriverStats {
             tx_device: tx.device_faults(),
         }
     }
+}
+
+/// One queue's device-protocol faults, in the order `lfw_metrics` lists them.
+const fn device_faults(faults: DeviceFaults) -> [u64; 3] {
+    [
+        faults.completion_out_of_range,
+        faults.completion_not_posted,
+        faults.completion_length_over_reported,
+    ]
 }
 
 fn bump(counter: &mut u64) {
@@ -310,7 +386,16 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
                 frame_len as u32,
                 Verdict::Transmit,
             ) {
-                Ok(()) => received = true,
+                Ok(()) => {
+                    received = true;
+                    bump(&mut counters.traffic.receive_frames);
+                    // Saturating: the rate is the wire's to choose, and a
+                    // wrapped total turns a sustained flood into a small number.
+                    counters.traffic.receive_bytes = counters
+                        .traffic
+                        .receive_bytes
+                        .saturating_add(frame_len as u64);
+                }
                 Err(buffer) => {
                     bump(&mut counters.input.rx_peer_ring_full);
                     pool.release(buffer);
@@ -528,6 +613,11 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
                 bump(&mut counters.invariant.tx_slot_occupied);
             }
             self.in_flight[descriptor.buffer as usize] = true;
+            bump(&mut counters.traffic.transmit_frames);
+            counters.traffic.transmit_bytes = counters
+                .traffic
+                .transmit_bytes
+                .saturating_add(u64::from(descriptor.len));
             sent = true;
         }
         sent
@@ -856,6 +946,112 @@ mod tests {
         fn forwarded(&mut self) -> Option<Descriptor> {
             self.peer.try_dequeue()
         }
+
+        /// The two halves of [`Counters`] a case is usually about, without the
+        /// traffic tally beside them: a test asserting "nothing went wrong"
+        /// would otherwise have to restate every frame it moved on the way.
+        fn faults(&self) -> Faults {
+            Faults {
+                input: self.counters.input,
+                invariant: self.counters.invariant,
+            }
+        }
+    }
+
+    /// The fault halves of [`Counters`], for the assertion above.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Faults {
+        input: InputDrops,
+        invariant: InvariantFaults,
+    }
+
+    /// A frame handed to the peer is counted as received, and its byte total is
+    /// the frame's own length rather than what the device reported: a device
+    /// that over-reports has its length clamped first, so the total an operator
+    /// reads is the driver's measurement and not the device's claim.
+    #[test]
+    fn a_received_frame_is_counted_with_the_length_the_driver_clamped_to() {
+        let mut fx = RxFixture::new();
+        fx.refill();
+        let head = fx.device.next_avail().expect("a posted descriptor");
+        // Far more than the buffer holds, so the clamp is what decides the count.
+        fx.device.complete(head, u32::MAX);
+        assert!(fx.drain());
+        assert_eq!(fx.counters.traffic.receive_frames, 1);
+        assert_eq!(
+            fx.counters.traffic.receive_bytes,
+            (BUFFER_SIZE - VirtioNetHdr::LEN) as u64,
+            "the count is the clamped length"
+        );
+    }
+
+    /// A frame posted to the device is counted as transmitted, with the length
+    /// the peer's descriptor named — the header the driver adds is not traffic.
+    #[test]
+    fn a_transmitted_frame_is_counted_with_its_own_length() {
+        let mut fx = TxFixture::new();
+        fx.enqueue_frame(0, VirtioNetHdr::LEN, &[0x5Au8; 64]);
+        assert!(fx.post());
+        assert_eq!(fx.faults(), Faults::default());
+        assert_eq!(fx.counters.traffic.transmit_frames, 1);
+        assert_eq!(fx.counters.traffic.transmit_bytes, 64);
+    }
+
+    /// Every counter this driver keeps reaches a slot of the shard it publishes,
+    /// and none reaches two. `lfw_metrics` names the vocabulary and depends on
+    /// none of this, so this is the enforcer that separation obliges (DOC-7).
+    #[test]
+    fn every_driver_counter_reaches_its_own_slot() {
+        let stats = DriverStats {
+            counters: Counters {
+                traffic: Traffic {
+                    receive_frames: 1,
+                    receive_bytes: 2,
+                    transmit_frames: 3,
+                    transmit_bytes: 4,
+                },
+                input: InputDrops {
+                    rx_runt_dropped: 5,
+                    rx_peer_ring_full: 6,
+                    tx_malformed: 7,
+                    tx_duplicate: 8,
+                    tx_discarded: 9,
+                    tx_verdict_undecodable: 10,
+                    tx_free_ring_full: 11,
+                },
+                invariant: InvariantFaults {
+                    rx_completion_unmapped: 12,
+                    tx_completion_unmapped: 13,
+                    rx_slot_occupied: 14,
+                    tx_slot_occupied: 15,
+                },
+            },
+            rx_device: DeviceFaults {
+                completion_out_of_range: 16,
+                completion_not_posted: 17,
+                completion_length_over_reported: 18,
+            },
+            tx_device: DeviceFaults {
+                completion_out_of_range: 19,
+                completion_not_posted: 20,
+                completion_length_over_reported: 21,
+            },
+        };
+        let sample = stats.to_sample(
+            PoolCounters {
+                reclaim_not_lent: 22,
+                reclaim_refused: 23,
+            },
+            LogSample {
+                dropped: 24,
+                refused: 25,
+            },
+        );
+        let values = sample.values();
+        assert_eq!(values.len(), lfw_metrics::DRIVER_SLOTS);
+        let mut seen: Vec<u64> = values.to_vec();
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=25).collect::<Vec<u64>>());
     }
 
     /// One transmit virtqueue over a fresh region, plus the device on its far
@@ -877,6 +1073,14 @@ mod tests {
     }
 
     impl TxFixture {
+        /// As `RxFixture::faults`.
+        fn faults(&self) -> Faults {
+            Faults {
+                input: self.counters.input,
+                invariant: self.counters.invariant,
+            }
+        }
+
         fn new() -> Self {
             let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
             let rings: &'static ForwardRings = Box::leak(Box::new(ForwardRings::new()));
@@ -991,7 +1195,7 @@ mod tests {
         fx.device.deliver(&frame, frame.len() as u32);
 
         assert!(fx.drain());
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
         let descriptor = fx.forwarded().expect("one frame forwarded");
         assert_eq!(descriptor.offset, VirtioNetHdr::LEN as u32);
         assert_eq!(descriptor.len, payload.len() as u32);
@@ -1031,8 +1235,8 @@ mod tests {
         assert!(!fx.drain());
         assert_eq!(fx.device_faults().completion_not_posted, 1);
         assert_eq!(
-            fx.counters,
-            Counters::default(),
+            fx.faults(),
+            Faults::default(),
             "a device duplicate is neither an input drop nor a driver fault here"
         );
         assert_eq!(fx.vq.free_count(), free_after_first);
@@ -1068,7 +1272,7 @@ mod tests {
         // the cap is per call rather than a one-off.
         assert!(!fx.drain());
         assert_eq!(fx.device_faults().completion_not_posted, 2 * Q as u64);
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
         // Only the one real frame was ever forwarded.
         assert!(fx.forwarded().is_some());
         assert!(fx.forwarded().is_none());
@@ -1082,7 +1286,7 @@ mod tests {
         fx.device.deliver(&[0u8; 16], BUFFER_SIZE as u32 + 1000);
 
         assert!(fx.drain());
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
         let descriptor = fx.forwarded().expect("frame forwarded");
         // Clamped to the buffer, then the header removed.
         assert_eq!(descriptor.len, (BUFFER_SIZE - VirtioNetHdr::LEN) as u32);
@@ -1129,6 +1333,9 @@ mod tests {
         assert_eq!(
             fx.counters,
             Counters {
+                // Nothing was handed to the peer, so nothing was received:
+                // `traffic` moves only where a frame crossed.
+                traffic: Traffic::default(),
                 input: InputDrops {
                     rx_peer_ring_full: 1,
                     ..InputDrops::default()
@@ -1246,7 +1453,7 @@ mod tests {
         fx.enqueue_frame(7, VirtioNetHdr::LEN, &payload);
 
         assert!(fx.post());
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
 
         // The device sees the frame with the 12 header bytes zeroed in front.
         let on_wire = fx.device.transmit();
@@ -1278,6 +1485,7 @@ mod tests {
         assert_eq!(
             fx.counters,
             Counters {
+                traffic: Traffic::default(),
                 input: InputDrops {
                     tx_discarded: 1,
                     ..InputDrops::default()
@@ -1326,6 +1534,7 @@ mod tests {
         assert_eq!(
             fx.counters,
             Counters {
+                traffic: Traffic::default(),
                 input: InputDrops {
                     tx_verdict_undecodable: 1,
                     ..InputDrops::default()
@@ -1494,7 +1703,7 @@ mod tests {
         fx.device.complete(head, 0);
         fx.reap();
         assert_eq!(fx.device_faults().completion_not_posted, 1);
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
         assert!(
             fx.returned().is_none(),
             "the duplicate must not produce a second return"
@@ -1520,7 +1729,7 @@ mod tests {
         );
         fx.reap();
         assert_eq!(fx.device_faults().completion_not_posted, 2 * Q as u64);
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
         assert!(fx.returned().is_none());
         assert_eq!(
             fx.vq.free_count(),
@@ -1564,7 +1773,7 @@ mod tests {
 
         assert!(fx.post());
         assert_eq!(fx.vq.free_count(), 0, "the virtqueue is full");
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
 
         // Drain the device and reap, then the surplus goes out.
         for _ in 0..Q {
@@ -1573,7 +1782,7 @@ mod tests {
         fx.reap();
         assert!(fx.post());
         assert_eq!(fx.vq.free_count(), Q - 2);
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
     }
 
     #[test]
@@ -1704,7 +1913,7 @@ mod tests {
             ));
         }
         assert!(fx.post());
-        assert_eq!(fx.counters, Counters::default());
+        assert_eq!(fx.faults(), Faults::default());
 
         // A fresh queue restarts at slot zero, so every one of these collides.
         let mut stray = StrayQueue::new();

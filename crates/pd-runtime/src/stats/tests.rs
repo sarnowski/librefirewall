@@ -1,0 +1,231 @@
+use lfw_http::Status;
+use lfw_metrics::{HTTP_STATUSES, PIPELINES, ROUTE_STAGE_DROP_REASONS, SHARDS, STATS_SLOTS};
+use lfw_tcp::TcpCounters;
+
+use super::*;
+
+/// The metric surface names the router's reasons itself, because `lfw_metrics`
+/// depends on none of the crates whose counters it mirrors. This is the enforcer
+/// that obligation names (DOC-7): the two lists are one vocabulary in two places,
+/// and a reason added to `routing` without a slot here would render under the
+/// wrong name rather than not at all.
+#[test]
+fn the_route_drop_vocabulary_is_the_routers_own() {
+    assert_eq!(ROUTE_DROP_REASONS.len(), DropReason::ALL.len());
+    for (token, reason) in ROUTE_DROP_REASONS.iter().zip(DropReason::ALL) {
+        assert_eq!(*token, reason.name(), "{reason:?}");
+    }
+}
+
+/// The same for the endpoint's refusal vocabulary.
+#[test]
+fn the_unhandled_vocabulary_is_the_endpoints_own() {
+    let series: Vec<&str> = lfw_metrics::ManagementSample::SERIES
+        .iter()
+        .filter(|series| series.metric.name == "librefirewall_endpoint_unhandled_total")
+        .filter_map(|series| {
+            series
+                .labels
+                .iter()
+                .find(|label| label.name == "reason")
+                .map(|label| label.value)
+        })
+        .collect();
+    assert_eq!(series.len(), Unhandled::ALL.len());
+    for (token, reason) in series.iter().zip(Unhandled::ALL) {
+        assert_eq!(*token, reason.name(), "{reason:?}");
+    }
+}
+
+/// And for the statuses the server can answer with: the counter table's order is
+/// `lfw_http::Status::ALL`'s, so a slot is stable and a status added to one and
+/// not the other is a build-time mismatch here rather than a miscounted response.
+#[test]
+fn the_status_vocabulary_is_the_servers_own() {
+    assert_eq!(HTTP_STATUSES.len(), Status::ALL.len());
+    for (token, status) in HTTP_STATUSES.iter().zip(Status::ALL) {
+        assert_eq!(*token, status.token(), "{status:?}");
+        assert_eq!(HTTP_STATUSES[status.slot()], status.token());
+    }
+}
+
+/// The shard count and the pipeline count are build facts the system description
+/// fixes; `xtask::sysdesc` holds that file to them from the other side.
+#[test]
+fn the_build_facts_the_catalogue_states_are_this_builds() {
+    assert_eq!(PIPELINES, usize::from(2u8), "two dataplane pipelines");
+    assert_eq!(SHARDS.len(), lfw_metrics::SHARD_COUNT);
+    assert_eq!(SHARDS[lfw_metrics::FORWARDER_SHARD].domain, "forwarder");
+    assert_eq!(SHARDS[lfw_metrics::MANAGEMENT_SHARD].domain, "management");
+}
+
+/// Every field of `RouteCounters` reaches a slot, checked by giving each a
+/// distinct value and reading the whole sample back: a conversion that dropped
+/// one, or wrote one twice, leaves a zero behind.
+#[test]
+fn every_route_counter_reaches_its_own_slot() {
+    let mut counters = RouteCounters {
+        forwarded: 1,
+        egress_full: 2,
+        malformed_descriptor: 3,
+        snapshot_failed: 4,
+        unparsable: 5,
+        misrouted: 6,
+        writeback_failed: 7,
+        ..RouteCounters::default()
+    };
+    for reason in DropReason::ALL {
+        for _ in 0..=reason as u64 {
+            counters.drops.record(reason);
+        }
+    }
+    let sample = pipeline_sample(&counters);
+    assert_eq!(sample.forwarded, 1);
+    assert_eq!(
+        sample.stage_drops,
+        [2, 3, 4, 5, 6, 7],
+        "the stage's own reasons are out of order"
+    );
+    assert_eq!(sample.stage_drops.len(), ROUTE_STAGE_DROP_REASONS.len());
+    for (slot, reason) in DropReason::ALL.iter().enumerate() {
+        assert_eq!(sample.route_drops[slot], *reason as u64 + 1);
+    }
+}
+
+/// The forwarder's whole shard: two pipelines that must not be transposed, and
+/// the configuration and log counts behind them.
+#[test]
+fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
+    let first = RouteCounters {
+        forwarded: 11,
+        ..RouteCounters::default()
+    };
+    let second = RouteCounters {
+        forwarded: 22,
+        ..RouteCounters::default()
+    };
+    let sample = forwarder_sample(
+        [&first, &second],
+        7,
+        ConfigCounters {
+            applied: 3,
+            refused: 1,
+        },
+        log_sample(5, 2),
+    );
+    assert_eq!(sample.pipelines[0].forwarded, 11);
+    assert_eq!(sample.pipelines[1].forwarded, 22);
+    assert_eq!(sample.generation, 7);
+    assert_eq!(sample.images_applied, 3);
+    assert_eq!(sample.images_refused, 1);
+    assert_eq!(sample.log.dropped, 5);
+    assert_eq!(sample.log.refused, 2);
+    assert!(sample.values().len() <= STATS_SLOTS);
+}
+
+/// A port with no endpoint publishes zeros for everything above the stage, and
+/// the stage's own counts regardless: "not addressed yet" and "addressed and
+/// idle" are told apart by `frames` and `unaddressed`, not by an absent series.
+#[test]
+fn an_unaddressed_port_publishes_its_stage_and_zeroes_the_rest() {
+    let stage = EndpointStageCounters {
+        frames: 9,
+        bytes: 900,
+        unaddressed: 9,
+        ..EndpointStageCounters::default()
+    };
+    let sample = management_sample(&stage, PoolCounters::default(), None, log_sample(0, 0));
+    assert_eq!(sample.frames, 9);
+    assert_eq!(sample.bytes, 900);
+    assert_eq!(sample.stage_drops[3], 9);
+    assert_eq!(sample.endpoint, lfw_metrics::EndpointSample::default());
+    assert_eq!(sample.tcp, lfw_metrics::TcpSample::default());
+    assert_eq!(sample.http, lfw_metrics::HttpSample::default());
+}
+
+/// Every field of `TcpCounters` reaches a slot of its own. The transport has
+/// twenty-six causes and MONITORING.md's attribution rule turns on them staying
+/// apart, so a conversion that merged two would be the one defect that rule
+/// exists to prevent.
+#[test]
+fn every_transport_counter_reaches_its_own_slot() {
+    // A distinct value per field, produced by walking the struct through its own
+    // byte image: any two fields that shared a slot would collide.
+    let counters = TcpCounters {
+        segments_received: 1,
+        segments_sent: 2,
+        connections_accepted: 3,
+        connections_established: 4,
+        connections_closed: 5,
+        connections_evicted: 6,
+        connections_reaped: 7,
+        connections_abandoned: 8,
+        bytes_received: 9,
+        bytes_sent: 10,
+        bytes_retransmitted: 11,
+        retransmits: 12,
+        refused_malformed: 13,
+        refused_bad_checksum: 14,
+        refused_out_of_window: 15,
+        refused_table_full: 16,
+        refused_not_listening: 17,
+        refused_no_connection: 18,
+        refused_unacceptable_ack: 19,
+        refused_no_acknowledgement: 20,
+        refused_out_of_order: 21,
+        urgent_ignored: 22,
+        challenge_acks: 23,
+        resets_received: 24,
+        resets_sent: 25,
+        write_refused: 26,
+    };
+    let sample = TcpSample {
+        segments_received: counters.segments_received,
+        segments_sent: counters.segments_sent,
+        connections_accepted: counters.connections_accepted,
+        connections_established: counters.connections_established,
+        connections_closed: counters.connections_closed,
+        connections_evicted: counters.connections_evicted,
+        connections_reaped: counters.connections_reaped,
+        connections_abandoned: counters.connections_abandoned,
+        bytes_received: counters.bytes_received,
+        bytes_sent: counters.bytes_sent,
+        bytes_retransmitted: counters.bytes_retransmitted,
+        retransmits: counters.retransmits,
+        refused_malformed: counters.refused_malformed,
+        refused_bad_checksum: counters.refused_bad_checksum,
+        refused_out_of_window: counters.refused_out_of_window,
+        refused_table_full: counters.refused_table_full,
+        refused_not_listening: counters.refused_not_listening,
+        refused_no_connection: counters.refused_no_connection,
+        refused_unacceptable_ack: counters.refused_unacceptable_ack,
+        refused_no_acknowledgement: counters.refused_no_acknowledgement,
+        refused_out_of_order: counters.refused_out_of_order,
+        urgent_ignored: counters.urgent_ignored,
+        challenge_acks: counters.challenge_acks,
+        resets_received: counters.resets_received,
+        resets_sent: counters.resets_sent,
+        write_refused: counters.write_refused,
+    };
+    let management = ManagementSample {
+        tcp: sample,
+        ..ManagementSample::default()
+    };
+    let values = management.values();
+    let mut seen: Vec<u64> = values.iter().copied().filter(|value| *value != 0).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (1..=26).collect::<Vec<u64>>());
+}
+
+/// A log ring's counts are `u32` on the writing side and `u64` on the wire, and
+/// the widening is where a value could be lost.
+#[test]
+fn a_log_sample_widens_rather_than_truncates() {
+    let sample = log_sample(u32::MAX, u32::MAX - 1);
+    assert_eq!(sample.dropped, u64::from(u32::MAX));
+    assert_eq!(sample.refused, u64::from(u32::MAX - 1));
+    assert_eq!(
+        config_sample(u32::MAX, sample).generation,
+        u64::from(u32::MAX)
+    );
+}

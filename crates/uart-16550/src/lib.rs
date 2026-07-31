@@ -67,6 +67,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use lfw_metrics::UartSample;
+
 #[cfg(test)]
 mod fake_port;
 
@@ -320,6 +322,20 @@ pub struct UartStats {
     /// Refused initialisations. Expected to be zero; one means the console was
     /// never usable, and more than one means a caller retried.
     pub init_failures: u64,
+}
+
+impl UartStats {
+    /// These three in the shape `lfw_metrics` publishes them, through the
+    /// console crate's own carrier: `lfw_log::ConsoleSample` is one shard and
+    /// this device fills three of its slots.
+    #[must_use]
+    pub const fn to_sample(&self) -> UartSample {
+        UartSample {
+            bytes_written: self.bytes_written,
+            thre_timeouts: self.thre_timeouts,
+            init_failures: self.init_failures,
+        }
+    }
 }
 
 /// The controller, before it has been programmed.
@@ -1166,5 +1182,27 @@ mod tests {
                 prop_assert!(u16::from(offset) < PORT_COUNT);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::*;
+
+    /// The device's three numbers reach the three slots that name them. They are
+    /// identically named on both sides, which is exactly when a transposition is
+    /// invisible to a reader and visible only to a test.
+    #[test]
+    fn every_device_counter_reaches_its_own_slot() {
+        let sample = UartStats {
+            bytes_written: 1,
+            thre_timeouts: 2,
+            init_failures: 3,
+        }
+        .to_sample();
+        assert_eq!(sample.bytes_written, 1);
+        assert_eq!(sample.thre_timeouts, 2);
+        assert_eq!(sample.init_failures, 3);
+        assert_eq!(UartStats::default().to_sample(), UartSample::default());
     }
 }

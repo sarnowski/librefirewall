@@ -44,8 +44,10 @@
 
 use config::{Change, Datastore};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Field, RingSink, Sink};
+use lfw_metrics::StatsShard;
 use pd_runtime::{
     ConfigAck, ConfigHandover, ConfigPublisher, MAX_INTERFACES, MAX_NEIGHBOURS, attach_region,
+    config_sample, log_sample,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{LogConsume, LogRecords};
@@ -71,6 +73,7 @@ fn init() -> ConfigDomain {
     let ack: &'static ConfigAck = attach_region!(cfgack_vaddr: ConfigAck);
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
+    let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let sink = RingSink::new(log.writer(log_consume));
     announce(&sink, DomainState::Starting);
 
@@ -90,11 +93,16 @@ fn init() -> ConfigDomain {
     }
     announce(&sink, report.state());
 
-    ConfigDomain {
+    let domain = ConfigDomain {
         handover,
         ack,
         publisher,
-    }
+        stats,
+        sink,
+        generation: report.generation(),
+    };
+    domain.publish();
+    domain
 }
 
 fn announce(sink: &dyn Sink, state: DomainState) {
@@ -105,11 +113,35 @@ fn announce(sink: &dyn Sink, state: DomainState) {
     });
 }
 
-/// What survives `init`: the two regions and where the offer has got to.
+/// What survives `init`: the three regions, where the offer has got to, and the
+/// generation this domain committed.
 struct ConfigDomain {
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,
     publisher: ConfigPublisher,
+    /// The one region this domain writes its counters into.
+    stats: &'static StatsShard,
+    /// Kept past `init` because the counters it carries are published on every
+    /// activation, not only on the first.
+    sink: RingSink<'static>,
+    /// The generation committed at boot, and the only one there will ever be
+    /// (README: no channel to submit a second document over).
+    generation: u32,
+}
+
+impl ConfigDomain {
+    /// Write what this domain counts into its shard: the generation it
+    /// committed, and what its own log ring lost.
+    ///
+    /// A domain that commits once and then blocks writes a shard that never
+    /// moves again, which is correct — its counters do not move either.
+    fn publish(&self) {
+        let sample = config_sample(
+            self.generation,
+            log_sample(self.sink.dropped(), self.sink.refused()),
+        );
+        self.stats.publish(&sample.values());
+    }
 }
 
 impl Handler for ConfigDomain {
@@ -128,6 +160,7 @@ impl Handler for ConfigDomain {
         {
             CONSUMER.notify();
         }
+        self.publish();
         Ok(())
     }
 }

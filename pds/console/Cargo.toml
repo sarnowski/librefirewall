@@ -11,6 +11,7 @@ lfw-log = { path = "../../crates/log" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 uart-16550 = { path = "../../crates/uart-16550" }
 wire = { path = "../../crates/wire" }
+lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]
 workspace = true

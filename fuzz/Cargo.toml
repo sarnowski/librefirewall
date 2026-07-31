@@ -33,6 +33,10 @@ cargo-fuzz = true
 #                   composes a reply out of an adversary's own bytes
 #   lfw-tcp         the transport that carries a connection on that port: every
 #                   segment field, every option, and the state machine over them
+#   lfw-http        the request head a management-plane attacker composes, cut
+#                   into whatever segments it chooses
+#   lfw-metrics     the exposition rendered out of counters a peer PD wrote, into
+#                   storage of whatever size the endpoint has
 #   routing         the forwarding decision made from those headers
 #   queue           the shared ring whose cursors and slots a peer PD owns
 #   packet-buffer   the ownership ledger a peer PD's buffer returns cross
@@ -48,6 +52,8 @@ config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
 lfw-ip-endpoint = { path = "../crates/ip-endpoint" }
 lfw-tcp = { path = "../crates/tcp" }
+lfw-http = { path = "../crates/http" }
+lfw-metrics = { path = "../crates/metrics" }
 lfw-clock = { path = "../crates/clock" }
 routing = { path = "../crates/routing" }
 queue = { path = "../crates/queue" }
@@ -138,6 +144,20 @@ bench = false
 [[bin]]
 name = "nic_driver_paths"
 path = "fuzz_targets/nic_driver_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metrics_render"
+path = "fuzz_targets/metrics_render.rs"
 test = false
 doc = false
 bench = false

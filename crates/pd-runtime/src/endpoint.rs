@@ -67,12 +67,13 @@ use core::num::NonZeroU64;
 use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
 use lfw_ip_endpoint::{Endpoint, IsnSecret};
 use lfw_log::RejectReason;
+use lfw_metrics::LogSample;
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
 use crate::{
     BUFFER_SIZE, Committed, CommittedReader, DEVICE_HEADER_LEN, DRAIN_LIMIT, Descriptor,
     ForwardRings, Pool, PoolCounters, PoolOwner, RING_SLOTS, ReturnRing, RingConsumer,
-    RingProducer, Verdict, bump, descriptor_in_bounds, place, snapshot,
+    RingProducer, StatsRegions, Verdict, bump, descriptor_in_bounds, place, snapshot,
 };
 
 /// How many segments one pass may send out of the transport's own timers.
@@ -83,6 +84,20 @@ use crate::{
 /// it is derived from the connection table rather than chosen, one connection
 /// being able to owe at most a retransmission and a reaping in one instant.
 pub const TIMER_LIMIT: usize = 2 * lfw_ip_endpoint::TCP_CONNECTIONS;
+
+/// How many segments one pass may send out of the server above the transport.
+///
+/// A bound the peer does not choose (ENG-4), derived rather than picked: a
+/// connection may have at most `lfw_tcp::MAX_UNACKED` ranges outstanding before
+/// its window refuses another, so this is every connection saturated at once and
+/// the loop stops long before it on any real pass.
+pub const OUTPUT_LIMIT: usize = lfw_tcp_max_unacked() * lfw_ip_endpoint::TCP_CONNECTIONS;
+
+/// `lfw_tcp::MAX_UNACKED`, reached through the endpoint that re-exports the
+/// transport rather than through a second dependency on it.
+const fn lfw_tcp_max_unacked() -> usize {
+    lfw_ip_endpoint::MAX_UNACKED
+}
 
 /// Why a published calibration is not one this domain will convert a counter
 /// reading with.
@@ -230,6 +245,9 @@ pub struct EndpointStage<'ring> {
     /// picked up and an unchanged one is not re-read.
     clock_generation: u32,
     config: CommittedReader,
+    /// Every stats region this domain is granted: its own, written at the end of
+    /// each pass, and the seven it reads to answer a scrape.
+    stats: StatsRegions<'ring>,
     received: [u8; BUFFER_SIZE],
     reply: [u8; MAX_REPLY_LEN],
     counters: EndpointStageCounters,
@@ -269,7 +287,11 @@ impl<'ring> EndpointStage<'ring> {
     /// double-owned one. No type refuses the second call; `queue`'s crate
     /// header states that single-handle rule and why nothing enforces it.
     #[must_use]
-    pub fn attach(regions: EndpointRegions<'ring>, secret: IsnSecret) -> Self {
+    pub fn attach(
+        regions: EndpointRegions<'ring>,
+        secret: IsnSecret,
+        stats: StatsRegions<'ring>,
+    ) -> Self {
         Self {
             from: regions.receive.rx.consumer(),
             free: regions.receive_returns.free.producer(),
@@ -282,6 +304,7 @@ impl<'ring> EndpointStage<'ring> {
             calibration: None,
             clock_generation: 0,
             config: CommittedReader::new(),
+            stats,
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
             counters: EndpointStageCounters::default(),
@@ -405,7 +428,7 @@ impl<'ring> EndpointStage<'ring> {
     ///
     /// Reply buffers are reclaimed first, so a burst is answered out of the
     /// buffers the previous pass's replies have already freed.
-    pub fn poll(&mut self, now: Ticks) -> usize {
+    pub fn poll(&mut self, now: Ticks, log: LogSample) -> usize {
         self.tx.reclaim();
         let now = self.monotonic(now);
         let mut frames = 0;
@@ -431,10 +454,78 @@ impl<'ring> EndpointStage<'ring> {
                 break;
             }
         }
+        // Before the body, and this is the whole reason the body is *asked for*
+        // rather than rendered inside the parse: the exposition carries this
+        // domain's own counters, and the request it answers has just been
+        // counted. Publishing here is what makes a scrape report the scrape.
+        self.publish(log);
+        self.supply_body();
         if let Some(now) = now {
             self.drive_timers(now);
+            self.drive_output(now);
         }
+        self.publish(log);
         frames
+    }
+
+    /// Render the exposition for a request that is waiting on one.
+    ///
+    /// The whole metric surface, read out of the eight shards this domain is
+    /// granted, into the server's own staging buffer — which is sized by the
+    /// renderer's worst case, so the `None` path is unreachable and counted
+    /// rather than asserted (`lfw_ip_endpoint::http`).
+    fn supply_body(&mut self) {
+        let stats = self.stats;
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return;
+        };
+        if !endpoint.body_wanted() {
+            return;
+        }
+        endpoint.supply_body(|out| stats.snapshot().render(out).ok());
+    }
+
+    /// Send whatever the server above the transport now owes.
+    ///
+    /// A response spans many segments and a pass is woken by one frame, so
+    /// without this a scrape would advance one segment per acknowledgement
+    /// round trip. Bounded by [`OUTPUT_LIMIT`] as well as by the loop's own
+    /// termination — every answer hands a range to the transport, and a
+    /// connection blocks once `lfw_tcp::MAX_UNACKED` of them are outstanding.
+    fn drive_output(&mut self, now: Monotonic) {
+        for _ in 0..OUTPUT_LIMIT {
+            let Self {
+                endpoint, reply, ..
+            } = self;
+            let Some(endpoint) = endpoint.as_mut() else {
+                return;
+            };
+            let Some(len) = endpoint.poll_output(now, reply) else {
+                return;
+            };
+            self.send(len);
+        }
+    }
+
+    /// Write this domain's own counters into the shard it owns.
+    ///
+    /// Once per pass rather than once per frame, which is what keeps the whole
+    /// metric surface off the hot path (OBS-3): the cost of a drain of up to
+    /// `DRAIN_LIMIT` descriptors is one bounded run of relaxed stores.
+    ///
+    /// A scrape answered *during* a pass therefore reads this domain's own
+    /// series as of the end of the previous one; every other domain's is as
+    /// fresh as that domain last published. A self-reporting metric cannot do
+    /// better — a scrape can never include the bytes of its own answer — and
+    /// MONITORING.md records it.
+    pub fn publish(&self, log: LogSample) {
+        let sample = crate::stats::management_sample(
+            &self.counters,
+            self.tx.counters(),
+            self.endpoint.as_ref(),
+            log,
+        );
+        self.stats.own().publish(&sample.values());
     }
 
     /// Send whatever the transport's own timers now owe.

@@ -43,6 +43,8 @@
 
 use core::fmt;
 
+use lfw_metrics::{ConsoleSample, UartSample};
+
 use wire::{CheckedBody, LogReader, LogRecordError};
 
 use crate::detail::Cause;
@@ -112,6 +114,32 @@ pub struct ConsoleCounters {
     /// lost, and it is the one counter with nowhere to be reported *to* — the
     /// console is the reporting mechanism.
     pub write_failed: u64,
+}
+
+impl ConsoleCounters {
+    /// This path in the shape `lfw_metrics` publishes, slot for slot, with the
+    /// device's own three beside it.
+    ///
+    /// The conversion is here because this is where both halves are visible:
+    /// `lfw_metrics` carries plain data and depends on neither this crate nor
+    /// `uart_16550`, and the console protection domain holds one of each. The
+    /// order below is the metric catalogue's, held to it by the test at the end
+    /// of this module.
+    #[must_use]
+    pub const fn to_sample(&self, uart: UartSample) -> ConsoleSample {
+        ConsoleSample {
+            records: [
+                self.printed,
+                self.malformed,
+                self.unknown,
+                self.unrenderable,
+                self.write_failed,
+            ],
+            uart_bytes_written: uart.bytes_written,
+            uart_transmitter_timeouts: uart.thre_timeouts,
+            uart_init_failures: uart.init_failures,
+        }
+    }
 }
 
 /// Saturating rather than wrapping, on [`ConsoleCounters`]'s terms.
@@ -239,6 +267,18 @@ impl<W: ByteSink> ConsolePrinter<W> {
             return false;
         };
         self.print(&event)
+    }
+
+    /// The writer this printer owns, for a caller that has to ask the device
+    /// about itself.
+    ///
+    /// It exists because the printer owns the writer outright (see the type's
+    /// own note on why) and the console domain's shard carries both halves: the
+    /// device's three counters are reachable only through the borrow this
+    /// printer holds.
+    #[must_use]
+    pub const fn writer(&self) -> &W {
+        &self.writer
     }
 
     /// A snapshot of the counters.

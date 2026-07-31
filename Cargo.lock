@@ -167,6 +167,7 @@ dependencies = [
  "lfw-clock",
  "lfw-hpet",
  "lfw-log",
+ "lfw-metrics",
  "lfw-rtc",
  "pd-runtime",
  "sel4",
@@ -191,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "sel4-microkit",
  "wire",
@@ -201,6 +203,7 @@ name = "console"
 version = "0.1.0"
 dependencies = [
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "sel4",
  "sel4-microkit",
@@ -322,6 +325,7 @@ name = "forwarder"
 version = "0.1.0"
 dependencies = [
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "routing",
  "sel4-microkit",
@@ -440,10 +444,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-http"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "lfw-ip-endpoint"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
+ "lfw-http",
+ "lfw-metrics",
  "lfw-tcp",
  "net-headers",
  "proptest",
@@ -454,7 +467,16 @@ name = "lfw-log"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
+ "lfw-metrics",
  "net-headers",
+ "proptest",
+ "wire",
+]
+
+[[package]]
+name = "lfw-metrics"
+version = "0.1.0"
+dependencies = [
  "proptest",
  "wire",
 ]
@@ -519,6 +541,7 @@ version = "0.1.0"
 dependencies = [
  "lfw-clock",
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "sel4-microkit",
  "wire",
@@ -548,6 +571,7 @@ name = "nic-driver"
 version = "0.1.0"
 dependencies = [
  "lfw-log",
+ "lfw-metrics",
  "nic-driver-core",
  "pd-runtime",
  "sel4-microkit",
@@ -560,6 +584,7 @@ name = "nic-driver-core"
 version = "0.1.0"
 dependencies = [
  "lfw-log",
+ "lfw-metrics",
  "pd-runtime",
  "proptest",
  "virtio",
@@ -619,8 +644,11 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "lfw-clock",
+ "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",
+ "lfw-metrics",
+ "lfw-tcp",
  "net-headers",
  "packet-buffer",
  "proptest",
@@ -1233,6 +1261,7 @@ dependencies = [
 name = "uart-16550"
 version = "0.1.0"
 dependencies = [
+ "lfw-metrics",
  "proptest",
 ]
 
@@ -1413,7 +1442,9 @@ dependencies = [
  "config",
  "lfw-clock",
  "lfw-hpet",
+ "lfw-http",
  "lfw-log",
+ "lfw-metrics",
  "lfw-rtc",
  "net-headers",
  "nic-driver-core",

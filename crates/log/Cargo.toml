@@ -18,6 +18,10 @@ lfw-clock = { path = "../clock" }
 # dependency runs this way and never back: `wire` lays out regions and depends
 # on nothing, and turning a region's bytes into an event is this crate's.
 wire = { path = "../wire" }
+# The shard the console domain publishes into. `ConsoleCounters::to_sample` is
+# here because this crate owns one half of that shard and the protection domain
+# holds the other; `lfw-metrics` depends on neither.
+lfw-metrics = { path = "../metrics" }
 
 [dev-dependencies]
 proptest = { workspace = true }

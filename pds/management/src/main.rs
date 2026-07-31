@@ -31,15 +31,12 @@
 //!
 //! # Why this domain returns buffers and owns the reply pool
 //!
-//! In the routed dataplane a descriptor travels onward and the *egress* driver
-//! returns the buffer, which is what lets the forwarder be denied both `free`
-//! rings. A terminal port has no egress driver, so this domain produces the
-//! returns itself on the receive pipeline and is granted `mgmt_rx_free`
-//! read-write; and a reply is a frame it originates, so it is the *owner* of the
-//! transmit pool and reclaims what the driver hands back. It is not the owner of
-//! the receive pool: the driver is, and it alone decides whether a returned index
-//! is one it lent. The argument is `pd_runtime::endpoint`'s and the grant is the
-//! system description's.
+//! A terminal port has no egress driver to return a buffer, so this domain
+//! produces the returns itself on the receive pipeline and is granted
+//! `mgmt_rx_free` read-write; and a reply is a frame it originates, so it owns
+//! the transmit pool and reclaims what the driver hands back. It is not the owner
+//! of the receive pool: the driver is, and it alone decides whether a returned
+//! index is one it lent.
 //!
 //! # It reads the configuration and acknowledges nothing
 //!
@@ -53,18 +50,15 @@
 //! `pd_runtime::CommittedReader` is that weaker role, and it holds the whole of
 //! it.
 //!
-//! What it costs, stated because nothing here would otherwise reveal it: this
-//! domain holds no channel to the configuration domain, so it learns of a commit
-//! only when something else wakes it — the next frame to arrive. A port that is
-//! never spoken to never picks up its address, and nothing needs it to.
+//! What it costs: this domain holds no channel to the configuration domain, so
+//! it learns of a commit only when the next frame wakes it.
 //!
 //! # Two instructions, and why they are here rather than in a crate
 //!
 //! Reading a counter and drawing a random number are capabilities, not logic:
-//! neither can be exercised by a host test, and a crate that reached for either
-//! could not be driven by one at all. So both live here, each in one `unsafe`
-//! block with a `SAFETY` comment naming what guarantees it, and everything done
-//! *with* the numbers is in a crate.
+//! neither can be exercised by a host test. So both live here, each in one
+//! `unsafe` block naming what guarantees it, and everything done *with* the
+//! numbers is in a crate.
 //!
 //! * **`RDTSC`**, once per wakeup. It is what makes a `Monotonic` out of the
 //!   calibration this domain reads, and every transport timer is stated against
@@ -79,38 +73,54 @@
 //!
 //! # It reads the clock and cannot set it
 //!
-//! The calibration region is mapped READ-ONLY, on the same footing as `cfg`: this
-//! domain is a *consumer* of what the clock domain measured. One that could write
-//! it would be able to move this node's own idea of time — every retransmission
-//! deadline, every reaping deadline, and one day every certificate's validity
-//! window (CONCEPT §7.2) — from the domain that answers the management-plane
-//! attacker. What it costs is the same thing the configuration costs: with no
-//! channel to the clock domain, a republished calibration is picked up on the next
-//! frame that wakes this one.
+//! The calibration region is mapped READ-ONLY, on the same footing as `cfg`. One
+//! that could write it would be able to move this node's own idea of time —
+//! every retransmission and reaping deadline, and one day every certificate's
+//! validity window (CONCEPT §7.2) — from the domain that answers the
+//! management-plane attacker. Every number in it is judged rather than believed
+//! (`pd_runtime::calibration_from`), the clock domain having measured them
+//! against a device; a triple this domain refuses leaves the port answering ARP
+//! and ICMP and refusing TCP.
 //!
-//! Every number in that region is judged rather than believed
-//! (`pd_runtime::calibration_from`): the clock domain measured them against a
-//! device, so a frequency in it is CONCEPT §7.1's hostile or malfunctioning device
-//! one indirection away. A triple this domain refuses leaves the port answering
-//! ARP and ICMP — which need no time — and refusing TCP, which does.
+//! # It answers `GET /metrics`, and it reads seven other domains to do it
 //!
-//! # What a record says, and why not one per frame
+//! It maps **eight** stats shards: its own read-write, and one per other
+//! protection domain READ-ONLY. That asymmetry is the whole argument — every
+//! number it renders is a claim only the domain that made it could have written,
+//! so a compromise of the domain that faces the management-plane attacker cannot
+//! forge a clean line for a port that is dropping every frame. What stays
+//! withheld is in `systems/qemu-x86_64/librefirewall.system` beside those rows.
+//! Its own shard is the one region in this system with exactly one mapper, so
+//! the renderer walks one uniform array rather than seven regions plus a live
+//! read of its own counters.
+//!
+//! # Deviation from CONCEPT §11: the endpoint is plain HTTP (CON-1, STA-4)
+//!
+//! CONCEPT §11 requires the management API to carry encryption, authentication
+//! and read/write authorization through an mTLS certificate pair. **None of it
+//! exists.** There is no TLS in this appliance, this domain authenticates
+//! nobody, and anything that can reach the management port can read every metric
+//! this node exposes. `GET /config` and `GET /logs` are absent too and answer 404
+//! rather than being stubbed (ENG-7). Until CONCEPT §11's TLS termination
+//! exists the port belongs on an isolated network; README's status records it.
+//!
+//! # What a console record says, and why not one per frame
 //!
 //! The console carries system state and never traffic (OBS-1), so nothing here
 //! reports a frame. What it reports is the port's running total, on any pass
-//! that moved at least one frame: a cumulative pair an operator reads as "this
-//! port is receiving", which is a fact about the node. The counts move to the
-//! metrics endpoint (CONCEPT §11) when one exists, and MONITORING.md records
-//! that this record is where they live until then.
+//! that moved at least one: "this port is receiving", which is a fact about the
+//! node. Every count now also reaches `/metrics`, where the rest of what this
+//! domain knows about itself lives.
 
 mod entropy;
 
 use entropy::EntropyError;
 use lfw_clock::Ticks;
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
+use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, EndpointRegions, EndpointStage,
-    ForwardRings, IsnSecret, Pool, ReturnRing, attach_region,
+    ForwardRings, IsnSecret, Pool, ReturnRing, StatsRegions, attach_region, log_sample,
 };
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{LogConsume, LogRecords};
@@ -197,6 +207,21 @@ fn init() -> Management {
         }
     };
 
+    // In `lfw_metrics::SHARDS` order, which is the ABI: a snapshot reads slot 3
+    // as `nic_driver2`'s, so a pair handed over out of order would attribute one
+    // port's traffic to another.
+    let stats = StatsRegions {
+        shards: [
+            attach_region!(stats_forwarder_vaddr: StatsShard),
+            attach_region!(stats_nic_driver0_vaddr: StatsShard),
+            attach_region!(stats_nic_driver1_vaddr: StatsShard),
+            attach_region!(stats_nic_driver2_vaddr: StatsShard),
+            attach_region!(stats_management_vaddr: StatsShard),
+            attach_region!(stats_console_vaddr: StatsShard),
+            attach_region!(stats_config_vaddr: StatsShard),
+            attach_region!(stats_clock_vaddr: StatsShard),
+        ],
+    };
     let stage = EndpointStage::attach(
         EndpointRegions {
             receive: attach_region!(mgmt_rx_fwd_vaddr: ForwardRings),
@@ -207,6 +232,7 @@ fn init() -> Management {
             transmit_pool: attach_region!(mgmt_tx_pool_vaddr: Pool),
         },
         secret,
+        stats,
     );
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
@@ -307,7 +333,12 @@ impl Handler for Management {
         // Read once per wakeup and used for the whole pass: every frame in one
         // drain is answered at one instant, which is what makes a retransmission
         // deadline a property of the pass rather than of a frame's position in it.
-        if running.stage.poll(read_timestamp_counter()) > 0 {
+        //
+        // The log ring's own counts travel in with it, because the shard the
+        // pass publishes carries them and this domain is the only thing that can
+        // read them.
+        let log = log_sample(running.sink.dropped(), running.sink.refused());
+        if running.stage.poll(read_timestamp_counter(), log) > 0 {
             let counters = running.stage.counters();
             announce(
                 &running.sink,

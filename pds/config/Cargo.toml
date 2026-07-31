@@ -10,6 +10,7 @@ config = { path = "../../crates/config" }
 lfw-log = { path = "../../crates/log" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
+lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]
 workspace = true

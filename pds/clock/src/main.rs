@@ -78,8 +78,9 @@ use lfw_clock::{
 };
 use lfw_hpet::{Hpet, HpetError, WORST_CASE_SERVICEABLE_WAIT};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
+use lfw_metrics::{ClockSample, StatsShard};
 use lfw_rtc::{Rtc, RtcError};
-use pd_runtime::attach_region;
+use pd_runtime::{attach_region, log_sample};
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{CalibrationImage, ClockCalibration, LogConsume, LogRecords};
 
@@ -332,8 +333,10 @@ fn init() -> Clock {
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let sink = RingSink::new(log.writer(log_consume));
     let published: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
+    let mut frequency_hertz = 0;
     match establish() {
         Ok(calibration) => {
             // The instant as of now rather than the anchor itself, which is
@@ -356,6 +359,7 @@ fn init() -> Clock {
                 boot_ticks: calibration.boot_ticks().0,
                 boot_unix_nanos: calibration.boot_unix_nanos(),
             });
+            frequency_hertz = calibration.tsc_hz().get();
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
@@ -367,6 +371,17 @@ fn init() -> Clock {
             );
         }
     }
+    // Last, and once: this domain runs to completion and parks with no channel
+    // to wake it, so its shard is written here and never moves again — which is
+    // correct, its counters not moving either. A refusal leaves the frequency at
+    // zero, which is what "this node measured nothing" reads as.
+    stats.publish(
+        &ClockSample {
+            frequency_hertz,
+            log: log_sample(sink.dropped(), sink.refused()),
+        }
+        .values(),
+    );
     Clock
 }
 

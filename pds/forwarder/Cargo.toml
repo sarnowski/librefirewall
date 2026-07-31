@@ -10,6 +10,7 @@ pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
 lfw-log = { path = "../../crates/log" }
 routing = { path = "../../crates/routing" }
+lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]
 workspace = true

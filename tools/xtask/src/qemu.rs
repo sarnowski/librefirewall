@@ -42,8 +42,8 @@ use crate::{
     clock_contract,
     config_transcript::ConfigContract,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
-    forward_harness::{self, BootContract, BootTest, Booted},
-    image, management_contract,
+    forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking},
+    image, management_contract, metrics_contract,
     topology::{PORTS, Topology},
     util::{copy_file, locate, require_file, run_command},
 };
@@ -154,6 +154,24 @@ enum ImageUnderTest {
     BuiltForTheScenario,
 }
 
+/// What a scenario does with the management port.
+///
+/// The two are mutually exclusive by construction, which is the point: a
+/// harness that plays a station on the wire sees every frame and composes every
+/// reply, and a harness that lets a real client in sees none of them. Asserting
+/// both in one boot would mean two things on one wire.
+enum ManagementRole {
+    /// The harness is the station: it injects opaque frames, an ARP request, an
+    /// ICMP echo request and a whole TCP exchange, and judges every answer field
+    /// by field.
+    Station,
+    /// QEMU's user-mode stack carries the port and `curl` scrapes `GET /metrics`
+    /// through a host port forward. Nothing at frame level is asserted on that
+    /// wire; what is asserted is the HTTP response and one metric value against
+    /// traffic the harness observed on the *dataplane* ports in the same boot.
+    Scraped,
+}
+
 /// Whether a scenario reads the console beside the traffic.
 ///
 /// One flag for every channel rather than one each, because it is one decision:
@@ -179,6 +197,7 @@ struct Scenario {
     document: &'static str,
     image: ImageUnderTest,
     console: Console,
+    management: ManagementRole,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
@@ -213,18 +232,32 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             document: image::CONFIGURATION_DOCUMENT,
             image: ImageUnderTest::Published,
             console: Console::Ignored,
+            management: ManagementRole::Station,
         },
         Scenario {
             name: "generation-swap",
             document: image::CONFIGURATION_DOCUMENT,
             image: ImageUnderTest::Published,
             console: Console::Judged,
+            management: ManagementRole::Station,
         },
         Scenario {
             name: "alternate-configuration",
             document: ALTERNATE_DOCUMENT,
             image: ImageUnderTest::BuiltForTheScenario,
             console: Console::Judged,
+            management: ManagementRole::Station,
+        },
+        Scenario {
+            name: "metrics-endpoint",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            // The console is not judged here and it is not an omission: this
+            // scenario injects no management frame, so the `frames=`/`bytes=`
+            // equality the other two hold the console to has nothing to be
+            // stated against. What it judges instead is the endpoint's answer.
+            console: Console::Ignored,
+            management: ManagementRole::Scraped,
         },
     ];
 
@@ -258,7 +291,8 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     let distinct = judge_sequence_numbers(&sequence_numbers)?;
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript, the clock record and the management port's count; {distinct}",
+         configuration transcript, the clock record and the management port's count, and one \
+         scraped with curl; {distinct}",
         scenarios.len(),
         Run::Shipping.config(),
     ))
@@ -346,7 +380,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     let disk = scenario_disk(root, scenario, run)?;
 
     let log_name = format!("qemu-{name}{}.log", run.name_suffix());
-    let booted = boot_and_forward(root, &disk, &log_name, &topology)
+    let backing = match scenario.management {
+        ManagementRole::Station => ManagementBacking::Socket,
+        ManagementRole::Scraped => ManagementBacking::UserNetwork {
+            host_port: forward_harness::reserve_host_port()
+                .map_err(|error| format!("scenario {name}: {error}"))?,
+        },
+    };
+    let booted = boot_and_forward(root, &disk, &log_name, &topology, backing)
         .map_err(|error| format!("scenario {name}: {error}"))?;
 
     // The table before the verdict: what the two endpoints exchanged and what
@@ -359,6 +400,32 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     }
 
     let log = scenario_log(root, scenario, run);
+    // The scrape before the console, because it is the whole of what this
+    // scenario proves and its evidence belongs where a reader looks first.
+    let scraped = match &scenario.management {
+        ManagementRole::Station => String::new(),
+        ManagementRole::Scraped if booted.scrapes.is_empty() => {
+            return Err(format!(
+                "scenario {name}: the boot met its routed contract and no scrape was taken, so \
+                 nothing was proved about the metrics endpoint\n  full run log: {}",
+                log.display()
+            ));
+        }
+        ManagementRole::Scraped => {
+            let judged = metrics_contract::judge(&booted.scrapes, booted.dataplane_frames)
+                .map_err(|error| {
+                    format!(
+                        "scenario {name}: {error}\n  full run log: {}",
+                        log.display()
+                    )
+                })?;
+            let evidence = metrics_contract::evidence(&booted.scrapes, &judged);
+            println!("{evidence}");
+            append_evidence(&log, &evidence)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {} scrapes judged", booted.scrapes.len())
+        }
+    };
     let judged = match scenario.console {
         Console::Ignored => String::new(),
         Console::Judged => {
@@ -382,7 +449,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
         }
     };
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}{judged}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}{judged}{scraped}); QEMU output is in {}",
         run.config(),
         booted.traffic.summary(),
         log.display()
@@ -401,8 +468,35 @@ pub(crate) fn boot_and_forward(
     disk: &Path,
     log_name: &str,
     topology: &Topology,
+    management: ManagementBacking,
 ) -> Result<Booted, String> {
-    boot(root, disk, log_name, BootContract::Routed, topology)
+    boot(
+        root,
+        disk,
+        log_name,
+        BootContract::Routed,
+        topology,
+        management,
+    )
+}
+
+/// Write one scrape's evidence into the run log, behind the guest's own output.
+///
+/// The log is the artifact a reader opens after a failure, and a proof that
+/// exists only in a terminal that has scrolled away is not evidence. Appended
+/// rather than interleaved: the capture above it is the guest's, byte for byte,
+/// and nothing this harness writes may land inside it.
+fn append_evidence(log: &Path, evidence: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(log)
+        .map_err(|error| format!("open {} to append the scrape: {error}", log.display()))?;
+    writeln!(
+        file,
+        "\n# the metrics scrape this boot was judged by\n{evidence}"
+    )
+    .map_err(|error| format!("append the scrape to {}: {error}", log.display()))
 }
 
 /// Boot `disk` expecting NO slot to be bootable: no injected packet may come
@@ -422,6 +516,7 @@ pub(crate) fn boot_and_halt(
         log_name,
         BootContract::Halted { marker },
         topology,
+        ManagementBacking::Socket,
     )
 }
 
@@ -431,9 +526,10 @@ fn boot(
     log_name: &str,
     contract: BootContract,
     topology: &Topology,
+    management: ManagementBacking,
 ) -> Result<Booted, String> {
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
-    let backends = forward_harness::NicBackends::new()?;
+    let backends = forward_harness::NicBackends::new(management)?;
     let Invocation {
         mut command,
         acceleration,
@@ -519,7 +615,7 @@ impl GuestNic {
     /// the dataplane ports, so `addr=0{slot+2}.0` reproduces 00:02.0, 00:03.0
     /// and 00:04.0 — and 00:04.0 is the device whose ECAM page the system
     /// description grants as `ecam2` at PCIEXBAR + (4 << 15).
-    const fn slot(self) -> usize {
+    pub(crate) const fn slot(self) -> usize {
         match self {
             Self::Dataplane(port) => port,
             Self::Management => PORTS,

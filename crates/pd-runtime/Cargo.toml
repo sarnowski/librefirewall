@@ -15,9 +15,19 @@ lfw-ip-endpoint = { path = "../ip-endpoint" }
 # transport's timers are stated against.
 lfw-clock = { path = "../clock" }
 lfw-log = { path = "../log" }
+# The shards this domain and its neighbours publish into, and the exposition the
+# management endpoint answers a scrape with. The conversions from this crate's
+# counters into that crate's samples live here (`stats`), because this is where
+# both halves are visible.
+lfw-metrics = { path = "../metrics" }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The status vocabulary the metric catalogue counts responses under, held to
+# `lfw_http::Status::ALL` by a test in `stats` — the crate that owns neither
+# alone.
+lfw-http = { path = "../http" }
+lfw-tcp = { path = "../tcp" }
 criterion = { workspace = true }
 
 [lints]

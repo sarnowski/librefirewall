@@ -1,0 +1,20 @@
+[package]
+# `metrics` is a common crate name; the directory keeps the short name and the
+# package carries the project prefix, so the lib target is `lfw_metrics` — the
+# same split `crates/clock`, `crates/log` and `crates/tcp` make.
+name = "lfw-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `MAPPING_ALIGN` alone: a stats region's extent is the same page-rounding every
+# other shared region in this system is sized by, and restating 4096 here would
+# be a second copy of a build fact `xtask::sysdesc` compares against.
+wire = { path = "../wire" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

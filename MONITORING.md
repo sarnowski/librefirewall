@@ -604,6 +604,12 @@ debug dump, scrapably and without degrading the dataplane.
 dataplane verdict and throughput counters; connection/flow-table occupancy and limits; the local log
 buffer's occupancy and drop count; and the applied-configuration state reflected as metrics.
 
+Of that intent the per-NIC and dataplane verdict and throughput counters, the pool ownership
+faults, the transport's connection accounting and the applied-configuration state are published
+today; the inventory below is the whole of what a scrape returns. Per-*core* counters await the
+multicore dataplane, queue and ring occupancy and the flow table await the stateful dataplane, and
+the local log buffer awaits the buffer itself — none of those exist to be counted yet.
+
 **Counter semantics (binding).** Every counter is **monotonic for the protection domain's life** and
 **saturates** rather than wrapping. There is no reset: a scraper derives a rate by differencing
 successive scrapes, so a reset would forge a negative rate, and a wrap would turn a sustained flood
@@ -616,38 +622,139 @@ own protocol, what a **device or peer sent** that a layer refused, and what **we
 a violation of a domain's own invariant, which is expected to read zero forever and is an alert, not
 a traffic statistic.
 
-**Metric inventory:** *None implemented yet* — populated per subsystem as metrics are implemented,
-each with its type, unit, labels, and meaning. Nothing is named in advance for the reason given
-under *Record inventory*: a metric name is what an alert and a dashboard are written against, and
-one published before the metric exists would be a guess an operator had already built on.
+**Transliteration (binding).** A metric name, a label name and a label value are the console's own
+key or token with `-` replaced by `_`, under the `librefirewall_` prefix, with `_total` on a counter.
+`no-route` on the console is `reason="no_route"` here; `nic-driver0` is `domain="nic_driver0"`. The
+rule exists so an operator reading a console line and an operator reading a dashboard are looking at
+the same word, and so neither has to keep a mapping table. A label value may begin with a digit
+(`pipeline="0"`), which the exposition format permits and a metric *name* does not.
 
-The dataplane already tallies its drops and faults in memory under the semantics above — eleven
-named routing drop reasons, the pool ownership faults, and the configuration handover's applied and
-refused counts — as does the console path: each writing domain's `dropped` and `refused`, the
-console's `printed`, `malformed`, `unknown`, `unrenderable` and `write_failed`, and the UART's
-`bytes_written`, `thre_timeouts` and `init_failures` (see *What the console loses, and what counts
-it*).
+**No node-side pre-summing (binding).** Every series carries `domain`, and the node publishes no
+total across domains. Two pipelines forwarding four frames each are two series of `4`, never one of
+`8`. Summing is the scraper's job and it is lossless there; summing here would destroy the
+attribution the section above requires, and a node that published both would be asserting an
+equality it cannot keep across a domain restart.
 
-**The management port's transport is now the largest such tally, and the one whose attribution is
-already in the shape this section requires.** `lfw_tcp::TcpCounters` keeps twenty-five fields, one per
-distinct cause, with the three classes above kept apart: what a peer sent that was refused
-(`refused_malformed`, `refused_bad_checksum`, `refused_out_of_window`, `refused_table_full`,
-`refused_not_listening`, `refused_no_connection`, `refused_unacceptable_ack`,
-`refused_no_acknowledgement`, `refused_out_of_order`); what the connection table did about it
-(`connections_accepted`, `connections_established`, `connections_closed`, `connections_evicted`,
-`connections_reaped`, `connections_abandoned`); what crossed it (`segments_received`, `segments_sent`,
-`bytes_received`, `bytes_sent`, `bytes_retransmitted`, `retransmits`); the RFC 5961 and RFC 793
-answers (`challenge_acks`, `resets_received`, `resets_sent`, `urgent_ignored`); and exactly one that
-accuses **this code** rather than a peer — `write_refused`, a segment the stack decided to send that
-did not fit the storage its caller offered, expected to read zero forever. There is deliberately no
-*device* class in it: nothing in that crate reads a register, so a bit flipped by a NIC and one
-flipped by an attacker are the same observation and both land under what a peer sent. Beside it
-`lfw_ip_endpoint` keeps `tcp_segments` and `unclocked`, its echo keeps seven more, and the endpoint
-stage keeps `clock_generation`, `clocks_refused` and `timer_segments`.
+**Freshness (binding).** A counter is published by the domain that owns it, into that domain's own
+shared region, and a scrape reads whatever was last written. There is no barrier and no seqlock: the
+values are individually meaningful, so a scrape may straddle two publications of *different* domains
+and each number is still exactly what its owner last wrote. What a scrape is therefore *not* is an
+instantaneous snapshot of the whole node, and no cross-domain equality should be alerted on at
+single-scrape resolution. The management domain publishes its own shard before rendering, so a
+scrape always reports the request that asked for it — its own response, composed afterwards, appears
+in the *next* one.
 
-No surface reads any of them out: **a drop is currently unobservable from outside the node**, on this
-surface or any other. The console-path counters are the sharper case, because the console is
-itself the last-resort surface — a node quietly losing records has no way to say so.
+### Metric inventory
+
+51 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. The whole document is 205 series and about 25 KiB.
+
+#### Dataplane: what the forwarder decided
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_forwarded_frames_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`) | Frames rewritten for their next hop and handed to the transmitting driver. |
+| `librefirewall_route_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`addressed_to_this_router`, `egress_is_ingress`, `interface_disabled`, `martian_source`, `no_neighbour`, `no_route`, `not_addressed_to_us`, `ttl_expired`, `unconfigured_ingress_port`, `unroutable_destination`, `vlan_tagged`) | Frames the router refused, by the reason it named. |
+| `librefirewall_route_stage_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`egress_full`, `malformed_descriptor`, `misrouted`, `snapshot_failed`, `unparsable`, `writeback_failed`) | Frames the routing stage refused around the router's own decision. |
+
+#### Dataplane: what each NIC moved, and what it got wrong
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_device_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `fault`&nbsp;(`completion_length_over_reported`, `completion_not_posted`, `completion_out_of_range`), `queue`&nbsp;(`receive`, `transmit`) | Virtqueue completions the device got wrong about its own protocol. |
+| `librefirewall_input_drops_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `reason`&nbsp;(`rx_peer_ring_full`, `rx_runt`, `tx_discarded`, `tx_duplicate`, `tx_free_ring_full`, `tx_malformed`, `tx_verdict_undecodable`) | Frames this driver did not move for a reason outside itself: a peer or the wire. |
+| `librefirewall_invariant_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `fault`&nbsp;(`rx_completion_unmapped`, `rx_slot_occupied`, `tx_completion_unmapped`, `tx_slot_occupied`) | This driver's own broken bookkeeping; ours, never traffic, expected to stay zero. |
+| `librefirewall_pool_returns_refused_total` | counter | `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | `pool`&nbsp;(`receive`, `transmit`), `reason`&nbsp;(`ledger_refused`, `not_lent`) | Buffer returns a pool owner refused: forged, out of range, duplicated or never lent. |
+| `librefirewall_receive_bytes_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Bytes those frames carried, after the device's own header. |
+| `librefirewall_receive_frames_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Frames this port's device delivered and the driver handed to its peer. |
+| `librefirewall_transmit_bytes_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Bytes those frames carried, after the device's own header. |
+| `librefirewall_transmit_frames_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Frames this driver posted to its device for transmission. |
+
+#### The management port: frames, and what the endpoint made of them
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_endpoint_bytes_total` | counter | `management` | — | Bytes those frames carried, as the ingress driver measured them. |
+| `librefirewall_endpoint_frames_total` | counter | `management` | — | Frames the terminal endpoint took off its pipeline. |
+| `librefirewall_endpoint_malformed_total` | counter | `management` | — | Frames no parser would read. |
+| `librefirewall_endpoint_not_for_us_total` | counter | `management` | — | Frames addressed to somebody else at layer 2 or 3. |
+| `librefirewall_endpoint_replies_lost_total` | counter | `management` | `reason`&nbsp;(`pool_exhausted`, `ring_full`, `write_failed`) | Replies composed and then lost, by where they were lost. |
+| `librefirewall_endpoint_replies_sent_total` | counter | `management` | — | Replies the endpoint composed and the stage handed to the driver. |
+| `librefirewall_endpoint_replies_total` | counter | `management` | `protocol`&nbsp;(`arp`, `icmp_echo`) | Stateless replies the endpoint answered a request with, by protocol. |
+| `librefirewall_endpoint_reply_refused_total` | counter | `management` | — | Replies decided on and not written, the caller's storage being too small; ours. |
+| `librefirewall_endpoint_stage_drops_total` | counter | `management` | `reason`&nbsp;(`malformed_descriptor`, `return_ring_full`, `snapshot_failed`, `unaddressed`) | Descriptors or frames the endpoint stage could not answer, by reason. |
+| `librefirewall_endpoint_tcp_segments_total` | counter | `management` | — | Segments the endpoint handed to its transport. |
+| `librefirewall_endpoint_timer_segments_total` | counter | `management` | — | Segments the transport composed out of its own timers rather than in answer to a frame. |
+| `librefirewall_endpoint_unclocked_total` | counter | `management` | — | Segments that arrived before this node had established a time; ours, not the sender's. |
+| `librefirewall_endpoint_unhandled_total` | counter | `management` | `reason`&nbsp;(`arp_not_a_request`, `arp_sender_mac_mismatch`, `ethertype_not_handled`, `fragmented`, `not_an_echo_request`, `protocol_not_handled`, `source_not_unicast`, `source_off_link`, `vlan_tagged`) | Well-formed frames for this endpoint that it deliberately does not answer, by reason. |
+
+#### The management port: the TCP transport
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_tcp_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
+| `librefirewall_tcp_challenge_acks_total` | counter | `management` | — | RFC 5961 challenge acknowledgements sent. |
+| `librefirewall_tcp_connections_total` | counter | `management` | `event`&nbsp;(`abandoned`, `accepted`, `closed`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. |
+| `librefirewall_tcp_refused_total` | counter | `management` | `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. |
+| `librefirewall_tcp_resets_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
+| `librefirewall_tcp_retransmits_total` | counter | `management` | — | Segments re-sent, data and control alike. |
+| `librefirewall_tcp_segments_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |
+| `librefirewall_tcp_urgent_ignored_total` | counter | `management` | — | Segments carrying URG, whose urgent pointer is ignored and data delivered in band. |
+| `librefirewall_tcp_write_refused_total` | counter | `management` | — | Segments the stack decided to send that did not fit its caller's storage; ours. |
+
+#### The management port: the HTTP server
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_http_expositions_refused_total` | counter | `management` | — | Expositions the renderer would not fit in the staging buffer; ours, expected to stay zero. |
+| `librefirewall_http_requests_overflowed_total` | counter | `management` | — | Requests that outgrew the bounded request buffer before their head ended. |
+| `librefirewall_http_requests_total` | counter | `management` | — | Requests the server read to their end and decided on. |
+| `librefirewall_http_response_bytes_total` | counter | `management` | — | Response bytes handed to the transport, headers included. |
+| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `414`, `431`, `503`, `505`) | Responses composed, by status code. |
+| `librefirewall_http_retransmits_unavailable_total` | counter | `management` | — | Ranges the transport asked for again that no response buffer held; ours, expected to stay zero. |
+| `librefirewall_http_slots_exhausted_total` | counter | `management` | — | Connections the server had no slot for; ours, the tables being one size, expected to stay zero. |
+
+#### The console path, and what it loses
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_console_records_total` | counter | `console` | `outcome`&nbsp;(`malformed`, `printed`, `unknown`, `unrenderable`, `write_failed`) | Records the console path resolved, by outcome; each outcome accuses a different party. |
+| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Records this domain could not publish because its ring had no slot. |
+| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Events this domain minted that the record ABI cannot carry; ours, expected to stay zero. |
+| `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
+| `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. |
+| `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
+
+#### Configuration and the clock
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_clock_calibrations_refused_total` | counter | `management` | — | Published calibrations this domain would not use. |
+| `librefirewall_clock_frequency_hertz` | gauge | `clock` | — | The timestamp counter frequency this node measured at boot; 0 before it did. |
+| `librefirewall_clock_generation` | gauge | `management` | — | The calibration generation this domain converts counter readings with; 0 is none. |
+| `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
+| `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. |
+
+The three attribution classes are kept apart exactly as stated above and are worth naming against
+the table: `librefirewall_device_faults_total` is what a **device** got wrong about its own protocol;
+`librefirewall_input_drops_total`, `librefirewall_route_drops_total` and
+`librefirewall_tcp_refused_total` are what a **device or peer sent** that a layer refused; and
+`librefirewall_invariant_faults_total`, `librefirewall_route_stage_drops_total`,
+`librefirewall_endpoint_stage_drops_total` and `librefirewall_tcp_write_refused_total` accuse **this
+code** and are expected to read zero forever — they are alerts, not traffic statistics.
+
+**What a scrape costs the dataplane.** Nothing measurable, and by construction rather than by
+measurement: a counter update is a relaxed add to a `u64` in the publishing domain's own cache-line
+aligned region, and the exposition is rendered in the management domain out of a read of those
+regions. No dataplane domain does any work on a scrape, and no lock is shared with one.
+
+**Still absent.** `/config` and `/logs` (below and above) are unimplemented, so the debug dump has
+only its state half. The endpoint is **plain HTTP with no client authentication**: CONCEPT.md §11
+requires mutual TLS on the management interface, and until that lands anyone who can reach the
+management interface can scrape it. That is a deviation, recorded in README's status table and in
+`lfw_ip_endpoint`'s crate header. The endpoint stages one response at a time, so a scrape arriving
+while another is still going out is answered `503` and counted as
+`librefirewall_http_responses_total{status="503"}`.
 
 ## Configuration read endpoint
 
