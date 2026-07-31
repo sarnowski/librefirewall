@@ -74,6 +74,36 @@
     <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />
     <memory_region name="bar1" size="0x4000" phys_addr="0x50004000" />
 
+    <!-- The High Precision Event Timer's register block, and the third device
+         region in this system.
+
+         Its phys_addr is not ours to choose, unlike vq0/vq1 and the pipeline
+         regions above: 0xFED00000 is where every x86 chipset places the block,
+         and it is `lfw_hpet::MMIO_BASE`, which that crate forms every register
+         address inside. The authoritative source is the ACPI HPET description
+         table — and it is unusable here for the reason CONCEPT §12.3 fixes
+         hardware at build time: a base discovered at run time is one no
+         statically granted capability could map, so the conventional answer is
+         the one that can be checked and the authoritative one is the one that
+         cannot.
+
+         SIZE IS A PAGE AND THE BLOCK IS 1 KIB, which is not slack anybody
+         chose. A grant is whole pages, so `lfw_hpet::MMIO_REGION_SIZE` is
+         `MMIO_LENGTH` rounded up to one and that is what `xtask::sysdesc`
+         compares this row against — the same derivation `wire` makes for a log
+         region. What keeps the rounding from widening the grant is a
+         const-assertion in that crate: 0xFED00000 is page-aligned and the block
+         is 0x400 bytes, so the whole of the page beyond the block is the same
+         device's decode and no other device sits in it.
+
+         Device MMIO: uncached, on the same footing as the ECAM pages and BAR
+         windows above. A counter read through a cached mapping is read once and
+         then answered from the cache forever, which is a stopped clock that
+         reports itself running — the one failure `lfw_hpet` cannot detect,
+         since it distinguishes a stalled counter from a slow one by reading it
+         again. -->
+    <memory_region name="hpet" size="0x1000" phys_addr="0xFED00000" />
+
     <!-- virtio virtqueues (driver <-> NIC), receive and transmit per port.
 
          Every map of a virtqueue or a pipeline below states cached="true"
@@ -154,7 +184,7 @@
          producer on one of these is two writers racing for the same slot.
 
          THE SPLIT EXISTS SO THE TWO DIRECTIONS CARRY OPPOSITE PERMISSIONS, and
-         that is the whole reason there are eight rows here rather than four. A
+         that is the whole reason there are ten rows here rather than five. A
          region is the unit of grant, so only two regions can give each domain
          write access to exactly the direction it speaks in — the same reason
          `cfg`/`cfgack` are two regions and each dataplane pipeline is three.
@@ -202,10 +232,10 @@
          `wire::LOG_CONSUME_REGION_SIZE`, each its type's `size_of` rounded up
          to the mapping granularity, on the same footing as every constant above
          and held to it the same way — `xtask::sysdesc` carries a rule per
-         region and compares it. `LogRecords` is 12296 bytes (64 slots of a
-         192-byte record, plus the producer cursor and the drop count) so each
+         region and compares it. `LogRecords` is 13320 bytes (64 slots of a
+         208-byte record, plus the producer cursor and the drop count) so each
          is four pages; `LogConsume` is one word and so costs the page a region
-         costs, exactly as `cfgack` does. The eight together are 80 KiB.
+         costs, exactly as `cfgack` does. The ten together are 100 KiB.
 
          None carries phys_addr, for the reason the address-map block above
          gives for `cfg` and `cfgack`: no device DMAs into a log region, so no
@@ -225,6 +255,8 @@
     <memory_region name="log_nic_driver1_consume" size="0x1000" />
     <memory_region name="log_config" size="0x4000" />
     <memory_region name="log_config_consume" size="0x1000" />
+    <memory_region name="log_clock" size="0x4000" />
+    <memory_region name="log_clock_consume" size="0x1000" />
 
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all.
@@ -302,6 +334,97 @@
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
+    <!-- The clock domain: it establishes what time it is, once, and says so.
+
+         It maps the HPET page, holds an I/O-port capability for the CMOS
+         real-time clock, calibrates the timestamp counter against the timer
+         whose rate is self-describing, reads the RTC once for an epoch to
+         anchor that counter to, publishes one record and parks. The protection
+         domain is documented in pds/clock.
+
+         =================================================================
+         `<ioport>` IS NO LONGER A CAPABILITY CLASS ONE DOMAIN HOLDS ALONE
+         (ENG-1, SCM-6)
+         =================================================================
+
+         READ THE CONSOLE DOMAIN'S `<ioport>` BLOCK BELOW BEFORE THIS ONE. The
+         lesson it records was paid for once and applies unchanged here: the
+         element places an X86IOPort CAPABILITY in this domain's CNode and does
+         NOT unlock an instruction. seL4 leaves the TSS I/O permission bitmap
+         denying every port and never edits it, so `in` and `out` executed in
+         this domain raise #GP with this grant present and correct; the ports
+         below are reached only by invoking the capability through
+         `seL4_X86_IOPort_In8` / `seL4_X86_IOPort_Out8`, which is what
+         `pds/clock/src/cmos.rs` does and why that file needs no `unsafe`.
+
+         WHAT IT GRANTS: two consecutive I/O ports, 0x70 and 0x71 — the CMOS
+         address and data registers, `lfw_rtc::INDEX_PORT` and `DATA_PORT`. That
+         crate writes an index to the first and reads the answer from the
+         second, and the nine registers it can name are `Register::ALL`, every
+         one of them const-asserted to carry bit 7 clear — so no index it can
+         form disables the non-maskable interrupt, and no address it can form
+         leaves this row.
+
+         WHAT STAYS WITHHELD is everything the console's block already
+         enumerates, minus the CMOS pair this row now grants: no PCI
+         configuration address/data pair at 0xCF8/0xCFC, no PS/2 controller, no
+         PIC, no PIT, no debug port, and no serial controller — this domain
+         cannot write the console it publishes through, which is the whole point
+         of publishing through a ring. The drivers and the forwarder still hold
+         zero I/O ports between them.
+
+         What the *pair* of grants costs, stated because it is the property that
+         changed: the console's claim to be the system's only port holder is
+         gone, and with it the argument that an attacker reaching any
+         non-console domain reaches no port instruction the kernel will accept.
+         What survives is narrower and still worth having — the two windows are
+         disjoint, each is held by exactly one domain, and neither domain can
+         reach the other's device. In particular this domain cannot splice bytes
+         into a console line, and the console cannot read or stop the clock.
+
+         WHY THE CMOS IS A DOMAIN OF ITS OWN rather than a function in the
+         console, which already holds a port capability: the two devices are
+         unrelated, and merging them would hand the domain that drives the
+         operator's only output channel a second device — and hand the domain
+         that reads a battery-backed register file the ability to write the line
+         an operator reads its result on. The split is what makes "the console
+         renders what the clock said" a statement about a ring rather than about
+         one domain's own bookkeeping.
+
+         PRIORITY 3, EQUAL TO THE CONFIGURATION DOMAIN, and the reasoning is
+         that domain's, one step further. The drivers and the console busy-loop
+         forever at priority 1 and the forwarder runs at 2, so a domain that
+         must run once and publish cannot sit at or below them: it would depend
+         on seL4's round-robin against three domains that never yield, for the
+         whole of a calibration window it is trying to measure real time across.
+         Above them it runs to completion and then blocks in the Microkit event
+         loop, where it costs nothing at all — it holds no channel, so nothing
+         can ever wake it again.
+
+         Equal to the configuration domain rather than above it, because both
+         are run-once-then-block domains and neither can starve the other: each
+         leaves `init` for good. Adding a fourth priority level would state an
+         ordering between the two that nothing needs — no record either writes
+         depends on the other, and the console renders both whenever it gets to
+         them.
+
+         What that priority does cost, named rather than left to be measured: a
+         calibration window is about a millisecond of real time during which
+         this domain preempts the dataplane. It happens once, at boot, before
+         any traffic exists.
+
+         It maps NO pool, NO dataplane ring, NO configuration region, NO ECAM
+         page and NO BAR window, so a compromised clock reaches no frame, no NIC
+         and no configuration — the shape of isolation the configuration and
+         console domains already have, in a third direction. -->
+    <protection_domain name="clock" priority="3" stack_size="0x4000">
+        <program_image path="clock.elf" />
+        <ioport id="0" addr="0x70" size="2" />
+        <map mr="hpet" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="hpet_vaddr" />
+        <map mr="log_clock" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+    </protection_domain>
+
     <!-- Each driver maps five of its six pipeline regions. The exception is the
          pool it receives INTO: it hands that pool's physical address to its NIC
          as a DMA target and never dereferences a byte of it, so it takes the
@@ -350,17 +473,16 @@
         <setvar symbol="tx_pool_paddr" region_paddr="pool0" />
     </protection_domain>
 
-    <!-- The console domain: the one holder of the serial controller, and the
-         only domain in this system with an I/O-PORT capability.
+    <!-- The console domain: the one holder of the serial controller.
 
          =================================================================
-         `<ioport>` IS A NEW CAPABILITY CLASS IN THIS SYSTEM (ENG-1, SCM-6)
+         `<ioport>` ENTERED THIS SYSTEM HERE (ENG-1, SCM-6)
          =================================================================
 
-         Every grant above this point is a memory mapping or a notification
-         channel. This row is neither: it places an X86IOPort CAPABILITY in the
-         console domain's CNode, and a capability is a thing the domain
-         INVOKES. It does not unlock an instruction. seL4 leaves the TSS I/O
+         Memory mappings and notification channels were the whole of what this
+         description granted until this row. It is neither: it places an
+         X86IOPort CAPABILITY in the console domain's CNode, and a capability is
+         a thing the domain INVOKES. It does not unlock an instruction. seL4 leaves the TSS I/O
          permission bitmap denying every port and never edits it, so `in` and
          `out` executed inside any protection domain raise #GP however this
          file is written; the ports below are reached only by invoking this
@@ -394,16 +516,19 @@
          configuration address/data pair at 0xCF8/0xCFC (which would be a second
          path to every device's configuration space, next to the ECAM mappings
          the drivers hold), no PS/2 controller, no PIC, no PIT, no CMOS/RTC, no
-         debug port. And no other domain holds any I/O port at all: the drivers,
-         the forwarder and the configuration domain each hold zero, so an
-         attacker who reaches one of them reaches no port instruction that will
-         execute.
+         debug port. The CMOS pair belongs to the clock domain above and to it
+         alone; this domain cannot read or stop the clock, and that domain
+         cannot write the line an operator reads its result on. The drivers and
+         the forwarder hold zero ports between them, so an attacker who reaches
+         either reaches no port instruction that will execute.
 
          WHY ONE DOMAIN OWNS IT. The device is unsynchronised and has one
          register file, so several writers interleave their bytes into one
          another and a console line arrives spliced with a second domain's. A
          capability held by exactly one domain is what makes that
-         unrepresentable rather than unlikely. In the RELEASE kernel
+         unrepresentable rather than unlikely — and it is a claim about THIS
+         window rather than about the port space, which the clock domain's grant
+         above shares nothing with. In the RELEASE kernel
          configuration this domain is then the only writer of 0x3F8 in the whole
          system and the property is exact. In the DEBUG configuration it is not:
          that kernel is built with CONFIG_PRINTING and writes the same port for
@@ -411,7 +536,7 @@
          prints on boot and on faults, not per record — but it is the reason the
          single-writer claim is stated of the shipped profile.
 
-         WHAT IT MAPS: eight log regions in four pairs, and the perms are the
+         WHAT IT MAPS: ten log regions in five pairs, and the perms are the
          whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
          Each `log_<domain>` is READ-ONLY here: this domain renders those
          records and must read them, and a console that could also write one
@@ -456,6 +581,8 @@
         <map mr="log_nic_driver1_consume" vaddr="0x4_210_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver1_consume_vaddr" />
         <map mr="log_config" vaddr="0x4_300_000" perms="r" cached="true" setvar_vaddr="log_config_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_310_000" perms="rw" cached="true" setvar_vaddr="log_config_consume_vaddr" />
+        <map mr="log_clock" vaddr="0x4_400_000" perms="r" cached="true" setvar_vaddr="log_clock_vaddr" />
+        <map mr="log_clock_consume" vaddr="0x4_410_000" perms="rw" cached="true" setvar_vaddr="log_clock_consume_vaddr" />
     </protection_domain>
 
     <!-- Both channels carry notifications in one direction only, so only that
@@ -505,12 +632,12 @@
          ABSENCE IS A DECISION.
 
          A DOMAIN THAT NEVER BLOCKS NEEDS NO WAKEUP. The console busy-polls the
-         four rings and never leaves `init`, for the reason set out above it, so
+         five rings and never leaves `init`, for the reason set out above it, so
          it never reaches the Microkit event loop and could not observe a
          notification if one were sent. It discovers work the only way a polling
          domain can: by reading the cursor each writing domain publishes, which
          it does on every pass regardless. A send capability on this domain
-         would therefore be authority granted for nothing — a widening of four
+         would therefore be authority granted for nothing — a widening of five
          writers' reach with no path that consumes it (ENG-1) — so no channel is
          declared, and the machinery that fed one is gone rather than left
          dormant (ENG-7).

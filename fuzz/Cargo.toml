@@ -21,7 +21,10 @@ cargo-fuzz = true
 #   wire            the descriptor ABI, the config handover image and the log
 #                   record and ring a peer PD writes
 #   lfw-log         the event a peer PD's log record decodes to, and the console
-#                   line it renders to
+#                   line it renders to — which since the record gained a
+#                   measured clock reaches `lfw-clock`'s calendar with a peer's
+#                   own `u64` of nanoseconds, so that crate is on this surface
+#                   through this one and needs no target of its own
 #   config          the configuration document, whose every byte is the
 #                   management-plane attacker's, and the model read out of it
 #   net-headers     the Ethernet/IPv4/UDP headers a wire carries

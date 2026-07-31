@@ -84,7 +84,8 @@ pub(crate) const CONFIG_PATH_VAR: &str = "LIBREFIREWALL_CONFIG_PATH";
 /// The single owner of that list: [`crate::host::test_host`] lints exactly these
 /// packages for the seL4 target, so a PD added here is linted by the same edit
 /// that makes it shippable and cannot slip through unlinted.
-pub(crate) const SYSTEM_PDS: &[&str] = &["nic-driver", "forwarder", "config-pd", "console"];
+pub(crate) const SYSTEM_PDS: &[&str] =
+    &["nic-driver", "forwarder", "config-pd", "console", "clock"];
 
 /// The pinned SDK's include directory for one seL4 kernel configuration.
 ///

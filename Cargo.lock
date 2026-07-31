@@ -161,6 +161,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clock"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "lfw-hpet",
+ "lfw-log",
+ "lfw-rtc",
+ "pd-runtime",
+ "sel4",
+ "sel4-microkit",
+ "wire",
+]
+
+[[package]]
 name = "config"
 version = "0.1.0"
 dependencies = [
@@ -429,6 +443,7 @@ dependencies = [
 name = "lfw-log"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
  "net-headers",
  "proptest",
  "wire",
@@ -1364,7 +1379,10 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "config",
+ "lfw-clock",
+ "lfw-hpet",
  "lfw-log",
+ "lfw-rtc",
  "nic-driver-core",
  "pd-runtime",
  "uart-16550",

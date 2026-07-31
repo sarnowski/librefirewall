@@ -39,6 +39,7 @@ use std::{
 
 use crate::{
     artifacts::DIST_DISK,
+    clock_contract,
     config_transcript::ConfigContract,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted},
@@ -143,8 +144,15 @@ enum ImageUnderTest {
     BuiltForTheScenario,
 }
 
-/// Whether a scenario judges the `LFW-CFG` console channel beside the traffic.
-enum Transcript {
+/// Whether a scenario reads the console beside the traffic.
+///
+/// One flag for both channels rather than two, because it is one decision: a
+/// scenario either judges what the appliance said or is left to report a
+/// forwarding failure as a forwarding failure and nothing else. What
+/// [`Console::Judged`] covers is the `LFW-CFG` transcript
+/// ([`crate::config_transcript`]) and the clock domain's record on the
+/// `LFW-PD` channel ([`crate::clock_contract`]).
+enum Console {
     Ignored,
     Judged,
 }
@@ -159,7 +167,7 @@ struct Scenario {
     /// the other does not.
     document: &'static str,
     image: ImageUnderTest,
-    transcript: Transcript,
+    console: Console,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
@@ -171,12 +179,13 @@ struct Scenario {
 ///    before configuration management, now stated between endpoints read out of
 ///    the document rather than written beside it, so a forwarding failure is
 ///    reported as a forwarding failure and nothing else.
-/// 2. **generation-swap** — the same disk, judged additionally by its
-///    configuration transcript: the node comes up fail-closed on generation 0
-///    and switches to generation 1, whose change records are the document's own
-///    diff. A separate boot, because a transcript that could only be read off a
-///    run whose traffic had already passed would be silent in exactly the case
-///    it exists for — a node that committed nothing and forwarded nothing.
+/// 2. **generation-swap** — the same disk, judged additionally by what it said:
+///    the node comes up fail-closed on generation 0 and switches to generation
+///    1, whose change records are the document's own diff, and its clock domain
+///    establishes a time and reports the frequency it measured. A separate boot,
+///    because a transcript that could only be read off a run whose traffic had
+///    already passed would be silent in exactly the case it exists for — a node
+///    that committed nothing and forwarded nothing.
 /// 3. **alternate-configuration** — a disk assembled from a second document
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
@@ -187,25 +196,25 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             name: "routed-forwarding",
             document: image::CONFIGURATION_DOCUMENT,
             image: ImageUnderTest::Published,
-            transcript: Transcript::Ignored,
+            console: Console::Ignored,
         },
         Scenario {
             name: "generation-swap",
             document: image::CONFIGURATION_DOCUMENT,
             image: ImageUnderTest::Published,
-            transcript: Transcript::Judged,
+            console: Console::Judged,
         },
         Scenario {
             name: "alternate-configuration",
             document: ALTERNATE_DOCUMENT,
             image: ImageUnderTest::BuiltForTheScenario,
-            transcript: Transcript::Judged,
+            console: Console::Judged,
         },
     ];
 
     let judged = scenarios
         .iter()
-        .filter(|scenario| matches!(scenario.transcript, Transcript::Judged))
+        .filter(|scenario| matches!(scenario.console, Console::Judged))
         .count();
 
     for scenario in &scenarios {
@@ -221,7 +230,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     }
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript",
+         configuration transcript and the clock record",
         scenarios.len(),
         Run::Shipping.config(),
     ))
@@ -282,15 +291,21 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String
     print!("{}", booted.traffic.render());
 
     let log = scenario_log(root, scenario, run);
-    let judged = match scenario.transcript {
-        Transcript::Ignored => String::new(),
-        Transcript::Judged => {
+    let judged = match scenario.console {
+        Console::Ignored => String::new(),
+        Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             contract
                 .judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!("; {}", contract.summary())
+            // The other console channel, and the one record whose content the
+            // build cannot predict: what the appliance measured about its own
+            // hardware. Judged after the transcript because a node that refused
+            // its configuration is the larger finding.
+            let clock = clock_contract::judge(&booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {}; {clock}", contract.summary())
         }
     };
     println!(
@@ -464,7 +479,19 @@ fn qemu_base(
     let mut command = Command::new("qemu-system-x86_64");
     command
         .current_dir(root)
-        .args(["-machine", "q35", "-accel", acceleration.qemu_accel()])
+        // `hpet=on` explicitly, and not because QEMU's q35 default is off — it
+        // is on. A default is a value QEMU may change between versions, and the
+        // clock domain's whole first step is probing a block at 0xFED00000: a
+        // machine that stopped presenting one would turn every system scenario
+        // into a `hpet-not-present` refusal, reported as this project's defect.
+        // The system description grants the region unconditionally, so stating
+        // the device here is what keeps the two ends of that grant agreeing.
+        .args([
+            "-machine",
+            "q35,hpet=on",
+            "-accel",
+            acceleration.qemu_accel(),
+        ])
         .args(["-cpu", GUEST_CPU])
         .args(["-m", "1G", "-display", "none"])
         .arg("-drive")

@@ -18,14 +18,14 @@
 //!
 //! # No timestamps
 //!
-//! There is no clock anywhere in this system — no timer, no interrupt, no
-//! trusted time source — so a record carries the configuration `generation` it
-//! belongs to and a `sequence` counting from zero within that generation's own
-//! records, rather than a reading. That is
-//! a real limitation, not a simplification: records cannot be correlated
-//! against an external system's timeline, and they are ordered and attributed
-//! only within one boot. It is preferred to inventing a time base a reader
-//! would then trust.
+//! No record is timestamped — there is no timer, no interrupt, and no time
+//! source anything may be judged against — so a record carries the
+//! configuration `generation` it belongs to and a `sequence` counting from zero
+//! within that generation's own records, rather than a reading. That is a real
+//! limitation: records cannot be correlated against an external system's
+//! timeline, and are ordered and attributed only within one boot. It is
+//! preferred to inventing a time base a reader would trust.
+//! [`DomainDetail::Established`] states a time and orders nothing by it.
 //!
 //! # Why `Identifier` is defined here
 //!

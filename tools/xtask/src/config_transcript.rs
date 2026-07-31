@@ -6,8 +6,8 @@
 //! the exact ordered sequence it must produce; the configuration and forwarding
 //! domains emit `LFW-CFG ` records and a scenario declares the same. Nothing
 //! here reads prose, and nothing here waits on a clock: the records carry the
-//! generation and a per-boot sequence number precisely because the system has
-//! no clock to order them by (MONITORING.md).
+//! generation and a per-boot sequence number precisely because no record on
+//! this channel is timestamped (MONITORING.md).
 //!
 //! # Where the expectation comes from
 //!
@@ -30,7 +30,7 @@
 //! `console::tests::the_rotation_serves_the_later_ring_first_when_its_turn_comes`
 //! hold it). So *which* domain's record reaches the line first is decided by
 //! where that rotation stood, not by which event happened first, and the
-//! records carry no clock to appeal to (MONITORING.md). Production order is not
+//! records carry no timestamp to appeal to (MONITORING.md). Production order is not
 //! emission order, and asserting one as the other asserts against the rotation.
 //!
 //! The transcript is therefore judged as the merge of two chains — each totally

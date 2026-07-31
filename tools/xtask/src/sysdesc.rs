@@ -68,9 +68,11 @@
 
 use std::{fs, path::Path};
 
+use lfw_hpet::MMIO_REGION_SIZE;
+use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
-use uart_16550::{COM1_BASE, PORT_COUNT};
+use uart_16550::{COM1_BASE, PORT_COUNT as COM1_PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
     CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
@@ -233,7 +235,7 @@ const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It ha
      domain that rewrites a header must reach the bytes";
 
 /// As [`POOL_WITHHELD`], for the log transport — the exclusion that holds
-/// between the four writing domains, and the one thing about a log region that
+/// between the five writing domains, and the one thing about a log region that
 /// is a mapping rather than an authority.
 ///
 /// What each pair's *perms* withhold is a different argument and is not stated
@@ -303,6 +305,27 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Uncached,
         grants: &[read_write("nic_driver1")],
+        withheld: None,
+    },
+    // The timer block, and the one region whose rule cites a constant that is
+    // NOT the extent of the thing inside it. `lfw_hpet::MMIO_LENGTH` is the
+    // register block: 0x400 bytes, which is what that crate addresses within
+    // and what its offset assertions are stated against. It is not what a grant
+    // can be — Microkit maps pages — so the crate derives `MMIO_REGION_SIZE`
+    // from it exactly as `wire` derives a log region's size from the type
+    // inside it, and that is the constant this row compares. Citing
+    // `MMIO_LENGTH` here would fail on a description no operator could fix, and
+    // citing `pd_runtime::MAPPING_ALIGN` would compare the grant against the
+    // page size — a number that agrees with this one by coincidence and would
+    // go on agreeing if the block moved or grew.
+    RegionRule {
+        name: "hpet",
+        size: ExpectedSize {
+            rust_name: "lfw_hpet::MMIO_REGION_SIZE",
+            bytes: MMIO_REGION_SIZE,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("clock")],
         withheld: None,
     },
     RegionRule {
@@ -514,6 +537,26 @@ const REGIONS: &[RegionRule] = &[
         withheld: Some(LOG_WITHHELD),
     },
     RegionRule {
+        name: "log_clock",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("clock"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_clock_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("clock"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
         name: "log_config",
         size: ExpectedSize {
             rust_name: "wire::LOG_RECORDS_REGION_SIZE",
@@ -543,15 +586,30 @@ const REGIONS: &[RegionRule] = &[
 /// would be a rule granting the whole space. There is no shape of this table
 /// that has nothing to say here, and making it unrepresentable is cheaper than
 /// a test asserting it (DOC-9).
-const COM1_WITHHELD: &str = "every other port in the 65536-port space stays refused, and to every \
+const COM1_WITHHELD: &str = "every other port in the 65536-port space stays refused to this \
      domain: no PCI configuration address/data pair at 0xCF8/0xCFC — a second path to every \
      device's configuration space, beside the ECAM mappings the drivers hold — no PS/2 \
-     controller, no PIC, no PIT, no CMOS/RTC and no debug port. The drivers, the forwarder and \
-     the configuration domain hold zero I/O ports between them, so an attacker who reaches one \
-     of them reaches no port instruction that will execute. This is also what makes the console \
-     the sole writer of the device: several writers on one unsynchronised register file splice \
-     their bytes into one another, and a capability held by exactly one domain is what makes \
-     that unrepresentable rather than unlikely";
+     controller, no PIC, no PIT, no CMOS/RTC and no debug port. The CMOS pair belongs to the \
+     clock domain and to it alone, so the domain that renders an operator's only output cannot \
+     read or stop the clock; the drivers and the forwarder hold zero ports between them, so an \
+     attacker who reaches either reaches no port instruction that will execute. This row is also \
+     what makes the console the sole writer of the serial device: several writers on one \
+     unsynchronised register file splice their bytes into one another, and a capability held by \
+     exactly one domain is what makes that unrepresentable rather than unlikely";
+
+/// As [`COM1_WITHHELD`], for the CMOS window the clock domain holds.
+///
+/// The two rows together are what replaced "one domain holds every port this
+/// system grants" with something narrower and still worth defending: the
+/// windows are disjoint, each has exactly one holder, and neither holder can
+/// reach the other's device.
+const CMOS_WITHHELD: &str = "every other port in the 65536-port space stays refused to this \
+     domain, the serial controller at 0x3F8 included — so the domain that reads a \
+     battery-backed register file cannot write the console line an operator reads its result on, \
+     and a compromised clock reaches no other device at all. Two ports and not eight: \
+     `lfw_rtc` forms exactly `INDEX_PORT` and `DATA_PORT`, selects all nine registers it can \
+     name through the first, and const-asserts every index it can write to leave bit 7 clear — \
+     so no invocation it can make disables the non-maskable interrupt or leaves this window";
 
 /// The exported Rust constant one attribute of an `<ioport>` must equal.
 ///
@@ -593,23 +651,40 @@ struct IoPortRule {
     withheld: &'static str,
 }
 
-/// Every I/O-port grant the description may declare. One grant on one domain is
-/// the whole table, and that is the property rather than an accident of how
-/// little the system does today: a second row here is a second domain able to
-/// execute a port instruction, and adding one is the review ENG-1 requires.
-const IO_PORTS: &[IoPortRule] = &[IoPortRule {
-    domain: "console",
-    id: "0",
-    addr: ExpectedPort {
-        rust_name: "uart_16550::COM1_BASE",
-        value: COM1_BASE as u64,
+/// Every I/O-port grant the description may declare. Two rows, on two domains,
+/// each holding one window — and the count is the property rather than an
+/// accident of how little the system does: a third row is a third domain able
+/// to reach a device by port invocation, and adding one is the review ENG-1
+/// requires. What the table states beyond the windows themselves is that they
+/// are disjoint and that neither domain holds the other's.
+const IO_PORTS: &[IoPortRule] = &[
+    IoPortRule {
+        domain: "console",
+        id: "0",
+        addr: ExpectedPort {
+            rust_name: "uart_16550::COM1_BASE",
+            value: COM1_BASE as u64,
+        },
+        size: ExpectedPort {
+            rust_name: "uart_16550::PORT_COUNT",
+            value: COM1_PORT_COUNT as u64,
+        },
+        withheld: COM1_WITHHELD,
     },
-    size: ExpectedPort {
-        rust_name: "uart_16550::PORT_COUNT",
-        value: PORT_COUNT as u64,
+    IoPortRule {
+        domain: "clock",
+        id: "0",
+        addr: ExpectedPort {
+            rust_name: "lfw_rtc::INDEX_PORT",
+            value: INDEX_PORT as u64,
+        },
+        size: ExpectedPort {
+            rust_name: "lfw_rtc::PORT_COUNT",
+            value: CMOS_PORT_COUNT as u64,
+        },
+        withheld: CMOS_WITHHELD,
     },
-    withheld: COM1_WITHHELD,
-}];
+];
 
 /// Every protection domain the description may declare. Exhaustive in both
 /// directions like the rest: the domain names are what [`RegionRule::mappers`]
@@ -622,6 +697,7 @@ const DOMAINS: &[&str] = &[
     "nic_driver0",
     "nic_driver1",
     "console",
+    "clock",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is

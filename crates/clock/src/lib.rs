@@ -8,10 +8,10 @@
 //! it against a reference timer is a capability a protection domain must be
 //! granted; the conversion arithmetic is neither, and it is the part that can be
 //! driven exhaustively by a host test. MONITORING.md's *Ordering and time*
-//! records the system it lands in as one with no clock and no trusted time
-//! source, where a record is ordered by `(generation, seq)` within a boot —
-//! this crate is the arithmetic half of the time source that would change that,
-//! and it changes no exposed signal on its own.
+//! records the system it lands in as one where no record is timestamped and no
+//! time source is trusted, a record being ordered by `(generation, seq)` within
+//! a boot — this crate is the arithmetic half of the source that would change
+//! that, and it changes no exposed signal on its own.
 //!
 //! # The adversary
 //!
@@ -82,12 +82,14 @@
 //! # Where a wall-clock reading can come from
 //!
 //! [`Ticks`] is transparent: a caller reads the counter and hands the number
-//! over. [`Monotonic`] and [`UtcNanos`] are not constructible from an integer,
-//! and the only thing that produces them is a [`Calibration`] — so a UTC
-//! reading cannot be composed by a caller that never established what its
-//! counter's frequency was. [`Duration`] is the exception among the opaque
-//! three, because a duration is a quantity a caller authors rather than
-//! observes.
+//! over. [`Monotonic`] is not constructible from an integer at all and only a
+//! [`Calibration`] produces one, so an uptime cannot be composed by a caller
+//! that never established its counter's frequency. [`UtcNanos`] carries that
+//! rule and one exception, [`UtcNanos::from_unix_nanos`]: an instant already
+//! established elsewhere and published as a count is one to reconstruct rather
+//! than compose, and re-deriving a calendar from it would put a second copy of
+//! this arithmetic wherever one is read. [`Duration`] is opaque for neither
+//! reason: a caller authors a duration rather than observing one.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -188,6 +190,12 @@ impl Monotonic {
 pub struct UtcNanos(u64);
 
 impl UtcNanos {
+    /// An instant another component established; see the crate header.
+    #[must_use]
+    pub const fn from_unix_nanos(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
     #[must_use]
     pub const fn as_nanos(self) -> u64 {
         self.0
@@ -850,6 +858,25 @@ mod tests {
             boot + 2 * NANOS_PER_SECOND
         );
         assert_eq!(clock.utc(Ticks(100)).unix_seconds(), 1_785_443_220);
+    }
+
+    /// A published instant reconstructed by a reader is the instant that was
+    /// published, and it reads as one however it was obtained: the two routes
+    /// into the type must not produce values a renderer tells apart.
+    #[test]
+    fn an_instant_reconstructed_from_a_published_count_is_the_instant_that_was_published() {
+        let boot = 1_785_443_220 * NANOS_PER_SECOND;
+        let established = calibration(ONE_GHZ, 100, boot).utc(Ticks(100));
+        let reconstructed = UtcNanos::from_unix_nanos(established.as_nanos());
+        assert_eq!(reconstructed, established);
+        assert_eq!(reconstructed.as_nanos(), boot);
+        assert_eq!(
+            CivilTime::from_utc(reconstructed),
+            CivilTime::from_utc(established)
+        );
+        for nanos in [0, 1, u64::MAX] {
+            assert_eq!(UtcNanos::from_unix_nanos(nanos).as_nanos(), nanos);
+        }
     }
 
     #[test]

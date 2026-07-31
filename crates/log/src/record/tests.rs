@@ -1,5 +1,7 @@
 use super::*;
 
+use core::num::NonZeroU64;
+
 use net_headers::{Ipv4Address, MacAddress};
 use proptest::prelude::*;
 use std::{format, string::String, vec::Vec};
@@ -175,7 +177,7 @@ fn every_value_variant_survives_both_ends_of_a_change() {
     }
 }
 
-/// The four detail shapes and all three refusal widths, each with both
+/// The five detail shapes and all three refusal widths, each with both
 /// `signalled` values and with the empty cause the ABI admits.
 #[test]
 fn every_domain_detail_shape_survives_the_crossing() {
@@ -184,6 +186,8 @@ fn every_domain_detail_shape_survives_the_crossing() {
         DomainDetail::Features(u64::MAX),
         DomainDetail::Features(0),
         DomainDetail::ReceivePosted(u32::MAX),
+        established(1, 0),
+        established(u64::MAX, u64::MAX),
     ];
     for operands in [
         RefusalDetail::None,
@@ -624,11 +628,22 @@ fn any_value() -> impl Strategy<Value = Value> {
     ]
 }
 
+/// The established-time detail, from the two numbers the ABI carries. A helper
+/// rather than a literal at each site: the frequency has to clear zero to exist
+/// at all, and every test that builds one would otherwise restate that.
+fn established(tsc_hz: u64, unix_nanos: u64) -> DomainDetail<Cause> {
+    DomainDetail::Established {
+        tsc_hz: NonZeroU64::new(tsc_hz).expect("a frequency above zero"),
+        utc: UtcNanos::from_unix_nanos(unix_nanos),
+    }
+}
+
 fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
     prop_oneof![
         Just(DomainDetail::None),
         any::<u64>().prop_map(DomainDetail::Features),
         any::<u32>().prop_map(DomainDetail::ReceivePosted),
+        (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
         (
             any_cause(),
             prop_oneof![
@@ -778,6 +793,8 @@ proptest! {
         cause_len in any::<u8>(),
         key_bytes in any::<[u8; MAX_IDENTIFIER_LEN]>(),
         key_len in any::<u8>(),
+        tsc_hz in any::<u64>(),
+        unix_nanos in any::<u64>(),
     ) {
         let [generation, sequence, changes, reject_offset, receive_posted] = numbers;
         let [domain, state, detail, operand_count, signalled, change, object, field, outcome, reason] =
@@ -806,6 +823,8 @@ proptest! {
             key: TextImage { bytes: key_bytes, len: key_len, _pad: [0; 3] },
             from: ValueImage::ZERO,
             to: ValueImage::ZERO,
+            tsc_hz,
+            unix_nanos,
         };
         match record.check() {
             Err(_) => {}

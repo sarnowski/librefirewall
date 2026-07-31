@@ -19,6 +19,7 @@ members = [
     "pds/forwarder",
     "pds/config",
     "pds/console",
+    "pds/clock",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

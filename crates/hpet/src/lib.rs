@@ -95,6 +95,10 @@ pub const MMIO_LENGTH: usize = 0x400;
 /// Bytes of an x86_64 page, the granularity a `<memory_region>` is granted at.
 const PAGE_SIZE: usize = 0x1000;
 
+/// Bytes the system description reserves, which is not [`MMIO_LENGTH`]: a
+/// grant is whole pages. Derived here so the gate compares one fact, not two.
+pub const MMIO_REGION_SIZE: usize = MMIO_LENGTH.next_multiple_of(PAGE_SIZE);
+
 /// Femtoseconds in a second: the scale `COUNTER_CLK_PERIOD` is stated in.
 pub const FEMTOSECONDS_PER_SECOND: u64 = 1_000_000_000_000_000;
 
@@ -243,6 +247,8 @@ const _: () = assert!(
 const _: () = assert!(Register::MainCounter.offset() + size_of::<u64>() <= MMIO_LENGTH);
 const _: () = assert!(MMIO_BASE.is_multiple_of(MMIO_LENGTH));
 const _: () = assert!(MMIO_BASE % PAGE_SIZE + MMIO_LENGTH <= PAGE_SIZE);
+// One page and not two, the line above having put the whole block inside one.
+const _: () = assert!(MMIO_REGION_SIZE == PAGE_SIZE);
 
 /// Aligned 64-bit access to the block's registers.
 ///

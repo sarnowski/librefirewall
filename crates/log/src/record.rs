@@ -49,6 +49,7 @@ use crate::event::{
 use crate::identifier::{Identifier, IdentifierError};
 
 use core::fmt;
+use lfw_clock::UtcNanos;
 
 /// Why a record decoded to no [`Event`].
 ///
@@ -317,6 +318,11 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::ReceivePosted.to_bits();
                     record.receive_posted = *count;
                 }
+                DomainDetail::Established { tsc_hz, utc } => {
+                    record.detail = LogDetailKind::Established.to_bits();
+                    record.tsc_hz = tsc_hz.get();
+                    record.unix_nanos = utc.as_nanos();
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -409,6 +415,12 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
         CheckedDetail::None => DomainDetail::None,
         CheckedDetail::Features(bits) => DomainDetail::Features(*bits),
         CheckedDetail::ReceivePosted(count) => DomainDetail::ReceivePosted(*count),
+        // Total: `wire` refused the zero frequency and every `u64` of
+        // nanoseconds names a civil time, so nothing is left to judge here.
+        CheckedDetail::Established { tsc_hz, unix_nanos } => DomainDetail::Established {
+            tsc_hz: *tsc_hz,
+            utc: UtcNanos::from_unix_nanos(*unix_nanos),
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -444,6 +456,9 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::None => DomainDetail::None,
                     DomainDetail::Features(bits) => DomainDetail::Features(bits),
                     DomainDetail::ReceivePosted(count) => DomainDetail::ReceivePosted(count),
+                    DomainDetail::Established { tsc_hz, utc } => {
+                        DomainDetail::Established { tsc_hz, utc }
+                    }
                     DomainDetail::Refusal(Refusal {
                         cause,
                         detail,

@@ -48,9 +48,9 @@ use uart_16550::{PortIo, Register};
 /// `third-party/sources.lock` is checksum-verified on every build (DEP-1) and
 /// moves only through a change that runs the whole gate (DEP-3); `xtask image`
 /// then writes the slot that SDK actually assigned into
-/// `build/image/<config>/report.txt`, where `ioports_0x3f8_console` stands at
-/// slot 394 — which is where this number came from and what a reviewer rereads
-/// it against. That report is generated, so it moves when the tool does.
+/// `build/image/<config>/report.txt` — under `cnode_console`, where
+/// `ioports_0x3f8_console` stands at slot 394, and in no other domain's CNode.
+/// That report is generated, so it moves when the tool does.
 ///
 /// *Enforcement* is [`Com1::claim`], which invokes the capability before this
 /// domain relies on it, so a slot that moved is refused by name rather than
@@ -58,7 +58,7 @@ use uart_16550::{PortIo, Register};
 const BASE_IOPORT_SLOT: seL4_CPtr = 394;
 
 /// The `id` of the `<ioport id="0" addr="0x3f8" size="8" />` element on the
-/// console domain in `systems/qemu-x86_64/librefirewall.system:436` — this
+/// console domain in `systems/qemu-x86_64/librefirewall.system:575` — this
 /// grant's index within the ioport bank.
 const COM1_IOPORT_ID: seL4_CPtr = 0;
 

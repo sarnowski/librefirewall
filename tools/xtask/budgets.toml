@@ -16,7 +16,7 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
-"crates/clock/src/lib.rs" = 0.4188
+"crates/clock/src/lib.rs" = 0.4183
 "crates/config/src/diff.rs" = 0.1864
 "crates/config/src/hash.rs" = 0.2917
 "crates/config/src/lib.rs" = 0.5044
@@ -28,14 +28,14 @@
 "crates/config/src/validate.rs" = 0.1392
 "crates/config/src/value.rs" = 0.2615
 "crates/config/src/xml.rs" = 0.1947
-"crates/hpet/src/lib.rs" = 0.5620
+"crates/hpet/src/lib.rs" = 0.5613
 "crates/log/src/console.rs" = 0.5310
-"crates/log/src/detail.rs" = 0.4061
-"crates/log/src/event.rs" = 0.2043
+"crates/log/src/detail.rs" = 0.4057
+"crates/log/src/event.rs" = 0.2035
 "crates/log/src/identifier.rs" = 0.2121
 "crates/log/src/lib.rs" = 0.4118
-"crates/log/src/record.rs" = 0.1832
-"crates/log/src/render.rs" = 0.1597
+"crates/log/src/record.rs" = 0.1818
+"crates/log/src/render.rs" = 0.1572
 "crates/log/src/ring.rs" = 0.3721
 "crates/net-headers/src/lib.rs" = 0.1925
 "crates/nic-driver-core/src/bringup.rs" = 0.3404
@@ -53,12 +53,15 @@
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
 "crates/wire/src/lib.rs" = 0.1941
-"crates/wire/src/log_record.rs" = 0.2216
+"crates/wire/src/log_record.rs" = 0.2214
 "crates/wire/src/log_ring.rs" = 0.4120
-"crates/wire/src/log_slot.rs" = 0.1254
+"crates/wire/src/log_slot.rs" = 0.1212
+"pds/clock/src/cmos.rs" = 0.6615
+"pds/clock/src/hpet_mmio.rs" = 0.7222
+"pds/clock/src/main.rs" = 0.4253
 "pds/config/src/main.rs" = 0.4511
 "pds/console/src/com1.rs" = 0.6400
-"pds/console/src/main.rs" = 0.5694
+"pds/console/src/main.rs" = 0.5613
 "pds/forwarder/src/main.rs" = 0.3878
 "pds/nic-driver/src/main.rs" = 0.4675
 
@@ -77,6 +80,7 @@
 "crates/uart-16550" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
+"pds/clock" = 4
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
@@ -97,6 +101,7 @@
 "crates/uart-16550" = 0
 "crates/virtio" = 4
 "crates/wire" = 0
+"pds/clock" = 0
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
@@ -117,6 +122,7 @@
 "crates/uart-16550" = 0
 "crates/virtio" = 0
 "crates/wire" = 0
+"pds/clock" = 0
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0

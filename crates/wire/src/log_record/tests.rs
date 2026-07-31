@@ -79,19 +79,21 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
     assert_eq!(size_of::<IdentifierImage>(), 20);
     assert_eq!(size_of::<CauseImage>(), 44);
     assert_eq!(size_of::<ValueImage>(), 32);
-    assert_eq!(size_of::<LogRecord>(), 192);
+    assert_eq!(size_of::<LogRecord>(), 208);
     assert_eq!(align_of::<LogRecord>(), 8);
     assert_eq!(
         [
             offset_of!(LogRecord, features),
             offset_of!(LogRecord, operands),
+            offset_of!(LogRecord, tsc_hz),
+            offset_of!(LogRecord, unix_nanos),
             offset_of!(LogRecord, kind),
             offset_of!(LogRecord, cause),
             offset_of!(LogRecord, key),
             offset_of!(LogRecord, from),
             offset_of!(LogRecord, to),
         ],
-        [0, 8, 24, 64, 108, 128, 160]
+        [0, 8, 24, 32, 40, 80, 124, 144, 176]
     );
 }
 
@@ -109,7 +111,7 @@ fn a_record_has_a_stable_little_endian_byte_image() {
         &bytes[0..8],
         &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
     );
-    assert_eq!(&bytes[24..28], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(&bytes[40..44], &[0xff, 0x00, 0x00, 0x00]);
     assert_eq!(record_from_bytes(bytes), record);
 }
 
@@ -162,6 +164,22 @@ fn a_domain_record_carries_each_detail_shape() {
             ..
         })
     ));
+
+    let established = LogRecord {
+        detail: LogDetailKind::Established.to_bits(),
+        tsc_hz: 2_999_998_000,
+        unix_nanos: u64::MAX,
+        ..domain_record()
+    };
+    let Ok(CheckedBody::Domain {
+        detail: CheckedDetail::Established { tsc_hz, unix_nanos },
+        ..
+    }) = established.check()
+    else {
+        panic!("an established clock decodes to one");
+    };
+    assert_eq!(tsc_hz.get(), 2_999_998_000);
+    assert_eq!(unix_nanos, u64::MAX);
 
     let Ok(CheckedBody::Domain {
         detail:
@@ -516,7 +534,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 6] = [
+    let cases: [(LogRecord, LogRecordError); 7] = [
         (
             LogRecord {
                 kind: 4,
@@ -533,10 +551,21 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 4,
+                detail: 5,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 4 },
+            LogRecordError::DetailKindUnknown { detail: 5 },
+        ),
+        // The one detail whose own field can refuse it: a frequency of zero
+        // scales no reading, so it is refused rather than carried on as a
+        // divisor every later consumer would have to re-check.
+        (
+            LogRecord {
+                detail: LogDetailKind::Established.to_bits(),
+                tsc_hz: 0,
+                ..domain_record()
+            },
+            LogRecordError::ClockFrequencyZero,
         ),
         (
             LogRecord {
@@ -755,7 +784,8 @@ fn every_refusal_names_the_field_and_the_value() {
         LogRecordError::KindUnknown { kind: 9 },
         LogRecordError::DomainUnknown { domain: 4 },
         LogRecordError::DomainStateUnknown { state: 4 },
-        LogRecordError::DetailKindUnknown { detail: 4 },
+        LogRecordError::DetailKindUnknown { detail: 5 },
+        LogRecordError::ClockFrequencyZero,
         LogRecordError::OperandCountUnknown { operands: 3 },
         LogRecordError::SignalledNotBoolean { signalled: 2 },
         LogRecordError::ChangeKindUnknown { change: 3 },
@@ -793,9 +823,10 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 4",
+            "domain token 4 is not below 5",
             "state token 4 is not below 4",
-            "detail kind 4 names no payload",
+            "detail kind 5 names no payload",
+            "the established counter frequency is zero, which scales no reading",
             "operand count 3 exceeds the 2 the record holds",
             "signalled byte 2 is not 0 or 1",
             "change token 3 is not below 3",
@@ -832,10 +863,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Features,
         LogDetailKind::ReceivePosted,
         LogDetailKind::Refusal,
+        LogDetailKind::Established,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(4), None);
+    assert_eq!(LogDetailKind::from_bits(5), None);
 
     for value in [
         LogValueKind::Absent,
@@ -871,7 +903,7 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
     (
         prop_oneof![9 => 0u32..=3, 1 => any::<u32>()],
         prop_oneof![9 => 0u8..=3, 1 => any::<u8>()],
-        prop_oneof![9 => 0u8..=3, 1 => any::<u8>()],
+        prop_oneof![9 => 0u8..=4, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![7 => 1u8..=16, 2 => 0u8..=40, 1 => any::<u8>()],
@@ -879,6 +911,10 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
         prop_oneof![9 => 0u8..=2, 1 => any::<u8>()],
         proptest::collection::vec(prop_oneof![9 => 0x61u8..=0x7a, 1 => any::<u8>()], 16),
         any::<[u8; 6]>(),
+        // Zero as often as anything else: it is the one value of this field
+        // that refuses the record, and a frequency drawn over `u64` would
+        // never be it.
+        prop_oneof![1 => Just(0u64), 1 => 1u64..=u64::MAX],
     )
         .prop_map(
             |(
@@ -892,6 +928,7 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
                 operand_count,
                 letters,
                 octets,
+                tsc_hz,
             )| {
                 let mut key = IdentifierImage::ZERO;
                 for (slot, byte) in key.bytes.iter_mut().zip(letters) {
@@ -929,6 +966,8 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
                         id: key,
                         ..ValueImage::ZERO
                     },
+                    tsc_hz,
+                    unix_nanos: u64::from(token) * u64::from(len),
                     ..LogRecord::ZERO
                 }
             },

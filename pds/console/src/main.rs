@@ -1,21 +1,21 @@
 #![no_main]
 #![no_std]
 
-//! Console protection domain: the one holder of the serial controller, and the
-//! only domain in this system with an I/O-port capability. It drains every
-//! other domain's log ring, renders each record, and puts the line on COM1.
+//! Console protection domain: the one holder of the serial controller. It
+//! drains every other domain's log ring, renders each record, and puts the line
+//! on COM1.
 //!
 //! # Adversary
 //!
 //! Both of the ones this domain can meet (CONCEPT §7.1). The **byzantine peer
-//! protection domain** owns the four records regions mapped here read-only:
+//! protection domain** owns the five records regions mapped here read-only:
 //! every slot, the producer cursor and the drop count are peer-chosen, and
 //! nothing this domain does can correct one. The **hostile or malfunctioning
 //! device** is the controller, which may never report its transmitter empty.
 //! Neither is judged in this file: `wire` and `lfw_log` refuse a record and
 //! `uart_16550` bounds every wait.
 //!
-//! # Eight regions, not four
+//! # Ten regions, not five
 //!
 //! Each writing domain's ring is two regions carrying opposite grants. This
 //! domain maps the records read-only, so it cannot forge a line attributed to a
@@ -70,7 +70,7 @@
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
 //! drives them (LAY-2); the register protocol and every bounded wait are in
-//! `uart_16550`. This file maps eight regions, claims one port window, and
+//! `uart_16550`. This file maps ten regions, claims one port window, and
 //! calls one function in a loop.
 //!
 //! # Why the port access is here and not in `uart_16550`
@@ -103,10 +103,10 @@ use uart_16550::{Transmitter, Uart, WriteError};
 use wire::{LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
-/// per writing domain, matching the four pairs of `<map>` rows on the console
+/// per writing domain, matching the five pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
 /// fixed by the system description (CONCEPT §12.3), so this is a build fact.
-const RINGS: usize = 4;
+const RINGS: usize = 5;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
 /// the trait and the transmitter are foreign here, and that is all it adds.
@@ -135,6 +135,7 @@ fn init() -> Console {
     let nic_driver0: &'static LogRecords = attach_region!(log_nic_driver0_vaddr: LogRecords);
     let nic_driver1: &'static LogRecords = attach_region!(log_nic_driver1_vaddr: LogRecords);
     let config: &'static LogRecords = attach_region!(log_config_vaddr: LogRecords);
+    let clock: &'static LogRecords = attach_region!(log_clock_vaddr: LogRecords);
     let forwarder_consume: &'static LogConsume =
         attach_region!(log_forwarder_consume_vaddr: LogConsume);
     let nic_driver0_consume: &'static LogConsume =
@@ -142,6 +143,7 @@ fn init() -> Console {
     let nic_driver1_consume: &'static LogConsume =
         attach_region!(log_nic_driver1_consume_vaddr: LogConsume);
     let config_consume: &'static LogConsume = attach_region!(log_config_consume_vaddr: LogConsume);
+    let clock_consume: &'static LogConsume = attach_region!(log_clock_consume_vaddr: LogConsume);
 
     let port = match Com1::claim() {
         Ok(port) => port,
@@ -183,6 +185,7 @@ fn init() -> Console {
         nic_driver0_consume.reader(nic_driver0),
         nic_driver1_consume.reader(nic_driver1),
         config_consume.reader(config),
+        clock_consume.reader(clock),
     ];
     printer.print(&announce(DomainState::Ready));
 

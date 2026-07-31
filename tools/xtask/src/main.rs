@@ -25,6 +25,7 @@
 //! - [`forward_harness`] — the two-port socket-backed forwarding harness.
 //! - [`topology`] — the bench read out of the configuration document under test.
 //! - [`config_transcript`] — the `LFW-CFG` console channel one boot must carry.
+//! - [`clock_contract`] — the clock domain's own record on the `LFW-PD` channel.
 //! - [`diagnose`] — re-run a failed release scenario on the debug kernel.
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
@@ -39,6 +40,7 @@ use std::{env, error::Error, fmt, fs, io, path::Path, process::ExitCode};
 mod ab_test;
 mod artifacts;
 mod budgets;
+mod clock_contract;
 mod config_transcript;
 mod diagnose;
 mod disk;

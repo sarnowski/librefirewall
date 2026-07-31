@@ -16,7 +16,7 @@
 //!
 //! The record is a fixed-layout POD with no implicit padding — the `const _`
 //! block at the foot of `crates/wire/src/log_record.rs` asserts the fields sum
-//! to the whole 192 bytes — so the fuzzer's bytes *are* the region.
+//! to the whole 208 bytes — so the fuzzer's bytes *are* the region.
 //! [`record_from_region`] lays the input over the ABI field for field and
 //! zeroes what the input does not reach, which is what a partially written
 //! region holds. Nothing is reduced into a plausible range on the way (TEST-8):
@@ -24,7 +24,8 @@
 //! value-type tags that name no value, text lengths past the storage the record
 //! carries, text bytes that are ESC, newline or anything else outside
 //! `[a-z0-9-]`, an operand count naming storage that does not exist, `signalled`
-//! bytes that are no boolean, and arbitrary padding are all ordinary inputs.
+//! bytes that are no boolean, a counter frequency of zero, an instant past any
+//! date a node will see, and arbitrary padding are all ordinary inputs.
 //!
 //! # Why three records are checked and not one
 //!
@@ -90,7 +91,7 @@ use wire::{
 /// Restated from the ABI contract rather than taken from `size_of`, so a record
 /// that changed size would show up as a seed that no longer means what it was
 /// committed for rather than as a silently re-laid-out input.
-pub const RECORD_BYTES: usize = 192;
+pub const RECORD_BYTES: usize = 208;
 
 /// The four record kinds, as the ABI numbers them. Restated here rather than
 /// reached for through `LogKind::to_bits`, which is the code under test.
@@ -101,12 +102,13 @@ const KIND_CONFIG_REJECTED: u32 = 3;
 /// One past the last kind: the smallest `kind` no event has.
 const KIND_COUNT: u32 = 4;
 
-/// The four `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
 const DETAIL_REFUSAL: u8 = 3;
-const DETAIL_COUNT: u8 = 4;
+const DETAIL_ESTABLISHED: u8 = 4;
+const DETAIL_COUNT: u8 = 5;
 
 /// The nine `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -163,6 +165,10 @@ fn narrow_discriminants(record: LogRecord) -> LogRecord {
     narrowed.detail = record.detail % (DETAIL_COUNT + 1);
     narrowed.operand_count = record.operand_count % (MAX_OPERANDS + 2);
     narrowed.signalled = record.signalled % 3;
+    // Zero is the one value of this field a rule refuses and is unreachable by
+    // chance over `u64`; one is the narrowest accepted frequency. The
+    // unmodified record still carries the whole of `u64` on every input.
+    narrowed.tsc_hz = record.tsc_hz % 2;
     narrowed.change = record.change % (LOG_CHANGE_KIND_COUNT + 2);
     narrowed.object = record.object % (LOG_OBJECT_KIND_COUNT + 2);
     narrowed.field = record.field % (LOG_FIELD_COUNT + 2);
@@ -425,6 +431,13 @@ const POISON: LogRecord = LogRecord {
     key: POISON_IDENTIFIER,
     from: POISON_VALUE,
     to: POISON_VALUE,
+    // Zero rather than the 0xAA pattern the rest carries: zero is the value the
+    // frequency rule refuses, and 0xAA… is one it admits. Poison is whatever a
+    // rule says no to, which for this field is the opposite of "unlikely".
+    tsc_hz: 0,
+    // And no value of this one is refused, so the pattern is only here to be
+    // visible if a decode read it under a detail that never named it.
+    unix_nanos: 0xAAAA_AAAA_AAAA_AAAA,
 };
 
 /// A text nothing admits: a length past its own storage, and every byte an ESC
@@ -464,6 +477,10 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
             match record.detail {
                 DETAIL_FEATURES => kept.features = record.features,
                 DETAIL_RECEIVE_POSTED => kept.receive_posted = record.receive_posted,
+                DETAIL_ESTABLISHED => {
+                    kept.tsc_hz = record.tsc_hz;
+                    kept.unix_nanos = record.unix_nanos;
+                }
                 DETAIL_REFUSAL => {
                     kept.cause = record.cause;
                     kept.operand_count = record.operand_count;
@@ -555,7 +572,8 @@ fn refusal(record: &LogRecord) -> Option<LogRecordError> {
 }
 
 /// A `Domain` record: the domain, then its state, then the detail — and, for a
-/// refusal, its cause, then its operand count, then `signalled`.
+/// refusal, its cause, then its operand count, then `signalled`; for an
+/// established clock, its frequency.
 fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
     vocabulary(
         record.domain,
@@ -575,6 +593,10 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
     })
     .or_else(|| match record.detail {
         DETAIL_NONE | DETAIL_FEATURES | DETAIL_RECEIVE_POSTED => None,
+        // The instant is unranged on purpose: every `u64` of nanoseconds names
+        // a civil time, so the frequency is the whole of what this detail can
+        // be refused for.
+        DETAIL_ESTABLISHED => (record.tsc_hz == 0).then_some(LogRecordError::ClockFrequencyZero),
         DETAIL_REFUSAL => text_refusal(&record.cause, LogText::Cause, true)
             .or_else(|| {
                 (record.operand_count > MAX_OPERANDS).then_some(
@@ -708,6 +730,8 @@ pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
     LogRecord {
         features: quad(unstructured),
         operands: [quad(unstructured), quad(unstructured)],
+        tsc_hz: quad(unstructured),
+        unix_nanos: quad(unstructured),
         kind: word(unstructured),
         generation: word(unstructured),
         sequence: word(unstructured),
@@ -791,6 +815,8 @@ pub(crate) fn region_from_record(record: &LogRecord) -> Vec<u8> {
     for operand in record.operands {
         out.extend_from_slice(&operand.to_le_bytes());
     }
+    out.extend_from_slice(&record.tsc_hz.to_le_bytes());
+    out.extend_from_slice(&record.unix_nanos.to_le_bytes());
     for word in [
         record.kind,
         record.generation,
@@ -906,6 +932,16 @@ mod tests {
         }
     }
 
+    /// A `Domain` record carrying a measured clock, which every rule admits.
+    fn established_record() -> LogRecord {
+        LogRecord {
+            detail: DETAIL_ESTABLISHED,
+            tsc_hz: 2_999_998_000,
+            unix_nanos: 1_785_443_220_123_456_789,
+            ..domain_record()
+        }
+    }
+
     /// A `ConfigGeneration` record every rule admits.
     fn config_generation_record() -> LogRecord {
         LogRecord {
@@ -978,6 +1014,22 @@ mod tests {
                         ..text_of(b"wan")
                     },
                     ..config_change_record()
+                }),
+            ),
+            // The measured clock, in both of the shapes its own field decides:
+            // a frequency and an instant the ABI carries, and the zero
+            // frequency that is the only thing this detail can be refused for.
+            // Committed rather than left to be rediscovered, for the reason the
+            // two above are: a zero drawn over `u64` never happens.
+            (
+                "valid_domain_established",
+                region_from_record(&established_record()),
+            ),
+            (
+                "established_frequency_zero",
+                region_from_record(&LogRecord {
+                    tsc_hz: 0,
+                    ..established_record()
                 }),
             ),
             // Every byte the writer could set, set.

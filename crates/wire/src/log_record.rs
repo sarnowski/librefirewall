@@ -37,6 +37,7 @@
 use core::{
     fmt,
     mem::{align_of, offset_of, size_of},
+    num::NonZeroU64,
 };
 
 /// Bytes an identifier occupies in a record, and so the longest one that
@@ -50,7 +51,7 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 4;
+pub const LOG_DOMAIN_COUNT: u8 = 5;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -118,6 +119,7 @@ pub enum LogDetailKind {
     Features,
     ReceivePosted,
     Refusal,
+    Established,
 }
 
 impl LogDetailKind {
@@ -128,6 +130,7 @@ impl LogDetailKind {
             Self::Features => 1,
             Self::ReceivePosted => 2,
             Self::Refusal => 3,
+            Self::Established => 4,
         }
     }
 
@@ -138,6 +141,7 @@ impl LogDetailKind {
             1 => Some(Self::Features),
             2 => Some(Self::ReceivePosted),
             3 => Some(Self::Refusal),
+            4 => Some(Self::Established),
             _ => None,
         }
     }
@@ -301,14 +305,20 @@ pub struct LogRecord {
     /// The numbers a refusal cause names, in the order it names them, under
     /// [`LogDetailKind::Refusal`]. `operand_count` says how many are the value.
     pub operands: [u64; 2],
+    /// The counter frequency in hertz, under [`LogDetailKind::Established`].
+    /// Zero is refused: it is the divisor every later reading is scaled by.
+    pub tsc_hz: u64,
+    /// Nanoseconds since the Unix epoch, under the same detail, and unranged —
+    /// every `u64` names a civil time, so believability is a reader's question.
+    pub unix_nanos: u64,
     /// Which [`LogKind`] this record is, as raw bits.
     pub kind: u32,
     /// The configuration generation of a [`LogKind::ConfigChange`],
     /// [`LogKind::ConfigGeneration`] or [`LogKind::ConfigRejected`].
     pub generation: u32,
     /// Position within the generation's records, for a
-    /// [`LogKind::ConfigChange`]. There is no clock, so this and `generation`
-    /// are the whole of a record's ordering.
+    /// [`LogKind::ConfigChange`]. Nothing is timestamped, so this and
+    /// `generation` are the whole of a record's ordering.
     pub sequence: u32,
     /// How many values a [`LogKind::ConfigGeneration`] commit changed.
     pub changes: u32,
@@ -363,6 +373,8 @@ impl LogRecord {
     pub const ZERO: Self = Self {
         features: 0,
         operands: [0; 2],
+        tsc_hz: 0,
+        unix_nanos: 0,
         kind: 0,
         generation: 0,
         sequence: 0,
@@ -449,6 +461,10 @@ impl LogRecord {
                 signalled: boolean(self.signalled).ok_or(LogRecordError::SignalledNotBoolean {
                     signalled: self.signalled,
                 })?,
+            },
+            Some(LogDetailKind::Established) => CheckedDetail::Established {
+                tsc_hz: NonZeroU64::new(self.tsc_hz).ok_or(LogRecordError::ClockFrequencyZero)?,
+                unix_nanos: self.unix_nanos,
             },
         };
         Ok(CheckedBody::Domain {
@@ -675,6 +691,11 @@ pub enum CheckedDetail {
         operands: CheckedOperands,
         signalled: bool,
     },
+    /// A [`NonZeroU64`]: a divisor in any other shape leaves a zero to re-check.
+    Established {
+        tsc_hz: NonZeroU64,
+        unix_nanos: u64,
+    },
 }
 
 /// Everything a [`LogRecord`] said, decoded and owned.
@@ -740,6 +761,8 @@ pub enum LogRecordError {
     SignalledNotBoolean {
         signalled: u8,
     },
+    /// An established frequency of zero. Alone among these it carries no value.
+    ClockFrequencyZero,
     ChangeKindUnknown {
         change: u8,
     },
@@ -801,6 +824,9 @@ impl fmt::Display for LogRecordError {
             }
             Self::SignalledNotBoolean { signalled } => {
                 write!(f, "signalled byte {signalled} is not 0 or 1")
+            }
+            Self::ClockFrequencyZero => {
+                f.write_str("the established counter frequency is zero, which scales no reading")
             }
             Self::ChangeKindUnknown { change } => write!(
                 f,
@@ -865,31 +891,33 @@ const _: () = {
     assert!(offset_of!(ValueImage, _pad) == 11);
     assert!(offset_of!(ValueImage, id) == 12);
 
-    assert!(size_of::<LogRecord>() == 192);
+    assert!(size_of::<LogRecord>() == 208);
     assert!(align_of::<LogRecord>() == 8);
     assert!(offset_of!(LogRecord, features) == 0);
     assert!(offset_of!(LogRecord, operands) == 8);
-    assert!(offset_of!(LogRecord, kind) == 24);
-    assert!(offset_of!(LogRecord, generation) == 28);
-    assert!(offset_of!(LogRecord, sequence) == 32);
-    assert!(offset_of!(LogRecord, changes) == 36);
-    assert!(offset_of!(LogRecord, reject_offset) == 40);
-    assert!(offset_of!(LogRecord, receive_posted) == 44);
-    assert!(offset_of!(LogRecord, domain) == 48);
-    assert!(offset_of!(LogRecord, state) == 49);
-    assert!(offset_of!(LogRecord, detail) == 50);
-    assert!(offset_of!(LogRecord, operand_count) == 51);
-    assert!(offset_of!(LogRecord, signalled) == 52);
-    assert!(offset_of!(LogRecord, change) == 53);
-    assert!(offset_of!(LogRecord, object) == 54);
-    assert!(offset_of!(LogRecord, field) == 55);
-    assert!(offset_of!(LogRecord, outcome) == 56);
-    assert!(offset_of!(LogRecord, reason) == 57);
-    assert!(offset_of!(LogRecord, _pad) == 58);
-    assert!(offset_of!(LogRecord, cause) == 64);
-    assert!(offset_of!(LogRecord, key) == 108);
-    assert!(offset_of!(LogRecord, from) == 128);
-    assert!(offset_of!(LogRecord, to) == 160);
+    assert!(offset_of!(LogRecord, tsc_hz) == 24);
+    assert!(offset_of!(LogRecord, unix_nanos) == 32);
+    assert!(offset_of!(LogRecord, kind) == 40);
+    assert!(offset_of!(LogRecord, generation) == 44);
+    assert!(offset_of!(LogRecord, sequence) == 48);
+    assert!(offset_of!(LogRecord, changes) == 52);
+    assert!(offset_of!(LogRecord, reject_offset) == 56);
+    assert!(offset_of!(LogRecord, receive_posted) == 60);
+    assert!(offset_of!(LogRecord, domain) == 64);
+    assert!(offset_of!(LogRecord, state) == 65);
+    assert!(offset_of!(LogRecord, detail) == 66);
+    assert!(offset_of!(LogRecord, operand_count) == 67);
+    assert!(offset_of!(LogRecord, signalled) == 68);
+    assert!(offset_of!(LogRecord, change) == 69);
+    assert!(offset_of!(LogRecord, object) == 70);
+    assert!(offset_of!(LogRecord, field) == 71);
+    assert!(offset_of!(LogRecord, outcome) == 72);
+    assert!(offset_of!(LogRecord, reason) == 73);
+    assert!(offset_of!(LogRecord, _pad) == 74);
+    assert!(offset_of!(LogRecord, cause) == 80);
+    assert!(offset_of!(LogRecord, key) == 124);
+    assert!(offset_of!(LogRecord, from) == 144);
+    assert!(offset_of!(LogRecord, to) == 176);
 
     // Every byte of the record belongs to a declared field: the fields sum to
     // the whole size, so the compiler inserted no padding of its own. That is
@@ -898,7 +926,7 @@ const _: () = {
     // on.
     assert!(
         size_of::<LogRecord>()
-            == 3 * size_of::<u64>()
+            == 5 * size_of::<u64>()
                 + 6 * size_of::<u32>()
                 + 10
                 + 6

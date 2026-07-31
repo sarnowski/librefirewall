@@ -1,0 +1,23 @@
+[package]
+# The program image the system description names is `clock.elf`, so the package
+# is `clock`. `crates/clock` is the arithmetic and carries the project prefix
+# (`lfw-clock`), which is what leaves this short name free for the domain.
+name = "clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The raw seL4 API, for the one thing `sel4-microkit` does not wrap: invoking an
+# x86 I/O-port capability. The same reason `pds/console` reaches for it.
+sel4.workspace = true
+sel4-microkit.workspace = true
+lfw-clock = { path = "../../crates/clock" }
+lfw-hpet = { path = "../../crates/hpet" }
+lfw-log = { path = "../../crates/log" }
+lfw-rtc = { path = "../../crates/rtc" }
+pd-runtime = { path = "../../crates/pd-runtime" }
+wire = { path = "../../crates/wire" }
+
+[lints]
+workspace = true

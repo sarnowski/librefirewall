@@ -53,6 +53,7 @@ closed_vocabulary! {
         NicDriver => "nic-driver",
         Config => "config",
         Console => "console",
+        Clock => "clock",
     }
 }
 

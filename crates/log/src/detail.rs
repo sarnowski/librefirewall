@@ -21,7 +21,9 @@
 //! stay one function: a line an operator reads cannot depend on which side of a
 //! shared region the event was assembled on.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU64};
+
+use lfw_clock::UtcNanos;
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
@@ -132,6 +134,14 @@ pub enum DomainDetail<C = &'static str> {
     /// Receive descriptors primed before a driver entered its poll loop.
     ReceivePosted(u32),
     Refusal(Refusal<C>),
+    /// What a domain established about time. The two travel together because
+    /// neither is worth reading alone, and they are the measurement's own types
+    /// rather than integers — `calibrate`'s and a `Calibration`'s — so a call
+    /// site can report neither a zero frequency nor an instant it never derived.
+    Established {
+        tsc_hz: NonZeroU64,
+        utc: UtcNanos,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

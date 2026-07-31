@@ -2,6 +2,8 @@
 
 use core::fmt::{self, Write as _};
 
+use lfw_clock::{RFC3339_LEN, render_rfc3339};
+
 use crate::detail::{DomainDetail, Refusal, RefusalDetail};
 use crate::event::Event;
 
@@ -107,6 +109,14 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
         DomainDetail::None => Ok(()),
         DomainDetail::Features(bits) => write!(cursor, " features={bits:#x}"),
         DomainDetail::ReceivePosted(count) => write!(cursor, " rx-posted={count}"),
+        // The instant goes out as the ASCII bytes it is: a `from_utf8` here
+        // would have no failure arm but a line missing the instant.
+        DomainDetail::Established { tsc_hz, utc } => {
+            write!(cursor, " tsc-hz={tsc_hz} utc=")?;
+            let mut instant = [0u8; RFC3339_LEN];
+            render_rfc3339(*utc, &mut instant);
+            cursor.write_ascii(&instant)
+        }
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -132,14 +142,19 @@ struct Cursor<'a> {
     written: usize,
 }
 
-impl fmt::Write for Cursor<'_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let bytes = text.as_bytes();
+impl Cursor<'_> {
+    fn write_ascii(&mut self, bytes: &[u8]) -> fmt::Result {
         let end = self.written.checked_add(bytes.len()).ok_or(fmt::Error)?;
         let slot = self.out.get_mut(self.written..end).ok_or(fmt::Error)?;
         slot.copy_from_slice(bytes);
         self.written = end;
         Ok(())
+    }
+}
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.write_ascii(text.as_bytes())
     }
 }
 
@@ -154,6 +169,15 @@ mod tests {
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{boxed::Box, string::String, vec, vec::Vec};
+
+    /// The established-time detail from the two numbers the ABI carries; see
+    /// the identically named helper in `record/tests.rs`.
+    fn established(tsc_hz: u64, unix_nanos: u64) -> DomainDetail {
+        DomainDetail::Established {
+            tsc_hz: core::num::NonZeroU64::new(tsc_hz).expect("a frequency above zero"),
+            utc: lfw_clock::UtcNanos::from_unix_nanos(unix_nanos),
+        }
+    }
 
     fn id(text: &str) -> Identifier {
         Identifier::new(text.as_bytes()).expect("the fixture is within the alphabet")
@@ -215,6 +239,42 @@ mod tests {
                 detail: DomainDetail::ReceivePosted(64),
             }),
             "LFW-PD domain=nic-driver state=ready rx-posted=64"
+        );
+    }
+
+    /// The one record that states a time, and the only place a value on this
+    /// surface is not `[a-z0-9-]`: an RFC 3339 instant carries `T`, `Z`, `:`
+    /// and `.`, exactly as a MAC carries colons and an address dots.
+    #[test]
+    fn an_established_clock_renders_its_frequency_and_the_instant_it_anchored() {
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Clock,
+                state: DomainState::Ready,
+                detail: established(2_999_998_000, 1_785_443_220 * 1_000_000_000 + 123_456_789),
+            }),
+            "LFW-PD domain=clock state=ready tsc-hz=2999998000 \
+             utc=2026-07-30T20:27:00.123456789Z"
+        );
+        // The two extremes of the pair, so the widest and narrowest fields are
+        // rendered rather than only a plausible middle: one hertz at the epoch,
+        // and the largest frequency and the last instant `u64` nanoseconds hold.
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Clock,
+                state: DomainState::Ready,
+                detail: established(1, 0),
+            }),
+            "LFW-PD domain=clock state=ready tsc-hz=1 utc=1970-01-01T00:00:00.000000000Z"
+        );
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Clock,
+                state: DomainState::Ready,
+                detail: established(u64::MAX, u64::MAX),
+            }),
+            "LFW-PD domain=clock state=ready tsc-hz=18446744073709551615 \
+             utc=2554-07-21T23:34:33.709551615Z"
         );
     }
 
@@ -531,6 +591,7 @@ mod tests {
             DomainDetail::None,
             DomainDetail::Features(u64::MAX),
             DomainDetail::ReceivePosted(u32::MAX),
+            established(u64::MAX, u64::MAX),
         ];
         for detail in [
             RefusalDetail::None,
@@ -557,6 +618,7 @@ mod tests {
             Just(DomainDetail::None),
             any::<u64>().prop_map(DomainDetail::Features),
             any::<u32>().prop_map(DomainDetail::ReceivePosted),
+            (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
             (
                 (0..causes.len()),
                 prop_oneof![

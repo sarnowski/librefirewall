@@ -64,9 +64,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-clock"
+version = "0.1.0"
+
+[[package]]
 name = "lfw-log"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
  "net-headers",
  "wire",
 ]

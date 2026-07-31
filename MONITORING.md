@@ -97,9 +97,13 @@ implementation and binds the two that follow.
   console this is structural rather than a rule to remember: the only value type that can carry text
   out of a configuration document is an identifier validated to `[a-z0-9-]{1,16}`, and a refusal
   names a *location* in the document and never the bytes at it.
-- **The console alphabet is a guarantee, not a convention.** Every value that reaches a console line
-  is restricted to `[a-z0-9-]`, and the rendered line as a whole is printable ASCII — no control
-  character, no ESC, and no newline but the single terminator the console appends. That is what
+- **The console alphabet is a guarantee, not a convention.** Every value carrying *text* is
+  restricted to `[a-z0-9-]`, and the rendered line as a whole is printable ASCII — no control
+  character, no ESC, and no newline but the single terminator the console appends. Values that are
+  not text render in their own notation and are the only place other characters appear: `:` in a
+  MAC, `.` in an address, and `-`, `T`, `:`, `.` and `Z` in the RFC 3339 instant the clock record
+  carries. Each is produced from an already-parsed number by first-party code, so no byte of one was
+  ever a peer's to choose. That is what
   stops a peer painting terminal escape sequences onto an operator's terminal, and it is checked
   *twice against two different adversaries*: once where a call site mints a value, and again in the
   console domain where a record arrives out of a region another domain owns and every byte of it was
@@ -109,10 +113,15 @@ implementation and binds the two that follow.
 
 ### Ordering and time
 
-**There is no clock in this system** — no timer, no interrupt of any kind, and no trusted time
-source. Nothing is therefore timestamped. A record carries the **configuration `generation`** it
-belongs to and, where one generation produces several change records, a **`seq`** numbering them
-from 0 in emission order.
+**No record is timestamped.** One domain now establishes a wall-clock time at boot — it calibrates
+the timestamp counter against the HPET, reads the CMOS real-time clock once, and reports both in the
+single record described under *`LFW-PD` — protection-domain lifecycle* below. That record is the
+only place a time appears on any surface: nothing consumes the calibration, no other record carries
+an instant, and there is still no timer and no interrupt of any kind. Nor is the time it establishes
+*trusted* — the CMOS answer is unauthenticated and unattested (README, *Trusted time source*), so it
+is a stated instant rather than one anything may be judged against. A record therefore carries the
+**configuration `generation`** it belongs to and, where one generation produces several change
+records, a **`seq`** numbering them from 0 in emission order.
 `(generation, seq)` is the whole of a record's ordering, and generations are monotonic within a
 boot, so it totally orders one boot's change records. `seq` appears on `LFW-CFG` change records and
 on no other shape: it numbers a generation's diff, and is neither a per-domain counter nor a
@@ -130,7 +139,7 @@ rings, renders each record and writes the line. Two guarantees follow, and no th
   rotating start and takes at most a bounded burst from each, which is the fairness rule that stops
   a flooding ring starving another. *Which* domain's record reaches the line first is therefore
   decided by where that rotation stood when the console next ran — not by which event happened
-  first — and there is no clock to appeal to.
+  first — and no record carries a timestamp to appeal to.
 
 A concrete consequence an operator will meet on every boot: the forwarding domain's
 `generation=1 outcome=applied changes=0` routinely prints **before** the change records that
@@ -139,7 +148,9 @@ A reader that infers causality from console order is inferring it from the fairn
 
 Within a domain, then, `(generation, seq)` is exact ordering and exact attribution, which is what a
 configuration audit needs, and it is preferred to inventing a time base a reader would then trust.
-What the absence of a clock costs is not small and is stated rather than left to be discovered:
+What the absence of a *timestamp* costs is not small and is stated rather than left to be
+discovered — every item below is unchanged by the clock domain's one record, which states an instant
+and orders nothing:
 
 - **Nothing correlates outside the node.** Not a neighbour's log, not an operator's action, not a
   packet capture — there is no shared time base to correlate on.
@@ -154,7 +165,9 @@ What the absence of a clock costs is not small and is stated rather than left to
 
 When a trusted time source lands, records gain a timestamp field and lose none of the above:
 `generation` and `seq` stay, because a change is attributed to a generation and a timestamp is not
-an attribution.
+an attribution. What exists today is the measurement half of that source and not the trust half, so
+the clock's own record is evidence that the chain works rather than a licence to date anything by
+it.
 
 ## Console (system state)
 
@@ -179,12 +192,12 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ### `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
-**`nic-driver`**, **`config`**, **`console`** — the domain names in the Microkit system description.
-`state=` is one of **`starting`**, **`negotiated`**, **`ready`**, **`refused`**.
+**`nic-driver`**, **`config`**, **`console`**, **`clock`** — the domain names in the Microkit system
+description. `state=` is one of **`starting`**, **`negotiated`**, **`ready`**, **`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
 written waits forever:
@@ -195,6 +208,7 @@ written waits forever:
 | `forwarder` | `starting` only | none |
 | `nic-driver` (once per port, two instances) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
+| `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -222,6 +236,18 @@ holding a silent appliance still has only the external act.
 - `features=0x<hex>` — the feature bitmap the driver and its device settled on. Which bit means what
   is virtio's vocabulary and is deliberately not decoded here.
 - `rx-posted=<n>` — receive descriptors primed before the driver entered its poll loop, decimal.
+- `tsc-hz=<n> utc=<rfc3339>` — what the clock domain established, and the only pair of fields on any
+  surface that states a time. `tsc-hz=` is the timestamp counter's measured frequency in hertz,
+  decimal, derived from an interval measured against the HPET and always inside the band the
+  appliance's own arithmetic accepts (10 MHz to 100 GHz); it is a *measurement*, so two boots of one
+  machine report different numbers, and a value near the band's edges is worth looking at rather
+  than a defect by itself. `utc=` is an RFC 3339 instant in UTC with all nine fractional digits, of
+  the fixed form `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ` and always in the 2000–2200 band the real-time
+  clock reader accepts. **It is the instant the CMOS part reported, advanced by the counter — not a
+  trusted time.** The part is unauthenticated, cannot say whether it holds UTC or local time, and is
+  read exactly once; a node whose firmware set it to local time reports an instant this appliance
+  cannot tell from a correct one. Nothing consumes either value, so neither is a claim about
+  anything else the node did.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. `signalled` says whether the
   device was told to stop (`STATUS_FAILED` written) or was left decoding nothing, which depends on
   whether its BAR had been placed when the rejection happened. `detail=` carries up to two numbers,
@@ -243,8 +269,14 @@ holding a silent appliance still has only the external act.
   a document naming nothing at all to produce that, generation 0 being empty; anything a document
   does name moves something.
 
-The 23 `cause=` tokens are the complete set. The first two are the domain's own, raised before the
-device is touched at all; the rest are the driver's bring-up tree.
+### `LFW-PD` refusal causes
+
+Every `cause=` token is listed below and the two tables together are the complete set: 23 the
+`nic-driver` domain raises and 25 the `clock` domain raises, with no token shared between them. A
+token outside both is a defect, not an extension.
+
+**`nic-driver`.** The first two are the domain's own, raised before the device is touched at all;
+the rest are the driver's bring-up tree.
 
 | group | tokens |
 |---|---|
@@ -253,6 +285,24 @@ device is touched at all; the rest are the driver's bring-up tree.
 | identity and BAR placement | `not-virtio-net` (vendor, device), `structures-outside-bar` (window), `common-cfg-misaligned` (offset, required), `bar-not-64-bit` (bar), `bar-index-out-of-range` (bar), `bar-has-no-high-half` (bar), `bar-target-unusable` (paddr) |
 | handshake | `reset-not-acknowledged` (status), `no-virtio-1` (offered features), `features-rejected` (status) |
 | queues and doorbells | `transmit-queue-absent` (offered, required), `virtqueue-region-unusable` (paddr), `queue-absent` (index), `queue-too-small` (device maximum, required), `doorbell-outside-bar` (slot end, BAR size — or BAR size alone where the offset overflowed), `doorbell-misaligned` (offset) |
+
+**`clock`.** Grouped by the stage that refused, which the token's own prefix names: `cmos-ioport-`
+the port capability, `hpet-` the reference timer, `tsc-` the measurement made against it, `rtc-` the
+real-time clock, and `epoch-` the conversion of its answer. `signalled=` is **always `false`** on
+this domain: it says whether a device was told to stop, and neither of these two has a stop to be
+told — a refusal leaves the timer running exactly as the firmware left it and the register file
+untouched. Where a refusal has more numbers than the line's two, the bound constants of the crate
+that raised it (`COUNTER_POLL_LIMIT`, `UIP_POLL_LIMIT`, `SNAPSHOT_ATTEMPTS`) are what is left out,
+being known without being transmitted.
+
+| group | tokens |
+|---|---|
+| the port capability (no `detail=` beyond the pair) | `cmos-ioport-refused` (refused port, seL4 error code) |
+| the timer block | `hpet-not-present` (capabilities word), `hpet-implausible-clock-period` (femtoseconds), `hpet-counter-too-narrow` (capabilities word), `hpet-not-enabled` (configuration readback), `hpet-counter-stalled` (the value it kept answering), `hpet-counter-too-slow` (observed, wanted), `hpet-duration-too-long` (nanoseconds) |
+| the measurement | `tsc-no-ticks-elapsed`, `hpet-no-reference-interval`, `tsc-implausibly-slow` (derived hertz), `tsc-implausibly-fast` (derived hertz, saturated at `0xffffffffffffffff` where the quotient exceeds 64 bits) |
+| the real-time clock | `rtc-update-never-completed` (status A), `rtc-snapshots-never-agreed`, `rtc-not-binary-coded-decimal` (CMOS index, value), `rtc-hour-outside-twelve-hour-range` (hour, PM flag), `rtc-implausible-year` (year, century register) |
+| the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
+| the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
 ### `LFW-CFG` — configuration
 
@@ -340,8 +390,9 @@ distinguishes them is that a document refusal is emitted before any generation i
 ### Reading records off the wire
 
 The serial device has **exactly one writer**: the `console` protection domain holds the only
-I/O-port capability in the system, and every other domain reaches the line by publishing a record
-into a single-producer ring that domain drains and renders. A record is therefore **whole or
+I/O-port capability covering `0x3F8`–`0x3FF`, and every other domain reaches the line by publishing
+a record into a single-producer ring that domain drains and renders. The one other port grant in the
+system, the `clock` domain's CMOS pair, shares no port with it. A record is therefore **whole or
 absent**, never spliced with another domain's — and that is a property of the capability grant, not
 of scheduling or of a lock.
 

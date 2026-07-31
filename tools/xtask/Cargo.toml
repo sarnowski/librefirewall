@@ -36,6 +36,19 @@ lfw-log = { path = "../../crates/log" }
 # `<ioport>` grant and the addresses the driver forms inside it are two
 # statements of one fact, and `sysdesc` is where they are compared.
 uart-16550 = { path = "../../crates/uart-16550" }
+# The CMOS window and the same crate's plausible-year band: the first is the
+# second `<ioport>` grant `sysdesc` compares, and the second is what
+# `clock_contract` holds a booted node's own reported instant to.
+lfw-rtc = { path = "../../crates/rtc" }
+# The HPET grant's extent — a page rather than the register block, derived in
+# the crate that owns the block for the reason every size constant above is
+# reached for rather than written out.
+lfw-hpet = { path = "../../crates/hpet" }
+# The band a derived counter frequency has to be inside, for `clock_contract`.
+# `lfw-log` already pulls this in transitively; a transitive dependency is not
+# a name this crate may use, and writing the two numbers out here is the drift
+# every dependency above exists to close.
+lfw-clock = { path = "../../crates/clock" }
 
 [lints]
 workspace = true

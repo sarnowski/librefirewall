@@ -37,10 +37,10 @@ generation 0, forwarding nothing — and switches to a generation only after re-
 of it itself, so every boot performs a live configuration swap on a running dataplane. There is
 still no way to *submit* a document to a running node: it is embedded at build time.
 
-A fifth protection domain owns the console. It holds the only I/O-port capability in the system —
-the eight ports at `0x3F8`, the PC-compatible COM1 window — and every other domain reaches an
-operator by publishing a typed record into a single-producer ring of its own, which that domain
-drains, renders, and puts on the line. It replaced `sel4_microkit::debug_println!`, which compiles
+A fifth protection domain owns the console. It holds the first of the system's two I/O-port
+capabilities — the eight ports at `0x3F8`, the PC-compatible COM1 window — and every other domain
+reaches an operator by publishing a typed record into a single-producer ring of its own, which that
+domain drains, renders, and puts on the line. It replaced `sel4_microkit::debug_println!`, which compiles
 to `seL4_DebugPutChar`, a kernel *debug* syscall the release kernel is not built with: until this
 landed, a **release image printed nothing at all**, so a node that parked on a refused NIC or came
 up fail-closed on a refused document said so only in the profile nobody ships.
@@ -57,6 +57,14 @@ small enough to fit what remains; see *[Signed boot chain](#signed-boot-chain)*.
 Both defects were reachable only in the configuration no gate booted, and both are the reason the
 gate now boots the shipped one: every QEMU scenario in `make ci` runs the release image, and the
 only debug kernel any gate boots is the one re-run to diagnose a scenario that has already failed.
+
+A sixth domain establishes what time it is. It maps the HPET's register page and holds the system's
+second I/O-port capability — the two CMOS ports at `0x70` — calibrates the timestamp counter against
+the timer whose rate is self-describing, reads the real-time clock once for an epoch to anchor that
+counter to, publishes one console record stating both, and parks. Nothing consumes the result yet,
+which is deliberate: a shared calibration region no domain maps would be a grant nobody uses. What
+the domain proves in the meantime is the whole chain that would fill one, end to end on the image
+that ships. It is **not** a trusted time source — see the status row above and its detail below.
 
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection
@@ -79,7 +87,7 @@ firewall.
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
 | Isolated sign-only CA protection domain | **open** | |
-| Trusted time source | **open** | the arithmetic (`crates/clock`), the reference measurement (`crates/hpet`) and the epoch anchoring (`crates/rtc`) exist as host-tested library crates, but nothing reads them: no protection domain, no capability for either device, and no record carries a timestamp |
+| Trusted time source | **partial** | a protection domain now establishes real time at boot and reports it; nothing about it is *trusted* — [detail](#trusted-time-source) |
 | Streaming DPI / signature matching | **open** | |
 | Full-object content scanning (YARA-X) | **open** | |
 | Web filtering | **open** | |
@@ -349,9 +357,9 @@ document that shares no address and no MAC with the first.
 
 ### Console device and log transport
 
-**Done.** The console is a device with exactly one owner. `pds/console` holds the system's only
-I/O-port capability — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible COM1 window — and
-is the sole writer of the line; every other domain publishes a typed record into a single-producer
+**Done.** The console is a device with exactly one owner. `pds/console` holds the only I/O-port
+capability that reaches it — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible COM1
+window — and is the sole writer of the line; every other domain publishes a typed record into a single-producer
 ring of its own and that domain drains, renders and transmits it. A record is therefore whole or
 absent rather than spliced with another domain's, which is a property of the capability grant rather
 than of scheduling.
@@ -373,18 +381,18 @@ invocation legal and never the instruction. The first implementation read it the
 correct grant, and faulted with #GP on `out %al,(%dx)` against `0x3F9` at boot. The
 `seL4_X86_IOPort_In8`/`Out8` invocations are the way through and `rust-sel4` exposes both as safe
 Rust, so the driver and the domain each carry **zero** `unsafe` blocks — the ENG-13 budget records a
-0 for both. `Com1::claim` then reads every register the driver can address before the domain relies
+0 for both, and the clock domain's own port adapter carries zero for the same reason. `Com1::claim` then reads every register the driver can address before the domain relies
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`crates/wire` carries the transport: a 192-byte fixed-layout `LogRecord` whose every offset is a
+`crates/wire` carries the transport: a 208-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
 records region (slots, producer cursor, the writer's drop count) is read-write to the writing domain
 and read-only to the console, so the console cannot forge a line attributed to a domain that never
 emitted one — it is the domain whose output is read as testimony about the others. The consume
 region (the console's cursor, one word) is read-write to the console and read-only to the writer, so
 a writer cannot forge how much of its own ring has been read and quietly reuse slots the console
-never rendered. Eight regions, 80 KiB, one pair per writing domain; no writer maps another writer's.
+never rendered. Ten regions, 100 KiB, one pair per writing domain; no writer maps another writer's.
 
 The console busy-polls and never leaves `init`, exactly as the NIC drivers do — Microkit has no
 periodic wakeup, so a `notified`-driven console would stall a boot transcript longer than the
@@ -425,15 +433,20 @@ indifferent to whether anything is printed.
   constants matched to the `<ioport>` grant, because a runtime base is a value the capability could
   not follow. There is no second console, no second UART, and no way to move either without a
   rebuild.
+- **The console is no longer the system's only port holder.** The clock domain holds the CMOS pair,
+  so "an attacker reaching any other domain reaches no port instruction" is narrower than it was:
+  what holds now is that the two windows are disjoint and each has exactly one holder.
 - **No Azure hardware has ever run this.** Azure Serial Console attaches to "ttyS0 or COM1" and QEMU
   q35 exposes COM1 as a 16550A, so this is the same device *by documentation* — which is why there
   is one driver and not two. It is not the same device by test: nothing in this repository has ever
   booted on an Azure VM, and the differences Microsoft documents are about availability (boot
   diagnostics enabled; the serial console possibly unavailable after live-migrating a Generation 2
   Trusted Launch VM with Secure Boot) rather than about registers.
-- **The I/O-port CNode slot is hand-rolled and unchecked at build time.** Microkit publishes a base
-  slot constant for every capability class a domain can hold *except* this one, so the slot number
-  is written out in `pds/console/src/com1.rs` as a cross-artifact fact. Its only detection is the
+- **The I/O-port CNode slot is hand-rolled and unchecked at build time, now in two places.**
+  Microkit publishes a base slot constant for every capability class a domain can hold *except* this
+  one, so the slot number is written out in `pds/console/src/com1.rs` and again in
+  `pds/clock/src/cmos.rs` as a cross-artifact fact — each read from its own domain's CNode in the
+  generated report, the two happening to agree. Its only detection is the
   pinned SDK version (`MICROKIT_VERSION=2.3.0`, checksum-verified, moved only through the full gate)
   read against the generated capability report; nothing compares the two automatically. What limits
   the damage is enforcement rather than detection: `Com1::claim` invokes the capability first, so a
@@ -460,7 +473,7 @@ indifferent to whether anything is printed.
 
 ### Console system-state events
 
-**Done.** The five ad-hoc bring-up markers are gone. Call sites in all four protection-domain
+**Done.** The five ad-hoc bring-up markers are gone. Call sites in all five protection-domain
 binaries emit **typed events** — a closed set of named fields — and rendering happens once, in the
 console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
 site rather than thrown away in a format string, and the structure is what crosses between domains
@@ -482,11 +495,12 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 
 - **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
   no `ready`, no failure — so MONITORING.md's "each stage reporting healthy or the specific fault"
-  holds for the driver and configuration domains and not for the one that carries traffic.
+  holds for the driver, configuration and clock domains and not for the one that carries traffic.
 - **Nothing orders one domain's records against another's.** Within a domain they are totally
   ordered — one writer per ring, drained in the order it wrote them — and a `generation`/`seq` pair
   totally orders one commit's change records. Across domains there is no order at all: which ring is
-  served first is decided by where the console's rotation stood, and there is no clock to appeal to.
+  served first is decided by where the console's rotation stood, and no record carries a timestamp
+  to appeal to.
   The boot capture above shows the forwarding domain's `generation=1 outcome=applied` printed
   *before* the change records that generation is made of, which is not a fault. A reader that infers
   causality from console order is inferring it from the fairness rule.
@@ -503,10 +517,55 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
   but no transport exists (see the status table), so the records reach an operator only over a
   serial line, on a node they are already attached to.
 
+### Trusted time source
+
+**Done.** A node establishes a wall-clock time at boot, and the whole chain that does it is
+host-tested library code driven by a thin domain. `crates/clock` is the arithmetic — a tick delta
+and a reference interval to a counter frequency, a counter reading to nanoseconds since boot or
+since the epoch, an instant to a civil date and to an RFC 3339 line — with Hinnant's era
+decomposition proved by an exhaustive round trip over every day a `u64` of nanoseconds can name.
+`crates/hpet` is the reference measurement: it decides whether the block at `0xFED00000` is an HPET,
+starts its main counter and measures a bounded span of it, and it earns that role by being
+*self-describing* — the capabilities register states its own tick period, so no frequency is
+assumed anywhere. `crates/rtc` is the epoch: the CMOS index/data protocol, two agreeing snapshots
+before anything is decoded, and every field ranged.
+
+`pds/clock` joins them. It maps the HPET page (three `unsafe` volatile accesses, each naming the
+`<memory_region>` row that guarantees it), holds an `<ioport>` for `0x70`–`0x71` and proves the
+capability answers before relying on it, calibrates over a one-millisecond window, reads the part
+once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
+can refuse does so with a typed error carrying what the device answered; the domain turns each into
+one of 25 console cause tokens and parks. Two of the three QEMU system scenarios assert that record
+on the release image — that it is `ready`, that its frequency is inside the band the calibration
+accepts, and that its year is inside the band the RTC reader accepts.
+
+**Missing** — and it is everything the word *trusted* covers:
+
+- **The time is unauthenticated and unattested.** It comes from a battery-backed register file that
+  any firmware, hypervisor or dead battery can make say anything plausible. There is no NTP, no
+  Roughtime, no signed time source and no attestation, so a wrong-but-plausible instant is
+  indistinguishable from a right one. CONCEPT §7.2 makes certificate validity depend on accurate
+  time; nothing here may be used for that.
+- **UTC is assumed, not discovered.** The CMOS carries no field saying whether it holds UTC or local
+  time. A machine whose firmware set it to local time yields an epoch wrong by that zone's offset,
+  detectably by nothing.
+- **Nothing consumes it.** There is no shared calibration region, so no other domain can read the
+  time, and no record but the clock's own carries an instant. Every ordering statement in
+  [MONITORING.md](MONITORING.md) is unchanged.
+- **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
+  never corrected; there is no timer, no interrupt, and no second reading to drift against.
+- **Single-core assumption.** The calibration is a reading of one core's counter, with no check that
+  the counter is invariant and no per-core anchoring — neither of which matters on the single vCPU
+  this system runs on and both of which would on any multicore variant.
+- **The measurement is biased high by its own overhead**, by one uncached timer read at each end of
+  the window: parts in a thousand at worst, stated in `pds/clock` rather than corrected, because
+  subtracting an estimate would replace a bounded one-signed error with an unbounded one.
+
 ### Protection-domain decomposition
 
-**Done.** Five protection domains from four binaries (one forwarder, one configuration domain, one
-console, two driver instances of one driver binary) with real, verifiable least privilege: the
+**Done.** Six protection domains from five binaries (one forwarder, one configuration domain, one
+console, one clock, two driver instances of one driver binary) with real, verifiable least
+privilege: the
 forwarder holds no device capability at all
 and neither pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a second
 time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two pipelines.
@@ -528,18 +587,28 @@ configuration domain alone. The console holds none in either direction — it ne
 loop, so a notification on it would be authority granted for nothing. Zero IRQs. The capability
 grant is machine-checkable in the Microkit capability/memory report the build generates.
 
-One **new capability class** appears here for the first time: an `<ioport>` grant, held by the
-console domain alone. It admits eight ports (`0x3F8`–`0x3FF`) and withholds the other 65,528 —
-notably the `0xCF8`/`0xCFC` PCI configuration pair, which would be a second path to every device's
-configuration space beside the ECAM mappings the drivers hold. No other domain holds any I/O port at
-all, so an attacker who reaches one of them reaches no port invocation the kernel will accept. The
-console in turn holds no pool, no dataplane ring, no configuration region, no ECAM page and no BAR
-window, so a compromised console reaches no frame, no NIC and no configuration.
+Two **`<ioport>` grants**, on two domains, and they are the whole of the system's port authority.
+The console holds eight ports (`0x3F8`–`0x3FF`, COM1) and the clock two (`0x70`–`0x71`, the CMOS
+address and data registers); the other 65,526 are refused to every domain — notably the
+`0xCF8`/`0xCFC` PCI configuration pair, which would be a second path to every device's configuration
+space beside the ECAM mappings the drivers hold. The two windows are disjoint and neither domain
+holds the other's, so the domain that renders an operator's only output cannot read or stop the
+clock and the domain that reads a battery-backed register file cannot write the line its result
+appears on. The drivers and the forwarder hold zero ports between them. Each of the two in turn
+holds no pool, no dataplane ring and no configuration region, and the clock additionally holds no
+ECAM page and no BAR window beyond the single timer page it maps — so a compromise of either reaches
+no frame, no NIC and no configuration.
+
+Reaching a port is an **invocation**, never an `in`/`out` instruction; that lesson was paid for once
+on the console's first boot and `pds/clock/src/cmos.rs` is written from it. Both domains prove the
+capability answers before relying on it, so a slot the Microkit tool moved is a named refusal rather
+than a fault mid-sequence.
 
 **Missing.** Two of the fourteen component classes in CONCEPT §6.3 exist: the NIC driver PDs and the
-configuration validator PD. The console domain is a third domain and *not* a third class — §6.3 does
-not enumerate one, the console being described there as a surface rather than as a component — so it
-adds a domain to the decomposition without closing any of the gap below. Absent: Rx/Tx virtualisers,
+configuration validator PD. The console and clock domains are two further domains and *not* two
+further classes — §6.3 enumerates neither, describing the console as a surface and leaving the
+trusted-time mechanism open (§13.1) — so they add domains to the decomposition without closing any
+of the gap below. Absent: Rx/Tx virtualisers,
 classifier,
 filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7 parsers, DPI engine,
 content scanner, CA signing PD, management API PD, HA state-sync PD, and the update/health PD. The
@@ -704,7 +773,7 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fourteen library crates, `xtask`, and all four protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fourteen library crates, `xtask`, and all five protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
 | QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two ports; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
@@ -776,16 +845,22 @@ asserting the routed contract in both directions:
 
 1. **routed-forwarding** — the published disk, judged on traffic alone. It is the regression guard,
    reporting a forwarding failure as a forwarding failure and nothing else.
-2. **generation-swap** — the same disk, judged additionally on its `LFW-CFG` console transcript: the
-   node comes up fail-closed on generation 0 and switches to generation 1, whose change records must
-   be the configuration document's own diff. A separate boot, because a transcript readable only off
-   a run whose traffic had already passed would be silent in exactly the case it exists for — a node
-   that committed nothing and forwarded nothing. The expected transcript is *derived* from the
-   document by the same calls and the same renderer the appliance uses, so a hand-written list
-   cannot drift from either.
+2. **generation-swap** — the same disk, judged additionally on what it said. Its `LFW-CFG`
+   transcript must show the node coming up fail-closed on generation 0 and switching to generation
+   1, whose change records must be the configuration document's own diff; and its `LFW-PD
+   domain=clock` record must show a time established, with a measured counter frequency inside the
+   band the calibration accepts and a year inside the band the real-time clock reader accepts. A
+   separate boot, because a transcript readable only off a run whose traffic had already passed
+   would be silent in exactly the case it exists for — a node that committed nothing and forwarded
+   nothing. The expected transcript is *derived* from the document by the same calls and the same
+   renderer the appliance uses, so a hand-written list cannot drift from either; the clock record's
+   two bands are imported from the appliance's own crates for the same reason. The measurement
+   itself cannot be predicted — that is what makes asserting the bands, rather than a value, the
+   only honest contract available.
 3. **alternate-configuration** — a disk assembled from a second document sharing no address and no
-   MAC with the first, judged on both. This is what proves the dataplane reads its table from the
-   document: a compiled-in table would satisfy the first two scenarios and fail every probe here.
+   MAC with the first, judged on both channels. This is what proves the dataplane reads its table
+   from the document: a compiled-in table would satisfy the first two scenarios and fail every probe
+   here.
 
 Every address in all of that comes from the configuration document the image under test was built
 from, so no part of the bench can hold an address the appliance does not. Each scenario prints what
@@ -880,8 +955,8 @@ enabled for every download. Do not commit the certificate.
 `make release` runs the complete acceptance gate and **boots nothing of its own**. It has nothing
 left to boot: `ci` already assembles the production-oriented Microkit release configuration into
 `dist/` and already holds that disk to both contracts a booted appliance owes — the forwarding
-contract on all three system scenarios and all eight A/B scenarios, and the `LFW-CFG` console
-transcript on two of the three system scenarios. What `make release` adds is the other half of
+contract on all three system scenarios and all eight A/B scenarios, and the `LFW-CFG` transcript and
+the clock's established-time record on two of the three system scenarios. What `make release` adds is the other half of
 BLD-3: if the gate did not prove the artifact, `dist/` is emptied rather than left holding an
 unproven image that looks finished. That covers a failure anywhere in the run, not a failed boot
 alone, because assembly populates `dist/` partway through and an incomplete release is no more
@@ -894,9 +969,9 @@ and a dataplane is indifferent to whether anything is printed. A scenario judgin
 derives it from the document its own image was built from, by the same calls and the same renderer
 the appliance uses, so passing means bytes a domain published reached the serial line *in the release
 kernel*: through the log ring, through the console domain, out of the UART, in order and with the
-right values. It does not enumerate the `LFW-PD` lifecycle channel, and it is not a claim that every
-record renders correctly. It defends the one property that was silently false — that the shipped
-profile has a console at all.
+right values. It does not enumerate the whole `LFW-PD` lifecycle channel — only the clock's own
+record on it — and it is not a claim that every record renders correctly. It defends the one property
+that was silently false: that the shipped profile has a console at all.
 
 The first release boot found more than that. The image did not boot at all: GRUB had placed the
 Microkit system image below the seL4 kernel and seL4 loaded the userland image over its own page

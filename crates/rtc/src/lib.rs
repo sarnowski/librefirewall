@@ -118,12 +118,12 @@ pub const DATA_PORT: u16 = 0x71;
 /// Consecutive I/O ports the part occupies, and so the width an `<ioport>`
 /// grant admitting a [`CmosPortIo`] implementation has to have.
 ///
-/// **Cross-artifact (DOC-7):** no such element exists yet — the only `<ioport>`
-/// in `systems/qemu-x86_64/librefirewall.system` is the console's `0x3f8`. This
-/// is therefore the requirement on the grant that would admit this crate, not a
-/// description of one that is present, and the domain that adds it enforces the
-/// match the way `pds/console/src/com1.rs` does: by invoking the capability for
-/// every member of [`Register::ALL`] before relying on it.
+/// **Cross-artifact (DOC-7):** the grant is the `clock` domain's `<ioport
+/// id="0" addr="0x70" size="2" />` in `systems/qemu-x86_64/librefirewall.system`,
+/// held to this constant by `xtask::sysdesc`'s `IO_PORTS` rule. The domain
+/// enforces the match the way `pds/console/src/com1.rs` does, and `pds/clock`'s
+/// `Cmos::claim` is where it does it: by invoking the capability for both ports
+/// before relying on it.
 pub const PORT_COUNT: u16 = 2;
 
 const _: () = assert!(DATA_PORT - INDEX_PORT + 1 == PORT_COUNT);

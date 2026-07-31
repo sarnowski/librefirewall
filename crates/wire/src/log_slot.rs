@@ -113,6 +113,8 @@ impl ValueSlot {
 pub(crate) struct LogSlot {
     features: AtomicU64,
     operands: [AtomicU64; 2],
+    tsc_hz: AtomicU64,
+    unix_nanos: AtomicU64,
     kind: AtomicU32,
     generation: AtomicU32,
     sequence: AtomicU32,
@@ -141,6 +143,8 @@ impl LogSlot {
         Self {
             features: AtomicU64::new(0),
             operands: [const { AtomicU64::new(0) }; 2],
+            tsc_hz: AtomicU64::new(0),
+            unix_nanos: AtomicU64::new(0),
             kind: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             sequence: AtomicU32::new(0),
@@ -170,6 +174,8 @@ impl LogSlot {
         for (cell, value) in self.operands.iter().zip(record.operands) {
             cell.store(value, Ordering::Relaxed);
         }
+        self.tsc_hz.store(record.tsc_hz, Ordering::Relaxed);
+        self.unix_nanos.store(record.unix_nanos, Ordering::Relaxed);
         self.kind.store(record.kind, Ordering::Relaxed);
         self.generation.store(record.generation, Ordering::Relaxed);
         self.sequence.store(record.sequence, Ordering::Relaxed);
@@ -204,6 +210,8 @@ impl LogSlot {
         LogRecord {
             features: self.features.load(Ordering::Relaxed),
             operands,
+            tsc_hz: self.tsc_hz.load(Ordering::Relaxed),
+            unix_nanos: self.unix_nanos.load(Ordering::Relaxed),
             kind: self.kind.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
             sequence: self.sequence.load(Ordering::Relaxed),
@@ -262,6 +270,8 @@ const _: () = {
     assert!(align_of::<LogSlot>() == align_of::<LogRecord>());
     assert!(offset_of!(LogSlot, features) == offset_of!(LogRecord, features));
     assert!(offset_of!(LogSlot, operands) == offset_of!(LogRecord, operands));
+    assert!(offset_of!(LogSlot, tsc_hz) == offset_of!(LogRecord, tsc_hz));
+    assert!(offset_of!(LogSlot, unix_nanos) == offset_of!(LogRecord, unix_nanos));
     assert!(offset_of!(LogSlot, kind) == offset_of!(LogRecord, kind));
     assert!(offset_of!(LogSlot, generation) == offset_of!(LogRecord, generation));
     assert!(offset_of!(LogSlot, sequence) == offset_of!(LogRecord, sequence));

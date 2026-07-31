@@ -772,6 +772,42 @@ mod tests {
                 ),
             },
         ),
+        (
+            "clock",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and \
+                                `clock_contract.rs` judges the `LFW-PD domain=clock` record its \
+                                serial output carries: `state=ready`, a `tsc-hz=` inside the band \
+                                `lfw_clock::calibrate` admits, and a `utc=` whose year is inside \
+                                the band `lfw_rtc` admits. No boot can produce that record \
+                                without this domain having mapped the HPET page and driven it \
+                                through `Hpet::probe`, sized a window with `ticks_for`, measured \
+                                the timestamp counter across `wait_ticks`, derived a frequency, \
+                                proved its `<ioport>` capability through `Cmos::claim` and driven \
+                                it by invocation (`seL4_X86_IOPort_In8`/`Out8` — an `in`/`out` \
+                                instruction would fault the domain instead), read the part \
+                                through `read_unix_seconds`, and anchored a `Calibration` it then \
+                                converted back to an instant — `init` and `establish`, which is \
+                                every statement it has that is not a refusal. `xtask test-ab` \
+                                boots the slot it selected through the same path.",
+                residue: Some(
+                    "The whole refusal tree — every arm of `StartupError::refusal` and the four \
+                     `?` sites that reach it — is reached by no QEMU test: every scenario boots \
+                     the one correct system description against QEMU's q35, which presents a \
+                     conforming HPET at 0xFED00000 and a conforming MC146818 at 0x70, so only \
+                     the accepting path ever runs. The refusals the three library crates \
+                     distinguish are covered by their own host tests, floored at 90% each; what \
+                     is unreached is this domain's translation of them into console tokens, and \
+                     `EpochOutOfRange`, which no reading `lfw_rtc` admits can produce. That is \
+                     first-party logic sitting in a PD where neither the host floor nor the QEMU \
+                     gate can measure it — the layering defect LAY-2 names — and not a covered \
+                     path. Closing it means the same move the other three PDs' residues \
+                     describe: a refusal type owning its own console mapping, which cannot live \
+                     in `lfw-clock` (the dependency would cycle through `lfw-log`) and so needs \
+                     a crate of its own the day a second consumer of these three exists.",
+                ),
+            },
+        ),
         ("xtask", CoverageExclusion::BuildOrchestration),
     ];
 
