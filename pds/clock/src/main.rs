@@ -20,16 +20,18 @@
 //! file maps a page, claims a port window, and turns whichever of them refused
 //! into a console record.
 //!
-//! # What this domain does NOT do, and why that is the whole design
+//! # It publishes what it measured, once, and to one reader
 //!
-//! It publishes no calibration to anybody. There is no shared region carrying
-//! the frequency and the epoch, because nothing in this system reads time yet:
-//! a region nobody maps is a grant nobody uses and an ABI nobody checks
-//! (ENG-7). The region lands with its first consumer, and what this domain
-//! proves in the meantime is the entire chain that would fill it — HPET,
-//! calibration, RTC, UTC, and a rendered line an operator reads.
+//! The calibration goes into a shared region (`wire::ClockCalibration`) the
+//! management domain maps read-only; it arrived with its first consumer, the
+//! condition the note it replaces set (ENG-7).
+//! **Publishing is the last thing this domain does**, after the record saying what
+//! it measured, so an operator reading a frequency off the line and a domain
+//! converting readings with one never see different numbers. A refusal publishes
+//! nothing: a zeroed region is one no reader takes, so a domain that could not
+//! establish a time leaves the port unclocked rather than clocked wrongly.
 //!
-//! It also does not correct, re-read or discipline anything. The RTC is read
+//! It does not correct, re-read or discipline anything. The RTC is read
 //! exactly once; from there a `Calibration` advances time from the counter. A
 //! second reading would be a second epoch to reconcile with the first, which is
 //! a clock discipline algorithm and not a boot step.
@@ -79,7 +81,7 @@ use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, 
 use lfw_rtc::{Rtc, RtcError};
 use pd_runtime::attach_region;
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
-use wire::{LogConsume, LogRecords};
+use wire::{CalibrationImage, ClockCalibration, LogConsume, LogRecords};
 
 /// How long the timestamp counter is measured against the reference timer.
 ///
@@ -329,6 +331,7 @@ fn init() -> Clock {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let sink = RingSink::new(log.writer(log_consume));
+    let published: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     match establish() {
@@ -346,6 +349,13 @@ fn init() -> Clock {
                     utc: calibration.utc(now),
                 },
             );
+            // After the record, and only on the path that established a time; see
+            // the crate header on why the order and the silence both matter.
+            published.publish(&CalibrationImage {
+                tsc_hz: calibration.tsc_hz().get(),
+                boot_ticks: calibration.boot_ticks().0,
+                boot_unix_nanos: calibration.boot_unix_nanos(),
+            });
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI

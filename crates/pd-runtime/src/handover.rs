@@ -26,7 +26,7 @@
 //! one nothing else runs in. Swapping the table there is what makes a frame
 //! decided entirely under one generation, and it needs no lock to be true.
 
-use lfw_ip_endpoint::{Endpoint, EndpointError};
+use lfw_ip_endpoint::{Endpoint, EndpointError, IsnSecret};
 use lfw_log::{Event, RejectReason};
 use net_headers::{Ipv4Address, MacAddress};
 use routing::{CapacityError, Interface, Neighbour, PortId, Router};
@@ -91,7 +91,10 @@ pub fn router_from<const MAX_I: usize, const MAX_N: usize>(
 ///
 /// # Errors
 /// [`EndpointError`], for a pair no endpoint can answer under.
-pub fn endpoint_from(checked: &CheckedConfig) -> Result<Option<Endpoint>, EndpointError> {
+pub fn endpoint_from(
+    checked: &CheckedConfig,
+    secret: IsnSecret,
+) -> Result<Option<Endpoint>, EndpointError> {
     let Some(management) = checked.management() else {
         return Ok(None);
     };
@@ -99,6 +102,7 @@ pub fn endpoint_from(checked: &CheckedConfig) -> Result<Option<Endpoint>, Endpoi
         MacAddress(management.mac()),
         Ipv4Address::from_octets(management.address()),
         management.prefix_length(),
+        secret,
     )
     .map(Some)
 }
@@ -947,22 +951,29 @@ mod tests {
         }
     }
 
+    /// A per-boot secret for the transport's initial sequence numbers, fixed here
+    /// so the fixture is deterministic.
+    fn secret() -> IsnSecret {
+        IsnSecret::from_bytes([0xa5; 16])
+    }
+
     const MGMT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x52];
     const MGMT_ADDRESS: [u8; 4] = [10, 0, 2, 15];
 
     #[test]
     fn an_endpoint_is_built_only_from_an_entry_that_addresses_the_port() {
         let checked = image(1).check(PORTS).expect("the fixture is valid");
-        assert_eq!(
-            endpoint_from(&checked),
-            Ok(None),
+        assert!(
+            endpoint_from(&checked, secret())
+                .expect("no entry is not an error")
+                .is_none(),
             "the fixture addresses no management port"
         );
 
         let mut addressed = image(1);
         addressed.management = management(1, MGMT_MAC, MGMT_ADDRESS);
         let checked = addressed.check(PORTS).expect("an enabled entry");
-        let endpoint = endpoint_from(&checked)
+        let endpoint = endpoint_from(&checked, secret())
             .expect("a unicast pair")
             .expect("an enabled entry");
         assert_eq!(endpoint.mac(), MacAddress(MGMT_MAC));
@@ -972,9 +983,10 @@ mod tests {
         // A disabled entry addresses nothing, whatever its other fields say.
         let mut disabled = addressed;
         disabled.management.enabled = 0;
-        assert_eq!(
-            endpoint_from(&disabled.check(PORTS).expect("still valid")),
-            Ok(None)
+        assert!(
+            endpoint_from(&disabled.check(PORTS).expect("still valid"), secret())
+                .expect("no entry is not an error")
+                .is_none()
         );
     }
 
@@ -989,8 +1001,8 @@ mod tests {
             .check(PORTS)
             .expect("the image ABI does not rule on an address");
         assert_eq!(
-            endpoint_from(&checked),
-            Err(lfw_ip_endpoint::EndpointError::AddressNotUnicast {
+            endpoint_from(&checked, secret()).err(),
+            Some(lfw_ip_endpoint::EndpointError::AddressNotUnicast {
                 address: Ipv4Address::from_octets([224, 0, 0, 1]),
             })
         );
@@ -1130,7 +1142,7 @@ mod tests {
                         // with a pair an endpoint accepts or names one it
                         // refuses; an image that addresses none can only build
                         // nothing.
-                        match (endpoint_from(&checked), checked.management()) {
+                        match (endpoint_from(&checked, secret()), checked.management()) {
                             (Ok(None), entry) => prop_assert!(entry.is_none()),
                             (Ok(Some(endpoint)), Some(entry)) => {
                                 prop_assert_eq!(endpoint.mac(), MacAddress(entry.mac()));

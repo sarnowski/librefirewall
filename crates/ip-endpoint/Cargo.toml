@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 net-headers = { path = "../net-headers" }
+# The transport this endpoint terminates a connection with, and the clock every
+# one of its timers is stated against.
+lfw-tcp = { path = "../tcp" }
+lfw-clock = { path = "../clock" }
 
 [dev-dependencies]
 proptest = { workspace = true }

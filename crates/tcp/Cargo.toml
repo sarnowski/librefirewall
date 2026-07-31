@@ -1,0 +1,23 @@
+[package]
+# `tcp` is a common crate name; the directory keeps the short name and the
+# package carries the project prefix, so the lib target is `lfw_tcp` — the same
+# split `crates/clock` and `crates/log` make.
+name = "lfw-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The ones' complement accumulator the TCP checksum is formed with, and the
+# address type its pseudo-header is stated over. One implementation of RFC 1071
+# in the workspace rather than a second one here.
+net-headers = { path = "../net-headers" }
+# `Monotonic` and `Duration`: every timer here is stated against the clock the
+# appliance established at boot rather than against a tick count of its own.
+lfw-clock = { path = "../clock" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

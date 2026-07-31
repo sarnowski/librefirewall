@@ -9,6 +9,9 @@ sel4-microkit.workspace = true
 pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
 lfw-log = { path = "../../crates/log" }
+# `Ticks`: the counter reading this domain takes and hands to the stage, which
+# converts it with the calibration the clock domain published.
+lfw-clock = { path = "../../crates/clock" }
 
 [lints]
 workspace = true

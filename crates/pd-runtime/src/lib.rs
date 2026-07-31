@@ -389,13 +389,18 @@ pub mod endpoint;
 pub mod handover;
 
 pub use endpoint::{
-    ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters, MAX_REPLY_LEN,
+    CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
+    MAX_REPLY_LEN, TIMER_LIMIT, calibration_from,
 };
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
     endpoint_from, router_from,
 };
-pub use wire::{ConfigAck, ConfigHandover, ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS};
+pub use lfw_ip_endpoint::IsnSecret;
+pub use wire::{
+    CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
+    ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS,
+};
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
 /// invisible: a byzantine peer's activity looks exactly like an idle link.

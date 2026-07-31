@@ -62,15 +62,69 @@
 //! and its first commit, and the alternative — holding descriptors until an
 //! address arrives — would strand the pool for as long as it took.
 
-use lfw_ip_endpoint::Endpoint;
+use core::num::NonZeroU64;
+
+use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
+use lfw_ip_endpoint::{Endpoint, IsnSecret};
 use lfw_log::RejectReason;
-use wire::ConfigHandover;
+use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
 use crate::{
     BUFFER_SIZE, Committed, CommittedReader, DEVICE_HEADER_LEN, DRAIN_LIMIT, Descriptor,
     ForwardRings, Pool, PoolCounters, PoolOwner, RING_SLOTS, ReturnRing, RingConsumer,
     RingProducer, Verdict, bump, descriptor_in_bounds, place, snapshot,
 };
+
+/// How many segments one pass may send out of the transport's own timers.
+///
+/// A bound the peer does not choose (ENG-4): every answer from
+/// `Endpoint::poll_timeouts` either frees a connection or moves a deadline, so
+/// the loop terminates on its own — this is what keeps a pass short even so, and
+/// it is derived from the connection table rather than chosen, one connection
+/// being able to owe at most a retransmission and a reaping in one instant.
+pub const TIMER_LIMIT: usize = 2 * lfw_ip_endpoint::TCP_CONNECTIONS;
+
+/// Why a published calibration is not one this domain will convert a counter
+/// reading with.
+///
+/// The region is peer-written (`wire::ClockCalibration`), so a frequency in it is
+/// a hostile or malfunctioning device's answer one indirection away and is judged
+/// here rather than believed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibrationRefused {
+    /// The region's counter moved but no whole triple could be read out from
+    /// under it: a publish in progress, or one the writer left unfinished
+    /// (`wire::ClockCalibration`). Not a refusal of anything the writer said —
+    /// there was nothing to refuse — and answered by looking again on the next
+    /// pass rather than by remembering it.
+    ///
+    /// A region nobody has published into is *not* this: its counter has not
+    /// moved, so there is nothing new to report and `take_clock` answers `None`.
+    NotPublished,
+    /// A frequency no x86_64 timestamp counter has. The band is `lfw_clock`'s, so
+    /// this domain applies that crate's judgement rather than a second copy of it.
+    FrequencyImplausible { tsc_hz: u64 },
+}
+
+/// Turn a published triple into a calibration, or refuse it.
+///
+/// # Errors
+/// [`CalibrationRefused`], naming the value that refused it.
+pub fn calibration_from(image: CalibrationImage) -> Result<Calibration, CalibrationRefused> {
+    let Some(tsc_hz) = NonZeroU64::new(image.tsc_hz) else {
+        return Err(CalibrationRefused::FrequencyImplausible { tsc_hz: 0 });
+    };
+    if tsc_hz.get() < MIN_PLAUSIBLE_TSC_HZ || tsc_hz.get() > MAX_PLAUSIBLE_TSC_HZ {
+        return Err(CalibrationRefused::FrequencyImplausible {
+            tsc_hz: tsc_hz.get(),
+        });
+    }
+    Ok(Calibration::new(
+        tsc_hz,
+        Ticks(image.boot_ticks),
+        image.boot_unix_nanos,
+    ))
+}
 
 /// The longest reply this stage can send, and so the whole of the storage the
 /// endpoint composes into: one pool buffer, less the room the device's header
@@ -137,6 +191,19 @@ pub struct EndpointStageCounters {
     /// offering images this domain cannot read looks otherwise like one that has
     /// stopped publishing.
     pub configs_refused: u64,
+    /// The calibration generation this domain is converting counter readings
+    /// with, and 0 while it has none. As `generation`, it is what tells two
+    /// scrapes apart.
+    pub clock_generation: u32,
+    /// Published calibrations this domain would not use, one per pass over a
+    /// region it refuses. A rising count is a clock domain publishing numbers no
+    /// counter has; a count that stays zero beside `unclocked` above zero is a
+    /// clock domain that has published nothing at all, and the two are different
+    /// things to go and look at.
+    pub clocks_refused: u64,
+    /// Segments this stage's transport composed out of its own timers — a
+    /// retransmission, a reset, a close — as against a reply to a frame.
+    pub timer_segments: u64,
 }
 
 /// A pipeline's consuming end where the descriptor goes no further: it counts
@@ -151,6 +218,17 @@ pub struct EndpointStage<'ring> {
     tx_pool: &'ring Pool,
     /// The addressing in force, or `None` until a generation is committed.
     endpoint: Option<Endpoint>,
+    /// The per-boot secret the transport's initial sequence numbers are derived
+    /// from, held because the endpoint is built later — when a generation is
+    /// committed — and the secret is obtained once, at start-up, by the domain
+    /// that can reach the instruction for it.
+    secret: IsnSecret,
+    /// What a counter reading means, or `None` until the clock domain has
+    /// published a triple this stage will use.
+    calibration: Option<Calibration>,
+    /// The calibration generation `calibration` came from, so a republished one is
+    /// picked up and an unchanged one is not re-read.
+    clock_generation: u32,
     config: CommittedReader,
     received: [u8; BUFFER_SIZE],
     reply: [u8; MAX_REPLY_LEN],
@@ -191,7 +269,7 @@ impl<'ring> EndpointStage<'ring> {
     /// double-owned one. No type refuses the second call; `queue`'s crate
     /// header states that single-handle rule and why nothing enforces it.
     #[must_use]
-    pub fn attach(regions: EndpointRegions<'ring>) -> Self {
+    pub fn attach(regions: EndpointRegions<'ring>, secret: IsnSecret) -> Self {
         Self {
             from: regions.receive.rx.consumer(),
             free: regions.receive_returns.free.producer(),
@@ -200,6 +278,9 @@ impl<'ring> EndpointStage<'ring> {
             tx: PoolOwner::attach(regions.transmit_returns),
             tx_pool: regions.transmit_pool,
             endpoint: None,
+            secret,
+            calibration: None,
+            clock_generation: 0,
             config: CommittedReader::new(),
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
@@ -223,7 +304,7 @@ impl<'ring> EndpointStage<'ring> {
                 generation,
                 checked,
             } => {
-                match crate::endpoint_from(&checked) {
+                match crate::endpoint_from(&checked, self.secret.clone()) {
                     Ok(endpoint) => {
                         self.endpoint = endpoint;
                         self.counters.generation = generation;
@@ -258,6 +339,53 @@ impl<'ring> EndpointStage<'ring> {
         }
     }
 
+    /// Take whatever calibration the clock domain has published, and answer with
+    /// the refusal where there is one.
+    ///
+    /// Read before every drain, for the reason the configuration is: this domain
+    /// holds no channel to the clock domain either, so what wakes it is a frame
+    /// and the time is picked up on the way to answering one. A generation it has
+    /// already converted is not re-read — the region is peer-written, and
+    /// re-deriving a calibration from it per pass would let that peer move this
+    /// node's clock under a connection's timers.
+    pub fn take_clock(&mut self, region: &ClockCalibration) -> Option<CalibrationRefused> {
+        let generation = region.generation();
+        if generation == self.clock_generation {
+            return None;
+        }
+        let Some(image) = region.load() else {
+            // The counter moved and no whole triple could be read from under it:
+            // a publish in progress, one the writer left unfinished, or a counter
+            // that has wrapped back to zero. None of them is a refusal of
+            // anything the writer said, and none is remembered — the next pass
+            // looks again.
+            return Some(CalibrationRefused::NotPublished);
+        };
+        match calibration_from(image) {
+            Ok(calibration) => {
+                self.calibration = Some(calibration);
+                self.clock_generation = generation;
+                self.counters.clock_generation = generation;
+                None
+            }
+            Err(refusal) => {
+                // Remembered, so a clock domain publishing an implausible triple
+                // is refused once rather than on every frame that arrives.
+                self.clock_generation = generation;
+                bump(&mut self.counters.clocks_refused);
+                Some(refusal)
+            }
+        }
+    }
+
+    /// The instant `now` names, or `None` while no calibration has been taken.
+    #[must_use]
+    pub fn monotonic(&self, now: Ticks) -> Option<Monotonic> {
+        self.calibration
+            .as_ref()
+            .map(|calibration| calibration.monotonic(now))
+    }
+
     /// Take frames off the pipeline until it is observed empty, the return ring
     /// refuses one, or [`DRAIN_LIMIT`] descriptors have been handled. Returns
     /// how many **frames** were counted, which is the quantity a caller acts
@@ -277,8 +405,9 @@ impl<'ring> EndpointStage<'ring> {
     ///
     /// Reply buffers are reclaimed first, so a burst is answered out of the
     /// buffers the previous pass's replies have already freed.
-    pub fn poll(&mut self) -> usize {
+    pub fn poll(&mut self, now: Ticks) -> usize {
         self.tx.reclaim();
+        let now = self.monotonic(now);
         let mut frames = 0;
         for _ in 0..DRAIN_LIMIT {
             let Some(descriptor) = self.from.try_dequeue() else {
@@ -293,7 +422,7 @@ impl<'ring> EndpointStage<'ring> {
                     .bytes
                     .saturating_add(u64::from(descriptor.len));
                 frames += 1;
-                self.answer(&descriptor);
+                self.answer(now, &descriptor);
             } else {
                 bump(&mut self.counters.malformed_descriptor);
             }
@@ -302,7 +431,30 @@ impl<'ring> EndpointStage<'ring> {
                 break;
             }
         }
+        if let Some(now) = now {
+            self.drive_timers(now);
+        }
         frames
+    }
+
+    /// Send whatever the transport's own timers now owe.
+    ///
+    /// Bounded by [`TIMER_LIMIT`] as well as by the loop's own termination, so a
+    /// pass is short whatever the table holds.
+    fn drive_timers(&mut self, now: Monotonic) {
+        for _ in 0..TIMER_LIMIT {
+            let Self {
+                endpoint, reply, ..
+            } = self;
+            let Some(endpoint) = endpoint.as_mut() else {
+                return;
+            };
+            let Some(len) = endpoint.poll_timeouts(now, reply) else {
+                return;
+            };
+            bump(&mut self.counters.timer_segments);
+            self.send(len);
+        }
     }
 
     /// The addressing in force, for a caller that reports what the port answers
@@ -332,8 +484,8 @@ impl<'ring> EndpointStage<'ring> {
     /// that point is counted and the frame left unanswered, because a reply this
     /// domain could not send is not a reason to withhold the buffer the frame
     /// arrived in.
-    fn answer(&mut self, descriptor: &Descriptor) {
-        if let Some(len) = self.compose(descriptor) {
+    fn answer(&mut self, now: Option<Monotonic>, descriptor: &Descriptor) {
+        if let Some(len) = self.compose(now, descriptor) {
             self.send(len);
         }
     }
@@ -341,7 +493,7 @@ impl<'ring> EndpointStage<'ring> {
     /// Snapshot the frame and hand it to the endpoint, answering with the length
     /// of whatever it composed. Every outcome is recorded in the endpoint's own
     /// counters, so what is decided here is only whether a frame leaves.
-    fn compose(&mut self, descriptor: &Descriptor) -> Option<usize> {
+    fn compose(&mut self, now: Option<Monotonic>, descriptor: &Descriptor) -> Option<usize> {
         let Self {
             rx_pool,
             endpoint,
@@ -358,7 +510,7 @@ impl<'ring> EndpointStage<'ring> {
             bump(&mut counters.snapshot_failed);
             return None;
         };
-        endpoint.handle(frame, reply).reply()
+        endpoint.handle(now, frame, reply).reply()
     }
 
     /// Put `len` bytes of the composed reply into a transmit buffer and lend it

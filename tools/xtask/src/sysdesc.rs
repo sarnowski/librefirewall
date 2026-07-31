@@ -75,7 +75,8 @@ use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
 use uart_16550::{COM1_BASE, PORT_COUNT as COM1_PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
-    CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
+    CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
+    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -296,6 +297,20 @@ const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region
      could produce on it would be a second producer on a ring that admits exactly one. This is \
      what a compromised forwarder is still unable to do: it can corrupt a frame in flight, and it \
      cannot hand a live DMA target back to be issued a second time";
+
+/// What the calibration region's one writer and one reader withhold. Quoted into
+/// the finding on either grant being widened, because the direction *is* the
+/// grant: the clock domain measured the numbers and the management domain
+/// consumes them, and no third domain has any use for either half.
+const CLOCK_WITHHELD: &str = "the clock domain writes the calibration and the management domain \
+     only reads it, and no other domain maps it in either direction. A management domain that \
+     could write it would be able to move this node's own idea of time — every retransmission and \
+     reaping deadline of the transport on its port, and one day every certificate's validity \
+     window (CONCEPT §7.2) — from the one domain that answers the management-plane attacker; a \
+     clock domain that could only read it would have nowhere to publish what it measured. Every \
+     other domain states no time and reads none, so a grant to one would be authority with no use \
+     (ENG-1) — and the console in particular must not be able to rewrite the frequency it is \
+     printing (ENG-1, SCM-6)";
 
 /// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
 /// the finding on the management domain gaining the acknowledgement region.
@@ -606,6 +621,20 @@ const REGIONS: &[RegionRule] = &[
             read_only("management"),
         ],
         withheld: None,
+    },
+    // The calibration: three words published under a seqlock, written by the
+    // domain that measured them and read by the one domain that converts a
+    // counter reading with them. The perms carry the direction and the exclusion
+    // carries everybody else.
+    RegionRule {
+        name: "clock",
+        size: ExpectedSize {
+            rust_name: "wire::CLOCK_CALIBRATION_REGION_SIZE",
+            bytes: CLOCK_CALIBRATION_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("clock"), read_only("management")],
+        withheld: Some(CLOCK_WITHHELD),
     },
     RegionRule {
         name: "cfgack",
@@ -2619,10 +2648,10 @@ mod tests {
     #[test]
     fn the_management_domain_reaching_the_acknowledgement_region_is_reported() {
         let findings = findings_after(
-            "<map mr=\"cfg\" vaddr=\"0x3_000_000\" perms=\"r\" cached=\"true\" \
-             setvar_vaddr=\"cfg_vaddr\" />\n        <map mr=\"log_management\"",
-            "<map mr=\"cfg\" vaddr=\"0x3_000_000\" perms=\"r\" cached=\"true\" \
-             setvar_vaddr=\"cfg_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_001_000\" \
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_management\"",
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_001_000\" \
              perms=\"rw\" cached=\"true\" setvar_vaddr=\"cfgack_vaddr\" />\n        \
              <map mr=\"log_management\"",
         );
@@ -2632,6 +2661,41 @@ mod tests {
         assert!(
             finding.contains("reads the COMMITTED generation alone"),
             "the finding quotes what withholding it was worth: {finding}"
+        );
+    }
+
+    /// The calibration's direction is the grant: a management domain that could
+    /// write it would move this node's own idea of time.
+    #[test]
+    fn the_management_domain_writing_the_calibration_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />",
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"rw\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />",
+        );
+        let finding = only_finding(&findings);
+        assert!(finding.contains("clock"), "{finding}");
+        assert!(finding.contains("\"management\""), "{finding}");
+    }
+
+    /// And the other half: a domain that states no time and reads none has no use
+    /// for it, so any third mapper is a finding that quotes what the exclusion
+    /// was worth.
+    #[test]
+    fn a_third_domain_reaching_the_calibration_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"log_forwarder\" vaddr=\"0x4_000_000\" perms=\"r\"",
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_forwarder\" \
+             vaddr=\"0x4_000_000\" perms=\"r\"",
+        );
+        assert!(!findings.is_empty(), "a third mapper went unreported");
+        let reported = findings.join("\n");
+        assert!(reported.contains("clock"), "{reported}");
+        assert!(
+            reported.contains("must not be able to rewrite the frequency"),
+            "the finding quotes what the exclusion was worth: {reported}"
         );
     }
 

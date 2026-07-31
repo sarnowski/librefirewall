@@ -39,10 +39,10 @@
 //! them `Release`, and nothing stops the writer rewriting them afterwards,
 //! which is why a [`CheckedConfig`] owns decoded values rather than borrowing.
 //!
-//! The log transport is a third object of the same kind, and the reason it is
-//! here rather than beside the events it carries is the dependency direction: a
-//! region's layout cannot be expressed in terms of the crate that reads it. A
-//! [`LogRecord`] is `lfw_log::Event` reduced to integers and fixed byte arrays,
+//! The log transport is a third object of the same kind and [`ClockCalibration`] a
+//! fourth, published under a seqlock for the reason it states. Both are here
+//! because a region's layout cannot be expressed in terms of the crate that reads
+//! it. A [`LogRecord`] is `lfw_log::Event` reduced to integers and fixed arrays,
 //! [`LogRecords`] and [`LogConsume`] are the ring's two halves — one region per
 //! direction, as the handover is — and [`LogRecord::check`] turns peer-written
 //! bytes back into fields a console may render, text included, because this
@@ -50,6 +50,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod clock;
 mod log_record;
 mod log_ring;
 mod log_slot;
@@ -60,6 +61,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
+pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, LOAD_ATTEMPTS};
 pub use log_record::{
     CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,
     CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT,

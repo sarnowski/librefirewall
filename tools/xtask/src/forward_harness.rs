@@ -175,6 +175,43 @@ const ECHO_PAYLOAD: &[u8] = b"LFW-PROBE/mgmt-echo-0123456789";
 /// `net_headers::EchoReply::TTL` puts on one.
 const ECHO_REPLY_TTL: u8 = 64;
 
+/// The management HTTP port the appliance listens on, and the whole of what a
+/// station may open a connection to (`lfw_ip_endpoint::MANAGEMENT_PORT`). Stated
+/// here rather than imported, because a client that took the port from the code
+/// under test could not catch that code listening somewhere else.
+const MANAGEMENT_TCP_PORT: u16 = 80;
+
+/// The ephemeral port this harness's client opens from, and the initial sequence
+/// number it opens with.
+///
+/// The client's own number may be fixed — nothing about the contract depends on
+/// it being unpredictable — but it is deliberately *not* round: a sequence
+/// arithmetic error that dropped or duplicated the low bits would still produce a
+/// plausible-looking number from a round one.
+const CLIENT_PORT: u16 = 0xc350;
+const CLIENT_ISN: u32 = 0x3b9a_ca07;
+
+/// What the client sends over the connection, and therefore exactly what must
+/// come back.
+///
+/// Its length is not a multiple of four and it is not a repeated byte, so a
+/// segment reassembled from the wrong offset, truncated to a word boundary, or
+/// answered with a constant reproduces neither the bytes nor the length.
+const TCP_PAYLOAD: &[u8] = b"LFW-PROBE/tcp-echo 0123456789 abcdefghijklmnopqrstuvwxyz!";
+
+/// The window the client advertises. Comfortably above the payload, so nothing
+/// about the exchange is a flow-control test: what is being proved here is the
+/// handshake, the stream and the close.
+const CLIENT_WINDOW: u16 = 8192;
+
+const TCP_PROTOCOL: u8 = 6;
+const TCP_HEADER_LEN: usize = 20;
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
 const ARP_ETHERTYPE: u16 = 0x0806;
 const ARP_PAYLOAD_LEN: usize = 28;
 const ARP_FRAME_LEN: usize = ETHERNET_HEADER_LEN + ARP_PAYLOAD_LEN;
@@ -1182,6 +1219,162 @@ fn management_echo_request(management: &ManagementPort) -> Vec<u8> {
     frame
 }
 
+/// A TCP segment as fields, read back by this harness's own reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TcpFrame {
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    window: u16,
+    payload: Vec<u8>,
+}
+
+impl TcpFrame {
+    /// Whether every flag in `wanted` is set and none in `forbidden` is.
+    fn carries(&self, wanted: u8, forbidden: u8) -> bool {
+        self.flags & wanted == wanted && self.flags & forbidden == 0
+    }
+}
+
+/// Read a TCP-over-IPv4 frame, refusing anything that is not one and verifying
+/// the pseudo-header checksum the way the station that receives one does.
+///
+/// # Errors
+/// The verdict, naming the value that refused it. The checksum is verified here
+/// rather than trusted, because it is the one field of the appliance's own
+/// composition that no other assertion below would notice being wrong.
+fn decode_tcp(frame: &[u8], management: &ManagementPort) -> Result<TcpFrame, String> {
+    let Some(header) = frame.get(..ETHERNET_HEADER_LEN + IPV4_HEADER_LEN) else {
+        return Err(format!(
+            "{} bytes is short of the {} an IPv4 frame needs",
+            frame.len(),
+            ETHERNET_HEADER_LEN + IPV4_HEADER_LEN
+        ));
+    };
+    if header[ETHERNET_HEADER_LEN + 9] != TCP_PROTOCOL {
+        return Err(format!(
+            "the datagram names IP protocol {} rather than TCP",
+            header[ETHERNET_HEADER_LEN + 9]
+        ));
+    }
+    let total_length = usize::from(u16::from_be_bytes([
+        header[ETHERNET_HEADER_LEN + 2],
+        header[ETHERNET_HEADER_LEN + 3],
+    ]));
+    let Some(segment) = frame.get(
+        ETHERNET_HEADER_LEN + IPV4_HEADER_LEN
+            ..ETHERNET_HEADER_LEN + total_length.max(IPV4_HEADER_LEN),
+    ) else {
+        return Err(format!(
+            "the datagram claims {total_length} bytes and the frame carries {}",
+            frame.len() - ETHERNET_HEADER_LEN
+        ));
+    };
+    let Some(fixed) = segment.get(..TCP_HEADER_LEN) else {
+        return Err(format!(
+            "{} bytes is short of the {TCP_HEADER_LEN} a TCP header needs",
+            segment.len()
+        ));
+    };
+    let data_offset = usize::from(fixed[12] >> 4) * 4;
+    if data_offset < TCP_HEADER_LEN || data_offset > segment.len() {
+        return Err(format!(
+            "the segment names a {data_offset}-byte header inside {} bytes",
+            segment.len()
+        ));
+    }
+    let computed = tcp_checksum(&management.address, &management.station, segment);
+    if computed != 0 {
+        return Err(format!(
+            "the segment's checksum does not verify: the ones' complement total over the \
+             pseudo-header and the segment is {computed:#06x} rather than zero"
+        ));
+    }
+    Ok(TcpFrame {
+        source_port: u16::from_be_bytes([fixed[0], fixed[1]]),
+        destination_port: u16::from_be_bytes([fixed[2], fixed[3]]),
+        sequence: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
+        acknowledgement: u32::from_be_bytes([fixed[8], fixed[9], fixed[10], fixed[11]]),
+        flags: fixed[13],
+        window: u16::from_be_bytes([fixed[14], fixed[15]]),
+        payload: segment.get(data_offset..).unwrap_or_default().to_vec(),
+    })
+}
+
+/// One TCP segment from this harness's client, as a whole frame on the wire.
+///
+/// The client's own composition, written from RFC 793 rather than reused from the
+/// appliance's builder: a segment built by the code under test and compared
+/// against that code's own expectation would agree with itself.
+fn tcp_frame(
+    management: &ManagementPort,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut segment = Vec::with_capacity(TCP_HEADER_LEN + payload.len());
+    segment.extend_from_slice(&CLIENT_PORT.to_be_bytes());
+    segment.extend_from_slice(&MANAGEMENT_TCP_PORT.to_be_bytes());
+    segment.extend_from_slice(&sequence.to_be_bytes());
+    segment.extend_from_slice(&acknowledgement.to_be_bytes());
+    // Five words of header and no options: the client offers no maximum segment
+    // size, so the appliance must fall back on RFC 1122's default rather than on
+    // whatever the option would have said.
+    segment.push(5 << 4);
+    segment.push(flags);
+    segment.extend_from_slice(&CLIENT_WINDOW.to_be_bytes());
+    segment.extend_from_slice(&[0, 0, 0, 0]);
+    segment.extend_from_slice(payload);
+    let checksum = tcp_checksum(&management.station, &management.address, &segment);
+    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + segment.len());
+    frame.extend_from_slice(&management.mac);
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    let mut ip = [0u8; IPV4_HEADER_LEN];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+    ip[8] = INJECTED_TTL;
+    ip[9] = TCP_PROTOCOL;
+    ip[12..16].copy_from_slice(&management.station);
+    ip[16..20].copy_from_slice(&management.address);
+    let header_checksum = header_checksum(&ip);
+    ip[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&segment);
+    frame
+}
+
+/// The RFC 793 §3.1 checksum over the pseudo-header and the segment.
+///
+/// Answers zero for a segment whose own field is consistent, which is what makes
+/// one call serve both directions: composing (with the field zero) yields the
+/// value to write, and verifying (with the field filled) yields zero.
+fn tcp_checksum(source: &[u8; 4], destination: &[u8; 4], segment: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |pair: [u8; 2]| sum += u32::from(u16::from_be_bytes(pair));
+    add([source[0], source[1]]);
+    add([source[2], source[3]]);
+    add([destination[0], destination[1]]);
+    add([destination[2], destination[3]]);
+    add([0, TCP_PROTOCOL]);
+    add((segment.len() as u16).to_be_bytes());
+    for index in 0..segment.len().div_ceil(2) {
+        let high = segment[index * 2];
+        let low = segment.get(index * 2 + 1).copied().unwrap_or(0);
+        add([high, low]);
+    }
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    // Lossless: the fold above leaves at most sixteen significant bits.
+    !(sum as u16)
+}
+
 /// The RFC 1071 ones' complement sum over a whole block whose checksum field is
 /// treated as zero, for a message this harness composes.
 ///
@@ -1216,21 +1409,96 @@ struct ManagementProbe {
     port: ManagementPort,
 }
 
-/// Which of the two replies a frame off the management wire was.
+/// Which of the replies a frame off the management wire was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagementReply {
     Arp,
     Echo,
+    /// One step of the TCP exchange, named by the step it completed.
+    Tcp(TcpStep),
+}
+
+/// Where the client's connection has got to.
+///
+/// The exchange is a *sequence*, and that is the point: a stack can answer every
+/// segment shape correctly and still be unable to carry a connection. Each step
+/// below both asserts what came back and composes what goes out next, so the
+/// contract is met only by walking the whole of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpStep {
+    /// Nothing sent yet: the client waits until the ARP and echo replies have
+    /// been accepted, so a failure in either is reported as itself.
+    Unopened,
+    /// `SYN` sent; the appliance owes a `SYN-ACK`.
+    AwaitSynAck,
+    /// Handshake completed and the payload sent; the appliance owes the echo.
+    AwaitEcho,
+    /// `FIN` sent; the appliance owes a `FIN-ACK`.
+    AwaitFinAck,
+    /// The final acknowledgement is out and the connection is closed.
+    Closed,
+}
+
+impl TcpStep {
+    /// What the appliance still owes, as a clause for a verdict.
+    fn outstanding(self) -> &'static str {
+        match self {
+            Self::Unopened => "the TCP exchange has not been started",
+            Self::AwaitSynAck => "the TCP SYN-ACK",
+            Self::AwaitEcho => "the TCP echo of the payload",
+            Self::AwaitFinAck => "the TCP FIN-ACK",
+            Self::Closed => "none",
+        }
+    }
+}
+
+/// The client's own end of the connection.
+///
+/// It is deliberately not a TCP stack: the wire between the harness and QEMU is a
+/// host socket, so it is lossless and in-order, and a client with a
+/// retransmission timer or a congestion window would be testing itself. What it
+/// does have is the whole of the sequence-number arithmetic, because that is the
+/// half the appliance's answers are checked against.
+#[derive(Clone, Copy, Debug)]
+struct TcpClient {
+    step: TcpStep,
+    /// The next sequence number this client will send.
+    sequence: u32,
+    /// What it expects to receive next, learned from the appliance's own numbers.
+    expect: u32,
+    /// The appliance's initial sequence number, kept so a caller can compare it
+    /// across boots: a constant one would be an off-path injection primitive
+    /// (RFC 6528), and one boot's number alone cannot show that it is not.
+    peer_isn: Option<u32>,
+}
+
+impl TcpClient {
+    const fn new() -> Self {
+        Self {
+            step: TcpStep::Unopened,
+            sequence: CLIENT_ISN,
+            expect: 0,
+            peer_isn: None,
+        }
+    }
 }
 
 impl ManagementProbe {
-    /// The two replies as evidence, in the voice of the routed-traffic lines: a
-    /// reader sees *that* the port answered and with which values. Every field
-    /// printed is one `judge` refused the frame for not carrying, so this is a
-    /// rendering of what was proved rather than a second reading of the wire.
+    /// The two stateless replies as evidence, in the voice of the routed-traffic
+    /// lines: a reader sees *that* the port answered and with which values. Every
+    /// field printed is one `judge` refused the frame for not carrying, so this is
+    /// a rendering of what was proved rather than a second reading of the wire.
+    ///
+    /// The TCP exchange has a line of its own ([`opened`](Self::opened)), because
+    /// it is one connection rather than one reply and the values worth printing
+    /// are the ones a whole exchange establishes.
     fn answered(&self, reply: ManagementReply) -> String {
         let port = &self.port;
         match reply {
+            // Unreachable: the caller renders a TCP step through `opened`. A line
+            // rather than a panic, because a rendering is not a place to fail a
+            // run that has otherwise met its contract.
+            ManagementReply::Tcp(step) => format!("  answered   tcp-step {step:?}"),
             ManagementReply::Arp => format!(
                 "  answered   arp-request           station->mgmt  who-has {} tell {}  \
                  is-at {}",
@@ -1278,7 +1546,12 @@ impl ManagementProbe {
     /// endpoint owes or a frame the port must never have put there — a dataplane
     /// probe that leaked across the isolation boundary, or something the
     /// appliance originated that nothing asked for.
-    fn judge(&self, frame: &[u8], probes: &[Probe]) -> Result<ManagementReply, String> {
+    fn judge(
+        &self,
+        frame: &[u8],
+        probes: &[Probe],
+        client: &mut TcpClient,
+    ) -> Result<ManagementReply, String> {
         for probe in probes {
             if contains(frame, probe.marker) {
                 return Err(format!(
@@ -1301,6 +1574,13 @@ impl ManagementProbe {
             .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
         match ether_type {
             Some(ARP_ETHERTYPE) => self.judge_arp(frame).map(|()| ManagementReply::Arp),
+            // An IPv4 datagram is one of two things on this wire, and the
+            // protocol number is what separates them: the echo reply the ICMP
+            // request obliges, or a segment of the one TCP connection the client
+            // opens.
+            Some(IPV4_ETHERTYPE) if is_tcp(frame) => {
+                self.judge_tcp(frame, client).map(ManagementReply::Tcp)
+            }
             Some(IPV4_ETHERTYPE) => self.judge_echo(frame).map(|()| ManagementReply::Echo),
             other => Err(format!(
                 "a {} byte frame with EtherType {} came back on the management port, and the \
@@ -1312,6 +1592,200 @@ impl ManagementProbe {
                 }
             )),
         }
+    }
+
+    /// Judge one segment of the client's connection against the step it is at, and
+    /// advance the client over it.
+    ///
+    /// Every assertion is a **field comparison**: the flags that must be set and
+    /// the flags that must not, the acknowledgement number against what the client
+    /// actually sent, the payload against the bytes it actually sent. Nothing here
+    /// matches a substring or a rendered line (TEST-13).
+    ///
+    /// # Errors
+    /// The verdict, naming the field and the two values. A segment that arrives at
+    /// a step it does not belong to is refused rather than tolerated: the whole
+    /// value of asserting a sequence is that its order is part of the contract.
+    fn judge_tcp(&self, frame: &[u8], client: &mut TcpClient) -> Result<TcpStep, String> {
+        let segment = decode_tcp(frame, &self.port)?;
+        if segment.source_port != MANAGEMENT_TCP_PORT || segment.destination_port != CLIENT_PORT {
+            return Err(format!(
+                "a segment came back from port {} to port {}, and the client opened {CLIENT_PORT} \
+                 to {MANAGEMENT_TCP_PORT}",
+                segment.source_port, segment.destination_port
+            ));
+        }
+        if segment.carries(TCP_RST, 0) {
+            return Err(format!(
+                "the appliance reset the connection at the {:?} step (sequence {}, \
+                 acknowledgement {})",
+                client.step, segment.sequence, segment.acknowledgement
+            ));
+        }
+        match client.step {
+            TcpStep::Unopened => Err(format!(
+                "a segment came back on the management port before the client opened a \
+                 connection: flags {:#04x}, sequence {}",
+                segment.flags, segment.sequence
+            )),
+            TcpStep::AwaitSynAck => {
+                if !segment.carries(TCP_SYN | TCP_ACK, TCP_FIN) {
+                    return Err(format!(
+                        "the appliance answered a SYN with flags {:#04x}, and a passive open owes \
+                         SYN and ACK together and no FIN",
+                        segment.flags
+                    ));
+                }
+                // The `SYN` occupies one sequence number, so this is the whole of
+                // what the appliance may acknowledge.
+                let owed = CLIENT_ISN.wrapping_add(1);
+                if segment.acknowledgement != owed {
+                    return Err(format!(
+                        "the SYN-ACK acknowledges {} and the client's SYN occupied {owed}",
+                        segment.acknowledgement
+                    ));
+                }
+                client.peer_isn = Some(segment.sequence);
+                client.expect = segment.sequence.wrapping_add(1);
+                client.sequence = owed;
+                Ok(TcpStep::AwaitSynAck)
+            }
+            TcpStep::AwaitEcho => {
+                if !segment.carries(TCP_ACK, TCP_SYN | TCP_FIN) {
+                    return Err(format!(
+                        "the appliance answered the payload with flags {:#04x}, and an established \
+                         connection owes an ACK with no SYN and no FIN",
+                        segment.flags
+                    ));
+                }
+                let owed = CLIENT_ISN
+                    .wrapping_add(1)
+                    .wrapping_add(TCP_PAYLOAD.len() as u32);
+                if segment.acknowledgement != owed {
+                    return Err(format!(
+                        "the segment acknowledges {} and the client had sent up to {owed}",
+                        segment.acknowledgement
+                    ));
+                }
+                if segment.payload.is_empty() {
+                    // A bare acknowledgement of the payload is legitimate TCP —
+                    // the echo may follow in a segment of its own — so the client
+                    // stays where it is rather than refusing it.
+                    return Ok(TcpStep::AwaitEcho);
+                }
+                if segment.payload != TCP_PAYLOAD {
+                    return Err(format!(
+                        "the connection carried back {} bytes and the client sent {}: {}",
+                        segment.payload.len(),
+                        TCP_PAYLOAD.len(),
+                        byte_difference(TCP_PAYLOAD, &segment.payload)
+                    ));
+                }
+                if segment.sequence != client.expect {
+                    return Err(format!(
+                        "the echo begins at sequence {} and the client expected {}",
+                        segment.sequence, client.expect
+                    ));
+                }
+                client.expect = segment.sequence.wrapping_add(segment.payload.len() as u32);
+                client.sequence = owed;
+                Ok(TcpStep::AwaitEcho)
+            }
+            TcpStep::AwaitFinAck => {
+                if !segment.carries(TCP_FIN | TCP_ACK, TCP_SYN) {
+                    return Err(format!(
+                        "the appliance answered a FIN with flags {:#04x}, and a peer that has \
+                         nothing left to send owes FIN and ACK together",
+                        segment.flags
+                    ));
+                }
+                // The client's `FIN` occupied one number past its payload.
+                let owed = CLIENT_ISN
+                    .wrapping_add(1)
+                    .wrapping_add(TCP_PAYLOAD.len() as u32)
+                    .wrapping_add(1);
+                if segment.acknowledgement != owed {
+                    return Err(format!(
+                        "the FIN-ACK acknowledges {} and the client's FIN occupied {owed}",
+                        segment.acknowledgement
+                    ));
+                }
+                if segment.sequence != client.expect {
+                    return Err(format!(
+                        "the FIN-ACK begins at sequence {} and the client expected {}",
+                        segment.sequence, client.expect
+                    ));
+                }
+                client.expect = segment.sequence.wrapping_add(1);
+                client.sequence = owed;
+                Ok(TcpStep::AwaitFinAck)
+            }
+            TcpStep::Closed => Err(format!(
+                "a segment came back after the connection closed: flags {:#04x}, sequence {}",
+                segment.flags, segment.sequence
+            )),
+        }
+    }
+
+    /// What the client sends to reach the next step, given the one it has just
+    /// completed. `None` at the end of the exchange.
+    fn advance(&self, client: &mut TcpClient) -> Option<Vec<u8>> {
+        let (next, frame) = match client.step {
+            TcpStep::Unopened => (
+                TcpStep::AwaitSynAck,
+                tcp_frame(&self.port, CLIENT_ISN, 0, TCP_SYN, &[]),
+            ),
+            // The handshake's third segment and the payload in one, which is what
+            // a client with something to say does: the acknowledgement rides on
+            // the data rather than costing a segment of its own.
+            TcpStep::AwaitSynAck => (
+                TcpStep::AwaitEcho,
+                tcp_frame(
+                    &self.port,
+                    client.sequence,
+                    client.expect,
+                    TCP_ACK | TCP_PSH,
+                    TCP_PAYLOAD,
+                ),
+            ),
+            TcpStep::AwaitEcho => (
+                TcpStep::AwaitFinAck,
+                tcp_frame(
+                    &self.port,
+                    client.sequence,
+                    client.expect,
+                    TCP_FIN | TCP_ACK,
+                    &[],
+                ),
+            ),
+            // `client.sequence` already counts this end's own `FIN`: the
+            // acknowledgement the appliance sent covered it, and `judge_tcp` set
+            // the number from that. Adding one here would put the final segment a
+            // byte past the window and be answered — correctly — with an
+            // acknowledgement rather than accepted, leaving the appliance's own
+            // `FIN` unacknowledged for ever.
+            TcpStep::AwaitFinAck => (
+                TcpStep::Closed,
+                tcp_frame(&self.port, client.sequence, client.expect, TCP_ACK, &[]),
+            ),
+            TcpStep::Closed => return None,
+        };
+        client.step = next;
+        Some(frame)
+    }
+
+    /// The exchange as evidence, in the voice of the routed-traffic lines.
+    fn opened(&self, client: &TcpClient) -> String {
+        format!(
+            "  answered   tcp-echo              station->mgmt  {}:{CLIENT_PORT} -> \
+             {}:{MANAGEMENT_TCP_PORT}  isn {}  {} bytes echoed  closed cleanly",
+            ipv4(self.port.station),
+            ipv4(self.port.address),
+            client
+                .peer_isn
+                .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
+            TCP_PAYLOAD.len()
+        )
     }
 
     /// The ARP reply the request obliges: our request's sender as the target, and
@@ -1617,6 +2091,13 @@ fn echo_differences(expected: &EchoFrame, observed: &EchoFrame) -> Vec<String> {
     found
 }
 
+/// Whether an IPv4 frame on the management wire carries a TCP segment.
+fn is_tcp(frame: &[u8]) -> bool {
+    frame
+        .get(ETHERNET_HEADER_LEN + 9)
+        .is_some_and(|protocol| *protocol == TCP_PROTOCOL)
+}
+
 /// Whether a frame carries anything only the management wire's traffic does: the
 /// port's own MAC, or the harness's station on it.
 ///
@@ -1668,29 +2149,58 @@ struct ManagementWire {
     /// one request is a frame nothing asked for.
     arp_reply: bool,
     echo_reply: bool,
+    /// The client's end of the one TCP connection this harness opens.
+    client: TcpClient,
+    /// Every frame this harness has put on the wire, accumulated as it goes.
+    ///
+    /// Accumulated rather than precomputed because the TCP exchange's frames are
+    /// decided by the appliance's own answers: the console's count is an equality
+    /// (`crate::management_contract`), so it must be stated against what was
+    /// actually sent and not against a tally written in advance.
+    injected: ManagementInjection,
 }
 
 impl ManagementWire {
-    /// Whether the port has answered everything it owes.
+    /// Whether the port has answered everything it owes: both stateless replies
+    /// and a whole TCP exchange.
     fn answered(&self) -> bool {
+        self.arp_reply && self.echo_reply && self.client.step == TcpStep::Closed
+    }
+
+    /// Whether the two stateless replies are in, which is what the TCP exchange
+    /// waits for: a failure in either is then reported as itself rather than as a
+    /// connection that never opened.
+    fn stateless_replies_in(&self) -> bool {
         self.arp_reply && self.echo_reply
     }
 
     /// Which replies are still outstanding, as a clause for a verdict.
     fn outstanding(&self) -> String {
-        match (self.arp_reply, self.echo_reply) {
-            (true, true) => String::from("none"),
-            (false, true) => String::from("the ARP reply"),
-            (true, false) => String::from("the ICMP echo reply"),
-            (false, false) => String::from("the ARP reply and the ICMP echo reply"),
+        let mut owed: Vec<&str> = Vec::new();
+        if !self.arp_reply {
+            owed.push("the ARP reply");
         }
+        if !self.echo_reply {
+            owed.push("the ICMP echo reply");
+        }
+        if self.client.step != TcpStep::Closed {
+            owed.push(self.client.step.outstanding());
+        }
+        if owed.is_empty() {
+            return String::from("none");
+        }
+        owed.join(" and ")
     }
 
     /// Record one accepted reply, refusing a second of the same kind.
+    ///
+    /// A TCP step is not one of those: the connection's own state machine is what
+    /// orders its segments, and it already refuses one that arrives out of turn.
     fn accept(&mut self, reply: ManagementReply) -> Result<(), String> {
         let seen = match reply {
             ManagementReply::Arp => &mut self.arp_reply,
             ManagementReply::Echo => &mut self.echo_reply,
+            ManagementReply::Tcp(_) => return Ok(()),
         };
         if *seen {
             return Err(format!(
@@ -1711,8 +2221,12 @@ impl ManagementWire {
         if self.injection_failure.is_some() {
             return;
         }
-        if let Err(error) = self.wire.write_all(&encode_wire(frame)) {
-            self.injection_failure = Some(error);
+        match self.wire.write_all(&encode_wire(frame)) {
+            Ok(()) => {
+                self.injected.frames += 1;
+                self.injected.bytes += frame.len() as u64;
+            }
+            Err(error) => self.injection_failure = Some(error),
         }
     }
 }
@@ -1774,6 +2288,13 @@ pub struct Booted {
     /// contract that failed first — and `management_contract::judge` refuses an
     /// empty one rather than reading two zeroes as agreement.
     pub management: ManagementInjection,
+    /// The appliance's own initial sequence number for the one connection this
+    /// boot opened, or `None` on a boot that never opened one.
+    ///
+    /// Returned so a caller can compare it *across boots*: RFC 6528 makes an
+    /// unpredictable one a security property, and one boot's number alone cannot
+    /// show that it is not a constant.
+    pub management_tcp_isn: Option<u32>,
     /// One line per reply the management port owed and gave, in the order they
     /// were accepted. Empty exactly when the run had no routed contract to meet:
     /// a routed run that reached its verdict answered both, the wait for them
@@ -1851,9 +2372,14 @@ fn run_boot(
     let mut broke: Option<usize> = None;
     // What reached the management wire, which stays empty on every path that
     // never got as far as sending it.
-    let (management_probe, injection) = ManagementProbe::new(test.topology.management());
+    let (management_probe, _) = ManagementProbe::new(test.topology.management());
     let mut injected = ManagementInjection::default();
     let mut answered: Vec<String> = Vec::new();
+    // Held outside the run block so it survives every exit path, as the traffic
+    // report does: a boot that opened a connection and then failed later still
+    // observed the number.
+    let mut tcp_isn: Option<u32> = None;
+    let mut observed_isn: Option<u32> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -1925,6 +2451,8 @@ fn run_boot(
             injection_failure: None,
             arp_reply: false,
             echo_reply: false,
+            client: TcpClient::new(),
+            injected: ManagementInjection::default(),
         };
 
         let mut endpoints: Vec<AttachedEndpoint> = Vec::new();
@@ -1973,20 +2501,53 @@ fn run_boot(
                 // booted, so no endpoint answered.
                 if egress == MANAGEMENT_SLOT {
                     match &test.contract {
-                        BootContract::Routed => match management_probe.judge(&frame, &probes) {
-                            Ok(reply) => match management.accept(reply) {
-                                Ok(()) => answered.push(management_probe.answered(reply)),
+                        BootContract::Routed => {
+                            match management_probe.judge(&frame, &probes, &mut management.client) {
+                                Ok(reply) => {
+                                    if let Err(verdict) = management.accept(reply) {
+                                        break 'run Err(format!(
+                                            "{verdict}; see {}",
+                                            log_path.display()
+                                        ));
+                                    }
+                                    // A TCP step both asserts what came back and
+                                    // decides what goes out next, so the client is
+                                    // advanced here rather than on a timer: the
+                                    // exchange is driven by the appliance's own
+                                    // answers.
+                                    if matches!(reply, ManagementReply::Tcp(_)) {
+                                        observed_isn = management.client.peer_isn;
+                                        if let Some(next) =
+                                            management_probe.advance(&mut management.client)
+                                        {
+                                            management.inject(&next);
+                                            injected = management.injected;
+                                        }
+                                        if management.client.step == TcpStep::Closed {
+                                            answered
+                                                .push(management_probe.opened(&management.client));
+                                            // Restart the settle window from the
+                                            // last frame this harness sent, so the
+                                            // appliance has a whole one to report
+                                            // the count including its final
+                                            // segment: the console's total is an
+                                            // equality, and breaking out at the
+                                            // instant the exchange closed would
+                                            // race that record.
+                                            settling_since = Some(Instant::now());
+                                        }
+                                    } else {
+                                        answered.push(management_probe.answered(reply));
+                                    }
+                                }
                                 Err(verdict) => {
                                     break 'run Err(format!(
                                         "{verdict}; see {}",
                                         log_path.display()
                                     ));
                                 }
-                            },
-                            Err(verdict) => {
-                                break 'run Err(format!("{verdict}; see {}", log_path.display()));
                             }
-                        },
+                        }
                         BootContract::Halted { .. } => {
                             break 'run Err(format!(
                                 "{} bytes came back on the management port, so a slot booted \
@@ -2060,13 +2621,26 @@ fn run_boot(
                         for frame in &management_probe.frames {
                             management.inject(frame);
                         }
-                        injected = injection;
+                        injected = management.injected;
                         settling_since = Some(Instant::now());
                     }
                     // The window is what a refusal needs to have come back in;
                     // the replies are what the management port owes. A run that
                     // waited out the window without both has not met the
                     // contract, and says which one is missing when it times out.
+                    // The two stateless replies are in, so a failure in either has
+                    // already been reported as itself: the connection may be
+                    // opened. Once, and never retransmitted — the wire to QEMU is
+                    // a host socket, so a client that re-sent would be testing
+                    // itself rather than the appliance.
+                    Some(_)
+                        if management.stateless_replies_in()
+                            && management.client.step == TcpStep::Unopened =>
+                    {
+                        if let Some(syn) = management_probe.advance(&mut management.client) {
+                            management.inject(&syn);
+                        }
+                    }
                     Some(since) if since.elapsed() >= SETTLE_WINDOW && management.answered() => {
                         break 'run Ok(());
                     }
@@ -2130,6 +2704,7 @@ fn run_boot(
 
     // Reliable shutdown: kill and reap QEMU on every path before joining the
     // reader threads (which unblock once the pipes and sockets close).
+    tcp_isn = tcp_isn.or(observed_isn);
     let terminate_result = terminate(&mut child, "boot test finished");
     let stdout_result = join_reader(stdout_reader, "stdout");
     let stderr_result = join_reader(stderr_reader, "stderr");
@@ -2178,6 +2753,7 @@ fn run_boot(
         serial: output,
         traffic,
         management: injected,
+        management_tcp_isn: tcp_isn,
         management_replies: answered,
     })
 }
@@ -3319,11 +3895,19 @@ mod tests {
         let probes = probes(&bench()).expect("the shipped bench");
 
         assert_eq!(
-            probe.judge(&arp_reply(&management, |_| {}), &probes),
+            probe.judge(
+                &arp_reply(&management, |_| {}),
+                &probes,
+                &mut TcpClient::new()
+            ),
             Ok(ManagementReply::Arp)
         );
         assert_eq!(
-            probe.judge(&echo_reply(&management, |_| {}), &probes),
+            probe.judge(
+                &echo_reply(&management, |_| {}),
+                &probes,
+                &mut TcpClient::new()
+            ),
             Ok(ManagementReply::Echo)
         );
 
@@ -3340,7 +3924,11 @@ mod tests {
         ];
         for (field, mutate) in arp_mutations {
             let verdict = probe
-                .judge(&arp_reply(&management, mutate), &probes)
+                .judge(
+                    &arp_reply(&management, mutate),
+                    &probes,
+                    &mut TcpClient::new(),
+                )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
         }
@@ -3359,7 +3947,11 @@ mod tests {
         ];
         for (field, mutate) in echo_mutations {
             let verdict = probe
-                .judge(&echo_reply(&management, mutate), &probes)
+                .judge(
+                    &echo_reply(&management, mutate),
+                    &probes,
+                    &mut TcpClient::new(),
+                )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
         }
@@ -3377,7 +3969,7 @@ mod tests {
         // direction a leak would be silent.
         let leaked = &probes[0].frame;
         let verdict = probe
-            .judge(leaked, &probes)
+            .judge(leaked, &probes, &mut TcpClient::new())
             .expect_err("a dataplane probe on the management wire");
         assert!(verdict.contains(probes[0].name), "{verdict}");
         assert!(verdict.contains("isolates that port"), "{verdict}");
@@ -3385,7 +3977,7 @@ mod tests {
         // One of the opaque frames coming back: the endpoint answers nothing for
         // that EtherType, so it must count it and stay silent.
         let verdict = probe
-            .judge(&probe.frames[0], &probes)
+            .judge(&probe.frames[0], &probes, &mut TcpClient::new())
             .expect_err("an opaque frame must never be answered");
         assert!(verdict.contains("say nothing"), "{verdict}");
 
@@ -3393,7 +3985,7 @@ mod tests {
         // one at all.
         for frame in [legacy_broadcast_frame(b"unrelated"), vec![0u8; 4]] {
             let verdict = probe
-                .judge(&frame, &probes)
+                .judge(&frame, &probes, &mut TcpClient::new())
                 .expect_err("nothing else may come back");
             assert!(
                 verdict.contains("answers ARP and ICMP echo alone"),
@@ -3406,14 +3998,14 @@ mod tests {
         let mut corrupt = echo_reply(&management, |_| {});
         corrupt[ETHERNET_HEADER_LEN + 10] ^= 0xff;
         let verdict = probe
-            .judge(&corrupt, &probes)
+            .judge(&corrupt, &probes, &mut TcpClient::new())
             .expect_err("a stale checksum");
         assert!(verdict.contains("IPv4 checksum"), "{verdict}");
 
         let mut short_arp = arp_reply(&management, |_| {});
         short_arp.truncate(ARP_FRAME_LEN - 1);
         let verdict = probe
-            .judge(&short_arp, &probes)
+            .judge(&short_arp, &probes, &mut TcpClient::new())
             .expect_err("a truncated ARP");
         assert!(verdict.contains("short of the"), "{verdict}");
     }
@@ -3452,19 +4044,33 @@ mod tests {
             injection_failure: None,
             arp_reply: false,
             echo_reply: false,
+            client: TcpClient::new(),
+            injected: ManagementInjection::default(),
         };
         assert!(!wire.answered());
+        assert!(!wire.stateless_replies_in());
         assert!(wire.outstanding().contains("ARP") && wire.outstanding().contains("echo"));
 
         wire.accept(ManagementReply::Arp).expect("the first");
         assert!(!wire.answered());
-        assert_eq!(wire.outstanding(), "the ICMP echo reply");
+        assert!(wire.outstanding().contains("ICMP echo reply"));
         let verdict = wire
             .accept(ManagementReply::Arp)
             .expect_err("one request is one reply");
         assert!(verdict.contains("a second"), "{verdict}");
 
         wire.accept(ManagementReply::Echo).expect("the second");
+        // Both stateless replies are in, and the connection is still owed: that is
+        // the point at which the client opens one.
+        assert!(wire.stateless_replies_in());
+        assert!(!wire.answered());
+        assert_eq!(wire.outstanding(), "the TCP exchange has not been started");
+
+        // A TCP step is not a reply that may arrive twice: the connection's own
+        // state machine orders its segments, so `accept` has nothing to refuse.
+        wire.accept(ManagementReply::Tcp(TcpStep::AwaitSynAck))
+            .expect("a step is not a reply");
+        wire.client.step = TcpStep::Closed;
         assert!(wire.answered());
         assert_eq!(wire.outstanding(), "none");
     }
@@ -3845,5 +4451,363 @@ mod tests {
             error.contains("additionally"),
             "the persistence failure must be reported too: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tcp_client_tests {
+    use super::*;
+    use crate::topology::Topology;
+
+    fn bench() -> Topology {
+        Topology::from_document(include_bytes!(
+            "../../../systems/qemu-x86_64/configuration.xml"
+        ))
+        .expect("the shipped document")
+    }
+
+    /// A segment the appliance would send, built here as it must build one, so a
+    /// negative test can move one field at a time.
+    fn appliance_segment(
+        management: &ManagementPort,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&MANAGEMENT_TCP_PORT.to_be_bytes());
+        segment.extend_from_slice(&CLIENT_PORT.to_be_bytes());
+        segment.extend_from_slice(&sequence.to_be_bytes());
+        segment.extend_from_slice(&acknowledgement.to_be_bytes());
+        segment.push(5 << 4);
+        segment.push(flags);
+        segment.extend_from_slice(&8192u16.to_be_bytes());
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        segment.extend_from_slice(payload);
+        let checksum = tcp_checksum(&management.address, &management.station, &segment);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+        ip[8] = 64;
+        ip[9] = TCP_PROTOCOL;
+        ip[12..16].copy_from_slice(&management.address);
+        ip[16..20].copy_from_slice(&management.station);
+        let sum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&segment);
+        frame
+    }
+
+    /// The whole exchange, driven the way the boot loop drives it: each answer
+    /// both asserts what came back and decides what goes out next.
+    #[test]
+    fn the_whole_exchange_is_walked_and_every_step_asserted() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = TcpClient::new();
+
+        // The client opens.
+        let syn = probe.advance(&mut client).expect("a SYN");
+        assert_eq!(client.step, TcpStep::AwaitSynAck);
+        let sent = decode_tcp(&syn, &management).expect("the client's own SYN re-parses");
+        assert!(sent.carries(TCP_SYN, TCP_ACK | TCP_FIN));
+        assert_eq!(sent.sequence, CLIENT_ISN);
+        assert_eq!(sent.destination_port, MANAGEMENT_TCP_PORT);
+
+        // The appliance answers with a SYN-ACK, and the client acknowledges it
+        // with the payload.
+        let peer_isn = 0x9e37_79b9;
+        let syn_ack = appliance_segment(
+            &management,
+            peer_isn,
+            CLIENT_ISN.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            &[],
+        );
+        assert_eq!(
+            probe.judge_tcp(&syn_ack, &mut client),
+            Ok(TcpStep::AwaitSynAck)
+        );
+        assert_eq!(client.peer_isn, Some(peer_isn));
+        let data = probe.advance(&mut client).expect("the payload");
+        assert_eq!(client.step, TcpStep::AwaitEcho);
+        let sent = decode_tcp(&data, &management).expect("the payload re-parses");
+        assert_eq!(sent.payload, TCP_PAYLOAD);
+        assert_eq!(sent.acknowledgement, peer_isn.wrapping_add(1));
+
+        // The echo, byte for byte.
+        let echoed = appliance_segment(
+            &management,
+            peer_isn.wrapping_add(1),
+            CLIENT_ISN
+                .wrapping_add(1)
+                .wrapping_add(TCP_PAYLOAD.len() as u32),
+            TCP_ACK | TCP_PSH,
+            TCP_PAYLOAD,
+        );
+        assert_eq!(
+            probe.judge_tcp(&echoed, &mut client),
+            Ok(TcpStep::AwaitEcho)
+        );
+        let fin = probe.advance(&mut client).expect("a FIN");
+        assert_eq!(client.step, TcpStep::AwaitFinAck);
+        let sent = decode_tcp(&fin, &management).expect("the FIN re-parses");
+        assert!(sent.carries(TCP_FIN | TCP_ACK, TCP_SYN));
+
+        // The close.
+        let closing = CLIENT_ISN
+            .wrapping_add(1)
+            .wrapping_add(TCP_PAYLOAD.len() as u32)
+            .wrapping_add(1);
+        let fin_ack = appliance_segment(
+            &management,
+            peer_isn
+                .wrapping_add(1)
+                .wrapping_add(TCP_PAYLOAD.len() as u32),
+            closing,
+            TCP_FIN | TCP_ACK,
+            &[],
+        );
+        assert_eq!(
+            probe.judge_tcp(&fin_ack, &mut client),
+            Ok(TcpStep::AwaitFinAck)
+        );
+        let last = probe.advance(&mut client).expect("the final ACK");
+        assert_eq!(client.step, TcpStep::Closed);
+        assert!(
+            decode_tcp(&last, &management)
+                .expect("the final ACK re-parses")
+                .carries(TCP_ACK, TCP_SYN | TCP_FIN)
+        );
+        assert_eq!(probe.advance(&mut client), None);
+        assert!(probe.opened(&client).contains(&peer_isn.to_string()));
+    }
+
+    /// Every field of every step, moved one at a time. This is what makes the
+    /// exchange a contract rather than a sequence of shapes: each mutation is a
+    /// segment a broken stack would plausibly send.
+    #[test]
+    fn one_moved_field_at_any_step_is_refused_by_name() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let peer_isn = 0x1234_5678;
+        let acked = CLIENT_ISN.wrapping_add(1);
+        let payload_end = acked.wrapping_add(TCP_PAYLOAD.len() as u32);
+
+        // A client at each step, and a segment that is wrong for it.
+        let cases: [(TcpStep, Vec<u8>, &str); 8] = [
+            (
+                TcpStep::AwaitSynAck,
+                appliance_segment(&management, peer_isn, acked, TCP_ACK, &[]),
+                "SYN and ACK together",
+            ),
+            (
+                TcpStep::AwaitSynAck,
+                appliance_segment(
+                    &management,
+                    peer_isn,
+                    acked.wrapping_add(7),
+                    TCP_SYN | TCP_ACK,
+                    &[],
+                ),
+                "acknowledges",
+            ),
+            (
+                TcpStep::AwaitSynAck,
+                appliance_segment(&management, peer_isn, acked, TCP_RST | TCP_ACK, &[]),
+                "reset the connection",
+            ),
+            (
+                TcpStep::AwaitEcho,
+                appliance_segment(
+                    &management,
+                    peer_isn + 1,
+                    payload_end,
+                    TCP_ACK,
+                    b"wrong bytes",
+                ),
+                "carried back",
+            ),
+            (
+                TcpStep::AwaitEcho,
+                appliance_segment(
+                    &management,
+                    peer_isn + 99,
+                    payload_end,
+                    TCP_ACK | TCP_PSH,
+                    TCP_PAYLOAD,
+                ),
+                "begins at sequence",
+            ),
+            (
+                TcpStep::AwaitFinAck,
+                appliance_segment(&management, peer_isn + 1, payload_end, TCP_ACK, &[]),
+                "FIN and ACK together",
+            ),
+            (
+                TcpStep::Unopened,
+                appliance_segment(&management, peer_isn, 0, TCP_ACK, &[]),
+                "before the client opened",
+            ),
+            (
+                TcpStep::Closed,
+                appliance_segment(&management, peer_isn, 0, TCP_ACK, &[]),
+                "after the connection closed",
+            ),
+        ];
+        for (step, frame, expected) in cases {
+            let mut client = TcpClient::new();
+            client.step = step;
+            client.expect = peer_isn.wrapping_add(1);
+            client.sequence = acked;
+            let verdict = probe
+                .judge_tcp(&frame, &mut client)
+                .expect_err(&format!("{step:?} must refuse this segment"));
+            assert!(
+                verdict.contains(expected),
+                "at {step:?}, expected {expected:?} in: {verdict}"
+            );
+        }
+    }
+
+    /// A bare acknowledgement of the payload is legitimate TCP: the echo may
+    /// follow in a segment of its own, so the client waits rather than refusing.
+    #[test]
+    fn a_bare_acknowledgement_of_the_payload_is_tolerated() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = TcpClient::new();
+        client.step = TcpStep::AwaitEcho;
+        client.expect = 0x1000;
+        let ack = appliance_segment(
+            &management,
+            0x1000,
+            CLIENT_ISN
+                .wrapping_add(1)
+                .wrapping_add(TCP_PAYLOAD.len() as u32),
+            TCP_ACK,
+            &[],
+        );
+        assert_eq!(probe.judge_tcp(&ack, &mut client), Ok(TcpStep::AwaitEcho));
+        assert_eq!(client.step, TcpStep::AwaitEcho, "the client moved on early");
+    }
+
+    /// The checksum is verified rather than trusted: it is the one field of the
+    /// appliance's own composition no other assertion here would notice.
+    #[test]
+    fn a_segment_whose_checksum_does_not_verify_is_refused() {
+        let management = bench().management();
+        let mut frame = appliance_segment(&management, 1, 2, TCP_ACK, b"body");
+        assert!(decode_tcp(&frame, &management).is_ok());
+        let at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 16;
+        frame[at] ^= 0xff;
+        let verdict = decode_tcp(&frame, &management).expect_err("a bad checksum");
+        assert!(verdict.contains("does not verify"), "{verdict}");
+    }
+
+    /// Everything a frame can be that is not a segment this client reads.
+    #[test]
+    fn a_frame_that_is_not_a_tcp_segment_is_refused_by_the_field_that_says_so() {
+        let management = bench().management();
+        assert!(decode_tcp(&[0u8; 10], &management).is_err());
+
+        let mut wrong_protocol = appliance_segment(&management, 1, 2, TCP_ACK, &[]);
+        wrong_protocol[ETHERNET_HEADER_LEN + 9] = ICMP_PROTOCOL;
+        assert!(
+            decode_tcp(&wrong_protocol, &management)
+                .expect_err("not TCP")
+                .contains("IP protocol")
+        );
+        assert!(!is_tcp(&wrong_protocol));
+
+        // A data offset naming more header than the segment carries.
+        let mut short_header = appliance_segment(&management, 1, 2, TCP_ACK, &[]);
+        let offset_at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 12;
+        short_header[offset_at] = 15 << 4;
+        assert!(
+            decode_tcp(&short_header, &management)
+                .expect_err("an impossible header length")
+                .contains("byte header")
+        );
+
+        // And one below the twenty a header occupies.
+        let mut tiny_header = appliance_segment(&management, 1, 2, TCP_ACK, &[]);
+        tiny_header[offset_at] = 4 << 4;
+        assert!(decode_tcp(&tiny_header, &management).is_err());
+
+        // A datagram claiming more than the frame carries.
+        let mut overlong = appliance_segment(&management, 1, 2, TCP_ACK, &[]);
+        overlong[ETHERNET_HEADER_LEN + 2..ETHERNET_HEADER_LEN + 4]
+            .copy_from_slice(&9000u16.to_be_bytes());
+        assert!(decode_tcp(&overlong, &management).is_err());
+    }
+
+    /// A segment addressed to the wrong port pair is not this connection's,
+    /// whatever else it carries.
+    #[test]
+    fn a_segment_on_another_port_pair_is_refused() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = TcpClient::new();
+        client.step = TcpStep::AwaitSynAck;
+        let mut frame = appliance_segment(
+            &management,
+            1,
+            CLIENT_ISN.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            &[],
+        );
+        // Move the source port and re-seal, so the refusal is the port rather than
+        // the checksum.
+        let at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        frame[at..at + 2].copy_from_slice(&8080u16.to_be_bytes());
+        frame[at + 16..at + 18].copy_from_slice(&[0, 0]);
+        let checksum = tcp_checksum(&management.address, &management.station, &frame[at..]);
+        frame[at + 16..at + 18].copy_from_slice(&checksum.to_be_bytes());
+        let verdict = probe
+            .judge_tcp(&frame, &mut client)
+            .expect_err("not this connection");
+        assert!(verdict.contains("came back from port 8080"), "{verdict}");
+    }
+
+    /// The two halves of one checksum routine: composing and verifying.
+    #[test]
+    fn the_checksum_routine_serves_both_directions() {
+        let source = [10, 0, 2, 2];
+        let destination = [10, 0, 2, 15];
+        let mut segment = std::vec![0u8; 24];
+        segment[12] = 5 << 4;
+        segment[13] = TCP_ACK;
+        let value = tcp_checksum(&source, &destination, &segment);
+        segment[16..18].copy_from_slice(&value.to_be_bytes());
+        assert_eq!(tcp_checksum(&source, &destination, &segment), 0);
+
+        // An odd-length segment is padded with a zero byte, as RFC 1071 says.
+        let mut odd = std::vec![0u8; 21];
+        odd[12] = 5 << 4;
+        let value = tcp_checksum(&source, &destination, &odd);
+        odd[16..18].copy_from_slice(&value.to_be_bytes());
+        assert_eq!(tcp_checksum(&source, &destination, &odd), 0);
+    }
+
+    /// Three boots' numbers, and the one thing they must not be.
+    #[test]
+    fn equal_sequence_numbers_across_boots_are_refused() {
+        assert!(crate::qemu::judge_sequence_numbers(&[]).is_err());
+        let distinct = crate::qemu::judge_sequence_numbers(&[("a", 1), ("b", 2), ("c", 3)])
+            .expect("three distinct numbers");
+        assert!(distinct.contains('3'), "{distinct}");
+        let verdict = crate::qemu::judge_sequence_numbers(&[("a", 7), ("b", 7)])
+            .expect_err("two equal numbers");
+        assert!(verdict.contains("both answered with"), "{verdict}");
+        assert!(verdict.contains("off-path"), "{verdict}");
     }
 }

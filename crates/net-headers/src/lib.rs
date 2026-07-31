@@ -42,6 +42,9 @@
 //! * **ICMP is echo or nothing.** [`IcmpEcho::parse_request`] is the whole of
 //!   what this crate reads of ICMP; every other type and code is refused, so no
 //!   error message, redirect or timestamp is parsed here.
+//! * **TCP is not parsed here.** A segment's header is inseparable from the state
+//!   machine that judges it, so `lfw_tcp` owns that parser and reaches this crate's
+//!   arithmetic through [`Checksum`]; [`Ipv4Frame`] is the datagram around one.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -697,6 +700,167 @@ impl ArpReply {
     }
 }
 
+/// A running RFC 1071 ones' complement sum, for a transport whose checksum spans
+/// more than one block — the TCP pseudo-header, nowhere in memory, followed by the
+/// segment. One implementation serves the workspace: two that disagreed would
+/// produce a stack that talks to nobody. Continuation is exact only across an even
+/// boundary, a property of the sum rather than a rule this type enforces:
+/// [`add_bytes`](Self::add_bytes) pads an odd-length piece with a zero byte, so such
+/// a piece must be the last.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Checksum(u32);
+
+impl Checksum {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Add a block of bytes; see the type's note on odd lengths. Not named `add`,
+    /// because `Add` is a trait this type must not implement.
+    #[must_use]
+    pub fn add_bytes(self, bytes: &[u8]) -> Self {
+        Self(accumulate(self.0, bytes))
+    }
+
+    #[must_use]
+    pub const fn add_u16(self, value: u16) -> Self {
+        Self(self.0.saturating_add(value as u32))
+    }
+
+    #[must_use]
+    pub const fn add_address(self, address: Ipv4Address) -> Self {
+        let bits = address.bits();
+        // Lossless: each shift-and-mask leaves 16 bits.
+        self.add_u16((bits >> 16) as u16)
+            .add_u16((bits & 0xffff) as u16)
+    }
+
+    /// The value the checksum field should carry.
+    #[must_use]
+    pub const fn finish(self) -> u16 {
+        !fold(self.0)
+    }
+
+    #[must_use]
+    pub const fn is_consistent(self) -> bool {
+        fold(self.0) == u16::MAX
+    }
+}
+
+/// The Ethernet and IPv4 headers of a datagram this appliance originates, stamped
+/// in front of a transport payload already written at [`Ipv4Frame::PAYLOAD_AT`].
+///
+/// The order is why this exists rather than a `write` taking a payload slice: a TCP
+/// segment's checksum covers its payload, so the segment must be complete before
+/// the datagram can be sized — and writing it in place is what lets it be written
+/// exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv4Frame {
+    pub destination_mac: MacAddress,
+    pub source_mac: MacAddress,
+    pub source: Ipv4Address,
+    pub destination: Ipv4Address,
+    pub protocol: Protocol,
+}
+
+impl Ipv4Frame {
+    /// Where the transport payload sits, and so where a caller composes it.
+    pub const PAYLOAD_AT: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+
+    /// The TTL such a datagram leaves with; see [`EchoReply::TTL`].
+    pub const TTL: u8 = 64;
+
+    /// Stamp the two headers in front of `payload_len` bytes already at
+    /// [`PAYLOAD_AT`](Self::PAYLOAD_AT), returning the frame's length on the wire.
+    ///
+    /// # Errors
+    /// [`ReplyError`], for storage too small or a payload no IPv4 total length can
+    /// name; nothing is written on either, so the payload survives a refusal.
+    pub fn write(&self, out: &mut [u8], payload_len: usize) -> Result<usize, ReplyError> {
+        let Some(total_length) = IPV4_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|total| u16::try_from(total).ok())
+        else {
+            return Err(ReplyError::PayloadTooLong { len: payload_len });
+        };
+        let needed = ETHERNET_HEADER_LEN + usize::from(total_length);
+        if out.len() < needed {
+            return Err(ReplyError::DoesNotFit {
+                needed,
+                capacity: out.len(),
+            });
+        }
+        let Some(head) = out.first_chunk_mut::<{ Self::PAYLOAD_AT }>() else {
+            return Err(ReplyError::DoesNotFit {
+                needed,
+                capacity: out.len(),
+            });
+        };
+
+        let MacAddress([d0, d1, d2, d3, d4, d5]) = self.destination_mac;
+        let MacAddress([s0, s1, s2, s3, s4, s5]) = self.source_mac;
+        let [ether_high, ether_low] = EtherType::IPV4.0.to_be_bytes();
+        let [len_high, len_low] = total_length.to_be_bytes();
+        let [src0, src1, src2, src3] = self.source.octets();
+        let [dst0, dst1, dst2, dst3] = self.destination.octets();
+
+        let mut ipv4 = [
+            0x45,
+            0,
+            len_high,
+            len_low,
+            0,
+            0,
+            0,
+            0,
+            Self::TTL,
+            self.protocol.0,
+            0,
+            0,
+            src0,
+            src1,
+            src2,
+            src3,
+            dst0,
+            dst1,
+            dst2,
+            dst3,
+        ];
+        let [ck_high, ck_low] = checksum_over(&ipv4, IPV4_CHECKSUM_AT).to_be_bytes();
+        ipv4[IPV4_CHECKSUM_AT] = ck_high;
+        ipv4[IPV4_CHECKSUM_AT + 1] = ck_low;
+
+        let [
+            i0,
+            i1,
+            i2,
+            i3,
+            i4,
+            i5,
+            i6,
+            i7,
+            i8,
+            i9,
+            i10,
+            i11,
+            i12,
+            i13,
+            i14,
+            i15,
+            i16,
+            i17,
+            i18,
+            i19,
+        ] = ipv4;
+        *head = [
+            d0, d1, d2, d3, d4, d5, s0, s1, s2, s3, s4, s5, ether_high, ether_low, i0, i1, i2, i3,
+            i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16, i17, i18, i19,
+        ];
+        Ok(needed)
+    }
+}
+
 /// The ICMP echo reply an addressed endpoint answers a request with.
 ///
 /// The echo is carried whole rather than field by field, because identifier,
@@ -1259,10 +1423,13 @@ fn accumulate(sum: u32, bytes: &[u8]) -> u32 {
 }
 
 /// Fold a running sum to the 16 bits a checksum field carries.
-fn fold(sum: u32) -> u16 {
+const fn fold(sum: u32) -> u16 {
+    // `u16::MAX as u32` rather than `u32::from`: `From` is not a const trait on
+    // the pinned toolchain, and the widening of a literal maximum is exact.
+    const HALF: u32 = u16::MAX as u32;
     let mut sum = sum;
-    while sum > u32::from(u16::MAX) {
-        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    while sum > HALF {
+        sum = (sum & HALF) + (sum >> 16);
     }
     // Lossless: the fold above leaves at most 16 significant bits.
     sum as u16

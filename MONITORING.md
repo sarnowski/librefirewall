@@ -309,10 +309,10 @@ holding a silent appliance still has only the external act.
 
 ### `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the two tables together are the complete set: 23 the
-`nic-driver` domain raises and 25 the `clock` domain raises, with no token shared between them. A
-token outside both is a defect, not an extension. The `forwarder`, `console` and `management` domains
-raise none: the first two have no `refused` record and the third has no refusal path at all.
+Every `cause=` token is listed below and the three tables together are the complete set: 23 the
+`nic-driver` domain raises, 25 the `clock` domain raises, and 4 the `management` domain raises, with
+no token shared between them. A token outside all three is a defect, not an extension. The
+`forwarder` and `console` domains raise none, having no `refused` record.
 
 **`nic-driver`.** The first two are the domain's own, raised before the device is touched at all;
 the rest are the driver's bring-up tree.
@@ -342,6 +342,26 @@ being known without being transmitted.
 | the real-time clock | `rtc-update-never-completed` (status A), `rtc-snapshots-never-agreed`, `rtc-not-binary-coded-decimal` (CMOS index, value), `rtc-hour-outside-twelve-hour-range` (hour, PM flag), `rtc-implausible-year` (year, century register) |
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
+
+**`management`.** Four tokens, and the two halves differ in what they mean for the domain.
+
+The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
+its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
+attacker inject into a connection it cannot see (RFC 6528). So the domain refuses to start rather
+than answering a connection weakly, and the management port stays unaddressed for the boot. Read
+either of them as "this node has no management port at all until it is rebooted on hardware that
+answers".
+
+The last two ride on a **`state=ready`** record instead, and mean something much narrower: the clock
+domain published a calibration this domain will not convert readings with, so the port answers ARP
+and ICMP echo — neither needs a time — and refuses TCP, counting each segment as unclocked. They are
+reported once per calibration rather than once per frame. `signalled=` is always `false` on all four:
+no device was told to stop, because none was told anything.
+
+| group | tokens |
+|---|---|
+| the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the two 64-bit draws failed) |
+| the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused) |
 
 ### `LFW-CFG` — configuration
 
@@ -606,8 +626,27 @@ named routing drop reasons, the pool ownership faults, and the configuration han
 refused counts — as does the console path: each writing domain's `dropped` and `refused`, the
 console's `printed`, `malformed`, `unknown`, `unrenderable` and `write_failed`, and the UART's
 `bytes_written`, `thre_timeouts` and `init_failures` (see *What the console loses, and what counts
-it*). No surface reads any of them out: **a drop is currently unobservable from outside the node**,
-on this surface or any other. The console-path counters are the sharper case, because the console is
+it*).
+
+**The management port's transport is now the largest such tally, and the one whose attribution is
+already in the shape this section requires.** `lfw_tcp::TcpCounters` keeps twenty-five fields, one per
+distinct cause, with the three classes above kept apart: what a peer sent that was refused
+(`refused_malformed`, `refused_bad_checksum`, `refused_out_of_window`, `refused_table_full`,
+`refused_not_listening`, `refused_no_connection`, `refused_unacceptable_ack`,
+`refused_no_acknowledgement`, `refused_out_of_order`); what the connection table did about it
+(`connections_accepted`, `connections_established`, `connections_closed`, `connections_evicted`,
+`connections_reaped`, `connections_abandoned`); what crossed it (`segments_received`, `segments_sent`,
+`bytes_received`, `bytes_sent`, `bytes_retransmitted`, `retransmits`); the RFC 5961 and RFC 793
+answers (`challenge_acks`, `resets_received`, `resets_sent`, `urgent_ignored`); and exactly one that
+accuses **this code** rather than a peer — `write_refused`, a segment the stack decided to send that
+did not fit the storage its caller offered, expected to read zero forever. There is deliberately no
+*device* class in it: nothing in that crate reads a register, so a bit flipped by a NIC and one
+flipped by an attacker are the same observation and both land under what a peer sent. Beside it
+`lfw_ip_endpoint` keeps `tcp_segments` and `unclocked`, its echo keeps seven more, and the endpoint
+stage keeps `clock_generation`, `clocks_refused` and `timer_segments`.
+
+No surface reads any of them out: **a drop is currently unobservable from outside the node**, on this
+surface or any other. The console-path counters are the sharper case, because the console is
 itself the last-resort surface — a node quietly losing records has no way to say so.
 
 ## Configuration read endpoint

@@ -28,9 +28,11 @@ cargo-fuzz = true
 #   config          the configuration document, whose every byte is the
 #                   management-plane attacker's, and the model read out of it
 #   net-headers     the Ethernet/IPv4/UDP/ARP/ICMP headers a wire carries
-#   lfw-ip-endpoint the terminal endpoint that answers ARP and ICMP echo for the
-#                   management port, and so the first surface here that composes
-#                   a reply out of an adversary's own bytes
+#   lfw-ip-endpoint the terminal endpoint that answers ARP, ICMP echo and TCP for
+#                   the management port, and so the first surface here that
+#                   composes a reply out of an adversary's own bytes
+#   lfw-tcp         the transport that carries a connection on that port: every
+#                   segment field, every option, and the state machine over them
 #   routing         the forwarding decision made from those headers
 #   queue           the shared ring whose cursors and slots a peer PD owns
 #   packet-buffer   the ownership ledger a peer PD's buffer returns cross
@@ -45,6 +47,8 @@ lfw-log = { path = "../crates/log" }
 config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
 lfw-ip-endpoint = { path = "../crates/ip-endpoint" }
+lfw-tcp = { path = "../crates/tcp" }
+lfw-clock = { path = "../crates/clock" }
 routing = { path = "../crates/routing" }
 queue = { path = "../crates/queue" }
 packet-buffer = { path = "../crates/packet-buffer" }
@@ -113,6 +117,13 @@ bench = false
 [[bin]]
 name = "ip_endpoint"
 path = "fuzz_targets/ip_endpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_segments"
+path = "fuzz_targets/tcp_segments.rs"
 test = false
 doc = false
 bench = false

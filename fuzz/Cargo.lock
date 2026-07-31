@@ -71,6 +71,8 @@ version = "0.1.0"
 name = "lfw-ip-endpoint"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
+ "lfw-tcp",
  "net-headers",
 ]
 
@@ -81,6 +83,14 @@ dependencies = [
  "lfw-clock",
  "net-headers",
  "wire",
+]
+
+[[package]]
+name = "lfw-tcp"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "net-headers",
 ]
 
 [[package]]
@@ -105,8 +115,10 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "config",
+ "lfw-clock",
  "lfw-ip-endpoint",
  "lfw-log",
+ "lfw-tcp",
  "libfuzzer-sys",
  "net-headers",
  "nic-driver-core",
@@ -139,6 +151,7 @@ version = "0.1.0"
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
  "lfw-ip-endpoint",
  "lfw-log",
  "net-headers",

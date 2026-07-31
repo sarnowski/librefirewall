@@ -241,6 +241,63 @@
     <memory_region name="cfg" size="0x1000" />
     <memory_region name="cfgack" size="0x1000" />
 
+    <!-- THE CLOCK CALIBRATION, and the first region in this system published
+         under a SEQLOCK rather than under an identifying generation
+         (ENG-1, SCM-6).
+
+         It carries three words — the timestamp counter's measured frequency, the
+         reading it was anchored on, and the wall-clock instant that reading
+         corresponds to — and they are only meaningful TOGETHER: a frequency from
+         one measurement anchored to another measurement's epoch names an instant
+         that never existed. Every bit pattern of each of the three is
+         individually plausible, so a torn triple is undetectable by inspection,
+         which is exactly what `cfg`'s "publish the bytes, then release the
+         generation" pattern relies on not being the case. `wire::ClockCalibration`
+         therefore spends its counter on the write rather than on the identity —
+         even settled, odd being written — and a reader that cannot get a matching
+         pair of even readings answers "nothing" rather than assembling a triple
+         from two publishes.
+
+         ONE WRITER AND ONE READER, and the direction is the whole grant. The
+         clock domain maps it READ-WRITE: it is the domain that measured the
+         numbers, and it publishes them once, after the record that says what it
+         measured. The management domain maps it READ-ONLY, on the same footing as
+         `cfg`: it is a CONSUMER of what was measured, and a domain that could
+         write it would be able to move this node's own idea of time — every
+         retransmission deadline and every reaping deadline of the transport on
+         its port, and one day every certificate's validity window (CONCEPT §7.2)
+         — from the domain that answers the management-plane attacker.
+
+         WHAT STAYS WITHHELD: every other domain. The forwarder, the configuration
+         domain, the three drivers and the console map no part of it, in either
+         direction. None of them states a time and none reads one, so a mapping
+         would be authority with no use (ENG-1) — and the console in particular
+         must not be able to rewrite the frequency it is printing.
+
+         WHY THE MANAGEMENT DOMAIN READS A REGION RATHER THAN ASKING. There is no
+         IPC for a timestamp: that domain reads `RDTSC` itself, which is one
+         unprivileged instruction, and converts it with the triple published here.
+         A channel to the clock domain would put a round trip on the path of every
+         frame and would give this domain a wakeup capability on a domain that
+         runs once and parks. What that costs is stated at pds/management: with no
+         channel, a republished calibration is picked up on the next frame.
+
+         Size is `wire::CLOCK_CALIBRATION_REGION_SIZE`, its type's `size_of`
+         rounded up to the mapping granularity, on the same footing as every
+         constant above and held to it the same way — `xtask::sysdesc` carries a
+         rule for this region and compares it. `ClockCalibration` is 32 bytes, so
+         it rounds to one page.
+
+         No phys_addr, for the reason the address-map block above gives for `cfg`:
+         no device DMAs into it, so no domain needs its physical address, and an
+         unplaced region is allocated from general-purpose untyped memory — which
+         is precisely the retyping seL4 zeroes, so `attach_region!`'s
+         zero-initialisation precondition holds by construction. A zeroed region
+         is generation zero, which `load` refuses, so a management domain that
+         comes up before the clock domain has published reads "no calibration"
+         rather than a triple of zeroes. -->
+    <memory_region name="clock" size="0x1000" />
+
     <!-- The log transport: one ring per WRITING domain, and TWO REGIONS PER
          RING, one for each direction.
 
@@ -498,19 +555,34 @@
          It maps NO pool, NO dataplane ring, NO configuration region, NO ECAM
          page and NO BAR window, so a compromised clock reaches no frame, no NIC
          and no configuration — the shape of isolation the configuration and
-         console domains already have, in a third direction. -->
+         console domains already have, in a third direction. What it DOES map, and
+         the only region it shares with anybody, is `clock` (read-write): the
+         calibration it publishes, read by the management domain alone. See the
+         note beside that region. -->
     <protection_domain name="clock" priority="3" stack_size="0x4000">
         <program_image path="clock.elf" />
         <ioport id="0" addr="0x70" size="2" />
         <map mr="hpet" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="hpet_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="rw" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_clock" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
     <!-- The management domain: the ADDRESSED endpoint of the management port. It
-         answers ARP requests for its own address and ICMP echo requests to it,
-         counts what the port receives, and forwards nothing — nothing in this
-         description gives it the means to.
+         answers ARP requests for its own address, ICMP echo requests to it, and
+         TCP connections to its one listening port; it counts what the port
+         receives, and forwards nothing — nothing in this description gives it the
+         means to.
+
+         IT NOW READS TWO INSTRUCTIONS AND STILL HOLDS NO CAPABILITY FOR EITHER.
+         `RDTSC` once per wakeup, for the instant its transport's timers are
+         stated against, and `RDRAND` once at start-up, for the secret those
+         connections\' initial sequence numbers are derived from (RFC 6528). Both
+         are unprivileged instructions rather than capabilities — no `<ioport>`,
+         no `<irq>`, no mapping — so nothing in this file grants or could withhold
+         them, and a part with no `RDRAND` refuses this domain rather than
+         answering it with a predictable sequence number. That refusal is a
+         console record, and pds/management is where the argument lives.
 
          =================================================================
          WHY THIS DOMAIN IS THE RETURNER ON ONE PIPELINE AND THE OWNER ON
@@ -563,6 +635,12 @@
              document (CONCEPT §12.3). Read-only because a domain that could
              write it would rewrite the addressing it is about to be judged by,
              and because the publisher must be able to read back what it wrote.
+           * clock (READ-ONLY) — what a counter reading means. Every timer of the
+             transport on this port is stated against an instant, and an instant
+             is a `RDTSC` reading converted by the triple the clock domain
+             published. Read-only because a domain that could write it would move
+             this node's own idea of time from the one domain that answers the
+             management-plane attacker; see the note beside that region.
 
          WHAT STAYS WITHHELD, and it is the whole of the isolation CONCEPT §9.1
          asks for: NO dataplane region of any kind — not a pool, not a
@@ -602,6 +680,7 @@
         <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_free_vaddr" />
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_pool_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>

@@ -36,17 +36,40 @@
 //!   reply byte for byte: an endpoint holds three configured values and no state
 //!   an adversary can move.
 
-use lfw_ip_endpoint::{Endpoint, Malformed, Outcome, Unhandled};
+use lfw_clock::{Calibration, Monotonic, Ticks};
+use lfw_ip_endpoint::{Endpoint, IsnSecret, Malformed, Outcome, Unhandled};
 use net_headers::{
-    ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Packet,
-    MIN_ECHO_REPLY_LEN, MacAddress,
+    ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Frame,
+    Ipv4Packet, MIN_ECHO_REPLY_LEN, MacAddress, Protocol,
 };
+use std::num::NonZeroU64;
+
+/// The shortest frame this endpoint composes: an ARP reply's 42 bytes, still
+/// below the 54 a bare TCP segment takes behind its two headers. It is what a
+/// reply's length is held above, and the assertion is what keeps the bound a real
+/// one as the endpoint gains protocols.
+const MIN_REPLY_LEN: usize = ARP_FRAME_LEN;
+
+const _: () = assert!(MIN_REPLY_LEN <= Ipv4Frame::PAYLOAD_AT + 20);
 
 /// The management port's own addressing, as `systems/qemu-x86_64/configuration.xml`
 /// gives it: a verdict here is one the appliance would reach.
 const OUR_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
 const OUR_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 15]);
 const PREFIX_LENGTH: u8 = 24;
+
+/// The per-boot secret the transport's initial sequence numbers are derived from.
+/// Fixed here because this harness is about the endpoint's *framing* decisions:
+/// the transport's own surface, the secret included, is
+/// [`crate::tcp`](crate::tcp)'s.
+const SECRET: [u8; 16] = [0x5a; 16];
+
+/// The instant every frame here arrives at. One reading, because nothing this
+/// harness asserts is about a timer: `crate::tcp` is what drives those.
+fn now() -> Monotonic {
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(1_000_000))
+}
 
 /// Storage the caller hands the endpoint to compose into, and the byte it is
 /// filled with so a reply's own bytes are distinguishable from untouched ones.
@@ -56,10 +79,15 @@ const UNTOUCHED: u8 = 0xa5;
 /// Hand one frame to an addressed endpoint and hold both the reply and the
 /// counters to everything the crate promises of them.
 pub fn ip_endpoint_harness(data: &[u8]) {
-    let mut endpoint =
-        Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX_LENGTH).expect("a unicast pair on a /24");
+    let mut endpoint = Endpoint::new(
+        OUR_MAC,
+        OUR_ADDRESS,
+        PREFIX_LENGTH,
+        IsnSecret::from_bytes(SECRET),
+    )
+    .expect("a unicast pair on a /24");
     let mut out = [UNTOUCHED; REPLY_CAPACITY];
-    let outcome = endpoint.handle(data, &mut out);
+    let outcome = endpoint.handle(Some(now()), data, &mut out);
 
     // One frame, one recorded outcome: the counters are what a scrape reads, so a
     // path that answered without recording would be invisible.
@@ -77,8 +105,11 @@ pub fn ip_endpoint_harness(data: &[u8]) {
         return;
     };
 
-    assert!(len <= REPLY_CAPACITY, "a reply overran the caller's storage");
-    assert!(len >= ARP_FRAME_LEN, "a reply shorter than any frame");
+    assert!(
+        len <= REPLY_CAPACITY,
+        "a reply overran the caller's storage"
+    );
+    assert!(len >= MIN_REPLY_LEN, "a reply shorter than any frame");
     assert!(
         out[len..].iter().all(|byte| *byte == UNTOUCHED),
         "a reply wrote past the length it reported"
@@ -114,7 +145,9 @@ pub fn ip_endpoint_harness(data: &[u8]) {
             assert_eq!(reply.target_mac, request.sender_mac);
             assert_eq!(reply.target_address, request.sender_address);
             assert!(
-                request.sender_address.shares_prefix(OUR_ADDRESS, PREFIX_LENGTH),
+                request
+                    .sender_address
+                    .shares_prefix(OUR_ADDRESS, PREFIX_LENGTH),
                 "a station off the link was answered"
             );
             assert_eq!(endpoint.counters().arp_replies, 1);
@@ -137,13 +170,34 @@ pub fn ip_endpoint_harness(data: &[u8]) {
             assert_eq!(echoed[2..], asked[2..], "the echo was not repeated");
             assert_eq!(endpoint.counters().echo_replies, 1);
         }
+        // A segment the transport composed: framed as this endpoint, addressed to
+        // the station that sent it, and carrying TCP. Everything *inside* it is
+        // `crate::tcp`'s surface, driven there over whole operation streams
+        // rather than one frame at a time.
+        Outcome::Tcp { .. } => {
+            assert_eq!(sent.header.ether_type, EtherType::IPV4);
+            let packet = Ipv4Packet::parse(sent.payload).expect("a datagram re-parses");
+            assert_eq!(packet.header().source, OUR_ADDRESS);
+            assert_eq!(packet.header().protocol, Protocol::TCP);
+            assert_eq!(endpoint.counters().tcp_segments, 1);
+        }
         other => panic!("{other:?} carried a reply"),
     }
 
-    // Nothing is carried between frames: the same bytes twice compose the same
-    // reply, and the counters advance by exactly one more.
+    if matches!(outcome, Outcome::Tcp { .. }) {
+        // A transport *is* state: the same segment twice is a retransmission, and
+        // the second answer is legitimately different from the first. Held to
+        // nothing more here, and to a great deal in `crate::tcp`.
+        return;
+    }
+
+    // Nothing about ARP or ICMP is carried between frames: the same bytes twice
+    // compose the same reply, and the counters advance by exactly one more. A TCP
+    // segment is deliberately not held to this — a transport *is* state, and
+    // `crate::tcp` is where that is driven — so the outcome above having been a
+    // reply means it was one of the two stateless kinds.
     let mut again = [UNTOUCHED; REPLY_CAPACITY];
-    let second = endpoint.handle(data, &mut again);
+    let second = endpoint.handle(Some(now()), data, &mut again);
     assert_eq!(second, outcome);
     assert_eq!(again[..len], out[..len]);
     assert_eq!(endpoint.counters().total(), 2);
@@ -202,8 +256,7 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
                 // endpoint's.
                 match ethernet.header.ether_type {
                     EtherType::ARP => {
-                        let request =
-                            ArpPacket::parse(ethernet.payload).expect("a parsed request");
+                        let request = ArpPacket::parse(ethernet.payload).expect("a parsed request");
                         assert_ne!(request.target_address, OUR_ADDRESS);
                     }
                     EtherType::IPV4 => {
@@ -232,6 +285,15 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
         // the counters attribute; there is nothing to re-derive from the bytes
         // that would not restate the endpoint's own decision.
         Outcome::Unhandled(_) | Outcome::ReplyRefused(_) => {}
+        // A segment the transport answered nothing for, and one that arrived with
+        // no clock. Both are ordinary and neither has a framing decision to
+        // re-derive: what the transport made of the bytes is `crate::tcp`'s
+        // surface, and this harness always supplies a clock.
+        Outcome::Tcp { .. } => {
+            let ethernet = Ethernet::parse(data).expect("a segment needs a header");
+            assert_eq!(ethernet.header.ether_type, EtherType::IPV4);
+        }
+        Outcome::Unclocked => panic!("a clock was supplied"),
         Outcome::ArpReply { .. } | Outcome::EchoReply { .. } => {
             panic!("a reply outcome reported no reply")
         }

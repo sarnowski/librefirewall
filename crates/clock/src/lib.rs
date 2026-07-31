@@ -42,11 +42,10 @@
 //! and narrowed once, at the end.
 //!
 //! Two cheaper shapes were rejected. Dividing first (`ticks / tsc_hz *
-//! 1_000_000_000`) stays in `u64` and discards every sub-second digit, which is
-//! the only part of a timestamp a reader compares. A precomputed fixed-point
-//! reciprocal would remove the division, and would add an error budget to prove
-//! — worth it on a dataplane path, and this is not one: a conversion happens
-//! when a record is rendered, not when a frame is forwarded.
+//! 1_000_000_000`) stays in `u64` and discards every sub-second digit, the only
+//! part of a timestamp a reader compares. A precomputed fixed-point reciprocal
+//! would remove the division and add an error budget to prove — worth it on a
+//! dataplane path, and this is not one.
 //!
 //! Floating point is not used at all. A protection domain would have to
 //! establish FPU state to reach it, and a rounded conversion has no exact
@@ -182,6 +181,24 @@ impl Monotonic {
     #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0 / NANOS_PER_MILLISECOND
+    }
+
+    /// The instant `span` after this one, saturating in [`Duration::from_millis`]'s
+    /// direction: a wrap would turn the furthest future instant into one already
+    /// past, which for a deadline is the difference between waiting and firing at
+    /// once. It exists so a deadline needs no way to build a [`Monotonic`] from an
+    /// integer, which would give up the guarantee the crate header states.
+    #[must_use]
+    pub const fn saturating_add(self, span: Duration) -> Self {
+        Self(self.0.saturating_add(span.as_nanos()))
+    }
+
+    /// How long after `earlier` this instant is, saturating at zero for
+    /// [`Calibration::monotonic`]'s reason: a reading behind an earlier one is a
+    /// counter that moved backwards, and no elapsed time answers it.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Duration {
+        Duration(self.0.saturating_sub(earlier.0))
     }
 }
 
@@ -846,6 +863,33 @@ mod tests {
         assert_eq!(clock.monotonic(Ticks(0)).as_nanos(), 0);
         assert_eq!(clock.monotonic(Ticks(4_999)).as_nanos(), 0);
         assert_eq!(clock.utc(Ticks(0)).as_nanos(), clock.boot_unix_nanos());
+    }
+
+    /// The two operations a deadline is computed with. They exist so that a
+    /// caller holding timeouts never needs a way to build a `Monotonic` from an
+    /// integer, which is what keeps the type's guarantee intact.
+    #[test]
+    fn an_instant_advances_by_a_span_and_measures_back_to_it() {
+        let clock = calibration(ONE_GHZ, 0, 0);
+        let start = clock.monotonic(Ticks(1_000));
+        let later = start.saturating_add(Duration::from_micros(3));
+        assert_eq!(later.as_nanos(), 4_000);
+        assert_eq!(later.since(start), Duration::from_micros(3));
+        // Backwards is no elapsed time rather than an enormous span.
+        assert_eq!(start.since(later), Duration::from_nanos(0));
+        assert_eq!(start.since(start), Duration::from_nanos(0));
+    }
+
+    #[test]
+    fn advancing_an_instant_saturates_rather_than_wrapping() {
+        let clock = calibration(ONE_GHZ, 0, 0);
+        let far = clock.monotonic(Ticks(u64::MAX));
+        assert_eq!(far.as_nanos(), u64::MAX);
+        assert_eq!(
+            far.saturating_add(Duration::from_millis(1)).as_nanos(),
+            u64::MAX
+        );
+        assert_eq!(far.since(clock.monotonic(Ticks(0))).as_nanos(), u64::MAX);
     }
 
     #[test]

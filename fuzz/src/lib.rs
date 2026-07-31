@@ -12,6 +12,7 @@
 //! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
 //! | [`ip_endpoint`] | `lfw_ip_endpoint`'s ARP and ICMP-echo answers, and the `net_headers` parsers and builders under them | untrusted network traffic **and** a management-plane attacker |
+//! | [`tcp`] | `lfw_tcp`'s segment parser, its option area and the state machine over them, driven as a stack | untrusted network traffic **and** a management-plane attacker |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
@@ -126,9 +127,9 @@
 pub mod document;
 pub mod driver;
 pub mod frame;
-pub mod ip_endpoint;
 pub mod free_list;
 pub mod handover;
+pub mod ip_endpoint;
 pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
@@ -136,6 +137,7 @@ pub mod pipeline;
 pub mod region;
 pub mod ring_abi;
 pub mod spsc_ring;
+pub mod tcp;
 pub mod virtio_pci;
 pub mod virtqueue;
 
@@ -221,6 +223,7 @@ mod tests {
         ("free_list_ownership", crate::free_list::free_list_harness),
         ("route_frame", crate::frame::frame_routing_harness),
         ("ip_endpoint", crate::ip_endpoint::ip_endpoint_harness),
+        ("tcp_segments", crate::tcp::tcp_segments_harness),
         ("config_document", crate::document::document_harness),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),

@@ -17,6 +17,21 @@ const FRAME_LEN: u32 = 64;
 /// would accept too.
 const PORTS: u8 = 2;
 
+/// The per-boot secret the transport's initial sequence numbers are derived
+/// from. Fixed here so a fixture is deterministic; the protection domain obtains
+/// one from `RDRAND`.
+const SECRET: [u8; 16] = [
+    0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
+];
+
+/// A counter reading every pass is made at. The fixture's frames are ARP and
+/// ICMP, which need no time at all, so one reading is enough for every test that
+/// does not set out to exercise the clock.
+const NOW: Ticks = Ticks(1_000_000);
+
+/// A plausible counter frequency, and the triple a clock domain publishes.
+const TSC_HZ: u64 = 2_500_000_000;
+
 /// The management port's own addressing, as the fixture's documents give it.
 const OUR_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
 const OUR_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 15]);
@@ -44,6 +59,8 @@ struct Fixture {
     handover: &'static ConfigHandover,
     /// Kept so a test can forge the shared cursors a driver owns.
     receive: &'static ForwardRings,
+    /// The calibration region, written by the clock domain.
+    clock: &'static ClockCalibration,
     stage: EndpointStage<'static>,
 }
 
@@ -67,14 +84,18 @@ impl Fixture {
             tx_pool: transmit_pool,
             handover,
             receive,
-            stage: EndpointStage::attach(EndpointRegions {
-                receive,
-                receive_returns,
-                receive_pool,
-                transmit,
-                transmit_returns,
-                transmit_pool,
-            }),
+            stage: EndpointStage::attach(
+                EndpointRegions {
+                    receive,
+                    receive_returns,
+                    receive_pool,
+                    transmit,
+                    transmit_returns,
+                    transmit_pool,
+                },
+                IsnSecret::from_bytes(SECRET),
+            ),
+            clock: Box::leak(Box::new(ClockCalibration::zero())),
         }
     }
 
@@ -284,7 +305,7 @@ fn a_fresh_stage_has_seen_nothing_and_an_empty_pipeline_leaves_it_that_way() {
         EndpointStageCounters::default()
     );
     assert!(unaddressed.stage.endpoint().is_none());
-    assert_eq!(unaddressed.stage.poll(), 0);
+    assert_eq!(unaddressed.stage.poll(NOW), 0);
     assert_eq!(
         unaddressed.stage.counters(),
         EndpointStageCounters::default()
@@ -292,7 +313,7 @@ fn a_fresh_stage_has_seen_nothing_and_an_empty_pipeline_leaves_it_that_way() {
 
     let mut fixture = Fixture::new();
     assert_eq!(fixture.stage.counters(), addressed());
-    assert_eq!(fixture.stage.poll(), 0);
+    assert_eq!(fixture.stage.poll(NOW), 0);
     assert_eq!(fixture.stage.counters(), addressed());
     assert_eq!(
         fixture.stage.endpoint().expect("addressed").address(),
@@ -312,7 +333,7 @@ fn a_received_frame_is_counted_and_its_buffer_returned_to_the_owner() {
         .expect("the pool starts full");
     assert_eq!(fixture.owner.owned(), full - 1, "the buffer is lent");
 
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(
         fixture.stage.counters(),
         EndpointStageCounters {
@@ -339,7 +360,7 @@ fn an_arp_request_for_this_port_is_answered_on_the_transmit_pipeline() {
         .receive(&arp_request(OUR_ADDRESS))
         .expect("the pool starts full");
 
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     let counters = fixture.stage.counters();
     assert_eq!(counters.frames, 1);
     assert_eq!(counters.replies_sent, 1);
@@ -382,7 +403,7 @@ fn an_echo_request_for_this_port_is_answered_with_a_well_formed_datagram() {
     fixture
         .receive(&echo_request(OUR_ADDRESS, b"payload-0123456789"))
         .expect("the pool starts full");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(fixture.stage.counters().replies_sent, 1);
 
     let frames = fixture.transmitted();
@@ -408,7 +429,7 @@ fn a_frame_this_port_does_not_answer_leaves_the_transmit_pipeline_untouched() {
     for frame in [arp_request(elsewhere), echo_request(elsewhere, b"x")] {
         fixture.receive(&frame).expect("a buffer is free");
     }
-    assert_eq!(fixture.stage.poll(), 2);
+    assert_eq!(fixture.stage.poll(NOW), 2);
 
     let counters = fixture.stage.counters();
     assert_eq!(counters.frames, 2);
@@ -436,7 +457,7 @@ fn an_unaddressed_port_counts_and_returns_without_answering() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("the pool starts full");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
 
     let counters = fixture.stage.counters();
     assert_eq!(counters.frames, 1);
@@ -456,7 +477,7 @@ fn an_unaddressed_port_counts_and_returns_without_answering() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer is free");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(fixture.stage.counters().replies_sent, 1);
 }
 
@@ -477,14 +498,14 @@ fn a_second_generation_moves_the_address_the_port_answers_at() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer is free");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert!(
         fixture.transmitted().is_empty(),
         "the old address is somebody else's now"
     );
 
     fixture.receive(&arp_request(moved)).expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     let frames = fixture.transmitted();
     assert_eq!(frames.len(), 1);
     let ethernet = Ethernet::parse(&frames[0]).expect("a frame");
@@ -511,7 +532,7 @@ fn a_refused_generation_leaves_the_port_answering_as_before() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(fixture.stage.counters().replies_sent, 1);
 
     // One commit, one outcome, however often it is asked for.
@@ -535,7 +556,7 @@ fn a_disabled_management_interface_stops_the_port_answering() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(fixture.stage.counters().unaddressed, 1);
     assert!(fixture.transmitted().is_empty());
 }
@@ -551,7 +572,7 @@ fn a_transmit_pool_with_nothing_coming_back_loses_replies_and_says_so() {
         fixture
             .receive(&arp_request(OUR_ADDRESS))
             .expect("a buffer");
-        assert_eq!(fixture.stage.poll(), 1);
+        assert_eq!(fixture.stage.poll(NOW), 1);
         assert_eq!(fixture.owner.reclaim(), 1);
     }
     let counters = fixture.stage.counters();
@@ -562,7 +583,7 @@ fn a_transmit_pool_with_nothing_coming_back_loses_replies_and_says_so() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     let counters = fixture.stage.counters();
     assert_eq!(counters.reply_pool_exhausted, 1);
     assert_eq!(counters.replies_sent, POOL_BUFFERS as u64);
@@ -577,7 +598,7 @@ fn a_transmit_pool_with_nothing_coming_back_loses_replies_and_says_so() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(
         fixture.stage.counters().replies_sent,
         POOL_BUFFERS as u64 + 1
@@ -593,7 +614,7 @@ fn a_forged_return_on_the_reply_pipeline_is_refused_by_this_domains_ledger() {
     fixture
         .receive(&arp_request(OUR_ADDRESS))
         .expect("a buffer");
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
 
     // The reply's own descriptor, returned twice: the first is the return the
     // driver owes, the second is the forgery. Only one buffer was lent, so the
@@ -607,7 +628,7 @@ fn a_forged_return_on_the_reply_pipeline_is_refused_by_this_domains_ledger() {
             .try_enqueue(descriptor)
             .expect("the ring is sized above the pool");
     }
-    fixture.stage.poll();
+    fixture.stage.poll(NOW);
     assert_eq!(fixture.stage.transmit_pool_counters().reclaim_not_lent, 1);
 
     // And an index this domain has never lent at all, which is what a forged
@@ -621,7 +642,7 @@ fn a_forged_return_on_the_reply_pipeline_is_refused_by_this_domains_ledger() {
             Verdict::Transmit,
         ))
         .expect("the ring is sized above the pool");
-    fixture.stage.poll();
+    fixture.stage.poll(NOW);
     assert_eq!(fixture.stage.transmit_pool_counters().reclaim_not_lent, 2);
 }
 
@@ -636,7 +657,7 @@ fn a_pool_sized_run_never_runs_the_owner_out_of_buffers() {
         fixture
             .receive_opaque(FRAME_LEN)
             .expect("a buffer is always free");
-        assert_eq!(fixture.stage.poll(), 1);
+        assert_eq!(fixture.stage.poll(NOW), 1);
         assert_eq!(fixture.owner.reclaim(), 1);
     }
     assert_eq!(fixture.owner.owned(), full);
@@ -660,7 +681,7 @@ fn the_byte_total_is_the_sum_of_the_lengths_the_driver_published() {
     for len in lengths {
         fixture.receive_opaque(len).expect("the pool holds six");
     }
-    assert_eq!(fixture.stage.poll(), lengths.len());
+    assert_eq!(fixture.stage.poll(NOW), lengths.len());
     let counters = fixture.stage.counters();
     assert_eq!(counters.frames, lengths.len() as u64);
     assert_eq!(
@@ -680,7 +701,7 @@ fn a_pass_that_moved_only_malformed_descriptors_counts_no_frame_and_no_byte() {
     for descriptor in &malformed {
         assert!(fixture.publish_raw(*descriptor));
     }
-    assert_eq!(fixture.stage.poll(), 0);
+    assert_eq!(fixture.stage.poll(NOW), 0);
     let counters = fixture.stage.counters();
     assert_eq!(counters.frames, 0);
     assert_eq!(counters.bytes, 0, "no unbelievable span reaches the total");
@@ -700,7 +721,7 @@ fn a_malformed_descriptor_is_still_returned_and_the_owner_judges_its_index() {
         1,
         Verdict::Transmit,
     )));
-    assert_eq!(fixture.stage.poll(), 0);
+    assert_eq!(fixture.stage.poll(NOW), 0);
     assert_eq!(fixture.stage.counters().malformed_descriptor, 1);
 
     assert_eq!(fixture.owner.reclaim(), 0);
@@ -721,7 +742,7 @@ fn a_lent_buffer_with_an_unbelievable_span_is_recovered_and_its_length_ignored()
     // The driver's own descriptor is dropped unread, and a second one naming
     // the same lent index with a span off the end of the buffer takes its place
     // — which is exactly the edit a byzantine driver makes in the shared ring.
-    let _ = fixture.stage.poll();
+    let _ = fixture.stage.poll(NOW);
     assert_eq!(fixture.owner.reclaim(), 1);
     assert_eq!(fixture.owner.owned(), full);
 
@@ -736,7 +757,7 @@ fn a_lent_buffer_with_an_unbelievable_span_is_recovered_and_its_length_ignored()
     // one. The stage counts one frame and one malformed span, and produces two
     // returns — of which the owner accepts exactly one, the second naming a
     // buffer it no longer has lent.
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     assert_eq!(fixture.stage.counters().malformed_descriptor, 1);
     assert_eq!(fixture.owner.reclaim(), 1);
     assert_eq!(fixture.owner.counters().reclaim_not_lent, 1);
@@ -767,7 +788,7 @@ fn a_full_return_ring_stops_the_drain_and_is_counted() {
     while fixture.publish_raw(frame(published)) {
         published += 1;
     }
-    assert_eq!(fixture.stage.poll(), published as usize);
+    assert_eq!(fixture.stage.poll(NOW), published as usize);
     assert_eq!(fixture.stage.counters().return_ring_full, 0);
 
     // Two more frames arrive and neither buffer has anywhere to go. The first
@@ -779,7 +800,7 @@ fn a_full_return_ring_stops_the_drain_and_is_counted() {
             "the ingress ring was just drained"
         );
     }
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     let counters = fixture.stage.counters();
     assert_eq!(counters.return_ring_full, 1);
     assert_eq!(counters.frames, u64::from(published) + 1);
@@ -789,11 +810,15 @@ fn a_full_return_ring_stops_the_drain_and_is_counted() {
     // second frame is still on the ingress ring when the next one runs. It is
     // counted then and stranded in its turn, one at a time, for as long as the
     // owner stays stalled — never a whole ring's worth at once.
-    assert_eq!(fixture.stage.poll(), 1);
+    assert_eq!(fixture.stage.poll(NOW), 1);
     let counters = fixture.stage.counters();
     assert_eq!(counters.return_ring_full, 2);
     assert_eq!(counters.frames, u64::from(published) + 2);
-    assert_eq!(fixture.stage.poll(), 0, "and now the ingress ring is empty");
+    assert_eq!(
+        fixture.stage.poll(NOW),
+        0,
+        "and now the ingress ring is empty"
+    );
 }
 
 /// Descriptors a byzantine driver can publish that name no span inside a pool
@@ -856,7 +881,7 @@ proptest! {
                 len,
                 verdict,
             });
-            let frames = fixture.stage.poll();
+            let frames = fixture.stage.poll(NOW);
             let counters = fixture.stage.counters();
 
             prop_assert!(frames <= DRAIN_LIMIT);
@@ -894,7 +919,228 @@ proptest! {
 
         for (head, tail) in forged {
             fixture.forge_receive_cursors(head, tail);
-            prop_assert!(fixture.stage.poll() <= DRAIN_LIMIT);
+            prop_assert!(fixture.stage.poll(NOW) <= DRAIN_LIMIT);
         }
     }
+}
+
+/// The calibration a clock domain publishes, and what this stage does with it.
+///
+/// The region is peer-written, so the frequency in it is judged rather than
+/// believed: a triple naming no counter any x86_64 part has is refused, and the
+/// refusal is a console record rather than a converted reading.
+#[test]
+fn a_published_calibration_is_taken_and_an_implausible_one_refused() {
+    let mut fixture = Fixture::new();
+    // A region nobody has published into: nothing new to report, and no
+    // calibration either.
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    assert_eq!(fixture.stage.monotonic(NOW), None);
+    assert_eq!(fixture.stage.counters().clocks_refused, 0);
+
+    fixture.clock.publish(&CalibrationImage {
+        tsc_hz: TSC_HZ,
+        boot_ticks: 0,
+        boot_unix_nanos: 1_785_443_220_000_000_000,
+    });
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    assert_eq!(fixture.stage.counters().clock_generation, 2);
+    // A reading converts: 1 000 000 ticks of a 2.5 GHz counter is 400 000 ns.
+    assert_eq!(
+        fixture
+            .stage
+            .monotonic(NOW)
+            .map(lfw_clock::Monotonic::as_nanos),
+        Some(400_000)
+    );
+
+    // The same generation is not re-read, which is what keeps a peer from moving
+    // this node's clock under a connection's timers on every frame.
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    assert_eq!(fixture.stage.counters().clocks_refused, 0);
+
+    // A counter that moved to a value with no whole triple behind it — a publish
+    // in progress, or one that wrapped back to zero after two billion of them.
+    // Reported and not remembered, so the next pass looks again; the region this
+    // stage already took stays in force.
+    let unpublished = ClockCalibration::zero();
+    assert_eq!(
+        fixture.stage.take_clock(&unpublished),
+        Some(CalibrationRefused::NotPublished)
+    );
+    assert_eq!(fixture.stage.counters().clocks_refused, 0);
+    assert_eq!(
+        fixture
+            .stage
+            .monotonic(NOW)
+            .map(lfw_clock::Monotonic::as_nanos),
+        Some(400_000)
+    );
+
+    // A republished triple no counter has is refused, once, and the calibration
+    // in force is left exactly as it was.
+    fixture.clock.publish(&CalibrationImage {
+        tsc_hz: 1,
+        boot_ticks: 0,
+        boot_unix_nanos: 0,
+    });
+    assert_eq!(
+        fixture.stage.take_clock(fixture.clock),
+        Some(CalibrationRefused::FrequencyImplausible { tsc_hz: 1 })
+    );
+    assert_eq!(fixture.stage.counters().clocks_refused, 1);
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    assert_eq!(fixture.stage.counters().clocks_refused, 1);
+    assert_eq!(
+        fixture
+            .stage
+            .monotonic(NOW)
+            .map(lfw_clock::Monotonic::as_nanos),
+        Some(400_000)
+    );
+}
+
+/// Every frequency the band refuses, and the two edges it admits.
+#[test]
+fn the_frequency_band_is_the_clock_crates_own() {
+    for tsc_hz in [0, 1, MIN_PLAUSIBLE_TSC_HZ - 1, MAX_PLAUSIBLE_TSC_HZ + 1] {
+        assert_eq!(
+            calibration_from(CalibrationImage {
+                tsc_hz,
+                boot_ticks: 0,
+                boot_unix_nanos: 0
+            }),
+            Err(CalibrationRefused::FrequencyImplausible { tsc_hz })
+        );
+    }
+    for tsc_hz in [MIN_PLAUSIBLE_TSC_HZ, TSC_HZ, MAX_PLAUSIBLE_TSC_HZ] {
+        let calibration = calibration_from(CalibrationImage {
+            tsc_hz,
+            boot_ticks: 7,
+            boot_unix_nanos: 9,
+        })
+        .expect("a plausible frequency");
+        assert_eq!(calibration.tsc_hz().get(), tsc_hz);
+        assert_eq!(calibration.boot_ticks(), Ticks(7));
+        assert_eq!(calibration.boot_unix_nanos(), 9);
+    }
+}
+
+/// A TCP segment on a port with no clock is counted and answered by nothing,
+/// while ARP on the same port is answered as it always was: the transport needs
+/// time and the other two protocols do not.
+#[test]
+fn a_segment_before_the_clock_is_counted_and_arp_still_answered() {
+    let mut fixture = Fixture::new();
+    let segment = tcp_syn(40000);
+    fixture.receive(&segment).expect("a buffer");
+    fixture
+        .receive(&arp_request(OUR_ADDRESS))
+        .expect("a buffer");
+    assert_eq!(fixture.stage.poll(NOW), 2);
+
+    let endpoint = fixture.stage.endpoint().expect("an addressed port");
+    assert_eq!(endpoint.counters().unclocked, 1);
+    assert_eq!(endpoint.counters().arp_replies, 1);
+    assert_eq!(endpoint.counters().tcp_segments, 0);
+    // One frame left: the ARP reply.
+    assert_eq!(fixture.transmitted().len(), 1);
+}
+
+/// A handshake across the pipeline, and the transport's own timer re-sending the
+/// `SYN-ACK` on a later pass. That second frame is the one no received frame
+/// asked for, and it is what proves the timers are driven at all.
+#[test]
+fn a_handshake_crosses_the_pipeline_and_its_timer_re_sends() {
+    let mut fixture = Fixture::new();
+    fixture.clock.publish(&CalibrationImage {
+        tsc_hz: TSC_HZ,
+        boot_ticks: 0,
+        boot_unix_nanos: 0,
+    });
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+
+    fixture.receive(&tcp_syn(40000)).expect("a buffer");
+    assert_eq!(fixture.stage.poll(NOW), 1);
+    let frames = fixture.transmitted();
+    assert_eq!(frames.len(), 1, "a SYN-ACK did not leave");
+    let first = tcp_flags(&frames[0]);
+    assert_eq!(first & 0x12, 0x12, "the answer was not a SYN-ACK");
+
+    let endpoint = fixture.stage.endpoint().expect("an addressed port");
+    assert_eq!(endpoint.counters().tcp_segments, 1);
+    assert_eq!(endpoint.tcp_counters().connections_accepted, 1);
+    assert_eq!(fixture.stage.counters().timer_segments, 0);
+
+    // A pass a whole retransmission timeout later, with no frame at all: the
+    // timer is what produces the segment.
+    let later = Ticks(NOW.0 + TSC_HZ * 2);
+    assert_eq!(fixture.stage.poll(later), 0);
+    assert!(fixture.stage.counters().timer_segments >= 1);
+    let frames = fixture.transmitted();
+    assert!(!frames.is_empty(), "the timer sent nothing");
+    assert_eq!(tcp_flags(&frames[0]) & 0x12, 0x12);
+}
+
+/// A `SYN` for the management port, framed the way a station puts one on the wire.
+fn tcp_syn(port: u16) -> Vec<u8> {
+    let mut out = vec![0u8; 128];
+    let len = lfw_ip_endpoint::Outgoing {
+        source_port: port,
+        destination_port: lfw_ip_endpoint::MANAGEMENT_PORT,
+        sequence: lfw_ip_endpoint::SeqNumber::new(0x1234),
+        acknowledgement: lfw_ip_endpoint::SeqNumber::new(0),
+        flags: lfw_ip_endpoint::Flags::SYN,
+        window: 4096,
+        mss: Some(1024),
+        window_scale: None,
+        payload: &[],
+    }
+    .write(
+        STATION_ADDRESS,
+        OUR_ADDRESS,
+        out.get_mut(net_headers::Ipv4Frame::PAYLOAD_AT..)
+            .expect("room"),
+    )
+    .expect("room for a segment");
+    let total = net_headers::Ipv4Frame {
+        destination_mac: OUR_MAC,
+        source_mac: STATION_MAC,
+        source: STATION_ADDRESS,
+        destination: OUR_ADDRESS,
+        protocol: net_headers::Protocol::TCP,
+    }
+    .write(&mut out, len)
+    .expect("room for a frame");
+    out.truncate(total);
+    out
+}
+
+/// The control bits of the segment inside a frame the stage sent.
+fn tcp_flags(frame: &[u8]) -> u8 {
+    let ethernet = Ethernet::parse(frame).expect("a frame");
+    let packet = Ipv4Packet::parse(ethernet.payload).expect("a datagram");
+    assert_eq!(packet.header().protocol, net_headers::Protocol::TCP);
+    packet.payload().get(13).copied().expect("a TCP header")
+}
+
+/// A clock and no address: the timers are driven and there is no transport to
+/// drive, which is the ordinary state of a node between the clock domain's publish
+/// and the configuration domain's first commit.
+#[test]
+fn a_clocked_but_unaddressed_port_drives_no_timers() {
+    let mut fixture = Fixture::unaddressed();
+    fixture.clock.publish(&CalibrationImage {
+        tsc_hz: TSC_HZ,
+        boot_ticks: 0,
+        boot_unix_nanos: 0,
+    });
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    assert!(fixture.stage.monotonic(NOW).is_some());
+
+    fixture.receive(&tcp_syn(40000)).expect("a buffer");
+    assert_eq!(fixture.stage.poll(NOW), 1);
+    assert_eq!(fixture.stage.counters().unaddressed, 1);
+    assert_eq!(fixture.stage.counters().timer_segments, 0);
+    assert!(fixture.transmitted().is_empty());
 }

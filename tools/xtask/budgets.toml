@@ -16,7 +16,7 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
-"crates/clock/src/lib.rs" = 0.4183
+"crates/clock/src/lib.rs" = 0.4182
 "crates/config/src/diff.rs" = 0.1827
 "crates/config/src/hash.rs" = 0.2703
 "crates/config/src/lib.rs" = 0.5044
@@ -29,7 +29,8 @@
 "crates/config/src/value.rs" = 0.2615
 "crates/config/src/xml.rs" = 0.1947
 "crates/hpet/src/lib.rs" = 0.5613
-"crates/ip-endpoint/src/lib.rs" = 0.2837
+"crates/ip-endpoint/src/echo.rs" = 0.3242
+"crates/ip-endpoint/src/lib.rs" = 0.2836
 "crates/log/src/console.rs" = 0.5310
 "crates/log/src/detail.rs" = 0.4033
 "crates/log/src/event.rs" = 0.2017
@@ -38,34 +39,43 @@
 "crates/log/src/record.rs" = 0.1780
 "crates/log/src/render.rs" = 0.1543
 "crates/log/src/ring.rs" = 0.3721
-"crates/net-headers/src/lib.rs" = 0.1891
+"crates/net-headers/src/lib.rs" = 0.1887
 "crates/nic-driver-core/src/bringup.rs" = 0.3404
 "crates/nic-driver-core/src/lib.rs" = 0.4917
 "crates/nic-driver-core/src/port.rs" = 0.4575
 "crates/packet-buffer/src/lib.rs" = 0.4529
-"crates/pd-runtime/src/endpoint.rs" = 0.4823
-"crates/pd-runtime/src/handover.rs" = 0.3484
-"crates/pd-runtime/src/lib.rs" = 0.4939
+"crates/pd-runtime/src/endpoint.rs" = 0.4696
+"crates/pd-runtime/src/handover.rs" = 0.3427
+"crates/pd-runtime/src/lib.rs" = 0.4911
 "crates/queue/src/lib.rs" = 0.4260
 "crates/routing/src/lib.rs" = 0.2716
 "crates/rtc/src/lib.rs" = 0.5119
+"crates/tcp/src/connection.rs" = 0.3051
+"crates/tcp/src/counters.rs" = 0.5055
+"crates/tcp/src/isn.rs" = 0.3564
+"crates/tcp/src/lib.rs" = 0.2930
+"crates/tcp/src/rto.rs" = 0.4386
+"crates/tcp/src/segment.rs" = 0.2926
+"crates/tcp/src/seq.rs" = 0.3789
 "crates/uart-16550/src/lib.rs" = 0.5239
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
-"crates/wire/src/lib.rs" = 0.1816
+"crates/wire/src/clock.rs" = 0.5176
+"crates/wire/src/lib.rs" = 0.1813
 "crates/wire/src/log_record.rs" = 0.2207
 "crates/wire/src/log_ring.rs" = 0.4120
 "crates/wire/src/log_slot.rs" = 0.1169
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
-"pds/clock/src/main.rs" = 0.4253
+"pds/clock/src/main.rs" = 0.4247
 "pds/config/src/main.rs" = 0.4511
 "pds/console/src/com1.rs" = 0.6400
 "pds/console/src/main.rs" = 0.5409
 "pds/forwarder/src/main.rs" = 0.3878
-"pds/management/src/main.rs" = 0.5276
+"pds/management/src/entropy.rs" = 0.6489
+"pds/management/src/main.rs" = 0.5234
 "pds/nic-driver/src/main.rs" = 0.4675
 
 [unsafe-blocks]
@@ -81,6 +91,7 @@
 "crates/queue" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
+"crates/tcp" = 0
 "crates/uart-16550" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
@@ -88,7 +99,7 @@
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
-"pds/management" = 0
+"pds/management" = 2
 "pds/nic-driver" = 4
 
 [unsafe-fns]
@@ -104,6 +115,7 @@
 "crates/queue" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
+"crates/tcp" = 0
 "crates/uart-16550" = 0
 "crates/virtio" = 4
 "crates/wire" = 0
@@ -127,6 +139,7 @@
 "crates/queue" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
+"crates/tcp" = 0
 "crates/uart-16550" = 0
 "crates/virtio" = 0
 "crates/wire" = 0

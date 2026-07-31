@@ -70,12 +70,22 @@ const OVMF_VARS_CANDIDATES: &[&str] = &[
 const KVM_DEVICE: &str = "/dev/kvm";
 
 /// The guest CPU, pinned to one feature set for BOTH accelerators. seL4's
-/// x86_64 kernel needs these features present; naming them explicitly (rather
-/// than passing `host` under KVM) is what makes the boot the system test
+/// x86_64 kernel needs the first four features present; naming them explicitly
+/// (rather than passing `host` under KVM) is what makes the boot the system test
 /// asserts on identical on every runner, accelerated or not. Every feature here
 /// has been baseline on x86-64 since well before the hardware this project
 /// targets, so pinning them costs no KVM host compatibility.
-const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave";
+///
+/// `rdrand` is the appliance's requirement rather than the kernel's, and it is a
+/// *hard* one: the management domain derives its transport's initial sequence
+/// numbers from a per-boot secret it draws with `RDRAND` (RFC 6528), and refuses
+/// to start at all when `CPUID.01H:ECX[30]` is clear rather than answering a
+/// connection with a predictable number. QEMU's `qemu64` model does not expose it
+/// — which this gate discovered by the domain refusing on its first boot, exactly
+/// as it would on a part that lacked it — so the bench must, and any deployment
+/// target must too. It has been present on Intel parts since Ivy Bridge (2012)
+/// and on AMD since Excavator, so it costs no host compatibility either.
+const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand";
 
 /// How QEMU will execute the guest and, when hardware acceleration was not
 /// taken, why. Carrying the reason (rather than a bare flag) is the point: a CI
@@ -223,22 +233,71 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
         .filter(|scenario| matches!(scenario.console, Console::Judged))
         .count();
 
+    // What each boot chose for its one management connection, kept so the
+    // *unpredictability* of it can be judged across boots. RFC 6528 makes that a
+    // security property and no single boot can show it: a constant initial
+    // sequence number is an off-path injection primitive against exactly the
+    // party this port faces (CONCEPT §7.1), and it looks perfectly correct in one
+    // scenario.
+    let mut sequence_numbers: Vec<(&str, u32)> = Vec::new();
     for scenario in &scenarios {
-        if let Err(verdict) = run_scenario(root, scenario, Run::Shipping) {
-            return Err(diagnose::after_shipping_failure(
-                &format!("system scenario {}", scenario.name),
-                verdict,
-                &scenario_log(root, scenario, Run::Shipping),
-                &scenario_log(root, scenario, Run::Diagnostic),
-                || run_scenario(root, scenario, Run::Diagnostic),
+        match run_scenario(root, scenario, Run::Shipping) {
+            Ok(Some(isn)) => sequence_numbers.push((scenario.name, isn)),
+            Ok(None) => {}
+            Err(verdict) => {
+                return Err(diagnose::after_shipping_failure(
+                    &format!("system scenario {}", scenario.name),
+                    verdict,
+                    &scenario_log(root, scenario, Run::Shipping),
+                    &scenario_log(root, scenario, Run::Diagnostic),
+                    || run_scenario(root, scenario, Run::Diagnostic).map(|_| ()),
+                ));
+            }
+        }
+    }
+    let distinct = judge_sequence_numbers(&sequence_numbers)?;
+    Ok(format!(
+        "{} system scenarios on the {} kernel, {judged} of them judged against the \
+         configuration transcript, the clock record and the management port's count; {distinct}",
+        scenarios.len(),
+        Run::Shipping.config(),
+    ))
+}
+
+/// Hold the initial sequence numbers three boots chose to being *different*.
+///
+/// The two dataplane scenarios boot the same disk, so nothing but the per-boot
+/// `RDRAND` secret and the time component separates their numbers (RFC 6528): two
+/// equal ones mean one of the two is missing, which is the whole of what makes an
+/// initial sequence number unguessable. Every boot must have opened a connection,
+/// too — a run that opened none proves nothing and must not read as a pass.
+///
+/// # Errors
+/// The verdict, naming the numbers observed.
+pub(crate) fn judge_sequence_numbers(observed: &[(&str, u32)]) -> Result<String, String> {
+    if observed.is_empty() {
+        return Err(String::from(
+            "no scenario opened a TCP connection to the management port, so nothing was judged \
+             about the sequence numbers the appliance chooses. Every routed scenario opens one, so \
+             this means none of them reached the point where it could",
+        ));
+    }
+    for pair in observed.windows(2) {
+        if let [(first, earlier), (second, later)] = pair
+            && earlier == later
+        {
+            return Err(format!(
+                "scenarios {first} and {second} were both answered with initial sequence number \
+                 {earlier}. Nothing but the per-boot RDRAND secret and a monotonic time component \
+                 separates two boots of one disk (RFC 6528), so an equal pair means one of the two \
+                 is not reaching the generator — and a predictable initial sequence number lets an \
+                 off-path attacker inject into a connection it cannot see"
             ));
         }
     }
     Ok(format!(
-        "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript, the clock record and the management port's count",
-        scenarios.len(),
-        Run::Shipping.config(),
+        "{} distinct initial sequence numbers across the boots that opened a connection",
+        observed.len()
     ))
 }
 
@@ -276,7 +335,7 @@ fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, 
     }
 }
 
-fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String> {
+fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32>, String> {
     let name = scenario.name;
     let path = root.join(scenario.document);
     let document = fs::read(&path)
@@ -328,7 +387,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String
         booted.traffic.summary(),
         log.display()
     );
-    Ok(())
+    Ok(booted.management_tcp_isn)
 }
 
 /// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the

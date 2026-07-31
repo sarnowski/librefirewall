@@ -443,6 +443,8 @@ dependencies = [
 name = "lfw-ip-endpoint"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
+ "lfw-tcp",
  "net-headers",
  "proptest",
 ]
@@ -462,6 +464,15 @@ name = "lfw-rtc"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
+ "proptest",
+]
+
+[[package]]
+name = "lfw-tcp"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "net-headers",
  "proptest",
 ]
 
@@ -506,6 +517,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "management"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
  "lfw-log",
  "pd-runtime",
  "sel4-microkit",
@@ -606,6 +618,7 @@ name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "lfw-clock",
  "lfw-ip-endpoint",
  "lfw-log",
  "net-headers",

@@ -98,14 +98,14 @@ router on a firewall's substrate, not yet a firewall.
 | Virtual-wire (bump-in-the-wire) operation | **open** | CONCEPT §6.4 |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | CONCEPT §6.5 |
 | Flow classifier (cut-through vs. proxy path) | **open** | |
-| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **open** | |
+| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **open** | a connection on the management port carries a byte stream and echoes it; nothing parses one |
 | OT/industrial protocol inspection | **open** | |
 | DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
 | Mirror port | **open** | |
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
 | Isolated sign-only CA protection domain | **open** | |
-| Trusted time source | **partial** | a protection domain now establishes real time at boot and reports it; nothing about it is *trusted* — [detail](#trusted-time-source) |
+| Trusted time source | **partial** | a protection domain establishes real time at boot, reports it and now publishes it to the one domain that reads it; nothing about it is *trusted* — [detail](#trusted-time-source) |
 | Streaming DPI / signature matching | **open** | |
 | Full-object content scanning (YARA-X) | **open** | |
 | Web filtering | **open** | |
@@ -117,10 +117,10 @@ router on a firewall's substrate, not yet a firewall.
 | Zero-copy shared-memory dataplane | **partial** | [detail](#zero-copy-dataplane) |
 | First-party virtio-net driver | **partial** | [detail](#virtio-net-driver) |
 | Multicore dataplane, RSS, per-core flow shards | **open** | single vCPU today |
-| Proxy TCP stack (smoltcp, SACK) | **open** | |
+| Proxy TCP stack | **partial** | a first-party passive-open stack carries a real connection on the management port, and it is the stack the dataplane proxy will run on; no active open, no SACK, no congestion control, and no dataplane consumer — [detail](#proxy-tcp-stack) |
 | 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
 | IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
-| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists, is addressed, answers ARP and ICMP echo, and is isolated from the dataplane; no other role does — [detail](#full-port-role-model) |
+| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists, is addressed, answers ARP, ICMP echo and TCP, and is isolated from the dataplane; no other role does — [detail](#full-port-role-model) |
 | Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
 | ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
 | Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
@@ -531,7 +531,10 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 
 - **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
   no `ready`, no failure — so MONITORING.md's "each stage reporting healthy or the specific fault"
-  holds for the driver, configuration and clock domains and not for the one that carries traffic.
+  holds for the driver, configuration, clock and management domains and not for the one that carries
+  traffic. (The management domain gained a refusal path with its transport: it refuses to start at all
+  when the hardware will not produce a per-boot secret for its sequence numbers, and reports a
+  published calibration it will not use without refusing to run.)
 - **Nothing orders one domain's records against another's.** Within a domain they are totally
   ordered — one writer per ring, drained in the order it wrote them — and a `generation`/`seq` pair
   totally orders one commit's change records. Across domains there is no order at all: which ring is
@@ -555,25 +558,28 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 
 ### Full port role model
 
-**Done.** One of the four roles CONCEPT §9.1 names exists, and it is now an **addressed IPv4
-endpoint**: a **dedicated management port** that answers for itself, carries no forwarded traffic, and
-is isolated from the dataplane by a grant set. It is a third `virtio-net-pci` device at 00:04.0,
+**Done.** One of the four roles CONCEPT §9.1 names exists, and it is an **addressed IPv4 endpoint
+that terminates TCP connections**: a **dedicated management port** that answers for itself, carries no
+forwarded traffic, and is isolated from the dataplane by a grant set. It is a third `virtio-net-pci` device at 00:04.0,
 driven by a third instance of the same `nic-driver.elf` the two dataplane ports use — the binary
 turned out to be port-agnostic already, so the third port cost it no code change — and its frames end
 at a `management` protection domain.
 
-That domain answers two protocols and counts everything: an **ARP request** for its own address is
-answered with its own MAC, and an **ICMP echo request** to it is answered with a reply carrying the
-same identifier, sequence and payload and both checksums recomputed. Everything else is refused by
-name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it does
+That domain answers three protocols and counts everything: an **ARP request** for its own address is
+answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
+identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
+is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), which for this
+increment echoes the bytes it is sent. Everything else is refused by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it does
 not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
-The decision is two host-tested `no_std` crates. `crates/net-headers` gained ARP (IPv4 over Ethernet
+The decision is three host-tested `no_std` crates. `crates/net-headers` gained ARP (IPv4 over Ethernet
 only; any other hardware type, protocol type, address length or operation is a typed error) and ICMP
 echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
 and one checksum routine. `crates/ip-endpoint` is the endpoint state machine — the appliance answering
 *for itself*, as against `crates/routing`, which forwards for others — with zero `unsafe`, a closed
-`Outcome` vocabulary, and a counter per outcome. `pd_runtime::EndpointStage` joins it to the two
+`Outcome` vocabulary, and a counter per outcome; it now owns a `crates/tcp` stack and the echo
+application above it, and keeps the transport's advertised window equal to that application's free
+space. `pd_runtime::EndpointStage` joins it to the two
 pipelines: copy the frame out of the receive pool, decide, and where a reply was composed take a
 transmit buffer, write the reply into it and lend it to the driver.
 
@@ -584,8 +590,16 @@ validator holds to its own rules *and* to not colliding with any dataplane prefi
 handover image carries to the domain. QEMU takes that MAC for the guest NIC, and the harness derives
 its own station address from that prefix, so no address on the bench is written down twice.
 
+It also **reads two instructions and holds no capability for either**: `RDTSC` once per wakeup, for
+the instant its transport's timers are stated against, and `RDRAND` once at start-up, for the secret
+those connections' initial sequence numbers are derived from. Both are unprivileged, so nothing in
+the system description grants or could withhold them; a part with no `RDRAND` refuses the domain and
+names the cause on the console rather than answering a `SYN` with a predictable number. Those are the
+domain's only two `unsafe` blocks, each naming what guarantees it.
+
 The domain reads the **committed** generation only (`pd_runtime::CommittedReader`): it maps the
-configuration region read-only, maps the acknowledgement region **not at all**, and so cannot delay a
+configuration region read-only, the calibration region read-only, and the acknowledgement region
+**not at all**, and so cannot delay a
 commit, refuse one on anybody's behalf, or forge the acknowledgement that releases one. That is
 strictly weaker than the forwarder's role, which is the consumer of the two-phase commit. What it
 costs is stated where it lives: with no channel to the configuration domain, the port picks up its
@@ -607,25 +621,36 @@ and a pool-sized run proving every buffer comes back.
 
 The QEMU gate asserts all of it on the release image. Every system scenario injects six frames into
 the management port once the capture proves every port is up — four opaque frames of four different
-lengths, an ARP request and an ICMP echo request — and then requires:
+lengths, an ARP request and an ICMP echo request — then opens a TCP connection with a minimal
+deterministic client of its own, and then requires:
 
 - a **well-formed ARP reply** carrying the configured MAC, decoded and compared field by field;
 - a **well-formed ICMP echo reply** with matching identifier, sequence and payload and a valid
   checksum, likewise decoded rather than matched as bytes;
-- **exactly one of each**, since one request is one reply;
+- a **whole TCP exchange**, every step asserted as a field comparison: `SYN` → a `SYN-ACK` whose
+  flags and acknowledgement number are checked and whose sequence number is *kept*, → `ACK` carrying
+  a payload → the **payload echoed back byte for byte** at the sequence number expected → `FIN` → a
+  `FIN-ACK` acknowledging it → the final `ACK`. Every segment's pseudo-header checksum is verified by
+  the harness's own summation, and a segment arriving at a step it does not belong to is refused;
+- **distinct initial sequence numbers across the boots**, compared between scenarios — two boots of
+  one disk are separated only by the per-boot `RDRAND` secret and the time component, so an equal
+  pair would mean one of the two is not reaching the generator (RFC 6528);
+- **exactly one of each stateless reply**, since one request is one reply;
 - **nothing else on that wire at all** — no opaque frame answered, no dataplane probe leaked;
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
 Two of the three scenarios additionally hold the console's own record to the frames and the bytes
-injected, to the frame and to the byte, and one of the three boots a *second* document whose
-management MAC, address and prefix all differ — so a compiled-in address could not satisfy it.
+injected — every one of them, the TCP client's segments included, accumulated as the harness sends
+them rather than tallied in advance — to the frame and to the byte; and one of the three boots a
+*second* document whose management MAC, address and prefix all differ, so a compiled-in address could
+not satisfy it.
 
 **Missing.**
 
-- **No TCP, no TLS, no HTTP.** The port answers ARP and ICMP echo and nothing else, so there is still
-  no management *plane* — no `GET /metrics`, no `/config`, no `/logs`, no mTLS. Those need a TCP stack
-  in a protection domain, which is open (see the status table).
+- **No TLS and no HTTP.** TCP carries a stream and the connection echoes it, so there is still no
+  management *plane* — no `GET /metrics`, no `/config`, no `/logs`, no mTLS. The echo is a stand-in
+  that HTTP replaces wholesale rather than builds on.
 - **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
   there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
@@ -641,6 +666,103 @@ management MAC, address and prefix all differ — so a compiled-in address could
   about it reads `object=management key=management`.
 - **No other role.** Session-replication, mirror and multiple port pairs are open, and so are the
   3/4/6/7-NIC hardware image variants: there is one system description with three ports in it.
+
+### Proxy TCP stack
+
+**Done.** `crates/tcp` is a first-party TCP implementation that completes a real handshake with a
+real client, carries a byte stream, and closes cleanly — proven on the booting **release** image by
+the gate performing a whole TCP exchange against the management port. It is not a
+management-endpoint toy: it is the stack the dataplane proxy will run on, and every constraint below
+comes from that.
+
+It was chosen over smoltcp for one reason: smoltcp carries a stream through `RingBuffer` socket
+buffers, and a copy per segment is what a zero-copy pool design cannot afford. So **the crate owns
+no buffers at all.** A received segment arrives as `&[u8]` — in the appliance, a pool buffer a NIC
+DMA'd into — and the in-order payload comes back out as a subslice of it; a segment to send is
+composed into a `&mut [u8]` the caller supplies, at the offset it will finally occupy, and
+`net_headers::Ipv4Frame` stamps the two headers in front of it afterwards, so a payload is written
+exactly once. The cost is a real obligation, and it is in the type system rather than in prose:
+`Timeout::Retransmit` names a sequence range the caller must supply the bytes of again, because the
+stack did not keep them. That is where a send buffer belongs — with the application that produced
+the bytes.
+
+**State is per shard and nothing is shared.** A `TcpStack<CONNECTIONS>` owns its whole connection
+table and reaches no `static`, no lock, no cell and no atomic; every method takes `&mut self`, so
+several instances run on several cores with no coordination and the compiler is what says so
+(ENG-2). The capacity is a const generic, so a shard's memory is fixed at compile time and sized by
+its caller. There is no allocator and no `alloc`.
+
+What the passive-open path implements, completely:
+
+- **RFC 793's state machine** as a passive open reaches it: `LISTEN` → `SYN_RECEIVED` →
+  `ESTABLISHED` → `CLOSE_WAIT`/`LAST_ACK`, `FIN_WAIT_1`/`FIN_WAIT_2`, `CLOSING` (the simultaneous
+  close), `TIME_WAIT` and `CLOSED`.
+- **Sequence-number validation.** RFC 793 p.69's four-case acceptability test; an out-of-window
+  segment is answered with an acknowledgement naming what was expected and never accepted, and a
+  retransmission overlapping the window's left edge is trimmed rather than refused.
+- **RFC 5961 validation**, applied in *every* state rather than only the synchronized ones: a `RST`
+  is obeyed only at the exact next byte expected, and an in-window one that is not — like an
+  in-window `SYN` — gets a challenge acknowledgement.
+- **RFC 6298 retransmission**: SRTT and RTTVAR with the RFC's own α and β, the RFC's one-second
+  floor, a 60-second ceiling, exponential backoff, and Karn's algorithm — a range that has been
+  re-sent yields no round-trip sample. The `SYN-ACK` and the `FIN` the stack composes itself; data
+  it asks the caller for.
+- **RFC 6528 initial sequence numbers**: a 4-microsecond time component plus SipHash-2-4 of the
+  4-tuple under a 128-bit per-boot secret. The hash is first-party and held to the published
+  reference vectors, so it is checked against something other than itself. The secret comes from
+  `RDRAND` in the protection domain; a part without it refuses the domain rather than answering with
+  a predictable number, because a predictable one is an off-path injection primitive against exactly
+  the party this port faces.
+- **Bounded state under a flood.** A fixed table, reaped by timeout *and* by capacity pressure —
+  the oldest reapable entry gives way, and a table of *established* connections refuses a new one
+  rather than letting a peer that completes handshakes evict everybody else. Every connection
+  becomes reapable in finite time, which is a property test rather than a claim.
+- **MSS clamping** (the peer's offer against this end's own limit, with RFC 1122's default and
+  floor), **window scaling** (RFC 7323, negotiated at the `SYN` and clamped to shift 14), and
+  correct pseudo-header checksums both ways.
+- **The advertised window is the receiver's free space**, not a constant: `lfw_ip_endpoint`'s echo
+  keeps it equal to the room it has left, so a peer is never told it may send more than the endpoint
+  can take.
+
+Every outcome is counted, one field per cause — twenty-five of them — under MONITORING.md's
+attribution rule: what a peer sent that was refused, and separately the one count that accuses this
+code (`write_refused`, storage too small, expected to read zero forever). There is no device class
+here, because nothing in the crate reads a register.
+
+Zero `unsafe` (`forbid(unsafe_code)`), zero panicking constructs on any path a segment reaches, and
+sequence arithmetic that is modulo-2^32 by construction: `SeqNumber` exposes no `Add`, `Sub` or
+`Ord`, because the derivable ones are all wrong across the wrap. 99.7% line coverage over 126 unit
+and property tests, plus a persistent fuzz target that drives arbitrary segments at arbitrary
+instants — including a clock that moves backwards — against a listening stack and an established
+one.
+
+**Missing.**
+
+- **No active open.** Nothing in the appliance originates a connection, so `SYN_SENT` and the
+  simultaneous-open path have no caller; they arrive with the proxy.
+- **No SACK.** Its value is retransmitting the holes in a reassembly queue, and there is no
+  reassembly queue — that would be a buffer the crate owns. The SACK-permitted option is parsed and
+  recorded, so adding it is a change to the state machine rather than to the parser.
+- **No reassembly, so no out-of-order data.** In-window payload ahead of the next byte expected is
+  dropped and re-requested by the acknowledgement that follows, counted as `refused_out_of_order`.
+  On a lossless in-order link — a management port, a same-host proxy hop — the case does not arise;
+  on a reordering path it costs a round trip per reorder.
+- **No congestion control**, no delayed acknowledgement, no Nagle. The structural place for the
+  first is `Connection::sendable`; the other two need a timer this stack is not driven by.
+- **The urgent pointer is ignored.** `URG` data is delivered in band and counted.
+- **No dataplane consumer.** The only caller is the management endpoint. Nothing proxies, nothing
+  terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
+  is untouched (see the status table).
+- **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
+  the management domain outright, so that node has no management port for the boot. The QEMU bench had
+  to be told to expose it (`tools/xtask/src/qemu.rs`); every deployment target must have it. There is
+  no software fallback and deliberately so — the alternative is a predictable sequence number, which
+  is worse than no port.
+- **Timers advance when the caller polls them.** The management domain is woken by a frame, so a
+  `TIME_WAIT` on an otherwise silent port is reaped on the next frame rather than at its deadline.
+  Bounded rather than unbounded — the table is also reaped under pressure — but not prompt.
+- **The counters reach no surface.** Twenty-five fields in memory and nothing that exposes them; see
+  [MONITORING.md](MONITORING.md).
 
 ### Trusted time source
 
@@ -674,9 +796,11 @@ accepts, and that its year is inside the band the RTC reader accepts.
 - **UTC is assumed, not discovered.** The CMOS carries no field saying whether it holds UTC or local
   time. A machine whose firmware set it to local time yields an epoch wrong by that zone's offset,
   detectably by nothing.
-- **Nothing consumes it.** There is no shared calibration region, so no other domain can read the
-  time, and no record but the clock's own carries an instant. Every ordering statement in
-  [MONITORING.md](MONITORING.md) is unchanged.
+- **Only one domain consumes it, and no record carries an instant.** The calibration is published
+  into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
+  management domain maps read-only and converts `RDTSC` readings with, which is what makes its
+  transport's timers real. Nothing else reads it, and no console or log record is timestamped, so
+  every ordering statement in [MONITORING.md](MONITORING.md) is unchanged.
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
   never corrected; there is no timer, no interrupt, and no second reading to drift against.
 - **Single-core assumption.** The calibration is a reading of one core's counter, with no check that
@@ -716,6 +840,9 @@ loop, so a notification on it would be authority granted for nothing. Zero IRQs.
 grant is machine-checkable in the Microkit capability/memory report the build generates.
 
 Two **`<ioport>` grants**, on two domains, and they are the whole of the system's port authority.
+Neither of the two instructions the management domain reads is one: `RDTSC` and `RDRAND` are
+unprivileged, so no grant makes them available and none could withhold them — which is why a part
+without `RDRAND` is a refusal that domain reports rather than a capability anybody could add.
 The console holds eight ports (`0x3F8`–`0x3FF`, COM1) and the clock two (`0x70`–`0x71`, the CMOS
 address and data registers); the other 65,526 are refused to every domain — notably the
 `0xCF8`/`0xCFC` PCI configuration pair, which would be a second path to every device's configuration
@@ -728,13 +855,16 @@ holds no pool, no dataplane ring and no configuration region, and the clock addi
 ECAM page and no BAR window beyond the single timer page it maps — so a compromise of either reaches
 no frame, no NIC and no configuration.
 
-The management domain's grant is two regions plus its own log ring, and what it withholds is the
-whole of the port isolation: no dataplane region of any kind, **no buffer pool at all** — not even
-its own port's, frames being counted off their descriptors and never read — no configuration region,
-no ECAM page, no BAR window, no virtqueue and no I/O port. Its receive pool is consequently mapped by
-**no protection domain in the system**: the driver takes its physical address alone and nothing with
-a CPU reaches it, which `xtask::sysdesc` carries as a rule with an empty grant set and a claim saying
-why. The one region it is granted read-write that the forwarder is refused is that pipeline's `free`
+The management domain's grant is its own port's two pipelines, the configuration and calibration
+regions **read-only**, and its own log ring; what it withholds is the whole of the port isolation: no
+dataplane region of any kind, no ECAM page, no BAR window, no virtqueue, no I/O port and no
+acknowledgement region. Of the six pipeline regions the receive **pool** is read-only — a frame this
+appliance was sent is parsed and never altered — while the transmit pool is read-write, because a
+reply is a frame this domain originates into a buffer it owns. The two read-only grants are the
+argument in each case: a domain that could write `cfg` would rewrite the addressing it is about to be
+judged by, and one that could write the calibration would move this node's own idea of time — every
+transport deadline on its port — from the one domain that answers the management-plane attacker. The
+one region it is granted read-write that the forwarder is refused is the receive pipeline's `free`
 ring, and it is the side of it that differs: a terminal port has no egress driver to return its
 buffers, so this domain **produces** returns while the driver **consumes** them as the pool's owner —
 the split the dataplane already has between its two drivers, which is what keeps a forged return
@@ -751,7 +881,7 @@ configuration validator PD. The console, clock and management domains are three 
 further classes — §6.3 enumerates neither, describing the console as a surface and leaving the
 trusted-time mechanism open (§13.1) — so they add domains to the decomposition without closing any
 of the gap below — the management domain is the endpoint of a port, not the management API PD, which
-needs ARP, IP, TCP, TLS and HTTP that do not exist. Absent: Rx/Tx virtualisers,
+needs the TLS and HTTP that do not exist above the ARP, IP and TCP that now do. Absent: Rx/Tx virtualisers,
 classifier,
 filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7 parsers, DPI engine,
 content scanner, CA signing PD, management API PD, HA state-sync PD, and the update/health PD. The
@@ -917,11 +1047,11 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fifteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the sixteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
 | QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | twelve persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | thirteen persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
@@ -950,7 +1080,7 @@ prefix-length rule from `ConfigImage::check`, and the port-range rule from `crat
 fails the seed-corpus smoke test on the committed seed named after it, so the corpus alone catches a
 lost rule with no live fuzzing at all.
 
-**Live fuzzing is conditional.** All eleven targets always build under AddressSanitizer, and the
+**Live fuzzing is conditional.** All thirteen targets always build under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
 run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
 probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
