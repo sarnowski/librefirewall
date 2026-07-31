@@ -27,6 +27,7 @@ const PRIME: u32 = 0x0100_0193;
 /// sequence has exactly one reading.
 const INTERFACE_MARK: u8 = 0x01;
 const NEIGHBOUR_MARK: u8 = 0x02;
+const MANAGEMENT_MARK: u8 = 0x03;
 const ID_END: u8 = 0xff;
 
 /// The identity of a configuration's content.
@@ -70,6 +71,20 @@ pub fn content_hash(model: &Model) -> ContentHash {
         hash = fold_id(hash, entry.interface);
         hash = fold_address(hash, entry.address);
         hash = fold_mac(hash, entry.mac);
+    }
+    // Folded at all because a commit is keyed on this number: a document whose
+    // only edit is the management address would otherwise read as unchanged.
+    if let Some(entry) = model.management() {
+        hash = fold(
+            hash,
+            &[
+                MANAGEMENT_MARK,
+                u8::from(entry.enabled),
+                entry.prefix_length,
+            ],
+        );
+        hash = fold_mac(hash, entry.mac);
+        hash = fold_address(hash, entry.address);
     }
     ContentHash(hash)
 }
@@ -172,6 +187,37 @@ mod tests {
             edited.push_neighbour(entry).expect("capacity");
         }
         content_hash(&edited)
+    }
+
+    /// The commit path keys on this number, so every field of the management
+    /// entry has to move it — including the enable flag, which is the one an
+    /// operator flips without touching an address.
+    #[test]
+    fn changing_any_single_management_field_changes_the_hash() {
+        let base = |change: fn(&mut crate::model::ManagementEntry)| {
+            let mut model = model(&["wan"]);
+            let mut entry = crate::model::ManagementEntry {
+                enabled: true,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+                address: Ipv4Address::from_octets([10, 0, 2, 15]),
+                prefix_length: 24,
+            };
+            change(&mut entry);
+            model.set_management(entry).expect("one");
+            content_hash(&model)
+        };
+        let hash = base(|_| {});
+        let edits: [fn(&mut crate::model::ManagementEntry); 4] = [
+            |entry| entry.enabled = false,
+            |entry| entry.mac = MacAddress([1, 2, 3, 4, 5, 6]),
+            |entry| entry.address = Ipv4Address::from_octets([9, 9, 9, 9]),
+            |entry| entry.prefix_length = 25,
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            assert_ne!(base(edit), hash, "edit {index}");
+        }
+        // And an absent entry is not a disabled one.
+        assert_ne!(hash, content_hash(&model(&["wan"])));
     }
 
     #[test]

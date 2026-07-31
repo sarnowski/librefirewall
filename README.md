@@ -37,13 +37,22 @@ generation 0, forwarding nothing — and switches to a generation only after re-
 of it itself, so every boot performs a live configuration swap on a running dataplane. There is
 still no way to *submit* a document to a running node: it is embedded at build time.
 
-A **dedicated management port** is now the third NIC. It is a third instance of the same driver
-binary — the binary is port-agnostic, so driving a management port took no code change to it — handing
-its frames to a `management` protection domain that counts them and reports the running total, and
-forwards nothing. The isolation CONCEPT §9.1 asks for is a grant set rather than a rule: the
-management domain holds no dataplane region and the forwarder holds no management region, and
-`xtask::sysdesc` names the mapper set of every region exactly, so either grant appearing fails the
-gate. The port has no address, no ARP and no IP — it receives and counts, and that is all.
+A **dedicated management port** is now the third NIC, and it is an **addressed IPv4 endpoint**: it
+answers ARP requests for its own address and ICMP echo requests to it, and forwards nothing. It is a
+third instance of the same driver binary — the binary is port-agnostic, so driving a management port
+took no code change to it — handing its frames to a `management` protection domain that reads the
+frame, answers what is addressed to it, and reports the port's running total. Its MAC, address and
+prefix come from the configuration document like every other address on the appliance, so the port is
+configured rather than compiled in, and the domain reads that document's **committed** generation
+only: it maps the configuration region read-only, maps the acknowledgement region not at all, and
+takes no part in the two-phase commit the forwarder is the consumer of.
+
+The isolation CONCEPT §9.1 asks for is a grant set rather than a rule: the management domain holds no
+dataplane region and the forwarder holds no management region, and `xtask::sysdesc` names the mapper
+set of every region exactly, so either grant appearing fails the gate. The QEMU gate asserts the same
+exclusion on the wire, in both directions, on the release image — no frame injected on the management
+port ever appears on a dataplane port, and no dataplane probe ever appears on the management one. What
+the port still has no notion of is TCP, TLS or HTTP: it answers two protocols and nothing else.
 
 Another protection domain owns the console. It holds the first of the system's two I/O-port
 capabilities — the eight ports at `0x3F8`, the PC-compatible COM1 window — and every other domain
@@ -75,16 +84,17 @@ the domain proves in the meantime is the whole chain that would fill one, end to
 that ships. It is **not** a trusted time source — see the status row above and its detail below.
 
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
-forwarded because it is routable, never because a policy allowed it. There is no connection
-tracking, no NAT, no ARP, and no ICMP. What exists is a router on a firewall's substrate, not yet a
-firewall.
+forwarded because it is routable, never because a policy allowed it. There is no connection tracking
+and no NAT, and the ARP and ICMP that exist belong to the management endpoint alone — the dataplane
+resolves a next hop from a static neighbour table and answers nothing for itself. What exists is a
+router on a firewall's substrate, not yet a firewall.
 
 ### Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
 | Stateful L2–L4 filtering and connection tracking | **open** | |
-| Routing, ARP, ICMP | **partial** | [detail](#routed-ipv4-forwarding) |
+| Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management endpoint only**, not for the dataplane — [detail](#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | CONCEPT §6.4 |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | CONCEPT §6.5 |
 | Flow classifier (cut-through vs. proxy path) | **open** | |
@@ -110,7 +120,7 @@ firewall.
 | Proxy TCP stack (smoltcp, SACK) | **open** | |
 | 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
 | IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
-| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists and is isolated from the dataplane; it receives and counts and does nothing else — [detail](#full-port-role-model) |
+| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists, is addressed, answers ARP and ICMP echo, and is isolated from the dataplane; no other role does — [detail](#full-port-role-model) |
 | Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
 | ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
 | Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
@@ -183,10 +193,15 @@ target (`route_frame`) whose input is the frame itself.
 
 **Missing.**
 
-- **No ARP and no ICMP**, so neighbours are a static table and a drop is silent. Both need a domain
-  that can *originate* a frame, which none can: the pools are owned by the receiving drivers, and a
-  frame can only leave the port opposite the one it arrived on.
-- **Interfaces and neighbours are all that is configurable.** They come from
+- **No ARP and no ICMP on the dataplane.** Both now exist — `crates/net-headers` parses and builds
+  them and `crates/ip-endpoint` answers them — but only for a port that answers *for itself*: the
+  management endpoint (see *[Full port role model](#full-port-role-model)*). On a dataplane port
+  neighbours are still a static table and a drop is still silent, because a dataplane frame can only
+  leave the port opposite the one it arrived on: the pools are owned by the receiving drivers, so no
+  domain on that path can originate a frame at all. Giving a dataplane port an ARP cache and an ICMP
+  responder means giving the forwarder a pool it owns, which is a capability change and not a code
+  one.
+- **Interfaces, neighbours and the management interface are all that is configurable.** They come from
   `systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
   now the single source of the appliance's addressing: the MAC QEMU gives each guest NIC and the
   endpoints the system test states its contract between are both read out of it
@@ -240,9 +255,9 @@ the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupEr
 Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
 every peer transmit descriptor.
 
-Eleven persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
-the configuration document and the handover image, and the log record and its ring (see
-*Engineering foundations*).
+Twelve persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
+the addressed management endpoint, the configuration document and the handover image, and the log
+record and its ring (see *Engineering foundations*).
 
 **Missing.**
 
@@ -280,14 +295,17 @@ values. The schema is closed: an unknown element or attribute is a refusal, not 
 because a misspelling nobody can see is the failure an appliance with no shell (CONCEPT §11) cannot
 afford. Parsing and semantic validation are separate passes over separate inputs — bytes, then a
 model — so a syntax rule cannot come to depend on an address and a topology rule cannot come to
-depend on where in the file something was written. Fifteen semantic rules then run over the model:
+depend on where in the file something was written. Twenty-one semantic rules then run over the model:
 a duplicate interface id, neighbour id or port; a port the build does not have; a prefix length past
 32; an interface address that is its own prefix's network or broadcast address; a non-unicast
 address or MAC on either object; overlapping prefixes; a neighbour naming an unknown interface, or
-sitting outside its interface's prefix, or equal to the interface's own address; and a duplicate
-neighbour address on one interface. A document naming more objects than the handover ABI can carry
-is refused by the reader rather than truncated. Every refusal is a typed error naming a **location**
-and never the offending bytes (OBS-5).
+sitting outside its interface's prefix, or equal to the interface's own address; a duplicate
+neighbour address on one interface; and six over the `<management>` element, which is held to the
+same field rules as an interface *and* to colliding with no dataplane prefix and no dataplane MAC —
+because one address reachable both by routing and by local termination is not something the grant set
+can express. A document naming more objects than the handover ABI can carry is refused by the reader
+rather than truncated. Every refusal is a typed error naming a **location** and never the offending
+bytes (OBS-5).
 
 `config::Datastore` versions what passed. A candidate is staged without touching what is running,
 `validate_document` takes `&self` so "an operation that changes nothing" is carried by the signature
@@ -305,10 +323,19 @@ publishes it under a two-phase protocol: offer, the consumer re-checks and ackno
 commit. The two regions are separate and mirrored (`cfg` read-write here and read-only there,
 `cfgack` the reverse) so neither domain can forge the other's half.
 
+The image has **two readers with different authority**, which is the shape a second consumer takes
+here. The forwarder is the *consumer* of the two-phase commit — it reads the offered generation,
+stages a table and acknowledges, and a commit waits for that. The management domain reads the
+**committed** generation alone (`pd_runtime::CommittedReader`) to learn its own addressing: it maps
+`cfg` read-only, maps `cfgack` not at all, and therefore cannot delay a commit, refuse one on
+anybody's behalf, or forge the acknowledgement that releases one.
+
 `pd_runtime::ConfigurationSwitch` is the consumer. It treats the region as a byzantine peer's
 claim — copies the image out before deciding on it, exactly as `RouteStage` snapshots a frame, and
 re-checks every field: a count past capacity, an `enabled` byte that is neither 0 nor 1, a port with
-no driver, a prefix length past 32, a non-unicast MAC. A refused image leaves the running
+no driver, a prefix length past 32, a non-unicast MAC — the management entry included, whose fields
+are left uninterpreted altogether when it is disabled, so an unaddressed port has one representation
+and a zeroed region is still the valid fail-closed image. A refused image leaves the running
 configuration exactly as it was and is never acknowledged, so the publisher never commits it. The
 switch happens **between two polls** and is provable rather than claimed: a Microkit domain runs one
 entrypoint to completion, so a frame is decided entirely under one generation with no lock involved.
@@ -318,7 +345,7 @@ as generation 1, **every boot performs a live configuration swap on a running fo
 changed value reaches the console as a structured `LFW-CFG` record (see
 [MONITORING.md](MONITORING.md)).
 
-Held by 170 tests in `crates/config` and 96 in `crates/log`, by the handover's own tests in
+Held by 182 tests in `crates/config` and 99 in `crates/log`, by the handover's own tests in
 `crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
@@ -355,8 +382,8 @@ document that shares no address and no MAC with the first.
 - **No distributed rollout.** CONCEPT §12.2's staged commit across an HA pair needs a pair; the
   handover protocol is written for exactly one consumer, and "every consumer has staged" is one
   comparison rather than a conjunction.
-- **Only interfaces and neighbours are configurable.** No routes, no policy, no zones, no NAT — none
-  of which exist to configure. Queue depths, pool sizes and buffer extents are deliberately *not*
+- **Only interfaces, neighbours and the management interface are configurable.** No routes, no policy,
+  no zones, no NAT — none of which exist to configure. Queue depths, pool sizes and buffer extents are deliberately *not*
   runtime configuration: they are memory-region extents fixed in the system description, which is
   where CONCEPT §12.3 draws the line at hardware, and moving one would move a capability grant.
 - **Refusal is only visible on the console.** A node that rejected its own document comes up
@@ -528,51 +555,90 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
 
 ### Full port role model
 
-**Done.** One of the four roles CONCEPT §9.1 names exists: a **dedicated management port**, isolated
-from the dataplane and carrying no forwarded traffic. It is a third `virtio-net-pci` device at
-00:04.0, driven by a third instance of the same `nic-driver.elf` the two dataplane ports use — the
-binary turned out to be port-agnostic already, so the third port cost it no code change, only new
-regions and a different peer — and its frames end at a `management` protection domain that counts
-them and reports the running total on the console.
+**Done.** One of the four roles CONCEPT §9.1 names exists, and it is now an **addressed IPv4
+endpoint**: a **dedicated management port** that answers for itself, carries no forwarded traffic, and
+is isolated from the dataplane by a grant set. It is a third `virtio-net-pci` device at 00:04.0,
+driven by a third instance of the same `nic-driver.elf` the two dataplane ports use — the binary
+turned out to be port-agnostic already, so the third port cost it no code change — and its frames end
+at a `management` protection domain.
+
+That domain answers two protocols and counts everything: an **ARP request** for its own address is
+answered with its own MAC, and an **ICMP echo request** to it is answered with a reply carrying the
+same identifier, sequence and payload and both checksums recomputed. Everything else is refused by
+name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it does
+not speak, a fragment, a non-unicast or off-link sender, a malformed header.
+
+The decision is two host-tested `no_std` crates. `crates/net-headers` gained ARP (IPv4 over Ethernet
+only; any other hardware type, protocol type, address length or operation is a typed error) and ICMP
+echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
+and one checksum routine. `crates/ip-endpoint` is the endpoint state machine — the appliance answering
+*for itself*, as against `crates/routing`, which forwards for others — with zero `unsafe`, a closed
+`Outcome` vocabulary, and a counter per outcome. `pd_runtime::EndpointStage` joins it to the two
+pipelines: copy the frame out of the receive pool, decide, and where a reply was composed take a
+transmit buffer, write the reply into it and lend it to the driver.
+
+The addressing is **configured, not compiled in**. `systems/qemu-x86_64/configuration.xml` gained a
+`<management mac= address= prefix-length= enabled=/>` element — a sibling of `<interfaces>`, because
+the port is not a dataplane port and `config::PORT_COUNT` is still 2 — which the schema requires, the
+validator holds to its own rules *and* to not colliding with any dataplane prefix or MAC, and the
+handover image carries to the domain. QEMU takes that MAC for the guest NIC, and the harness derives
+its own station address from that prefix, so no address on the bench is written down twice.
+
+The domain reads the **committed** generation only (`pd_runtime::CommittedReader`): it maps the
+configuration region read-only, maps the acknowledgement region **not at all**, and so cannot delay a
+commit, refuse one on anybody's behalf, or forge the acknowledgement that releases one. That is
+strictly weaker than the forwarder's role, which is the consumer of the two-phase commit. What it
+costs is stated where it lives: with no channel to the configuration domain, the port picks up its
+address on the next frame that wakes it.
 
 The isolation is a grant set, not a rule anybody has to remember. The management domain holds **no**
-dataplane region, no buffer pool at all, no configuration region, no device capability and no I/O
-port; the forwarder holds no management region; and `xtask::sysdesc` names the mapper set of every
-region *exactly*, so either grant appearing fails the gate at the point the edit is made. The
-management port is not in the router's port set and no configuration document can put it there —
-`config::PORT_COUNT` is 2 and the forwarder refuses a table naming a port it has no driver for.
+dataplane region, no device capability and no I/O port; the forwarder holds no management region; the
+receive pool it reads is mapped **read-only**, because a frame this appliance was sent is parsed and
+never altered; and `xtask::sysdesc` names the mapper set *and the perms* of every region exactly, so a
+widened grant fails the gate at the point the edit is made. The management port is not in the router's
+port set and no configuration document can put it there.
 
-`crates/pd-runtime`'s `TerminalStage` is the mechanism, and it exists because the dataplane's does
-not transfer: a routed descriptor travels *onward* and the egress driver returns the buffer, which is
-what lets the forwarder be denied both `free` rings. A terminal port has no egress driver, so this
-domain produces the returns itself while the driver consumes them as the pool's owner — the same
-producer/consumer split the two drivers already have, which keeps a forged return refused by the
-ledger rather than believed. It is host-tested against a byzantine driver: forged indices,
-unbelievable spans, a stalled return ring, and a pool-sized run proving every buffer comes back.
+Its two pools are owned by different domains in opposite directions — the driver owns the receive
+pool, the management domain owns the transmit pool it composes replies into — so each `free` ring has
+one producer and one consumer and a forged return is refused by a ledger rather than believed. That is
+`pd_runtime::EndpointStage`, host-tested against a byzantine driver: forged indices, unbelievable
+spans, a stalled return ring, an exhausted transmit pool, a duplicate return on the reply pipeline,
+and a pool-sized run proving every buffer comes back.
 
-The QEMU gate asserts both halves on the release image. Every system scenario injects four frames of
-four different lengths into the management port once the capture proves every port is up, and holds
-that port to carrying **nothing** back — nothing produces onto its transmit pipeline and the
-forwarder cannot reach it, so a frame arriving there means one of those two facts has stopped being
-true. Two of the three scenarios additionally hold the console's own record to the frames and the
-bytes injected, to the frame and to the byte: `LFW-PD domain=management state=ready frames=4
-bytes=352`.
+The QEMU gate asserts all of it on the release image. Every system scenario injects six frames into
+the management port once the capture proves every port is up — four opaque frames of four different
+lengths, an ARP request and an ICMP echo request — and then requires:
 
-**Missing** — and it is nearly everything a management port is for:
+- a **well-formed ARP reply** carrying the configured MAC, decoded and compared field by field;
+- a **well-formed ICMP echo reply** with matching identifier, sequence and payload and a valid
+  checksum, likewise decoded rather than matched as bytes;
+- **exactly one of each**, since one request is one reply;
+- **nothing else on that wire at all** — no opaque frame answered, no dataplane probe leaked;
+- and the **mutual exclusion in both directions**: no frame the harness put on the management wire
+  ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-- **The port has no address.** No ARP, no IPv4, no TCP, no TLS, no HTTP, and nothing in the
-  configuration document describes it: it has no `<interface>`, so its MAC is a constant in
-  `tools/xtask/src/qemu.rs` rather than a configured value, and the harness's station MAC is a
-  constant beside it. Both move into the document the day it gains a management interface.
-- **It reads no frame.** Frames and bytes are counted off the descriptors the driver publishes, so
-  the domain maps no pool and its receive pool is mapped by no protection domain at all. Parsing a
-  frame needs that mapping, and it arrives with the code that does the parsing.
-- **It transmits nothing.** The transmit pipeline exists because the port-agnostic driver binary
-  takes a transmit side whatever port it drives; no domain produces onto it, so the port is
-  receive-only in fact as well as in intent.
-- **The counts are on the console and nowhere else.** They belong on `/metrics` (CONCEPT §11), which
-  does not exist, and `TerminalCounters::malformed_descriptor` and `return_ring_full` reach no
-  surface at all — so a management port whose driver is misbehaving is invisible.
+Two of the three scenarios additionally hold the console's own record to the frames and the bytes
+injected, to the frame and to the byte, and one of the three boots a *second* document whose
+management MAC, address and prefix all differ — so a compiled-in address could not satisfy it.
+
+**Missing.**
+
+- **No TCP, no TLS, no HTTP.** The port answers ARP and ICMP echo and nothing else, so there is still
+  no management *plane* — no `GET /metrics`, no `/config`, no `/logs`, no mTLS. Those need a TCP stack
+  in a protection domain, which is open (see the status table).
+- **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
+  there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
+  probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
+  address is not contradicted.
+- **A reply is only ever composed for a neighbour**: the sender must share the port's prefix, because
+  there is no route table and no gateway behind this endpoint. An off-link station is refused and
+  counted.
+- **The counters reach no surface.** The console carries the port's cumulative `frames=`/`bytes=` pair
+  and nothing else, so every outcome the endpoint distinguishes — and every reply it could not send —
+  is invisible to an operator. They belong on `/metrics` (CONCEPT §11), which does not exist.
+- **A change to the management interface is audited like any other**, but only because the change
+  records are keyed by a synthetic identifier: the element has no `id` of its own, so every record
+  about it reads `object=management key=management`.
 - **No other role.** Session-replication, mirror and multiple port pairs are open, and so are the
   3/4/6/7-NIC hardware image variants: there is one system description with three ports in it.
 
@@ -851,11 +917,11 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fourteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the fifteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
 | QEMU end-to-end gate (three system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | eleven persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | twelve persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |

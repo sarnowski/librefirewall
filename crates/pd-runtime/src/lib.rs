@@ -93,7 +93,7 @@
 use core::mem::{align_of, offset_of, size_of};
 
 use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, TtlExpired};
-use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError};
+use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError, WriteOutsideBuffer};
 use queue::SpscRing;
 use routing::{Decision, DropCounters, DropReason, PortId, Router};
 
@@ -101,40 +101,43 @@ pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
 pub use wire::{Descriptor, Verdict};
 
-/// Re-exported rather than restated: one number, one declaration. What is this
-/// crate's own is what it additionally fixes — a [`Pool`] is the whole of its
-/// region, so a region base's alignment is every buffer's DMA alignment.
+/// Re-exported rather than restated: one number, one declaration. What this
+/// crate adds is that a [`Pool`] is the whole of its region, so a region base's
+/// alignment is every buffer's DMA alignment.
 pub use wire::MAPPING_ALIGN;
 
 pub const POOL_BUFFERS: usize = 64;
 
-/// Power of two; usable capacity is one less. Sized above [`POOL_BUFFERS`] so
-/// no ring can fill before the pool is exhausted, which makes buffer hand-offs
-/// along a correctly accounted chain infallible.
+/// Bytes a published frame leaves free in front of itself, for the transmitting
+/// driver to write the device's own header into. The pipeline's constant rather
+/// than a driver's: a domain that *originates* a frame must leave the room and
+/// holds no virtio type to ask. `nic_driver_core` const-asserts it equal.
+pub const DEVICE_HEADER_LEN: u32 = 12;
+
+/// Power of two; usable capacity is one less. Sized above [`POOL_BUFFERS`] so no
+/// ring fills before the pool is exhausted, making hand-offs along a correctly
+/// accounted chain infallible.
 pub const RING_SLOTS: usize = 128;
 
 /// The most descriptors any single drain of a peer-fed ring will process.
 ///
 /// A peer that keeps advancing its published cursor keeps a dequeue returning
 /// descriptors forever, and a domain stuck in that loop stops servicing its own
-/// device. One full ring's worth is the natural bound — no legitimate backlog
-/// can exceed `RING_SLOTS - 1` real descriptors or [`POOL_BUFFERS`] outstanding
-/// buffers — and it comes from this crate's own constants rather than from a
-/// ring's peer-influenced `len()`.
+/// device. One full ring's worth bounds it — no legitimate backlog exceeds
+/// `RING_SLOTS - 1` descriptors or [`POOL_BUFFERS`] buffers — and it comes from
+/// this crate's constants, not a ring's peer-influenced `len()`.
 pub const DRAIN_LIMIT: usize = RING_SLOTS;
 
 pub type Ring = SpscRing<RING_SLOTS>;
 
 /// Both NICs' DMA target, and the whole of one memory region: pool buffer `i`
-/// sits at the region's own physical base plus `i * BUFFER_SIZE`, with no
-/// offset to add and none to get wrong.
+/// sits at the region's physical base plus `i * BUFFER_SIZE`, no offset to add.
 pub type Pool = BufferPool<POOL_BUFFERS>;
 
 /// Bytes the system description reserves for each region, derived rather than
 /// chosen: the fewest [`MAPPING_ALIGN`] pages that hold the region's type. As a
-/// literal the single-region size drifted to 1.93x its type, mapping bytes no
-/// field names into three domains. `xtask::sysdesc` reads that file back and
-/// holds every `size=` to the constant here, proved by its
+/// literal it drifted to 1.93x its type, mapping bytes no field names into three
+/// domains. `xtask::sysdesc` holds every `size=` to the constant here, proved by
 /// `a_short_region_is_reported_against_the_constant_it_must_equal`.
 pub const POOL_REGION_SIZE: usize = size_of::<Pool>().next_multiple_of(MAPPING_ALIGN);
 
@@ -144,8 +147,7 @@ pub const FORWARD_REGION_SIZE: usize = size_of::<ForwardRings>().next_multiple_o
 /// As [`POOL_REGION_SIZE`], for the return region.
 pub const RETURN_REGION_SIZE: usize = size_of::<ReturnRing>().next_multiple_of(MAPPING_ALIGN);
 
-/// Whether a descriptor from a neighbouring protection domain names a span
-/// within one pool buffer. A failing descriptor is rejected, never followed.
+/// Whether a peer's descriptor names a span within one pool buffer; a failing one is rejected.
 #[must_use]
 pub fn descriptor_in_bounds(descriptor: &Descriptor) -> bool {
     (descriptor.buffer as usize) < POOL_BUFFERS
@@ -160,25 +162,21 @@ pub(crate) fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-/// The forwarder's region: the two rings a descriptor crosses on its way from
-/// the receiving driver to the transmitting one.
+/// The forwarder's region: the two rings a descriptor crosses between drivers.
 ///
-/// The ring the buffers come back on is a separate region, which the forwarder
-/// never maps; the [`Pool`] those descriptors index is a third, and it is
-/// mapped, because the routed frame's headers are rewritten in place.
+/// The ring the buffers come back on is a separate region the forwarder never
+/// maps; the [`Pool`] those descriptors index is a third, and *is* mapped,
+/// because the routed frame's headers are rewritten in place.
 ///
 /// A zeroed region is the valid empty state, so no domain constructs one; each
 /// attaches to the mapped frames with [`attach_region!`].
 #[repr(C)]
 pub struct ForwardRings {
-    /// Received frames, rx driver to forwarder.
     pub rx: Ring,
-    /// Frames to transmit, forwarder to tx driver.
     pub tx: Ring,
 }
 
-/// The return region: transmitted buffers, tx driver back to the pool-owning rx
-/// driver.
+/// The return region: transmitted buffers, tx driver back to the pool owner.
 ///
 /// Its own region rather than a third field beside [`ForwardRings`], which is
 /// what denies the forwarder the ability to forge a return — the one move that
@@ -243,8 +241,7 @@ const _: () = {
 const _: () = assert!(MAPPING_ALIGN.is_multiple_of(BUFFER_SIZE));
 
 impl ForwardRings {
-    /// For host use; a mapped region is already zeroed and needs no
-    /// construction.
+    /// For host use; a mapped region is already zeroed.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -388,11 +385,16 @@ macro_rules! attach_region {
     }};
 }
 
+pub mod endpoint;
 pub mod handover;
-pub mod terminal;
 
-pub use handover::{ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer, router_from};
-pub use terminal::{TerminalCounters, TerminalStage};
+pub use endpoint::{
+    ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters, MAX_REPLY_LEN,
+};
+pub use handover::{
+    Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
+    endpoint_from, router_from,
+};
 pub use wire::{ConfigAck, ConfigHandover, ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS};
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
@@ -841,6 +843,28 @@ fn route_frame<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
     }
 }
 
+/// Copy `bytes` into pool buffer `index` at `offset`, leaving the rest untouched.
+///
+/// # Errors
+/// [`WriteOutsideBuffer`] when the span leaves the buffer, bounded here rather
+/// than by faulting.
+fn place(pool: &Pool, index: u32, offset: u32, bytes: &[u8]) -> Result<(), WriteOutsideBuffer> {
+    // SAFETY: `write_at`'s two clauses, and the mapping under them.
+    //
+    // * The mapping is the `<map mr="pool0"/"pool1"/"mgmt_tx_pool" perms="rw"
+    //   cached="true">` grant in `systems/qemu-x86_64/librefirewall.system`,
+    //   taken through `attach_region!`.
+    // * `bytes` is the caller's own storage, which cannot alias a pool the
+    //   caller holds no reference into.
+    // * The span is `write_at`'s own business: it bounds `offset + len`
+    //   unconditionally and answers in its return value.
+    // * Exclusive ownership of `index` is the clause this crate cannot
+    //   guarantee at every call site; the crate header records it as accepted
+    //   residue, and violating it yields bytes another domain was concurrently
+    //   writing, never a dangling or aliased reference (`packet_buffer`).
+    unsafe { pool.write_at(index as usize, offset as usize, bytes) }
+}
+
 /// Put the rewritten headers back into the pool buffer, and answer whether the
 /// frame may still be transmitted.
 ///
@@ -853,21 +877,14 @@ fn write_back(
     scratch: &[u8; BUFFER_SIZE],
     counters: &mut RouteCounters,
 ) -> Verdict {
-    // SAFETY: the ownership clause, the mapping and the span are exactly as
-    // `snapshot` states them for the same buffer, `write_at` differing only in
-    // direction; the source is this domain's own storage, so it cannot alias
-    // the pool. The written window is a fixed range of a fixed-size array,
-    // bounded by the `REWRITTEN_HEADER_LEN <= BUFFER_SIZE` assertion above at
-    // build time, and where it lands in the buffer is `write_at`'s own business
-    // — it bounds that unconditionally and answers in its return value.
-    let placed = unsafe {
-        pool.write_at(
-            descriptor.buffer as usize,
-            descriptor.offset as usize,
-            &scratch[..REWRITTEN_HEADER_LEN],
-        )
-    };
-    match placed {
+    // A fixed range of a fixed-size array, bounded at build time by the
+    // `REWRITTEN_HEADER_LEN <= BUFFER_SIZE` assertion above.
+    match place(
+        pool,
+        descriptor.buffer,
+        descriptor.offset,
+        &scratch[..REWRITTEN_HEADER_LEN],
+    ) {
         Ok(()) => Verdict::Transmit,
         Err(_) => {
             bump(&mut counters.writeback_failed);

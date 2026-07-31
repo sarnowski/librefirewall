@@ -6,6 +6,7 @@ members = [
     "crates/packet-buffer",
     "crates/net-headers",
     "crates/routing",
+    "crates/ip-endpoint",
     "crates/log",
     "crates/virtio",
     "crates/pd-runtime",

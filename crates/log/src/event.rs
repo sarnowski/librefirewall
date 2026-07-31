@@ -83,6 +83,7 @@ closed_vocabulary! {
     ObjectKind {
         Interface => "interface",
         Neighbour => "neighbour",
+        Management => "management",
     }
 }
 

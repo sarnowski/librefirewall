@@ -183,8 +183,18 @@ mod tests {
     use lfw_log::{ChangeKind, Field, ObjectKind, RecordingSink, Value};
     use std::{format, string::String, vec::Vec};
 
-    /// Room for every record a commit from generation 0 can produce.
-    const CAPACITY: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS) * Field::ALL.len();
+    /// A document naming no object at all — every section present and empty,
+    /// which is what generation 0 already is.
+    const EMPTY: &str = concat!(
+        "<configuration><interfaces/><neighbours/>",
+        "<management enabled=\"false\" mac=\"52:54:00:12:34:52\" ",
+        "address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "</configuration>"
+    );
+
+    /// Room for every record a commit from generation 0 can produce: every
+    /// object the image holds, the one management interface included.
+    const CAPACITY: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS + 1) * Field::ALL.len();
 
     const ONE_PORT: &str = concat!(
         "<configuration><interfaces>",
@@ -192,7 +202,9 @@ mod tests {
         "address=\"10.0.0.1\" prefix-length=\"24\"/>",
         "</interfaces><neighbours>",
         "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>",
-        "</neighbours></configuration>"
+        "</neighbours>",
+        "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "</configuration>"
     );
 
     fn run(document: &str) -> (CommitReport, Vec<Event>) {
@@ -267,6 +279,7 @@ mod tests {
             [
                 (ObjectKind::Interface, String::from("wan")),
                 (ObjectKind::Neighbour, String::from("gw")),
+                (ObjectKind::Management, String::from("management")),
             ]
         );
     }
@@ -314,7 +327,7 @@ mod tests {
             ("<configuration>", RejectReason::Malformed),
             ("<!DOCTYPE x><configuration/>", RejectReason::Doctype),
             (
-                "<configuration><interfaces/><neighbours/><extra/></configuration>",
+                "<configuration><interfaces/><neighbours/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/><extra/></configuration>",
                 RejectReason::UnknownElement,
             ),
         ];
@@ -364,17 +377,29 @@ mod tests {
         assert_eq!(store.running().to_bits(), 1);
     }
 
-    /// The reachable one, and the reason the three outcomes are three: an
-    /// empty-but-valid document hashes to what generation 0 already runs, so
-    /// nothing is published and nothing was refused.
+    /// The reachable one, and the reason the three outcomes are three: a
+    /// document whose content is already running assigns nothing and refuses
+    /// nothing.
+    ///
+    /// It takes a *second* commit of one document to reach, and no first commit
+    /// can: the schema requires a `<management>` element, so every document a
+    /// reader accepts names at least that object and therefore moves the
+    /// configuration off the empty generation 0.
     #[test]
-    fn an_empty_document_commits_as_unchanged_against_the_fail_closed_generation() {
-        let (report, events) = run("<configuration><interfaces/><neighbours/></configuration>");
+    fn a_document_already_running_commits_as_unchanged() {
+        let mut store = Datastore::new();
+        let (first, _) = run_on(&mut store, EMPTY);
+        assert!(
+            matches!(first, CommitReport::Published(_)),
+            "a disabled management port is still something a document says"
+        );
+
+        let (report, events) = run_on(&mut store, EMPTY);
         assert_eq!(report, CommitReport::Unchanged);
         assert_eq!(
             events,
             [Event::ConfigGeneration {
-                generation: 0,
+                generation: 1,
                 outcome: GenerationOutcome::Unchanged,
                 changes: 0,
             }]
@@ -392,7 +417,9 @@ mod tests {
         assert!(matches!(published, CommitReport::Published(_)));
         assert_eq!(published.state(), DomainState::Ready);
 
-        let unchanged = run("<configuration><interfaces/><neighbours/></configuration>").0;
+        let mut store = Datastore::new();
+        run_on(&mut store, EMPTY);
+        let unchanged = run_on(&mut store, EMPTY).0;
         assert_eq!(unchanged, CommitReport::Unchanged);
         assert_eq!(unchanged.state(), DomainState::Ready);
         assert_eq!(unchanged.image(), None, "there is nothing to publish");

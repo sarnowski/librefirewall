@@ -254,7 +254,7 @@ mod tests {
             "<configuration><interfaces>\
              <interface id=\"wan\" port=\"{port}\" enabled=\"{enabled}\" \
              mac=\"52:54:00:00:00:01\" address=\"10.0.{variant}.1\" prefix-length=\"24\"/>\
-             </interfaces><neighbours/></configuration>"
+             </interfaces><neighbours/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
         )
     }
 
@@ -388,8 +388,9 @@ mod tests {
         let first = store.commit(&mut changes).expect("a candidate");
         assert_eq!(first.generation(), Generation::from_bits(1));
         assert_eq!(first.outcome(), GenerationOutcome::Applied);
-        assert_eq!(first.changes().written(), 5);
-        assert_eq!(changes.iter().flatten().count(), 5);
+        // Five interface fields and the management element's four.
+        assert_eq!(first.changes().written(), 9);
+        assert_eq!(changes.iter().flatten().count(), 9);
 
         store.stage(document(1, true).as_bytes()).expect("sound");
         let second = store.commit(&mut changes).expect("a candidate");
@@ -434,7 +435,7 @@ mod tests {
                 .expect("a candidate")
                 .changes()
                 .written(),
-            5
+            9
         );
 
         store.stage(one().as_bytes()).expect("sound");
@@ -477,7 +478,7 @@ mod tests {
 
         assert_eq!(outcome.generation(), Generation::from_bits(1));
         assert_eq!(outcome.changes().written(), 2);
-        assert_eq!(outcome.changes().dropped(), 3);
+        assert_eq!(outcome.changes().dropped(), 7);
         assert!(outcome.changes().overflowed());
         assert_eq!(store.running(), Generation::from_bits(1));
     }
@@ -500,13 +501,15 @@ mod tests {
             "</interfaces><neighbours>",
             "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" ",
             "mac=\"52:54:00:00:00:02\"/>",
-            "</neighbours></configuration>"
+            "</neighbours>",
+            "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
+            "</configuration>"
         );
         let mut changes = [None; ROOMY];
         store.stage(text.as_bytes()).expect("sound");
         let outcome = store.commit(&mut changes).expect("a candidate");
 
-        assert_eq!(outcome.changes().total(), 8);
+        assert_eq!(outcome.changes().total(), 12);
         let kinds: Vec<ObjectKind> = changes
             .iter()
             .flatten()
@@ -525,6 +528,13 @@ mod tests {
                 .filter(|kind| **kind == ObjectKind::Neighbour)
                 .count(),
             3
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == ObjectKind::Management)
+                .count(),
+            4
         );
     }
 

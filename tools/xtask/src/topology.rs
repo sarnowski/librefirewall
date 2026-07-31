@@ -25,10 +25,22 @@
 //! unclaimed, disables one, or attaches two stations to one port describes a
 //! bench this harness cannot play. That is refused by name here rather than
 //! silently reduced to the first two of something.
+//!
+//! # The management port is read out of the document too, station and all
+//!
+//! Its MAC and address are the `<management>` element's, so the guest NIC on it
+//! carries a MAC the appliance was configured with exactly as a dataplane port
+//! does. Its *station* is the one address on the bench the document does not
+//! name — there is no `<neighbour>` for a port that is not in the router's set —
+//! so it is DERIVED from the management prefix rather than written down: host 2
+//! of that prefix, which is where QEMU's own user-mode stack puts the gateway.
+//! A prefix with no room for a second host is refused by name, for the reason
+//! every other unplayable bench is.
 
 use std::{fmt, fs, path::Path};
 
 use config::{ConfigError, Identifier, Model};
+use net_headers::{Ipv4Address, prefix_mask};
 
 /// Dataplane ports the appliance is built with, and so the ports this harness
 /// plays a station on. A property of the build — the system description
@@ -43,6 +55,23 @@ struct AppliancePort {
     mac: [u8; 6],
     address: [u8; 4],
     prefix_length: u8,
+}
+
+/// The management port as the bench sees it: what the appliance answers at, and
+/// the station address the harness must speak from to be answered.
+///
+/// It is not an [`AppliancePort`] plus an [`Endpoint`]: there is no neighbour in
+/// the document to make an endpoint of, and no `port` number to index it by. The
+/// station is derived here so a bench cannot be stated between an address the
+/// appliance would refuse and a port that never claimed one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManagementPort {
+    pub(crate) mac: [u8; 6],
+    pub(crate) address: [u8; 4],
+    pub(crate) prefix_length: u8,
+    /// Host 2 of the management prefix, which the appliance's own document puts
+    /// QEMU's user-mode gateway at.
+    pub(crate) station: [u8; 4],
 }
 
 /// One host station on one dataplane port: the address the harness injects as,
@@ -73,6 +102,7 @@ impl Endpoint {
 pub(crate) struct Topology {
     ports: [AppliancePort; PORTS],
     endpoints: [Endpoint; PORTS],
+    management: ManagementPort,
 }
 
 impl Topology {
@@ -173,8 +203,13 @@ impl Topology {
             claimed.push(appliance);
             stations.push(endpoint);
         }
+        let management = management_port(model)?;
         match (claimed.try_into(), stations.try_into()) {
-            (Ok(ports), Ok(endpoints)) => Ok(Self { ports, endpoints }),
+            (Ok(ports), Ok(endpoints)) => Ok(Self {
+                ports,
+                endpoints,
+                management,
+            }),
             // Unreachable by the loop above, which pushes exactly `PORTS` of
             // each; the conversion is fallible and this is what that costs.
             _ => Err(TopologyError::PortBeyondTheBuild { port: PORTS }),
@@ -198,6 +233,13 @@ impl Topology {
         self.endpoints
     }
 
+    /// The management port, which is not one of [`Topology::endpoints`] and never
+    /// will be: CONCEPT §9.1 keeps it out of the dataplane, so no probe crosses
+    /// it and no routed contract is stated between it and anything.
+    pub(crate) fn management(&self) -> ManagementPort {
+        self.management
+    }
+
     /// Whether any interface prefix covers `address` — which is to say whether
     /// the appliance has a route for it. The harness needs an address it has
     /// none for, and "none" is a property of the document rather than of a
@@ -208,23 +250,63 @@ impl Topology {
             .any(|appliance| same_prefix(appliance.address, address, appliance.prefix_length))
     }
 
-    /// Whether `mac` belongs to an appliance port or to a station on the bench.
+    /// Whether `mac` belongs to anything on the bench: an appliance port, the
+    /// management port, or a station on one of them.
     pub(crate) fn carries_mac(&self, mac: [u8; 6]) -> bool {
         self.ports.iter().any(|appliance| appliance.mac == mac)
             || self.endpoints.iter().any(|endpoint| endpoint.mac == mac)
+            || self.management.mac == mac
     }
 }
 
-/// Whether two addresses share the first `prefix_length` bits.
-fn same_prefix(left: [u8; 4], right: [u8; 4], prefix_length: u8) -> bool {
-    let mask = match prefix_length {
-        0 => 0u32,
-        // `config` refuses a prefix length beyond 32, and a shift of exactly 32
-        // is undefined for a `u32`; both bounds are handled rather than assumed.
-        length if length >= 32 => u32::MAX,
-        length => u32::MAX << (32 - length),
+/// Read the `<management>` element as a bench: the port's own addressing, and the
+/// station address derived from its prefix.
+///
+/// # Errors
+/// [`TopologyError`] for a document with no management interface, one that is
+/// disabled, or one whose prefix has no room for a station beside the appliance.
+fn management_port(model: &Model) -> Result<ManagementPort, TopologyError> {
+    let Some(entry) = model.management() else {
+        return Err(TopologyError::NoManagementInterface);
     };
-    (u32::from_be_bytes(left) & mask) == (u32::from_be_bytes(right) & mask)
+    if !entry.enabled {
+        return Err(TopologyError::ManagementDisabled);
+    }
+    let address = entry.address.octets();
+    let station = management_station(address, entry.prefix_length)
+        .ok_or(TopologyError::ManagementPrefixHasNoStation { address })?;
+    Ok(ManagementPort {
+        mac: entry.mac.0,
+        address,
+        prefix_length: entry.prefix_length,
+        station,
+    })
+}
+
+/// Host 2 of the prefix `address` sits in, or `None` where that is not a second
+/// host address on the same link.
+///
+/// Host 2 rather than "the next free one" because it is where QEMU's user-mode
+/// stack puts its gateway, so an interactive `make run` reaches the port from the
+/// same address the harness speaks from. A `/31` or `/32` has no room for the
+/// pair, and a management address that IS host 2 would leave the station talking
+/// to itself; both are refused rather than nudged to a third value nobody wrote.
+fn management_station(address: [u8; 4], prefix_length: u8) -> Option<[u8; 4]> {
+    // A `/31` is two addresses and a `/32` is one, so neither holds the pair.
+    if prefix_length >= 31 {
+        return None;
+    }
+    let station = (u32::from_be_bytes(address) & prefix_mask(prefix_length)) | 2;
+    if station == u32::from_be_bytes(address) {
+        return None;
+    }
+    Some(station.to_be_bytes())
+}
+
+/// Whether two addresses share the first `prefix_length` bits, decided by the
+/// appliance's own mask rather than by a second copy of it here.
+fn same_prefix(left: [u8; 4], right: [u8; 4], prefix_length: u8) -> bool {
+    Ipv4Address::from_octets(left).shares_prefix(Ipv4Address::from_octets(right), prefix_length)
 }
 
 /// Why a document does not describe a bench this harness can play.
@@ -239,6 +321,9 @@ pub(crate) enum TopologyError {
     PortWithoutAStation { port: usize },
     PortWithSeveralStations { port: usize },
     NeighbourOnAnUnclaimedPort { id: Identifier },
+    NoManagementInterface,
+    ManagementDisabled,
+    ManagementPrefixHasNoStation { address: [u8; 4] },
 }
 
 impl fmt::Display for TopologyError {
@@ -283,6 +368,22 @@ impl fmt::Display for TopologyError {
                 "neighbour {:?} names an interface that claims no port of this build",
                 id.as_str()
             ),
+            Self::NoManagementInterface => f.write_str(
+                "the document has no <management> element, so the guest NIC on the management \
+                 port would carry a MAC the appliance has never been told about",
+            ),
+            Self::ManagementDisabled => f.write_str(
+                "the management interface is disabled, so the appliance would answer nothing \
+                 the bench puts on that port",
+            ),
+            Self::ManagementPrefixHasNoStation { address } => {
+                let [a, b, c, d] = address;
+                write!(
+                    f,
+                    "the management prefix around {a}.{b}.{c}.{d} has no room for a station \
+                     beside the appliance, so there is nobody for the endpoint to answer"
+                )
+            }
         }
     }
 }
@@ -306,6 +407,13 @@ mod tests {
         "</interfaces>"
     );
 
+    /// The management element the bench documents carry, on a prefix neither
+    /// interface claims and with room for a station at host 2.
+    const MANAGEMENT: &str = concat!(
+        "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
+        "prefix-length=\"24\" enabled=\"true\"/>"
+    );
+
     const NEIGHBOURS: &str = concat!(
         "<neighbours>",
         "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
@@ -316,7 +424,7 @@ mod tests {
     );
 
     fn whole() -> Vec<u8> {
-        document(&format!("{INTERFACES}{NEIGHBOURS}"))
+        document(&format!("{INTERFACES}{NEIGHBOURS}{MANAGEMENT}"))
     }
 
     #[test]
@@ -365,7 +473,7 @@ mod tests {
     #[test]
     fn the_bench_is_the_same_whichever_order_the_document_is_written_in() {
         let reversed = document(&format!(
-            "{}{}",
+            "{MANAGEMENT}{}{}",
             concat!(
                 "<interfaces>",
                 "<interface id=\"two\" port=\"1\" enabled=\"true\" mac=\"52:54:00:12:34:51\" ",
@@ -394,6 +502,111 @@ mod tests {
     }
 
     #[test]
+    fn the_management_port_and_its_station_come_out_of_the_document() {
+        let management = Topology::from_document(&whole())
+            .expect("a two-port bench")
+            .management();
+        assert_eq!(management.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+        assert_eq!(management.address, [10, 0, 2, 15]);
+        assert_eq!(management.prefix_length, 24);
+        assert_eq!(
+            management.station,
+            [10, 0, 2, 2],
+            "host 2 of the prefix, where QEMU's own user-mode gateway sits"
+        );
+    }
+
+    /// The management port is not one of the dataplane ports, and nothing about
+    /// the bench may confuse the two: its MAC belongs to nothing else, and no
+    /// endpoint the routed contract is stated between sits on its prefix.
+    #[test]
+    fn the_management_port_shares_nothing_with_the_dataplane() {
+        let topology = Topology::from_document(&whole()).expect("a two-port bench");
+        let management = topology.management();
+        for port in 0..PORTS {
+            assert_ne!(topology.port_mac(port), Ok(management.mac));
+        }
+        for endpoint in topology.endpoints() {
+            assert_ne!(endpoint.mac, management.mac);
+            assert_ne!(endpoint.address, management.address);
+        }
+        assert!(
+            !topology.covers(management.address),
+            "a dataplane prefix covering the management address would make one \
+             address reachable two ways"
+        );
+        assert!(!topology.covers(management.station));
+        // It is nevertheless on the bench, so a probe addressed to it is not
+        // addressed to nobody.
+        assert!(topology.carries_mac(management.mac));
+    }
+
+    #[test]
+    fn a_document_with_no_management_interface_or_a_disabled_one_is_refused() {
+        let absent = document(&format!("{INTERFACES}{NEIGHBOURS}"));
+        // `config` refuses it first: the element is required by the schema.
+        assert!(matches!(
+            Topology::from_document(&absent),
+            Err(TopologyError::Refused(_))
+        ));
+
+        let text = String::from_utf8(whole()).expect("ASCII");
+        let disabled = text.replacen(
+            "prefix-length=\"24\" enabled=\"true\"/>",
+            "prefix-length=\"24\" enabled=\"false\"/>",
+            1,
+        );
+        let error = Topology::from_document(disabled.as_bytes())
+            .expect_err("an unaddressed management port answers nothing");
+        assert_eq!(error, TopologyError::ManagementDisabled);
+        assert!(format!("{error}").contains("answer nothing"), "{error}");
+    }
+
+    /// A prefix with no second host has nobody for the endpoint to answer, and
+    /// the bench says so rather than inventing an address off the link.
+    #[test]
+    fn a_management_prefix_with_no_room_for_a_station_is_refused() {
+        let text = String::from_utf8(whole()).expect("ASCII");
+        for (prefix_length, address) in [(31u8, "10.0.2.15"), (32, "10.0.2.15")] {
+            let narrow = text.replacen(
+                "address=\"10.0.2.15\" prefix-length=\"24\" enabled=\"true\"",
+                &format!(
+                    "address=\"{address}\" prefix-length=\"{prefix_length}\" enabled=\"true\""
+                ),
+                1,
+            );
+            let error =
+                Topology::from_document(narrow.as_bytes()).expect_err("no room for a station");
+            assert_eq!(
+                error,
+                TopologyError::ManagementPrefixHasNoStation {
+                    address: [10, 0, 2, 15],
+                }
+            );
+        }
+        // And an appliance sitting *on* host 2 leaves the station talking to
+        // itself, which is refused rather than nudged elsewhere.
+        let collides = text.replacen("address=\"10.0.2.15\"", "address=\"10.0.2.2\"", 1);
+        assert_eq!(
+            Topology::from_document(collides.as_bytes()),
+            Err(TopologyError::ManagementPrefixHasNoStation {
+                address: [10, 0, 2, 2],
+            })
+        );
+    }
+
+    #[test]
+    fn a_station_is_derived_only_where_the_prefix_holds_one() {
+        assert_eq!(management_station([10, 0, 2, 15], 24), Some([10, 0, 2, 2]));
+        assert_eq!(management_station([10, 0, 2, 15], 16), Some([10, 0, 0, 2]));
+        assert_eq!(management_station([10, 0, 2, 15], 0), Some([0, 0, 0, 2]));
+        assert_eq!(management_station([10, 0, 2, 2], 24), None);
+        assert_eq!(management_station([10, 0, 2, 15], 31), None);
+        assert_eq!(management_station([10, 0, 2, 15], 32), None);
+        assert_eq!(management_station([10, 0, 2, 15], 255), None);
+    }
+
+    #[test]
     fn a_document_the_configuration_domain_refuses_is_refused_here_too() {
         let error = Topology::from_document(b"<!DOCTYPE evil><configuration/>")
             .expect_err("a doctype is refused before anything else");
@@ -404,7 +617,7 @@ mod tests {
     #[test]
     fn a_port_no_interface_claims_is_named_rather_than_left_carrying_an_invented_mac() {
         let one_port = document(&format!(
-            "{}{}",
+            "{}{}{MANAGEMENT}",
             concat!(
                 "<interfaces>",
                 "<interface id=\"one\" port=\"0\" enabled=\"true\" mac=\"52:54:00:12:34:50\" ",
@@ -426,7 +639,7 @@ mod tests {
     #[test]
     fn a_port_with_no_station_leaves_the_contract_nothing_to_be_stated_between() {
         let one_station = document(&format!(
-            "{INTERFACES}{}",
+            "{INTERFACES}{}{MANAGEMENT}",
             concat!(
                 "<neighbours>",
                 "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
@@ -443,7 +656,7 @@ mod tests {
     #[test]
     fn a_second_station_on_one_port_is_refused_rather_than_reduced_to_the_first() {
         let crowded = document(&format!(
-            "{INTERFACES}{}",
+            "{INTERFACES}{}{MANAGEMENT}",
             concat!(
                 "<neighbours>",
                 "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
@@ -530,6 +743,11 @@ mod tests {
             assert_ne!(a.address, b.address);
             assert_ne!(a.mac, b.mac);
             assert_ne!(topology.port_mac(0), topology.port_mac(1));
+            // And a management port that answers, on a prefix neither dataplane
+            // port routes into.
+            let management = topology.management();
+            assert!(!topology.covers(management.address));
+            assert_ne!(management.station, management.address);
         }
     }
 
@@ -557,5 +775,13 @@ mod tests {
             assert!(!alternate.covers(endpoint.address), "{}", endpoint.name());
             assert!(!alternate.carries_mac(endpoint.mac), "{}", endpoint.name());
         }
+        // Including the management port: scenario 3 proves the endpoint answers
+        // under the addressing it was configured with, which needs both
+        // documents to disagree about every value it uses.
+        assert_ne!(shipped.management().mac, alternate.management().mac);
+        assert_ne!(shipped.management().address, alternate.management().address);
+        assert_ne!(shipped.management().station, alternate.management().station);
+        assert!(!shipped.carries_mac(alternate.management().mac));
+        assert!(!alternate.carries_mac(shipped.management().mac));
     }
 }

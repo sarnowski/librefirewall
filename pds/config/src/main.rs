@@ -61,9 +61,9 @@ const CONFIG_XML: &[u8] = include_bytes!(env!("LIBREFIREWALL_CONFIG_PATH"));
 const CONSUMER: Channel = Channel::new(0);
 
 /// Room for every record one commit can produce: every object the handover
-/// image holds, in every field a record can name. Sized from the same two
-/// constants, so a document the image can carry cannot overrun this buffer.
-const MAX_CHANGES: usize = (MAX_INTERFACES + MAX_NEIGHBOURS) * Field::ALL.len();
+/// image holds — interfaces, neighbours and the one management interface — in
+/// every field a record can name, sized from the image's own constants.
+const MAX_CHANGES: usize = (MAX_INTERFACES + MAX_NEIGHBOURS + 1) * Field::ALL.len();
 
 #[protection_domain]
 fn init() -> ConfigDomain {

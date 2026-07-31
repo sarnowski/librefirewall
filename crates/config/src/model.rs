@@ -43,6 +43,17 @@ pub struct NeighbourEntry {
     pub mac: MacAddress,
 }
 
+/// The `<management>` element: the appliance's own presence on the port
+/// CONCEPT §9.1 keeps out of the dataplane. It carries no `id` and no `port` —
+/// one such port, not in the router's set, so neither has anything to select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagementEntry {
+    pub enabled: bool,
+    pub mac: MacAddress,
+    pub address: Ipv4Address,
+    pub prefix_length: u8,
+}
+
 /// A whole configuration.
 ///
 /// `Copy`, because a domain holds a running one beside a candidate one and
@@ -51,6 +62,7 @@ pub struct NeighbourEntry {
 pub struct Model {
     interfaces: [Option<InterfaceEntry>; MAX_INTERFACES],
     neighbours: [Option<NeighbourEntry>; MAX_NEIGHBOURS],
+    management: Option<ManagementEntry>,
 }
 
 impl Model {
@@ -59,6 +71,7 @@ impl Model {
     pub const EMPTY: Self = Self {
         interfaces: [None; MAX_INTERFACES],
         neighbours: [None; MAX_NEIGHBOURS],
+        management: None,
     };
 
     /// # Errors
@@ -117,9 +130,29 @@ impl Model {
         self.neighbours().find(|entry| entry.id == id)
     }
 
+    /// One port, one element, held here rather than only in the reader.
+    ///
+    /// # Errors
+    /// [`Full`] once an entry is held.
+    pub fn set_management(&mut self, entry: ManagementEntry) -> Result<(), Full> {
+        match self.management {
+            Some(_) => Err(Full),
+            None => {
+                self.management = Some(entry);
+                Ok(())
+            }
+        }
+    }
+
+    /// `None` for a configuration describing none, which generation 0 is.
+    #[must_use]
+    pub const fn management(&self) -> Option<ManagementEntry> {
+        self.management
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.interface_count() == 0 && self.neighbour_count() == 0
+        self.interface_count() == 0 && self.neighbour_count() == 0 && self.management.is_none()
     }
 
     /// The interfaces by id, whichever order they were written in. Both orders
@@ -132,6 +165,11 @@ impl Model {
 
     pub(crate) fn neighbours_by_id(&self) -> [Option<NeighbourEntry>; MAX_NEIGHBOURS] {
         by_id(&self.neighbours, |entry| entry.id)
+    }
+
+    /// The one-slot array shape the diff walks, so the same merge compares it.
+    pub(crate) fn management_slot(&self) -> [Option<ManagementEntry>; 1] {
+        [self.management]
     }
 }
 
@@ -311,6 +349,31 @@ mod tests {
         assert!(sorted.first().expect("a slot").is_some());
         assert!(sorted.iter().skip(1).all(Option::is_none));
         assert!(Model::EMPTY.interfaces_by_id().iter().all(Option::is_none));
+    }
+
+    pub(crate) fn management() -> ManagementEntry {
+        ManagementEntry {
+            enabled: true,
+            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+            address: Ipv4Address::from_octets([10, 0, 2, 15]),
+            prefix_length: 24,
+        }
+    }
+
+    #[test]
+    fn one_management_interface_is_held_and_a_second_is_refused() {
+        let mut model = Model::EMPTY;
+        assert_eq!(model.management(), None);
+        assert!(model.is_empty());
+        model.set_management(management()).expect("the first");
+        assert_eq!(model.management(), Some(management()));
+        assert_eq!(model.set_management(management()), Err(Full));
+        assert!(
+            !model.is_empty(),
+            "a configuration that addresses the management port is not empty"
+        );
+        assert_eq!(model.management_slot(), [Some(management())]);
+        assert_eq!(Model::EMPTY.management_slot(), [None]);
     }
 
     #[test]

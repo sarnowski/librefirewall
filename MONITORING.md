@@ -216,10 +216,10 @@ written waits forever:
 |---|---|---|
 | `config` | `starting`, then `ready` **or** `refused` | none |
 | `forwarder` | `starting` only | none |
-| `nic-driver` (once per port, two instances) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
+| `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused` | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -270,14 +270,22 @@ holding a silent appliance still has only the external act.
   frame, so a burst of a hundred frames produces as few records as the scheduler allows and a reader
   must not infer a frame boundary from a record. The counts belong on the metrics endpoint of
   CONCEPT §11 and will move there when it exists; until then this record is where they live, and it
-  is the only place. Two counters behind them reach no surface at all — descriptors naming a span
-  outside the pool, and returns the pool owner's ring would not take — so a management port whose
-  driver is misbehaving is not distinguishable here from one that is idle.
+  is the only place.
+
+  **Everything else that port knows about itself reaches no surface at all**, and the list grew when
+  the port became an addressed endpoint: descriptors naming a span outside the pool, returns the pool
+  owner's ring would not take, and now every outcome the endpoint distinguishes — ARP replies and echo
+  replies sent, frames not addressed to it, each reason a frame went unhandled, malformed frames, and
+  replies it composed and could not send. So `frames=` and `bytes=` say the port is *receiving* and
+  nothing on this surface says whether it is *answering*: that is asserted by the QEMU gate against
+  the wire (README's port-role-model row) and will be readable on `/metrics` when one exists.
 
   `management` never reports `refused`, and unlike the console's silence that is not the shape of a
   failure: the domain has no device to answer it and no build datum to judge, so there is no third
   outcome for a refusal to name. It reaches its event loop or it faults, and a fault is the Microkit
-  monitor's to report.
+  monitor's to report. **An unaddressed port is not a refusal either** — before the first commit, and
+  under a configuration that disables the interface, the port takes frames and answers nothing, which
+  is `ready` with a rising count and no reply on the wire.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. `signalled` says whether the
   device was told to stop (`STATUS_FAILED` written) or was left decoding nothing, which depends on
   whether its BAR had been placed when the rejection happened. `detail=` carries up to two numbers,
@@ -349,19 +357,23 @@ LFW-CFG generation=<n> rejected=<reason> offset=<n>
 the volume of a commit is the size of its diff.
 
 - `change=` is **`added`**, **`removed`** or **`modified`**.
-- `object=` is **`interface`** or **`neighbour`**.
+- `object=` is **`interface`**, **`neighbour`** or **`management`**.
 - `key=` is the object's `id` from the document — its stable identity, so reordering the document
-  produces no records at all.
+  produces no records at all. The `<management>` element has none, a document holding exactly one, so
+  a record about it reads `key=management`: the two keys are the same word and neither is derived from
+  the other.
 - `field=` is **`port`**, **`enabled`**, **`mac`**, **`address`**, **`prefix-length`** or
   **`interface`**, spelled as the document's own attribute. Not every field belongs to every object:
   an `interface` carries `port`, `enabled`, `mac`, `address`, `prefix-length`; a `neighbour` carries
-  `mac`, `address`, `interface`. A pairing outside those is not written.
+  `mac`, `address`, `interface`; `management` carries `enabled`, `mac`, `address`, `prefix-length` —
+  it has no `port`, being no part of the router's port set. A pairing outside those is not written.
 - `from=` is absent exactly when the object was added, `to=` exactly when it was removed. A
   `modified` record carries both.
 - Values render by their type: `port` and `prefix-length` decimal, `enabled` `true|false`, `mac` as
   `52:54:00:12:34:50` (lower case), `address` as a dotted quad, `interface` as the referenced id.
-- Records are ordered interfaces first then neighbours, by id, then by the field order listed above.
-  Two runs over one pair of configurations produce byte-identical output.
+- Records are ordered interfaces first, then neighbours, then the management interface, by id within
+  each, then by the field order listed above. Two runs over one pair of configurations produce
+  byte-identical output.
 
 **Generation outcome** — what a commit or a switch did. `outcome=` is **`applied`** (the generation
 is now in force; `changes=` is the size of its whole diff, even where more records were produced
@@ -383,11 +395,16 @@ unterminated, mismatched or misplaced constructs all read as `malformed`, becaus
 to the same place and a finer token would name an internal parser state rather than something an
 operator can go and fix.
 
-A refusal changes nothing — whatever was running stays running — but the two readers that can raise
-one label it differently, and the label is the reliable way to tell them apart. The publishing
-domain refusing a **document** writes the generation still **running**, because no generation was
-ever assigned to the text it rejected. The forwarding domain refusing an **offered image** writes
-the generation that image **claimed**, that being the only identity the offer had.
+A refusal changes nothing — whatever was running stays running — but the readers that can raise one
+label it differently, and the label is the reliable way to tell them apart. The publishing domain
+refusing a **document** writes the generation still **running**, because no generation was ever
+assigned to the text it rejected. The forwarding domain refusing an **offered image** writes the
+generation that image **claimed**, that being the only identity the offer had. The **management**
+domain can raise one too, and it is the one refusal that changes nothing anywhere: it reads the
+*committed* generation to learn its own addressing, so an image it will not read is one the forwarder
+has already staged and the publisher has already released. The port goes on carrying the addressing
+it had, and `offset=` on such a record is the value that was refused rather than an index into
+anything.
 
 ### Two things an operator will otherwise read wrong
 

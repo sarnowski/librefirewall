@@ -10,6 +10,7 @@ queue = { path = "../queue" }
 packet-buffer = { path = "../packet-buffer" }
 net-headers = { path = "../net-headers" }
 routing = { path = "../routing" }
+lfw-ip-endpoint = { path = "../ip-endpoint" }
 lfw-log = { path = "../log" }
 
 [dev-dependencies]

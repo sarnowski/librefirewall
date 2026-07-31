@@ -8,17 +8,37 @@
 //!
 //! # The management port is a different kind of thing, not a third port
 //!
-//! It is not in [`PORTS`], carries no [`Endpoint`], and no probe crosses it: the
-//! routed contract must never expect it to forward anything, because CONCEPT
-//! §9.1 says it carries no forwarded traffic. What it gets instead is
-//! [`MANAGEMENT_FRAMES`] injected once — at the point the capture proves every
-//! port is up, so an exact count is possible — and one standing prohibition that
-//! holds for every boot: **no frame may ever come back on it**. Nothing in the
-//! appliance produces onto that port's transmit pipeline, so a frame arriving
-//! there would mean either that something does or that the forwarder has reached
-//! a port it is granted no region of. What was injected travels back to the
-//! caller as a [`ManagementInjection`] for `management_contract` to judge the
-//! console against.
+//! It is not in [`PORTS`], carries no [`Endpoint`], and **no probe crosses it**:
+//! the routed contract must never expect it to forward anything, because CONCEPT
+//! §9.1 says it carries no forwarded traffic. What it gets instead is a contract
+//! of its own, injected once at the point the capture proves every port is up so
+//! an exact count is possible:
+//!
+//! * [`MANAGEMENT_FRAMES`] opaque frames, whose only purpose is to be counted —
+//!   four different lengths, so the console's byte total is evidence rather than
+//!   a multiple of one number;
+//! * an **ARP request** for the management address, which must be answered with
+//!   the MAC the document gives that port;
+//! * an **ICMP echo request** to it, which must be answered with a reply
+//!   carrying the same identifier, sequence and payload and a valid checksum.
+//!
+//! Both replies are decoded field by field by this harness's own reader, never
+//! matched as bytes and never as text: a reply built by the appliance's own
+//! builder and compared against the appliance's own expectation would agree with
+//! itself. What was injected travels back to the caller as a
+//! [`ManagementInjection`] for `management_contract` to judge the console
+//! against.
+//!
+//! # The isolation is asserted in both directions, not described
+//!
+//! CONCEPT §9.1's mutual exclusion is two prohibitions, and a boot must satisfy
+//! both: **no frame the harness put on the management wire may appear on either
+//! dataplane port**, and **no dataplane probe may appear on the management
+//! port**. Neither is a property of what the appliance was asked to do — it is a
+//! property of a grant set no domain spans — so each is a machine-checked
+//! assertion here rather than a sentence in the system description. The only
+//! frames that may come back on the management port at all are the two replies
+//! above, exactly once each: the port answers for itself and forwards nothing.
 //!
 //! The primary contract, [`BootContract::Routed`], is the system's real
 //! observable behaviour. The guest is an IPv4 router between two directly
@@ -69,8 +89,8 @@ use std::{
 };
 
 use crate::management_contract::{self, ManagementInjection};
-use crate::qemu::{MANAGEMENT_MAC, every_guest_nic};
-use crate::topology::{Endpoint, PORTS, Topology};
+use crate::qemu::every_guest_nic;
+use crate::topology::{Endpoint, ManagementPort, PORTS, Topology};
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
 /// TCG (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
@@ -107,6 +127,7 @@ const MIN_ETHERNET_FRAME: usize = 60;
 /// larger means a corrupt stream, not a jumbo frame.
 const MAX_WIRE_FRAME: usize = 65535;
 
+const MAC_PAIR_LEN: usize = 12;
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
@@ -134,10 +155,35 @@ const FOREIGN_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x99, 0x99, 0x99];
 
 /// The station the harness plays on the management wire.
 ///
-/// A constant here rather than a document entry for the same reason
-/// `crate::qemu::MANAGEMENT_MAC` is: the port has no `<interface>`, so it has no
-/// `<neighbour>` either. It moves into the document beside that one.
+/// The one address on the bench the document does not name, and the reason is the
+/// port itself: it is not in the router's port set, so it has no `<neighbour>`
+/// for a station to be. Its *address* is derived from the management prefix
+/// (`crate::topology`); only this MAC is the harness's own, and the tests below
+/// hold it to belonging to nothing on either bench.
 const MANAGEMENT_STATION_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x0c];
+
+/// The identifier, sequence and payload the echo request carries, and so exactly
+/// what its reply must carry back (RFC 792). None of the three is derivable from
+/// the frame the appliance received, so a reply that reproduces all three
+/// reproduces the request rather than a shape.
+const ECHO_IDENTIFIER: u16 = 0x4c46;
+const ECHO_SEQUENCE: u16 = 0x2711;
+const ECHO_PAYLOAD: &[u8] = b"LFW-PROBE/mgmt-echo-0123456789";
+
+/// The TTL an echo reply is expected to leave with. It is not the request's
+/// decremented: a reply is a new datagram, and this is what
+/// `net_headers::EchoReply::TTL` puts on one.
+const ECHO_REPLY_TTL: u8 = 64;
+
+const ARP_ETHERTYPE: u16 = 0x0806;
+const ARP_PAYLOAD_LEN: usize = 28;
+const ARP_FRAME_LEN: usize = ETHERNET_HEADER_LEN + ARP_PAYLOAD_LEN;
+const ARP_REQUEST: u16 = 1;
+const ARP_REPLY: u16 = 2;
+const ICMP_PROTOCOL: u8 = 1;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMP_HEADER_LEN: usize = 8;
 
 /// The lengths of the frames injected into the management port, and the whole of
 /// what the console's byte total is judged against.
@@ -150,10 +196,15 @@ const MANAGEMENT_STATION_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x0c];
 /// delivers is the length written.
 const MANAGEMENT_FRAMES: [usize; 4] = [60, 64, 100, 128];
 
-/// The marker every management frame carries, so a frame of this harness's on
-/// that wire is never confused with a dataplane probe's — and so a frame coming
-/// back on the management port is attributable rather than merely unexpected.
-const MANAGEMENT_MARKER: &[u8] = b"LFW-PROBE/management";
+/// The marker every *opaque* management frame carries, so a frame of this
+/// harness's on that wire is never confused with a dataplane probe's — and so a
+/// frame coming back on the management port is attributable rather than merely
+/// unexpected.
+///
+/// It is deliberately not a prefix of [`ECHO_PAYLOAD`]: the two must be
+/// distinguishable as byte strings, or a returned echo reply would read as an
+/// opaque frame the endpoint should never have answered.
+const MANAGEMENT_MARKER: &[u8] = b"LFW-PROBE/mgmt-opaque";
 
 /// The UDP port pair every probe uses. Fixed rather than varied per probe: the
 /// payload marker is what attributes a delivery, so a second varying field
@@ -1059,17 +1110,18 @@ impl NicBackends {
     }
 }
 
-/// One frame for the management port: addressed at L2 to the port's own MAC from
-/// the harness's station, carrying the marker and padded to `len`.
+/// One opaque frame for the management port: addressed at L2 to the port's own
+/// MAC from the harness's station, carrying the marker and padded to `len`.
 ///
-/// It is deliberately not IPv4. Nothing in the appliance parses a management
-/// frame yet — the domain counts descriptors — so a datagram here would be a
-/// shape the contract implied a meaning for and nothing read. The EtherType is
-/// the same local-experimental one [`legacy_broadcast_frame`] uses, for the same
-/// reason: it names no protocol anything will one day route by accident.
-fn management_frame(len: usize) -> Vec<u8> {
+/// It is deliberately not a protocol the endpoint answers. Its whole purpose is
+/// to be *counted*, so the EtherType is the local-experimental one
+/// [`legacy_broadcast_frame`] uses — it names no protocol anything will one day
+/// route by accident — and the appliance must take it, count it, and say nothing
+/// back. A frame the endpoint answered would make the console's byte total and
+/// the reply contract two views of the same event.
+fn management_frame(management: &ManagementPort, len: usize) -> Vec<u8> {
     let mut frame = Vec::with_capacity(len);
-    frame.extend_from_slice(&MANAGEMENT_MAC);
+    frame.extend_from_slice(&management.mac);
     frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
     frame.extend_from_slice(&LOCAL_EXPERIMENTAL_ETHERTYPE.to_be_bytes());
     frame.extend_from_slice(MANAGEMENT_MARKER);
@@ -1077,22 +1129,505 @@ fn management_frame(len: usize) -> Vec<u8> {
     frame
 }
 
-/// The frames one boot puts on the management wire, and what they oblige the
-/// appliance to report.
+/// The ARP request the harness asks the management address with: broadcast at
+/// L2, from the station's own pair, unpadded at 42 bytes.
 ///
-/// Every length is at or above the Ethernet minimum, so `resize` only ever pads
-/// and the byte total is exactly the sum of [`MANAGEMENT_FRAMES`] — which is the
-/// number `management_contract` holds the console to.
-fn management_probe() -> (Vec<Vec<u8>>, ManagementInjection) {
-    let frames: Vec<Vec<u8>> = MANAGEMENT_FRAMES
-        .iter()
-        .map(|len| management_frame(*len))
-        .collect();
-    let injection = ManagementInjection {
-        frames: frames.len(),
-        bytes: frames.iter().map(|frame| frame.len() as u64).sum(),
+/// Unpadded on purpose. A real endpoint sees both shapes, and 42 bytes is the one
+/// that catches a parser reading a fixed 60-byte payload.
+fn management_arp_request(management: &ManagementPort) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(ARP_FRAME_LEN);
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    frame.push(6);
+    frame.push(4);
+    frame.extend_from_slice(&ARP_REQUEST.to_be_bytes());
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&management.station);
+    frame.extend_from_slice(&[0; 6]);
+    frame.extend_from_slice(&management.address);
+    frame
+}
+
+/// The ICMP echo request the harness pings the management address with, from the
+/// station's own pair at both layers.
+fn management_echo_request(management: &ManagementPort) -> Vec<u8> {
+    let mut icmp = Vec::with_capacity(ICMP_HEADER_LEN + ECHO_PAYLOAD.len());
+    icmp.push(ICMP_ECHO_REQUEST);
+    icmp.push(0);
+    icmp.extend_from_slice(&[0, 0]);
+    icmp.extend_from_slice(&ECHO_IDENTIFIER.to_be_bytes());
+    icmp.extend_from_slice(&ECHO_SEQUENCE.to_be_bytes());
+    icmp.extend_from_slice(ECHO_PAYLOAD);
+    let checksum = message_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + icmp.len());
+    frame.extend_from_slice(&management.mac);
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    let mut ip = [0u8; IPV4_HEADER_LEN];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + icmp.len()) as u16).to_be_bytes());
+    ip[8] = INJECTED_TTL;
+    ip[9] = ICMP_PROTOCOL;
+    ip[12..16].copy_from_slice(&management.station);
+    ip[16..20].copy_from_slice(&management.address);
+    let checksum = header_checksum(&ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+/// The RFC 1071 ones' complement sum over a whole block whose checksum field is
+/// treated as zero, for a message this harness composes.
+///
+/// [`header_checksum`] is the same arithmetic over a fixed-size IPv4 header; this
+/// is the variable-length case, and both are written independently of the
+/// appliance's own routine — the value of the check is that the two were arrived
+/// at separately.
+fn message_checksum(message: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for index in 0..message.len().div_ceil(2) {
+        let high = message[index * 2];
+        let low = message.get(index * 2 + 1).copied().unwrap_or(0);
+        let pair = u16::from_be_bytes([high, low]);
+        // The field is part of its own input, so it is summed as zero.
+        if index != 1 {
+            sum += u32::from(pair);
+        }
+    }
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// What one boot puts on the management wire: the frames, and what the appliance
+/// owes in return.
+struct ManagementProbe {
+    /// In injection order: the opaque frames, then the ARP request, then the
+    /// echo request.
+    frames: Vec<Vec<u8>>,
+    /// The bench the expectations are stated against.
+    port: ManagementPort,
+}
+
+/// Which of the two replies a frame off the management wire was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagementReply {
+    Arp,
+    Echo,
+}
+
+impl ManagementProbe {
+    /// The two replies as evidence, in the voice of the routed-traffic lines: a
+    /// reader sees *that* the port answered and with which values. Every field
+    /// printed is one `judge` refused the frame for not carrying, so this is a
+    /// rendering of what was proved rather than a second reading of the wire.
+    fn answered(&self, reply: ManagementReply) -> String {
+        let port = &self.port;
+        match reply {
+            ManagementReply::Arp => format!(
+                "  answered   arp-request           station->mgmt  who-has {} tell {}  \
+                 is-at {}",
+                ipv4(port.address),
+                ipv4(port.station),
+                mac(port.mac)
+            ),
+            ManagementReply::Echo => format!(
+                "  answered   icmp-echo-request     station->mgmt  {} -> {}  id {ECHO_IDENTIFIER:#06x} \
+                 seq {ECHO_SEQUENCE:#06x}  ttl {ECHO_REPLY_TTL}",
+                ipv4(port.station),
+                ipv4(port.address)
+            ),
+        }
+    }
+
+    /// Every frame one boot injects, and what it obliges the console to report.
+    ///
+    /// The count and the byte total are derived from the frames themselves, so the
+    /// console contract cannot come to be stated against a second copy of them.
+    fn new(management: ManagementPort) -> (Self, ManagementInjection) {
+        let mut frames: Vec<Vec<u8>> = MANAGEMENT_FRAMES
+            .iter()
+            .map(|len| management_frame(&management, *len))
+            .collect();
+        frames.push(management_arp_request(&management));
+        frames.push(management_echo_request(&management));
+        let injection = ManagementInjection {
+            frames: frames.len(),
+            bytes: frames.iter().map(|frame| frame.len() as u64).sum(),
+        };
+        (
+            Self {
+                frames,
+                port: management,
+            },
+            injection,
+        )
+    }
+
+    /// Judge one frame that came back on the management wire.
+    ///
+    /// # Errors
+    /// The verdict. Every frame on this wire is either one of the two replies the
+    /// endpoint owes or a frame the port must never have put there — a dataplane
+    /// probe that leaked across the isolation boundary, or something the
+    /// appliance originated that nothing asked for.
+    fn judge(&self, frame: &[u8], probes: &[Probe]) -> Result<ManagementReply, String> {
+        for probe in probes {
+            if contains(frame, probe.marker) {
+                return Err(format!(
+                    "probe {} came back on the management port. CONCEPT §9.1 isolates that port \
+                     from the dataplane, and no domain is granted a region on both sides of it, so \
+                     a dataplane frame reaching it means one of those grants has changed",
+                    probe.name
+                ));
+            }
+        }
+        if contains(frame, MANAGEMENT_MARKER) {
+            return Err(format!(
+                "an opaque management frame of {} bytes came back. Those frames carry a protocol \
+                 the endpoint answers nothing for: it must count them and say nothing",
+                frame.len()
+            ));
+        }
+        let ether_type = frame
+            .get(MAC_PAIR_LEN..ETHERNET_HEADER_LEN)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+        match ether_type {
+            Some(ARP_ETHERTYPE) => self.judge_arp(frame).map(|()| ManagementReply::Arp),
+            Some(IPV4_ETHERTYPE) => self.judge_echo(frame).map(|()| ManagementReply::Echo),
+            other => Err(format!(
+                "a {} byte frame with EtherType {} came back on the management port, and the \
+                 endpoint answers ARP and ICMP echo alone",
+                frame.len(),
+                match other {
+                    Some(value) => format!("0x{value:04x}"),
+                    None => String::from("(too short to have one)"),
+                }
+            )),
+        }
+    }
+
+    /// The ARP reply the request obliges: our request's sender as the target, and
+    /// the management port's own pair as the sender.
+    fn judge_arp(&self, frame: &[u8]) -> Result<(), String> {
+        let reply = decode_arp(frame)?;
+        let expected = ArpFrame {
+            destination_mac: MANAGEMENT_STATION_MAC,
+            source_mac: self.port.mac,
+            operation: ARP_REPLY,
+            sender_mac: self.port.mac,
+            sender_address: self.port.address,
+            target_mac: MANAGEMENT_STATION_MAC,
+            target_address: self.port.station,
+        };
+        if reply == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "the ARP reply on the management port departs from the contract in {}",
+            arp_differences(&expected, &reply).join("; ")
+        ))
+    }
+
+    /// The echo reply the request obliges: the addresses reversed, and the echo
+    /// repeated to the byte.
+    fn judge_echo(&self, frame: &[u8]) -> Result<(), String> {
+        let reply = decode_echo(frame)?;
+        let expected = EchoFrame {
+            destination_mac: MANAGEMENT_STATION_MAC,
+            source_mac: self.port.mac,
+            source: self.port.address,
+            destination: self.port.station,
+            ttl: ECHO_REPLY_TTL,
+            message_type: ICMP_ECHO_REPLY,
+            code: 0,
+            identifier: ECHO_IDENTIFIER,
+            sequence: ECHO_SEQUENCE,
+            payload: ECHO_PAYLOAD.to_vec(),
+        };
+        if reply == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "the ICMP echo reply on the management port departs from the contract in {}",
+            echo_differences(&expected, &reply).join("; ")
+        ))
+    }
+}
+
+/// An ARP frame as fields, read back by this harness's own reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArpFrame {
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    operation: u16,
+    sender_mac: [u8; 6],
+    sender_address: [u8; 4],
+    target_mac: [u8; 6],
+    target_address: [u8; 4],
+}
+
+/// Read an ARP-over-Ethernet frame, refusing anything that is not IPv4 over
+/// Ethernet.
+///
+/// # Errors
+/// The verdict, naming the value that refused it. Padding past the 28-byte
+/// payload is ignored, as an endpoint must ignore it.
+fn decode_arp(frame: &[u8]) -> Result<ArpFrame, String> {
+    let Some(bytes) = frame.get(..ARP_FRAME_LEN) else {
+        return Err(format!(
+            "{} bytes is short of the {ARP_FRAME_LEN} an ARP frame needs",
+            frame.len()
+        ));
     };
-    (frames, injection)
+    let hardware = u16::from_be_bytes([bytes[14], bytes[15]]);
+    let protocol = u16::from_be_bytes([bytes[16], bytes[17]]);
+    if hardware != 1 || protocol != IPV4_ETHERTYPE || bytes[18] != 6 || bytes[19] != 4 {
+        return Err(format!(
+            "the ARP reply names hardware type {hardware}, protocol type 0x{protocol:04x} and              address lengths {}/{}, which is not IPv4 over Ethernet",
+            bytes[18], bytes[19]
+        ));
+    }
+    let six = |at: usize| -> [u8; 6] {
+        let mut out = [0u8; 6];
+        out.copy_from_slice(&bytes[at..at + 6]);
+        out
+    };
+    let four = |at: usize| -> [u8; 4] {
+        let mut out = [0u8; 4];
+        out.copy_from_slice(&bytes[at..at + 4]);
+        out
+    };
+    Ok(ArpFrame {
+        destination_mac: six(0),
+        source_mac: six(6),
+        operation: u16::from_be_bytes([bytes[20], bytes[21]]),
+        sender_mac: six(22),
+        sender_address: four(28),
+        target_mac: six(32),
+        target_address: four(38),
+    })
+}
+
+/// An ICMP echo frame as fields, read back by this harness's own reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EchoFrame {
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    source: [u8; 4],
+    destination: [u8; 4],
+    ttl: u8,
+    message_type: u8,
+    code: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: Vec<u8>,
+}
+
+/// Read an ICMP-over-IPv4 frame, validating both checksums and every length the
+/// field view rests on.
+///
+/// # Errors
+/// The verdict, naming the value that refused it.
+fn decode_echo(frame: &[u8]) -> Result<EchoFrame, String> {
+    let Some((ethernet, after_ethernet)) = frame.split_first_chunk::<ETHERNET_HEADER_LEN>() else {
+        return Err(format!(
+            "{} bytes is short of an Ethernet header",
+            frame.len()
+        ));
+    };
+    let Some((ip, after_ip)) = after_ethernet.split_first_chunk::<IPV4_HEADER_LEN>() else {
+        return Err(format!(
+            "{} bytes leave no room for an IPv4 header",
+            after_ethernet.len()
+        ));
+    };
+    if ip[0] != 0x45 {
+        return Err(format!(
+            "the reply's version/IHL byte is 0x{:02x} rather than 0x45",
+            ip[0]
+        ));
+    }
+    let found = u16::from_be_bytes([ip[10], ip[11]]);
+    let computed = header_checksum(ip);
+    if found != computed {
+        return Err(format!(
+            "the reply's IPv4 checksum is 0x{found:04x} where 0x{computed:04x} was required"
+        ));
+    }
+    if ip[9] != ICMP_PROTOCOL {
+        return Err(format!("IP protocol {} is not ICMP", ip[9]));
+    }
+    let total_length = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    let Some(message_len) = total_length.checked_sub(IPV4_HEADER_LEN) else {
+        return Err(format!(
+            "total length {total_length} is below the IPv4 header"
+        ));
+    };
+    let Some(message) = after_ip.get(..message_len) else {
+        return Err(format!(
+            "total length {total_length} exceeds the {}-byte frame",
+            frame.len()
+        ));
+    };
+    let Some((icmp, payload)) = message.split_first_chunk::<ICMP_HEADER_LEN>() else {
+        return Err(format!(
+            "{message_len} bytes leave no room for an ICMP echo header"
+        ));
+    };
+    let found = u16::from_be_bytes([icmp[2], icmp[3]]);
+    let computed = message_checksum(message);
+    if found != computed {
+        return Err(format!(
+            "the reply's ICMP checksum is 0x{found:04x} where 0x{computed:04x} was required"
+        ));
+    }
+    let mut destination_mac = [0u8; 6];
+    destination_mac.copy_from_slice(&ethernet[..6]);
+    let mut source_mac = [0u8; 6];
+    source_mac.copy_from_slice(&ethernet[6..12]);
+    let mut source = [0u8; 4];
+    source.copy_from_slice(&ip[12..16]);
+    let mut destination = [0u8; 4];
+    destination.copy_from_slice(&ip[16..20]);
+    Ok(EchoFrame {
+        destination_mac,
+        source_mac,
+        source,
+        destination,
+        ttl: ip[8],
+        message_type: icmp[0],
+        code: icmp[1],
+        identifier: u16::from_be_bytes([icmp[4], icmp[5]]),
+        sequence: u16::from_be_bytes([icmp[6], icmp[7]]),
+        payload: payload.to_vec(),
+    })
+}
+
+/// Name every field in which an ARP reply departs from its contract, so a
+/// verdict says which one the endpoint got wrong rather than that a frame was
+/// wrong.
+fn arp_differences(expected: &ArpFrame, observed: &ArpFrame) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut note = |name: &str, left: String, right: String| {
+        if left != right {
+            found.push(format!("{name} {right} (expected {left})"));
+        }
+    };
+    note(
+        "destination MAC",
+        mac(expected.destination_mac),
+        mac(observed.destination_mac),
+    );
+    note(
+        "source MAC",
+        mac(expected.source_mac),
+        mac(observed.source_mac),
+    );
+    note(
+        "operation",
+        expected.operation.to_string(),
+        observed.operation.to_string(),
+    );
+    note(
+        "sender MAC",
+        mac(expected.sender_mac),
+        mac(observed.sender_mac),
+    );
+    note(
+        "sender address",
+        ipv4(expected.sender_address),
+        ipv4(observed.sender_address),
+    );
+    note(
+        "target MAC",
+        mac(expected.target_mac),
+        mac(observed.target_mac),
+    );
+    note(
+        "target address",
+        ipv4(expected.target_address),
+        ipv4(observed.target_address),
+    );
+    found
+}
+
+/// As [`arp_differences`], for an echo reply.
+fn echo_differences(expected: &EchoFrame, observed: &EchoFrame) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut note = |name: &str, left: String, right: String| {
+        if left != right {
+            found.push(format!("{name} {right} (expected {left})"));
+        }
+    };
+    note(
+        "destination MAC",
+        mac(expected.destination_mac),
+        mac(observed.destination_mac),
+    );
+    note(
+        "source MAC",
+        mac(expected.source_mac),
+        mac(observed.source_mac),
+    );
+    note(
+        "source address",
+        ipv4(expected.source),
+        ipv4(observed.source),
+    );
+    note(
+        "destination address",
+        ipv4(expected.destination),
+        ipv4(observed.destination),
+    );
+    note("TTL", expected.ttl.to_string(), observed.ttl.to_string());
+    note(
+        "ICMP type",
+        expected.message_type.to_string(),
+        observed.message_type.to_string(),
+    );
+    note(
+        "ICMP code",
+        expected.code.to_string(),
+        observed.code.to_string(),
+    );
+    note(
+        "identifier",
+        format!("0x{:04x}", expected.identifier),
+        format!("0x{:04x}", observed.identifier),
+    );
+    note(
+        "sequence",
+        format!("0x{:04x}", expected.sequence),
+        format!("0x{:04x}", observed.sequence),
+    );
+    if expected.payload != observed.payload {
+        found.push(format!(
+            "payload: {}",
+            byte_difference(&expected.payload, &observed.payload)
+        ));
+    }
+    found
+}
+
+/// Whether a frame carries anything only the management wire's traffic does: the
+/// port's own MAC, or the harness's station on it.
+///
+/// Both belong to nothing else on either bench (`crate::qemu`'s and
+/// `crate::topology`'s tests hold them to it), so either appearing in a frame on
+/// a dataplane port is the isolation CONCEPT §9.1 requires having stopped being
+/// true — in the direction no console record would ever show.
+fn carries_management_traffic(frame: &[u8], management: &ManagementPort) -> bool {
+    contains(frame, MANAGEMENT_MARKER)
+        || contains(frame, &management.mac)
+        || contains(frame, &MANAGEMENT_STATION_MAC)
 }
 
 /// An [`Endpoint`] joined to the QEMU socket that carries its port's traffic.
@@ -1128,6 +1663,44 @@ impl AttachedEndpoint {
 struct ManagementWire {
     wire: TcpStream,
     injection_failure: Option<io::Error>,
+    /// Which of the two replies has arrived and been accepted. Both must, and
+    /// each exactly once: the endpoint answers a request, and a second answer to
+    /// one request is a frame nothing asked for.
+    arp_reply: bool,
+    echo_reply: bool,
+}
+
+impl ManagementWire {
+    /// Whether the port has answered everything it owes.
+    fn answered(&self) -> bool {
+        self.arp_reply && self.echo_reply
+    }
+
+    /// Which replies are still outstanding, as a clause for a verdict.
+    fn outstanding(&self) -> String {
+        match (self.arp_reply, self.echo_reply) {
+            (true, true) => String::from("none"),
+            (false, true) => String::from("the ARP reply"),
+            (true, false) => String::from("the ICMP echo reply"),
+            (false, false) => String::from("the ARP reply and the ICMP echo reply"),
+        }
+    }
+
+    /// Record one accepted reply, refusing a second of the same kind.
+    fn accept(&mut self, reply: ManagementReply) -> Result<(), String> {
+        let seen = match reply {
+            ManagementReply::Arp => &mut self.arp_reply,
+            ManagementReply::Echo => &mut self.echo_reply,
+        };
+        if *seen {
+            return Err(format!(
+                "a second {reply:?} reply came back on the management port. One request is one \
+                 reply, and the harness injects each exactly once"
+            ));
+        }
+        *seen = true;
+        Ok(())
+    }
 }
 
 impl ManagementWire {
@@ -1164,8 +1737,10 @@ fn describe_management(
         );
     }
     format!(
-        "{} management frames of {} bytes were injected",
-        injected.frames, injected.bytes
+        "{} management frames of {} bytes were injected, and the port still owes {}",
+        injected.frames,
+        injected.bytes,
+        wire.outstanding()
     )
 }
 
@@ -1199,6 +1774,11 @@ pub struct Booted {
     /// contract that failed first — and `management_contract::judge` refuses an
     /// empty one rather than reading two zeroes as agreement.
     pub management: ManagementInjection,
+    /// One line per reply the management port owed and gave, in the order they
+    /// were accepted. Empty exactly when the run had no routed contract to meet:
+    /// a routed run that reached its verdict answered both, the wait for them
+    /// being what ends it.
+    pub management_replies: Vec<String>,
 }
 
 /// Spawn the prepared QEMU `command` (which must carry this harness's NIC
@@ -1271,8 +1851,9 @@ fn run_boot(
     let mut broke: Option<usize> = None;
     // What reached the management wire, which stays empty on every path that
     // never got as far as sending it.
-    let (management_frames, injection) = management_probe();
+    let (management_probe, injection) = ManagementProbe::new(test.topology.management());
     let mut injected = ManagementInjection::default();
+    let mut answered: Vec<String> = Vec::new();
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -1342,6 +1923,8 @@ fn run_boot(
         let mut management = ManagementWire {
             wire: management_stream,
             injection_failure: None,
+            arp_reply: false,
+            echo_reply: false,
         };
 
         let mut endpoints: Vec<AttachedEndpoint> = Vec::new();
@@ -1383,16 +1966,48 @@ fn run_boot(
         loop {
             drain(&serial_receiver, &mut output);
             while let Ok((egress, frame)) = frame_receiver.try_recv() {
-                // The management port's standing prohibition, checked before any
-                // probe is matched because it holds under BOTH contracts and for
-                // any frame at all: nothing in the appliance produces onto that
-                // port's transmit pipeline, and the forwarder is granted no
-                // region of it, so a frame here means one of those two facts has
-                // stopped being true (CONCEPT §9.1).
+                // The management port is judged before any dataplane probe is
+                // matched, because what may come back on it is a contract of its
+                // own: the two replies the endpoint owes, and nothing else. Under
+                // the halted contract nothing may come back at all — no slot
+                // booted, so no endpoint answered.
                 if egress == MANAGEMENT_SLOT {
+                    match &test.contract {
+                        BootContract::Routed => match management_probe.judge(&frame, &probes) {
+                            Ok(reply) => match management.accept(reply) {
+                                Ok(()) => answered.push(management_probe.answered(reply)),
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            },
+                            Err(verdict) => {
+                                break 'run Err(format!("{verdict}; see {}", log_path.display()));
+                            }
+                        },
+                        BootContract::Halted { .. } => {
+                            break 'run Err(format!(
+                                "{} bytes came back on the management port, so a slot booted \
+                                 where none may be bootable; see {}",
+                                frame.len(),
+                                log_path.display()
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                // And the other direction of that isolation, which no console
+                // record would ever show: a frame the harness put on the
+                // management wire, or one the endpoint answered with, reaching a
+                // dataplane port.
+                if carries_management_traffic(&frame, &test.topology.management()) {
                     break 'run Err(format!(
-                        "{} bytes came back on the management port, which carries no forwarded \
-                         traffic and has no producer on its transmit pipeline; see {}",
+                        "{} bytes carrying management traffic came back on port{egress}. CONCEPT \
+                         §9.1 isolates the management port from the dataplane, and no domain is \
+                         granted a region on both sides of it, so a frame crossing means one of \
+                         those grants has changed; see {}",
                         frame.len(),
                         log_path.display()
                     ));
@@ -1439,14 +2054,22 @@ fn run_boot(
                             matches!(probe.expectation, Expectation::Dropped { .. })
                         });
                         // Once, and never retransmitted: a retransmission is a
-                        // second frame, and the contract is an equality.
-                        for frame in &management_frames {
+                        // second frame, and both halves of this contract are
+                        // equalities — the console's count, and one reply per
+                        // request.
+                        for frame in &management_probe.frames {
                             management.inject(frame);
                         }
                         injected = injection;
                         settling_since = Some(Instant::now());
                     }
-                    Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
+                    // The window is what a refusal needs to have come back in;
+                    // the replies are what the management port owes. A run that
+                    // waited out the window without both has not met the
+                    // contract, and says which one is missing when it times out.
+                    Some(since) if since.elapsed() >= SETTLE_WINDOW && management.answered() => {
+                        break 'run Ok(());
+                    }
                     _ => {}
                 },
                 BootContract::Halted { marker } => {
@@ -1555,6 +2178,7 @@ fn run_boot(
         serial: output,
         traffic,
         management: injected,
+        management_replies: answered,
     })
 }
 
@@ -1799,6 +2423,12 @@ mod tests {
         bench().endpoints()
     }
 
+    /// The second bench scenario 3 plays, whose every address differs.
+    fn alternate() -> Topology {
+        Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
+            .expect("the alternate document describes a bench")
+    }
+
     fn routed_test<'a>(log: &'a Path, topology: &'a Topology) -> BootTest<'a> {
         BootTest {
             contract: BootContract::Routed,
@@ -1865,7 +2495,10 @@ mod tests {
                 "mac=\"52:54:00:00:00:0a\"/>",
                 "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
                 "mac=\"52:54:00:00:00:0b\"/>",
-                "</neighbours></configuration>"
+                "</neighbours>",
+                "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
+                "prefix-length=\"24\" enabled=\"true\"/>",
+                "</configuration>"
             )
             .as_bytes(),
         )
@@ -1885,7 +2518,10 @@ mod tests {
                 "mac=\"52:54:00:00:00:0a\"/>",
                 "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
                 "mac=\"52:54:00:00:00:0b\"/>",
-                "</neighbours></configuration>"
+                "</neighbours>",
+                "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
+                "prefix-length=\"24\" enabled=\"true\"/>",
+                "</configuration>"
             )
             .as_bytes(),
         )
@@ -1899,11 +2535,8 @@ mod tests {
     /// would prove nothing.
     #[test]
     fn a_probe_carries_the_addresses_of_the_document_it_was_built_from() {
-        let alternate =
-            Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
-                .expect("the alternate document describes a bench");
         let shipped_probes = probes(&bench()).expect("the shipped bench");
-        let alternate_probes = probes(&alternate).expect("the alternate bench");
+        let alternate_probes = probes(&alternate()).expect("the alternate bench");
 
         assert_eq!(shipped_probes.len(), alternate_probes.len());
         for (shipped, other) in shipped_probes.iter().zip(&alternate_probes) {
@@ -2560,7 +3193,7 @@ mod tests {
         assert!(devices[1].contains("addr=03.0") && devices[1].contains("romfile="));
         assert!(
             devices[MANAGEMENT_SLOT].contains("addr=04.0")
-                && devices[MANAGEMENT_SLOT].contains(&mac(MANAGEMENT_MAC))
+                && devices[MANAGEMENT_SLOT].contains(&mac(bench().management().mac))
         );
         let netdevs: Vec<&String> = args
             .iter()
@@ -2576,23 +3209,28 @@ mod tests {
     }
 
     /// The management frames are what the console's count is judged against, so
-    /// the two must be derived from one place. This is that derivation: four
-    /// lengths, none of them padded, summing to the byte total the contract
-    /// expects — and none of them a multiple of another, which is what stops a
-    /// domain that summed a constant from reproducing the total.
+    /// the two must be derived from one place. This is that derivation: the four
+    /// opaque frames, none of them padded and none a multiple of another — which
+    /// is what stops a domain that summed a constant from reproducing the total —
+    /// followed by the two the endpoint must answer.
     #[test]
     fn the_management_probe_reports_exactly_the_frames_it_built() {
-        let (frames, injection) = management_probe();
-        assert_eq!(frames.len(), MANAGEMENT_FRAMES.len());
-        assert_eq!(injection.frames, frames.len());
+        let management = bench().management();
+        let (probe, injection) = ManagementProbe::new(management);
+        assert_eq!(probe.frames.len(), MANAGEMENT_FRAMES.len() + 2);
+        assert_eq!(injection.frames, probe.frames.len());
         assert_eq!(
             injection.bytes,
-            MANAGEMENT_FRAMES.iter().map(|len| *len as u64).sum::<u64>()
+            probe
+                .frames
+                .iter()
+                .map(|frame| frame.len() as u64)
+                .sum::<u64>()
         );
         assert!(!injection.is_empty());
 
         let mut lengths = Vec::new();
-        for (frame, len) in frames.iter().zip(MANAGEMENT_FRAMES) {
+        for (frame, len) in probe.frames.iter().zip(MANAGEMENT_FRAMES) {
             // Nothing pads: every length is at or above the Ethernet minimum,
             // so the length QEMU delivers is the length written and the byte
             // total is the sum of these and not of something wider.
@@ -2601,7 +3239,7 @@ mod tests {
             assert!(contains(frame, MANAGEMENT_MARKER));
             // Addressed to the management port from the harness's station, so a
             // frame on that wire is attributable in a capture.
-            assert!(frame.starts_with(&MANAGEMENT_MAC));
+            assert!(frame.starts_with(&management.mac));
             assert!(frame[6..12] == MANAGEMENT_STATION_MAC);
             lengths.push(len);
         }
@@ -2614,18 +3252,332 @@ mod tests {
                 );
             }
         }
+
+        // The two protocol frames are the last two, and neither carries the
+        // opaque marker: they are answered rather than merely counted, so a
+        // reply reaching the wire must not read as one of them coming back.
+        let arp = &probe.frames[MANAGEMENT_FRAMES.len()];
+        let echo = &probe.frames[MANAGEMENT_FRAMES.len() + 1];
+        assert_eq!(
+            arp.len(),
+            ARP_FRAME_LEN,
+            "an ARP request is 42 bytes unpadded"
+        );
+        assert!(!contains(arp, MANAGEMENT_MARKER));
+        assert!(!contains(echo, MANAGEMENT_MARKER));
+        assert!(contains(echo, ECHO_PAYLOAD));
     }
 
-    /// No dataplane probe may carry the management marker and no management
-    /// frame a probe's, or a delivery would be attributed to the wrong wire.
+    /// Both requests must be exactly what the endpoint expects to see, or the
+    /// contract tests something the appliance was right to refuse. Each is
+    /// decoded by the harness's own reader, which is what the replies are judged
+    /// with too.
     #[test]
-    fn no_management_frame_carries_a_dataplane_probes_marker() {
-        let (frames, _) = management_probe();
-        for probe in probes(&bench()).expect("the shipped bench") {
-            assert!(!contains(&probe.frame, MANAGEMENT_MARKER), "{}", probe.name);
-            for frame in &frames {
-                assert!(!contains(frame, probe.marker), "{}", probe.name);
+    fn the_two_requests_the_management_port_is_asked_carry_the_benchs_addresses() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let arp = decode_arp(&probe.frames[MANAGEMENT_FRAMES.len()]).expect("a well-formed ARP");
+        assert_eq!(
+            arp,
+            ArpFrame {
+                destination_mac: [0xff; 6],
+                source_mac: MANAGEMENT_STATION_MAC,
+                operation: ARP_REQUEST,
+                sender_mac: MANAGEMENT_STATION_MAC,
+                sender_address: management.station,
+                target_mac: [0; 6],
+                target_address: management.address,
             }
+        );
+
+        let echo =
+            decode_echo(&probe.frames[MANAGEMENT_FRAMES.len() + 1]).expect("a well-formed echo");
+        assert_eq!(
+            echo,
+            EchoFrame {
+                destination_mac: management.mac,
+                source_mac: MANAGEMENT_STATION_MAC,
+                source: management.station,
+                destination: management.address,
+                ttl: INJECTED_TTL,
+                message_type: ICMP_ECHO_REQUEST,
+                code: 0,
+                identifier: ECHO_IDENTIFIER,
+                sequence: ECHO_SEQUENCE,
+                payload: ECHO_PAYLOAD.to_vec(),
+            }
+        );
+    }
+
+    /// The reply each request obliges, built here as the appliance must build it
+    /// — and then the same reply with one field moved at a time, every one of
+    /// which must be refused by name.
+    #[test]
+    fn only_the_reply_the_endpoint_owes_is_accepted_and_a_moved_field_is_named() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let probes = probes(&bench()).expect("the shipped bench");
+
+        assert_eq!(
+            probe.judge(&arp_reply(&management, |_| {}), &probes),
+            Ok(ManagementReply::Arp)
+        );
+        assert_eq!(
+            probe.judge(&echo_reply(&management, |_| {}), &probes),
+            Ok(ManagementReply::Echo)
+        );
+
+        let arp_mutations: [ArpMutation; 5] = [
+            ("destination MAC", |reply| reply.destination_mac = [1; 6]),
+            ("source MAC", |reply| reply.source_mac = [2; 6]),
+            ("operation", |reply| reply.operation = ARP_REQUEST),
+            ("sender address", |reply| {
+                reply.sender_address = [9, 9, 9, 9]
+            }),
+            ("target address", |reply| {
+                reply.target_address = [8, 8, 8, 8]
+            }),
+        ];
+        for (field, mutate) in arp_mutations {
+            let verdict = probe
+                .judge(&arp_reply(&management, mutate), &probes)
+                .expect_err("a moved field must be refused");
+            assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
+        }
+
+        let echo_mutations: [EchoMutation; 6] = [
+            ("source address", |reply| reply.source = [9, 9, 9, 9]),
+            ("destination address", |reply| {
+                reply.destination = [8, 8, 8, 8]
+            }),
+            ("ICMP type", |reply| reply.message_type = ICMP_ECHO_REQUEST),
+            ("identifier", |reply| reply.identifier = 1),
+            ("sequence", |reply| reply.sequence = 1),
+            ("payload", |reply| {
+                reply.payload = b"something else".to_vec()
+            }),
+        ];
+        for (field, mutate) in echo_mutations {
+            let verdict = probe
+                .judge(&echo_reply(&management, mutate), &probes)
+                .expect_err("a moved field must be refused");
+            assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
+        }
+    }
+
+    /// Everything else that can arrive on that wire, and the reason each is a
+    /// failure rather than noise.
+    #[test]
+    fn a_frame_the_endpoint_never_owed_is_refused_wherever_it_came_from() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let probes = probes(&bench()).expect("the shipped bench");
+
+        // A dataplane probe: the isolation CONCEPT §9.1 requires, in the
+        // direction a leak would be silent.
+        let leaked = &probes[0].frame;
+        let verdict = probe
+            .judge(leaked, &probes)
+            .expect_err("a dataplane probe on the management wire");
+        assert!(verdict.contains(probes[0].name), "{verdict}");
+        assert!(verdict.contains("isolates that port"), "{verdict}");
+
+        // One of the opaque frames coming back: the endpoint answers nothing for
+        // that EtherType, so it must count it and stay silent.
+        let verdict = probe
+            .judge(&probe.frames[0], &probes)
+            .expect_err("an opaque frame must never be answered");
+        assert!(verdict.contains("say nothing"), "{verdict}");
+
+        // A protocol the endpoint does not speak, and a frame too short to name
+        // one at all.
+        for frame in [legacy_broadcast_frame(b"unrelated"), vec![0u8; 4]] {
+            let verdict = probe
+                .judge(&frame, &probes)
+                .expect_err("nothing else may come back");
+            assert!(
+                verdict.contains("answers ARP and ICMP echo alone"),
+                "{verdict}"
+            );
+        }
+
+        // A malformed reply of the right EtherType is refused by the field that
+        // refused it, rather than read as a different reply.
+        let mut corrupt = echo_reply(&management, |_| {});
+        corrupt[ETHERNET_HEADER_LEN + 10] ^= 0xff;
+        let verdict = probe
+            .judge(&corrupt, &probes)
+            .expect_err("a stale checksum");
+        assert!(verdict.contains("IPv4 checksum"), "{verdict}");
+
+        let mut short_arp = arp_reply(&management, |_| {});
+        short_arp.truncate(ARP_FRAME_LEN - 1);
+        let verdict = probe
+            .judge(&short_arp, &probes)
+            .expect_err("a truncated ARP");
+        assert!(verdict.contains("short of the"), "{verdict}");
+    }
+
+    /// The evidence a passing run prints names the values `judge` refused a
+    /// frame for not carrying, so the two cannot drift apart.
+    #[test]
+    fn each_answer_is_reported_with_the_values_it_was_judged_against() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let arp = probe.answered(ManagementReply::Arp);
+        assert!(arp.contains(&ipv4(management.address)), "{arp}");
+        assert!(arp.contains(&ipv4(management.station)), "{arp}");
+        assert!(arp.contains(&mac(management.mac)), "{arp}");
+
+        let echo = probe.answered(ManagementReply::Echo);
+        assert!(echo.contains(&ipv4(management.address)), "{echo}");
+        assert!(echo.contains(&ipv4(management.station)), "{echo}");
+        assert!(echo.contains(&format!("{ECHO_IDENTIFIER:#06x}")), "{echo}");
+        assert!(echo.contains(&format!("{ECHO_SEQUENCE:#06x}")), "{echo}");
+        assert!(echo.contains(&ECHO_REPLY_TTL.to_string()), "{echo}");
+    }
+
+    /// Each reply is owed exactly once, and the port must answer both before a
+    /// boot has met the contract.
+    #[test]
+    fn both_replies_are_owed_and_neither_may_arrive_twice() {
+        let mut wire = ManagementWire {
+            wire: TcpStream::connect(
+                TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap(),
+            )
+            .unwrap(),
+            injection_failure: None,
+            arp_reply: false,
+            echo_reply: false,
+        };
+        assert!(!wire.answered());
+        assert!(wire.outstanding().contains("ARP") && wire.outstanding().contains("echo"));
+
+        wire.accept(ManagementReply::Arp).expect("the first");
+        assert!(!wire.answered());
+        assert_eq!(wire.outstanding(), "the ICMP echo reply");
+        let verdict = wire
+            .accept(ManagementReply::Arp)
+            .expect_err("one request is one reply");
+        assert!(verdict.contains("a second"), "{verdict}");
+
+        wire.accept(ManagementReply::Echo).expect("the second");
+        assert!(wire.answered());
+        assert_eq!(wire.outstanding(), "none");
+    }
+
+    /// The reply the appliance owes, as this harness builds it for its own
+    /// negative tests: `mutate` moves one field so a refusal can be attributed.
+    /// One named field of a reply fixture, and the edit that moves it.
+    type ArpMutation = (&'static str, fn(&mut ArpFrame));
+    type EchoMutation = (&'static str, fn(&mut EchoFrame));
+
+    fn arp_reply(management: &ManagementPort, mutate: impl Fn(&mut ArpFrame)) -> Vec<u8> {
+        let mut fields = ArpFrame {
+            destination_mac: MANAGEMENT_STATION_MAC,
+            source_mac: management.mac,
+            operation: ARP_REPLY,
+            sender_mac: management.mac,
+            sender_address: management.address,
+            target_mac: MANAGEMENT_STATION_MAC,
+            target_address: management.station,
+        };
+        mutate(&mut fields);
+        let mut frame = Vec::with_capacity(ARP_FRAME_LEN);
+        frame.extend_from_slice(&fields.destination_mac);
+        frame.extend_from_slice(&fields.source_mac);
+        frame.extend_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&fields.operation.to_be_bytes());
+        frame.extend_from_slice(&fields.sender_mac);
+        frame.extend_from_slice(&fields.sender_address);
+        frame.extend_from_slice(&fields.target_mac);
+        frame.extend_from_slice(&fields.target_address);
+        frame
+    }
+
+    /// As [`arp_reply`], for the echo reply.
+    fn echo_reply(management: &ManagementPort, mutate: impl Fn(&mut EchoFrame)) -> Vec<u8> {
+        let mut fields = EchoFrame {
+            destination_mac: MANAGEMENT_STATION_MAC,
+            source_mac: management.mac,
+            source: management.address,
+            destination: management.station,
+            ttl: ECHO_REPLY_TTL,
+            message_type: ICMP_ECHO_REPLY,
+            code: 0,
+            identifier: ECHO_IDENTIFIER,
+            sequence: ECHO_SEQUENCE,
+            payload: ECHO_PAYLOAD.to_vec(),
+        };
+        mutate(&mut fields);
+
+        let mut icmp = Vec::new();
+        icmp.push(fields.message_type);
+        icmp.push(fields.code);
+        icmp.extend_from_slice(&[0, 0]);
+        icmp.extend_from_slice(&fields.identifier.to_be_bytes());
+        icmp.extend_from_slice(&fields.sequence.to_be_bytes());
+        icmp.extend_from_slice(&fields.payload);
+        let checksum = message_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&fields.destination_mac);
+        frame.extend_from_slice(&fields.source_mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + icmp.len()) as u16).to_be_bytes());
+        ip[8] = fields.ttl;
+        ip[9] = ICMP_PROTOCOL;
+        ip[12..16].copy_from_slice(&fields.source);
+        ip[16..20].copy_from_slice(&fields.destination);
+        let checksum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&icmp);
+        frame
+    }
+
+    /// No dataplane probe may carry anything the management wire's traffic does,
+    /// and no management frame a probe's marker: the two directions of the
+    /// isolation check rest on exactly that.
+    #[test]
+    fn nothing_on_one_wire_is_mistakable_for_traffic_on_the_other() {
+        for topology in [bench(), alternate()] {
+            let management = topology.management();
+            let (probe, _) = ManagementProbe::new(management);
+            for dataplane in probes(&topology).expect("a bench") {
+                assert!(
+                    !carries_management_traffic(&dataplane.frame, &management),
+                    "{}",
+                    dataplane.name
+                );
+                for frame in &probe.frames {
+                    assert!(!contains(frame, dataplane.marker), "{}", dataplane.name);
+                }
+            }
+            // And every frame the harness puts on the management wire is
+            // recognisable as management traffic, which is what makes the
+            // dataplane-side check able to see a leak at all.
+            for frame in &probe.frames {
+                assert!(carries_management_traffic(frame, &management));
+            }
+            assert!(carries_management_traffic(
+                &arp_reply(&management, |_| {}),
+                &management
+            ));
+            assert!(carries_management_traffic(
+                &echo_reply(&management, |_| {}),
+                &management
+            ));
         }
     }
 

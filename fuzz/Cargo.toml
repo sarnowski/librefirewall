@@ -27,7 +27,10 @@ cargo-fuzz = true
 #                   through this one and needs no target of its own
 #   config          the configuration document, whose every byte is the
 #                   management-plane attacker's, and the model read out of it
-#   net-headers     the Ethernet/IPv4/UDP headers a wire carries
+#   net-headers     the Ethernet/IPv4/UDP/ARP/ICMP headers a wire carries
+#   lfw-ip-endpoint the terminal endpoint that answers ARP and ICMP echo for the
+#                   management port, and so the first surface here that composes
+#                   a reply out of an adversary's own bytes
 #   routing         the forwarding decision made from those headers
 #   queue           the shared ring whose cursors and slots a peer PD owns
 #   packet-buffer   the ownership ledger a peer PD's buffer returns cross
@@ -41,6 +44,7 @@ wire = { path = "../crates/wire" }
 lfw-log = { path = "../crates/log" }
 config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
+lfw-ip-endpoint = { path = "../crates/ip-endpoint" }
 routing = { path = "../crates/routing" }
 queue = { path = "../crates/queue" }
 packet-buffer = { path = "../crates/packet-buffer" }
@@ -102,6 +106,13 @@ bench = false
 [[bin]]
 name = "route_frame"
 path = "fuzz_targets/route_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_endpoint"
+path = "fuzz_targets/ip_endpoint.rs"
 test = false
 doc = false
 bench = false

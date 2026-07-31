@@ -58,7 +58,7 @@ pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
 pub const LOG_CHANGE_KIND_COUNT: u8 = 3;
 
 /// `lfw_log::ObjectKind::ALL`.
-pub const LOG_OBJECT_KIND_COUNT: u8 = 2;
+pub const LOG_OBJECT_KIND_COUNT: u8 = 3;
 
 /// `lfw_log::Field::ALL`.
 pub const LOG_FIELD_COUNT: u8 = 6;

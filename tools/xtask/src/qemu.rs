@@ -295,6 +295,9 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<(), String
     // verdict is only the count of it. For the alternate scenario it is also
     // where a reader sees the second document's addresses on the wire.
     print!("{}", booted.traffic.render());
+    for answered in &booted.management_replies {
+        println!("{answered}");
+    }
 
     let log = scenario_log(root, scenario, run);
     let judged = match scenario.console {
@@ -434,36 +437,20 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The MAC the management port's guest NIC carries.
-///
-/// It is a constant here and not a derivation, because the configuration
-/// document has no management interface to derive it from: the port has no
-/// address, no ARP and no IP in this increment, so nothing about it is
-/// configurable yet (README's port-role-model row). **It moves into the document
-/// as that interface's `mac=` the day one exists**, and this constant goes with
-/// it — at which point `nic_device` reads it out of the topology like every
-/// other port's and `a_managed_port_carries_a_mac_no_dataplane_port_claims`
-/// stops being a test about a literal.
-///
-/// Its value is chosen to sit one past the two the shipped document gives the
-/// dataplane ports, so a capture or a `tcpdump` reads in port order; that is
-/// convention and nothing depends on it. What *is* depended on is that it
-/// belongs to no interface and no station on either bench, which the tests
-/// below hold it to: two NICs answering to one address would have a routed
-/// frame accepted by whichever saw it first.
-pub(crate) const MANAGEMENT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x52];
-
 /// Which guest NIC a `-device` argument is for.
 ///
 /// A type rather than a port number, because the two are not the same kind of
-/// thing: a dataplane port's MAC comes out of the configuration document and the
-/// management port's cannot, so a bare `usize` would have to mean "index into
-/// the document" and "the one past the end" at once.
+/// thing: a dataplane port is one of the document's `<interface>` elements and
+/// is indexed by the `port=` it claims, while the management port is the
+/// document's one `<management>` element and has no number at all. A bare
+/// `usize` would have to mean "index into the interfaces" and "the one past the
+/// end" at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GuestNic {
     /// Dataplane port `n`, whose MAC the document's interface on it claims.
     Dataplane(usize),
-    /// The management port, carrying [`MANAGEMENT_MAC`].
+    /// The management port, whose MAC the document's `<management>` element
+    /// claims.
     Management,
 }
 
@@ -491,20 +478,19 @@ impl GuestNic {
 /// address the system description assigns it, with no option ROM (so the
 /// firmware gains no PXE payload).
 ///
-/// The MAC is the derivation this function exists for. A dataplane port's used to
+/// The MAC is the derivation this function exists for. Every one of them used to
 /// be a literal here that had to equal a literal in the harness and a third in
-/// the document, with nothing comparing the three; now such a NIC can only be
-/// given a MAC an interface claims, and the address the routed contract expects
-/// the appliance to answer to is that same interface's. The management port has
-/// no interface to claim one, so it carries [`MANAGEMENT_MAC`] and the tests hold
-/// that constant to belonging to nothing else on the bench.
+/// the document, with nothing comparing the three; now a NIC can only be given a
+/// MAC the document claims — a dataplane port's from the `<interface>` on it, and
+/// the management port's from the `<management>` element — so the address a
+/// contract expects the appliance to answer to is the address the port carries.
 ///
 /// # Errors
 /// A dataplane port with no interface in the document, which the topology names.
 pub(crate) fn nic_device(topology: &Topology, nic: GuestNic) -> Result<String, String> {
     let [a, b, c, d, e, f] = match nic {
         GuestNic::Dataplane(port) => topology.port_mac(port).map_err(|error| error.to_string())?,
-        GuestNic::Management => MANAGEMENT_MAC,
+        GuestNic::Management => topology.management().mac,
     };
     Ok(format!(
         "virtio-net-pci,netdev={},disable-legacy=on,disable-modern=off,\
@@ -698,21 +684,32 @@ mod tests {
         assert_eq!(slots, (0..=PORTS).collect::<Vec<_>>());
     }
 
-    /// The management port answers to an address nothing else on either bench
-    /// does. Two NICs sharing one would have a routed frame accepted by
-    /// whichever saw it first, and the document cannot refuse a collision it
-    /// does not know about.
+    /// The management port answers to an address no dataplane port on either
+    /// bench does. Two NICs sharing one would have a routed frame accepted by
+    /// whichever saw it first — and now that both come out of one document, this
+    /// is a check on what that document says rather than on a literal.
     #[test]
     fn a_managed_port_carries_a_mac_no_dataplane_port_claims() {
         for topology in [bench(), alternate()] {
-            assert!(
-                !topology.carries_mac(MANAGEMENT_MAC),
-                "the management MAC belongs to something on the bench"
-            );
+            let management = topology.management().mac;
             for port in 0..PORTS {
-                assert_ne!(topology.port_mac(port), Ok(MANAGEMENT_MAC));
+                assert_ne!(topology.port_mac(port), Ok(management));
             }
+            for endpoint in topology.endpoints() {
+                assert_ne!(endpoint.mac, management);
+            }
+            assert!(
+                nic_device(&topology, GuestNic::Management)
+                    .unwrap()
+                    .contains(&mac_argument(management))
+            );
         }
+    }
+
+    /// The MAC as a `-device` argument renders it, so a test compares the string
+    /// QEMU is given rather than a second formatting of the same bytes.
+    fn mac_argument([a, b, c, d, e, f]: [u8; 6]) -> String {
+        format!("mac={a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
     }
 
     /// The cross-artifact fact that used to be a comment saying nothing checked
@@ -755,23 +752,18 @@ mod tests {
     }
 
     #[test]
-    fn the_alternate_document_puts_different_macs_on_the_same_ports() {
+    fn the_alternate_document_puts_different_macs_on_every_port() {
         let shipped = bench();
         let alternate = alternate();
-        for port in 0..PORTS {
-            let nic = GuestNic::Dataplane(port);
+        // Every NIC, the management one included: its MAC is in the document
+        // now, so scenario 3 re-derives it like the rest and a management
+        // endpoint answering there proves it read the second document.
+        for nic in every_guest_nic() {
             assert_ne!(
                 nic_device(&shipped, nic).unwrap(),
-                nic_device(&alternate, nic).unwrap()
+                nic_device(&alternate, nic).unwrap(),
+                "{nic:?}"
             );
         }
-        // The management port is the exception, and deliberately: its MAC is not
-        // in either document, so both benches present the same one — which is
-        // what makes it the one NIC argument the alternate scenario does not
-        // re-derive.
-        assert_eq!(
-            nic_device(&shipped, GuestNic::Management).unwrap(),
-            nic_device(&alternate, GuestNic::Management).unwrap()
-        );
     }
 }

@@ -6,7 +6,7 @@
 //! alternative is a panic reached through a rule enforced in another module.
 
 use lfw_log::Identifier;
-use wire::{ConfigImage, InterfaceImage, NeighbourImage};
+use wire::{ConfigImage, InterfaceImage, ManagementImage, NeighbourImage};
 
 use crate::{
     hash::content_hash,
@@ -32,6 +32,19 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
     let mut image = ConfigImage {
         generation: generation.to_bits(),
         content_hash: content_hash(model).to_bits(),
+        management: match model.management() {
+            Some(entry) => ManagementImage {
+                enabled: u8::from(entry.enabled),
+                prefix_length: entry.prefix_length,
+                _pad: [0; 2],
+                mac: entry.mac.0,
+                _pad2: [0; 2],
+                address: entry.address.octets(),
+            },
+            // A configuration describing no management port leaves the zeroed
+            // entry, which is what the reader decodes as "no addressing".
+            None => ManagementImage::ZERO,
+        },
         ..ConfigImage::ZERO
     };
 
@@ -97,7 +110,17 @@ mod tests {
         "</interfaces><neighbours>",
         "<neighbour id=\"gateway-a\" interface=\"lan\" address=\"10.0.1.2\" ",
         "mac=\"52:54:00:00:00:0a\"/>",
-        "</neighbours></configuration>"
+        "</neighbours>",
+        "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
+        "address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "</configuration>"
+    );
+
+    /// The management element the generated documents below carry, on a prefix
+    /// none of their interfaces claims.
+    const MANAGEMENT: &str = concat!(
+        "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
+        "address=\"192.168.42.15\" prefix-length=\"24\"/>"
     );
 
     fn id(text: &str) -> Identifier {
@@ -118,11 +141,52 @@ mod tests {
     }
 
     #[test]
+    fn the_management_entry_crosses_into_the_image_and_its_reader_decodes_it() {
+        let image = image_from(&model(), Generation::ZERO).expect("a validated model builds");
+        assert_eq!(image.management.enabled, 1);
+        assert_eq!(image.management.prefix_length, 24);
+        assert_eq!(image.management.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+        assert_eq!(image.management.address, [192, 168, 42, 15]);
+
+        let management = image
+            .check(PORT_COUNT)
+            .expect("its own reader accepts it")
+            .management()
+            .expect("an enabled entry decodes");
+        assert_eq!(management.mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+        assert_eq!(management.address(), [192, 168, 42, 15]);
+        assert_eq!(management.prefix_length(), 24);
+    }
+
+    /// A disabled entry crosses as a zero byte, not as an absent one — and its
+    /// reader decodes that as no addressing at all.
+    #[test]
+    fn a_disabled_management_interface_crosses_as_disabled() {
+        let disabled = TWO_PORTS.replacen(
+            "<management enabled=\"true\"",
+            "<management enabled=\"false\"",
+            1,
+        );
+        let model = load(disabled.as_bytes()).expect("a sound document");
+        let image = image_from(&model, Generation::ZERO).expect("it builds");
+        assert_eq!(image.management.enabled, 0);
+        assert_eq!(image.management.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+        assert_eq!(
+            image
+                .check(PORT_COUNT)
+                .expect("still a valid image")
+                .management(),
+            None
+        );
+    }
+
+    #[test]
     fn the_empty_configuration_builds_an_image_that_forwards_nothing() {
         let image = image_from(&Model::EMPTY, Generation::ZERO).expect("the fail-closed model");
         assert_eq!(image.interface_count, 0);
         assert_eq!(image.neighbour_count, 0);
         assert_eq!(image.generation, 0);
+        assert_eq!(image.management, ManagementImage::ZERO);
     }
 
     #[test]
@@ -200,7 +264,9 @@ mod tests {
                  prefix-length=\"24\"/>"
             ));
         }
-        text.push_str("</interfaces><neighbours/></configuration>");
+        text.push_str("</interfaces><neighbours/>");
+        text.push_str(MANAGEMENT);
+        text.push_str("</configuration>");
         text
     }
 

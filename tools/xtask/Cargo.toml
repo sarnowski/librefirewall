@@ -44,6 +44,11 @@ lfw-rtc = { path = "../../crates/rtc" }
 # the crate that owns the block for the reason every size constant above is
 # reached for rather than written out.
 lfw-hpet = { path = "../../crates/hpet" }
+# The address arithmetic the bench is derived with: `prefix_mask`, and the
+# parsers `forward_harness` decodes a management reply with. Writing either out
+# here would make the harness agree with itself rather than with the appliance —
+# the drift every dependency above exists to close.
+net-headers = { path = "../../crates/net-headers" }
 # The band a derived counter frequency has to be inside, for `clock_contract`.
 # `lfw-log` already pulls this in transitively; a transitive dependency is not
 # a name this crate may use, and writing the two numbers out here is the drift

@@ -163,33 +163,36 @@
          same `pd_runtime` constants, packed immediately after the dataplane's:
          0x31046000 through 0x3108C000.
 
-         Why a port that forwards nothing needs two pipelines at all: the driver
-         binary is port-agnostic and takes a receive side *and* a transmit side
-         (pds/nic-driver's crate header), so the transmit three exist because the
-         third instance of that binary maps them, and for no other reason. What
-         differs from the dataplane is the far end of the receive pipeline. There
-         is no egress driver to hand a descriptor onward to, so the management
-         domain is the end of the journey and produces the return itself onto
-         mgmt_rx_free — the same producer/consumer split the dataplane already
-         has between its two drivers, with that domain standing where the egress
-         driver stands. See the management domain below on why it is the returner
-         and not the pool's owner.
+         BOTH PIPELINES ARE NOW USED IN BOTH DIRECTIONS, which is the change this
+         port's addressing brought (ENG-1, SCM-6). The receive three carry frames
+         to the management domain as before; the transmit three now carry the
+         replies that domain originates, so the driver binary's transmit side —
+         which existed because the binary is port-agnostic and takes one whatever
+         port it drives (pds/nic-driver's crate header) — has a producer at last.
 
-         mgmt_rx_pool IS MAPPED BY NO PROTECTION DOMAIN. The driver receives into
-         it and takes its physical address alone, exactly as a dataplane driver
-         does with the pool it receives into; and the management domain counts
-         frames off their descriptors without dereferencing one, so it maps no
-         pool either. The region therefore exists solely as the management NIC's
-         DMA target, and `xtask::sysdesc` carries that empty grant set as a rule
-         — a region reachable by no CPU in the system is a claim worth checking
-         rather than an oversight worth tolerating. It stops being true the day
-         this port needs to *read* a frame, which is what ARP and IP will need.
+         What still differs from the dataplane is the far end of the receive
+         pipeline. There is no egress driver to hand a descriptor onward to, so
+         the management domain is the end of the journey and produces the return
+         itself onto mgmt_rx_free — the same producer/consumer split the dataplane
+         already has between its two drivers, with that domain standing where the
+         egress driver stands.
 
-         mgmt_tx_pool by contrast is mapped, by the driver alone, for the reason
-         every transmit pool is: `TxPath::post` writes the 12-byte virtio-net
-         header in front of the frame. Nothing produces onto mgmt_tx_fwd yet, so
-         nothing is ever transmitted on this port — which is the property the
-         QEMU harness asserts by requiring that no frame ever comes back on it. -->
+         THE TWO POOLS ARE OWNED BY DIFFERENT DOMAINS, in opposite directions,
+         and that asymmetry is the whole of why a forged return is refused on
+         both. mgmt_rx_pool is the DRIVER's: it receives into it, and the
+         management domain maps it READ-ONLY to copy a frame out — a frame this
+         appliance was sent is never altered, so read is the whole of the
+         authority that reading it needs. mgmt_tx_pool is the MANAGEMENT
+         DOMAIN's: it allocates a buffer, writes a reply into it (hence
+         read-write) and lends it, and the driver maps it because `TxPath::post`
+         writes the 12-byte virtio-net header in front of the frame.
+
+         mgmt_rx_pool was mapped by no protection domain at all until this
+         change, and that claim is gone rather than weakened: the grant arrived
+         with the code that reads a frame, which is exactly the condition the
+         note it replaces set for it (ENG-7). `xtask::sysdesc` carries the new
+         mapper set as a rule, read-only side included, so a widening to
+         read-write fails the gate at the point the edit is made. -->
     <memory_region name="mgmt_rx_pool" size="0x20000" phys_addr="0x31046000" />
     <memory_region name="mgmt_rx_fwd" size="0x2000" phys_addr="0x31066000" />
     <memory_region name="mgmt_rx_free" size="0x1000" phys_addr="0x31068000" />
@@ -207,6 +210,24 @@
          exactly the direction it speaks in. The config domain cannot forge an
          acknowledgement to release its own generation, and the forwarder cannot
          rewrite the configuration it is about to be judged by.
+
+         `cfg` HAS TWO READERS AND `cfgack` STILL ONE WRITER, and the asymmetry
+         is a decision rather than an omission (ENG-1, SCM-6). The management
+         domain maps `cfg` read-only — its addressing comes from the document
+         (CONCEPT §12.3) — and maps `cfgack` NOT AT ALL, because it is not the
+         *consumer* of the two-phase commit. The forwarder is: it reads the
+         offered generation, stages a table and acknowledges, and a commit waits
+         for that. The management domain reads the COMMITTED generation only
+         (`pd_runtime::CommittedReader`), which is a strictly weaker role — it
+         cannot delay a commit, cannot refuse one on anybody's behalf, and holds
+         no region to forge an acknowledgement in. Granting it `cfgack` would
+         make "every consumer has staged" a claim about two domains and hand a
+         domain that answers the management-plane attacker the word that releases
+         a generation.
+
+         What that costs is stated at pds/management: with no channel to the
+         config domain, that port picks up its address on the next frame that
+         wakes it rather than at the commit.
 
          Sizes are `wire::CONFIG_REGION_SIZE` and `wire::CONFIG_ACK_REGION_SIZE`,
          each its type's `size_of` rounded up to the mapping granularity, on the
@@ -486,14 +507,14 @@
         <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
 
-    <!-- The management domain: the end of the management port's receive
-         pipeline. It counts what that port receives and reports the running
-         total; it forwards nothing, and nothing in this description gives it the
-         means to.
+    <!-- The management domain: the ADDRESSED endpoint of the management port. It
+         answers ARP requests for its own address and ICMP echo requests to it,
+         counts what the port receives, and forwards nothing — nothing in this
+         description gives it the means to.
 
          =================================================================
-         WHY THIS DOMAIN IS THE RETURNER AND NOT THE POOL'S OWNER
-         (ENG-1, SCM-6)
+         WHY THIS DOMAIN IS THE RETURNER ON ONE PIPELINE AND THE OWNER ON
+         THE OTHER (ENG-1, SCM-6)
          =================================================================
 
          The forwarder maps NEITHER dataplane `free` ring, and the note beside
@@ -512,33 +533,49 @@
          the authority the forwarder was refused is WHICH SIDE OF THE RING it is:
          this domain PRODUCES returns and nic_driver2 CONSUMES them as the pool's
          owner (`pd_runtime::PoolOwner::reclaim`), which accepts an index only if
-         it is in that driver's own lent set and its ledger agrees. This domain
-         holds no ledger and decides nothing about ownership; a return it forges
-         names a buffer the driver never lent and is refused and counted there.
-         The dataplane already has exactly this split between its two drivers —
-         the transmitting one produces onto the ring the receiving one consumes —
-         and this is that shape with the management domain standing where the
-         transmitting driver stands.
+         it is in that driver's own lent set and its ledger agrees. A return it
+         forges names a buffer the driver never lent and is refused and counted
+         there.
 
-         WHAT IT MAPS: mgmt_rx_fwd, to consume the descriptors, and mgmt_rx_free,
-         to produce the returns. Two regions and nothing else beyond its own log
-         ring.
+         ON THE TRANSMIT PIPELINE THE ROLES ARE EXACTLY REVERSED. A reply is a
+         frame this domain originates, so it is the OWNER of mgmt_tx_pool: it
+         allocates a buffer, writes the reply into it, lends it on mgmt_tx_fwd,
+         and CONSUMES the returns nic_driver2 produces onto mgmt_tx_free. So each
+         pool has one owner, each owner holds the ledger for its own pool, and
+         each `free` ring has one producer and one consumer — which is what makes
+         a forged return refused rather than believed in both directions. The
+         dataplane already has this shape between its two drivers; here one domain
+         stands at each end.
+
+         WHAT IT MAPS, and why each grant exists:
+
+           * mgmt_rx_fwd (rw) — consume the descriptors the driver publishes.
+           * mgmt_rx_free (rw) — produce the returns, per the argument above.
+           * mgmt_rx_pool (READ-ONLY) — copy the received frame out to parse it.
+             Read is the whole of the authority parsing needs: a frame this
+             appliance was sent is never altered, and the reply is composed
+             elsewhere. This is the grant the previous note deferred to "the day
+             this port parses ARP or IP", and it arrived with that code (ENG-7).
+           * mgmt_tx_pool (rw) — write the reply into the buffer it owns.
+           * mgmt_tx_fwd (rw) — lend the reply to the driver.
+           * mgmt_tx_free (rw) — consume the driver's returns as the pool's owner.
+           * cfg (READ-ONLY) — the addressing comes from the configuration
+             document (CONCEPT §12.3). Read-only because a domain that could
+             write it would rewrite the addressing it is about to be judged by,
+             and because the publisher must be able to read back what it wrote.
 
          WHAT STAYS WITHHELD, and it is the whole of the isolation CONCEPT §9.1
          asks for: NO dataplane region of any kind — not a pool, not a
-         `ForwardRings`, not a return ring — NO buffer pool at all, not even the
-         management port's own, NO configuration region, NO ECAM page, NO BAR
-         window, NO virtqueue and NO ioport. A compromise of the domain that will
-         one day terminate an operator's TLS session therefore reaches no frame
-         in flight, no NIC, and no configuration.
+         `ForwardRings`, not a return ring — NO ECAM page, NO BAR window, NO
+         virtqueue and NO ioport. A compromise of the domain that will one day
+         terminate an operator's TLS session therefore reaches no frame in flight
+         and no NIC.
 
-         NO POOL IS THE ONE WORTH DWELLING ON. Frames and bytes are counted off
-         the descriptors, so nothing here dereferences a frame byte and a pool
-         mapping would be authority with no use — the same argument the receiving
-         driver's withheld pool makes, from the other end of the pipeline. It is
-         also why mgmt_rx_pool is mapped by nobody at all. The day this port
-         parses ARP or IP, that grant arrives with the code that consumes it and
-         is reviewed then (ENG-7).
+         AND NO `cfgack`, WHICH IS THE ONE WORTH DWELLING ON. This domain is not
+         the consumer of the two-phase commit: it reads the COMMITTED generation
+         alone (`pd_runtime::CommittedReader`), so it cannot delay a commit,
+         cannot refuse one on anybody's behalf, and holds no region an
+         acknowledgement could be forged in. See the note beside cfg/cfgack.
 
          PRIORITY 2, EQUAL TO THE FORWARDER, and for the forwarder's reason: this
          is a `notified`-driven domain among three drivers that busy-loop forever
@@ -548,11 +585,23 @@
          forwarder rather than above or below it because neither can starve the
          other — each runs to completion per wakeup — and an ordering between the
          two would be a claim nothing needs: no frame crosses from one to the
-         other, which is the point of the port. -->
-    <protection_domain name="management" priority="2" stack_size="0x4000">
+         other, which is the point of the port.
+
+         STACK 0x8000, twice the forwarder's, and the reason is one number: this
+         domain holds two `BUFFER_SIZE` scratch buffers rather than one per stage
+         — the received frame is snapshotted out of the pool and the reply is
+         composed into storage of its own, because the pool exposes no safe path
+         to its bytes (`pd_runtime::endpoint`). 4 KiB of a 16 KiB stack is a
+         margin worth not spending. -->
+    <protection_domain name="management" priority="2" stack_size="0x8000">
         <program_image path="management.elf" />
         <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_fwd_vaddr" />
         <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_free_vaddr" />
+        <map mr="mgmt_rx_pool" vaddr="0x2_004_000" perms="r" cached="true" setvar_vaddr="mgmt_rx_pool_vaddr" />
+        <map mr="mgmt_tx_fwd" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_fwd_vaddr" />
+        <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_free_vaddr" />
+        <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_pool_vaddr" />
+        <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
     </protection_domain>
@@ -613,12 +662,14 @@
 
          The two pipelines are the management port's own, so no dataplane region
          appears here and this driver can reach no frame belonging to either
-         dataplane pipeline. Its receive pool is the one region in this
-         description no domain maps: it takes `rx_pool_paddr` and hands it to the
-         NIC, exactly as the two above do with theirs. Its transmit pool IS
-         mapped, for the header write, and nothing ever queues a frame onto
-         mgmt_tx_fwd — so the mapping and the paddr are the price of one binary
-         rather than authority anything exercises. -->
+         dataplane pipeline. Its receive pool it does not map at all: it takes
+         `rx_pool_paddr` and hands it to the NIC, exactly as the two above do with
+         theirs — the management domain reads that pool read-only, which is a
+         grant to a domain that dereferences a frame and not to the one that DMAs
+         into it. Its transmit pool IS mapped, for the header write, and the
+         management domain now queues replies onto mgmt_tx_fwd, so this driver's
+         transmit side carries traffic rather than existing for the sake of one
+         binary. -->
     <protection_domain name="nic_driver2" priority="1" stack_size="0x8000">
         <program_image path="nic-driver.elf" />
         <map mr="ecam2" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />

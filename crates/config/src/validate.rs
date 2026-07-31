@@ -13,11 +13,15 @@
 //! the vocabulary already had the tokens for both.
 
 use lfw_log::{Identifier, RejectReason};
-use net_headers::{Ipv4Address, MacAddress};
-use routing::prefix_mask;
+use net_headers::{Ipv4Address, prefix_mask};
 use wire::MAX_PREFIX_LENGTH;
 
 use crate::{PORT_COUNT, model::Model};
+
+// The image ABI and the address arithmetic each state the bound independently —
+// `wire` depends on no domain crate — so the two are held equal here, the one
+// place that depends on both.
+const _: () = assert!(MAX_PREFIX_LENGTH == net_headers::MAX_PREFIX_LENGTH);
 
 /// Why a configuration cannot be held.
 ///
@@ -47,8 +51,7 @@ pub enum SemanticError {
         id: Identifier,
         prefix_length: u8,
     },
-    /// An address no host may hold: the prefix's own network or broadcast
-    /// address.
+    /// An address no host may hold: the prefix's network or broadcast address.
     InterfaceAddressNotAHostAddress {
         id: Identifier,
     },
@@ -87,6 +90,24 @@ pub enum SemanticError {
         id: Identifier,
         other: Identifier,
     },
+    /// The management element's own rules, each naming it by
+    /// [`Identifier::MANAGEMENT`]: it has no id of its own.
+    ManagementPrefixLengthOutOfRange {
+        prefix_length: u8,
+    },
+    ManagementAddressNotUnicast,
+    ManagementAddressNotAHostAddress,
+    ManagementMacNotUnicast,
+    /// One address reachable two ways: routed out of `other`'s port, and
+    /// terminated off the dataplane (CONCEPT §9.1).
+    ManagementPrefixCollidesWithInterface {
+        other: Identifier,
+    },
+    /// Two ports answering to one L2 address: a frame would be taken by
+    /// whichever saw it first.
+    ManagementMacCollidesWithInterface {
+        other: Identifier,
+    },
 }
 
 impl SemanticError {
@@ -109,6 +130,12 @@ impl SemanticError {
             | Self::NeighbourOutsidePrefix { id }
             | Self::NeighbourIsInterfaceAddress { id }
             | Self::DuplicateNeighbourAddress { id, .. } => id,
+            Self::ManagementPrefixLengthOutOfRange { .. }
+            | Self::ManagementAddressNotUnicast
+            | Self::ManagementAddressNotAHostAddress
+            | Self::ManagementMacNotUnicast
+            | Self::ManagementPrefixCollidesWithInterface { .. }
+            | Self::ManagementMacCollidesWithInterface { .. } => Identifier::MANAGEMENT,
         }
     }
 
@@ -133,6 +160,13 @@ impl SemanticError {
             Self::NeighbourOutsidePrefix { .. } => RejectReason::NeighbourOutsidePrefix,
             Self::NeighbourIsInterfaceAddress { .. } => RejectReason::NeighbourIsInterfaceAddress,
             Self::DuplicateNeighbourAddress { .. } => RejectReason::DuplicateNeighbourAddress,
+            Self::ManagementPrefixLengthOutOfRange { .. } => RejectReason::PrefixLengthOutOfRange,
+            Self::ManagementAddressNotUnicast => RejectReason::AddressNotUnicast,
+            Self::ManagementAddressNotAHostAddress => RejectReason::AddressNotAHostAddress,
+            Self::ManagementMacNotUnicast | Self::ManagementMacCollidesWithInterface { .. } => {
+                RejectReason::MacNotUnicast
+            }
+            Self::ManagementPrefixCollidesWithInterface { .. } => RejectReason::OverlappingPrefixes,
         }
     }
 }
@@ -151,6 +185,48 @@ pub fn validate(model: &Model) -> Result<(), SemanticError> {
     neighbour_identities(model)?;
     neighbour_fields(model)?;
     neighbour_addresses(model)?;
+    management(model)?;
+    Ok(())
+}
+
+/// The management interface's own rules, then the two that hold it apart from
+/// the dataplane: neither a shared prefix nor a shared MAC is representable in
+/// the grant set (CONCEPT §9.1), so a document may not describe one.
+fn management(model: &Model) -> Result<(), SemanticError> {
+    let Some(entry) = model.management() else {
+        return Ok(());
+    };
+    if entry.prefix_length > MAX_PREFIX_LENGTH {
+        return Err(SemanticError::ManagementPrefixLengthOutOfRange {
+            prefix_length: entry.prefix_length,
+        });
+    }
+    if !entry.mac.is_unicast() {
+        return Err(SemanticError::ManagementMacNotUnicast);
+    }
+    if !entry.address.is_unicast() {
+        return Err(SemanticError::ManagementAddressNotUnicast);
+    }
+    if !is_host_address(entry.address, entry.prefix_length) {
+        return Err(SemanticError::ManagementAddressNotAHostAddress);
+    }
+    for interface in model.interfaces() {
+        if overlaps(
+            interface.address,
+            interface.prefix_length,
+            entry.address,
+            entry.prefix_length,
+        ) {
+            return Err(SemanticError::ManagementPrefixCollidesWithInterface {
+                other: interface.id,
+            });
+        }
+        if interface.mac == entry.mac {
+            return Err(SemanticError::ManagementMacCollidesWithInterface {
+                other: interface.id,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -182,10 +258,10 @@ fn interface_fields(model: &Model) -> Result<(), SemanticError> {
                 prefix_length: entry.prefix_length,
             });
         }
-        if !is_unicast_mac(entry.mac) {
+        if !entry.mac.is_unicast() {
             return Err(SemanticError::InterfaceMacNotUnicast { id });
         }
-        if !is_unicast_address(entry.address) {
+        if !entry.address.is_unicast() {
             return Err(SemanticError::InterfaceAddressNotUnicast { id });
         }
         if !is_host_address(entry.address, entry.prefix_length) {
@@ -243,10 +319,10 @@ fn neighbour_fields(model: &Model) -> Result<(), SemanticError> {
                 interface: entry.interface,
             });
         };
-        if !is_unicast_mac(entry.mac) {
+        if !entry.mac.is_unicast() {
             return Err(SemanticError::NeighbourMacNotUnicast { id });
         }
-        if !is_unicast_address(entry.address) {
+        if !entry.address.is_unicast() {
             return Err(SemanticError::NeighbourAddressNotUnicast { id });
         }
         if entry.address == interface.address {
@@ -274,14 +350,6 @@ fn neighbour_addresses(model: &Model) -> Result<(), SemanticError> {
     Ok(())
 }
 
-/// An address a host may hold and a router may forward to.
-fn is_unicast_address(address: Ipv4Address) -> bool {
-    !(address.is_multicast()
-        || address.is_broadcast()
-        || address.is_loopback()
-        || address.is_unspecified())
-}
-
 /// A `/31` is a two-address point-to-point link and a `/32` is a host route, so
 /// neither reserves a network or a broadcast address to exclude (RFC 3021).
 fn is_host_address(address: Ipv4Address, prefix_length: u8) -> bool {
@@ -291,12 +359,6 @@ fn is_host_address(address: Ipv4Address, prefix_length: u8) -> bool {
     let mask = prefix_mask(prefix_length);
     let network = address.bits() & mask;
     address.bits() != network && address.bits() != (network | !mask)
-}
-
-/// An interface MAC is a source address the appliance transmits under and a
-/// destination it answers to; a group address is neither.
-fn is_unicast_mac(mac: MacAddress) -> bool {
-    !mac.is_group() && mac != MacAddress([0; 6])
 }
 
 /// Whether two prefixes cover a common address, which is decided entirely by
@@ -310,7 +372,8 @@ fn overlaps(left: Ipv4Address, left_len: u8, right: Ipv4Address, right_len: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InterfaceEntry, NeighbourEntry};
+    use crate::model::{InterfaceEntry, ManagementEntry, NeighbourEntry};
+    use net_headers::MacAddress;
     use proptest::prelude::*;
 
     fn id(text: &str) -> Identifier {
@@ -357,6 +420,35 @@ mod tests {
                 mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
             })
             .expect("capacity");
+        model
+            .set_management(ManagementEntry {
+                enabled: true,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+                address: Ipv4Address::from_octets([192, 168, 42, 15]),
+                prefix_length: 24,
+            })
+            .expect("one");
+        model
+    }
+
+    /// The management entry `sound()` carries, on a prefix neither interface
+    /// claims.
+    fn management_entry() -> ManagementEntry {
+        ManagementEntry {
+            enabled: true,
+            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+            address: Ipv4Address::from_octets([192, 168, 42, 15]),
+            prefix_length: 24,
+        }
+    }
+
+    /// `sound()` with its management entry replaced by `entry`.
+    fn with_management(entry: ManagementEntry) -> Model {
+        let mut model = Model::EMPTY;
+        for interface in sound().interfaces() {
+            model.push_interface(*interface).expect("capacity");
+        }
+        model.set_management(entry).expect("one");
         model
     }
 
@@ -667,6 +759,102 @@ mod tests {
     }
 
     #[test]
+    fn a_management_interface_that_cannot_be_answered_under_is_refused_by_its_own_rule() {
+        let cases: [(ManagementEntry, SemanticError, RejectReason); 6] = [
+            (
+                ManagementEntry {
+                    prefix_length: MAX_PREFIX_LENGTH + 1,
+                    ..management_entry()
+                },
+                SemanticError::ManagementPrefixLengthOutOfRange { prefix_length: 33 },
+                RejectReason::PrefixLengthOutOfRange,
+            ),
+            (
+                ManagementEntry {
+                    mac: MacAddress::BROADCAST,
+                    ..management_entry()
+                },
+                SemanticError::ManagementMacNotUnicast,
+                RejectReason::MacNotUnicast,
+            ),
+            (
+                ManagementEntry {
+                    address: Ipv4Address::from_octets([224, 0, 0, 1]),
+                    ..management_entry()
+                },
+                SemanticError::ManagementAddressNotUnicast,
+                RejectReason::AddressNotUnicast,
+            ),
+            (
+                ManagementEntry {
+                    address: Ipv4Address::from_octets([192, 168, 42, 0]),
+                    ..management_entry()
+                },
+                SemanticError::ManagementAddressNotAHostAddress,
+                RejectReason::AddressNotAHostAddress,
+            ),
+            (
+                // Inside `wan`'s prefix: one address the appliance would both
+                // route towards and terminate on.
+                ManagementEntry {
+                    address: Ipv4Address::from_octets([10, 0, 0, 9]),
+                    ..management_entry()
+                },
+                SemanticError::ManagementPrefixCollidesWithInterface { other: id("wan") },
+                RejectReason::OverlappingPrefixes,
+            ),
+            (
+                ManagementEntry {
+                    mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
+                    ..management_entry()
+                },
+                SemanticError::ManagementMacCollidesWithInterface { other: id("wan") },
+                RejectReason::MacNotUnicast,
+            ),
+        ];
+        for (entry, expected, reason) in cases {
+            let error = refusal(&with_management(entry));
+            assert_eq!(error, expected);
+            assert_eq!(error.id(), Identifier::MANAGEMENT);
+            assert_eq!(error.reason(), reason);
+        }
+    }
+
+    /// A disabled management interface is held to every one of those rules: the
+    /// port is unaddressed today and the document is what an operator will
+    /// enable tomorrow, so a collision refused only when enabled is a collision
+    /// discovered at the worst moment.
+    #[test]
+    fn a_disabled_management_interface_is_held_to_the_same_rules() {
+        validate(&with_management(ManagementEntry {
+            enabled: false,
+            ..management_entry()
+        }))
+        .expect("a sound entry is sound either way");
+        assert_eq!(
+            refusal(&with_management(ManagementEntry {
+                enabled: false,
+                address: Ipv4Address::from_octets([10, 0, 1, 9]),
+                ..management_entry()
+            })),
+            SemanticError::ManagementPrefixCollidesWithInterface { other: id("lan") }
+        );
+    }
+
+    /// A configuration that describes no management port at all breaks no rule:
+    /// generation 0 is one, and the schema is where a *document* is held to
+    /// naming one.
+    #[test]
+    fn a_configuration_with_no_management_interface_breaks_no_rule() {
+        let mut model = Model::EMPTY;
+        for interface in sound().interfaces() {
+            model.push_interface(*interface).expect("capacity");
+        }
+        assert_eq!(model.management(), None);
+        validate(&model).expect("nothing to hold to a rule");
+    }
+
+    #[test]
     fn every_variant_names_the_object_it_refuses() {
         let one = id("one");
         let two = id("two");
@@ -705,6 +893,19 @@ mod tests {
         ];
         for variant in variants {
             assert_eq!(variant.id(), one, "{variant:?}");
+        }
+        // The management variants carry no id of their own and name the element
+        // by the key a change record uses.
+        for variant in [
+            SemanticError::ManagementPrefixLengthOutOfRange { prefix_length: 33 },
+            SemanticError::ManagementAddressNotUnicast,
+            SemanticError::ManagementAddressNotAHostAddress,
+            SemanticError::ManagementMacNotUnicast,
+            SemanticError::ManagementPrefixCollidesWithInterface { other: two },
+            SemanticError::ManagementMacCollidesWithInterface { other: two },
+        ] {
+            assert_eq!(variant.id(), Identifier::MANAGEMENT, "{variant:?}");
+            assert!(RejectReason::ALL.contains(&variant.reason()), "{variant:?}");
         }
     }
 
@@ -768,8 +969,8 @@ mod tests {
                 for entry in model.interfaces() {
                     prop_assert!(entry.port < PORT_COUNT);
                     prop_assert!(entry.prefix_length <= MAX_PREFIX_LENGTH);
-                    prop_assert!(is_unicast_mac(entry.mac));
-                    prop_assert!(is_unicast_address(entry.address));
+                    prop_assert!(entry.mac.is_unicast());
+                    prop_assert!(entry.address.is_unicast());
                 }
                 for (index, entry) in model.interfaces().enumerate() {
                     for earlier in model.interfaces().take(index) {

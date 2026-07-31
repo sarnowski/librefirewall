@@ -64,6 +64,9 @@ use pd_runtime::{
 use virtio::net::VirtioNetHdr;
 use virtio::queue::{DeviceFaults, SplitVirtqueue};
 
+// The one place that depends on both: the pipeline fixes the room, this driver fills it.
+const _: () = assert!(VirtioNetHdr::LEN == pd_runtime::DEVICE_HEADER_LEN as usize);
+
 /// The tallies a driver protection domain keeps, split by who is answerable.
 ///
 /// The split is structural on purpose. Both halves are recorded the same way —

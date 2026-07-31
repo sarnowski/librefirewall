@@ -1,0 +1,239 @@
+//! `lfw_ip_endpoint` and the `net_headers` parsers beneath it, under the two
+//! adversaries that reach an addressed management port.
+//!
+//! # The adversary and the surface
+//!
+//! Whatever is attached to the management port chooses every byte of a frame
+//! (CONCEPT §7.1: untrusted network traffic **and** the management-plane
+//! attacker), so the input here *is* the frame: no length prefix, no operation
+//! selector, no structure this harness imposes. A corpus entry is a packet, which
+//! is what makes a capture off a real wire a usable seed.
+//!
+//! What makes this surface different from [`crate::frame`]'s is the direction:
+//! the routed dataplane reaches a *verdict* on a frame, and this one composes a
+//! *reply* to it. Every byte of that reply is derived from bytes the adversary
+//! chose, so the questions are about what leaves rather than only about what is
+//! accepted.
+//!
+//! # What is asserted
+//!
+//! * **Totality.** Every byte string is answered — a reply, a refusal, or a
+//!   parse error — and nothing panics, indexes past a bound, or overflows.
+//! * **Containment of the reply.** A reply never exceeds the storage the caller
+//!   handed over, and the bytes past its length are never touched. This is the
+//!   claim the protection domain rests on: it writes that many bytes into a pool
+//!   buffer.
+//! * **A reply is only ever produced for a frame addressed to us**, at L2 and at
+//!   L3, and it always leaves *as* us and *to* the station that asked. A reply to
+//!   a group address would make the port a reflector; a reply from an address
+//!   nobody configured would be a frame no station answers.
+//! * **Every outcome is counted, exactly once.** The counters are the only
+//!   evidence a port with an address is doing anything, so their total is
+//!   asserted equal to the number of frames handed over.
+//! * **A reply re-parses**, which is both checksums asserted the way the station
+//!   that receives one tests them.
+//! * **Nothing is carried between frames.** The same frame twice yields the same
+//!   reply byte for byte: an endpoint holds three configured values and no state
+//!   an adversary can move.
+
+use lfw_ip_endpoint::{Endpoint, Malformed, Outcome, Unhandled};
+use net_headers::{
+    ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Packet,
+    MIN_ECHO_REPLY_LEN, MacAddress,
+};
+
+/// The management port's own addressing, as `systems/qemu-x86_64/configuration.xml`
+/// gives it: a verdict here is one the appliance would reach.
+const OUR_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+const OUR_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 15]);
+const PREFIX_LENGTH: u8 = 24;
+
+/// Storage the caller hands the endpoint to compose into, and the byte it is
+/// filled with so a reply's own bytes are distinguishable from untouched ones.
+const REPLY_CAPACITY: usize = 2048;
+const UNTOUCHED: u8 = 0xa5;
+
+/// Hand one frame to an addressed endpoint and hold both the reply and the
+/// counters to everything the crate promises of them.
+pub fn ip_endpoint_harness(data: &[u8]) {
+    let mut endpoint =
+        Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX_LENGTH).expect("a unicast pair on a /24");
+    let mut out = [UNTOUCHED; REPLY_CAPACITY];
+    let outcome = endpoint.handle(data, &mut out);
+
+    // One frame, one recorded outcome: the counters are what a scrape reads, so a
+    // path that answered without recording would be invisible.
+    let counters = endpoint.counters();
+    assert_eq!(
+        counters.total(),
+        1,
+        "one frame moved {} counts",
+        counters.total()
+    );
+
+    let Some(len) = outcome.reply() else {
+        assert!(out.iter().all(|byte| *byte == UNTOUCHED));
+        assert_outcome_has_no_reply(&outcome, data);
+        return;
+    };
+
+    assert!(len <= REPLY_CAPACITY, "a reply overran the caller's storage");
+    assert!(len >= ARP_FRAME_LEN, "a reply shorter than any frame");
+    assert!(
+        out[len..].iter().all(|byte| *byte == UNTOUCHED),
+        "a reply wrote past the length it reported"
+    );
+
+    // A reply is only ever composed for a frame this endpoint was addressed by,
+    // and it always leaves as this endpoint to the station that asked.
+    let received = Ethernet::parse(data).expect("a reply needs a header to have come from");
+    assert!(
+        received.header.destination == OUR_MAC || received.header.destination.is_broadcast(),
+        "a frame addressed to somebody else was answered"
+    );
+    assert!(
+        received.header.source.is_unicast(),
+        "a reply was addressed to a group"
+    );
+
+    let sent = Ethernet::parse(&out[..len]).expect("a reply is a frame");
+    assert_eq!(sent.header.source, OUR_MAC);
+    assert_eq!(sent.header.destination, received.header.source);
+
+    match outcome {
+        Outcome::ArpReply { .. } => {
+            assert_eq!(len, ARP_FRAME_LEN);
+            assert_eq!(sent.header.ether_type, EtherType::ARP);
+            let reply = ArpPacket::parse(sent.payload).expect("an ARP reply re-parses");
+            assert_eq!(reply.operation, ArpOperation::Reply);
+            assert_eq!(reply.sender_mac, OUR_MAC);
+            assert_eq!(reply.sender_address, OUR_ADDRESS);
+            // The request it answers is the frame that arrived, and the answer
+            // names that requester rather than anything of the endpoint's own.
+            let request = ArpPacket::parse(received.payload).expect("a request was parsed");
+            assert_eq!(reply.target_mac, request.sender_mac);
+            assert_eq!(reply.target_address, request.sender_address);
+            assert!(
+                request.sender_address.shares_prefix(OUR_ADDRESS, PREFIX_LENGTH),
+                "a station off the link was answered"
+            );
+            assert_eq!(endpoint.counters().arp_replies, 1);
+        }
+        Outcome::EchoReply { .. } => {
+            assert!(len >= MIN_ECHO_REPLY_LEN);
+            assert_eq!(sent.header.ether_type, EtherType::IPV4);
+            // Re-parsing is both checksums asserted the way the station that
+            // receives the reply tests them.
+            let packet = Ipv4Packet::parse(sent.payload).expect("a valid datagram");
+            assert_eq!(packet.header().source, OUR_ADDRESS);
+            let request = Ipv4Packet::parse(received.payload).expect("a request was parsed");
+            assert_eq!(packet.header().destination, request.header().source);
+            assert_eq!(fold(packet.payload()), u16::MAX, "the ICMP sum validates");
+
+            // The echo is repeated whole: identifier, sequence and payload are
+            // the sender's only way to match a reply to its request (RFC 792).
+            let echoed = &packet.payload()[2..];
+            let asked = &request.payload()[2..];
+            assert_eq!(echoed[2..], asked[2..], "the echo was not repeated");
+            assert_eq!(endpoint.counters().echo_replies, 1);
+        }
+        other => panic!("{other:?} carried a reply"),
+    }
+
+    // Nothing is carried between frames: the same bytes twice compose the same
+    // reply, and the counters advance by exactly one more.
+    let mut again = [UNTOUCHED; REPLY_CAPACITY];
+    let second = endpoint.handle(data, &mut again);
+    assert_eq!(second, outcome);
+    assert_eq!(again[..len], out[..len]);
+    assert_eq!(endpoint.counters().total(), 2);
+}
+
+/// The RFC 1071 sum over a block that carries its own checksum, folded to 16
+/// bits: all ones when the block validates. Written here rather than reached for,
+/// so the assertion is independent of the crate that produced the value.
+fn fold(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for index in 0..bytes.len().div_ceil(2) {
+        let high = bytes[index * 2];
+        let low = bytes.get(index * 2 + 1).copied().unwrap_or(0);
+        sum += u32::from(u16::from_be_bytes([high, low]));
+    }
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    // Lossless: the fold above leaves at most 16 significant bits.
+    sum as u16
+}
+
+/// What an outcome that composed nothing must be consistent with.
+///
+/// The point is that a *refusal* is attributable: a frame refused for not being
+/// ours really is not ours, and one refused as malformed really does not parse.
+/// An endpoint that answered nothing for the wrong reason would count the wrong
+/// thing, and the counters are what an operator will read.
+fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
+    match outcome {
+        Outcome::Malformed(Malformed::Frame(_)) => {
+            // Either the Ethernet header did not parse, or the IPv4 header
+            // behind it did not.
+            if let Ok(ethernet) = Ethernet::parse(data) {
+                assert!(
+                    Ipv4Packet::parse(ethernet.payload).is_err(),
+                    "a frame that parses was reported malformed"
+                );
+            }
+        }
+        Outcome::Malformed(Malformed::Arp(_)) => {
+            let ethernet = Ethernet::parse(data).expect("an ARP refusal needs a header");
+            assert_eq!(ethernet.header.ether_type, EtherType::ARP);
+            assert!(ArpPacket::parse(ethernet.payload).is_err());
+        }
+        Outcome::Malformed(Malformed::Icmp(_)) => {
+            let ethernet = Ethernet::parse(data).expect("an ICMP refusal needs a header");
+            assert_eq!(ethernet.header.ether_type, EtherType::IPV4);
+        }
+        Outcome::NotForUs => {
+            let ethernet = Ethernet::parse(data).expect("a refusal at L2 or L3 needs a header");
+            let ours = ethernet.header.destination == OUR_MAC
+                || ethernet.header.destination.is_broadcast();
+            if ours {
+                // Then it was refused at L3, so the address it names is not this
+                // endpoint's.
+                match ethernet.header.ether_type {
+                    EtherType::ARP => {
+                        let request =
+                            ArpPacket::parse(ethernet.payload).expect("a parsed request");
+                        assert_ne!(request.target_address, OUR_ADDRESS);
+                    }
+                    EtherType::IPV4 => {
+                        let refused_at_l2 = ethernet.header.destination != OUR_MAC;
+                        if !refused_at_l2 {
+                            let packet =
+                                Ipv4Packet::parse(ethernet.payload).expect("a parsed datagram");
+                            assert_ne!(packet.header().destination, OUR_ADDRESS);
+                        }
+                    }
+                    other => panic!("{other} reached the addressed paths"),
+                }
+            }
+        }
+        Outcome::Unhandled(Unhandled::VlanTagged) => {
+            let ethernet = Ethernet::parse(data).expect("a tagged frame has a header");
+            assert_eq!(ethernet.header.ether_type, EtherType::VLAN);
+        }
+        Outcome::Unhandled(Unhandled::EtherType(ether_type)) => {
+            let ethernet = Ethernet::parse(data).expect("an EtherType refusal has a header");
+            assert_eq!(&ethernet.header.ether_type, ether_type);
+            assert_ne!(*ether_type, EtherType::ARP);
+            assert_ne!(*ether_type, EtherType::IPV4);
+        }
+        // The remaining reasons are properties of an already-parsed header that
+        // the counters attribute; there is nothing to re-derive from the bytes
+        // that would not restate the endpoint's own decision.
+        Outcome::Unhandled(_) | Outcome::ReplyRefused(_) => {}
+        Outcome::ArpReply { .. } | Outcome::EchoReply { .. } => {
+            panic!("a reply outcome reported no reply")
+        }
+    }
+}

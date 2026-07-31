@@ -265,18 +265,27 @@ const LOG_WITHHELD: &str = "no writing domain maps another writing domain's ring
 /// the property untrue.
 const MANAGEMENT_WITHHELD: &str = "the forwarder maps no management region and the management      domain maps no dataplane one. CONCEPT §9.1 isolates the management port from the dataplane      and gives it no forwarded traffic, and that isolation is exactly this mutual exclusion — a      frame cannot cross between the two because no domain is granted a region on both sides of      it. A dataplane grant appearing on the management domain would put the domain that will one      day terminate an operator's session on the path of every frame in flight; a management grant      appearing on the forwarder would let the routing stage reach a port that is meant to be      unreachable from it";
 
-/// As [`MANAGEMENT_WITHHELD`], for the management port's transmit pipeline —
-/// the three regions the port-agnostic driver binary requires and no other
-/// domain has any use for.
-const MANAGEMENT_TRANSMIT_WITHHELD: &str = "the driver instance is the only domain that maps any      of the management port's transmit pipeline, and nothing in this system produces onto it. The      three regions exist because that binary takes a transmit side whatever port it drives      (pds/nic-driver's crate header) — not because anything transmits. A grant to the management      domain would be authority over a buffer pool with no code that writes one and no frame to      send, which is authority for nothing (ENG-1) and arrives with the code that originates a      management response rather than before it (ENG-7); a grant to the forwarder would put a      dataplane domain on a port CONCEPT §9.1 makes unreachable from it";
+/// As [`MANAGEMENT_WITHHELD`], for the management port's transmit pipeline — the
+/// three regions a reply travels out on, and what keeps the dataplane off them.
+const MANAGEMENT_TRANSMIT_WITHHELD: &str = "the forwarder maps no part of the management port's \
+     transmit pipeline, and the management domain and its driver instance are the only domains \
+     that map any of it. The two sit at opposite ends of it: the management domain OWNS this pool \
+     — it allocates a buffer, writes a reply into it, lends it, and consumes the returns — and the \
+     driver maps the pool to write the virtio-net header in front of the frame and produces those \
+     returns. A grant to the forwarder would put a dataplane domain on a port CONCEPT §9.1 makes \
+     unreachable from it, and a grant to any third domain would be a second writer of a pool that \
+     has one owner (ENG-1)";
 
-/// As [`POOL_WITHHELD`], for the management port's receive pool: the one region
-/// in this description that NO protection domain maps.
-///
-/// A rule with an empty grant set is admissible only with a claim like this
-/// one, because "reachable by no domain" is otherwise indistinguishable from a
-/// rule whose grants were forgotten — see [`check_region_mappers`].
-const DMA_ONLY_WITHHELD: &str = "no protection domain maps this region at all. The driver      receives into it and is granted its physical address alone (pds/nic-driver's crate header),      and the management domain counts frames off their descriptors without dereferencing one, so      it maps no pool either — which leaves the region reachable by the management NIC's DMA and      by nothing with a CPU. Any mapping here is therefore a new authority over a live DMA target,      and it is the grant that arrives with the code that reads a frame, not before it (ENG-7)";
+/// As [`POOL_WITHHELD`], for the management port's receive pool: the one pool in
+/// this description whose mapper holds it READ-ONLY.
+const MANAGEMENT_RECEIVE_POOL_WITHHELD: &str = "the driver that receives into this pool maps no \
+     part of it, and the domain that reads it cannot write it. The driver is granted the physical \
+     address alone (pds/nic-driver's crate header) — a mapping would additionally make the DMA \
+     target the device writes reachable from the CPU side of the same domain — and the management \
+     domain maps it READ-ONLY, because a frame this appliance was sent is parsed and never \
+     altered: a reply is composed in storage of that domain's own and copied into a buffer of the \
+     *transmit* pool. Read-write here would be authority to rewrite a frame under the decision \
+     that inspected it, for a use no code has (ENG-1)";
 
 /// As [`POOL_WITHHELD`], for the return rings — the exclusion the forwarder's
 /// isolation now rests on entirely.
@@ -287,6 +296,19 @@ const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region
      could produce on it would be a second producer on a ring that admits exactly one. This is \
      what a compromised forwarder is still unable to do: it can corrupt a frame in flight, and it \
      cannot hand a live DMA target back to be issued a second time";
+
+/// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
+/// the finding on the management domain gaining the acknowledgement region.
+const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `cfgack` NOT AT \
+     ALL, which is what makes it a weaker consumer of the handover than the forwarder rather than \
+     a second one. The forwarder is the consumer of the two-phase commit: it reads the OFFERED \
+     generation, stages a table and acknowledges, and a commit waits for that acknowledgement. \
+     The management domain reads the COMMITTED generation alone \
+     (`pd_runtime::CommittedReader`), so it cannot delay a commit, cannot refuse one on anybody's \
+     behalf, and holds no region an acknowledgement could be forged in. A `cfgack` grant here \
+     would make 'every consumer has staged' a conjunction over two domains and hand the domain \
+     that answers the management-plane attacker the word that releases a generation (ENG-1, \
+     SCM-6)";
 
 /// Every memory region the description may declare, and what each one owes the
 /// code. A region absent from this table fails the gate; so does a rule here
@@ -491,12 +513,12 @@ const REGIONS: &[RegionRule] = &[
     // drivers — which is why this rule's exclusion is MANAGEMENT_WITHHELD, the
     // dataplane mutual exclusion, and not RETURN_WITHHELD.
     //
-    // mgmt_rx_pool is the one region here granted to nobody, and DMA_ONLY_WITHHELD
-    // is what makes that a checked claim rather than a rule somebody forgot to
-    // finish. The transmit three are the driver binary's alone: it takes a
-    // transmit side whatever port it drives, and nothing produces onto that
-    // pipeline, so this is the narrowest grant set that lets one binary serve
-    // three ports.
+    // mgmt_rx_pool is read by the management domain and written by nothing with a
+    // CPU: the frame it parses is copied out of that pool, and the reply goes
+    // into the transmit pool it owns. The transmit three are that pool and its
+    // rings, with the two domains at opposite ends of each — the management
+    // domain owning the pool and consuming the returns, the driver writing the
+    // device header and producing them.
     RegionRule {
         name: "mgmt_rx_pool",
         size: ExpectedSize {
@@ -504,8 +526,8 @@ const REGIONS: &[RegionRule] = &[
             bytes: POOL_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[],
-        withheld: Some(DMA_ONLY_WITHHELD),
+        grants: &[read_only("management")],
+        withheld: Some(MANAGEMENT_RECEIVE_POOL_WITHHELD),
     },
     RegionRule {
         name: "mgmt_rx_fwd",
@@ -534,7 +556,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: POOL_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("nic_driver2")],
+        grants: &[read_write("nic_driver2"), read_write("management")],
         withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
     },
     RegionRule {
@@ -544,7 +566,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: FORWARD_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("nic_driver2")],
+        grants: &[read_write("nic_driver2"), read_write("management")],
         withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
     },
     RegionRule {
@@ -554,7 +576,7 @@ const REGIONS: &[RegionRule] = &[
             bytes: RETURN_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("nic_driver2")],
+        grants: &[read_write("nic_driver2"), read_write("management")],
         withheld: Some(MANAGEMENT_TRANSMIT_WITHHELD),
     },
     // The configuration handover, and the one place in this description where
@@ -565,9 +587,12 @@ const REGIONS: &[RegionRule] = &[
     // publisher reporting a generation nobody runs; a `cfgack` the config
     // domain could write would let it forge the acknowledgement that releases
     // its own generation, which is the whole of what the second phase is for.
-    // Neither exclusion — no driver maps either region — is claimed anywhere,
-    // and a driver has no more use for a configuration image than for a
-    // parser, so `withheld` is None and the perms carry the argument.
+    // `cfg` has a second reader and `cfgack` still one writer, and that is where
+    // the claim sits: the management domain reads the committed generation to
+    // learn its own addressing and takes no part in the commit, so a `cfgack`
+    // grant to it is the edit CONFIG_ACK_WITHHELD refuses. On `cfg` itself no
+    // exclusion is claimed — a driver has no more use for a configuration image
+    // than for a parser — so the perms carry the argument there.
     RegionRule {
         name: "cfg",
         size: ExpectedSize {
@@ -575,7 +600,11 @@ const REGIONS: &[RegionRule] = &[
             bytes: CONFIG_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("config"), read_only("forwarder")],
+        grants: &[
+            read_write("config"),
+            read_only("forwarder"),
+            read_only("management"),
+        ],
         withheld: None,
     },
     RegionRule {
@@ -586,7 +615,7 @@ const REGIONS: &[RegionRule] = &[
         },
         cacheability: Cacheability::Cached,
         grants: &[read_only("config"), read_write("forwarder")],
-        withheld: None,
+        withheld: Some(CONFIG_ACK_WITHHELD),
     },
     // The log transport: one ring per writing domain, split into two regions so
     // the two directions can carry opposite authority. Every pair below is the
@@ -2564,33 +2593,91 @@ mod tests {
         }
     }
 
-    /// The management port's receive pool is reachable by no domain, and a
-    /// mapping of it is therefore a capability change like any other. This is
-    /// the check on the check: the empty grant set must refuse a holder rather
-    /// than pass over one, which is exactly what an unclaimed region would do.
+    /// The management port's receive pool is read and never written, and the
+    /// perms are the whole of that: a widening to read-write is a capability
+    /// change like any other, and the finding quotes what the read-only grant
+    /// was worth.
     #[test]
-    fn a_domain_mapping_a_region_no_domain_may_map_is_reported() {
+    fn a_domain_widening_the_management_receive_pool_to_write_is_reported() {
         let findings = findings_after(
-            "<map mr=\"mgmt_rx_fwd\" vaddr=\"0x2_000_000\" perms=\"rw\" cached=\"true\" \
-             setvar_vaddr=\"mgmt_rx_fwd_vaddr\" />\n        <map mr=\"mgmt_rx_free\"",
-            "<map mr=\"mgmt_rx_pool\" vaddr=\"0x2_300_000\" perms=\"rw\" cached=\"true\" \
-             setvar_vaddr=\"mgmt_rx_pool_vaddr\" />\n        <map mr=\"mgmt_rx_free\"",
+            "<map mr=\"mgmt_rx_pool\" vaddr=\"0x2_004_000\" perms=\"r\"",
+            "<map mr=\"mgmt_rx_pool\" vaddr=\"0x2_004_000\" perms=\"rw\"",
         );
-        let joined = findings.join("\n");
-        assert!(joined.contains("mgmt_rx_pool"), "{joined}");
+        let finding = only_finding(&findings);
+        assert!(finding.contains("mgmt_rx_pool"), "{finding}");
+        assert!(finding.contains("\"management\""), "{finding}");
         assert!(
-            joined.contains("grants to no protection domain at all"),
-            "{joined}"
+            finding.contains("perms=\"rw\"") && finding.contains("\"r\""),
+            "the finding names both the grant and what was asked for: {finding}"
         );
-        // And the finding quotes what the emptiness was worth, rather than
-        // telling the author which domain list to add a name to.
+    }
+
+    /// The asymmetry the management domain's grant set rests on: it reads the
+    /// configuration and holds no acknowledgement region, because it is not the
+    /// consumer of the two-phase commit. A `cfgack` mapping is the edit that
+    /// would make it one, and the finding quotes what its absence was worth.
+    #[test]
+    fn the_management_domain_reaching_the_acknowledgement_region_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"cfg\" vaddr=\"0x3_000_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"cfg_vaddr\" />\n        <map mr=\"log_management\"",
+            "<map mr=\"cfg\" vaddr=\"0x3_000_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"cfg_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_001_000\" \
+             perms=\"rw\" cached=\"true\" setvar_vaddr=\"cfgack_vaddr\" />\n        \
+             <map mr=\"log_management\"",
+        );
+        let finding = only_finding(&findings);
+        assert!(finding.contains("cfgack"), "{finding}");
+        assert!(finding.contains("\"management\""), "{finding}");
         assert!(
-            joined.contains("no protection domain maps this region at all"),
-            "{joined}"
+            finding.contains("reads the COMMITTED generation alone"),
+            "the finding quotes what withholding it was worth: {finding}"
         );
-        // The rule for the region whose mapping was replaced is now matching
-        // nothing, which is the other half of the same edit.
-        assert!(joined.contains("mgmt_rx_fwd"), "{joined}");
+    }
+
+    /// A rule granting its region to nobody is a real shape — a DMA target the
+    /// owning driver holds only the physical address of — and this description
+    /// happens to hold none today. The rendering is kept covered because the
+    /// check is what tells that shape from a rule whose grants were forgotten.
+    #[test]
+    fn an_empty_grant_set_is_spelled_out_rather_than_printed_as_brackets() {
+        let unmapped = RegionRule {
+            name: "dma-only",
+            size: ExpectedSize {
+                rust_name: "pd_runtime::POOL_REGION_SIZE",
+                bytes: POOL_REGION_SIZE,
+            },
+            cacheability: Cacheability::Cached,
+            grants: &[],
+            withheld: None,
+        };
+        assert_eq!(unmapped.granted_to(), "no protection domain at all");
+        assert!(unmapped.grant("management").is_none());
+
+        // With no claim, the emptiness itself is the finding: an unclaimed empty
+        // grant set is what a forgotten one looks like.
+        let mut findings = Vec::new();
+        check_region_mappers(&unmapped, &[], &mut findings);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let finding = findings.join("");
+        assert!(finding.contains("to no protection domain"), "{finding}");
+        assert!(finding.contains("record the claim"), "{finding}");
+
+        // With one, a holder is reported against it and the claim is quoted.
+        let claimed = RegionRule {
+            withheld: Some("nothing with a CPU may reach it"),
+            ..unmapped
+        };
+        let mut findings = Vec::new();
+        check_region_mappers(
+            &claimed,
+            &[("dma-only", String::from("management"))],
+            &mut findings,
+        );
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let finding = findings.join("");
+        assert!(finding.contains("no protection domain at all"), "{finding}");
+        assert!(finding.contains("nothing with a CPU"), "{finding}");
     }
 
     /// The mutual exclusion CONCEPT §9.1 asks for, in the direction that would

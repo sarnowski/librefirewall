@@ -11,6 +11,7 @@
 //! | [`virtio_pci`] | `virtio::pci` capability walk and BAR bounds, and the `nic_driver_core` bring-up typestate above them | a hostile or malfunctioning device |
 //! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
+//! | [`ip_endpoint`] | `lfw_ip_endpoint`'s ARP and ICMP-echo answers, and the `net_headers` parsers and builders under them | untrusted network traffic **and** a management-plane attacker |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
@@ -125,6 +126,7 @@
 pub mod document;
 pub mod driver;
 pub mod frame;
+pub mod ip_endpoint;
 pub mod free_list;
 pub mod handover;
 pub mod log_record;
@@ -218,6 +220,7 @@ mod tests {
         ("log_record", crate::log_record::log_record_harness),
         ("free_list_ownership", crate::free_list::free_list_harness),
         ("route_frame", crate::frame::frame_routing_harness),
+        ("ip_endpoint", crate::ip_endpoint::ip_endpoint_harness),
         ("config_document", crate::document::document_harness),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),

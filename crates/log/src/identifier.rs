@@ -42,6 +42,14 @@ pub struct Identifier {
 }
 
 impl Identifier {
+    /// The key a change record about the management interface carries: that
+    /// element has no `id` of its own. A literal rather than a fallible call at
+    /// a place with no failure; the assertion below keeps it admissible.
+    pub const MANAGEMENT: Self = Self {
+        bytes: *b"management\0\0\0\0\0\0",
+        len: 10,
+    };
+
     pub fn new(bytes: &[u8]) -> Result<Self, IdentifierError> {
         if bytes.is_empty() {
             return Err(IdentifierError::Empty);
@@ -91,6 +99,23 @@ impl Identifier {
     }
 }
 
+/// What [`Identifier::new`] would have checked, checked at build time instead:
+/// a wrong literal is a compile error rather than an unrenderable line.
+const _: () = {
+    let Identifier { bytes, len } = Identifier::MANAGEMENT;
+    assert!(len > 0 && len <= MAX_IDENTIFIER_LEN);
+    let mut offset = 0;
+    while offset < MAX_IDENTIFIER_LEN {
+        let byte = bytes[offset];
+        if offset < len {
+            assert!(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        } else {
+            assert!(byte == 0);
+        }
+        offset += 1;
+    }
+};
+
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -112,6 +137,19 @@ mod tests {
             assert_eq!(id.len(), text.len());
             assert!(!id.is_empty());
         }
+    }
+
+    /// The hand-built constant is the one [`Identifier::new`] would have made,
+    /// which is what the const assertion beside it cannot state.
+    #[test]
+    fn the_management_key_is_the_identifier_its_own_constructor_would_build() {
+        assert_eq!(
+            Identifier::MANAGEMENT,
+            Identifier::new(b"management").expect("within the alphabet")
+        );
+        assert_eq!(Identifier::MANAGEMENT.as_str(), "management");
+        assert_eq!(Identifier::MANAGEMENT.len(), 10);
+        assert!(!Identifier::MANAGEMENT.is_empty());
     }
 
     #[test]

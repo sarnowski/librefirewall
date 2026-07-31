@@ -67,9 +67,10 @@ const CONFIG_RECORD_PREFIX: &str = "LFW-CFG ";
 const FIRST_COMMIT: u32 = 1;
 
 /// Room for every record one commit from the empty model can produce: every
-/// object the handover image holds, in every field a record can name. The same
-/// two constants `pds/config` sizes its own buffer from.
-const MAX_CHANGES: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS) * Field::ALL.len();
+/// object the handover image holds — the interfaces, the neighbours and the one
+/// management interface — in every field a record can name. The same constants
+/// `pds/config` sizes its own buffer from.
+const MAX_CHANGES: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS + 1) * Field::ALL.len();
 
 /// Why a document does not describe a transcript worth asserting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,8 +130,22 @@ impl ConfigContract {
     pub(crate) fn from_document(document: &[u8]) -> Result<Self, ContractError> {
         let model = config::load(document)
             .map_err(|error| ContractError::Refused(error.reason().name().to_owned()))?;
+        Self::from_model(&model)
+    }
+
+    /// The transcript a model would produce, which is the half of
+    /// [`ConfigContract::from_document`] that does not read bytes.
+    ///
+    /// Separate because one of its refusals is unreachable from a document: a
+    /// configuration that moves nothing is one naming no object at all, and the
+    /// schema requires a `<management>` element, so every document a reader
+    /// accepts names at least that one.
+    ///
+    /// # Errors
+    /// [`ContractError`], as [`ConfigContract::from_document`].
+    fn from_model(model: &Model) -> Result<Self, ContractError> {
         let mut records = [None::<Change>; MAX_CHANGES];
-        let summary = config::diff(&Model::EMPTY, &model, &mut records);
+        let summary = config::diff(&Model::EMPTY, model, &mut records);
         if summary.overflowed() {
             return Err(ContractError::TooManyChanges {
                 total: summary.total(),
@@ -489,10 +504,11 @@ mod tests {
     #[test]
     fn the_shipped_document_produces_a_record_for_every_value_it_names() {
         let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
-        // Two interfaces of five fields and two neighbours of three: the
-        // document's own content, counted rather than restated.
-        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3);
-        assert!(contract.summary().contains("16"));
+        // Two interfaces of five fields, two neighbours of three, and the
+        // management interface's four: the document's own content, counted rather
+        // than restated.
+        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 4);
+        assert!(contract.summary().contains("20"));
         for record in &contract.changes {
             assert!(record.starts_with("LFW-CFG generation=1 seq="), "{record}");
             assert!(record.contains("change=added"), "{record}");
@@ -512,22 +528,45 @@ mod tests {
             "key=dataplane-1 field=address to=10.0.1.1",
             "key=endpoint-a field=address to=10.0.0.2",
             "key=endpoint-b field=mac to=52:54:00:00:00:0b",
+            // The management interface is one of the document's objects, keyed
+            // by the name a record about it carries rather than by an id it does
+            // not have.
+            "object=management key=management field=mac to=52:54:00:12:34:52",
+            "object=management key=management field=address to=10.0.2.15",
         ] {
             assert!(joined.contains(value), "{value} missing from:\n{joined}");
         }
     }
 
+    /// Every record that names an id, an address or a MAC must differ between the
+    /// two documents, or a stale table could satisfy both transcripts.
+    ///
+    /// The one record they share is the management interface's `enabled=true`,
+    /// and it is exhaustively accounted for rather than excused: both documents
+    /// enable that port, so that record is the same *statement* in both. A
+    /// boolean carries no addressing, so it can prove nothing either way — but
+    /// it is asserted to be the only one, so a second shared record is a failure.
     #[test]
-    fn the_alternate_document_produces_a_transcript_that_shares_no_value_with_the_shipped_one() {
+    fn the_alternate_document_produces_a_transcript_that_shares_no_addressing_with_the_shipped_one()
+    {
         let shipped = ConfigContract::from_document(SHIPPED).expect("the shipped document");
         let alternate = ConfigContract::from_document(ALTERNATE).expect("the alternate document");
         assert_eq!(shipped.changes.len(), alternate.changes.len());
-        for record in &alternate.changes {
-            assert!(
-                !shipped.changes.contains(record),
-                "a transcript both documents produce proves nothing: {record}"
-            );
-        }
+
+        let shared: Vec<&String> = alternate
+            .changes
+            .iter()
+            .filter(|record| shipped.changes.contains(record))
+            .collect();
+        assert_eq!(
+            shared,
+            [&format!(
+                "LFW-CFG generation=1 seq={} change=added object=management key=management \
+                 field=enabled to=true",
+                2 * 5 + 2 * 3
+            )],
+            "a transcript both documents produce proves nothing"
+        );
     }
 
     #[test]
@@ -604,7 +643,7 @@ mod tests {
         let verdict = contract
             .judge(text.as_bytes(), log())
             .expect_err("the summary ahead of the records it summarises");
-        assert!(verdict.contains("changes=16"), "{verdict}");
+        assert!(verdict.contains("changes=20"), "{verdict}");
         assert!(
             verdict.contains("which the domain published first"),
             "{verdict}"
@@ -890,10 +929,18 @@ mod tests {
             ConfigContract::from_document(b"<!DOCTYPE evil><configuration/>"),
             Err(ContractError::Refused(_))
         ));
+        // A document naming no object at all is one no reader accepts: the
+        // schema requires a `<management>` element, which is why
+        // `ContractError::MovesNothing` is unreachable from a valid document and
+        // is exercised against the model directly instead.
         assert!(matches!(
             ConfigContract::from_document(
                 b"<configuration><interfaces/><neighbours/></configuration>"
             ),
+            Err(ContractError::Refused(_))
+        ));
+        assert!(matches!(
+            ConfigContract::from_model(&Model::EMPTY),
             Err(ContractError::MovesNothing)
         ));
     }

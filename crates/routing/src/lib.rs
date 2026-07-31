@@ -16,18 +16,13 @@
 //! no gateway indirection — and it is what a two-port appliance between two
 //! directly attached subnets needs.
 //!
-//! Neighbours are configured, never learned. ARP is not implemented anywhere in
-//! the system, and it cannot be until a domain can *originate* a frame: the
-//! buffer pools are owned by the receiving drivers, the forwarder owns none, and
-//! a frame can only leave the port opposite the one it arrived on. Resolution
-//! therefore stays a table until that topology changes (CONCEPT §6.3's
-//! Routing/ARP/ICMP component), and this crate carries no discovery state.
+//! Neighbours are configured, never learned: this crate carries no discovery
+//! state. Resolution stays a table because the forwarder cannot *originate* a
+//! frame — it owns no buffer pool, and a frame leaves only the port opposite the
+//! one it arrived on (CONCEPT §6.3's Routing/ARP/ICMP component).
 //!
-//! # No ICMP
-//!
-//! A drop is counted, never answered. Every reason below would, in a complete
-//! router, generate an ICMP error — time exceeded, destination unreachable —
-//! and generating one needs the same frame origination ARP does.
+//! A drop is counted, never answered. An ICMP error — time exceeded,
+//! destination unreachable — needs that same origination.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -50,8 +45,8 @@ pub struct Interface {
     /// The MAC this port answers to, and the source MAC it forwards under.
     pub mac: MacAddress,
     pub address: Ipv4Address,
-    /// Bits of `address` that form the network; see [`prefix_mask`], which is
-    /// what makes every value of this field a valid one.
+    /// Bits of `address` that form the network. Every `u8` is a valid one:
+    /// `Ipv4Address::shares_prefix` saturates rather than rejecting.
     pub prefix_length: u8,
     /// Administratively up. A disabled interface is neither a valid ingress
     /// nor a selectable egress.
@@ -71,8 +66,7 @@ impl Interface {
 
     #[must_use]
     pub const fn covers(&self, destination: Ipv4Address) -> bool {
-        let mask = prefix_mask(self.prefix_length);
-        destination.bits() & mask == self.address.bits() & mask
+        destination.shares_prefix(self.address, self.prefix_length)
     }
 }
 
@@ -90,20 +84,6 @@ impl Neighbour {
         address: Ipv4Address::from_octets([0, 0, 0, 0]),
         mac: MacAddress([0; 6]),
     };
-}
-
-/// The network mask for a prefix length, saturating rather than rejecting: a
-/// length above 32 is a host route and 0 matches everything, so every `u8` maps
-/// to a mask and no invalid configuration is representable.
-#[must_use]
-pub const fn prefix_mask(prefix_length: u8) -> u32 {
-    if prefix_length == 0 {
-        0
-    } else if prefix_length >= 32 {
-        u32::MAX
-    } else {
-        u32::MAX << (32 - prefix_length)
-    }
 }
 
 /// Why a frame was not forwarded. Each variant is one counter in
@@ -389,19 +369,11 @@ impl<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
 
         let header = frame.ipv4();
         let source = header.source;
-        if source.is_multicast()
-            || source.is_broadcast()
-            || source.is_loopback()
-            || source.is_unspecified()
-        {
+        if !source.is_unicast() {
             return Decision::Drop(DropReason::MartianSource);
         }
         let destination = header.destination;
-        if destination.is_multicast()
-            || destination.is_broadcast()
-            || destination.is_loopback()
-            || destination.is_unspecified()
-        {
+        if !destination.is_unicast() {
             return Decision::Drop(DropReason::UnroutableDestination);
         }
         if self.is_local_address(destination) {
@@ -858,15 +830,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn prefix_masks_saturate_at_both_ends() {
-        assert_eq!(prefix_mask(0), 0);
-        assert_eq!(prefix_mask(1), 0x8000_0000);
-        assert_eq!(prefix_mask(24), 0xffff_ff00);
-        assert_eq!(prefix_mask(32), u32::MAX);
-        assert_eq!(prefix_mask(255), u32::MAX);
     }
 
     #[test]

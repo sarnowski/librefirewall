@@ -128,6 +128,8 @@ mod tests {
         "    <neighbour id=\"gateway-a\" interface=\"wan\"\n",
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
         "  </neighbours>\n",
+        "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\"\n",
+        "              prefix-length=\"24\" enabled=\"true\"/>\n",
         "</configuration>\n"
     );
 
@@ -156,6 +158,16 @@ mod tests {
         // all, so the semantic rules never see a model to judge.
         let both = load(b"<!DOCTYPE x><configuration/>").expect_err("a doctype");
         assert_eq!(both.reason(), RejectReason::Doctype);
+    }
+
+    /// The management element crosses both halves too: the reader gives it to
+    /// the model and the rules hold it apart from the dataplane.
+    #[test]
+    fn a_management_interface_colliding_with_a_dataplane_prefix_is_refused_by_the_rules() {
+        let collides = CONTRACT_DOCUMENT.replacen("192.168.42.15", "10.0.0.9", 1);
+        let error = load(collides.as_bytes()).expect_err("one address, two ways to reach it");
+        assert!(matches!(error, ConfigError::Semantic(_)));
+        assert_eq!(error.reason(), RejectReason::OverlappingPrefixes);
     }
 
     #[test]

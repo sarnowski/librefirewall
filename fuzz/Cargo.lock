@@ -68,6 +68,13 @@ name = "lfw-clock"
 version = "0.1.0"
 
 [[package]]
+name = "lfw-ip-endpoint"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+]
+
+[[package]]
 name = "lfw-log"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +105,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "config",
+ "lfw-ip-endpoint",
  "lfw-log",
  "libfuzzer-sys",
  "net-headers",
@@ -131,6 +139,7 @@ version = "0.1.0"
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "lfw-ip-endpoint",
  "lfw-log",
  "net-headers",
  "packet-buffer",

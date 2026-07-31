@@ -33,7 +33,9 @@
 
 use std::sync::LazyLock;
 
-use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, Ipv4Address, MacAddress};
+use net_headers::{
+    ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet, MacAddress,
+};
 use routing::{Decision, Interface, Neighbour, PortId, Router};
 
 const PORT0: PortId = PortId(0);
@@ -79,6 +81,32 @@ static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
     .expect("two of each fit in two")
 });
 
+/// The rewritable parser and the read-only one are one validator, so a header
+/// either passes both or neither — and where both pass, they agree field for
+/// field.
+///
+/// Asserted here because the two are reached by different domains: the forwarder
+/// rewrites through [`Frame`], and the addressed management endpoint reads
+/// through [`Ipv4Packet`]. A divergence would mean one of them was routing on a
+/// header the other had refused.
+fn agree_on_the_ipv4_header(data: &[u8]) {
+    let mut bytes = data.to_vec();
+    let rewritable = Frame::parse(&mut bytes).map(|frame| frame.ipv4());
+    let Some(after_l2) = data.get(ETHERNET_HEADER_LEN..) else {
+        return;
+    };
+    let read_only = Ipv4Packet::parse(after_l2).map(|packet| packet.header());
+    match (rewritable, read_only) {
+        (Ok(left), Ok(right)) => assert_eq!(left, right, "two readings of one header"),
+        // Either may refuse what the other accepts, but only for a reason that
+        // is its own: `Frame` additionally reads a transport header, and
+        // `Ipv4Packet` is reached here without the EtherType dispatch in front
+        // of it. What must never happen is the same *header* rule answering two
+        // ways, which is what the accepted case above pins.
+        _ => {}
+    }
+}
+
 /// Parse one frame, decide on it as if it had arrived on each port in turn, and
 /// carry out whatever rewrite the decision authorises.
 ///
@@ -86,6 +114,7 @@ static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
 /// one depends on bytes the adversary chose: driving a single port would leave
 /// the whole `Forward` arm reachable only by accident.
 pub fn frame_routing_harness(data: &[u8]) {
+    agree_on_the_ipv4_header(data);
     for ingress in [PORT0, PORT1] {
         let original = data.to_vec();
         let mut bytes = original.clone();

@@ -20,7 +20,7 @@
 
 use lfw_log::{ChangeKind, Field, Identifier, ObjectKind, Value};
 
-use crate::model::{InterfaceEntry, Model, NeighbourEntry};
+use crate::model::{InterfaceEntry, ManagementEntry, Model, NeighbourEntry};
 
 /// One value that changed, named the way the document names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +125,17 @@ pub fn diff(before: &Model, after: &Model, records: &mut [Option<Change>]) -> Di
         &after.neighbours_by_id(),
         |entry| entry.id,
         neighbour_fields,
+        &mut out,
+    );
+    // One slot, and the same merge: an element that appears, disappears or
+    // changes a field is added, removed or modified on the terms every other
+    // object kind is held to.
+    walk(
+        ObjectKind::Management,
+        &before.management_slot(),
+        &after.management_slot(),
+        |_| Identifier::MANAGEMENT,
+        management_fields,
         &mut out,
     );
     out.finish()
@@ -258,6 +269,17 @@ fn modified(
 fn interface_fields(entry: &InterfaceEntry) -> Fields {
     [
         Some(Value::Port(entry.port)),
+        Some(Value::Bool(entry.enabled)),
+        Some(Value::Mac(entry.mac)),
+        Some(Value::Ipv4(entry.address)),
+        Some(Value::PrefixLength(entry.prefix_length)),
+        None,
+    ]
+}
+
+fn management_fields(entry: &ManagementEntry) -> Fields {
+    [
+        None,
         Some(Value::Bool(entry.enabled)),
         Some(Value::Mac(entry.mac)),
         Some(Value::Ipv4(entry.address)),
@@ -496,6 +518,79 @@ mod tests {
         );
     }
 
+    fn management(enabled: bool, last: u8) -> ManagementEntry {
+        ManagementEntry {
+            enabled,
+            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+            address: Ipv4Address::from_octets([10, 0, 2, last]),
+            prefix_length: 24,
+        }
+    }
+
+    #[test]
+    fn the_management_interface_is_diffed_field_by_field_like_any_other_object() {
+        let mut before = Model::EMPTY;
+        before.set_management(management(true, 15)).expect("one");
+        let mut after = Model::EMPTY;
+        after.set_management(management(false, 15)).expect("one");
+
+        let (written, summary) = records(&before, &after);
+        assert_eq!(summary.written(), 1);
+        assert_eq!(
+            written.first().copied(),
+            Some(Change {
+                kind: ChangeKind::Modified,
+                object: ObjectKind::Management,
+                key: Identifier::MANAGEMENT,
+                field: Field::Enabled,
+                from: Some(Value::Bool(true)),
+                to: Some(Value::Bool(false)),
+            })
+        );
+
+        // Appearing and disappearing, on the terms every other object is held to.
+        let (added, _) = records(&Model::EMPTY, &before);
+        assert_eq!(added.len(), 4);
+        assert!(added.iter().all(|change| change.kind == ChangeKind::Added
+            && change.object == ObjectKind::Management
+            && change.from.is_none()));
+        assert_eq!(
+            added.iter().map(|change| change.field).collect::<Vec<_>>(),
+            [
+                Field::Enabled,
+                Field::Mac,
+                Field::Address,
+                Field::PrefixLength
+            ]
+        );
+        let (removed, _) = records(&before, &Model::EMPTY);
+        assert!(
+            removed
+                .iter()
+                .all(|change| change.kind == ChangeKind::Removed && change.to.is_none())
+        );
+
+        // An unchanged entry produces nothing at all.
+        assert!(records(&before, &before).0.is_empty());
+    }
+
+    /// The management records come last, after both dataplane object kinds: the
+    /// ordering is by object kind, and a reader depends on it.
+    #[test]
+    fn management_records_follow_the_dataplane_ones() {
+        let mut after = with_interfaces(&["wan"]);
+        after
+            .push_neighbour(neighbour("gateway-a", "wan", 2))
+            .expect("capacity");
+        after.set_management(management(true, 15)).expect("one");
+        let (written, _) = records(&Model::EMPTY, &after);
+        let kinds: Vec<ObjectKind> = written.iter().map(|change| change.object).collect();
+        let mut sorted = kinds.clone();
+        sorted.sort_unstable();
+        assert_eq!(kinds, sorted);
+        assert_eq!(kinds.last(), Some(&ObjectKind::Management));
+    }
+
     #[test]
     fn interfaces_are_reported_before_neighbours() {
         let mut after = with_interfaces(&["wan"]);
@@ -694,7 +789,12 @@ mod tests {
                 for offset in 0..count {
                     text.push_str(&peer(order(offset)));
                 }
-                text.push_str("</neighbours></configuration>");
+                text.push_str("</neighbours>");
+                text.push_str(
+                    "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" \
+                     address=\"192.168.42.15\" prefix-length=\"24\"/>",
+                );
+                text.push_str("</configuration>");
                 text
             };
 
@@ -723,7 +823,35 @@ mod tests {
         match change.object {
             ObjectKind::Interface => apply_interface(model, change),
             ObjectKind::Neighbour => apply_neighbour(model, change),
+            ObjectKind::Management => apply_management(model, change),
         }
+    }
+
+    fn apply_management(model: &mut Model, change: &Change) {
+        let mut entry = model.management().unwrap_or(ManagementEntry {
+            enabled: false,
+            mac: MacAddress([0; 6]),
+            address: Ipv4Address::from_octets([0, 0, 0, 0]),
+            prefix_length: 0,
+        });
+        let mut rebuilt = Model::EMPTY;
+        for interface in model.interfaces() {
+            rebuilt.push_interface(*interface).expect("capacity");
+        }
+        for neighbour in model.neighbours() {
+            rebuilt.push_neighbour(*neighbour).expect("capacity");
+        }
+        if change.kind != ChangeKind::Removed {
+            match change.to {
+                Some(Value::Bool(enabled)) => entry.enabled = enabled,
+                Some(Value::Mac(mac)) => entry.mac = mac,
+                Some(Value::Ipv4(address)) => entry.address = address,
+                Some(Value::PrefixLength(length)) => entry.prefix_length = length,
+                _ => {}
+            }
+            rebuilt.set_management(entry).expect("one");
+        }
+        *model = rebuilt;
     }
 
     fn apply_interface(model: &mut Model, change: &Change) {
@@ -800,10 +928,17 @@ mod tests {
 
     /// The objects a configuration holds, in id order and stripped of the order
     /// they were written in — which is the equality a replay can reach.
-    fn content_of(model: &Model) -> (Vec<InterfaceEntry>, Vec<NeighbourEntry>) {
+    fn content_of(
+        model: &Model,
+    ) -> (
+        Vec<InterfaceEntry>,
+        Vec<NeighbourEntry>,
+        Option<ManagementEntry>,
+    ) {
         (
             model.interfaces_by_id().iter().flatten().copied().collect(),
             model.neighbours_by_id().iter().flatten().copied().collect(),
+            model.management(),
         )
     }
 }

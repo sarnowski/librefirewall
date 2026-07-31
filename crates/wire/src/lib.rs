@@ -224,6 +224,37 @@ impl NeighbourImage {
     };
 }
 
+/// The management interface as the validating domain left it: the appliance's
+/// own presence on the port CONCEPT §9.1 keeps out of the dataplane.
+///
+/// It carries no port, unlike an [`InterfaceImage`]: the management port is not
+/// in the router's port set and no number in this image can put it there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagementImage {
+    /// 0 or 1 as raw bits, on [`InterfaceImage::enabled`]'s terms. A zero here
+    /// is what a zeroed region says, and it is why every other field below is
+    /// left uninterpreted in that case.
+    pub enabled: u8,
+    pub prefix_length: u8,
+    pub _pad: [u8; 2],
+    pub mac: [u8; 6],
+    pub _pad2: [u8; 2],
+    /// Network order, as the address appears in a header.
+    pub address: [u8; 4],
+}
+
+impl ManagementImage {
+    pub const ZERO: Self = Self {
+        enabled: 0,
+        prefix_length: 0,
+        _pad: [0; 2],
+        mac: [0; 6],
+        _pad2: [0; 2],
+        address: [0; 4],
+    };
+}
+
 /// A whole configuration generation as bytes in a shared region.
 ///
 /// The arrays are always their full size, so the image is one fixed-size object
@@ -240,6 +271,7 @@ pub struct ConfigImage {
     /// Over the validated model, so re-offering an unchanged document is
     /// recognisable without comparing every field.
     pub content_hash: u32,
+    pub management: ManagementImage,
     pub interfaces: [InterfaceImage; MAX_INTERFACES],
     pub neighbours: [NeighbourImage; MAX_NEIGHBOURS],
 }
@@ -253,6 +285,7 @@ impl ConfigImage {
         interface_count: 0,
         neighbour_count: 0,
         content_hash: 0,
+        management: ManagementImage::ZERO,
         interfaces: [InterfaceImage::ZERO; MAX_INTERFACES],
         neighbours: [NeighbourImage::ZERO; MAX_NEIGHBOURS],
     };
@@ -291,6 +324,7 @@ impl ConfigImage {
         Ok(CheckedConfig {
             generation: self.generation,
             content_hash: self.content_hash,
+            management: check_management(&self.management)?,
             interfaces,
             neighbours,
         })
@@ -411,6 +445,51 @@ impl NeighbourSlot {
     }
 }
 
+/// As [`InterfaceSlot`], for the management entry.
+#[repr(C)]
+struct ManagementSlot {
+    enabled: AtomicU8,
+    prefix_length: AtomicU8,
+    _pad: [AtomicU8; 2],
+    mac: [AtomicU8; 6],
+    _pad2: [AtomicU8; 2],
+    address: [AtomicU8; 4],
+}
+
+impl ManagementSlot {
+    const fn zero() -> Self {
+        Self {
+            enabled: AtomicU8::new(0),
+            prefix_length: AtomicU8::new(0),
+            _pad: [const { AtomicU8::new(0) }; 2],
+            mac: [const { AtomicU8::new(0) }; 6],
+            _pad2: [const { AtomicU8::new(0) }; 2],
+            address: [const { AtomicU8::new(0) }; 4],
+        }
+    }
+
+    fn store(&self, entry: &ManagementImage) {
+        self.enabled.store(entry.enabled, Ordering::Relaxed);
+        self.prefix_length
+            .store(entry.prefix_length, Ordering::Relaxed);
+        store_bytes(&self._pad, entry._pad);
+        store_bytes(&self.mac, entry.mac);
+        store_bytes(&self._pad2, entry._pad2);
+        store_bytes(&self.address, entry.address);
+    }
+
+    fn load(&self) -> ManagementImage {
+        ManagementImage {
+            enabled: self.enabled.load(Ordering::Relaxed),
+            prefix_length: self.prefix_length.load(Ordering::Relaxed),
+            _pad: load_bytes(&self._pad),
+            mac: load_bytes(&self.mac),
+            _pad2: load_bytes(&self._pad2),
+            address: load_bytes(&self.address),
+        }
+    }
+}
+
 /// The shared-memory image of a [`ConfigImage`], readable and writable through
 /// a shared reference — the only kind of reference a mapped region is reached
 /// by. Accesses are `Relaxed`: all the ordering the region needs is the
@@ -421,6 +500,7 @@ struct ConfigSlot {
     interface_count: AtomicU32,
     neighbour_count: AtomicU32,
     content_hash: AtomicU32,
+    management: ManagementSlot,
     interfaces: [InterfaceSlot; MAX_INTERFACES],
     neighbours: [NeighbourSlot; MAX_NEIGHBOURS],
 }
@@ -432,6 +512,7 @@ impl ConfigSlot {
             interface_count: AtomicU32::new(0),
             neighbour_count: AtomicU32::new(0),
             content_hash: AtomicU32::new(0),
+            management: ManagementSlot::zero(),
             interfaces: [const { InterfaceSlot::zero() }; MAX_INTERFACES],
             neighbours: [const { NeighbourSlot::zero() }; MAX_NEIGHBOURS],
         }
@@ -445,6 +526,7 @@ impl ConfigSlot {
             .store(image.neighbour_count, Ordering::Relaxed);
         self.content_hash
             .store(image.content_hash, Ordering::Relaxed);
+        self.management.store(&image.management);
         for (slot, entry) in self.interfaces.iter().zip(&image.interfaces) {
             slot.store(entry);
         }
@@ -459,6 +541,7 @@ impl ConfigSlot {
             interface_count: self.interface_count.load(Ordering::Relaxed),
             neighbour_count: self.neighbour_count.load(Ordering::Relaxed),
             content_hash: self.content_hash.load(Ordering::Relaxed),
+            management: self.management.load(),
             ..ConfigImage::ZERO
         };
         for (entry, slot) in image.interfaces.iter_mut().zip(&self.interfaces) {
@@ -618,6 +701,18 @@ pub enum ConfigImageError {
         index: usize,
         mac: [u8; 6],
     },
+    /// The management entry's own three rules. They carry no index: the image
+    /// holds exactly one management interface, so the value refused is the whole
+    /// of what locates the fault.
+    ManagementEnabledNotBoolean {
+        enabled: u8,
+    },
+    ManagementPrefixLengthTooLong {
+        prefix_length: u8,
+    },
+    ManagementMacNotUnicast {
+        mac: [u8; 6],
+    },
 }
 
 impl fmt::Display for ConfigImageError {
@@ -660,6 +755,18 @@ impl fmt::Display for ConfigImageError {
             }
             Self::NeighbourMacNotUnicast { index, mac } => {
                 write!(f, "neighbour {index} MAC ")?;
+                write_mac(f, *mac)?;
+                write!(f, " is not unicast")
+            }
+            Self::ManagementEnabledNotBoolean { enabled } => {
+                write!(f, "management enabled byte {enabled} is not 0 or 1")
+            }
+            Self::ManagementPrefixLengthTooLong { prefix_length } => write!(
+                f,
+                "management prefix length {prefix_length} exceeds {MAX_PREFIX_LENGTH}"
+            ),
+            Self::ManagementMacNotUnicast { mac } => {
+                write!(f, "management MAC ")?;
                 write_mac(f, *mac)?;
                 write!(f, " is not unicast")
             }
@@ -749,6 +856,67 @@ fn check_neighbour(
     Ok(CheckedNeighbour { port, mac, address })
 }
 
+/// The management entry, or `None` where the image carries none.
+///
+/// A disabled entry is `None` rather than a [`CheckedManagement`] with a flag:
+/// the fields of a disabled interface are not interpreted at all, so an
+/// unaddressed port has one representation here and it is the one a zeroed
+/// region produces. That is what keeps [`ConfigImage::ZERO`] — the fail-closed
+/// generation every domain starts under — a valid image.
+fn check_management(raw: &ManagementImage) -> Result<Option<CheckedManagement>, ConfigImageError> {
+    let ManagementImage {
+        enabled,
+        prefix_length,
+        mac,
+        address,
+        ..
+    } = *raw;
+
+    match enabled {
+        0 => return Ok(None),
+        1 => {}
+        enabled => return Err(ConfigImageError::ManagementEnabledNotBoolean { enabled }),
+    }
+    if prefix_length > MAX_PREFIX_LENGTH {
+        return Err(ConfigImageError::ManagementPrefixLengthTooLong { prefix_length });
+    }
+    if !is_unicast(mac) {
+        return Err(ConfigImageError::ManagementMacNotUnicast { mac });
+    }
+    Ok(Some(CheckedManagement {
+        prefix_length,
+        mac,
+        address,
+    }))
+}
+
+/// An enabled management interface that survived [`ConfigImage::check`]. Holding
+/// one *is* the enable flag; see [`check_management`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedManagement {
+    prefix_length: u8,
+    mac: [u8; 6],
+    address: [u8; 4],
+}
+
+impl CheckedManagement {
+    #[must_use]
+    pub const fn prefix_length(&self) -> u8 {
+        self.prefix_length
+    }
+
+    #[must_use]
+    pub const fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// Network order, as the address appears in a header.
+    #[must_use]
+    pub const fn address(&self) -> [u8; 4] {
+        self.address
+    }
+}
+
 /// One interface that survived [`ConfigImage::check`]. Its fields are private
 /// and it has no public constructor, so the only way to hold one is to have
 /// checked it — and `enabled` is a `bool` because the byte that was not 0 or 1
@@ -827,6 +995,7 @@ impl CheckedNeighbour {
 pub struct CheckedConfig {
     generation: u32,
     content_hash: u32,
+    management: Option<CheckedManagement>,
     interfaces: [Option<CheckedInterface>; MAX_INTERFACES],
     neighbours: [Option<CheckedNeighbour>; MAX_NEIGHBOURS],
 }
@@ -840,6 +1009,12 @@ impl CheckedConfig {
     #[must_use]
     pub const fn content_hash(&self) -> u32 {
         self.content_hash
+    }
+
+    /// The addressing of the management port, or `None` where it has none.
+    #[must_use]
+    pub const fn management(&self) -> Option<CheckedManagement> {
+        self.management
     }
 
     pub fn interfaces(&self) -> impl Iterator<Item = CheckedInterface> {
@@ -883,14 +1058,24 @@ const _: () = {
     assert!(offset_of!(NeighbourImage, _pad2) == 10);
     assert!(offset_of!(NeighbourImage, address) == 12);
 
-    assert!(size_of::<ConfigImage>() == 656);
+    assert!(size_of::<ManagementImage>() == 16);
+    assert!(align_of::<ManagementImage>() == 1);
+    assert!(offset_of!(ManagementImage, enabled) == 0);
+    assert!(offset_of!(ManagementImage, prefix_length) == 1);
+    assert!(offset_of!(ManagementImage, _pad) == 2);
+    assert!(offset_of!(ManagementImage, mac) == 4);
+    assert!(offset_of!(ManagementImage, _pad2) == 10);
+    assert!(offset_of!(ManagementImage, address) == 12);
+
+    assert!(size_of::<ConfigImage>() == 672);
     assert!(align_of::<ConfigImage>() == 4);
     assert!(offset_of!(ConfigImage, generation) == 0);
     assert!(offset_of!(ConfigImage, interface_count) == 4);
     assert!(offset_of!(ConfigImage, neighbour_count) == 8);
     assert!(offset_of!(ConfigImage, content_hash) == 12);
-    assert!(offset_of!(ConfigImage, interfaces) == 16);
-    assert!(offset_of!(ConfigImage, neighbours) == 144);
+    assert!(offset_of!(ConfigImage, management) == 16);
+    assert!(offset_of!(ConfigImage, interfaces) == 32);
+    assert!(offset_of!(ConfigImage, neighbours) == 160);
 
     // Expressing the image as atomics must leave the region the reading domain
     // maps byte-identical to a plain `ConfigImage`: same size, same alignment,
@@ -913,16 +1098,28 @@ const _: () = {
     assert!(offset_of!(NeighbourSlot, _pad2) == offset_of!(NeighbourImage, _pad2));
     assert!(offset_of!(NeighbourSlot, address) == offset_of!(NeighbourImage, address));
 
+    assert!(size_of::<ManagementSlot>() == size_of::<ManagementImage>());
+    assert!(align_of::<ManagementSlot>() == align_of::<ManagementImage>());
+    assert!(offset_of!(ManagementSlot, enabled) == offset_of!(ManagementImage, enabled));
+    assert!(
+        offset_of!(ManagementSlot, prefix_length) == offset_of!(ManagementImage, prefix_length)
+    );
+    assert!(offset_of!(ManagementSlot, _pad) == offset_of!(ManagementImage, _pad));
+    assert!(offset_of!(ManagementSlot, mac) == offset_of!(ManagementImage, mac));
+    assert!(offset_of!(ManagementSlot, _pad2) == offset_of!(ManagementImage, _pad2));
+    assert!(offset_of!(ManagementSlot, address) == offset_of!(ManagementImage, address));
+
     assert!(size_of::<ConfigSlot>() == size_of::<ConfigImage>());
     assert!(align_of::<ConfigSlot>() == align_of::<ConfigImage>());
     assert!(offset_of!(ConfigSlot, generation) == offset_of!(ConfigImage, generation));
     assert!(offset_of!(ConfigSlot, interface_count) == offset_of!(ConfigImage, interface_count));
     assert!(offset_of!(ConfigSlot, neighbour_count) == offset_of!(ConfigImage, neighbour_count));
     assert!(offset_of!(ConfigSlot, content_hash) == offset_of!(ConfigImage, content_hash));
+    assert!(offset_of!(ConfigSlot, management) == offset_of!(ConfigImage, management));
     assert!(offset_of!(ConfigSlot, interfaces) == offset_of!(ConfigImage, interfaces));
     assert!(offset_of!(ConfigSlot, neighbours) == offset_of!(ConfigImage, neighbours));
 
-    assert!(size_of::<ConfigHandover>() == 664);
+    assert!(size_of::<ConfigHandover>() == 680);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
     assert!(offset_of!(ConfigHandover, committed) == 4);
@@ -1077,6 +1274,11 @@ mod tests {
         assert_eq!(checked.content_hash(), 0);
         assert_eq!(checked.interface_count(), 0);
         assert_eq!(checked.neighbour_count(), 0);
+        assert_eq!(
+            checked.management(),
+            None,
+            "a zeroed region addresses no management port"
+        );
         assert_eq!(checked.interfaces().next(), None);
         assert_eq!(checked.neighbours().next(), None);
     }
@@ -1273,6 +1475,83 @@ mod tests {
         }
     }
 
+    /// An enabled management entry decodes to its three values; a disabled one
+    /// decodes to nothing at all, so an unaddressed port has one representation.
+    #[test]
+    fn the_management_entry_is_read_only_where_it_is_enabled() {
+        let mut raw = image(1, 1);
+        raw.management = ManagementImage {
+            enabled: 1,
+            prefix_length: 24,
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            address: [10, 0, 2, 15],
+            ..ManagementImage::ZERO
+        };
+        let management = raw
+            .check(PORTS)
+            .expect("an enabled entry")
+            .management()
+            .expect("an enabled entry decodes");
+        assert_eq!(management.prefix_length(), 24);
+        assert_eq!(management.mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
+        assert_eq!(management.address(), [10, 0, 2, 15]);
+
+        // Disabled, and every other field left as a writer put it: none of them
+        // is interpreted, so none of them can refuse the image.
+        let mut disabled = raw;
+        disabled.management.enabled = 0;
+        disabled.management.prefix_length = 99;
+        disabled.management.mac = [0xff; 6];
+        assert_eq!(
+            disabled
+                .check(PORTS)
+                .expect("a disabled entry")
+                .management(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_management_entry_no_endpoint_could_answer_under_is_refused_by_its_own_rule() {
+        let enabled = ManagementImage {
+            enabled: 1,
+            prefix_length: 24,
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            address: [10, 0, 2, 15],
+            ..ManagementImage::ZERO
+        };
+        let with = |management: ManagementImage| {
+            let mut raw = image(1, 1);
+            raw.management = management;
+            raw.check(PORTS)
+        };
+
+        for byte in [2u8, 3, 0xff] {
+            assert_eq!(
+                with(ManagementImage {
+                    enabled: byte,
+                    ..enabled
+                }),
+                Err(ConfigImageError::ManagementEnabledNotBoolean { enabled: byte })
+            );
+        }
+        for prefix_length in [MAX_PREFIX_LENGTH + 1, 64, 255] {
+            assert_eq!(
+                with(ManagementImage {
+                    prefix_length,
+                    ..enabled
+                }),
+                Err(ConfigImageError::ManagementPrefixLengthTooLong { prefix_length })
+            );
+        }
+        for mac in [[0xff; 6], [0x01, 0, 0, 0, 0, 1], [0; 6]] {
+            assert_eq!(
+                with(ManagementImage { mac, ..enabled }),
+                Err(ConfigImageError::ManagementMacNotUnicast { mac })
+            );
+        }
+    }
+
     #[test]
     fn padding_the_writer_chose_is_read_by_nothing() {
         let mut raw = image(1, 1);
@@ -1280,6 +1559,8 @@ mod tests {
         raw.interfaces[0]._pad2 = [0xbb; 2];
         raw.neighbours[0]._pad = [0xcc; 3];
         raw.neighbours[0]._pad2 = [0xdd; 2];
+        raw.management._pad = [0xee; 2];
+        raw.management._pad2 = [0xff; 2];
         assert_eq!(raw.check(PORTS), image(1, 1).check(PORTS));
     }
 
@@ -1287,11 +1568,13 @@ mod tests {
     fn the_layout_the_reading_domain_maps_is_the_recorded_one() {
         assert_eq!(size_of::<InterfaceImage>(), 16);
         assert_eq!(size_of::<NeighbourImage>(), 16);
-        assert_eq!(size_of::<ConfigImage>(), 656);
-        assert_eq!(size_of::<ConfigHandover>(), 664);
+        assert_eq!(size_of::<ManagementImage>(), 16);
+        assert_eq!(size_of::<ConfigImage>(), 672);
+        assert_eq!(size_of::<ConfigHandover>(), 680);
         assert_eq!(size_of::<ConfigAck>(), 8);
-        assert_eq!(offset_of!(ConfigImage, interfaces), 16);
-        assert_eq!(offset_of!(ConfigImage, neighbours), 144);
+        assert_eq!(offset_of!(ConfigImage, management), 16);
+        assert_eq!(offset_of!(ConfigImage, interfaces), 32);
+        assert_eq!(offset_of!(ConfigImage, neighbours), 160);
         assert_eq!(offset_of!(ConfigHandover, image), 8);
         assert_eq!(CONFIG_REGION_SIZE, 0x1000);
         assert_eq!(CONFIG_ACK_REGION_SIZE, 0x1000);
@@ -1309,6 +1592,7 @@ mod tests {
                 offset_of!(ConfigSlot, interface_count),
                 offset_of!(ConfigSlot, neighbour_count),
                 offset_of!(ConfigSlot, content_hash),
+                offset_of!(ConfigSlot, management),
                 offset_of!(ConfigSlot, interfaces),
                 offset_of!(ConfigSlot, neighbours),
             ],
@@ -1317,6 +1601,7 @@ mod tests {
                 offset_of!(ConfigImage, interface_count),
                 offset_of!(ConfigImage, neighbour_count),
                 offset_of!(ConfigImage, content_hash),
+                offset_of!(ConfigImage, management),
                 offset_of!(ConfigImage, interfaces),
                 offset_of!(ConfigImage, neighbours),
             ]
@@ -1342,6 +1627,27 @@ mod tests {
                 offset_of!(InterfaceImage, mac),
                 offset_of!(InterfaceImage, _pad2),
                 offset_of!(InterfaceImage, address),
+            ]
+        );
+
+        assert_eq!(size_of::<ManagementSlot>(), size_of::<ManagementImage>());
+        assert_eq!(align_of::<ManagementSlot>(), align_of::<ManagementImage>());
+        assert_eq!(
+            [
+                offset_of!(ManagementSlot, enabled),
+                offset_of!(ManagementSlot, prefix_length),
+                offset_of!(ManagementSlot, _pad),
+                offset_of!(ManagementSlot, mac),
+                offset_of!(ManagementSlot, _pad2),
+                offset_of!(ManagementSlot, address),
+            ],
+            [
+                offset_of!(ManagementImage, enabled),
+                offset_of!(ManagementImage, prefix_length),
+                offset_of!(ManagementImage, _pad),
+                offset_of!(ManagementImage, mac),
+                offset_of!(ManagementImage, _pad2),
+                offset_of!(ManagementImage, address),
             ]
         );
 
@@ -1373,6 +1679,7 @@ mod tests {
         assert_eq!(ConfigSlot::zero().load(), ConfigImage::ZERO);
         assert_eq!(InterfaceSlot::zero().load(), InterfaceImage::ZERO);
         assert_eq!(NeighbourSlot::zero().load(), NeighbourImage::ZERO);
+        assert_eq!(ManagementSlot::zero().load(), ManagementImage::ZERO);
     }
 
     /// Publishing is one act: the generation the reader sees and the bytes it
@@ -1488,6 +1795,46 @@ mod tests {
             .boxed()
     }
 
+    fn any_management_image() -> BoxedStrategy<ManagementImage> {
+        (
+            any::<[u8; 4]>(),
+            any::<[u8; 6]>(),
+            any::<[u8; 2]>(),
+            any::<[u8; 4]>(),
+        )
+            .prop_map(
+                |([enabled, prefix_length, pad0, pad1], mac, pad2, address)| ManagementImage {
+                    enabled,
+                    prefix_length,
+                    _pad: [pad0, pad1],
+                    mac,
+                    _pad2: pad2,
+                    address,
+                },
+            )
+            .boxed()
+    }
+
+    /// As [`plausible_interface_image`], for the management entry: weighted so
+    /// the enabled path — the one with three rules behind it — is reached as
+    /// often as the disabled one.
+    fn plausible_management_image() -> BoxedStrategy<ManagementImage> {
+        (
+            prop_oneof![9 => 0u8..=1, 1 => any::<u8>()],
+            prop_oneof![9 => 0u8..=MAX_PREFIX_LENGTH, 1 => any::<u8>()],
+            plausible_mac(),
+            any::<[u8; 4]>(),
+        )
+            .prop_map(|(enabled, prefix_length, mac, address)| ManagementImage {
+                enabled,
+                prefix_length,
+                mac,
+                address,
+                ..ManagementImage::ZERO
+            })
+            .boxed()
+    }
+
     fn any_neighbour_image() -> BoxedStrategy<NeighbourImage> {
         (
             any::<u8>(),
@@ -1566,19 +1913,22 @@ mod tests {
     fn config_image(
         interfaces: BoxedStrategy<InterfaceImage>,
         neighbours: BoxedStrategy<NeighbourImage>,
+        management: BoxedStrategy<ManagementImage>,
     ) -> impl Strategy<Value = ConfigImage> {
         (
             any::<u32>(),
             any::<u32>(),
             proptest::array::uniform8(interfaces),
             proptest::array::uniform32(neighbours),
+            management,
         )
             .prop_map(
-                |(generation, content_hash, interfaces, neighbours)| ConfigImage {
+                |(generation, content_hash, interfaces, neighbours, management)| ConfigImage {
                     generation,
                     content_hash,
                     interfaces,
                     neighbours,
+                    management,
                     ..ConfigImage::ZERO
                 },
             )
@@ -1661,6 +2011,24 @@ mod tests {
                 });
             }
         }
+        let management = image.management;
+        if management.enabled > 1 {
+            return Some(ConfigImageError::ManagementEnabledNotBoolean {
+                enabled: management.enabled,
+            });
+        }
+        if management.enabled == 1 {
+            if management.prefix_length > MAX_PREFIX_LENGTH {
+                return Some(ConfigImageError::ManagementPrefixLengthTooLong {
+                    prefix_length: management.prefix_length,
+                });
+            }
+            if !is_unicast(management.mac) {
+                return Some(ConfigImageError::ManagementMacNotUnicast {
+                    mac: management.mac,
+                });
+            }
+        }
         None
     }
 
@@ -1672,7 +2040,11 @@ mod tests {
         /// every entry it yields satisfies every rule.
         #[test]
         fn a_wholly_arbitrary_region_is_read_without_panicking_and_stays_bounded(
-            mut image in config_image(any_interface_image(), any_neighbour_image()),
+            mut image in config_image(
+                any_interface_image(),
+                any_neighbour_image(),
+                any_management_image(),
+            ),
             interface_count in any_plausible_count(),
             neighbour_count in any_plausible_count(),
             port_count in any::<u8>(),
@@ -1706,7 +2078,11 @@ mod tests {
         /// refusal is attributed to the wrong field.
         #[test]
         fn an_arbitrary_region_is_read_totally_and_yields_only_valid_entries(
-            mut image in config_image(plausible_interface_image(), plausible_neighbour_image()),
+            mut image in config_image(
+                plausible_interface_image(),
+                plausible_neighbour_image(),
+                plausible_management_image(),
+            ),
             interface_count in any_plausible_count(),
             neighbour_count in any_plausible_count(),
             port_count in 1u8..=4,
@@ -1735,6 +2111,15 @@ mod tests {
             for entry in checked.neighbours() {
                 prop_assert!(entry.port() < port_count);
                 prop_assert!(is_unicast(entry.mac()));
+            }
+            match checked.management() {
+                Some(management) => {
+                    prop_assert_eq!(image.management.enabled, 1);
+                    prop_assert!(management.prefix_length() <= MAX_PREFIX_LENGTH);
+                    prop_assert!(is_unicast(management.mac()));
+                    prop_assert_eq!(management.address(), image.management.address);
+                }
+                None => prop_assert_eq!(image.management.enabled, 0),
             }
         }
 
@@ -1765,7 +2150,11 @@ mod tests {
         /// of it, so a writer's bytes are the reader's bytes whatever they say.
         #[test]
         fn an_arbitrary_image_round_trips_through_the_region(
-            mut written in config_image(any_interface_image(), any_neighbour_image()),
+            mut written in config_image(
+                any_interface_image(),
+                any_neighbour_image(),
+                any_management_image(),
+            ),
             interface_count in any::<u32>(),
             neighbour_count in any::<u32>(),
         ) {

@@ -26,6 +26,7 @@
 //! one nothing else runs in. Swapping the table there is what makes a frame
 //! decided entirely under one generation, and it needs no lock to be true.
 
+use lfw_ip_endpoint::{Endpoint, EndpointError};
 use lfw_log::{Event, RejectReason};
 use net_headers::{Ipv4Address, MacAddress};
 use routing::{CapacityError, Interface, Neighbour, PortId, Router};
@@ -83,6 +84,25 @@ pub fn router_from<const MAX_I: usize, const MAX_N: usize>(
     Router::from_slices(filled_interfaces, filled_neighbours)
 }
 
+/// Build the endpoint a checked image addresses the management port with, or
+/// `None` where it addresses none. The image's reader has already refused a
+/// prefix length and a group MAC; [`Endpoint::new`] is the third layer, taking
+/// nothing on trust from the domain that published it.
+///
+/// # Errors
+/// [`EndpointError`], for a pair no endpoint can answer under.
+pub fn endpoint_from(checked: &CheckedConfig) -> Result<Option<Endpoint>, EndpointError> {
+    let Some(management) = checked.management() else {
+        return Ok(None);
+    };
+    Endpoint::new(
+        MacAddress(management.mac()),
+        Ipv4Address::from_octets(management.address()),
+        management.prefix_length(),
+    )
+    .map(Some)
+}
+
 /// Why an offered image was refused, in the vocabulary a console line speaks,
 /// and the one number that locates it.
 ///
@@ -111,6 +131,19 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         ConfigImageError::InterfaceMacNotUnicast { index, .. }
         | ConfigImageError::NeighbourMacNotUnicast { index, .. } => {
             (RejectReason::MacNotUnicast, index as u32)
+        }
+        // No index: an image holds one entry, so the number that locates the
+        // fault is the value refused.
+        ConfigImageError::ManagementEnabledNotBoolean { enabled } => {
+            (RejectReason::MalformedValue, u32::from(enabled))
+        }
+        ConfigImageError::ManagementPrefixLengthTooLong { prefix_length } => (
+            RejectReason::PrefixLengthOutOfRange,
+            u32::from(prefix_length),
+        ),
+        ConfigImageError::ManagementMacNotUnicast { mac } => {
+            let [first, ..] = mac;
+            (RejectReason::MacNotUnicast, u32::from(first))
         }
     }
 }
@@ -366,6 +399,93 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
         match self.staged {
             Some((generation, _)) => generation,
             None => self.active_generation,
+        }
+    }
+}
+
+/// The read-only consumer of the handover: it takes the **committed**
+/// generation and nothing else.
+///
+/// A strictly weaker role than [`ConfigurationSwitch`], and the difference is
+/// the point: that type reads the *offered* generation, stages from it and writes
+/// the acknowledgement a commit waits for. This one never reads `offered`, so it
+/// cannot be handed a generation nobody released; never writes, so it needs no
+/// [`ConfigAck`] region and cannot forge that acknowledgement — the management
+/// domain is granted `cfg` read-only and `cfgack` not at all; and cannot delay a
+/// commit, an image it refuses being one the *forwarder* has already staged. The
+/// cost: it learns of a commit only when something else next wakes it — for the
+/// management port, the next frame that arrives.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommittedReader {
+    taken: u32,
+}
+
+/// What one pass over the committed generation found. `None` from
+/// [`CommittedReader::take`] is "nothing newer", which is not one of these.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing needs an allocator; the value is a temporary destructured at once"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Committed {
+    Image {
+        generation: u32,
+        checked: CheckedConfig,
+    },
+    /// The committed image was refused. Nothing this reader had is replaced:
+    /// refusing an image is not a reason to forget the one in force.
+    Refused {
+        generation: u32,
+        reason: RejectReason,
+        detail: u32,
+    },
+}
+
+impl CommittedReader {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { taken: 0 }
+    }
+
+    /// The newest committed generation this reader has taken, or 0 while it has
+    /// taken none — generation 0 being the fail-closed configuration.
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.taken
+    }
+
+    /// Take the committed generation, once, if it is newer than the last one
+    /// taken.
+    ///
+    /// The image is copied out of the region before a field of it is looked at,
+    /// on [`ConfigurationSwitch::take_offer`]'s terms: the publisher may rewrite
+    /// the bytes at any moment, so a decision made on them in place is no
+    /// decision. One commit yields one outcome however often this is called,
+    /// which is what puts a refusal on the publisher's rate rather than on the
+    /// caller's polling rate.
+    ///
+    /// `ports` is the caller's own port count, so an image naming a port this
+    /// build has no driver for is refused by a bound the publisher does not
+    /// choose (ENG-4).
+    pub fn take(&mut self, handover: &ConfigHandover, ports: u8) -> Option<Committed> {
+        let generation = handover.committed_generation();
+        if generation <= self.taken {
+            return None;
+        }
+        self.taken = generation;
+        match handover.load_image().check(ports) {
+            Ok(checked) => Some(Committed::Image {
+                generation,
+                checked,
+            }),
+            Err(error) => {
+                let (reason, detail) = refusal(error);
+                Some(Committed::Refused {
+                    generation,
+                    reason,
+                    detail,
+                })
+            }
         }
     }
 }
@@ -815,7 +935,224 @@ mod tests {
         );
     }
 
+    /// The management entry the fixture image carries, addressed on a prefix the
+    /// two interfaces do not claim.
+    fn management(enabled: u8, mac: [u8; 6], address: [u8; 4]) -> wire::ManagementImage {
+        wire::ManagementImage {
+            enabled,
+            prefix_length: 24,
+            mac,
+            address,
+            ..wire::ManagementImage::ZERO
+        }
+    }
+
+    const MGMT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x52];
+    const MGMT_ADDRESS: [u8; 4] = [10, 0, 2, 15];
+
+    #[test]
+    fn an_endpoint_is_built_only_from_an_entry_that_addresses_the_port() {
+        let checked = image(1).check(PORTS).expect("the fixture is valid");
+        assert_eq!(
+            endpoint_from(&checked),
+            Ok(None),
+            "the fixture addresses no management port"
+        );
+
+        let mut addressed = image(1);
+        addressed.management = management(1, MGMT_MAC, MGMT_ADDRESS);
+        let checked = addressed.check(PORTS).expect("an enabled entry");
+        let endpoint = endpoint_from(&checked)
+            .expect("a unicast pair")
+            .expect("an enabled entry");
+        assert_eq!(endpoint.mac(), MacAddress(MGMT_MAC));
+        assert_eq!(endpoint.address(), Ipv4Address::from_octets(MGMT_ADDRESS));
+        assert_eq!(endpoint.prefix_length(), 24);
+
+        // A disabled entry addresses nothing, whatever its other fields say.
+        let mut disabled = addressed;
+        disabled.management.enabled = 0;
+        assert_eq!(
+            endpoint_from(&disabled.check(PORTS).expect("still valid")),
+            Ok(None)
+        );
+    }
+
+    /// The third layer earns its place here: the image's own reader does not
+    /// hold the *address* to a rule, so a multicast one reaches this call and is
+    /// refused by the type that will answer under it.
+    #[test]
+    fn an_address_the_image_reader_admits_and_an_endpoint_cannot_is_refused() {
+        let mut multicast = image(1);
+        multicast.management = management(1, MGMT_MAC, [224, 0, 0, 1]);
+        let checked = multicast
+            .check(PORTS)
+            .expect("the image ABI does not rule on an address");
+        assert_eq!(
+            endpoint_from(&checked),
+            Err(lfw_ip_endpoint::EndpointError::AddressNotUnicast {
+                address: Ipv4Address::from_octets([224, 0, 0, 1]),
+            })
+        );
+    }
+
+    /// The reader takes the *committed* word and nothing else: an offer nobody
+    /// has released is invisible to it, which is the whole difference between
+    /// this role and the forwarder's.
+    #[test]
+    fn an_offer_that_is_not_committed_is_not_taken() {
+        let (handover, ack) = regions();
+        let mut reader = CommittedReader::new();
+        assert_eq!(reader.generation(), 0);
+        assert_eq!(reader.take(&handover, PORTS), None);
+
+        handover.publish(&image(1));
+        assert_eq!(
+            reader.take(&handover, PORTS),
+            None,
+            "an offer is not a commit"
+        );
+        assert_eq!(reader.generation(), 0);
+
+        handover.publish_committed(1);
+        assert!(matches!(
+            reader.take(&handover, PORTS),
+            Some(Committed::Image { generation: 1, .. })
+        ));
+        assert_eq!(reader.generation(), 1);
+        // Nothing is written on this side at all: the acknowledgement region is
+        // not this reader's to touch, and the domain that uses it maps none.
+        assert_eq!(ack.staged_generation(), 0);
+        assert_eq!(ack.running_generation(), 0);
+    }
+
+    #[test]
+    fn one_commit_yields_one_outcome_however_often_it_is_asked_for() {
+        let (handover, _ack) = regions();
+        let mut reader = CommittedReader::new();
+        handover.publish(&image(3));
+        handover.publish_committed(3);
+        assert!(reader.take(&handover, PORTS).is_some());
+        for _ in 0..100 {
+            assert_eq!(reader.take(&handover, PORTS), None);
+        }
+
+        // And a newer commit is a new outcome.
+        handover.publish(&image(4));
+        handover.publish_committed(4);
+        assert!(matches!(
+            reader.take(&handover, PORTS),
+            Some(Committed::Image { generation: 4, .. })
+        ));
+    }
+
+    /// A committed image this reader will not read is reported once and consumes
+    /// the generation: the publisher has already released it, so re-reading it
+    /// would report the same refusal on the caller's polling rate (OBS-1).
+    #[test]
+    fn a_committed_image_that_cannot_be_read_is_refused_once() {
+        let (handover, _ack) = regions();
+        let mut reader = CommittedReader::new();
+        let mut bad = image(1);
+        bad.interfaces[0].port = PORTS;
+        handover.publish(&bad);
+        handover.publish_committed(1);
+        assert_eq!(
+            reader.take(&handover, PORTS),
+            Some(Committed::Refused {
+                generation: 1,
+                reason: RejectReason::PortOutOfRange,
+                detail: 0,
+            })
+        );
+        assert_eq!(reader.take(&handover, PORTS), None);
+        assert_eq!(reader.generation(), 1);
+    }
+
+    /// Every refusal the management entry can produce reaches the console as a
+    /// reason and a number, on the same terms as the dataplane's.
+    #[test]
+    fn every_management_refusal_reaches_the_console_as_a_reason_and_a_number() {
+        let cases = [
+            (
+                ConfigImageError::ManagementEnabledNotBoolean { enabled: 7 },
+                RejectReason::MalformedValue,
+                7,
+            ),
+            (
+                ConfigImageError::ManagementPrefixLengthTooLong { prefix_length: 33 },
+                RejectReason::PrefixLengthOutOfRange,
+                33,
+            ),
+            (
+                ConfigImageError::ManagementMacNotUnicast { mac: [0xff; 6] },
+                RejectReason::MacNotUnicast,
+                0xff,
+            ),
+        ];
+        for (error, reason, detail) in cases {
+            assert_eq!(refusal(error), (reason, detail), "{error:?}");
+        }
+    }
+
     proptest! {
+        /// Whatever a publisher commits, the reader answers rather than
+        /// panicking, takes each generation once, and never moves backwards.
+        #[test]
+        fn an_arbitrary_committed_region_is_read_once_and_never_backwards(
+            generations in prop::collection::vec(0u32..6, 0..12),
+            enabled in any::<u8>(),
+            prefix_length in any::<u8>(),
+            mac in any::<[u8; 6]>(),
+            address in any::<[u8; 4]>(),
+        ) {
+            let (handover, ack) = regions();
+            let mut reader = CommittedReader::new();
+            let mut highest = 0u32;
+            for generation in generations {
+                let mut raw = image(generation);
+                raw.management = wire::ManagementImage {
+                    enabled,
+                    prefix_length,
+                    mac,
+                    address,
+                    ..wire::ManagementImage::ZERO
+                };
+                handover.publish(&raw);
+                handover.publish_committed(generation);
+
+                match reader.take(&handover, PORTS) {
+                    None => prop_assert!(generation <= highest),
+                    Some(Committed::Image { generation: taken, checked }) => {
+                        prop_assert!(taken > highest);
+                        highest = taken;
+                        // An image that checked out either addresses the port
+                        // with a pair an endpoint accepts or names one it
+                        // refuses; an image that addresses none can only build
+                        // nothing.
+                        match (endpoint_from(&checked), checked.management()) {
+                            (Ok(None), entry) => prop_assert!(entry.is_none()),
+                            (Ok(Some(endpoint)), Some(entry)) => {
+                                prop_assert_eq!(endpoint.mac(), MacAddress(entry.mac()));
+                                prop_assert_eq!(endpoint.prefix_length(), entry.prefix_length());
+                            }
+                            (Err(_), entry) => prop_assert!(entry.is_some()),
+                            (Ok(Some(_)), None) => {
+                                prop_assert!(false, "an endpoint from no entry");
+                            }
+                        }
+                    }
+                    Some(Committed::Refused { generation: taken, .. }) => {
+                        prop_assert!(taken > highest);
+                        highest = taken;
+                    }
+                }
+                prop_assert_eq!(reader.generation(), highest);
+            }
+            prop_assert_eq!(ack.staged_generation(), 0);
+            prop_assert_eq!(ack.running_generation(), 0);
+        }
+
         /// The headline property of a byzantine region: whatever is in it, a
         /// pass either refuses it or runs a table built from it, never panics,
         /// and never acknowledges a generation it did not stage.

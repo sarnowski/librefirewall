@@ -18,11 +18,17 @@
 //!     <neighbour id="gateway-a" interface="wan"
 //!                address="10.0.0.2" mac="52:54:00:00:00:0a"/>
 //!   </neighbours>
+//!   <management mac="52:54:00:12:34:52" address="10.0.2.15"
+//!               prefix-length="24" enabled="true"/>
 //! </configuration>
 //! ```
+//!
+//! `<management>` is a sibling of `<interfaces>`, not an entry inside it: that
+//! port is not a dataplane one — no `port` number, not in the router's set
+//! (CONCEPT §9.1). Required like the other two; `enabled="false"` means no address.
 
 use crate::{
-    model::{InterfaceEntry, Model, NeighbourEntry},
+    model::{InterfaceEntry, ManagementEntry, Model, NeighbourEntry},
     value,
     xml::{Attribute, DocumentError, DocumentFault, Element, Event, Reader},
 };
@@ -50,9 +56,23 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
 
     let mut interfaces_read = false;
     let mut neighbours_read = false;
+    let mut management_read = false;
     loop {
         match next(&mut reader)? {
             Some(Event::Start(section)) => {
+                if section.name == b"management" {
+                    if management_read {
+                        return Err(unknown_element(&section));
+                    }
+                    management_read = true;
+                    let entry = management_from(&section)?;
+                    model.set_management(entry).map_err(|_| DocumentError {
+                        fault: DocumentFault::CapacityExceeded,
+                        offset: section.offset,
+                    })?;
+                    expect_empty(&mut reader)?;
+                    continue;
+                }
                 reject_attributes(&section)?;
                 if section.name == b"interfaces" && !interfaces_read {
                     interfaces_read = true;
@@ -70,7 +90,7 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
     }
     end_of_document(&mut reader)?;
 
-    if interfaces_read && neighbours_read {
+    if interfaces_read && neighbours_read && management_read {
         return Ok(model);
     }
     Err(DocumentError {
@@ -169,6 +189,28 @@ fn neighbour_from(element: &Element<'_>) -> Result<NeighbourEntry, DocumentError
     })
 }
 
+fn management_from(element: &Element<'_>) -> Result<ManagementEntry, DocumentError> {
+    let mut enabled = None;
+    let mut mac = None;
+    let mut address = None;
+    let mut prefix_length = None;
+    for attribute in element.attributes() {
+        match attribute.name {
+            b"enabled" => enabled = Some(read(attribute, value::boolean)?),
+            b"mac" => mac = Some(read(attribute, value::mac)?),
+            b"address" => address = Some(read(attribute, value::ipv4)?),
+            b"prefix-length" => prefix_length = Some(read(attribute, value::prefix_length)?),
+            _ => return Err(unknown_attribute(attribute)),
+        }
+    }
+    Ok(ManagementEntry {
+        enabled: required(enabled, element)?,
+        mac: required(mac, element)?,
+        address: required(address, element)?,
+        prefix_length: required(prefix_length, element)?,
+    })
+}
+
 fn read<T>(
     attribute: &Attribute<'_>,
     parse_value: fn(&[u8]) -> Result<T, value::ValueError>,
@@ -244,6 +286,22 @@ mod tests {
     use proptest::prelude::*;
     use std::{string::String, vec::Vec};
 
+    /// The `<management>` element every document below carries, addressing the
+    /// management port on a prefix no interface here claims.
+    ///
+    /// A macro rather than a `const` so it expands to a literal, which is what
+    /// `concat!` takes.
+    macro_rules! management {
+        () => {
+            concat!(
+                "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
+                "address=\"192.168.42.15\" prefix-length=\"24\"/>"
+            )
+        };
+    }
+
+    const MANAGEMENT: &str = management!();
+
     /// The document from CONTRACTS.md §4b, verbatim. Every negative test below
     /// is a single edit to it, so what each proves is that *that* edit is
     /// caught rather than that some fragment fails for its own reasons.
@@ -258,6 +316,8 @@ mod tests {
         "    <neighbour id=\"gateway-a\" interface=\"wan\"\n",
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
         "  </neighbours>\n",
+        "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" ",
+        "prefix-length=\"24\" enabled=\"true\"/>\n",
         "</configuration>\n"
     );
 
@@ -311,38 +371,71 @@ mod tests {
 
     #[test]
     fn both_sections_may_be_empty_and_both_must_be_present() {
-        let empty = "<configuration><interfaces/><neighbours/></configuration>";
+        let empty = concat!(
+            "<configuration><interfaces/><neighbours/>",
+            management!(),
+            "</configuration>"
+        );
         let model = parse(empty.as_bytes()).expect("empty sections are a configuration");
-        assert!(model.is_empty());
-        assert_eq!(
-            parse(b"<configuration><interfaces/></configuration>")
-                .expect_err("neighbours is required")
-                .fault,
-            DocumentFault::MissingElement
+        assert_eq!(model.interface_count(), 0);
+        assert_eq!(model.neighbour_count(), 0);
+        assert!(
+            model.management().is_some(),
+            "the management element is not one of the two that may be empty"
         );
-        assert_eq!(
-            parse(b"<configuration><neighbours/></configuration>")
-                .expect_err("interfaces is required")
-                .fault,
-            DocumentFault::MissingElement
-        );
-        assert_eq!(
-            parse(b"<configuration/>")
-                .expect_err("both are required")
-                .fault,
-            DocumentFault::MissingElement
-        );
+        // Every one of the three sections is required, so each of them missing
+        // is a rejection rather than a default.
+        for partial in [
+            concat!(
+                "<configuration><interfaces/>",
+                management!(),
+                "</configuration>"
+            ),
+            concat!(
+                "<configuration><neighbours/>",
+                management!(),
+                "</configuration>"
+            ),
+            "<configuration><interfaces/><neighbours/></configuration>",
+            "<configuration/>",
+        ] {
+            assert_eq!(
+                parse(partial.as_bytes())
+                    .expect_err("every section is required")
+                    .fault,
+                DocumentFault::MissingElement,
+                "{partial}"
+            );
+        }
     }
 
     #[test]
     fn the_sections_may_be_written_in_either_order_and_neither_twice() {
-        let swapped = "<configuration><neighbours/><interfaces/></configuration>";
-        assert!(parse(swapped.as_bytes()).is_ok());
-        let twice = "<configuration><interfaces/><interfaces/><neighbours/></configuration>";
-        assert_eq!(
-            parse(twice.as_bytes()).expect_err("one each").fault,
-            DocumentFault::UnknownElement
+        let swapped = concat!(
+            "<configuration>",
+            management!(),
+            "<neighbours/><interfaces/></configuration>"
         );
+        assert!(parse(swapped.as_bytes()).is_ok());
+        for twice in [
+            concat!(
+                "<configuration><interfaces/><interfaces/><neighbours/>",
+                management!(),
+                "</configuration>"
+            ),
+            concat!(
+                "<configuration><interfaces/><neighbours/>",
+                management!(),
+                management!(),
+                "</configuration>"
+            ),
+        ] {
+            assert_eq!(
+                parse(twice.as_bytes()).expect_err("one each").fault,
+                DocumentFault::UnknownElement,
+                "{twice}"
+            );
+        }
     }
 
     #[test]
@@ -361,6 +454,80 @@ mod tests {
         );
         assert_eq!(
             fault_of(&edited("    <neighbour id", "    <peer id")),
+            DocumentFault::UnknownElement
+        );
+    }
+
+    #[test]
+    fn the_management_element_parses_to_the_port_it_addresses() {
+        let model = parse(CONTRACT_DOCUMENT.as_bytes()).expect("the contract document");
+        let management = model.management().expect("the element is required");
+        assert!(management.enabled);
+        assert_eq!(
+            management.mac,
+            MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52])
+        );
+        assert_eq!(
+            management.address,
+            Ipv4Address::from_octets([192, 168, 42, 15])
+        );
+        assert_eq!(management.prefix_length, 24);
+    }
+
+    #[test]
+    fn the_management_elements_vocabulary_is_as_closed_as_every_other() {
+        // An attribute the schema does not name, including one that belongs to
+        // an `<interface>` but not here: the management port has no port number.
+        for extra in ["port=\"0\"", "id=\"mgmt\"", "mtu=\"1500\""] {
+            assert_eq!(
+                fault_of(&edited(
+                    "<management ",
+                    &std::format!("<management {extra} ")
+                )),
+                DocumentFault::UnknownAttribute,
+                "{extra}"
+            );
+        }
+        // Each attribute it does name, omitted. Every substring below is
+        // unique to the management element: `enabled="true"` alone would edit
+        // the interface, which is the first line that carries one.
+        for (removed, replacement) in [
+            ("mac=\"52:54:00:12:34:52\" ", ""),
+            ("address=\"192.168.42.15\" ", ""),
+            ("prefix-length=\"24\" enabled", "enabled"),
+            (" enabled=\"true\"/>", "/>"),
+        ] {
+            assert_eq!(
+                fault_of(&edited(removed, replacement)),
+                DocumentFault::MissingAttribute,
+                "without {removed:?}"
+            );
+        }
+        // And each of them malformed, reported at the value.
+        for (from, to) in [
+            ("mac=\"52:54:00:12:34:52\"", "mac=\"52-54-00-12-34-52\""),
+            ("address=\"192.168.42.15\"", "address=\"192.168.42\""),
+            (
+                "prefix-length=\"24\" enabled",
+                "prefix-length=\"x\" enabled",
+            ),
+            ("enabled=\"true\"/>", "enabled=\"1\"/>"),
+        ] {
+            let document = edited(from, to);
+            let error = parse(document.as_bytes()).expect_err(to);
+            assert_eq!(error.fault, DocumentFault::MalformedValue, "{to}");
+            assert_eq!(
+                document.as_bytes().get(error.offset as usize),
+                Some(&b'"'),
+                "the offset points at the value's opening quote: {to}"
+            );
+        }
+        // A child inside it is a nesting the grammar does not admit.
+        assert_eq!(
+            fault_of(&edited(
+                "enabled=\"true\"/>",
+                "enabled=\"true\"><x/></management>"
+            )),
             DocumentFault::UnknownElement
         );
     }
@@ -520,7 +687,9 @@ mod tests {
                      mac=\"52:54:00:00:00:02\"/>"
                 ));
             }
-            text.push_str("</neighbours></configuration>");
+            text.push_str("</neighbours>");
+            text.push_str(MANAGEMENT);
+            text.push_str("</configuration>");
             text
         }
         let at_limit = document(wire::MAX_INTERFACES, wire::MAX_NEIGHBOURS);
@@ -563,7 +732,11 @@ mod tests {
     /// The complete document, with nothing after its root: the base every
     /// trailing-content case below appends to, so each rejection's offset is
     /// this length and the edit is the only thing under test.
-    const CLOSED_DOCUMENT: &str = "<configuration><interfaces/><neighbours/></configuration>";
+    const CLOSED_DOCUMENT: &str = concat!(
+        "<configuration><interfaces/><neighbours/>",
+        management!(),
+        "</configuration>"
+    );
 
     /// Every fault the reader raises past the root, which a parse that stopped
     /// at the root's end tag never asked for. Each one made `load` accept a
@@ -576,7 +749,9 @@ mod tests {
             "<configuration><interfaces>",
             "<interface id=\"lan\" port=\"1\" enabled=\"true\" mac=\"52:54:00:00:00:02\" ",
             "address=\"192.168.0.1\" prefix-length=\"24\"/>",
-            "</interfaces><neighbours/></configuration>"
+            "</interfaces><neighbours/>",
+            management!(),
+            "</configuration>"
         );
         for (trailing, fault) in [
             ("<x/>", DocumentFault::TrailingContent),
@@ -605,7 +780,8 @@ mod tests {
     #[test]
     fn a_document_that_parsed_whole_is_the_whole_document() {
         let single = parse(CLOSED_DOCUMENT.as_bytes()).expect("a complete document");
-        assert!(single.is_empty());
+        assert_eq!(single.interface_count(), 0);
+        assert_eq!(single.neighbour_count(), 0);
         assert_eq!(
             parse(std::format!("{CLOSED_DOCUMENT}{CLOSED_DOCUMENT}").as_bytes())
                 .expect_err("two documents are not one")
@@ -662,7 +838,9 @@ mod tests {
                      mac=\"52:54:00:00:00:02\"/>"
                 ));
             }
-            text.push_str("</neighbours></configuration>");
+            text.push_str("</neighbours>");
+            text.push_str(MANAGEMENT);
+            text.push_str("</configuration>");
 
             match parse(text.as_bytes()) {
                 Ok(model) => {
@@ -703,7 +881,9 @@ mod tests {
                 for name in ordered {
                     text.push_str(&entry(name));
                 }
-                text.push_str("</interfaces><neighbours/></configuration>");
+                text.push_str("</interfaces><neighbours/>");
+                text.push_str(MANAGEMENT);
+                text.push_str("</configuration>");
                 text
             };
             let mut reversed = names.clone();

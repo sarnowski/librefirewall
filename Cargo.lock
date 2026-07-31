@@ -440,6 +440,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-ip-endpoint"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+ "proptest",
+]
+
+[[package]]
 name = "lfw-log"
 version = "0.1.0"
 dependencies = [
@@ -598,6 +606,7 @@ name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "lfw-ip-endpoint",
  "lfw-log",
  "net-headers",
  "packet-buffer",
@@ -1393,6 +1402,7 @@ dependencies = [
  "lfw-hpet",
  "lfw-log",
  "lfw-rtc",
+ "net-headers",
  "nic-driver-core",
  "pd-runtime",
  "uart-16550",
