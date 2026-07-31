@@ -117,6 +117,7 @@ pub(crate) struct LogSlot {
     unix_nanos: AtomicU64,
     frames: AtomicU64,
     frame_bytes: AtomicU64,
+    stamp_nanos: AtomicU64,
     kind: AtomicU32,
     generation: AtomicU32,
     sequence: AtomicU32,
@@ -133,7 +134,8 @@ pub(crate) struct LogSlot {
     field: AtomicU8,
     outcome: AtomicU8,
     reason: AtomicU8,
-    _pad: [AtomicU8; 6],
+    stamp_kind: AtomicU8,
+    _pad: [AtomicU8; 5],
     cause: TextSlot<LOG_CAUSE_BYTES>,
     key: TextSlot<LOG_IDENTIFIER_BYTES>,
     from: ValueSlot,
@@ -149,6 +151,7 @@ impl LogSlot {
             unix_nanos: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             frame_bytes: AtomicU64::new(0),
+            stamp_nanos: AtomicU64::new(0),
             kind: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             sequence: AtomicU32::new(0),
@@ -165,7 +168,8 @@ impl LogSlot {
             field: AtomicU8::new(0),
             outcome: AtomicU8::new(0),
             reason: AtomicU8::new(0),
-            _pad: [const { AtomicU8::new(0) }; 6],
+            stamp_kind: AtomicU8::new(0),
+            _pad: [const { AtomicU8::new(0) }; 5],
             cause: TextSlot::zero(),
             key: TextSlot::zero(),
             from: ValueSlot::zero(),
@@ -183,6 +187,8 @@ impl LogSlot {
         self.frames.store(record.frames, Ordering::Relaxed);
         self.frame_bytes
             .store(record.frame_bytes, Ordering::Relaxed);
+        self.stamp_nanos
+            .store(record.stamp_nanos, Ordering::Relaxed);
         self.kind.store(record.kind, Ordering::Relaxed);
         self.generation.store(record.generation, Ordering::Relaxed);
         self.sequence.store(record.sequence, Ordering::Relaxed);
@@ -202,6 +208,7 @@ impl LogSlot {
         self.field.store(record.field, Ordering::Relaxed);
         self.outcome.store(record.outcome, Ordering::Relaxed);
         self.reason.store(record.reason, Ordering::Relaxed);
+        self.stamp_kind.store(record.stamp_kind, Ordering::Relaxed);
         store_bytes(&self._pad, record._pad);
         self.cause.store(&record.cause);
         self.key.store(&record.key);
@@ -221,6 +228,7 @@ impl LogSlot {
             unix_nanos: self.unix_nanos.load(Ordering::Relaxed),
             frames: self.frames.load(Ordering::Relaxed),
             frame_bytes: self.frame_bytes.load(Ordering::Relaxed),
+            stamp_nanos: self.stamp_nanos.load(Ordering::Relaxed),
             kind: self.kind.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
             sequence: self.sequence.load(Ordering::Relaxed),
@@ -237,6 +245,7 @@ impl LogSlot {
             field: self.field.load(Ordering::Relaxed),
             outcome: self.outcome.load(Ordering::Relaxed),
             reason: self.reason.load(Ordering::Relaxed),
+            stamp_kind: self.stamp_kind.load(Ordering::Relaxed),
             _pad: load_bytes(&self._pad),
             cause: self.cause.load(),
             key: self.key.load(),
@@ -283,6 +292,7 @@ const _: () = {
     assert!(offset_of!(LogSlot, unix_nanos) == offset_of!(LogRecord, unix_nanos));
     assert!(offset_of!(LogSlot, frames) == offset_of!(LogRecord, frames));
     assert!(offset_of!(LogSlot, frame_bytes) == offset_of!(LogRecord, frame_bytes));
+    assert!(offset_of!(LogSlot, stamp_nanos) == offset_of!(LogRecord, stamp_nanos));
     assert!(offset_of!(LogSlot, kind) == offset_of!(LogRecord, kind));
     assert!(offset_of!(LogSlot, generation) == offset_of!(LogRecord, generation));
     assert!(offset_of!(LogSlot, sequence) == offset_of!(LogRecord, sequence));
@@ -299,6 +309,7 @@ const _: () = {
     assert!(offset_of!(LogSlot, field) == offset_of!(LogRecord, field));
     assert!(offset_of!(LogSlot, outcome) == offset_of!(LogRecord, outcome));
     assert!(offset_of!(LogSlot, reason) == offset_of!(LogRecord, reason));
+    assert!(offset_of!(LogSlot, stamp_kind) == offset_of!(LogRecord, stamp_kind));
     assert!(offset_of!(LogSlot, _pad) == offset_of!(LogRecord, _pad));
     assert!(offset_of!(LogSlot, cause) == offset_of!(LogRecord, cause));
     assert!(offset_of!(LogSlot, key) == offset_of!(LogRecord, key));

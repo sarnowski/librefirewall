@@ -78,10 +78,11 @@ only debug kernel any gate boots is the one re-run to diagnose a scenario that h
 A sixth domain establishes what time it is. It maps the HPET's register page and holds the system's
 second I/O-port capability — the two CMOS ports at `0x70` — calibrates the timestamp counter against
 the timer whose rate is self-describing, reads the real-time clock once for an epoch to anchor that
-counter to, publishes one console record stating both, and parks. Nothing consumes the result yet,
-which is deliberate: a shared calibration region no domain maps would be a grant nobody uses. What
-the domain proves in the meantime is the whole chain that would fill one, end to end on the image
-that ships. It is **not** a trusted time source — see the status row above and its detail below.
+counter to, publishes one console record stating both, publishes the calibration itself, and parks.
+Every other domain now reads that calibration, so **every structured record carries the UTC instant
+it was emitted at**, rendered as RFC 3339 — and the records emitted before the calibration exists
+carry the token `unsynchronized` rather than a fake 1970. It is **not** a trusted time source — see
+the status row above and its detail below.
 
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection tracking
@@ -105,7 +106,7 @@ router on a firewall's substrate, not yet a firewall.
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
 | Isolated sign-only CA protection domain | **open** | |
-| Trusted time source | **partial** | a protection domain establishes real time at boot, reports it and now publishes it to the one domain that reads it; nothing about it is *trusted* — [detail](#trusted-time-source) |
+| Trusted time source | **partial** | a protection domain establishes real time at boot and publishes it to every other domain, so every structured record carries the instant it was emitted at; nothing about it is *trusted* — [detail](#trusted-time-source) |
 | Streaming DPI / signature matching | **open** | |
 | Full-object content scanning (YARA-X) | **open** | |
 | Web filtering | **open** | |
@@ -420,8 +421,12 @@ Rust, so the driver and the domain each carry **zero** `unsafe` blocks — the E
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`crates/wire` carries the transport: a 224-byte fixed-layout `LogRecord` whose every offset is a
+`crates/wire` carries the transport: a 232-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
+record grew by the eight bytes of its instant and one discriminant byte taken out of existing
+padding, and the slot count did not move: the ring is sized for a boot transcript whose first
+generation alone is 16 change records, and 64 records of 232 bytes still fit the 16 KiB the region
+already rounded to. The
 records region (slots, producer cursor, the writer's drop count) is read-write to the writing domain
 and read-only to the console, so the console cannot forge a line attributed to a domain that never
 emitted one — it is the domain whose output is read as testimony about the others. The consume
@@ -515,9 +520,11 @@ binaries emit **typed events** — a closed set of named fields — and renderin
 console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
 site rather than thrown away in a format string, and the structure is what crosses between domains
 rather than the text. Two channels of closed vocabulary reach the line,
-`LFW-PD domain=… state=…` for a domain's lifecycle and `LFW-CFG generation=… …` for configuration,
-both specified field for field in [MONITORING.md](MONITORING.md) and matching the existing
-`LFW-BOOT` convention, so a reader keys on the `LFW-` prefix alone.
+`LFW-PD time=… domain=… state=…` for a domain's lifecycle and `LFW-CFG time=… generation=… …` for
+configuration, both specified field for field in [MONITORING.md](MONITORING.md) and matching the
+existing `LFW-BOOT` convention, so a reader keys on the `LFW-` prefix alone. The instant is the
+first field of both and is the emitting domain's own, taken at the moment of emission; the
+pre-kernel `LFW-BOOT` channel has none, having no domain and no calibration behind it.
 
 That the values are safe to print is structural rather than a rule to remember: an event's value
 type is a closed set of already-parsed domain types with no arbitrary-bytes variant, and the one
@@ -526,7 +533,9 @@ route text takes from a configuration document to a console line is an identifie
 rather than truncates, a truncated line being one an operator reads as complete. The transcript is
 a machine-checked contract, not prose: a QEMU scenario derives the records a document must produce
 by running that document through the same two calls the domain makes and the same renderer its
-console backend uses, then asserts the boot's `LFW-CFG` channel against it.
+console backend uses, then asserts the boot's `LFW-CFG` channel against it — record for record, less
+each record's instant, which is the one field a build cannot predict and which a contract of its own
+judges over every channel at once.
 
 **Missing.**
 
@@ -537,10 +546,12 @@ console backend uses, then asserts the boot's `LFW-CFG` channel against it.
   when the hardware will not produce a per-boot secret for its sequence numbers, and reports a
   published calibration it will not use without refusing to run.)
 - **Nothing orders one domain's records against another's.** Within a domain they are totally
-  ordered — one writer per ring, drained in the order it wrote them — and a `generation`/`seq` pair
-  totally orders one commit's change records. Across domains there is no order at all: which ring is
-  served first is decided by where the console's rotation stood, and no record carries a timestamp
-  to appeal to.
+  ordered — one writer per ring, drained in the order it wrote them, with non-decreasing instants —
+  and a `generation`/`seq` pair totally orders one commit's change records. Across domains there is
+  no order at all: which ring is served first is decided by where the console's rotation stood. The
+  instant every record now carries does not repair that. Two domains' instants are comparable
+  arithmetic, but nothing serialises two domains against each other, so a record printed first
+  routinely carries the later instant.
   The boot capture above shows the forwarding domain's `generation=1 outcome=applied` printed
   *before* the change records that generation is made of, which is not a fault. A reader that infers
   causality from console order is inferring it from the fairness rule.
@@ -591,12 +602,13 @@ validator holds to its own rules *and* to not colliding with any dataplane prefi
 handover image carries to the domain. QEMU takes that MAC for the guest NIC, and the harness derives
 its own station address from that prefix, so no address on the bench is written down twice.
 
-It also **reads two instructions and holds no capability for either**: `RDTSC` once per wakeup, for
-the instant its transport's timers are stated against, and `RDRAND` once at start-up, for the secret
-those connections' initial sequence numbers are derived from. Both are unprivileged, so nothing in
-the system description grants or could withhold them; a part with no `RDRAND` refuses the domain and
-names the cause on the console rather than answering a `SYN` with a predictable number. Those are the
-domain's only two `unsafe` blocks, each naming what guarantees it.
+It also **reads two instructions and holds no capability for either**: `RDTSC`, for the instant its
+transport's timers are stated against and for the one on every record it emits, and `RDRAND` once at
+start-up, for the secret those connections' initial sequence numbers are derived from. Both are
+unprivileged, so nothing in the system description grants or could withhold them; a part with no
+`RDRAND` refuses the domain and names the cause on the console rather than answering a `SYN` with a
+predictable number. `RDRAND` is now this domain's only `unsafe` block: the counter read moved into
+`pd_runtime`, where one seam serves every domain that stamps a record.
 
 The domain reads the **committed** generation only (`pd_runtime::CommittedReader`): it maps the
 configuration region read-only, the calibration region read-only, and the acknowledgement region
@@ -829,6 +841,21 @@ one of 25 console cause tokens and parks. Two of the four QEMU system scenarios 
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts.
 
+**Every domain consumes it, and every structured record carries an instant.** The calibration goes
+into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
+clock domain maps read-write and the other seven read-only. Each reads `RDTSC` itself — one
+unprivileged instruction, behind the single `unsafe` seam in `pd_runtime::read_timestamp_counter` —
+converts it with the published triple, and stamps the record it is about to emit, so an instant is
+this node's own arithmetic over one counter rather than a value passed between domains. The console
+renders it as a leading `time=` field in RFC 3339 with all nine fractional digits. A domain that has
+no calibration yet emits `time=unsynchronized`: the absence is a case of the type all the way down
+(`wire::CheckedStamp`, `lfw_log::Stamp`) rather than a zero, so no record can be dated 1970 by
+accident. That is most of a boot transcript, the clock domain's own two records included — it
+publishes *after* the record that states what it measured. The same two scenarios assert the whole
+of this against the release image: that every record carries the field in one of its two forms, that
+every instant is inside the RTC reader's year band, that no domain goes back to `unsynchronized`
+after stamping, and that no domain's instants go backwards.
+
 **Missing** — and it is everything the word *trusted* covers:
 
 - **The time is unauthenticated and unattested.** It comes from a battery-backed register file that
@@ -839,11 +866,14 @@ accepts, and that its year is inside the band the RTC reader accepts.
 - **UTC is assumed, not discovered.** The CMOS carries no field saying whether it holds UTC or local
   time. A machine whose firmware set it to local time yields an epoch wrong by that zone's offset,
   detectably by nothing.
-- **Only one domain consumes it, and no record carries an instant.** The calibration is published
-  into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
-  management domain maps read-only and converts `RDTSC` readings with, which is what makes its
-  transport's timers real. Nothing else reads it, and no console or log record is timestamped, so
-  every ordering statement in [MONITORING.md](MONITORING.md) is unchanged.
+- **Accurate to about a second, and nothing checks that.** The epoch is one whole-second CMOS
+  reading; the nanoseconds under it are elapsed counter ticks, which are precise and say nothing
+  about how well the epoch was set. A record's instant is therefore good enough to line a node up
+  against an external log to about a second, and is evidence of nothing.
+- **No metric says which domain has taken the calibration up.** It is readable per record on the log
+  stream (`time=unsynchronized` against an instant) and `/metrics` carries the gauge for the
+  management domain alone; the other six writing domains publish no such series
+  ([MONITORING.md](MONITORING.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
   never corrected; there is no timer, no interrupt, and no second reading to drift against.
 - **Single-core assumption.** The calibration is a reading of one core's counter, with no check that

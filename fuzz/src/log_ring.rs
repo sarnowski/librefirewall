@@ -860,6 +860,7 @@ mod tests {
         let all_set = LogRecord {
             features: u64::MAX,
             operands: [u64::MAX; 2],
+            stamp_nanos: u64::MAX,
             kind: u32::MAX,
             generation: u32::MAX,
             sequence: u32::MAX,
@@ -876,7 +877,8 @@ mod tests {
             field: u8::MAX,
             outcome: u8::MAX,
             reason: u8::MAX,
-            _pad: [u8::MAX; 6],
+            stamp_kind: u8::MAX,
+            _pad: [u8::MAX; 5],
             cause: wire::CauseImage {
                 bytes: [u8::MAX; wire::LOG_CAUSE_BYTES],
                 len: u8::MAX,

@@ -48,7 +48,7 @@
 //!
 //! # Why the peer stores one location at a time
 //!
-//! A slot is 147 separate atomics and `LogSlot::load` reads them as 147
+//! A slot is 152 separate atomics and `LogSlot::load` reads them as 152
 //! separate relaxed loads, so the peer's real granularity is **one atomic**,
 //! not one record. That distinction is the whole of the torn-read hazard
 //! `log_ring`'s own header names ("per-field atomics mean a write concurrent
@@ -58,7 +58,7 @@
 //! byzantine one leaves a slot half-rewritten.
 //!
 //! [`store_location`](LogRingPeer::store_location) is therefore the primitive
-//! and [`store_record`](LogRingPeer::store_record) is 147 of it. Single-location
+//! and [`store_record`](LogRingPeer::store_record) is 152 of it. Single-location
 //! coherence makes that sufficient rather than merely convenient: each atomic's
 //! `load` returns *some* value stored to it at or before the load, so the
 //! records a torn read can produce are exactly the location-wise mixtures, and
@@ -113,22 +113,23 @@ impl Width {
 /// fail there rather than silently putting a peer store in the wrong place.
 ///
 /// The runs, in order: `features`, the two `operands`, the two quads a measured
-/// clock carries and the two a terminal endpoint's counts do; the six `u32`
-/// counters from `kind` to `receive_posted`; the ten vocabulary bytes, the six
-/// pad bytes and the whole of `cause` and `key`; `from.number`; the rest of
-/// `from`; `to.number`; the rest of `to`.
+/// clock carries, the two a terminal endpoint's counts do and the record's own
+/// instant; the six `u32` counters from `kind` to `receive_posted`; the ten
+/// vocabulary bytes, the stamp discriminant, the five pad bytes and the whole of
+/// `cause` and `key`; `from.number`; the rest of `from`; `to.number`; the rest
+/// of `to`.
 const SEGMENTS: &[(usize, usize, usize, Width)] = &[
-    (0, 0, 7, Width::Quad),
-    (7, 56, 6, Width::Word),
-    (13, 80, 80, Width::Byte),
-    (93, 160, 1, Width::Word),
-    (94, 164, 28, Width::Byte),
-    (122, 192, 1, Width::Word),
-    (123, 196, 28, Width::Byte),
+    (0, 0, 8, Width::Quad),
+    (8, 64, 6, Width::Word),
+    (14, 88, 80, Width::Byte),
+    (94, 168, 1, Width::Word),
+    (95, 172, 28, Width::Byte),
+    (123, 200, 1, Width::Word),
+    (124, 204, 28, Width::Byte),
 ];
 
 /// How many separately writable atomics one slot holds.
-pub const LOCATION_COUNT: usize = 151;
+pub const LOCATION_COUNT: usize = 152;
 
 /// Which atomic of a slot a peer store lands in.
 ///
@@ -162,7 +163,7 @@ impl Location {
     /// Where this location sits within a slot, and how wide it is.
     ///
     /// Total by construction: `Location` is only ever built from a value
-    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..147`
+    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..152`
     /// without a gap — which [`tests::the_segments_partition_the_whole_record`]
     /// is what proves. The fallback is the last run rather than a panic
     /// because a branch safe Rust cannot delete is not a failure to surface.
@@ -472,13 +473,17 @@ mod tests {
             kind: 1,
             generation: 0xDEAD_BEEF,
             reason: 29,
-            _pad: [0xAB; 6],
+            stamp_kind: 1,
+            stamp_nanos: 0x1122_3344_5566_7788,
+            _pad: [0xAB; 5],
             ..LogRecord::ZERO
         };
         assert_eq!(record_from_bytes(record_bytes(&record)), record);
         assert_eq!(
             record_from_bytes([0xFF; RECORD_BYTES]).check(),
-            Err(LogRecordError::KindUnknown { kind: u32::MAX }),
+            // The stamp is ruled on first, so an all-bytes-set image is refused
+            // for its discriminant and never reaches the kind behind it.
+            Err(LogRecordError::StampKindUnknown { kind: u8::MAX }),
             "the all-bytes-set image is not the record the ABI says it is"
         );
     }

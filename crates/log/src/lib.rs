@@ -16,16 +16,16 @@
 //! arbitrary-bytes variant, so a byte string out of a document reaches no
 //! console line as itself (OBS-5), [`Identifier`] excepted for its alphabet.
 //!
-//! # No timestamps
+//! # Every record is stamped, and half of them with nothing
 //!
-//! No record is timestamped — there is no timer, no interrupt, and no time
-//! source anything may be judged against — so a record carries the
-//! configuration `generation` it belongs to and a `sequence` counting from zero
-//! within that generation's own records, rather than a reading. That is a real
-//! limitation: records cannot be correlated against an external system's
-//! timeline, and are ordered and attributed only within one boot. It is
-//! preferred to inventing a time base a reader would trust.
-//! [`DomainDetail::Established`] states a time and orders nothing by it.
+//! A [`Sink`] stamps each record with a [`Stamp`] at the moment of emission,
+//! and both cases are ordinary: a domain emitting before this node established
+//! a time gets [`Stamp::Unsynchronized`], which is most of a boot transcript.
+//! The absence is a case of the type rather than a zero, so no reader can take
+//! it for 1970 (ENG-12). What it is not is a *trusted* time — the epoch behind
+//! it is an unauthenticated CMOS reading (README, *Trusted time source*) — nor
+//! an ordering: a change is attributed by `generation` and `sequence`, and an
+//! instant is not an attribution.
 //!
 //! # Why `Identifier` is defined here
 //!
@@ -60,6 +60,7 @@ mod identifier;
 mod record;
 mod render;
 mod ring;
+mod stamp;
 
 use core::cell::Cell;
 
@@ -73,6 +74,7 @@ pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};
 pub use render::{MAX_LINE_LEN, RenderError, render};
 pub use ring::RingSink;
+pub use stamp::{Clock, Stamp};
 
 /// Where events go.
 ///
@@ -218,8 +220,12 @@ mod tests {
         });
         let recorded = sink.get(0).expect("one event was emitted");
         let mut buffer = [0u8; MAX_LINE_LEN];
-        let written = render(&recorded, &mut buffer).expect("MAX_LINE_LEN holds every line");
-        assert_eq!(&buffer[..written], b"LFW-PD domain=config state=refused");
+        let written = render(Stamp::Unsynchronized, &recorded, &mut buffer)
+            .expect("MAX_LINE_LEN holds every line");
+        assert_eq!(
+            &buffer[..written],
+            b"LFW-PD time=unsynchronized domain=config state=refused"
+        );
     }
 
     /// A sink taken by reference is what a subsystem that only logs sees.

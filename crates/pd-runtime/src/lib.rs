@@ -385,10 +385,12 @@ macro_rules! attach_region {
     }};
 }
 
+pub mod clock;
 pub mod endpoint;
 pub mod handover;
 pub mod stats;
 
+pub use clock::{PdClock, read_timestamp_counter};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
     MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,

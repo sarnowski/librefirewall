@@ -64,10 +64,11 @@ use core::{
 pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, LOAD_ATTEMPTS};
 pub use log_record::{
     CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,
-    CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT,
-    LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT,
-    LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT, LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind,
-    LogRecord, LogRecordError, LogText, LogValueKind, TextImage, ValueImage,
+    CheckedRecord, CheckedStamp, CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES,
+    LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT,
+    LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT,
+    LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind,
+    LogText, LogValueKind, TextImage, ValueImage,
 };
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,

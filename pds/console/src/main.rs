@@ -96,12 +96,12 @@
 mod com1;
 
 use com1::Com1;
-use lfw_log::{ConsolePrinter, Domain, DomainDetail, DomainState, Event};
+use lfw_log::{Clock as _, ConsolePrinter, Domain, DomainDetail, DomainState, Event};
 use lfw_metrics::{ConsoleSample, StatsShard};
-use pd_runtime::attach_region;
+use pd_runtime::{PdClock, attach_region};
 use sel4_microkit::{ChannelSet, Handler, Infallible, debug_println, protection_domain};
 use uart_16550::{Transmitter, Uart, WriteError};
-use wire::{LogConsume, LogReader, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
 /// per writing domain, matching the seven pairs of `<map>` rows on the console
@@ -152,6 +152,8 @@ fn init() -> Console {
     let management_consume: &'static LogConsume =
         attach_region!(log_management_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
+    // For its own two records alone: a peer's instant is rendered, never minted.
+    let stamps = PdClock::new(attach_region!(clock_vaddr: ClockCalibration));
 
     let port = match Com1::claim() {
         Ok(port) => port,
@@ -181,7 +183,7 @@ fn init() -> Console {
     };
 
     let mut printer = ConsolePrinter::new(SerialLine(transmitter));
-    printer.print(&announce(DomainState::Starting));
+    printer.print(stamps.now(), &announce(DomainState::Starting));
 
     // Taken once and kept, which is what `LogConsume::reader` asks of a caller:
     // a second handle restarts at slot zero and re-renders every record the
@@ -197,7 +199,7 @@ fn init() -> Console {
         nic_driver2_consume.reader(nic_driver2),
         management_consume.reader(management),
     ];
-    printer.print(&announce(DomainState::Ready));
+    printer.print(stamps.now(), &announce(DomainState::Ready));
 
     // Written once so a scrape taken before the first record reads a console
     // that is up, and thereafter only when something moved. Compared rather than

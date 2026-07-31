@@ -18,7 +18,7 @@ fn record_from_bytes(bytes: [u8; RECORD_BYTES]) -> LogRecord {
 #[test]
 fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
     assert_eq!(size_of::<LogSlot>(), size_of::<LogRecord>());
-    assert_eq!(size_of::<LogSlot>(), 224);
+    assert_eq!(size_of::<LogSlot>(), 232);
     assert_eq!(align_of::<LogSlot>(), align_of::<LogRecord>());
     assert_eq!(align_of::<LogSlot>(), 8);
     assert_eq!(
@@ -27,6 +27,7 @@ fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
             offset_of!(LogSlot, operands),
             offset_of!(LogSlot, tsc_hz),
             offset_of!(LogSlot, unix_nanos),
+            offset_of!(LogSlot, stamp_nanos),
             offset_of!(LogSlot, kind),
             offset_of!(LogSlot, generation),
             offset_of!(LogSlot, sequence),
@@ -43,6 +44,7 @@ fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
             offset_of!(LogSlot, field),
             offset_of!(LogSlot, outcome),
             offset_of!(LogSlot, reason),
+            offset_of!(LogSlot, stamp_kind),
             offset_of!(LogSlot, _pad),
             offset_of!(LogSlot, cause),
             offset_of!(LogSlot, key),
@@ -54,6 +56,7 @@ fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
             offset_of!(LogRecord, operands),
             offset_of!(LogRecord, tsc_hz),
             offset_of!(LogRecord, unix_nanos),
+            offset_of!(LogRecord, stamp_nanos),
             offset_of!(LogRecord, kind),
             offset_of!(LogRecord, generation),
             offset_of!(LogRecord, sequence),
@@ -70,6 +73,7 @@ fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
             offset_of!(LogRecord, field),
             offset_of!(LogRecord, outcome),
             offset_of!(LogRecord, reason),
+            offset_of!(LogRecord, stamp_kind),
             offset_of!(LogRecord, _pad),
             offset_of!(LogRecord, cause),
             offset_of!(LogRecord, key),

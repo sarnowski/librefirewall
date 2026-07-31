@@ -27,6 +27,7 @@
 //! - [`config_transcript`] — the `LFW-CFG` console channel one boot must carry.
 //! - [`clock_contract`] — the clock domain's own record on the `LFW-PD` channel.
 //! - [`management_contract`] — the management port's count on the same channel.
+//! - [`stamp_contract`] — the instant every record of every channel carries.
 //! - [`console_records`] — recovering structured records out of a serial capture.
 //! - [`diagnose`] — re-run a failed release scenario on the debug kernel.
 //!
@@ -58,6 +59,7 @@ mod pins;
 mod qemu;
 mod reproducible;
 mod signing;
+mod stamp_contract;
 mod sysdesc;
 mod topology;
 mod util;

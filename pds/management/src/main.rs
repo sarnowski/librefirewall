@@ -115,12 +115,12 @@
 mod entropy;
 
 use entropy::EntropyError;
-use lfw_clock::Ticks;
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, EndpointRegions, EndpointStage,
-    ForwardRings, IsnSecret, Pool, ReturnRing, StatsRegions, attach_region, log_sample,
+    ForwardRings, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region, log_sample,
+    read_timestamp_counter,
 };
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{LogConsume, LogRecords};
@@ -189,7 +189,8 @@ fn init() -> Management {
     // console domain drains it whenever it comes up.
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
-    let sink = RingSink::new(log.writer(log_consume));
+    let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting, DomainDetail::None);
 
     // First, because it is the one thing that can refuse: a port that came up and
@@ -235,7 +236,6 @@ fn init() -> Management {
         stats,
     );
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
-    let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
     // The port is unaddressed until a generation is committed and unclocked until
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
@@ -276,27 +276,7 @@ struct Running {
     stage: EndpointStage<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
-    sink: RingSink<'static>,
-}
-
-/// One reading of the x86_64 timestamp counter.
-///
-/// Unserialised, on `pds/clock`'s terms: the transport's timeouts are milliseconds
-/// and out-of-order execution moves the instruction by tens of cycles, so a
-/// barrier would tighten an error six orders of magnitude below anything measured
-/// against it.
-fn read_timestamp_counter() -> Ticks {
-    // SAFETY: `_rdtsc` requires only that the instruction execute, which is two
-    // facts neither this domain nor any first-party crate provides. The target is
-    // the guarantor of the first — `RDTSC` has been architectural on x86_64 since
-    // the ISA existed, and `support/targets/x86_64-sel4-minimal.json` targets
-    // nothing else (CON-4). The seL4 kernel is the guarantor of the second: it
-    // leaves `CR4.TSD` clear, which is what makes the instruction unprivileged in
-    // a protection domain. That is third-party runtime behaviour, recorded rather
-    // than asserted — and it is the one step of this argument this domain cannot
-    // make for itself. Being wrong about it is a #GP the Microkit monitor reports
-    // as a fault in this domain, not a silently wrong number.
-    Ticks(unsafe { core::arch::x86_64::_rdtsc() })
+    sink: RingSink<'static, PdClock<'static>>,
 }
 
 impl Handler for Management {

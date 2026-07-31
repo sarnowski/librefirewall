@@ -34,14 +34,15 @@
 "crates/http/src/response.rs" = 0.2824
 "crates/ip-endpoint/src/http.rs" = 0.2892
 "crates/ip-endpoint/src/lib.rs" = 0.2827
-"crates/log/src/console.rs" = 0.5101
+"crates/log/src/console.rs" = 0.5084
 "crates/log/src/detail.rs" = 0.4033
 "crates/log/src/event.rs" = 0.2017
 "crates/log/src/identifier.rs" = 0.2097
-"crates/log/src/lib.rs" = 0.4118
-"crates/log/src/record.rs" = 0.1780
-"crates/log/src/render.rs" = 0.1543
-"crates/log/src/ring.rs" = 0.3721
+"crates/log/src/lib.rs" = 0.4065
+"crates/log/src/record.rs" = 0.1723
+"crates/log/src/render.rs" = 0.1542
+"crates/log/src/ring.rs" = 0.3667
+"crates/log/src/stamp.rs" = 0.4681
 "crates/metrics/src/catalog.rs" = 0.1576
 "crates/metrics/src/lib.rs" = 0.5941
 "crates/metrics/src/render.rs" = 0.3057
@@ -51,9 +52,10 @@
 "crates/nic-driver-core/src/lib.rs" = 0.4598
 "crates/nic-driver-core/src/port.rs" = 0.4521
 "crates/packet-buffer/src/lib.rs" = 0.4529
+"crates/pd-runtime/src/clock.rs" = 0.6224
 "crates/pd-runtime/src/endpoint.rs" = 0.4625
 "crates/pd-runtime/src/handover.rs" = 0.3427
-"crates/pd-runtime/src/lib.rs" = 0.4879
+"crates/pd-runtime/src/lib.rs" = 0.4869
 "crates/pd-runtime/src/stats.rs" = 0.1747
 "crates/queue/src/lib.rs" = 0.4260
 "crates/routing/src/lib.rs" = 0.2716
@@ -71,20 +73,20 @@
 "crates/virtio/src/pci.rs" = 0.3866
 "crates/virtio/src/queue.rs" = 0.3538
 "crates/wire/src/clock.rs" = 0.5176
-"crates/wire/src/lib.rs" = 0.1813
-"crates/wire/src/log_record.rs" = 0.2207
+"crates/wire/src/lib.rs" = 0.1811
+"crates/wire/src/log_record.rs" = 0.2201
 "crates/wire/src/log_ring.rs" = 0.4120
-"crates/wire/src/log_slot.rs" = 0.1169
+"crates/wire/src/log_slot.rs" = 0.1129
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
-"pds/clock/src/main.rs" = 0.4196
-"pds/config/src/main.rs" = 0.4277
+"pds/clock/src/main.rs" = 0.3995
+"pds/config/src/main.rs" = 0.4251
 "pds/console/src/com1.rs" = 0.6400
-"pds/console/src/main.rs" = 0.5285
-"pds/forwarder/src/main.rs" = 0.3851
+"pds/console/src/main.rs" = 0.5282
+"pds/forwarder/src/main.rs" = 0.3829
 "pds/management/src/entropy.rs" = 0.6489
-"pds/management/src/main.rs" = 0.5227
-"pds/nic-driver/src/main.rs" = 0.4553
+"pds/management/src/main.rs" = 0.5060
+"pds/nic-driver/src/main.rs" = 0.4529
 
 [unsafe-blocks]
 "crates/clock" = 0
@@ -97,7 +99,7 @@
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 3
 "crates/packet-buffer" = 3
-"crates/pd-runtime" = 4
+"crates/pd-runtime" = 5
 "crates/queue" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
@@ -105,11 +107,11 @@
 "crates/uart-16550" = 0
 "crates/virtio" = 20
 "crates/wire" = 0
-"pds/clock" = 4
+"pds/clock" = 3
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
-"pds/management" = 2
+"pds/management" = 1
 "pds/nic-driver" = 4
 
 [unsafe-fns]

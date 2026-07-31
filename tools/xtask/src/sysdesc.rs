@@ -299,20 +299,6 @@ const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region
      what a compromised forwarder is still unable to do: it can corrupt a frame in flight, and it \
      cannot hand a live DMA target back to be issued a second time";
 
-/// What the calibration region's one writer and one reader withhold. Quoted into
-/// the finding on either grant being widened, because the direction *is* the
-/// grant: the clock domain measured the numbers and the management domain
-/// consumes them, and no third domain has any use for either half.
-const CLOCK_WITHHELD: &str = "the clock domain writes the calibration and the management domain \
-     only reads it, and no other domain maps it in either direction. A management domain that \
-     could write it would be able to move this node's own idea of time — every retransmission and \
-     reaping deadline of the transport on its port, and one day every certificate's validity \
-     window (CONCEPT §7.2) — from the one domain that answers the management-plane attacker; a \
-     clock domain that could only read it would have nowhere to publish what it measured. Every \
-     other domain states no time and reads none, so a grant to one would be authority with no use \
-     (ENG-1) — and the console in particular must not be able to rewrite the frequency it is \
-     printing (ENG-1, SCM-6)";
-
 /// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
 /// the finding on the management domain gaining the acknowledgement region.
 const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `cfgack` NOT AT \
@@ -624,9 +610,12 @@ const REGIONS: &[RegionRule] = &[
         withheld: None,
     },
     // The calibration: three words published under a seqlock, written by the
-    // domain that measured them and read by the one domain that converts a
-    // counter reading with them. The perms carry the direction and the exclusion
-    // carries everybody else.
+    // domain that measured them and read by every domain that converts a counter
+    // reading with them — which, since a log record carries the instant it was
+    // emitted at, is all of them. What this rule withholds is therefore an
+    // authority and not a mapping, so it lives in the perms and `withheld` has
+    // nothing to say (see the field's own note); the system description carries
+    // what the one-writer direction is worth.
     RegionRule {
         name: "clock",
         size: ExpectedSize {
@@ -634,8 +623,17 @@ const REGIONS: &[RegionRule] = &[
             bytes: CLOCK_CALIBRATION_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("clock"), read_only("management")],
-        withheld: Some(CLOCK_WITHHELD),
+        grants: &[
+            read_write("clock"),
+            read_only("config"),
+            read_only("console"),
+            read_only("forwarder"),
+            read_only("management"),
+            read_only("nic_driver0"),
+            read_only("nic_driver1"),
+            read_only("nic_driver2"),
+        ],
+        withheld: None,
     },
     RegionRule {
         name: "cfgack",
@@ -2751,10 +2749,12 @@ mod tests {
         );
     }
 
-    /// The calibration's direction is the grant: a management domain that could
-    /// write it would move this node's own idea of time.
+    /// The calibration's direction is the whole grant: every domain reads it and
+    /// exactly one writes it, so a second writer is the finding. Any reader will
+    /// do to prove it — the first in the description is the forwarder — because
+    /// what is reported is the perms of a named domain against this table.
     #[test]
-    fn the_management_domain_writing_the_calibration_is_reported() {
+    fn a_reader_of_the_calibration_that_could_write_it_is_reported() {
         let findings = findings_after(
             "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />",
@@ -2763,27 +2763,23 @@ mod tests {
         );
         let finding = only_finding(&findings);
         assert!(finding.contains("clock"), "{finding}");
-        assert!(finding.contains("\"management\""), "{finding}");
+        assert!(finding.contains("\"forwarder\""), "{finding}");
+        assert!(finding.contains("capability change"), "{finding}");
     }
 
-    /// And the other half: a domain that states no time and reads none has no use
-    /// for it, so any third mapper is a finding that quotes what the exclusion
-    /// was worth.
+    /// And the other direction: a domain that stopped reading it would stamp no
+    /// record, so a vanished grant is a finding exactly as a widened one is.
     #[test]
-    fn a_third_domain_reaching_the_calibration_is_reported() {
+    fn a_domain_that_stops_reading_the_calibration_is_reported() {
         let findings = findings_after(
-            "<map mr=\"log_forwarder\" vaddr=\"0x4_000_000\" perms=\"r\"",
             "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_forwarder\" \
              vaddr=\"0x4_000_000\" perms=\"r\"",
+            "<map mr=\"log_forwarder\" vaddr=\"0x4_000_000\" perms=\"r\"",
         );
-        assert!(!findings.is_empty(), "a third mapper went unreported");
-        let reported = findings.join("\n");
-        assert!(reported.contains("clock"), "{reported}");
-        assert!(
-            reported.contains("must not be able to rewrite the frequency"),
-            "the finding quotes what the exclusion was worth: {reported}"
-        );
+        let finding = only_finding(&findings);
+        assert!(finding.contains("clock"), "{finding}");
+        assert!(finding.contains("console"), "{finding}");
     }
 
     /// A rule granting its region to nobody is a real shape — a DMA target the

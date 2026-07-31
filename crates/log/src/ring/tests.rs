@@ -2,11 +2,15 @@ use super::*;
 
 use proptest::prelude::*;
 use std::{boxed::Box, vec::Vec};
-use wire::{CheckedBody, LogConsume, LogRecords};
+use wire::{LogConsume, LogRecords};
 
 use crate::detail::{Cause, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{Domain, DomainState, GenerationOutcome};
 use crate::record::DecodeError;
+use crate::stamp::{
+    Stamp,
+    testing::{FixedClock, utc},
+};
 
 /// The two regions one ring is, on the heap: `LogRecords` is larger than a
 /// comfortable stack frame in a test binary. Held together here because a test
@@ -44,13 +48,21 @@ fn generation(n: u32) -> Event {
 /// Every event the reader could pull, decoded — the console domain's whole side
 /// of the region.
 fn drain(ring: &Ring) -> Vec<Result<Event<Cause>, DecodeError>> {
+    stamped_drain(ring)
+        .into_iter()
+        .map(|decoded| decoded.map(|(_, event)| event))
+        .collect()
+}
+
+/// As [`drain`], keeping each record's instant, for the tests that are about it.
+fn stamped_drain(ring: &Ring) -> Vec<Result<(Stamp, Event<Cause>), DecodeError>> {
     let mut reader = ring.reader();
     let capacity = reader.capacity();
     reader
         .drain(capacity)
-        .map(|body| {
-            let body: CheckedBody = body.expect("every record here was written by the encoder");
-            Event::decode(&body)
+        .map(|record| {
+            let record = record.expect("every record here was written by the encoder");
+            Event::decode(&record)
         })
         .collect()
 }
@@ -58,7 +70,7 @@ fn drain(ring: &Ring) -> Vec<Result<Event<Cause>, DecodeError>> {
 #[test]
 fn a_fresh_sink_has_refused_nothing() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     assert_eq!(sink.dropped(), 0);
     assert_eq!(sink.refused(), 0);
     assert!(drain(&ring).is_empty());
@@ -67,7 +79,7 @@ fn a_fresh_sink_has_refused_nothing() {
 #[test]
 fn records_that_fit_are_readable_in_the_order_they_were_emitted() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     for n in 0..8 {
         sink.emit(&generation(n));
     }
@@ -90,7 +102,7 @@ fn records_that_fit_are_readable_in_the_order_they_were_emitted() {
 #[test]
 fn a_full_ring_refuses_and_counts_rather_than_blocking() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     let capacity = ring.reader().capacity();
     let overrun = 5u32;
     let offered = u32::try_from(capacity).expect("the capacity fits") + overrun;
@@ -121,7 +133,7 @@ fn a_full_ring_refuses_and_counts_rather_than_blocking() {
 #[test]
 fn a_drained_ring_takes_records_again() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     let capacity = u32::try_from(ring.reader().capacity()).expect("the capacity fits");
     for n in 0..capacity + 1 {
         sink.emit(&generation(n));
@@ -141,7 +153,7 @@ fn a_drained_ring_takes_records_again() {
 #[test]
 fn an_unencodable_event_is_refused_without_touching_the_ring() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     let unencodable = Event::Domain {
         domain: Domain::NicDriver,
         state: DomainState::Refused,
@@ -174,7 +186,7 @@ fn an_unencodable_event_is_refused_without_touching_the_ring() {
 #[test]
 fn a_sink_already_in_use_refuses_rather_than_faulting() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     {
         let _held = sink.writer.borrow_mut();
         sink.emit(&generation(1));
@@ -192,7 +204,7 @@ fn a_sink_already_in_use_refuses_rather_than_faulting() {
 #[test]
 fn the_counters_saturate_rather_than_wrapping() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     sink.refused.set(u32::MAX);
     sink.refuse();
     assert_eq!(sink.refused(), u32::MAX);
@@ -203,7 +215,7 @@ fn the_counters_saturate_rather_than_wrapping() {
 #[test]
 fn the_drop_count_a_domain_reports_is_the_one_the_region_carries() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     let capacity = u32::try_from(ring.reader().capacity()).expect("the capacity fits");
     for n in 0..capacity + 3 {
         sink.emit(&generation(n));
@@ -217,7 +229,7 @@ fn the_drop_count_a_domain_reports_is_the_one_the_region_carries() {
 #[test]
 fn a_ring_sink_is_usable_through_the_trait_alone() {
     let ring = ring();
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     fn announce(sink: &dyn Sink) {
         sink.emit(&Event::Domain {
             domain: Domain::Console,
@@ -229,6 +241,35 @@ fn a_ring_sink_is_usable_through_the_trait_alone() {
     assert_eq!(drain(&ring).len(), 1);
 }
 
+/// The instant is the sink's, taken at the moment of the call: a call site
+/// emits an event and never an event and a time, so a record cannot be stamped
+/// with one the emitting domain did not hold.
+#[test]
+fn a_record_carries_the_instant_the_sinks_clock_gave_it() {
+    let ring = ring();
+    let at = utc(1_785_443_220_123_456_789);
+    let sink = RingSink::new(ring.writer(), FixedClock(at));
+    sink.emit(&generation(1));
+    let [Ok((stamped, _))] = stamped_drain(&ring)[..] else {
+        panic!("one record was emitted");
+    };
+    assert_eq!(stamped, at);
+}
+
+/// A domain emitting before this node has established a time produces the
+/// absence rather than the epoch, which is most of a boot transcript (ENG-12).
+#[test]
+fn a_domain_with_no_clock_yet_emits_the_absence_and_not_nineteen_seventy() {
+    let ring = ring();
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
+    sink.emit(&generation(1));
+    let [Ok((stamped, _))] = stamped_drain(&ring)[..] else {
+        panic!("one record was emitted");
+    };
+    assert_eq!(stamped, Stamp::Unsynchronized);
+    assert_ne!(stamped, utc(0));
+}
+
 proptest! {
     /// However many records a domain offers, the sink accounts for every one of
     /// them: what the reader sees plus what was counted is what was emitted.
@@ -236,7 +277,7 @@ proptest! {
     #[test]
     fn every_emitted_record_is_either_readable_or_counted(count in 0usize..200) {
         let ring = ring();
-        let sink = RingSink::new(ring.writer());
+        let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
         for n in 0..count {
             sink.emit(&generation(u32::try_from(n).expect("the bound fits")));
         }

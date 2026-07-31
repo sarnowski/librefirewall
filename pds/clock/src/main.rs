@@ -74,13 +74,13 @@ mod hpet_mmio;
 use cmos::{Cmos, PortFault};
 use hpet_mmio::HpetPage;
 use lfw_clock::{
-    Calibration, CalibrationError, CivilTimeError, Duration, NANOS_PER_SECOND, Ticks, calibrate,
+    Calibration, CalibrationError, CivilTimeError, Duration, NANOS_PER_SECOND, calibrate,
 };
 use lfw_hpet::{Hpet, HpetError, WORST_CASE_SERVICEABLE_WAIT};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::{ClockSample, StatsShard};
 use lfw_rtc::{Rtc, RtcError};
-use pd_runtime::{attach_region, log_sample};
+use pd_runtime::{PdClock, attach_region, log_sample, read_timestamp_counter};
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{CalibrationImage, ClockCalibration, LogConsume, LogRecords};
 
@@ -331,8 +331,8 @@ fn init() -> Clock {
     // console domain drains it whenever it comes up.
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
-    let sink = RingSink::new(log.writer(log_consume));
     let published: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let sink = RingSink::new(log.writer(log_consume), PdClock::new(published));
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
@@ -420,28 +420,6 @@ fn establish() -> Result<Calibration, StartupError> {
         .checked_mul(NANOS_PER_SECOND)
         .ok_or(StartupError::EpochOutOfRange { unix_seconds })?;
     Ok(Calibration::new(tsc_hz, after, boot_unix_nanos))
-}
-
-/// One reading of the x86_64 timestamp counter.
-///
-/// The reading is deliberately not serialised with an `lfence`. Out-of-order
-/// execution moves the instruction by tens of cycles and the window it is
-/// measuring is millions, so the serialisation would tighten an error already
-/// an order of magnitude below the reference-read overhead named at the call
-/// site — and it would do it on the one path where a wrong barrier is
-/// indistinguishable from a right one.
-fn read_timestamp_counter() -> Ticks {
-    // SAFETY: `_rdtsc` requires only that the instruction execute, which is two
-    // facts neither this domain nor any first-party crate provides. The target
-    // is the guarantor of the first — `RDTSC` has been architectural on x86_64
-    // since the ISA existed, and `support/targets/x86_64-sel4-minimal.json` targets
-    // nothing else (CON-4). The seL4 kernel is the guarantor of the second: it
-    // leaves `CR4.TSD` clear, which is what makes the instruction unprivileged
-    // in a protection domain. That is third-party runtime behaviour, recorded
-    // rather than asserted — and it is the one step of this argument this
-    // domain cannot make for itself. Being wrong about it is a #GP the Microkit
-    // monitor reports as a fault in this domain, not a silently wrong number.
-    Ticks(unsafe { core::arch::x86_64::_rdtsc() })
 }
 
 /// Returned by `init` in every case: this domain runs once and then parks in

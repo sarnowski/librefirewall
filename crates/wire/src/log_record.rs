@@ -69,6 +69,36 @@ pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
 /// `lfw_log::RejectReason::ALL`.
 pub const LOG_REJECT_REASON_COUNT: u8 = 30;
 
+/// Whether a record's instant is one or is the absence of one.
+///
+/// A discriminant rather than a reserved value of [`LogRecord::stamp_nanos`]:
+/// zero is a real instant, so a sentinel would date 1970 every record emitted
+/// before this node established a time — most of a boot transcript (ENG-12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogStampKind {
+    Unsynchronized,
+    Utc,
+}
+
+impl LogStampKind {
+    #[must_use]
+    pub const fn to_bits(self) -> u8 {
+        match self {
+            Self::Unsynchronized => 0,
+            Self::Utc => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Unsynchronized),
+            1 => Some(Self::Utc),
+            _ => None,
+        }
+    }
+}
+
 /// Which shape a [`LogRecord`] is, and so which of its fields name anything.
 ///
 /// One variant per `lfw_log::Event` variant. Unlike the vocabularies, this is
@@ -222,7 +252,6 @@ impl fmt::Display for LogText {
 }
 
 /// Text in a record: `N` bytes of storage and how many of them are the value.
-///
 /// The padding is explicit rather than implied, so these offsets are the ones a
 /// writer in another language computes for the same declaration.
 #[repr(C)]
@@ -255,7 +284,7 @@ pub type CauseImage = TextImage<LOG_CAUSE_BYTES>;
 ///
 /// One shape for every variant rather than a union, because a union in shared
 /// memory is a second reading of the same bytes and the writer picks which one
-/// applies. Each variant reads the fields its kind names and no others.
+/// applies.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueImage {
@@ -318,6 +347,9 @@ pub struct LogRecord {
     /// Bytes those frames carried. `frame_bytes` rather than `bytes` so it
     /// cannot read as a size of this record.
     pub frame_bytes: u64,
+    /// Nanoseconds since the Unix epoch at which the writing domain emitted
+    /// this record, read by nothing unless `stamp_kind` says so.
+    pub stamp_nanos: u64,
     /// Which [`LogKind`] this record is, as raw bits.
     pub kind: u32,
     /// The configuration generation of a [`LogKind::ConfigChange`],
@@ -357,8 +389,10 @@ pub struct LogRecord {
     pub outcome: u8,
     /// `lfw_log::RejectReason` as a token below [`LOG_REJECT_REASON_COUNT`].
     pub reason: u8,
+    /// Which [`LogStampKind`] `stamp_nanos` is, as raw bits.
+    pub stamp_kind: u8,
     /// Explicit rather than implied, so the whole record is fields.
-    pub _pad: [u8; 6],
+    pub _pad: [u8; 5],
     /// What was refused, under [`LogDetailKind::Refusal`]. A literal on the
     /// writing side and arbitrary bytes on this one, so the decode holds it to
     /// the same alphabet an identifier is held to.
@@ -382,6 +416,7 @@ impl LogRecord {
         unix_nanos: 0,
         frames: 0,
         frame_bytes: 0,
+        stamp_nanos: 0,
         kind: 0,
         generation: 0,
         sequence: 0,
@@ -398,19 +433,40 @@ impl LogRecord {
         field: 0,
         outcome: 0,
         reason: 0,
-        _pad: [0; 6],
+        stamp_kind: 0,
+        _pad: [0; 5],
         cause: CauseImage::ZERO,
         key: IdentifierImage::ZERO,
         from: ValueImage::ZERO,
         to: ValueImage::ZERO,
     };
 
-    /// Decodes the fields this record's [`LogKind`] names, refusing it on the
-    /// first one that cannot be a value.
+    /// Decodes the instant and the fields this record's [`LogKind`] names,
+    /// refusing it on the first one that cannot be a value.
     ///
     /// # Errors
     /// [`LogRecordError`], naming the field and the value that refused it.
-    pub fn check(&self) -> Result<CheckedBody, LogRecordError> {
+    pub fn check(&self) -> Result<CheckedRecord, LogRecordError> {
+        Ok(CheckedRecord {
+            at: self.check_stamp()?,
+            body: self.check_body()?,
+        })
+    }
+
+    /// The instant, before any body field: a record whose stamp discriminant
+    /// names neither case is one no line can be dated by, and a body rendered
+    /// without one would silently read as having no time.
+    fn check_stamp(&self) -> Result<CheckedStamp, LogRecordError> {
+        match LogStampKind::from_bits(self.stamp_kind) {
+            None => Err(LogRecordError::StampKindUnknown {
+                kind: self.stamp_kind,
+            }),
+            Some(LogStampKind::Unsynchronized) => Ok(CheckedStamp::Unsynchronized),
+            Some(LogStampKind::Utc) => Ok(CheckedStamp::Utc(self.stamp_nanos)),
+        }
+    }
+
+    fn check_body(&self) -> Result<CheckedBody, LogRecordError> {
         match LogKind::from_bits(self.kind) {
             None => Err(LogRecordError::KindUnknown { kind: self.kind }),
             Some(LogKind::Domain) => self.check_domain(),
@@ -717,6 +773,25 @@ pub enum CheckedDetail {
     },
 }
 
+/// When a [`LogRecord`] says it was emitted.
+///
+/// A sum type rather than a number with a reserved value, so an absent instant
+/// has no `u64` in it to be mistaken for a reading (DOC-9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedStamp {
+    Unsynchronized,
+    /// Nanoseconds since the Unix epoch, unranged: every `u64` names a civil
+    /// time, so believability is a reader's question and not this decode's.
+    Utc(u64),
+}
+
+/// A whole decoded record: when it was emitted, and what it said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedRecord {
+    pub at: CheckedStamp,
+    pub body: CheckedBody,
+}
+
 /// Everything a [`LogRecord`] said, decoded and owned.
 ///
 /// Owned rather than borrowed because the record it came from may be the shared
@@ -762,6 +837,10 @@ pub enum CheckedBody {
 /// it one, so a refusal is attributable to a field rather than to a category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogRecordError {
+    /// The stamp discriminant is neither of the two [`LogStampKind`] admits.
+    StampKindUnknown {
+        kind: u8,
+    },
     KindUnknown {
         kind: u32,
     },
@@ -827,6 +906,12 @@ pub enum LogRecordError {
 impl fmt::Display for LogRecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StampKindUnknown { kind } => {
+                write!(
+                    f,
+                    "stamp kind {kind} says neither a time nor the lack of one"
+                )
+            }
             Self::KindUnknown { kind } => write!(f, "record kind {kind} names no event"),
             Self::DomainUnknown { domain } => {
                 write!(f, "domain token {domain} is not below {LOG_DOMAIN_COUNT}")
@@ -910,7 +995,7 @@ const _: () = {
     assert!(offset_of!(ValueImage, _pad) == 11);
     assert!(offset_of!(ValueImage, id) == 12);
 
-    assert!(size_of::<LogRecord>() == 224);
+    assert!(size_of::<LogRecord>() == 232);
     assert!(align_of::<LogRecord>() == 8);
     assert!(offset_of!(LogRecord, features) == 0);
     assert!(offset_of!(LogRecord, operands) == 8);
@@ -918,27 +1003,29 @@ const _: () = {
     assert!(offset_of!(LogRecord, unix_nanos) == 32);
     assert!(offset_of!(LogRecord, frames) == 40);
     assert!(offset_of!(LogRecord, frame_bytes) == 48);
-    assert!(offset_of!(LogRecord, kind) == 56);
-    assert!(offset_of!(LogRecord, generation) == 60);
-    assert!(offset_of!(LogRecord, sequence) == 64);
-    assert!(offset_of!(LogRecord, changes) == 68);
-    assert!(offset_of!(LogRecord, reject_offset) == 72);
-    assert!(offset_of!(LogRecord, receive_posted) == 76);
-    assert!(offset_of!(LogRecord, domain) == 80);
-    assert!(offset_of!(LogRecord, state) == 81);
-    assert!(offset_of!(LogRecord, detail) == 82);
-    assert!(offset_of!(LogRecord, operand_count) == 83);
-    assert!(offset_of!(LogRecord, signalled) == 84);
-    assert!(offset_of!(LogRecord, change) == 85);
-    assert!(offset_of!(LogRecord, object) == 86);
-    assert!(offset_of!(LogRecord, field) == 87);
-    assert!(offset_of!(LogRecord, outcome) == 88);
-    assert!(offset_of!(LogRecord, reason) == 89);
-    assert!(offset_of!(LogRecord, _pad) == 90);
-    assert!(offset_of!(LogRecord, cause) == 96);
-    assert!(offset_of!(LogRecord, key) == 140);
-    assert!(offset_of!(LogRecord, from) == 160);
-    assert!(offset_of!(LogRecord, to) == 192);
+    assert!(offset_of!(LogRecord, stamp_nanos) == 56);
+    assert!(offset_of!(LogRecord, kind) == 64);
+    assert!(offset_of!(LogRecord, generation) == 68);
+    assert!(offset_of!(LogRecord, sequence) == 72);
+    assert!(offset_of!(LogRecord, changes) == 76);
+    assert!(offset_of!(LogRecord, reject_offset) == 80);
+    assert!(offset_of!(LogRecord, receive_posted) == 84);
+    assert!(offset_of!(LogRecord, domain) == 88);
+    assert!(offset_of!(LogRecord, state) == 89);
+    assert!(offset_of!(LogRecord, detail) == 90);
+    assert!(offset_of!(LogRecord, operand_count) == 91);
+    assert!(offset_of!(LogRecord, signalled) == 92);
+    assert!(offset_of!(LogRecord, change) == 93);
+    assert!(offset_of!(LogRecord, object) == 94);
+    assert!(offset_of!(LogRecord, field) == 95);
+    assert!(offset_of!(LogRecord, outcome) == 96);
+    assert!(offset_of!(LogRecord, reason) == 97);
+    assert!(offset_of!(LogRecord, stamp_kind) == 98);
+    assert!(offset_of!(LogRecord, _pad) == 99);
+    assert!(offset_of!(LogRecord, cause) == 104);
+    assert!(offset_of!(LogRecord, key) == 148);
+    assert!(offset_of!(LogRecord, from) == 168);
+    assert!(offset_of!(LogRecord, to) == 200);
 
     // Every byte of the record belongs to a declared field: the fields sum to
     // the whole size, so the compiler inserted no padding of its own. That is
@@ -947,20 +1034,22 @@ const _: () = {
     // on.
     assert!(
         size_of::<LogRecord>()
-            == 7 * size_of::<u64>()
+            == size_of::<[u64; 8]>()
                 + 6 * size_of::<u32>()
-                + 10
-                + 6
+                + 11
+                + 5
                 + size_of::<CauseImage>()
                 + size_of::<IdentifierImage>()
                 + 2 * size_of::<ValueImage>()
     );
 
     // A zeroed region must already be a decodable record, which is what lets a
-    // reader come up against one before anything has been written.
+    // reader come up against one before anything has been written — and, for
+    // the stamp, what stops an untouched slot reading as the epoch.
     assert!(LogKind::Domain.to_bits() == 0);
     assert!(LogDetailKind::None.to_bits() == 0);
     assert!(LogValueKind::Absent.to_bits() == 0);
+    assert!(LogStampKind::Unsynchronized.to_bits() == 0);
 };
 
 #[cfg(test)]

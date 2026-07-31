@@ -55,11 +55,9 @@
 use std::path::Path;
 
 use config::{Change, Model};
-use lfw_log::{Event, Field, GenerationOutcome, MAX_LINE_LEN, render};
+use lfw_log::{Event, Field, GenerationOutcome, MAX_LINE_LEN, Stamp, render};
 
-/// The prefix marking a run of serial bytes as a configuration record rather
-/// than console prose. The grammar is fixed in `crates/log/src/render.rs`.
-const CONFIG_RECORD_PREFIX: &str = "LFW-CFG ";
+use crate::console_records::{CONFIG_PREFIX as CONFIG_RECORD_PREFIX, without_time};
 
 /// The first generation a commit can assign: the datastore starts running
 /// generation 0 — the fail-closed empty configuration — and the document a
@@ -220,7 +218,8 @@ impl ConfigContract {
     /// says it must, and where the whole run log is.
     pub(crate) fn judge(&self, serial: &[u8], log: &Path) -> Result<(), String> {
         let text = String::from_utf8_lossy(serial);
-        let observed = config_records(&text);
+        let carried = config_records(&text);
+        let observed = borrowed(&carried);
         let fail_closed = Self::fail_closed()?;
         let committed = self.committed()?;
         let switched = Self::switched()?;
@@ -301,15 +300,25 @@ impl ConfigContract {
     }
 }
 
-/// Render one event as the console line the domain's own `Sink` would write.
+/// Render one event as the console line the domain's own `Sink` would write,
+/// less its instant.
+///
+/// Less its instant because that is the one field the build cannot predict: it
+/// is whatever the appliance's counter said at the moment of emission, and two
+/// runs of one image disagree about it. Both sides of every comparison below
+/// go through this function and through
+/// [`console_records::without_time`](crate::console_records::without_time), so
+/// a transcript is judged on *what* each record says. What the instant itself
+/// owes is [`crate::stamp_contract`]'s, over every record of every channel.
 fn line(event: &Event) -> Result<String, ContractError> {
     let unrenderable = || ContractError::Unrenderable {
         event: format!("{event:?}"),
     };
     let mut buffer = [0u8; MAX_LINE_LEN];
-    let written = render(event, &mut buffer).map_err(|_| unrenderable())?;
+    let written = render(Stamp::Unsynchronized, event, &mut buffer).map_err(|_| unrenderable())?;
     let bytes = buffer.get(..written).ok_or_else(unrenderable)?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| unrenderable())
+    let rendered = String::from_utf8(bytes.to_vec()).map_err(|_| unrenderable())?;
+    Ok(without_time(&rendered))
 }
 
 impl From<ContractError> for String {
@@ -351,8 +360,16 @@ impl From<ContractError> for String {
 ///
 /// What that scan does not do — reassemble a torn record — and what giving up
 /// the line boundary costs, are stated where it lives.
-fn config_records(text: &str) -> Vec<&str> {
+fn config_records(text: &str) -> Vec<String> {
     crate::console_records::records_on(text, CONFIG_RECORD_PREFIX)
+        .into_iter()
+        .map(without_time)
+        .collect()
+}
+
+/// As [`config_records`], borrowed, which is what every comparison below takes.
+fn borrowed(records: &[String]) -> Vec<&str> {
+    records.iter().map(String::as_str).collect()
 }
 
 /// Name the records the channel did not carry exactly once and those it carried

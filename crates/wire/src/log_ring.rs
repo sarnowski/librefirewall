@@ -52,8 +52,6 @@
 //!
 //! # A full ring refuses the newest record
 //!
-//! Two reasons, the first structural.
-//!
 //! A ring that dropped the *oldest* would have the writer advance the reader's
 //! cursor — a write the split has now made impossible in any case, and which
 //! the private-position rule above forbade before it: the writer would be
@@ -62,16 +60,13 @@
 //! Refusing the newest keeps the writer inside the slots the reader has
 //! released, and that is what makes a record either whole or absent.
 //!
-//! The second is what this ring is for. It carries the boot transcript, and
-//! when a domain parks the earliest records are the ones that say why.
-//! Dropping the oldest would discard exactly those and keep the repetitive
-//! tail.
+//! And it is what this ring is for: it carries the boot transcript, and when a
+//! domain parks the earliest records are the ones that say why.
 //!
 //! This is the opposite bias from the `GET /logs` retention buffer MONITORING.md
 //! specifies, which drops the oldest because it answers "what is this node
-//! doing *right now*". Both are bounded and lossy and each counts what it
-//! dropped; they differ because recent history and first history are different
-//! questions.
+//! doing *right now*": recent history and first history are different
+//! questions, and each buffer counts what it dropped.
 //!
 //! # What each side still achieves against the other
 //!
@@ -86,8 +81,8 @@
 //!   always a well-formed value, never undefined behaviour, and refused by
 //!   [`LogRecord::check`] before anything is rendered.
 //! * **The drop count is the writer's own claim about itself** and bounds
-//!   nothing here. It restarts at zero when the writing domain does, which is
-//!   the one discontinuity MONITORING.md's counter semantics admit.
+//!   nothing here. It restarts at zero when the writing domain does — the one
+//!   discontinuity MONITORING.md's counter semantics admit.
 
 use core::{
     mem::size_of,
@@ -95,7 +90,7 @@ use core::{
 };
 
 use crate::MAPPING_ALIGN;
-use crate::log_record::{CheckedBody, LogRecord, LogRecordError};
+use crate::log_record::{CheckedRecord, LogRecord, LogRecordError};
 use crate::log_slot::LogSlot;
 
 /// Slots one records region holds, of which [`LogRecords::capacity`] are usable.
@@ -106,6 +101,11 @@ use crate::log_slot::LogSlot;
 /// lifecycle records plus a first configuration generation's whole diff must
 /// fit before the console domain has started, or the records that explain a
 /// failed bring-up are the ones refused.
+///
+/// It is what a wider record is spent against, and it wins: the shipped
+/// document's first generation alone is 16 change records. At 232 bytes a
+/// record, 64 of them are 14 856 of the 16 384 the region already rounds to, so
+/// the growth costs neither the count nor the system description.
 pub const LOG_RING_SLOTS: usize = 64;
 
 /// Bytes the system description reserves for one records region, derived rather
@@ -379,7 +379,7 @@ impl<'ring> LogReader<'ring> {
     /// `Some`. The inner `Err` is a record the writer's bytes cannot be, which
     /// is counted by [`undecodable`](Self::undecodable) and is a fact about the
     /// peer rather than a reason to stop draining.
-    pub fn read(&mut self) -> Option<Result<CheckedBody, LogRecordError>> {
+    pub fn read(&mut self) -> Option<Result<CheckedRecord, LogRecordError>> {
         if self.head == self.records.tail() {
             return None;
         }
@@ -451,7 +451,7 @@ pub struct LogDrain<'reader, 'ring> {
 }
 
 impl Iterator for LogDrain<'_, '_> {
-    type Item = Result<CheckedBody, LogRecordError>;
+    type Item = Result<CheckedRecord, LogRecordError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {

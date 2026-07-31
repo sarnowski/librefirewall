@@ -53,11 +53,11 @@ use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingS
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch, ForwardRings, MAX_INTERFACES,
-    MAX_NEIGHBOURS, Offer, Pool, RouteStage, attach_region, forwarder_sample, log_sample,
+    MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, attach_region, forwarder_sample, log_sample,
 };
 use routing::PortId;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
-use wire::{LogConsume, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogRecords};
 
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
@@ -82,7 +82,8 @@ fn init() -> Forwarder {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
-    let sink = RingSink::new(log.writer(log_consume));
+    let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     sink.emit(&Event::Domain {
         domain: Domain::Forwarder,
@@ -123,7 +124,7 @@ struct Forwarder {
     /// The one region this domain writes its counters into.
     stats: &'static StatsShard,
     /// Kept for the domain's life; a second half would restart at slot zero.
-    sink: RingSink<'static>,
+    sink: RingSink<'static, PdClock<'static>>,
 }
 
 impl Forwarder {

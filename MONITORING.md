@@ -101,9 +101,10 @@ implementation and binds the two that follow.
   restricted to `[a-z0-9-]`, and the rendered line as a whole is printable ASCII — no control
   character, no ESC, and no newline but the single terminator the console appends. Values that are
   not text render in their own notation and are the only place other characters appear: `:` in a
-  MAC, `.` in an address, and `-`, `T`, `:`, `.` and `Z` in the RFC 3339 instant the clock record
-  carries. Each is produced from an already-parsed number by first-party code, so no byte of one was
-  ever a peer's to choose. That is what
+  MAC, `.` in an address, and `-`, `T`, `:`, `.` and `Z` in the RFC 3339 instants — the `time=`
+  field every record carries and the `utc=` the clock record states. Each is produced from an
+  already-parsed number by first-party code, so no byte of one was ever a peer's to choose. That is
+  what
   stops a peer painting terminal escape sequences onto an operator's terminal, and it is checked
   *twice against two different adversaries*: once where a call site mints a value, and again in the
   console domain where a record arrives out of a region another domain owns and every byte of it was
@@ -113,19 +114,56 @@ implementation and binds the two that follow.
 
 ### Ordering and time
 
-**No record is timestamped.** One domain now establishes a wall-clock time at boot — it calibrates
-the timestamp counter against the HPET, reads the CMOS real-time clock once, and reports both in the
-single record described under *`LFW-PD` — protection-domain lifecycle* below. That record is the
-only place a time appears on any surface: nothing consumes the calibration, no other record carries
-an instant, and there is still no timer and no interrupt of any kind. Nor is the time it establishes
-*trusted* — the CMOS answer is unauthenticated and unattested (README, *Trusted time source*), so it
-is a stated instant rather than one anything may be judged against. A record therefore carries the
-**configuration `generation`** it belongs to and, where one generation produces several change
-records, a **`seq`** numbering them from 0 in emission order.
-`(generation, seq)` is the whole of a record's ordering, and generations are monotonic within a
-boot, so it totally orders one boot's change records. `seq` appears on `LFW-CFG` change records and
-on no other shape: it numbers a generation's diff, and is neither a per-domain counter nor a
-sequence number for the console stream as a whole.
+**Every in-kernel record carries the instant it was emitted, in a leading `time=` field**, and that
+field has exactly two forms: an RFC 3339 instant in UTC with all nine fractional digits, or the token
+**`unsynchronized`**. `LFW-BOOT` is the exception and carries no such field at all — those records
+are written before seL4 starts, by a boot manager that has no protection domain, no calibration and
+no counter reading behind it.
+
+**Where the instant comes from, and how far it may be trusted.** One domain establishes a wall-clock
+time at boot: it calibrates the timestamp counter against the HPET, reads the CMOS real-time clock
+once, and publishes the resulting frequency, anchor reading and epoch for every other domain to
+read. A domain stamps a record by reading `RDTSC` itself and converting with that triple, so an
+instant is *this node's own arithmetic over one hardware counter* and never a value passed between
+domains. Two consequences an operator should hold on to:
+
+- **It is accurate to about a second, and not better.** The epoch is a CMOS reading taken once, to
+  whole-second resolution, and never disciplined afterwards; the nanoseconds below that second are
+  elapsed counter ticks, which are precise and say nothing about how well the epoch was set.
+- **It is not a trusted time source.** The CMOS part is unauthenticated and unattested, cannot say
+  whether it holds UTC or local time, and a hypervisor or a dead battery produces a plausible
+  instant this appliance cannot tell from a correct one (README, *Trusted time source*). Nothing may
+  be *judged* against a record's instant — not a certificate's validity, not an audit claim about
+  when an operator acted. It is a statement, on the record, of what this node believed the time to
+  be.
+
+**`unsynchronized` means the emitting domain had established no time when it emitted**, and it is
+ordinary rather than a fault: a domain logs during its own `init`, several domains run before the
+clock domain publishes, and the clock domain publishes *after* its own `ready` record — so its two
+records are unsynchronized while stating the instant it just measured. The token is deliberately not
+a zero: a record dated `1970-01-01T00:00:00.000000000Z` would be indistinguishable from one this
+node really emitted at the epoch. Within one domain the transition happens once and in one
+direction — a calibration is published once and never withdrawn — so a domain that has stamped a
+record stamps every later one.
+
+**Timestamps are attributable per boot and per node, and no wider.** They share the limits the
+*Identity and context* section above states: there is no node identity and no build stamp on any
+record, so two nodes' instants, or one node's across a reboot, are correlated by whatever an
+operator knows from outside the contract. Two boots of one machine also anchor to two separate CMOS
+readings.
+
+**A rate is still the scraper's arithmetic.** A counter on `/metrics` carries no timestamp and the
+node contributes no time to a rate; differencing two scrapes is timed by the scraper exactly as
+before. The instant on a log record and the counters in an exposition are separate surfaces, and
+nothing correlates one to the other on the node.
+
+A record additionally carries the **configuration `generation`** it belongs to and, where one
+generation produces several change records, a **`seq`** numbering them from 0 in emission order.
+Those stay, and the instant does not replace them: `(generation, seq)` is an *attribution* — this
+record belongs to that commit's diff, at that position — and an instant is not one. Generations are
+monotonic within a boot, so `(generation, seq)` totally orders one boot's change records. `seq`
+appears on `LFW-CFG` change records and on no other shape: it numbers a generation's diff, and is
+neither a per-domain counter nor a sequence number for the console stream as a whole.
 
 **Ordering across domains is not defined, and this is structural.** Every domain but the console
 publishes its records into a single-producer ring of its own, and the console domain drains the
@@ -139,35 +177,36 @@ rings, renders each record and writes the line. Two guarantees follow, and no th
   rotating start and takes at most a bounded burst from each, which is the fairness rule that stops
   a flooding ring starving another. *Which* domain's record reaches the line first is therefore
   decided by where that rotation stood when the console next ran — not by which event happened
-  first — and no record carries a timestamp to appeal to.
+  first.
 
-A concrete consequence an operator will meet on every boot: the forwarding domain's
+**The instant does not repair that, and reading it as an ordering is the mistake to avoid.** Two
+domains' instants are comparable arithmetic — one counter, one epoch — but the *capture* is ordered
+by the rotation, so a record printed first may carry the later instant, and on a healthy boot
+routinely does. What holds is one guarantee per direction: a domain's own records appear in emission
+order **and** carry non-decreasing instants; between domains, neither the order on the line nor the
+order of the instants is a causal claim, because nothing serialises two domains against each other
+in the first place. A concrete consequence met on every boot: the forwarding domain's
 `generation=1 outcome=applied changes=0` routinely prints **before** the change records that
 generation is made of, which the publishing domain emitted first. That is the rotation, not a fault.
-A reader that infers causality from console order is inferring it from the fairness rule.
 
-Within a domain, then, `(generation, seq)` is exact ordering and exact attribution, which is what a
-configuration audit needs, and it is preferred to inventing a time base a reader would then trust.
-What the absence of a *timestamp* costs is not small and is stated rather than left to be
-discovered — every item below is unchanged by the clock domain's one record, which states an instant
-and orders nothing:
+Within a domain, then, `(generation, seq)` remains exact ordering and exact attribution, which is
+what a configuration audit needs. What is now available beside it, and what still is not:
 
-- **Nothing correlates outside the node.** Not a neighbour's log, not an operator's action, not a
-  packet capture — there is no shared time base to correlate on.
-- **Nothing measures duration.** How long bring-up took, how long a node sat fail-closed on
-  generation 0, and the interval between any two records are all unavailable, on this surface and on
-  every other.
-- **Ordering holds within one boot only.** Two boots' records are ordered by nothing at all, and
-  both `generation` and `seq` restart from 0 in each. A node that reboots between two records leaves
-  a reader no way to tell which came first.
+- **Duration is measurable within a boot, to counter precision.** How long bring-up took, how long a
+  node sat fail-closed on generation 0, and the interval between any two of one domain's records are
+  differences of two instants on one counter, and are exact to the tick.
+- **Correlation outside the node is possible and is not attestable.** A neighbour's log, an
+  operator's action or a packet capture can be lined up against these instants to about a second,
+  which is the accuracy of the CMOS epoch. Nothing about that alignment is evidence: the epoch is
+  unauthenticated, so a node whose firmware set it wrongly produces a plausible and wrong alignment.
+- **Two boots are still only loosely ordered.** `generation` and `seq` restart from 0 in each, and
+  the instants come from two separate CMOS readings — close enough to place two boots in sequence,
+  never exact enough to order two records across one.
 - **A rate is the scraper's arithmetic, not the node's.** Differencing two scrapes of a counter is
   timed by the scraper; the node contributes no time to the result.
 
-When a trusted time source lands, records gain a timestamp field and lose none of the above:
-`generation` and `seq` stay, because a change is attributed to a generation and a timestamp is not
-an attribution. What exists today is the measurement half of that source and not the trust half, so
-the clock's own record is evidence that the chain works rather than a licence to date anything by
-it.
+When a *trusted* time source lands (CONCEPT §13.1) the field's form does not change; what changes is
+what may be judged by it. Until then a record's instant is a statement and not a proof.
 
 ## Console (system state)
 
@@ -195,13 +234,13 @@ traffic", which is system state. It moves to the metrics endpoint when there is 
 document's inventory is where that move will be recorded.
 
 Everything below is what the renderer writes, field for field. Every record of the grammars below is
-one line of at most **192 bytes**, and a line is never truncated — see *Reading records off the
+one line of at most **228 bytes**, and a line is never truncated — see *Reading records off the
 wire* for the two ways a line can nevertheless fail to be one record.
 
 ### `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -244,11 +283,15 @@ than as a second fault, and surfaces the debug boot's serial output beside it. T
 convenience for this repository's own scenarios, not a channel on a deployed node: an operator
 holding a silent appliance still has only the external act.
 
+- `time=<rfc3339|unsynchronized>` — when the emitting domain emitted this record, or that it had no
+  time to give it. Every record of this channel and of `LFW-CFG` carries it, first among the fields;
+  *Ordering and time* above says what it is worth and what it is not.
 - `features=0x<hex>` — the feature bitmap the driver and its device settled on. Which bit means what
   is virtio's vocabulary and is deliberately not decoded here.
 - `rx-posted=<n>` — receive descriptors primed before the driver entered its poll loop, decimal.
-- `tsc-hz=<n> utc=<rfc3339>` — what the clock domain established, and the only pair of fields on any
-  surface that states a time. `tsc-hz=` is the timestamp counter's measured frequency in hertz,
+- `tsc-hz=<n> utc=<rfc3339>` — what the clock domain established, which is the *source* of every
+  other record's `time=` rather than another reading of it. `tsc-hz=` is the timestamp counter's
+  measured frequency in hertz,
   decimal, derived from an interval measured against the HPET and always inside the band the
   appliance's own arithmetic accepts (10 MHz to 100 GHz); it is a *measurement*, so two boots of one
   machine report different numbers, and a value near the band's edges is worth looking at rather
@@ -257,8 +300,9 @@ holding a silent appliance still has only the external act.
   clock reader accepts. **It is the instant the CMOS part reported, advanced by the counter — not a
   trusted time.** The part is unauthenticated, cannot say whether it holds UTC or local time, and is
   read exactly once; a node whose firmware set it to local time reports an instant this appliance
-  cannot tell from a correct one. Nothing consumes either value, so neither is a claim about
-  anything else the node did.
+  cannot tell from a correct one. This record's own `time=` field reads `unsynchronized`, and that
+  is not a contradiction: the calibration is published *after* the record that states it, so the
+  domain had none to stamp itself with at the moment it emitted.
 - `frames=<n> bytes=<n>` — what a terminal port has received since the domain started: frames taken
   off its pipeline, and the bytes they carried, both decimal and both **cumulative and monotonic for
   the domain's life**. They are the management port's, and they are counts of what arrived — never any
@@ -365,12 +409,12 @@ no device was told to stop, because none was told anything.
 
 ### `LFW-CFG` — configuration
 
-Three shapes, distinguished by their second key:
+Three shapes, distinguished by their third key:
 
 ```
-LFW-CFG generation=<n> seq=<n> change=<kind> object=<kind> key=<id> field=<name>[ from=<value>][ to=<value>]
-LFW-CFG generation=<n> outcome=<applied|refused|unchanged> changes=<n>
-LFW-CFG generation=<n> rejected=<reason> offset=<n>
+LFW-CFG time=<rfc3339|unsynchronized> generation=<n> seq=<n> change=<kind> object=<kind> key=<id> field=<name>[ from=<value>][ to=<value>]
+LFW-CFG time=<rfc3339|unsynchronized> generation=<n> outcome=<applied|refused|unchanged> changes=<n>
+LFW-CFG time=<rfc3339|unsynchronized> generation=<n> rejected=<reason> offset=<n>
 ```
 
 **Change record** — one per configuration value that moved. An unchanged value produces nothing, so
@@ -482,7 +526,7 @@ That guarantee is exact **in the release profile**, and one caveat qualifies it 
   guarantee available: a torn record fails to parse rather than parsing into something false.
 - **A record that will not render is dropped and counted, not reported.** There is no
   `LFW-PD unrendered=…` line and no other escape hatch: a record whose bytes the ABI refuses, whose
-  vocabulary token this build does not know, or that will not fit the 192-byte line is counted and
+  vocabulary token this build does not know, or that will not fit the 228-byte line is counted and
   discarded silently. Those counters are described below and **nothing exposes them**, so an
   operator reading the console cannot currently tell a record that was never emitted from one that
   was emitted and lost.
@@ -502,7 +546,7 @@ misbehaved, and the three classes never merge. **None of them is exposed on any 
 | `refused` | each writing domain | *our own* invariant | an event this build minted that the record ABI cannot carry. Expected to read zero forever |
 | `malformed` | the console | the **peer that sent it** | the bytes in the slot are no record at all — the writing domain published something the ABI cannot carry, or wrote a slot it had not been given |
 | `unknown` | the console | the **peer that sent it** | the record decoded, but its vocabulary token names no variant this build has: the two halves of the ABI have parted, which means the two domains are different builds |
-| `unrenderable` | the console | *our own* invariant | the event decoded and would not fit the 192-byte line. No peer can cause this; it is a defect in this build's renderer, and it is an alert rather than a statistic |
+| `unrenderable` | the console | *our own* invariant | the event decoded and would not fit the 228-byte line. No peer can cause this; it is a defect in this build's renderer, and it is an alert rather than a statistic |
 | `write_failed` | the console | the **device** | the controller would not take the line. Console output has been lost, and this is the one counter with nowhere to be reported *to* — the console is the reporting mechanism |
 | `printed` | the console | — | lines rendered and handed to the device in full |
 | `bytes_written`, `thre_timeouts`, `init_failures` | the UART driver | the **device** | bytes handed to the transmitter; bytes dropped because it never reported itself empty; refused initialisations |
@@ -529,7 +573,10 @@ signal that says which slot is running.
 LFW-BOOT slot=<A|B|none> state=<confirmed|trying|rejected|exhausted|unpersisted|bad-order|halted>
 ```
 
-One record per decision, in decision order; the seven states above are the complete set. The
+One record per decision, in decision order; the seven states above are the complete set. **This is
+the one channel with no `time=` field**, and it is a fact about where the records come from rather
+than an omission: they are written before seL4 starts, by a boot manager with no protection domain,
+no calibration region and no counter reading behind it. The
 human-readable `librefirewall: …` lines printed beside each record are prose and carry no contract —
 a reader must key on the `LFW-BOOT ` prefix alone.
 
@@ -734,6 +781,15 @@ domains publishing that family. The whole document is 205 series and about 25 Ki
 | `librefirewall_clock_generation` | gauge | `management` | — | The calibration generation this domain converts counter readings with; 0 is none. |
 | `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
 | `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. |
+
+**No metric was added when every record gained an instant, and that is deliberate.** Whether a
+domain has a calibration is visible on each record it emits — `time=unsynchronized` against an
+instant — so a counter of unsynchronized records would restate, at lower resolution, something the
+records already carry per record. `librefirewall_clock_frequency_hertz` says what this node
+measured and `librefirewall_clock_generation` says which calibration the management domain converts
+with; the other six writing domains publish no such gauge, so *which* of them has taken the
+calibration up is answerable from the log stream and not from a scrape. That is a gap, it is small,
+and it is named here rather than closed with a series nothing needs.
 
 The three attribution classes are kept apart exactly as stated above and are worth naming against
 the table: `librefirewall_device_faults_total` is what a **device** got wrong about its own protocol;

@@ -258,21 +258,39 @@
          pair of even readings answers "nothing" rather than assembling a triple
          from two publishes.
 
-         ONE WRITER AND ONE READER, and the direction is the whole grant. The
+         ONE WRITER AND SEVEN READERS, and the direction is the whole grant. The
          clock domain maps it READ-WRITE: it is the domain that measured the
          numbers, and it publishes them once, after the record that says what it
-         measured. The management domain maps it READ-ONLY, on the same footing as
-         `cfg`: it is a CONSUMER of what was measured, and a domain that could
+         measured. Every other domain maps it READ-ONLY, on the same footing as
+         `cfg`: each is a CONSUMER of what was measured, and a domain that could
          write it would be able to move this node's own idea of time — every
          retransmission deadline and every reaping deadline of the transport on
-         its port, and one day every certificate's validity window (CONCEPT §7.2)
-         — from the domain that answers the management-plane attacker.
+         the management port, every instant a log record is dated with, and one
+         day every certificate's validity window (CONCEPT §7.2) — from a domain
+         that answers an attacker.
 
-         WHAT STAYS WITHHELD: every other domain. The forwarder, the configuration
-         domain, the three drivers and the console map no part of it, in either
-         direction. None of them states a time and none reads one, so a mapping
-         would be authority with no use (ENG-1) — and the console in particular
-         must not be able to rewrite the frequency it is printing.
+         THE READ GRANT WIDENED (ENG-1, SCM-6) when every log record gained the
+         instant it was emitted at. Six domains were added: the forwarder, the
+         configuration domain, the three drivers and the console. Each stamps its
+         own records, so each needs the three words that turn a counter reading
+         into a time, and a domain that could not read them would emit a
+         transcript no reader could place in time.
+
+         WHAT THE ADDED GRANT GIVES, exactly: a READ of three integers, and
+         nothing else. It confers no ability to write the calibration, no channel
+         to the clock domain in either direction, no wakeup capability on it, and
+         no reach into any other region — the page carries a frequency, an anchor
+         reading and an epoch, and holding it lets a domain answer "what time is
+         it" and no other question. A compromised domain gains a number it could
+         already have approximated from its own `RDTSC`, which every domain may
+         execute in any case: seL4 leaves `CR4.TSD` clear, so the counter is not
+         what the grant confers either. The console in particular still cannot
+         rewrite the frequency it is printing, which was the exclusion this
+         region's grant was drawn around, and the direction is what preserves it.
+
+         WHAT STAYS WITHHELD: the write, from every domain but the one that
+         measured, which is the whole of the asymmetry. Nothing else in this
+         system maps the region at all.
 
          WHY THE MANAGEMENT DOMAIN READS A REGION RATHER THAN ASKING. There is no
          IPC for a timestamp: that domain reads `RDTSC` itself, which is one
@@ -510,6 +528,7 @@
         <map mr="pool1" vaddr="0x2_300_000" perms="rw" cached="true" setvar_vaddr="pool1_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_001_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_forwarder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -544,6 +563,7 @@
         <program_image path="config-pd.elf" />
         <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_001_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_config" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -798,6 +818,7 @@
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free1" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool1" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver0" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver0_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver0" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -817,6 +838,7 @@
         <map mr="fwd0" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free0" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver1" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver1_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver1" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -852,6 +874,7 @@
         <map mr="mgmt_tx_fwd" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver2" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver2_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver2" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -961,6 +984,7 @@
     <protection_domain name="console" priority="1" stack_size="0x4000">
         <program_image path="console.elf" />
         <ioport id="0" addr="0x3f8" size="8" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="r" cached="true" setvar_vaddr="log_forwarder_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="rw" cached="true" setvar_vaddr="log_forwarder_consume_vaddr" />
         <map mr="log_nic_driver0" vaddr="0x4_100_000" perms="r" cached="true" setvar_vaddr="log_nic_driver0_vaddr" />

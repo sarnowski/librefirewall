@@ -6,13 +6,14 @@ use lfw_clock::{RFC3339_LEN, render_rfc3339};
 
 use crate::detail::{DomainDetail, Refusal, RefusalDetail};
 use crate::event::Event;
+use crate::stamp::Stamp;
 
 /// An upper bound on what [`render`] produces, so a caller sizes one buffer
 /// once and is done with it. Held by
 /// `the_widest_line_of_each_shape_fits_the_maximum`, which renders the widest
 /// value of every field of every shape against it, a refusal's `cause` at
 /// [`crate::MAX_CAUSE_LEN`] — which [`Cause`](crate::Cause) now holds it to.
-pub const MAX_LINE_LEN: usize = 192;
+pub const MAX_LINE_LEN: usize = 228;
 
 /// The buffer could not hold the line.
 ///
@@ -32,17 +33,21 @@ impl fmt::Display for RenderError {
     }
 }
 
-/// Write `event` into `out` as its console line, without a trailing newline,
-/// and return how many bytes it took.
+/// Write `event`, stamped `at`, into `out` as its console line, without a
+/// trailing newline, and return how many bytes it took.
 ///
 /// There is no allocator, so the buffer is the caller's and the length comes
 /// back rather than a string.
-pub fn render<C: fmt::Display>(event: &Event<C>, out: &mut [u8]) -> Result<usize, RenderError> {
+pub fn render<C: fmt::Display>(
+    at: Stamp,
+    event: &Event<C>,
+    out: &mut [u8],
+) -> Result<usize, RenderError> {
     let mut cursor = Cursor {
         out,
         written: 0usize,
     };
-    match write_line(event, &mut cursor) {
+    match write_line(at, event, &mut cursor) {
         Ok(()) => Ok(cursor.written),
         // `fmt::Error` is a unit type, so this discards nothing: capacity is
         // all a failure here can have been.
@@ -50,14 +55,20 @@ pub fn render<C: fmt::Display>(event: &Event<C>, out: &mut [u8]) -> Result<usize
     }
 }
 
-fn write_line<C: fmt::Display>(event: &Event<C>, cursor: &mut Cursor<'_>) -> fmt::Result {
+fn write_line<C: fmt::Display>(
+    at: Stamp,
+    event: &Event<C>,
+    cursor: &mut Cursor<'_>,
+) -> fmt::Result {
     match event {
         Event::Domain {
             domain,
             state,
             detail,
         } => {
-            write!(cursor, "LFW-PD domain={domain} state={state}")?;
+            cursor.write_str("LFW-PD")?;
+            write_stamp(at, cursor)?;
+            write!(cursor, " domain={domain} state={state}")?;
             write_detail(detail, cursor)
         }
         Event::ConfigChange {
@@ -70,9 +81,11 @@ fn write_line<C: fmt::Display>(event: &Event<C>, cursor: &mut Cursor<'_>) -> fmt
             from,
             to,
         } => {
+            cursor.write_str("LFW-CFG")?;
+            write_stamp(at, cursor)?;
             write!(
                 cursor,
-                "LFW-CFG generation={generation} seq={sequence} change={change} \
+                " generation={generation} seq={sequence} change={change} \
                  object={object} key={key} field={field}"
             )?;
             if let Some(value) = from {
@@ -87,18 +100,46 @@ fn write_line<C: fmt::Display>(event: &Event<C>, cursor: &mut Cursor<'_>) -> fmt
             generation,
             outcome,
             changes,
-        } => write!(
-            cursor,
-            "LFW-CFG generation={generation} outcome={outcome} changes={changes}"
-        ),
+        } => {
+            cursor.write_str("LFW-CFG")?;
+            write_stamp(at, cursor)?;
+            write!(
+                cursor,
+                " generation={generation} outcome={outcome} changes={changes}"
+            )
+        }
         Event::ConfigRejected {
             generation,
             reason,
             offset,
-        } => write!(
-            cursor,
-            "LFW-CFG generation={generation} rejected={reason} offset={offset}"
-        ),
+        } => {
+            cursor.write_str("LFW-CFG")?;
+            write_stamp(at, cursor)?;
+            write!(
+                cursor,
+                " generation={generation} rejected={reason} offset={offset}"
+            )
+        }
+    }
+}
+
+/// The instant, immediately after the record identifier and before every field
+/// that identifies *what* happened.
+///
+/// It goes after `LFW-…` rather than in front of it because MONITORING.md makes
+/// that prefix a reader's only handle on where a record starts: a field written
+/// ahead of it would be outside every record the documented scan recovers.
+fn write_stamp(at: Stamp, cursor: &mut Cursor<'_>) -> fmt::Result {
+    cursor.write_str(" time=")?;
+    match at {
+        Stamp::Unsynchronized => cursor.write_str(Stamp::UNSYNCHRONIZED),
+        // The instant goes out as the ASCII bytes it is: a `from_utf8` here
+        // would have no failure arm but a line missing the instant.
+        Stamp::Utc(utc) => {
+            let mut instant = [0u8; RFC3339_LEN];
+            render_rfc3339(utc, &mut instant);
+            cursor.write_ascii(&instant)
+        }
     }
 }
 
@@ -109,8 +150,6 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
         DomainDetail::None => Ok(()),
         DomainDetail::Features(bits) => write!(cursor, " features={bits:#x}"),
         DomainDetail::ReceivePosted(count) => write!(cursor, " rx-posted={count}"),
-        // The instant goes out as the ASCII bytes it is: a `from_utf8` here
-        // would have no failure arm but a line missing the instant.
         DomainDetail::Established { tsc_hz, utc } => {
             write!(cursor, " tsc-hz={tsc_hz} utc=")?;
             let mut instant = [0u8; RFC3339_LEN];
@@ -186,9 +225,19 @@ mod tests {
         Identifier::new(text.as_bytes()).expect("the fixture is within the alphabet")
     }
 
+    /// The instant every expectation below is written against, so a literal
+    /// line is a literal rather than whatever the host's counter said.
+    const AT: Stamp = Stamp::Utc(lfw_clock::UtcNanos::from_unix_nanos(
+        1_785_443_220 * 1_000_000_000 + 123_456_789,
+    ));
+
     fn rendered(event: &Event) -> String {
+        rendered_at(AT, event)
+    }
+
+    fn rendered_at(at: Stamp, event: &Event) -> String {
         let mut buffer = [0u8; MAX_LINE_LEN];
-        let written = render(event, &mut buffer).expect("MAX_LINE_LEN holds every line");
+        let written = render(at, event, &mut buffer).expect("MAX_LINE_LEN holds every line");
         String::from_utf8(buffer[..written].to_vec()).expect("the grammar is ASCII")
     }
 
@@ -213,7 +262,7 @@ mod tests {
                 state: DomainState::Negotiated,
                 detail: DomainDetail::None,
             }),
-            "LFW-PD domain=nic-driver state=negotiated"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=negotiated"
         );
         assert_eq!(
             rendered(&Event::Domain {
@@ -221,8 +270,46 @@ mod tests {
                 state: DomainState::Ready,
                 detail: DomainDetail::None,
             }),
-            "LFW-PD domain=forwarder state=ready"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=forwarder state=ready"
         );
+    }
+
+    /// The two forms of the leading field. The absence renders as a token an
+    /// operator can read and a parser can match, never as an instant — a record
+    /// dated 1970 would be indistinguishable from one this node actually
+    /// emitted at the epoch (ENG-12).
+    #[test]
+    fn a_record_with_no_time_carries_the_token_and_not_the_epoch() {
+        let event = Event::Domain {
+            domain: Domain::Clock,
+            state: DomainState::Starting,
+            detail: DomainDetail::None,
+        };
+        assert_eq!(
+            rendered_at(Stamp::Unsynchronized, &event),
+            "LFW-PD time=unsynchronized domain=clock state=starting"
+        );
+        assert_eq!(
+            rendered_at(Stamp::Utc(lfw_clock::UtcNanos::from_unix_nanos(0)), &event),
+            "LFW-PD time=1970-01-01T00:00:00.000000000Z domain=clock state=starting"
+        );
+    }
+
+    /// The field sits after the record identifier, which is the handle
+    /// MONITORING.md gives a reader for where a record starts: a stamp written
+    /// in front of `LFW-` would fall outside every record the documented scan
+    /// recovers.
+    #[test]
+    fn the_instant_follows_the_record_identifier_rather_than_preceding_it() {
+        for shape in every_shape() {
+            for at in [Stamp::Unsynchronized, AT] {
+                let line = rendered_at(at, &shape);
+                assert!(line.starts_with("LFW-"), "{line}");
+                let (identifier, rest) = line.split_once(' ').expect("a record has fields");
+                assert!(identifier.starts_with("LFW-"), "{line}");
+                assert!(rest.starts_with("time="), "{line}");
+            }
+        }
     }
 
     #[test]
@@ -233,7 +320,7 @@ mod tests {
                 state: DomainState::Negotiated,
                 detail: DomainDetail::Features(0x1_3000_0020),
             }),
-            "LFW-PD domain=nic-driver state=negotiated features=0x130000020"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=negotiated features=0x130000020"
         );
         assert_eq!(
             rendered(&Event::Domain {
@@ -241,7 +328,7 @@ mod tests {
                 state: DomainState::Ready,
                 detail: DomainDetail::ReceivePosted(64),
             }),
-            "LFW-PD domain=nic-driver state=ready rx-posted=64"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=ready rx-posted=64"
         );
     }
 
@@ -256,7 +343,7 @@ mod tests {
                 state: DomainState::Ready,
                 detail: established(2_999_998_000, 1_785_443_220 * 1_000_000_000 + 123_456_789),
             }),
-            "LFW-PD domain=clock state=ready tsc-hz=2999998000 \
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=clock state=ready tsc-hz=2999998000 \
              utc=2026-07-30T20:27:00.123456789Z"
         );
         // The two extremes of the pair, so the widest and narrowest fields are
@@ -268,7 +355,7 @@ mod tests {
                 state: DomainState::Ready,
                 detail: established(1, 0),
             }),
-            "LFW-PD domain=clock state=ready tsc-hz=1 utc=1970-01-01T00:00:00.000000000Z"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=clock state=ready tsc-hz=1 utc=1970-01-01T00:00:00.000000000Z"
         );
         assert_eq!(
             rendered(&Event::Domain {
@@ -276,7 +363,7 @@ mod tests {
                 state: DomainState::Ready,
                 detail: established(u64::MAX, u64::MAX),
             }),
-            "LFW-PD domain=clock state=ready tsc-hz=18446744073709551615 \
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=clock state=ready tsc-hz=18446744073709551615 \
              utc=2554-07-21T23:34:33.709551615Z"
         );
     }
@@ -294,11 +381,11 @@ mod tests {
         };
         assert_eq!(
             received(1, 60),
-            "LFW-PD domain=management state=ready frames=1 bytes=60"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready frames=1 bytes=60"
         );
         assert_eq!(
             received(u64::MAX, u64::MAX),
-            "LFW-PD domain=management state=ready \
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
              frames=18446744073709551615 bytes=18446744073709551615"
         );
     }
@@ -318,17 +405,17 @@ mod tests {
         };
         assert_eq!(
             refusal(RefusalDetail::Two(0x1af4, 0x1000)),
-            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false \
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=refused cause=not-virtio-net signalled=false \
              detail=0x1af4,0x1000"
         );
         assert_eq!(
             refusal(RefusalDetail::One(0x31000000)),
-            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false \
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=refused cause=not-virtio-net signalled=false \
              detail=0x31000000"
         );
         assert_eq!(
             refusal(RefusalDetail::None),
-            "LFW-PD domain=nic-driver state=refused cause=not-virtio-net signalled=false"
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=refused cause=not-virtio-net signalled=false"
         );
     }
 
@@ -359,7 +446,7 @@ mod tests {
                 Some(Value::PrefixLength(24)),
                 Some(Value::PrefixLength(25)),
             )),
-            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=4 seq=2 change=modified object=interface key=wan \
              field=prefix-length from=24 to=25"
         );
     }
@@ -368,12 +455,12 @@ mod tests {
     fn an_addition_omits_from_and_a_removal_omits_to() {
         assert_eq!(
             rendered(&change(None, Some(Value::PrefixLength(25)))),
-            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=4 seq=2 change=modified object=interface key=wan \
              field=prefix-length to=25"
         );
         assert_eq!(
             rendered(&change(Some(Value::PrefixLength(24)), None)),
-            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=4 seq=2 change=modified object=interface key=wan \
              field=prefix-length from=24"
         );
     }
@@ -382,7 +469,7 @@ mod tests {
     fn a_record_with_neither_end_renders_the_key_and_stops() {
         assert_eq!(
             rendered(&change(None, None)),
-            "LFW-CFG generation=4 seq=2 change=modified object=interface key=wan \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=4 seq=2 change=modified object=interface key=wan \
              field=prefix-length"
         );
     }
@@ -401,7 +488,7 @@ mod tests {
         };
         assert_eq!(
             rendered(&event),
-            "LFW-CFG generation=1 seq=0 change=added object=neighbour key=gateway-a \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=1 seq=0 change=added object=neighbour key=gateway-a \
              field=mac to=52:54:00:00:00:0a"
         );
     }
@@ -420,7 +507,7 @@ mod tests {
         };
         assert_eq!(
             rendered(&event),
-            "LFW-CFG generation=9 seq=3 change=removed object=interface key=lan \
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=9 seq=3 change=removed object=interface key=lan \
              field=address from=10.0.1.1"
         );
     }
@@ -438,7 +525,10 @@ mod tests {
                     outcome,
                     changes: 0,
                 }),
-                std::format!("LFW-CFG generation=0 outcome={token} changes=0")
+                std::format!(
+                    "LFW-CFG time=2026-07-30T20:27:00.123456789Z \
+                     generation=0 outcome={token} changes=0"
+                )
             );
         }
     }
@@ -451,7 +541,7 @@ mod tests {
                 reason: RejectReason::Doctype,
                 offset: 38,
             }),
-            "LFW-CFG generation=2 rejected=doctype offset=38"
+            "LFW-CFG time=2026-07-30T20:27:00.123456789Z generation=2 rejected=doctype offset=38"
         );
     }
 
@@ -478,12 +568,12 @@ mod tests {
         let event = change(Some(Value::PrefixLength(24)), Some(Value::PrefixLength(25)));
         let exact = rendered(&event).len();
         let mut just_enough = vec![0u8; exact];
-        assert_eq!(render(&event, &mut just_enough), Ok(exact));
+        assert_eq!(render(AT, &event, &mut just_enough), Ok(exact));
 
         for size in 0..exact {
             let mut short = vec![0u8; size];
             assert_eq!(
-                render(&event, &mut short),
+                render(AT, &event, &mut short),
                 Err(RenderError::BufferTooSmall),
                 "a {size}-byte buffer should be refused"
             );
@@ -546,7 +636,7 @@ mod tests {
         ];
         for shape in shapes {
             let mut buffer = [0u8; MAX_LINE_LEN];
-            let written = render(&shape, &mut buffer);
+            let written = render(AT, &shape, &mut buffer);
             assert!(
                 matches!(written, Ok(len) if len <= MAX_LINE_LEN),
                 "{shape:?} did not fit MAX_LINE_LEN"
@@ -669,6 +759,15 @@ mod tests {
         ]
     }
 
+    /// Both cases of the stamp, and every instant a `u64` of nanoseconds names:
+    /// the widest instant must fit the same line the narrowest does.
+    fn any_stamp() -> impl Strategy<Value = Stamp> {
+        prop_oneof![
+            Just(Stamp::Unsynchronized),
+            any::<u64>().prop_map(|nanos| Stamp::Utc(lfw_clock::UtcNanos::from_unix_nanos(nanos))),
+        ]
+    }
+
     fn any_identifier() -> impl Strategy<Value = Identifier> {
         "[a-z0-9-]{1,16}"
             .prop_map(|text| Identifier::new(text.as_bytes()).expect("the pattern is the alphabet"))
@@ -747,9 +846,9 @@ mod tests {
         /// Bounded work and bounded output: whatever an event carries, the line
         /// fits the advertised maximum and is the ASCII a console can print.
         #[test]
-        fn every_event_fits_the_advertised_maximum(event in any_event()) {
+        fn every_event_fits_the_advertised_maximum(event in any_event(), at in any_stamp()) {
             let mut buffer = [0u8; MAX_LINE_LEN];
-            let written = render(&event, &mut buffer).expect("MAX_LINE_LEN holds every line");
+            let written = render(at, &event, &mut buffer).expect("MAX_LINE_LEN holds every line");
             prop_assert!(written <= MAX_LINE_LEN);
             let line = core::str::from_utf8(&buffer[..written]).expect("the grammar is ASCII");
             prop_assert!(line.starts_with("LFW-"));
@@ -761,11 +860,12 @@ mod tests {
         #[test]
         fn any_buffer_size_yields_a_line_or_a_refusal(
             event in any_event(),
+            at in any_stamp(),
             size in 0usize..=MAX_LINE_LEN,
         ) {
-            let reference = rendered(&event);
+            let reference = rendered_at(at, &event);
             let mut buffer = vec![0u8; size];
-            match render(&event, &mut buffer) {
+            match render(at, &event, &mut buffer) {
                 Ok(written) => {
                     prop_assert!(written <= size);
                     prop_assert_eq!(&buffer[..written], reference.as_bytes());

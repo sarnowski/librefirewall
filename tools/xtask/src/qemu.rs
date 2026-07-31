@@ -43,7 +43,7 @@ use crate::{
     config_transcript::ConfigContract,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking},
-    image, management_contract, metrics_contract,
+    image, management_contract, metrics_contract, stamp_contract,
     topology::{PORTS, Topology},
     util::{copy_file, locate, require_file, run_command},
 };
@@ -445,7 +445,11 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             // report to the frame and to the byte.
             let management = management_contract::judge(&booted.serial, &log, booted.management)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!("; {}; {clock}; {management}", contract.summary())
+            // Last, over every channel at once: the field the other three do
+            // not judge, on the records they do not name.
+            let stamps = stamp_contract::judge(&booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {}; {clock}; {management}; {stamps}", contract.summary())
         }
     };
     println!(

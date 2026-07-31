@@ -2,12 +2,16 @@ use super::*;
 
 use proptest::prelude::*;
 use std::{boxed::Box, string::String, vec, vec::Vec};
-use wire::{CheckedDetail, LogConsume, LogRecord, LogRecords, LogWriter};
+use wire::{
+    CheckedBody, CheckedDetail, CheckedRecord, CheckedStamp, LogConsume, LogRecord, LogRecords,
+    LogWriter,
+};
 
 use crate::Sink;
 use crate::detail::{DomainDetail, Refusal, RefusalDetail};
 use crate::event::{Domain, DomainState, GenerationOutcome};
 use crate::ring::RingSink;
+use crate::stamp::testing::FixedClock;
 
 /// A writer that keeps every byte, and that can be told to start refusing.
 ///
@@ -115,7 +119,9 @@ fn domain_event(domain: Domain, state: DomainState) -> Event {
 fn put(writer: &mut LogWriter<'_>, events: &[Event]) {
     for event in events {
         let bounded = Event::<Cause>::try_from(*event).expect("no cause to bound");
-        writer.write(&bounded.encode()).expect("the ring has room");
+        writer
+            .write(&bounded.encode(Stamp::Unsynchronized))
+            .expect("the ring has room");
     }
 }
 
@@ -141,7 +147,8 @@ fn unreadable() -> LogRecord {
 /// agree with itself whichever of the two was wrong.
 fn rendered(event: &Event) -> String {
     let mut line = [0u8; MAX_LINE_LEN];
-    let written = render(event, &mut line).expect("MAX_LINE_LEN holds every line");
+    let written =
+        render(Stamp::Unsynchronized, event, &mut line).expect("MAX_LINE_LEN holds every line");
     String::from_utf8(line[..written].to_vec()).expect("a rendered line is UTF-8")
 }
 
@@ -158,19 +165,21 @@ fn an_event_the_domain_mints_itself_reaches_the_device_as_its_console_line() {
     // decoded record takes (ENG-7).
     let mut printer = ConsolePrinter::new(FakeSink::new());
     let event = domain_event(Domain::Console, DomainState::Ready);
-    assert!(printer.print(&event));
+    assert!(printer.print(Stamp::Unsynchronized, &event));
     assert_eq!(printer.counters().printed, 1);
     assert_eq!(
         printer.writer.lines(),
-        vec![String::from("LFW-PD domain=console state=ready")]
+        vec![String::from(
+            "LFW-PD time=unsynchronized domain=console state=ready"
+        )]
     );
 }
 
 #[test]
 fn every_line_is_terminated_so_a_transcript_is_lines_and_not_one_run_on_string() {
     let mut printer = ConsolePrinter::new(FakeSink::new());
-    printer.print(&generation(1));
-    printer.print(&generation(2));
+    printer.print(Stamp::Unsynchronized, &generation(1));
+    printer.print(Stamp::Unsynchronized, &generation(2));
     let written = printer.writer.written;
     assert!(written.ends_with(LINE_END));
     assert_eq!(
@@ -190,7 +199,7 @@ fn a_records_journey_is_the_writing_domains_sink_to_the_console_line() {
     // what the domain said.
     let ring = ring();
     let event = domain_event(Domain::Forwarder, DomainState::Starting);
-    let sink = RingSink::new(ring.writer());
+    let sink = RingSink::new(ring.writer(), FixedClock(Stamp::Unsynchronized));
     sink.emit(&event);
     sink.emit(&generation(7));
 
@@ -335,17 +344,20 @@ fn a_record_naming_a_variant_this_build_does_not_have_is_counted_apart() {
     // holds that count equal to this crate's variant list, so the two agree by
     // build assertion and no ring can carry this. What can is a peer built
     // from a *different* build of the ABI, which is what a hand-made
-    // `CheckedBody` stands in for — the shape `wire` would hand over if its
+    // `CheckedRecord` stands in for — the shape `wire` would hand over if its
     // vocabulary were the wider one. It must accuse the vocabulary rather than
     // the bytes, because the operator's action differs: one is a rebuild, the
     // other is a misbehaving domain.
     let mut printer = ConsolePrinter::new(FakeSink::new());
-    let body = CheckedBody::Domain {
-        domain: u8::MAX,
-        state: 0,
-        detail: CheckedDetail::None,
+    let record = CheckedRecord {
+        at: CheckedStamp::Unsynchronized,
+        body: CheckedBody::Domain {
+            domain: u8::MAX,
+            state: 0,
+            detail: CheckedDetail::None,
+        },
     };
-    assert!(!printer.print_record(Ok(body)));
+    assert!(!printer.print_record(Ok(record)));
     assert_eq!(printer.counters().unknown, 1);
     assert_eq!(printer.counters().malformed, 0);
     assert_eq!(printer.counters().printed, 0);
@@ -379,7 +391,7 @@ fn a_device_that_wedges_costs_the_lines_and_not_the_pass() {
 #[test]
 fn a_line_refused_halfway_is_counted_once_and_not_twice() {
     let mut printer = ConsolePrinter::new(FakeSink::wedging_after(1));
-    assert!(!printer.print(&generation(1)));
+    assert!(!printer.print(Stamp::Unsynchronized, &generation(1)));
     assert_eq!(printer.counters().write_failed, 1);
     assert_eq!(printer.counters().printed, 0);
 }
@@ -390,12 +402,12 @@ fn the_counters_saturate_rather_than_wrapping_at_the_top() {
     // when the number matters, so the top is a fixed point.
     let mut printer = ConsolePrinter::new(FakeSink::wedging_after(0));
     printer.counters.write_failed = u64::MAX;
-    assert!(!printer.print(&generation(1)));
+    assert!(!printer.print(Stamp::Unsynchronized, &generation(1)));
     assert_eq!(printer.counters().write_failed, u64::MAX);
 
     let mut good = ConsolePrinter::new(FakeSink::new());
     good.counters.printed = u64::MAX;
-    assert!(good.print(&generation(1)));
+    assert!(good.print(Stamp::Unsynchronized, &generation(1)));
     assert_eq!(good.counters().printed, u64::MAX);
 
     let ring = ring();
@@ -407,10 +419,13 @@ fn the_counters_saturate_rather_than_wrapping_at_the_top() {
 
     let mut unknown = ConsolePrinter::new(FakeSink::new());
     unknown.counters.unknown = u64::MAX;
-    assert!(!unknown.print_record(Ok(CheckedBody::Domain {
-        domain: u8::MAX,
-        state: 0,
-        detail: CheckedDetail::None,
+    assert!(!unknown.print_record(Ok(CheckedRecord {
+        at: CheckedStamp::Unsynchronized,
+        body: CheckedBody::Domain {
+            domain: u8::MAX,
+            state: 0,
+            detail: CheckedDetail::None,
+        },
     })));
     assert_eq!(unknown.counters().unknown, u64::MAX);
 }

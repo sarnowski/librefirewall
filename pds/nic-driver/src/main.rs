@@ -92,11 +92,12 @@ use nic_driver_core::bringup::{
 };
 use nic_driver_core::port::{NicPort, PeerSignal, ReceiveSide, TransmitSide};
 use pd_runtime::{
-    ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, Pool, ReturnRing, attach_region, log_sample,
+    ForwardRings, MAPPING_ALIGN, POOL_REGION_SIZE, PdClock, Pool, ReturnRing, attach_region,
+    log_sample,
 };
 use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
-use wire::{LogConsume, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogRecords};
 
 /// The domain this port's received frames go to — the forwarder for a dataplane
 /// port, the management domain for the management port, and this file cannot
@@ -223,7 +224,8 @@ fn init() -> NicDriver {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
-    let sink = RingSink::new(log.writer(log_consume));
+    let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     match bring_up(&sink) {
@@ -271,7 +273,7 @@ fn init() -> NicDriver {
 /// Assembled in `nic_driver_core`, where a test holds the metric surface's
 /// vocabulary to the enums it names (LAY-2); this file supplies the one thing
 /// only it has, the log ring's own drop counts.
-fn sample(port: &NicPort<'static>, sink: &RingSink<'static>) -> DriverSample {
+fn sample(port: &NicPort<'static>, sink: &RingSink<'static, PdClock<'static>>) -> DriverSample {
     port.stats().to_sample(
         port.pool_counters(),
         log_sample(sink.dropped(), sink.refused()),
@@ -282,7 +284,7 @@ fn sample(port: &NicPort<'static>, sink: &RingSink<'static>) -> DriverSample {
 fn publish(
     stats: &'static StatsShard,
     port: &NicPort<'static>,
-    sink: &RingSink<'static>,
+    sink: &RingSink<'static, PdClock<'static>>,
 ) -> DriverSample {
     let sample = sample(port, sink);
     stats.publish(&sample.values());

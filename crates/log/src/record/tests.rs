@@ -5,7 +5,7 @@ use core::num::NonZeroU64;
 use net_headers::{Ipv4Address, MacAddress};
 use proptest::prelude::*;
 use std::{format, string::String, vec::Vec};
-use wire::{CauseImage, IdentifierImage, LogRecordError, TextImage};
+use wire::{CauseImage, CheckedRecord, CheckedStamp, IdentifierImage, LogRecordError, TextImage};
 
 use crate::detail::MAX_CAUSE_LEN;
 use crate::identifier::MAX_IDENTIFIER_LEN;
@@ -21,8 +21,25 @@ fn cause(text: &str) -> Cause {
 /// The whole crossing, as a console domain performs it: encode, hand the bytes
 /// to `wire`'s own check exactly as a reader does, then decode.
 fn round_trip(event: &Event<Cause>) -> Result<Event<Cause>, RoundTripError> {
-    let body = event.encode().check().map_err(RoundTripError::Record)?;
-    Event::decode(&body).map_err(RoundTripError::Decode)
+    stamped_round_trip(Stamp::Unsynchronized, event).map(|(_, event)| event)
+}
+
+/// As [`round_trip`], keeping the instant, for the tests that are about it.
+fn stamped_round_trip(
+    at: Stamp,
+    event: &Event<Cause>,
+) -> Result<(Stamp, Event<Cause>), RoundTripError> {
+    let record = event.encode(at).check().map_err(RoundTripError::Record)?;
+    Event::decode(&record).map_err(RoundTripError::Decode)
+}
+
+/// A checked record around a body a test built by hand, which is the shape a
+/// peer's region hands the console.
+fn checked(body: CheckedBody) -> CheckedRecord {
+    CheckedRecord {
+        at: CheckedStamp::Unsynchronized,
+        body,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -277,7 +294,7 @@ fn a_token_past_the_last_variant_is_a_typed_refusal() {
     ];
     for (body, vocabulary, token) in cases {
         assert_eq!(
-            Event::decode(&body),
+            Event::decode(&checked(body)),
             Err(DecodeError::Vocabulary { vocabulary, token }),
             "{body:?}"
         );
@@ -299,7 +316,11 @@ fn a_change_record_refuses_each_of_its_tokens_by_name() {
         from: None,
         to: Some(Value::Port(1)),
     };
-    let body = event.encode().check().expect("the fixture is well formed");
+    let body = event
+        .encode(Stamp::Unsynchronized)
+        .check()
+        .expect("the fixture is well formed")
+        .body;
     let CheckedBody::ConfigChange {
         generation,
         sequence,
@@ -327,7 +348,7 @@ fn a_change_record_refuses_each_of_its_tokens_by_name() {
         (rebuild(0, 0, 250), Vocabulary::Field, 250),
     ] {
         assert_eq!(
-            Event::decode(&body),
+            Event::decode(&checked(body)),
             Err(DecodeError::Vocabulary { vocabulary, token })
         );
     }
@@ -536,7 +557,7 @@ fn a_record_writes_only_the_fields_its_kind_names() {
         outcome: GenerationOutcome::Refused,
         changes: 4,
     }
-    .encode();
+    .encode(Stamp::Unsynchronized);
     assert_eq!(record.kind, LogKind::ConfigGeneration.to_bits());
     assert_eq!(record.generation, 3);
     assert_eq!(record.changes, 4);
@@ -555,16 +576,19 @@ fn a_record_writes_only_the_fields_its_kind_names() {
 /// domain's first slot holds before anything is written.
 #[test]
 fn the_zeroed_record_decodes_to_the_first_variant_of_everything() {
-    let body = LogRecord::ZERO
+    let record = LogRecord::ZERO
         .check()
         .expect("a zeroed region is readable");
     assert_eq!(
-        Event::decode(&body),
-        Ok(Event::Domain {
-            domain: Domain::Forwarder,
-            state: DomainState::Starting,
-            detail: DomainDetail::None,
-        })
+        Event::decode(&record),
+        Ok((
+            Stamp::Unsynchronized,
+            Event::Domain {
+                domain: Domain::Forwarder,
+                state: DomainState::Starting,
+                detail: DomainDetail::None,
+            }
+        ))
     );
 }
 
@@ -584,7 +608,7 @@ fn an_absent_end_and_a_zero_valued_one_do_not_encode_alike() {
             from,
             to,
         }
-        .encode()
+        .encode(Stamp::Unsynchronized)
     };
     let absent = change(None, None);
     let zero = change(Some(Value::Port(0)), Some(Value::Count(0)));
@@ -608,7 +632,7 @@ fn text_shorter_than_its_storage_leaves_no_tail() {
             signalled: false,
         }),
     }
-    .encode();
+    .encode(Stamp::Unsynchronized);
     assert_eq!(record.cause.len, 3);
     assert_eq!(&record.cause.bytes[..3], b"abc");
     assert!(record.cause.bytes[3..].iter().all(|&byte| byte == 0));
@@ -750,7 +774,7 @@ proptest! {
     /// only thing that can refuse a crossing is a peer's bytes.
     #[test]
     fn encoding_never_refuses_and_always_produces_a_readable_record(event in any_event()) {
-        prop_assert!(event.encode().check().is_ok());
+        prop_assert!(event.encode(Stamp::Unsynchronized).check().is_ok());
     }
 
     /// A record that survived `wire` and this decode renders, so the console
@@ -759,7 +783,8 @@ proptest! {
     fn a_decoded_event_renders_within_the_advertised_maximum(event in any_event()) {
         let decoded = round_trip(&event).expect("the crossing is lossless");
         let mut buffer = [0u8; crate::MAX_LINE_LEN];
-        let written = crate::render(&decoded, &mut buffer).expect("MAX_LINE_LEN holds every line");
+        let written = crate::render(Stamp::Unsynchronized, &decoded, &mut buffer)
+            .expect("MAX_LINE_LEN holds every line");
         prop_assert!(written <= crate::MAX_LINE_LEN);
         prop_assert!(buffer[..written].starts_with(b"LFW-"));
     }
@@ -788,8 +813,9 @@ proptest! {
         let bounded = Event::<Cause>::try_from(minted).expect("the pattern is the alphabet");
         let mut minted_line = [0u8; crate::MAX_LINE_LEN];
         let mut bounded_line = [0u8; crate::MAX_LINE_LEN];
-        let a = crate::render(&minted, &mut minted_line).expect("fits");
-        let b = crate::render(&bounded, &mut bounded_line).expect("fits");
+        let a = crate::render(Stamp::Unsynchronized, &minted, &mut minted_line).expect("fits");
+        let b =
+            crate::render(Stamp::Unsynchronized, &bounded, &mut bounded_line).expect("fits");
         prop_assert_eq!(&minted_line[..a], &bounded_line[..b]);
     }
 
@@ -810,6 +836,8 @@ proptest! {
         tsc_hz in any::<u64>(),
         unix_nanos in any::<u64>(),
         counts in any::<[u64; 2]>(),
+        stamp_kind in any::<u8>(),
+        stamp_nanos in any::<u64>(),
     ) {
         let [generation, sequence, changes, reject_offset, receive_posted] = numbers;
         let [frames, frame_bytes] = counts;
@@ -834,25 +862,29 @@ proptest! {
             field,
             outcome,
             reason,
-            _pad: [0; 6],
+            stamp_kind,
+            _pad: [0; 5],
             cause: TextImage { bytes: cause_bytes, len: cause_len, _pad: [0; 3] },
             key: TextImage { bytes: key_bytes, len: key_len, _pad: [0; 3] },
             from: ValueImage::ZERO,
             to: ValueImage::ZERO,
             tsc_hz,
             unix_nanos,
+            stamp_nanos,
             frames,
             frame_bytes,
         };
         match record.check() {
             Err(_) => {}
-            Ok(body) => match Event::decode(&body) {
+            Ok(checked) => match Event::decode(&checked) {
                 Err(_) => {}
-                Ok(event) => {
+                Ok((at, event)) => {
                     // Anything that decodes must also render, or the console
-                    // domain would hold an event it cannot put on the wire.
+                    // domain would hold an event it cannot put on the wire —
+                    // and the widest instant is exactly as bounded as the
+                    // narrowest, so the stamp cannot be what overruns the line.
                     let mut buffer = [0u8; crate::MAX_LINE_LEN];
-                    prop_assert!(crate::render(&event, &mut buffer).is_ok());
+                    prop_assert!(crate::render(at, &event, &mut buffer).is_ok());
                 }
             },
         }

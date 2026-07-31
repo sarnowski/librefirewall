@@ -46,11 +46,11 @@ use config::{Change, Datastore};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Field, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    ConfigAck, ConfigHandover, ConfigPublisher, MAX_INTERFACES, MAX_NEIGHBOURS, attach_region,
-    config_sample, log_sample,
+    ConfigAck, ConfigHandover, ConfigPublisher, MAX_INTERFACES, MAX_NEIGHBOURS, PdClock,
+    attach_region, config_sample, log_sample,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
-use wire::{LogConsume, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogRecords};
 
 /// The configuration document this appliance runs, as bytes.
 ///
@@ -74,7 +74,8 @@ fn init() -> ConfigDomain {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
-    let sink = RingSink::new(log.writer(log_consume));
+    let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting);
 
     // Both live only as long as this call: a second commit would need the
@@ -123,7 +124,7 @@ struct ConfigDomain {
     stats: &'static StatsShard,
     /// Kept past `init` because the counters it carries are published on every
     /// activation, not only on the first.
-    sink: RingSink<'static>,
+    sink: RingSink<'static, PdClock<'static>>,
     /// The generation committed at boot, and the only one there will ever be
     /// (README: no channel to submit a second document over).
     generation: u32,

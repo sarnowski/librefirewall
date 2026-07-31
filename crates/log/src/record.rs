@@ -37,8 +37,8 @@
 //! truncated into a token an operator would read as whole (ENG-12).
 
 use wire::{
-    CheckedBody, CheckedDetail, CheckedIdentifier, CheckedOperands, CheckedValue, LogDetailKind,
-    LogKind, LogRecord, LogText, LogValueKind, LogWriter, ValueImage,
+    CheckedBody, CheckedDetail, CheckedIdentifier, CheckedOperands, CheckedRecord, CheckedValue,
+    LogDetailKind, LogKind, LogRecord, LogStampKind, LogText, LogValueKind, LogWriter, ValueImage,
 };
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
@@ -47,6 +47,7 @@ use crate::event::{
     Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
+use crate::stamp::{Clock, Stamp};
 
 use core::fmt;
 use lfw_clock::UtcNanos;
@@ -297,15 +298,22 @@ impl<C> Event<C> {
 }
 
 impl Event<Cause> {
-    /// This event as the record a peer domain reads.
+    /// This event, stamped `at`, as the record a peer domain reads.
     ///
     /// Total: every variant and every field of every variant has a place in the
     /// ABI, and [`Cause`] is bounded by construction, so there is nothing here
     /// that can fail. What a record leaves untouched is what its own
     /// [`LogKind`] does not name, which is exactly what `wire` reads back.
     #[must_use]
-    pub fn encode(&self) -> LogRecord {
+    pub fn encode(&self, at: Stamp) -> LogRecord {
         let mut record = LogRecord::ZERO;
+        match at {
+            Stamp::Unsynchronized => record.stamp_kind = LogStampKind::Unsynchronized.to_bits(),
+            Stamp::Utc(utc) => {
+                record.stamp_kind = LogStampKind::Utc.to_bits();
+                record.stamp_nanos = utc.as_nanos();
+            }
+        }
         self.encode_common(&mut record);
         if let Self::Domain { detail, .. } = self {
             match detail {
@@ -353,13 +361,20 @@ impl Event<Cause> {
         record
     }
 
-    /// The event a checked record says happened.
+    /// The instant and the event a checked record says happened.
     ///
     /// # Errors
     /// [`DecodeError`], naming the token or the text that refused it. `wire`
     /// has already refused every shape it owns; what is refused here is a token
     /// this build has no variant for.
-    pub fn decode(body: &CheckedBody) -> Result<Self, DecodeError> {
+    pub fn decode(record: &CheckedRecord) -> Result<(Stamp, Self), DecodeError> {
+        Ok((
+            Stamp::from_checked(record.at),
+            Self::decode_body(&record.body)?,
+        ))
+    }
+
+    fn decode_body(body: &CheckedBody) -> Result<Self, DecodeError> {
         Ok(match *body {
             CheckedBody::Domain {
                 domain,
@@ -528,10 +543,14 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
 ///
 /// # Errors
 /// [`SendError`], distinguishing a flood from this domain's own defect.
-pub(crate) fn send(writer: &mut LogWriter<'_>, event: &Event) -> Result<(), SendError> {
+pub(crate) fn send(
+    writer: &mut LogWriter<'_>,
+    clock: &dyn Clock,
+    event: &Event,
+) -> Result<(), SendError> {
     let bounded = Event::<Cause>::try_from(*event).map_err(SendError::Unencodable)?;
     writer
-        .write(&bounded.encode())
+        .write(&bounded.encode(clock.now()))
         .map_err(|full| SendError::Full {
             dropped: full.dropped,
         })

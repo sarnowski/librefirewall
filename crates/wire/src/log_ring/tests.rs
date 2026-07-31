@@ -1,8 +1,8 @@
 use super::*;
 use crate::log_record::{
-    CheckedDetail, CheckedValue, LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
-    LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_OBJECT_KIND_COUNT, LOG_REJECT_REASON_COUNT,
-    LogDetailKind, LogKind,
+    CheckedBody, CheckedDetail, CheckedStamp, CheckedValue, LOG_CHANGE_KIND_COUNT,
+    LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT,
+    LOG_OBJECT_KIND_COUNT, LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind,
 };
 use core::mem::offset_of;
 use proptest::prelude::*;
@@ -58,16 +58,22 @@ fn tagged(generation: u32) -> LogRecord {
     }
 }
 
-fn is_tagged(body: &Result<CheckedBody, LogRecordError>, generation: u32) -> bool {
+fn is_tagged(record: &Result<CheckedRecord, LogRecordError>, generation: u32) -> bool {
     matches!(
-        body,
-        Ok(CheckedBody::ConfigGeneration { generation: read, .. }) if *read == generation
+        record,
+        Ok(CheckedRecord {
+            body: CheckedBody::ConfigGeneration { generation: read, .. },
+            ..
+        }) if *read == generation
     )
 }
 
-fn generation_of(body: &Result<CheckedBody, LogRecordError>) -> Option<u32> {
-    match body {
-        Ok(CheckedBody::ConfigGeneration { generation, .. }) => Some(*generation),
+fn generation_of(record: &Result<CheckedRecord, LogRecordError>) -> Option<u32> {
+    match record {
+        Ok(CheckedRecord {
+            body: CheckedBody::ConfigGeneration { generation, .. },
+            ..
+        }) => Some(*generation),
         _ => None,
     }
 }
@@ -75,9 +81,9 @@ fn generation_of(body: &Result<CheckedBody, LogRecordError>) -> Option<u32> {
 #[test]
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(LOG_RING_SLOTS, 64);
-    assert_eq!(size_of::<LogRecord>(), 224);
-    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 224);
-    assert_eq!(size_of::<LogRecords>(), 14_344);
+    assert_eq!(size_of::<LogRecord>(), 232);
+    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 232);
+    assert_eq!(size_of::<LogRecords>(), 14_856);
     assert_eq!(LOG_RECORDS_REGION_SIZE, 0x4000);
     assert!(LOG_RECORDS_REGION_SIZE >= size_of::<LogRecords>());
     assert!(LOG_RECORDS_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
@@ -153,10 +159,14 @@ fn a_record_survives_the_region_field_for_field() {
     record.cause.len = 14;
     writer.write(&record).expect("the ring is empty");
 
-    let Some(Ok(CheckedBody::Domain {
-        domain,
-        state,
-        detail: CheckedDetail::Refusal { cause, .. },
+    let Some(Ok(CheckedRecord {
+        body:
+            CheckedBody::Domain {
+                domain,
+                state,
+                detail: CheckedDetail::Refusal { cause, .. },
+            },
+        ..
     })) = reader.read()
     else {
         panic!("the record crossed intact");
@@ -315,7 +325,7 @@ fn an_undecodable_record_is_counted_and_the_drain_carries_on() {
         .expect("space");
     writer.write(&tagged(2)).expect("space");
 
-    let read: Vec<Result<CheckedBody, LogRecordError>> = reader.drain(LOG_RING_SLOTS).collect();
+    let read: Vec<Result<CheckedRecord, LogRecordError>> = reader.drain(LOG_RING_SLOTS).collect();
     assert_eq!(read.len(), 3);
     assert!(is_tagged(&read[0], 1));
     assert_eq!(
@@ -600,8 +610,14 @@ fn a_thread_scribbling_both_regions_cannot_break_either_side() {
 /// Everything a record the console will render is allowed to be. Restated here
 /// rather than reached through the decode, so the property pins what is yielded
 /// and not merely that something was.
-fn assert_yield_is_renderable(body: &CheckedBody) -> Result<(), TestCaseError> {
-    match body {
+fn assert_yield_is_renderable(record: &CheckedRecord) -> Result<(), TestCaseError> {
+    // The stamp is a decoded case rather than a raw discriminant, which is the
+    // half of the record a peer can no longer make mean nothing.
+    prop_assert!(matches!(
+        record.at,
+        CheckedStamp::Unsynchronized | CheckedStamp::Utc(_)
+    ));
+    match &record.body {
         CheckedBody::Domain { domain, state, .. } => {
             prop_assert!(*domain < LOG_DOMAIN_COUNT);
             prop_assert!(*state < LOG_DOMAIN_STATE_COUNT);
@@ -667,13 +683,13 @@ fn stamped(tag: u32) -> LogRecord {
 
 /// The tag all three fields of a [`stamped`] record must agree on, or `None`
 /// where the record is not one this test wrote.
-fn stamp_of(body: &CheckedBody) -> Option<(u32, u32, u32)> {
+fn stamp_of(record: &CheckedRecord) -> Option<(u32, u32, u32)> {
     let CheckedBody::ConfigChange {
         generation,
         sequence,
         key,
         ..
-    } = body
+    } = &record.body
     else {
         return None;
     };
@@ -713,7 +729,7 @@ proptest! {
         for tail in tails {
             ring.records.tail.store(tail, Ordering::Relaxed);
 
-            let read: Vec<Result<CheckedBody, LogRecordError>> = reader.drain(limit).collect();
+            let read: Vec<Result<CheckedRecord, LogRecordError>> = reader.drain(limit).collect();
             // Terminates, and never more than the ring can hold in one pass.
             prop_assert!(read.len() <= LOG_RING_SLOTS);
             prop_assert!(read.len() <= reader.capacity());

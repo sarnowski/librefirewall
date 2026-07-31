@@ -45,11 +45,12 @@ use core::fmt;
 
 use lfw_metrics::{ConsoleSample, UartSample};
 
-use wire::{CheckedBody, LogReader, LogRecordError};
+use wire::{CheckedRecord, LogReader, LogRecordError};
 
 use crate::detail::Cause;
 use crate::event::Event;
 use crate::render::{MAX_LINE_LEN, render};
+use crate::stamp::Stamp;
 
 /// Records one pass may take from a single ring before it moves to the next.
 ///
@@ -182,15 +183,15 @@ impl<W: ByteSink> ConsolePrinter<W> {
         }
     }
 
-    /// Render one event and put the line on the device. Answers whether the
-    /// whole line reached the writer.
+    /// Render one event, stamped `at`, and put the line on the device. Answers
+    /// whether the whole line reached the writer.
     ///
     /// Generic over the cause type so this is the single call both a decoded
     /// peer record ([`Event<Cause>`]) and the console domain's own event
     /// ([`Event`], whose cause is a literal) travel through.
-    pub fn print<C: fmt::Display>(&mut self, event: &Event<C>) -> bool {
+    pub fn print<C: fmt::Display>(&mut self, at: Stamp, event: &Event<C>) -> bool {
         let mut line = [0u8; MAX_LINE_LEN];
-        let Ok(written) = render(event, &mut line) else {
+        let Ok(written) = render(at, event, &mut line) else {
             bump(&mut self.counters.unrenderable);
             return false;
         };
@@ -257,16 +258,16 @@ impl<W: ByteSink> ConsolePrinter<W> {
     /// Neither refusal stops the pass. A byzantine writer that filled its ring
     /// with rubbish would otherwise take the console down with it, and the
     /// records worth reading at that moment are the *other* domains'.
-    fn print_record(&mut self, record: Result<CheckedBody, LogRecordError>) -> bool {
-        let Ok(body) = record else {
+    fn print_record(&mut self, record: Result<CheckedRecord, LogRecordError>) -> bool {
+        let Ok(checked) = record else {
             bump(&mut self.counters.malformed);
             return false;
         };
-        let Ok(event) = Event::<Cause>::decode(&body) else {
+        let Ok((at, event)) = Event::<Cause>::decode(&checked) else {
             bump(&mut self.counters.unknown);
             return false;
         };
-        self.print(&event)
+        self.print(at, &event)
     }
 
     /// The writer this printer owns, for a caller that has to ask the device

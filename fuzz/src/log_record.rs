@@ -25,11 +25,12 @@
 //! carries, text bytes that are ESC, newline or anything else outside
 //! `[a-z0-9-]`, an operand count naming storage that does not exist, `signalled`
 //! bytes that are no boolean, a counter frequency of zero, an instant past any
-//! date a node will see, and arbitrary padding are all ordinary inputs.
+//! date a node will see, a stamp discriminant that says neither a time nor the
+//! lack of one, and arbitrary padding are all ordinary inputs.
 //!
 //! # Why three records are checked and not one
 //!
-//! `kind` is a `u32` with four admissible values, so a uniform 192-byte blob is
+//! `kind` is a `u32` with four admissible values, so a uniform record-sized blob is
 //! `KindUnknown` for all but four of the 2^32 values that one field can take,
 //! and the rules behind it would never be reached by chance.
 //! [`derivations`] therefore checks, **in addition to** the
@@ -78,7 +79,7 @@
 //!   again to the same event, and renders to the same line.
 
 use arbitrary::{Arbitrary as _, Unstructured};
-use lfw_log::{Cause, Event, MAX_LINE_LEN, render};
+use lfw_log::{Cause, Event, MAX_LINE_LEN, Stamp, render};
 use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
@@ -91,7 +92,7 @@ use wire::{
 /// Restated from the ABI contract rather than taken from `size_of`, so a record
 /// that changed size would show up as a seed that no longer means what it was
 /// committed for rather than as a silently re-laid-out input.
-pub const RECORD_BYTES: usize = 224;
+pub const RECORD_BYTES: usize = 232;
 
 /// The four record kinds, as the ABI numbers them. Restated here rather than
 /// reached for through `LogKind::to_bits`, which is the code under test.
@@ -101,6 +102,11 @@ const KIND_CONFIG_GENERATION: u32 = 2;
 const KIND_CONFIG_REJECTED: u32 = 3;
 /// One past the last kind: the smallest `kind` no event has.
 const KIND_COUNT: u32 = 4;
+
+/// The two stamp discriminants and one past them, on [`KIND_COUNT`]'s terms.
+const STAMP_UNSYNCHRONIZED: u8 = 0;
+const STAMP_UTC: u8 = 1;
+const STAMP_KIND_COUNT: u8 = 2;
 
 /// The six `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
@@ -161,6 +167,7 @@ fn derivations(data: &[u8]) -> [LogRecord; 3] {
 fn narrow_discriminants(record: LogRecord) -> LogRecord {
     let mut narrowed = record;
     narrowed.kind = record.kind % (KIND_COUNT + 1);
+    narrowed.stamp_kind = record.stamp_kind % (STAMP_KIND_COUNT + 1);
     narrowed.domain = record.domain % (LOG_DOMAIN_COUNT + 2);
     narrowed.state = record.state % (LOG_DOMAIN_STATE_COUNT + 2);
     narrowed.detail = record.detail % (DETAIL_COUNT + 1);
@@ -232,9 +239,10 @@ fn check_one(record: &LogRecord) {
         "the record check and the ABI contract disagree about this record"
     );
 
-    let Ok(body) = outcome else {
+    let Ok(checked) = outcome else {
         return;
     };
+    let body = checked.body;
 
     assert_body_carries_only_what_its_kind_names(record, &body);
     assert_texts_are_within_their_bounds(&body);
@@ -242,29 +250,31 @@ fn check_one(record: &LogRecord) {
     // The console's own path, in the console's own order: `wire` has ruled on
     // the shape, `lfw_log` rules on the vocabulary, and what survives both is
     // rendered onto a line.
-    let event = Event::<Cause>::decode(&body).unwrap_or_else(|error| {
+    let (at, event) = Event::<Cause>::decode(&checked).unwrap_or_else(|error| {
         panic!(
             "a record the ABI accepted decoded to no event ({error}); the two crates' copies of a \
              vocabulary cardinality or of a text alphabet have parted, and a console would count \
              this `unknown` and print nothing"
         )
     });
-    let line = assert_console_line_is_printable(&event);
+    let line = assert_console_line_is_printable(at, &event);
 
     // Round trip: the event the console holds is one the ABI can carry back,
-    // and carrying it back changes neither the body, the event, nor the line an
-    // operator reads.
-    let re_encoded = event.encode();
+    // and carrying it back changes neither the record, the event, the instant,
+    // nor the line an operator reads.
+    let re_encoded = event.encode(at);
     assert_eq!(
         re_encoded.check(),
-        Ok(body),
-        "an event re-encoded to a record the check no longer accepts as the same body"
+        Ok(checked),
+        "an event re-encoded to a record the check no longer accepts as the same record"
     );
-    let re_decoded = Event::<Cause>::decode(&body).expect("the same body decoded once already");
-    assert_eq!(event, re_decoded, "decoding one body twice gave two events");
+    let (re_at, re_decoded) =
+        Event::<Cause>::decode(&checked).expect("the same record decoded once already");
+    assert_eq!(event, re_decoded, "decoding one record twice gave two events");
+    assert_eq!(at, re_at, "decoding one record twice gave two instants");
     assert_eq!(
         line,
-        assert_console_line_is_printable(&re_decoded),
+        assert_console_line_is_printable(re_at, &re_decoded),
         "one event rendered two different lines"
     );
 }
@@ -281,9 +291,9 @@ fn check_one(record: &LogRecord) {
 /// the last thing an operator could believe.
 ///
 /// Returns the line so a caller can compare two renderings of one event.
-fn assert_console_line_is_printable(event: &Event<Cause>) -> Vec<u8> {
+fn assert_console_line_is_printable(at: Stamp, event: &Event<Cause>) -> Vec<u8> {
     let mut buffer = [0u8; MAX_LINE_LEN];
-    let written = render(event, &mut buffer).unwrap_or_else(|error| {
+    let written = render(at, event, &mut buffer).unwrap_or_else(|error| {
         panic!(
             "an event decoded out of a record did not fit MAX_LINE_LEN ({error}); no peer can \
              cause that, so the renderer and the buffer have parted"
@@ -400,7 +410,7 @@ fn assert_text<const N: usize>(text: &CheckedText<N>, may_be_empty: bool) {
 fn assert_body_carries_only_what_its_kind_names(record: &LogRecord, body: &CheckedBody) {
     let scribbled = keep_only_named_fields(record);
     assert_eq!(
-        scribbled.check(),
+        scribbled.check().map(|checked| checked.body),
         Ok(*body),
         "rewriting the fields this record's kind does not name changed what the check decoded"
     );
@@ -427,7 +437,8 @@ const POISON: LogRecord = LogRecord {
     field: 0xAA,
     outcome: 0xAA,
     reason: 0xAA,
-    _pad: [0xAA; 6],
+    stamp_kind: 0xAA,
+    _pad: [0xAA; 5],
     cause: POISON_CAUSE,
     key: POISON_IDENTIFIER,
     from: POISON_VALUE,
@@ -443,6 +454,9 @@ const POISON: LogRecord = LogRecord {
     // the same reason.
     frames: 0xAAAA_AAAA_AAAA_AAAA,
     frame_bytes: 0xAAAA_AAAA_AAAA_AAAA,
+    // Nor of this one, under either discriminant: an instant is unranged and an
+    // unsynchronized record reads the field not at all.
+    stamp_nanos: 0xAAAA_AAAA_AAAA_AAAA,
 };
 
 /// A text nothing admits: a length past its own storage, and every byte an ESC
@@ -474,6 +488,13 @@ const POISON_VALUE: ValueImage = ValueImage {
 fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
     let mut kept = POISON;
     kept.kind = record.kind;
+    // The stamp belongs to every shape rather than to a kind, so it is kept
+    // whatever the kind is — and its nanoseconds only under the discriminant
+    // that names them, which is the same rule the body's fields are held to.
+    kept.stamp_kind = record.stamp_kind;
+    if record.stamp_kind == STAMP_UTC {
+        kept.stamp_nanos = record.stamp_nanos;
+    }
     match record.kind {
         KIND_DOMAIN => {
             kept.domain = record.domain;
@@ -559,6 +580,12 @@ fn keep_only_named_value_fields(value: &ValueImage) -> ValueImage {
 /// `malformed` attribution would be sent to the wrong field of the wrong
 /// domain's record.
 fn refusal(record: &LogRecord) -> Option<LogRecordError> {
+    // The stamp is ruled on before any body field, so a record that is wrong in
+    // both places is refused for the stamp. The order is part of the contract:
+    // a body rendered without an instant would silently read as having no time.
+    if let Some(refusal) = stamp_refusal(record) {
+        return Some(refusal);
+    }
     match record.kind {
         KIND_DOMAIN => domain_refusal(record),
         KIND_CONFIG_CHANGE => config_change_refusal(record),
@@ -577,6 +604,16 @@ fn refusal(record: &LogRecord) -> Option<LogRecordError> {
             },
         ),
         kind => Some(LogRecordError::KindUnknown { kind }),
+    }
+}
+
+/// The instant: two admissible discriminants and nothing else. The nanoseconds
+/// beside them are unranged in both cases — every `u64` names a civil time, and
+/// under the unsynchronized discriminant nothing reads the field at all.
+fn stamp_refusal(record: &LogRecord) -> Option<LogRecordError> {
+    match record.stamp_kind {
+        STAMP_UNSYNCHRONIZED | STAMP_UTC => None,
+        kind => Some(LogRecordError::StampKindUnknown { kind }),
     }
 }
 
@@ -745,6 +782,7 @@ pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
         unix_nanos: quad(unstructured),
         frames: quad(unstructured),
         frame_bytes: quad(unstructured),
+        stamp_nanos: quad(unstructured),
         kind: word(unstructured),
         generation: word(unstructured),
         sequence: word(unstructured),
@@ -761,6 +799,7 @@ pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
         field: byte(unstructured),
         outcome: byte(unstructured),
         reason: byte(unstructured),
+        stamp_kind: byte(unstructured),
         _pad: bytes(unstructured),
         cause: text(unstructured),
         key: text(unstructured),
@@ -832,6 +871,7 @@ pub(crate) fn region_from_record(record: &LogRecord) -> Vec<u8> {
     out.extend_from_slice(&record.unix_nanos.to_le_bytes());
     out.extend_from_slice(&record.frames.to_le_bytes());
     out.extend_from_slice(&record.frame_bytes.to_le_bytes());
+    out.extend_from_slice(&record.stamp_nanos.to_le_bytes());
     for word in [
         record.kind,
         record.generation,
@@ -853,6 +893,7 @@ pub(crate) fn region_from_record(record: &LogRecord) -> Vec<u8> {
         record.field,
         record.outcome,
         record.reason,
+        record.stamp_kind,
     ]);
     out.extend_from_slice(&record._pad);
     push_text(&mut out, &record.cause);
@@ -1195,9 +1236,9 @@ mod tests {
             config_generation_record(),
             config_rejected_record(),
         ] {
-            let body = record.check().expect("the fixture is a well-formed record");
-            let event = Event::<Cause>::decode(&body).expect("a checked record decodes");
-            let line = assert_console_line_is_printable(&event);
+            let checked = record.check().expect("the fixture is a well-formed record");
+            let (at, event) = Event::<Cause>::decode(&checked).expect("a checked record decodes");
+            let line = assert_console_line_is_printable(at, &event);
             assert!(line.starts_with(b"LFW-"));
         }
     }
@@ -1269,9 +1310,22 @@ mod tests {
     /// The all-bytes-set record: refused, and refused for the field the ABI
     /// contract rules on first.
     #[test]
-    fn a_record_of_every_byte_set_is_refused_for_its_kind() {
+    fn a_record_of_every_byte_set_is_refused_for_its_stamp() {
+        // The stamp is ruled on ahead of the kind, so the all-bytes-set image
+        // never reaches the `u32::MAX` kind behind it. Both refusals are
+        // asserted, which is what makes the *order* of the two checks a
+        // property rather than an accident.
+        let record = record_from_region(&seed("every_byte_set"));
         assert_eq!(
-            record_from_region(&seed("every_byte_set")).check(),
+            record.check(),
+            Err(LogRecordError::StampKindUnknown { kind: u8::MAX })
+        );
+        assert_eq!(
+            LogRecord {
+                stamp_kind: STAMP_UNSYNCHRONIZED,
+                ..record
+            }
+            .check(),
             Err(LogRecordError::KindUnknown { kind: u32::MAX })
         );
     }

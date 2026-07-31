@@ -44,6 +44,9 @@ pub(crate) const RECORD_MARKER: &str = "LFW-";
 /// grammar is fixed in `crates/log/src/render.rs`.
 pub(crate) const LIFECYCLE_PREFIX: &str = "LFW-PD ";
 
+/// As [`LIFECYCLE_PREFIX`], for the configuration channel.
+pub(crate) const CONFIG_PREFIX: &str = "LFW-CFG ";
+
 /// The protection-domain lifecycle records a capture carries, in emission order.
 pub(crate) fn lifecycle_records(text: &str) -> Vec<&str> {
     records_on(text, LIFECYCLE_PREFIX)
@@ -77,10 +80,30 @@ fn records_in_line<'a>(line: &'a str, prefix: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The key of the instant every record carries, first among its fields.
+pub(crate) const TIME_KEY: &str = "time";
+
 /// One `key=value` field as the console grammar writes it, so a search for one
 /// cannot match a different key ending in the same letters.
 pub(crate) fn field(key: &str, value: &str) -> String {
     format!(" {key}={value}")
+}
+
+/// `record` without its instant.
+///
+/// The instant is the one field whose value two runs of one build disagree
+/// about, so a contract comparing a record against a line the build rendered
+/// compares this. What the instant itself owes is judged on its own
+/// ([`crate::stamp_contract`]), over every record rather than the few a
+/// transcript names.
+pub(crate) fn without_time(record: &str) -> String {
+    let needle = field(TIME_KEY, "");
+    let Some(at) = record.find(&needle) else {
+        return record.to_owned();
+    };
+    let rest = record.get(at + needle.len()..).unwrap_or_default();
+    let tail = rest.find(' ').map_or("", |end| &rest[end..]);
+    format!("{}{tail}", &record[..at])
 }
 
 /// The value of `key` in `record`, up to the next space or the end of it.
@@ -159,6 +182,25 @@ mod tests {
 
     /// A key that is the tail of another must not match it, which is the whole
     /// reason a field is searched for with its leading space.
+    #[test]
+    fn a_record_without_its_instant_keeps_every_other_field_in_place() {
+        assert_eq!(
+            without_time("LFW-PD time=unsynchronized domain=clock state=starting"),
+            "LFW-PD domain=clock state=starting"
+        );
+        assert_eq!(
+            without_time(
+                "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+                 frames=4 bytes=352"
+            ),
+            "LFW-PD domain=management state=ready frames=4 bytes=352"
+        );
+        // The last field, which is where an off-by-one would take the tail with
+        // it, and a record carrying no instant at all.
+        assert_eq!(without_time("LFW-PD time=unsynchronized"), "LFW-PD");
+        assert_eq!(without_time("LFW-PD domain=clock"), "LFW-PD domain=clock");
+    }
+
     #[test]
     fn a_key_ending_in_another_keys_letters_does_not_match_it() {
         let record = "LFW-PD domain=management state=ready frames=4 bytes=352";

@@ -22,6 +22,15 @@ fn record_to_bytes(record: LogRecord) -> [u8; RECORD_BYTES] {
     unsafe { core::mem::transmute(record) }
 }
 
+impl LogRecord {
+    /// The body a record decodes to. Most assertions below are about a body,
+    /// and the stamp in front of it is exercised by the tests that name one, so
+    /// this keeps a case's `Err` the body's own rather than the stamp's.
+    fn body(&self) -> Result<CheckedBody, LogRecordError> {
+        self.check().map(|checked| checked.body)
+    }
+}
+
 fn text<const N: usize>(value: &[u8]) -> TextImage<N> {
     let mut image = TextImage::<N>::ZERO;
     for (slot, &byte) in image.bytes.iter_mut().zip(value) {
@@ -79,7 +88,7 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
     assert_eq!(size_of::<IdentifierImage>(), 20);
     assert_eq!(size_of::<CauseImage>(), 44);
     assert_eq!(size_of::<ValueImage>(), 32);
-    assert_eq!(size_of::<LogRecord>(), 224);
+    assert_eq!(size_of::<LogRecord>(), 232);
     assert_eq!(align_of::<LogRecord>(), 8);
     assert_eq!(
         [
@@ -89,13 +98,15 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
             offset_of!(LogRecord, unix_nanos),
             offset_of!(LogRecord, frames),
             offset_of!(LogRecord, frame_bytes),
+            offset_of!(LogRecord, stamp_nanos),
             offset_of!(LogRecord, kind),
+            offset_of!(LogRecord, stamp_kind),
             offset_of!(LogRecord, cause),
             offset_of!(LogRecord, key),
             offset_of!(LogRecord, from),
             offset_of!(LogRecord, to),
         ],
-        [0, 8, 24, 32, 40, 48, 56, 96, 140, 160, 192]
+        [0, 8, 24, 32, 40, 48, 56, 64, 98, 104, 148, 168, 200]
     );
 }
 
@@ -105,7 +116,9 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
 fn a_record_has_a_stable_little_endian_byte_image() {
     let record = LogRecord {
         features: 0x1122_3344_5566_7788,
+        stamp_nanos: 0x0102_0304_0506_0708,
         kind: 0x0000_00ff,
+        stamp_kind: LogStampKind::Utc.to_bits(),
         ..LogRecord::ZERO
     };
     let bytes = record_to_bytes(record);
@@ -113,7 +126,12 @@ fn a_record_has_a_stable_little_endian_byte_image() {
         &bytes[0..8],
         &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
     );
-    assert_eq!(&bytes[56..60], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        &bytes[56..64],
+        &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+    );
+    assert_eq!(&bytes[64..68], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(&bytes[98..99], &[0x01]);
     assert_eq!(record_from_bytes(bytes), record);
 }
 
@@ -121,7 +139,7 @@ fn a_record_has_a_stable_little_endian_byte_image() {
 fn a_zeroed_region_is_already_a_decodable_record() {
     assert_eq!(LogRecord::default(), LogRecord::ZERO);
     assert_eq!(
-        LogRecord::ZERO.check(),
+        LogRecord::ZERO.body(),
         Ok(CheckedBody::Domain {
             domain: 0,
             state: 0,
@@ -133,7 +151,7 @@ fn a_zeroed_region_is_already_a_decodable_record() {
 #[test]
 fn a_domain_record_carries_each_detail_shape() {
     assert_eq!(
-        domain_record().check(),
+        domain_record().body(),
         Ok(CheckedBody::Domain {
             domain: 1,
             state: 2,
@@ -147,7 +165,7 @@ fn a_domain_record_carries_each_detail_shape() {
         ..domain_record()
     };
     assert!(matches!(
-        features.check(),
+        features.body(),
         Ok(CheckedBody::Domain {
             detail: CheckedDetail::Features(0x8000_0000_0000_0001),
             ..
@@ -160,7 +178,7 @@ fn a_domain_record_carries_each_detail_shape() {
         ..domain_record()
     };
     assert!(matches!(
-        posted.check(),
+        posted.body(),
         Ok(CheckedBody::Domain {
             detail: CheckedDetail::ReceivePosted(256),
             ..
@@ -176,7 +194,7 @@ fn a_domain_record_carries_each_detail_shape() {
     let Ok(CheckedBody::Domain {
         detail: CheckedDetail::Established { tsc_hz, unix_nanos },
         ..
-    }) = established.check()
+    }) = established.body()
     else {
         panic!("an established clock decodes to one");
     };
@@ -190,7 +208,7 @@ fn a_domain_record_carries_each_detail_shape() {
         ..domain_record()
     };
     assert!(matches!(
-        received.check(),
+        received.body(),
         Ok(CheckedBody::Domain {
             detail: CheckedDetail::Received {
                 frames: 4,
@@ -208,7 +226,7 @@ fn a_domain_record_carries_each_detail_shape() {
                 signalled,
             },
         ..
-    }) = refusal_record().check()
+    }) = refusal_record().body()
     else {
         panic!("a refusal decodes to a refusal");
     };
@@ -231,7 +249,7 @@ fn a_refusal_carries_as_many_operands_as_it_named() {
             ..refusal_record()
         };
         assert!(matches!(
-            record.check(),
+            record.body(),
             Ok(CheckedBody::Domain { detail: CheckedDetail::Refusal { operands, .. }, .. })
                 if operands == expected
         ));
@@ -248,7 +266,7 @@ fn a_refusal_cause_may_be_empty_where_an_identifier_may_not() {
         ..refusal_record()
     };
     assert!(matches!(
-        record.check(),
+        record.body(),
         Ok(CheckedBody::Domain { detail: CheckedDetail::Refusal { cause, .. }, .. })
             if cause.is_empty() && cause.as_str().is_empty()
     ));
@@ -257,7 +275,7 @@ fn a_refusal_cause_may_be_empty_where_an_identifier_may_not() {
             key: IdentifierImage::ZERO,
             ..change_record()
         }
-        .check(),
+        .body(),
         Err(LogRecordError::TextEmpty { text: LogText::Key })
     );
 }
@@ -273,7 +291,7 @@ fn a_change_record_carries_its_key_field_and_both_values() {
         field,
         from,
         to,
-    }) = change_record().check()
+    }) = change_record().body()
     else {
         panic!("the record is well formed");
     };
@@ -294,7 +312,7 @@ fn an_absent_value_decodes_to_none() {
         ..change_record()
     };
     assert!(matches!(
-        record.check(),
+        record.body(),
         Ok(CheckedBody::ConfigChange {
             from: None,
             to: Some(_),
@@ -374,7 +392,7 @@ fn every_value_kind_decodes_to_its_own_shape() {
             ..change_record()
         };
         assert!(
-            matches!(record.check(), Ok(CheckedBody::ConfigChange { from: Some(value), .. }) if value == expected),
+            matches!(record.body(), Ok(CheckedBody::ConfigChange { from: Some(value), .. }) if value == expected),
             "{expected:?}"
         );
     }
@@ -386,7 +404,7 @@ fn every_value_kind_decodes_to_its_own_shape() {
     let Ok(CheckedBody::ConfigChange {
         from: Some(CheckedValue::Id(name)),
         ..
-    }) = record.check()
+    }) = record.body()
     else {
         panic!("an identifier value decodes to one");
     };
@@ -404,7 +422,7 @@ fn the_two_configuration_summary_records_carry_their_own_fields() {
         ..LogRecord::ZERO
     };
     assert_eq!(
-        generation.check(),
+        generation.body(),
         Ok(CheckedBody::ConfigGeneration {
             generation: 4,
             outcome: 2,
@@ -420,7 +438,7 @@ fn the_two_configuration_summary_records_carry_their_own_fields() {
         ..LogRecord::ZERO
     };
     assert_eq!(
-        rejected.check(),
+        rejected.body(),
         Ok(CheckedBody::ConfigRejected {
             generation: 5,
             reason: 29,
@@ -449,7 +467,7 @@ fn a_field_the_kind_does_not_name_is_read_by_nothing() {
             ..ValueImage::ZERO
         },
         cause: text(b"NOT A CAUSE"),
-        _pad: [0xff; 6],
+        _pad: [0xff; 5],
         kind: LogKind::ConfigGeneration.to_bits(),
         generation: 4,
         outcome: 2,
@@ -457,13 +475,66 @@ fn a_field_the_kind_does_not_name_is_read_by_nothing() {
         ..LogRecord::ZERO
     };
     assert_eq!(
-        noise.check(),
+        noise.body(),
         Ok(CheckedBody::ConfigGeneration {
             generation: 4,
             outcome: 2,
             changes: 11,
         })
     );
+}
+
+/// The stamp is the one field every shape carries, and its zero must be the
+/// *absence* of a time: a zeroed slot that decoded to the epoch would date every
+/// untouched record 1970-01-01 (ENG-12).
+#[test]
+fn a_zeroed_stamp_is_no_time_rather_than_the_epoch() {
+    assert_eq!(
+        LogRecord::ZERO.check().map(|checked| checked.at),
+        Ok(CheckedStamp::Unsynchronized)
+    );
+}
+
+#[test]
+fn a_stamped_record_carries_the_instant_it_was_given() {
+    let record = LogRecord {
+        stamp_kind: LogStampKind::Utc.to_bits(),
+        stamp_nanos: 1_785_443_220_123_456_789,
+        ..domain_record()
+    };
+    assert_eq!(
+        record.check().map(|checked| checked.at),
+        Ok(CheckedStamp::Utc(1_785_443_220_123_456_789))
+    );
+    // The nanoseconds a record carries under the unsynchronized discriminant
+    // are read by nothing, exactly as a field the kind does not name.
+    let unstamped = LogRecord {
+        stamp_kind: LogStampKind::Unsynchronized.to_bits(),
+        ..record
+    };
+    assert_eq!(
+        unstamped.check().map(|checked| checked.at),
+        Ok(CheckedStamp::Unsynchronized)
+    );
+}
+
+/// Every discriminant a peer can write outside the two, refused with the value
+/// that made it one — and refused *before* the body, so a record whose stamp is
+/// undecodable never reaches a line attributed to no time.
+#[test]
+fn a_stamp_discriminant_outside_its_set_is_refused_ahead_of_the_body() {
+    for kind in 2..=u8::MAX {
+        let record = LogRecord {
+            stamp_kind: kind,
+            domain: LOG_DOMAIN_COUNT,
+            ..domain_record()
+        };
+        assert_eq!(
+            record.check(),
+            Err(LogRecordError::StampKindUnknown { kind }),
+            "stamp kind {kind}"
+        );
+    }
 }
 
 #[test]
@@ -526,7 +597,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
         ),
     ];
     for (record, expected) in cases {
-        assert_eq!(record.check(), Err(expected), "{expected:?}");
+        assert_eq!(record.body(), Err(expected), "{expected:?}");
     }
 
     // The boundary from the other side: the highest token each vocabulary
@@ -537,7 +608,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
             state: LOG_DOMAIN_STATE_COUNT - 1,
             ..domain_record()
         }
-        .check()
+        .body()
         .is_ok()
     );
     assert!(
@@ -546,7 +617,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
             outcome: LOG_GENERATION_OUTCOME_COUNT - 1,
             ..LogRecord::ZERO
         }
-        .check()
+        .body()
         .is_ok()
     );
 }
@@ -612,7 +683,7 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
     ];
     for (record, expected) in cases {
-        assert_eq!(record.check(), Err(expected), "{expected:?}");
+        assert_eq!(record.body(), Err(expected), "{expected:?}");
     }
 }
 
@@ -657,7 +728,7 @@ fn a_value_slot_the_writer_filled_wrongly_is_refused_at_its_own_position() {
             from: image,
             ..change_record()
         };
-        assert_eq!(record.check(), Err(expected), "{expected:?}");
+        assert_eq!(record.body(), Err(expected), "{expected:?}");
 
         // The same value in the other slot is refused against that slot, so a
         // refusal names which of the two the writer got wrong.
@@ -666,7 +737,7 @@ fn a_value_slot_the_writer_filled_wrongly_is_refused_at_its_own_position() {
             ..change_record()
         };
         assert!(matches!(
-            record.check(),
+            record.body(),
             Err(LogRecordError::ValueKindUnknown {
                 text: LogText::To,
                 ..
@@ -692,7 +763,7 @@ fn a_prefix_length_word_that_does_not_fit_a_byte_is_refused_rather_than_truncate
         ..change_record()
     };
     assert_eq!(
-        record.check(),
+        record.body(),
         Err(LogRecordError::ValueNumberTooLarge {
             text: LogText::From,
             number: 280,
@@ -713,7 +784,7 @@ fn text_outside_the_console_alphabet_is_refused_wherever_it_appears() {
         };
         assert!(
             matches!(
-                key.check(),
+                key.body(),
                 Err(LogRecordError::TextNotInAlphabet {
                     text: LogText::Key,
                     ..
@@ -732,7 +803,7 @@ fn text_outside_the_console_alphabet_is_refused_wherever_it_appears() {
         };
         assert!(
             matches!(
-                value.check(),
+                value.body(),
                 Err(LogRecordError::TextNotInAlphabet {
                     text: LogText::From,
                     ..
@@ -747,7 +818,7 @@ fn text_outside_the_console_alphabet_is_refused_wherever_it_appears() {
         };
         assert!(
             matches!(
-                cause.check(),
+                cause.body(),
                 Err(LogRecordError::TextNotInAlphabet {
                     text: LogText::Cause,
                     ..
@@ -768,7 +839,7 @@ fn a_text_length_beyond_its_storage_is_refused_for_being_one() {
         let mut record = change_record();
         record.key.len = len;
         assert_eq!(
-            record.check(),
+            record.body(),
             Err(LogRecordError::TextTooLong {
                 text: LogText::Key,
                 len
@@ -780,7 +851,7 @@ fn a_text_length_beyond_its_storage_is_refused_for_being_one() {
     let mut record = change_record();
     record.key = text(b"abcdefghijklmnop");
     assert!(matches!(
-        record.check(),
+        record.body(),
         Ok(CheckedBody::ConfigChange { key, .. }) if key.len() == LOG_IDENTIFIER_BYTES
     ));
 }
@@ -794,7 +865,7 @@ fn text_compares_by_content_not_by_the_tail_the_writer_left() {
     noisy.key.bytes[3] = b'x';
     noisy.key.bytes[15] = b'z';
     noisy.key._pad = [0xff; 3];
-    assert_eq!(noisy.check(), change_record().check());
+    assert_eq!(noisy.body(), change_record().body());
 }
 
 #[test]
@@ -1070,8 +1141,14 @@ proptest! {
         let record = record_from_bytes(image);
         prop_assert_eq!(record_to_bytes(record), image);
 
-        if let Ok(body) = record.check() {
-            assert_body_is_well_formed(&body)?;
+        if let Ok(checked) = record.check() {
+            // The stamp is a decoded case rather than the raw byte: whatever a
+            // peer wrote, it reads as an instant or as the lack of one.
+            prop_assert!(matches!(
+                checked.at,
+                CheckedStamp::Unsynchronized | CheckedStamp::Utc(_)
+            ));
+            assert_body_is_well_formed(&checked.body)?;
         }
     }
 
@@ -1082,7 +1159,7 @@ proptest! {
     fn a_plausible_record_decodes_totally_and_yields_only_renderable_values(
         record in plausible_record(),
     ) {
-        match record.check() {
+        match record.body() {
             Ok(body) => assert_body_is_well_formed(&body)?,
             Err(error) => {
                 // A refusal is attributable: it renders, and it names a field.
@@ -1097,7 +1174,7 @@ proptest! {
     /// captured record rather than a property of when it was read.
     #[test]
     fn decoding_is_a_function_of_the_bytes_alone(record in plausible_record()) {
-        prop_assert_eq!(record.check(), record.check());
+        prop_assert_eq!(record.body(), record.body());
     }
 
     /// Text survives the decode verbatim: what a writer put in `bytes[..len]`
@@ -1108,7 +1185,7 @@ proptest! {
             key: text(name.as_bytes()),
             ..change_record()
         };
-        let Ok(CheckedBody::ConfigChange { key, .. }) = record.check() else {
+        let Ok(CheckedBody::ConfigChange { key, .. }) = record.body() else {
             return Err(TestCaseError::fail("the identifier is admissible"));
         };
         prop_assert_eq!(key.as_str(), name.as_str());

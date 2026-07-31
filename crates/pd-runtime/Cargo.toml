@@ -11,8 +11,9 @@ packet-buffer = { path = "../packet-buffer" }
 net-headers = { path = "../net-headers" }
 routing = { path = "../routing" }
 lfw-ip-endpoint = { path = "../ip-endpoint" }
-# The arithmetic that turns a counter reading into an instant, which is what the
-# transport's timers are stated against.
+# The arithmetic that turns a counter reading into an instant: what the
+# transport's timers are stated against, and what `clock.rs` stamps every log
+# record with.
 lfw-clock = { path = "../clock" }
 lfw-log = { path = "../log" }
 # The shards this domain and its neighbours publish into, and the exposition the
