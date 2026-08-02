@@ -47,7 +47,7 @@ use crate::catalog::{
 /// matching `config::PORT_COUNT`, held to it by a test in `pd_runtime`.
 pub const PIPELINES: usize = 2;
 
-/// The router's own refusal vocabulary, in `routing::DropReason::ALL` order —
+/// The pipeline's whole refusal vocabulary, in `pipeline::DropReason::ALL` order —
 /// which a test in `pd_runtime` holds this array to, name for name.
 pub const ROUTE_DROP_REASONS: [&str; 11] = [
     "unconfigured_ingress_port",

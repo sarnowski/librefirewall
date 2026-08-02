@@ -16,17 +16,26 @@ whenever it runs and `make coverage` states the current coverage; what a section
 
 ## Routed IPv4 forwarding
 
-**What exists.** Two host-tested `no_std` crates carry the whole decision. `crates/net-headers`
+**What exists.** Three host-tested `no_std` crates carry the whole decision. `crates/net-headers`
 parses Ethernet, one optional 802.1Q tag, IPv4, and the UDP, TCP or ICMP header behind it, and
 applies the four edits a hop requires — both MACs, the TTL decrement, and the header checksum —
-as one operation that cannot be performed in part. `crates/routing` turns a parsed frame and its ingress port into a verdict:
-forward out of a named port under a named MAC pair, or one of eleven named drop reasons, each with
-its own counter. `pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of
-the pool, decide, rewrite, and write back the 34 header bytes — and marks every frame it refuses
-`Verdict::Discard` so the transmitting driver returns the buffer instead of transmitting it. The
-table it decides against is data rather than code: the const parameters are capacities, the lengths
-are runtime values, and the domain is handed one table and later handed another (see
-*[Configuration management](#configuration-management)*).
+as one operation that cannot be performed in part. `crates/routing` holds the forwarding table and
+answers lookups against it — which interface a port has, which prefix covers a destination, which
+neighbour holds a MAC, which addresses are the appliance's own — and reaches no verdict itself.
+`crates/pipeline` is the chain that does: link-layer admission first, then the forwarding decision,
+each a concrete stage called in a fixed order, ending in a verdict that is either a forward out of a
+named port under a named MAC pair or one of eleven named drop reasons, each with its own counter.
+The order is compiled in and the tables the stages consult are data. `pd_runtime::RouteStage` joins
+all three to the dataplane — snapshot the frame out of the pool, put it through the chain, rewrite,
+and write back the 34 header bytes — and marks every frame it refuses `Verdict::Discard` so the
+transmitting driver returns the buffer instead of transmitting it. The table is data rather than
+code: the const parameters are capacities, the lengths are runtime values, and the domain is handed
+one table and later handed another (see *[Configuration management](#configuration-management)*).
+
+The chain is one value per domain, not one per direction. A `RouteStage` is per direction because
+its rings, its pool and its scratch are; the pipeline is owned by the forwarder itself and lent to
+each poll, because a stage whose state must span both directions of a flow cannot live inside a
+stage that sees one.
 
 Held by unit and property tests across the two crates, by the stage's own tests in
 `crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
@@ -74,7 +83,7 @@ target (`route_frame`) whose input is the frame itself.
 **What exists.** The substrate exists as four host-tested `no_std` crates: `crates/queue` (the
 lock-free SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership ledger),
 `crates/wire` (the descriptor ABI shared across domains, pinned by static layout assertion) and
-`crates/pd-runtime` (the pipeline, pool owner and routing stage the protection domains are
+`crates/pd-runtime` (the shared regions, pool owner and routing stage the protection domains are
 assembled from).
 
 Correctness is held by unit and property tests across those four crates — including hostile-peer
@@ -86,7 +95,7 @@ A frame is copied twice per hop with the recorder switched out of the picture: o
 into the routing domain's own memory, because a decision made on bytes a peer may rewrite underneath
 it is no decision at all, and once back — 34 bytes of header, never the payload.
 
-**The tap makes it three, and adds a second parse.** Every frame the router decides on is copied a
+**The tap makes it three, and adds a second parse.** Every frame the pipeline decides on is copied a
 third time, out of the routing domain's scratch into the tap ring the recorder reads
 ([detail](#recording-and-download)) — up to 2048 bytes, the whole frame rather than its header. The
 copy is taken between the decision and the forwarding rewrite, which is what makes a recorded frame
@@ -215,7 +224,7 @@ that the *read* crossed to the medium and not merely to the driver's own staging
 
 ## Recording and download
 
-**What exists.** Every frame the router decides on is observed, both recordings are written to the
+**What exists.** Every frame the pipeline decides on is observed, both recordings are written to the
 medium as pcapng, and either can be downloaded whole over HTTP.
 
 The forwarder taps its own routing stage. `RouteStage` already snapshots each frame into private
@@ -224,8 +233,8 @@ the pool. The copy is lifted after the verdict and before the hop's rewrite, whi
 that makes a recording evidence about the wire rather than about this appliance's own output, and
 the price of it is a second header parse on the forwarding path: the rewrite re-parses what the
 decision already parsed. Three classes of frame are counted and deliberately absent from a
-recording, because `wire::TapDropReason` mirrors `routing::DropReason` exactly and there is no
-honest encoding for them: a frame no routing decision was reached about (a malformed descriptor, a
+recording, because `wire::TapDropReason` mirrors `pipeline::DropReason` exactly and there is no
+honest encoding for them: a frame no verdict was reached about (a malformed descriptor, a
 refused snapshot, bytes that are not IPv4 over Ethernet), a frame routed out of a port the stage is
 not wired to, and
 a frame recorded as forwarded that a later refusal still lost. **The tap never backpressures
@@ -361,7 +370,7 @@ and wall-clock times. An independent parse of the two files established:
 - **Only the dataplane is tapped.** The management port has no tap, so nothing on it — including the
   download itself — appears in either recording.
 - **Some frames are counted and deliberately not recorded**, because `wire::TapDropReason` mirrors
-  `routing::DropReason` exactly and there is no honest encoding for them: a frame no routing decision
+  `pipeline::DropReason` exactly and there is no honest encoding for them: a frame no verdict
   was reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
   that a later refusal still lost. An operator reconciling a recording against `/metrics` subtracts
   those; the [recordings reference](../reference/recordings.md) states the reconciliation.
@@ -773,7 +782,7 @@ The decision is three host-tested `no_std` crates. `crates/net-headers` gained A
 only; any other hardware type, protocol type, address length or operation is a typed error) and ICMP
 echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
 and one checksum routine. `crates/ip-endpoint` is the endpoint state machine — the appliance answering
-*for itself*, as against `crates/routing`, which forwards for others — with zero `unsafe`, a closed
+*for itself*, as against `crates/pipeline`, which decides what to forward for others — with zero `unsafe`, a closed
 `Outcome` vocabulary, and a counter per outcome; it now owns a `crates/tcp` stack and the HTTP
 server above it, and keeps the transport's advertised window equal to that server's free
 space. `pd_runtime::EndpointStage` joins it to the two pipelines: copy the frame out of the receive
@@ -1209,8 +1218,10 @@ the endpoint of a port, not the management API PD, which needs the TLS and HTTP 
 above the ARP, IP and TCP that now do. Absent: Rx/Tx
 virtualisers, classifier, filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7
 parsers, DPI engine, content scanner, CA signing PD, management API PD, HA state-sync PD, and the
-update/health PD. The routing/ARP/ICMP class is the one that is neither: routing exists as a *stage
-inside* the forwarder rather than as a domain of its own, and ARP and ICMP do not exist at all.
+update/health PD. The routing/ARP/ICMP class is the one that is neither: routing exists as one
+*stage of the forwarder's verdict pipeline* rather than as a domain of its own, and ARP and ICMP do
+not exist at all. That pipeline is where the classifier and the filter/connection-tracking classes
+would go if they were domains of their own; today it is the seam and holds two stages.
 There is no fault handler and no PD restart, one system description, and no SMP variant.
 
 One grant is also wider than the code needs, and it is not closed:
@@ -1265,8 +1276,8 @@ and a write each terminate within their advertised bound for *any* sequence of d
 representable, `pop` minting a non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
 Every rejection is a **counted drop**, never a fault: `PoolCounters` and `RouteCounters` record
-them, the latter attributing every refused frame to one of eleven named routing reasons or to the
-stage check that caught it. `ConfigCounters` does the same for the handover, so a publisher offering
+them, the latter attributing every refused frame to one of the eleven named pipeline reasons or to
+the stage check that caught it. `ConfigCounters` does the same for the handover, so a publisher offering
 images this domain will not run is distinguishable from one that has stopped offering any.
 Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit header-room
 check) and checked against the driver's in-flight set before any span is touched. Every peer-fed
@@ -1305,7 +1316,7 @@ rubbish are the *other* domains'.
   exclusive ownership across domains is a protocol claim no single domain can verify. Closing it
   needs an IOMMU — the confinement the [threat model](../design/threat-model.md) calls for — or a
   cross-domain per-buffer ownership epoch; neither exists.
-- **A verdict rests on a snapshot, not on the frame.** `RouteStage` decides on a copy in its own
+- **A verdict rests on a snapshot, not on the frame.** `RouteStage` puts a copy in its own
   memory, so a peer cannot change the frame under the decision — but it can change it *after*, and
   before the transmitting NIC reads it. What leaves the port may differ from what was decided on in
   every field the rewrite does not overwrite. The same IOMMU or ownership epoch is what would close
@@ -1390,7 +1401,7 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `crates/` and `pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-two library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-three library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (six system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the three scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |

@@ -24,7 +24,7 @@
 //!
 //! # Saturating, never reset
 //!
-//! `routing::DropCounters`' terms, and for its reason: a scrape differences
+//! `pipeline::DropCounters`' terms, and for its reason: a scrape differences
 //! successive samples, so a reset would forge a negative rate and a wrap would
 //! turn a sustained flood back into a small number — which is exactly the signal
 //! a counter of attacker-driven events exists to carry.

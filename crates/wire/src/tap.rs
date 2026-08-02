@@ -120,10 +120,10 @@ pub const TAP_FLAG_OUTBOUND: u32 = 1;
 /// gives.
 pub const TAP_FLAGS_KNOWN: u32 = TAP_FLAG_OUTBOUND;
 
-/// Drop reasons this ABI encodes, which is `routing::DropReason::ALL.len()`.
+/// Drop reasons this ABI encodes, which is `pipeline::DropReason::ALL.len()`.
 ///
 /// Restated here rather than imported: `wire` is the crate every region's
-/// layout is expressed in, and a dependency on `routing` would forbid the
+/// layout is expressed in, and a dependency on `pipeline` would forbid the
 /// reverse edge for good. [`TapDropReason`] mirrors that enum the way
 /// [`crate::LogRecord`] mirrors `lfw_log::Event` — as integers, in the source
 /// enum's declaration order, offset by one so zero can mean *no reason*.
@@ -173,7 +173,7 @@ impl TapDirection {
     }
 }
 
-/// What the appliance decided about the observed frame — `routing::Decision`
+/// What the appliance decided about the observed frame — `pipeline::Verdict`
 /// without its payload, which lives in the annotation's own fields.
 ///
 /// pcapng carries it as `epb_verdict`, a custom option of the recording.
@@ -204,7 +204,7 @@ impl TapVerdict {
     }
 }
 
-/// Why a frame was not forwarded — `routing::DropReason` as integers, in that
+/// Why a frame was not forwarded — `pipeline::DropReason` as integers, in that
 /// enum's declaration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapDropReason {
@@ -1047,7 +1047,7 @@ const _: () = {
     assert!(TapDirection::Inbound.to_bits() == 0);
     assert!(TapDropReason::from_bits(0).is_none());
     assert!(MAX_INTERFACES >= 1);
-    // The mirrored enum's width, so a reason added to `routing::DropReason`
+    // The mirrored enum's width, so a reason added to `pipeline::DropReason`
     // without a slot here is caught by the count rather than by a reader.
     assert!(TapDropReason::NoNeighbour.to_bits() == TAP_DROP_REASON_COUNT);
     assert!(TapDropReason::from_bits(TAP_DROP_REASON_COUNT).is_some());

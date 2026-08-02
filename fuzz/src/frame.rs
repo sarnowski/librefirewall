@@ -1,4 +1,4 @@
-//! `net_headers` and `routing` under untrusted network traffic.
+//! `net_headers`, `routing` and `pipeline` under untrusted network traffic.
 //!
 //! # The adversary and the surface
 //!
@@ -7,8 +7,8 @@
 //! operation selector, no structure this harness imposes. A corpus entry is a
 //! packet, which is also what makes a capture off a real wire a usable seed.
 //!
-//! The two crates are driven together because that is how the dataplane uses
-//! them and because neither is interesting alone: a parse that returns is only
+//! The three crates are driven together because that is how the dataplane uses
+//! them and because none is interesting alone: a parse that returns is only
 //! safe if what it returns cannot then be turned into a forwarding decision the
 //! topology does not support, and a decision is only safe if the rewrite it
 //! authorises leaves a frame the next hop will accept.
@@ -54,7 +54,8 @@ use net_headers::{
     ETHERNET_HEADER_LEN, Frame, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet,
     MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
-use routing::{Decision, DropReason, Interface, Neighbour, PortId, Router};
+use pipeline::{Configuration, DropReason, Inspection, Pipeline, Verdict};
+use routing::{Interface, Neighbour, PortId, Router};
 
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
@@ -129,6 +130,19 @@ fn agree_on_the_ipv4_header(data: &[u8]) {
 /// also the fifth and sixth byte of whatever else the datagram carries there.
 const TRANSPORT_LENGTH_AT: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 4;
 
+/// The verdict this appliance's topology reaches for one frame arriving on each
+/// port in turn.
+///
+/// A fresh pipeline per call, because the two verdicts a caller compares must
+/// not depend on which was asked for first.
+fn verdicts_on_both_ports(bytes: &mut [u8]) -> [Verdict; 2] {
+    [PORT0, PORT1].map(|ingress| {
+        let frame = Frame::parse(bytes).expect("the caller parsed these bytes already");
+        let mut inspection = Inspection::new(ingress, frame);
+        Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER))
+    })
+}
+
 /// Rewriting the transport header changes neither the parse nor the verdict.
 ///
 /// A router carries an IPv4 datagram because the datagram is well formed; what
@@ -150,10 +164,8 @@ fn the_transport_header_decides_nothing(data: &[u8]) {
     if frame.vlan().is_some() {
         return;
     }
-    let baseline = [
-        ROUTER.decide(PORT0, &frame),
-        ROUTER.decide(PORT1, &frame),
-    ];
+    drop(frame);
+    let baseline = verdicts_on_both_ports(&mut original);
     if data.len() < TRANSPORT_LENGTH_AT + 2 {
         return;
     }
@@ -164,14 +176,11 @@ fn the_transport_header_decides_nothing(data: &[u8]) {
             return;
         };
         field.copy_from_slice(&length.to_be_bytes());
-        let Ok(mutated_frame) = Frame::parse(&mut mutated) else {
+        if Frame::parse(&mut mutated).is_err() {
             panic!("a transport length of {length} made a well-formed datagram unparsable");
-        };
+        }
         assert_eq!(
-            [
-                ROUTER.decide(PORT0, &mutated_frame),
-                ROUTER.decide(PORT1, &mutated_frame),
-            ],
+            verdicts_on_both_ports(&mut mutated),
             baseline,
             "a transport length of {length} changed the routing verdict"
         );
@@ -317,35 +326,41 @@ pub fn frame_routing_harness(data: &[u8]) {
     the_transport_header_decides_nothing(data);
     the_transport_annotation_matches_the_datagram(data);
     the_table_answers_the_same_however_it_was_written(data);
+    // One pipeline across both directions, as the forwarder holds it: a stage
+    // whose state spans a flow must see the two halves through the same value.
+    let mut pipeline = Pipeline::new();
     for ingress in [PORT0, PORT1] {
         let original = data.to_vec();
         let mut bytes = original.clone();
-        let Ok(mut frame) = Frame::parse(&mut bytes) else {
+        let Ok(frame) = Frame::parse(&mut bytes) else {
             // A rejected frame is left byte-for-byte alone, which is what lets
             // a caller report it against the header it arrived with.
             assert_eq!(bytes, original, "a refused parse modified the frame");
             continue;
         };
 
-        let decision = ROUTER.decide(ingress, &frame);
+        let mut inspection = Inspection::new(ingress, frame);
+        // Generation 0: nothing in the chain reads it, and the table it names is
+        // this harness's fixed topology rather than one an operator committed.
+        let decision = pipeline.evaluate(&mut inspection, &Configuration::new(0, &ROUTER));
         // A frame claiming one of this router's own addresses as its source is
         // forged or looped and may never be carried. Asserted for a frame that
         // reaches the source check at all: the link-layer refusals in front of it
         // outrank it, and a tagged or misaddressed frame is refused there first.
         let addressed_to_us = ROUTER
             .interface(ingress)
-            .is_some_and(|entry| entry.mac == frame.destination_mac());
-        if ROUTER.is_local_address(frame.ipv4().source)
-            && frame.vlan().is_none()
+            .is_some_and(|entry| entry.mac == inspection.frame().destination_mac());
+        if ROUTER.is_local_address(inspection.frame().ipv4().source)
+            && inspection.frame().vlan().is_none()
             && addressed_to_us
         {
             assert_eq!(
                 decision,
-                Decision::Drop(DropReason::MartianSource),
+                Verdict::Drop(DropReason::MartianSource),
                 "a frame sourced from an address this appliance holds was not refused",
             );
         }
-        let Decision::Forward {
+        let Verdict::Forward {
             egress,
             source,
             destination,
@@ -353,6 +368,12 @@ pub fn frame_routing_harness(data: &[u8]) {
         else {
             continue;
         };
+        // The decision is taken before a byte is rewritten and the frame is
+        // parsed a second time to rewrite it, which is the order the dataplane
+        // uses: the first borrow must end before anything can read the frame as
+        // it arrived.
+        drop(inspection);
+        let mut frame = Frame::parse(&mut bytes).expect("the frame parsed a moment ago");
 
         assert_ne!(egress, ingress, "a forward verdict looped the frame back");
         let interface = ROUTER

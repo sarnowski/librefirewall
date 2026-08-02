@@ -23,7 +23,7 @@
 //!
 //! An [`Outcome`] is returned *and* recorded in [`EndpointCounters`]: a station
 //! probing an endpoint that silently refuses everything looks exactly like an
-//! idle link. The counters follow `routing::DropCounters` — saturating, never
+//! idle link. The counters follow `pipeline::DropCounters` — saturating, never
 //! reset — because the rate is the attacker's to choose.
 //!
 //! # The transport, and the service on it
@@ -314,7 +314,7 @@ impl Outcome {
 }
 
 /// What an endpoint has seen, in the shape the metrics endpoint will
-/// scrape. Monotonic and saturating on `routing::DropCounters`' terms: no reset,
+/// scrape. Monotonic and saturating on `pipeline::DropCounters`' terms: no reset,
 /// because a scrape differences successive samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndpointCounters {

@@ -833,10 +833,10 @@ mod tests {
         assert_eq!(switch.generation(), 0);
         assert_eq!(switch.counters(), ConfigCounters::default());
         let configuration = switch.configuration();
-        assert_eq!(configuration.generation, 0);
+        assert_eq!(configuration.generation(), 0);
         // The table with no interface and no neighbour: the absence of policy,
         // which is the only compiled-in configuration this domain has.
-        assert_eq!(*configuration.table, Router::empty());
+        assert_eq!(*configuration.table(), Router::empty());
     }
 
     #[test]

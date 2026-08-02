@@ -55,7 +55,7 @@
 "crates/metrics/src/lib.rs" = 0.5746
 "crates/metrics/src/render.rs" = 0.2850
 "crates/metrics/src/sample.rs" = 0.0756
-"crates/net-headers/src/lib.rs" = 0.2099
+"crates/net-headers/src/lib.rs" = 0.2059
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
 "crates/nic-driver-core/src/port.rs" = 0.4521
@@ -65,13 +65,14 @@
 "crates/pd-runtime/src/download.rs" = 0.3750
 "crates/pd-runtime/src/endpoint.rs" = 0.4636
 "crates/pd-runtime/src/handover.rs" = 0.3423
-"crates/pd-runtime/src/lib.rs" = 0.4788
+"crates/pd-runtime/src/lib.rs" = 0.4830
 "crates/pd-runtime/src/stats.rs" = 0.1581
 "crates/pd-runtime/src/tap.rs" = 0.4260
+"crates/pipeline/src/lib.rs" = 0.3580
 "crates/queue/src/lib.rs" = 0.4260
 "crates/recorder/src/deck.rs" = 0.2374
 "crates/recorder/src/lib.rs" = 0.2187
-"crates/routing/src/lib.rs" = 0.3136
+"crates/routing/src/lib.rs" = 0.3270
 "crates/rtc/src/lib.rs" = 0.5119
 "crates/tcp/src/connection.rs" = 0.3133
 "crates/tcp/src/counters.rs" = 0.5183
@@ -98,7 +99,7 @@
 "pds/config/src/main.rs" = 0.4286
 "pds/console/src/com1.rs" = 0.6400
 "pds/console/src/main.rs" = 0.5115
-"pds/forwarder/src/main.rs" = 0.3804
+"pds/forwarder/src/main.rs" = 0.3842
 "pds/management/src/entropy.rs" = 0.6489
 "pds/management/src/main.rs" = 0.4852
 "pds/nic-driver/src/main.rs" = 0.4571
@@ -119,6 +120,7 @@
 "crates/packet-buffer" = 3
 "crates/pcapng" = 0
 "crates/pd-runtime" = 5
+"crates/pipeline" = 0
 "crates/queue" = 0
 "crates/recorder" = 0
 "crates/routing" = 0
@@ -150,6 +152,7 @@
 "crates/packet-buffer" = 3
 "crates/pcapng" = 0
 "crates/pd-runtime" = 1
+"crates/pipeline" = 0
 "crates/queue" = 0
 "crates/recorder" = 0
 "crates/routing" = 0
@@ -181,6 +184,7 @@
 "crates/packet-buffer" = 1
 "crates/pcapng" = 0
 "crates/pd-runtime" = 0
+"crates/pipeline" = 0
 "crates/queue" = 0
 "crates/recorder" = 0
 "crates/routing" = 0

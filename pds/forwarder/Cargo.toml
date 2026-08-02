@@ -10,6 +10,9 @@ pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
 lfw-log = { path = "../../crates/log" }
 routing = { path = "../../crates/routing" }
+# The verdict chain both directions are decided by. Held here rather than by
+# either stage, because a stage of it may span both of them.
+pipeline = { path = "../../crates/pipeline" }
 lfw-metrics = { path = "../../crates/metrics" }
 
 [lints]

@@ -1,0 +1,18 @@
+[package]
+name = "pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+net-headers = { path = "../net-headers" }
+# The forwarding table and the port identity a verdict names. The dependency
+# runs this way and never the other: `routing` answers questions about a table
+# without knowing a chain of stages asks them.
+routing = { path = "../routing" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

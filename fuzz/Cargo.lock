@@ -169,6 +169,7 @@ dependencies = [
  "nic-driver-core",
  "packet-buffer",
  "pd-runtime",
+ "pipeline",
  "queue",
  "routing",
  "virtio",
@@ -205,9 +206,18 @@ dependencies = [
  "lfw-recorder",
  "net-headers",
  "packet-buffer",
+ "pipeline",
  "queue",
  "routing",
  "wire",
+]
+
+[[package]]
+name = "pipeline"
+version = "0.1.0"
+dependencies = [
+ "net-headers",
+ "routing",
 ]
 
 [[package]]

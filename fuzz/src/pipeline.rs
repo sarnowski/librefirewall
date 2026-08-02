@@ -89,6 +89,7 @@ use pd_runtime::{
     Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
     descriptor_in_bounds,
 };
+use pipeline::Pipeline;
 use routing::{Interface, Neighbour, PortId, Router};
 
 use crate::region::ZeroedRegion;
@@ -195,6 +196,9 @@ pub fn pipeline_harness(data: &[u8]) {
     let mut owner = PoolOwner::attach(returns);
     let mut rx_producer = rings.rx.producer();
     let mut stage = RouteStage::attach(rings, pool, PORT0, PORT1);
+    // One chain across the run, as the forwarder holds it, so state a stage
+    // accumulates is not quietly reset between operations.
+    let mut verdicts = Pipeline::new();
     let mut peer_free = returns.free.producer();
     let mut peer_tx = rings.tx.consumer();
     let rx_view = PeerView::<RING_SLOTS>::new(&rings.rx);
@@ -277,7 +281,7 @@ pub fn pipeline_harness(data: &[u8]) {
                 );
             }
             4 => {
-                let handed_on = stage.poll(Configuration::new(GENERATION, &ROUTER), None);
+                let handed_on = stage.poll(&mut verdicts, Configuration::new(GENERATION, &ROUTER), None);
                 assert!(
                     handed_on <= DRAIN_LIMIT,
                     "the forwarder handed on {handed_on} descriptors, past the {DRAIN_LIMIT} bound"

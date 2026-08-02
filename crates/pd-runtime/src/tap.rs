@@ -18,12 +18,12 @@
 //! observation and the forwarder treats that as ordinary operation rather than
 //! as an error (`wire::tap`).
 //!
-//! The conversion from `routing::DropReason` lives here rather than in either
+//! The conversion from `pipeline::DropReason` lives here rather than in either
 //! endpoint: `wire` is the crate every region's layout is expressed in and may
-//! not depend on `routing`, and `routing` describes a decision without knowing
+//! not depend on `pipeline`, and `pipeline` reaches a verdict without knowing
 //! it is recorded. This crate is where both are visible.
 
-use routing::DropReason;
+use pipeline::DropReason;
 use wire::{
     TapAnnotation, TapConsume, TapDirection, TapDropReason, TapOutcome, TapRecords, TapWriteError,
     TapWriter,

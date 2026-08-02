@@ -76,7 +76,7 @@ A recorder domain owns the appliance's **block device** and turns the traffic in
 record. It brings a virtio-blk device up, proves the path to the medium by reading a sector and
 writing a recognisable one back, and then writes **two pcapng recordings** onto that device: a
 *log* recording snapped to 128 bytes per frame and a *capture* recording snapped to 2048. What it
-records is what the forwarder taps: one observation of every frame the router reached a decision
+records is what the forwarder taps: one observation of every frame the pipeline reached a verdict
 about, lifted while the frame is still the one that arrived rather than the one this appliance will
 send on — which is what makes a recording evidence about the wire and not about the appliance's own
 output. Either recording is downloadable whole over the management port — `GET /logs.pcapng`,

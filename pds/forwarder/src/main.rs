@@ -1,11 +1,15 @@
 #![no_main]
 #![no_std]
 
-//! Forwarder protection domain — the routing stage between the two NIC ports.
-//! Pipeline 0 carries frames received on port 0 to port 1's transmitter and
-//! pipeline 1 the reverse: each frame is snapshotted out of the pool, parsed,
-//! decided on, and — if it is to be forwarded — rewritten for its next hop in
-//! place, so ownership and 34 bytes of header move and the payload never does.
+//! Forwarder protection domain — the verdict pipeline between the two NIC
+//! ports. Pipeline 0 carries frames received on port 0 to port 1's transmitter
+//! and pipeline 1 the reverse: each frame is snapshotted out of the pool,
+//! parsed, put through the pipeline, and — if the verdict is to forward it —
+//! rewritten for its next hop in place, so ownership and 34 bytes of header
+//! move and the payload never does. The two [`RouteStage`]s are per direction
+//! because their rings, pool and scratch are; the [`Pipeline`] is not, because a
+//! stage of it may hold state spanning both directions of a flow, so it is owned
+//! here and lent to each poll.
 //!
 //! # Adversary
 //!
@@ -13,7 +17,7 @@
 //! Every descriptor read here, every byte parsed, and the configuration decided
 //! under were written by another domain or by whatever is attached to a
 //! dataplane port. All three are rejected by a counted drop rather than a fault,
-//! in `net_headers`, `routing` and `pd_runtime`.
+//! in `net_headers`, `pipeline` and `pd_runtime`.
 //!
 //! # Constraints
 //!
@@ -39,7 +43,7 @@
 //! Records go to a ring, not `debug_println!` — no `seL4_DebugPutChar` in the
 //! release kernel.
 //!
-//! # Every frame the router decides on is offered to the recorder
+//! # Every frame the pipeline decides on is offered to the recorder
 //!
 //! This domain never waits on the tap ring: a full one costs the newest
 //! observation and is counted, because a tap that backpressured forwarding
@@ -59,6 +63,7 @@ use pd_runtime::{
     MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, Tap, attach_region, forwarder_sample,
     log_sample,
 };
+use pipeline::Pipeline;
 use routing::PortId;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{ClockCalibration, LogConsume, LogRecords, TapConsume, TapRecords};
@@ -104,6 +109,7 @@ fn init() -> Forwarder {
             RouteStage::attach(fwd0, pool0, PORT0, PORT1),
             RouteStage::attach(fwd1, pool1, PORT1, PORT0),
         ],
+        pipeline: Pipeline::new(),
         switch: ConfigurationSwitch::new(PORTS),
         tap: Tap::attach(tap_records, tap_consume),
         handover,
@@ -124,6 +130,7 @@ const fn applied(generation: u32) -> Event {
 
 struct Forwarder {
     stages: [RouteStage<'static>; 2],
+    pipeline: Pipeline,
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
     /// One per domain: a packet identity is per appliance.
     tap: Tap<'static>,
@@ -138,8 +145,7 @@ struct Forwarder {
 impl Forwarder {
     /// Write everything this domain counts into its shard. Assembled in
     /// `pd_runtime::stats`, where a test holds the metric surface's vocabulary
-    /// to the enums it names; this file supplies the log ring's own drop
-    /// counts and the region.
+    /// to the enums it names; this file supplies the log ring's own counts.
     fn publish(&self) {
         let sample = forwarder_sample(
             [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
@@ -176,7 +182,7 @@ impl Handler for Forwarder {
         let configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS> =
             self.switch.configuration();
         for stage in &mut self.stages {
-            stage.poll(configuration, Some(&mut self.tap));
+            stage.poll(&mut self.pipeline, configuration, Some(&mut self.tap));
         }
         self.publish();
         Ok(())

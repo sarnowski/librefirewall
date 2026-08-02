@@ -10,6 +10,9 @@ queue = { path = "../queue" }
 packet-buffer = { path = "../packet-buffer" }
 net-headers = { path = "../net-headers" }
 routing = { path = "../routing" }
+# The verdict chain the routing stage drives, and the refusal vocabulary every
+# counter and every tap annotation here is keyed by.
+pipeline = { path = "../pipeline" }
 lfw-ip-endpoint = { path = "../ip-endpoint" }
 # The arithmetic that turns a counter reading into an instant: what the
 # transport's timers are stated against, and what `clock.rs` stamps every log

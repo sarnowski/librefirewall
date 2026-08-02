@@ -37,6 +37,7 @@ use pd_runtime::{
     Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
     RouteStage, Verdict,
 };
+use pipeline::Pipeline;
 use routing::{Interface, Neighbour, PortId, Router};
 
 /// Representative Ethernet payload sizes: a minimum frame, a mid-size frame,
@@ -207,6 +208,7 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
     let mut owner = PoolOwner::attach(&regions.returns);
     let mut rx_in = regions.rings.rx.producer();
     let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
+    let mut pipeline = Pipeline::new();
     let configuration = Configuration::new(GENERATION, &ROUTER);
     let mut tx_out = regions.rings.tx.consumer();
     let mut free_in = regions.returns.free.producer();
@@ -232,7 +234,7 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
                     }
 
                     let started = Instant::now();
-                    let handed_on = black_box(stage.poll(configuration, None));
+                    let handed_on = black_box(stage.poll(&mut pipeline, configuration, None));
                     elapsed += started.elapsed();
 
                     assert_eq!(handed_on, BATCH, "every frame must be handed on");

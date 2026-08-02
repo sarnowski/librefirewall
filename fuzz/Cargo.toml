@@ -37,7 +37,8 @@ cargo-fuzz = true
 #                   into whatever segments it chooses
 #   lfw-metrics     the exposition rendered out of counters a peer PD wrote, into
 #                   storage of whatever size the endpoint has
-#   routing         the forwarding decision made from those headers
+#   routing         the forwarding table those headers are resolved against
+#   pipeline        the chain of stages that turns them into a verdict
 #   queue           the shared ring whose cursors and slots a peer PD owns
 #   packet-buffer   the ownership ledger a peer PD's buffer returns cross
 #   virtio          the device's PCI config space and virtqueue
@@ -64,6 +65,7 @@ lfw-http = { path = "../crates/http" }
 lfw-metrics = { path = "../crates/metrics" }
 lfw-clock = { path = "../crates/clock" }
 routing = { path = "../crates/routing" }
+pipeline = { path = "../crates/pipeline" }
 queue = { path = "../crates/queue" }
 packet-buffer = { path = "../crates/packet-buffer" }
 virtio = { path = "../crates/virtio" }

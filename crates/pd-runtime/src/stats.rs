@@ -26,7 +26,7 @@ use lfw_metrics::{
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
-use routing::DropReason;
+use pipeline::DropReason;
 
 use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, TapCounters};
 
