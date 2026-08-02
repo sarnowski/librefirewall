@@ -10,8 +10,12 @@
          the receiving NIC and out of by the transmitting NIC, so a frame crosses
          the whole system without ever being copied. The session-replication and
          mirror ports of the full port model (CONCEPT.md §9) are not part of this
-         slice. The protection domains are documented in pds/nic-driver,
-         pds/forwarder and pds/management. -->
+         slice. A seventh domain, the RECORDER, owns the appliance's virtio-blk
+         device and touches no frame: it is joined to the forwarder by a capture
+         tap it may only read, and to the management domain by a download
+         handover, and it holds no dataplane region of any kind. The protection
+         domains are documented in pds/nic-driver, pds/forwarder,
+         pds/management and pds/recorder. -->
 
     <!-- ===================================================================
          The physical address map is a contract, and this is where it is
@@ -27,8 +31,8 @@
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
 
-         * vq0..vq2 and the twelve pipeline regions
-           (0x30000000..0x3108C000) must
+         * vq0..vq2 and blk_dma, the twelve pipeline regions and blk_io
+           (0x30000000..0x310CC000) must
            lie INSIDE RAM. They are ordinary memory, and seL4 zeroes a frame
            retyped from a general-purpose untyped but not one retyped from a
            device untyped — which is what an address outside RAM yields. That
@@ -38,25 +42,32 @@
            first-party code re-checks it, and a region placed outside RAM would
            fail as unbacked reads at run time rather than as a build or boot
            error.
-         * bar0..bar2 (0x50000000..0x5000C000) must lie OUTSIDE RAM, in the q35
+         * bar0..bar3 (0x50000000..0x50010000) must lie OUTSIDE RAM, in the q35
            32-bit PCI hole: each driver reprograms its device's 64-bit MMIO BAR
            to that address, so RAM underneath it would be shadowed by the
-           device's decode.
+           device's decode. The block device's BAR is the fourth and is placed on
+           exactly the terms the three NICs' are.
 
          Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
          which puts the first group inside it and the second above it. The
          window either side is narrow and nothing checks it: RAM must now reach
-         past 0x3108C000 — 784.55 MiB rather than the 784.27 MiB the dataplane
-         alone needed, so the management pipelines NARROW the lower end of that
-         unasserted window by 280 KiB and every further port narrows it again —
-         while at 1280 MiB or more RAM reaches 0x50000000 and swallows the BAR
-         window. Changing `-m`, or targeting hardware with a different memory
-         map, means re-deriving this map. README's status records the window as
-         load-bearing and unasserted, and this is the change that made it
-         tighter rather than the change that closed it.
+         past 0x310CC000 — 784.80 MiB rather than the 784.55 MiB the three ports
+         alone needed, so the recorder's staging region NARROWS the lower end of
+         that unasserted window by a further 256 KiB and every further device
+         narrows it again — while at 1280 MiB or more RAM reaches 0x50000000 and
+         swallows the BAR window. Changing `-m`, or targeting hardware with a
+         different memory map, means re-deriving this map. README's status
+         records the window as load-bearing and unasserted, and this is the
+         change that made it tighter rather than the change that closed it.
+
+         The staging region is by some way the largest single claim on that
+         window — 256 KiB where every other region added here costs four — and it
+         is the first thing to shrink if the window ever has to be given back:
+         nothing but how much the recorder can have in flight at once depends on
+         its size.
 
          The two configuration regions (cfg, cfgack) are the exception and are
-         deliberately NOT in the packed range, which now ends at 0x3108C000.
+         deliberately NOT in the packed range, which now ends at 0x310CC000.
          No device DMAs into them, so no driver needs their physical address, so
          no `setvar region_paddr` names them and the tool has no reason to
          demand a fixed one. Leaving it out is not a convenience: an unplaced
@@ -78,6 +89,15 @@
     <memory_region name="ecam0" size="0x1000" phys_addr="0xE0010000" />
     <memory_region name="ecam1" size="0x1000" phys_addr="0xE0018000" />
     <memory_region name="ecam2" size="0x1000" phys_addr="0xE0020000" />
+    <!-- And the fourth pinned function, 00:05.0 — the virtio-blk device the
+         recorder owns. Same derivation, one slot past the management port:
+         0xE0000000 + (5 << 15). The slot is not free-floating either, and the
+         one place that could disagree is held to it — `xtask::qemu` builds the
+         guest's `-device` arguments from `GuestNic::slot() + 2` for the three
+         NICs and pins the data device at `addr=05.0` beside them, so the guest
+         topology and this page are one derivation rather than two numbers that
+         happen to match. -->
+    <memory_region name="ecam3" size="0x1000" phys_addr="0xE0028000" />
     <!-- Where each driver relocates its device's modern MMIO BAR (patched into
          the driver via region_paddr). Packed back to back from the base of the
          q35 32-bit PCI hole, so the three together are 0x50000000..0x5000C000.
@@ -85,6 +105,15 @@
     <memory_region name="bar0" size="0x4000" phys_addr="0x50000000" />
     <memory_region name="bar1" size="0x4000" phys_addr="0x50004000" />
     <memory_region name="bar2" size="0x4000" phys_addr="0x50008000" />
+    <!-- The block device's BAR, packed immediately after the three NICs', so
+         the four together are 0x50000000..0x50010000. Its size is
+         `lfw_blk::BAR_WINDOW_SIZE` rather than the drivers'
+         `nic_driver_core::bringup::BAR_WINDOW_SIZE`: the two crates are
+         independent device classes with independent bounds, and citing one
+         crate's constant for the other's window would make a change to either
+         silently move the other. That the two numbers agree today is not a fact
+         either crate promises. -->
+    <memory_region name="bar3" size="0x4000" phys_addr="0x5000C000" />
 
     <!-- The High Precision Event Timer's register block, and the third device
          region in this system.
@@ -128,6 +157,22 @@
     <memory_region name="vq0" size="0x1000" phys_addr="0x30000000" />
     <memory_region name="vq1" size="0x1000" phys_addr="0x30001000" />
     <memory_region name="vq2" size="0x1000" phys_addr="0x30002000" />
+
+    <!-- The block device's DMA region, packed immediately after the three
+         virtqueues because it is the same kind of memory and is read the same
+         way: the request virtqueue at its base, and behind it the sixteen-byte
+         header of each in-flight request and the byte the device writes its
+         status into. `lfw_blk`'s layout assertions are what place those three
+         inside one page; this row is only what makes the page exist.
+
+         It is a DRIVER-PRIVATE region and deliberately not a staging one. No
+         payload passes through it, so nothing the recorder records and nothing
+         an operator downloads is ever reachable at this address — which is why
+         it stays one page while `blk_io` is sixty-four.
+
+         Size is `lfw_blk::DMA_REGION_SIZE`, cached for the reason every
+         virtqueue above is, and `xtask::sysdesc` compares both. -->
+    <memory_region name="blk_dma" size="0x1000" phys_addr="0x30003000" />
 
     <!-- Three regions per forwarding direction (rx driver -> forwarder -> tx
          driver), because a region is the unit of grant: what a domain can reach
@@ -200,6 +245,46 @@
     <memory_region name="mgmt_tx_fwd" size="0x2000" phys_addr="0x31089000" />
     <memory_region name="mgmt_tx_free" size="0x1000" phys_addr="0x3108B000" />
 
+    <!-- THE BLOCK STAGING WINDOW, and the last region in the packed range:
+         0x3108C000 through 0x310CC000.
+
+         It is where every byte the recorder reads off its medium arrives and
+         every byte it writes to one is composed, and it is a region of its own
+         rather than more of `blk_dma` for the reason each pipeline is three
+         regions: the two hold different things and the split is what lets them
+         be different sizes and, one day, different grants. `blk_dma` carries
+         this driver's bookkeeping — a virtqueue, sixteen bytes of header per
+         request and a status byte — and is a page. This carries payload, and it
+         is 256 KiB because that is how much a recorder may usefully have in
+         flight at once.
+
+         IT NEEDS A FIXED PHYSICAL ADDRESS FOR THE ORDINARY REASON. Every data
+         segment of every request names a byte of this region by physical
+         address, and the device DMAs to it, so the recorder is told where it is
+         (`io_paddr`, below) exactly as each driver is told where its pool is.
+         There is no IOMMU on this platform (CONCEPT §7.2), so that address is an
+         address the device may write — which is what `lfw_blk::io::IoRegion`
+         exists for: the authority to name a byte of this window exists in one
+         shape, an `IoSector` that is in range by construction, so a wrong
+         offset is unrepresentable rather than caught.
+
+         ONE MAPPER, AND THAT IS THE WHOLE OF THE ISOLATION. No other domain maps
+         it in either direction. The forwarder does not: a capture reaches the
+         recorder as an annotation on the `tap` ring, never as a pointer into
+         this window, so a compromised forwarder cannot write bytes that will be
+         committed to the medium under the appliance's own name. The management
+         domain does not either, and that one is worth stating plainly: it is the
+         domain a download is answered from, so the obvious shortcut would be to
+         let it read the staging window directly. It reads `dl_reply` instead —
+         a copy the recorder composed and published — because a management domain
+         that could read this region could read whatever the recorder had most
+         recently staged, download or not, and one that could write it could put
+         bytes of its own choosing on the medium.
+
+         Size is `lfw_blk::BLK_IO_REGION_SIZE`, cached on the same footing as
+         every DMA region above, and `xtask::sysdesc` compares both. -->
+    <memory_region name="blk_io" size="0x40000" phys_addr="0x3108C000" />
+
     <!-- The configuration handover, one region per direction.
 
          `cfg` carries the validated configuration image and the two generation
@@ -258,7 +343,7 @@
          pair of even readings answers "nothing" rather than assembling a triple
          from two publishes.
 
-         ONE WRITER AND SEVEN READERS, and the direction is the whole grant. The
+         ONE WRITER AND EIGHT READERS, and the direction is the whole grant. The
          clock domain maps it READ-WRITE: it is the domain that measured the
          numbers, and it publishes them once, after the record that says what it
          measured. Every other domain maps it READ-ONLY, on the same footing as
@@ -274,7 +359,11 @@
          configuration domain, the three drivers and the console. Each stamps its
          own records, so each needs the three words that turn a counter reading
          into a time, and a domain that could not read them would emit a
-         transcript no reader could place in time.
+         transcript no reader could place in time. The recorder is the eighth
+         reader and arrived on the same terms: it stamps its own records, and it
+         will one day date every observation it commits to the medium — a capture
+         whose timestamps are the appliance's own idea of time and not a
+         separate one.
 
          WHAT THE ADDED GRANT GIVES, exactly: a READ of three integers, and
          nothing else. It confers no ability to write the calibration, no channel
@@ -316,6 +405,94 @@
          rather than a triple of zeroes. -->
     <memory_region name="clock" size="0x1000" />
 
+    <!-- THE CAPTURE TAP, one region per direction, and the third handover in
+         this system built the way the log ring and the configuration handover
+         are (ENG-1, SCM-6).
+
+         `tap` carries what the forwarder has to say about the frames it decided
+         on — an annotation per record and nothing else — and `tap_consume`
+         carries how far the recorder has read. Two regions rather than one for
+         the reason `cfg`/`cfgack` are two and each log ring is two: a region is
+         the unit of grant, so only two can give each domain write access to
+         exactly the direction it speaks in.
+
+         THE PERMS ARE THE WHOLE ARGUMENT, and they are the log ring's, mirrored
+         onto a different pair of domains. The FORWARDER maps `tap` READ-WRITE
+         and `tap_consume` READ-ONLY: it is the producer, and a producer that
+         could move the consume cursor would reuse slots the recorder had not
+         read — discarding observations while its own drop count stayed at zero,
+         which is silent loss reported as none. The RECORDER maps `tap`
+         READ-ONLY and `tap_consume` READ-WRITE: how far it has read is its own
+         statement about itself, and a recorder that could write the ring could
+         invent an observation the forwarder never made and commit it to the
+         medium as that domain's testimony. A capture an operator reads as
+         evidence must not be forgeable by the domain that stores it.
+
+         WHAT STAYS WITHHELD: every other domain, in either direction. No driver
+         maps it, so a compromised driver cannot see what was decided about the
+         frames it delivered; the management domain does not, so the domain that
+         answers a download cannot read the tap ahead of the recorder or write
+         into it; and the console does not, which keeps the two output channels
+         disjoint.
+
+         AND THE TAP CARRIES NO FRAME. It is annotations — lengths, verdicts,
+         interface indices, an instant — never packet bytes, which is what makes
+         it a region the recorder can be given without the forwarder handing over
+         a pool. `wire::tap` is where the record's shape and its checking live.
+
+         Sizes are `wire::TAP_RECORDS_REGION_SIZE` and
+         `wire::TAP_CONSUME_REGION_SIZE`, each its type's `size_of` rounded up to
+         the mapping granularity, on the same footing as every constant above and
+         held to it the same way. `TapRecords` is 132 KiB of slots plus its two
+         cursors, so it rounds to thirty-three pages; `TapConsume` is one word
+         and costs the page a region costs, exactly as `cfgack` does.
+
+         Neither carries phys_addr: no device DMAs into either, so no domain
+         needs their physical address, and an unplaced region is allocated from
+         general-purpose untyped memory — precisely the retyping seL4 zeroes, so
+         `attach_region!`'s zero-initialisation precondition holds by
+         construction and a zeroed pair is a valid empty ring. -->
+    <memory_region name="tap" size="0x21000" />
+    <memory_region name="tap_consume" size="0x1000" />
+
+    <!-- THE DOWNLOAD HANDOVER, one region per direction, and it runs the
+         opposite way round from the tap above.
+
+         `dl_request` carries what the management domain has been asked for — a
+         recording, an offset, a length — and `dl_reply` carries the window of
+         bytes the recorder answered with. The MANAGEMENT domain maps
+         `dl_request` READ-WRITE and `dl_reply` READ-ONLY; the RECORDER maps
+         `dl_request` READ-ONLY and `dl_reply` READ-WRITE. Each domain writes
+         exactly the direction it speaks in, and neither can forge the other's
+         half: a management domain that could write the reply could serve an
+         operator bytes no medium holds, and a recorder that could write the
+         request could answer a question nobody asked.
+
+         WHY THE REPLY IS A COPY AND NOT A POINTER. The obvious design hands the
+         management domain a window into `blk_io` and saves the copy. It is
+         refused: that region is where everything the recorder is currently
+         staging lives, download or not, so a read grant on it would let the
+         domain an attacker reaches first read whatever the recorder happened to
+         have in hand. A bounded region the recorder fills deliberately is the
+         narrower grant, and 36 KiB is what it costs.
+
+         THE FORWARDER MAPS NEITHER, in either direction, and that is the
+         counterpart of it mapping no `blk_io`: the dataplane cannot see what an
+         operator is downloading and cannot influence it. Nor may it — a
+         forwarder able to write `dl_reply` would be able to answer a download
+         with bytes of its own while the recorder reported having served the
+         medium's.
+
+         Sizes are `wire::DOWNLOAD_REQUEST_REGION_SIZE` and
+         `wire::DOWNLOAD_REPLY_REGION_SIZE`, on the same footing as every
+         constant above. `DownloadRequest` fits a page; `DownloadReply` is
+         `DOWNLOAD_WINDOW_LEN` bytes of window plus its header, and rounds to
+         nine pages.
+
+         Neither carries phys_addr, for the reason `cfg` does not. -->
+    <memory_region name="dl_request" size="0x1000" />
+    <memory_region name="dl_reply" size="0x9000" />
+
     <!-- The log transport: one ring per WRITING domain, and TWO REGIONS PER
          RING, one for each direction.
 
@@ -331,7 +508,7 @@
          producer on one of these is two writers racing for the same slot.
 
          THE SPLIT EXISTS SO THE TWO DIRECTIONS CARRY OPPOSITE PERMISSIONS, and
-         that is the whole reason there are fourteen rows here rather than seven. A
+         that is the whole reason there are sixteen rows here rather than eight. A
          region is the unit of grant, so only two regions can give each domain
          write access to exactly the direction it speaks in — the same reason
          `cfg`/`cfgack` are two regions and each dataplane pipeline is three.
@@ -382,7 +559,7 @@
          region and compares it. `LogRecords` is 13320 bytes (64 slots of a
          208-byte record, plus the producer cursor and the drop count) so each
          is four pages; `LogConsume` is one word and so costs the page a region
-         costs, exactly as `cfgack` does. The ten together are 100 KiB.
+         costs, exactly as `cfgack` does. The sixteen together are 160 KiB.
 
          None carries phys_addr, for the reason the address-map block above
          gives for `cfg` and `cfgack`: no device DMAs into a log region, so no
@@ -408,22 +585,24 @@
     <memory_region name="log_nic_driver2_consume" size="0x1000" />
     <memory_region name="log_management" size="0x4000" />
     <memory_region name="log_management_consume" size="0x1000" />
+    <memory_region name="log_recorder" size="0x4000" />
+    <memory_region name="log_recorder_consume" size="0x1000" />
 
 
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
          that domain alone and read by the management domain alone
          (ENG-1, SCM-6).
 
-         WHY EIGHT REGIONS AND NOT ONE. A region is the unit of grant, and the
+         WHY NINE REGIONS AND NOT ONE. A region is the unit of grant, and the
          property worth having here is that a domain's numbers are *its own
          testimony*: the management domain renders every one of them into the
-         exposition an operator scrapes, so it must read all eight, and a single
-         shared region would make it a writer of all eight too. It could then
+         exposition an operator scrapes, so it must read all nine, and a single
+         shared region would make it a writer of all nine too. It could then
          attribute a driver's dropped frames to another driver, or zero a count
          that accuses itself — and it is the domain that faces the
-         management-plane attacker. Eight regions with eight writers is what
+         management-plane attacker. Nine regions with nine writers is what
          makes each series a claim only its own domain can make, and it is the
-         same argument the fourteen log regions make one step further: there the
+         same argument the sixteen log regions make one step further: there the
          console cannot forge a *record*, here it cannot forge a *number*.
 
          PER-DOMAIN SERIES, NO TOTALS. Nothing in this node sums across shards.
@@ -456,7 +635,7 @@
 
          `stats_management` HAS EXACTLY ONE MAPPER, and that is not an oversight.
          The management domain both writes and reads it, because the renderer
-         walks one uniform array of eight shards rather than seven regions plus a
+         walks one uniform array of nine shards rather than eight regions plus a
          live read of its own counters — one code path, and a set of numbers
          taken at one publish rather than half of them changing under the render.
          It costs no cross-domain authority: no other domain maps it.
@@ -465,7 +644,7 @@
          up to the mapping granularity, on the same footing as every constant
          above and held to it the same way — `xtask::sysdesc` carries a rule per
          region and compares it. A `StatsShard` is 768 bytes, so each rounds to
-         one page and the eight cost 32 KiB.
+         one page and the nine cost 36 KiB.
 
          None carries phys_addr, for the reason the address-map block above gives
          for `cfg`: no device DMAs into a shard, so no domain needs its physical
@@ -482,6 +661,7 @@
     <memory_region name="stats_console" size="0x1000" />
     <memory_region name="stats_config" size="0x1000" />
     <memory_region name="stats_clock" size="0x1000" />
+    <memory_region name="stats_recorder" size="0x1000" />
 
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
@@ -519,13 +699,32 @@
          acknowledging is this domain's own statement about itself — what it has
          staged and what it is running — and it is the only domain that may make
          it. The two perms together are what make the handover a protocol
-         between two domains rather than a shared scratch area. -->
+         between two domains rather than a shared scratch area.
+
+         IT NOW ALSO PRODUCES ONTO THE CAPTURE TAP, and the perms are the log
+         ring's argument on a different pair of domains (ENG-1, SCM-6). `tap` is
+         read-write here because this domain is the producer: what it decided
+         about a frame is its own testimony, and it is the only domain that may
+         make it. `tap_consume` is READ-ONLY, so THIS DOMAIN CANNOT FORGE HOW
+         MUCH THE RECORDER HAS READ — one that could would advance the cursor to
+         reuse slots the recorder had not taken, discarding observations while
+         its own drop count stayed at zero, which is a capture with holes in it
+         that reports none.
+
+         What the tap does NOT give this domain is any reach toward the medium.
+         It maps no `blk_io`, no `blk_dma`, no `bar3` and no `ecam3`, and it maps
+         neither download region, so a compromised forwarder can put annotations
+         on a ring the recorder is free to refuse and can do nothing else: it
+         cannot write a sector, cannot read what has been recorded, and cannot
+         see or answer a download. -->
     <protection_domain name="forwarder" priority="2" stack_size="0x4000">
         <program_image path="forwarder.elf" />
         <map mr="fwd0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="fwd0_vaddr" />
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="fwd1_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="pool0_vaddr" />
         <map mr="pool1" vaddr="0x2_300_000" perms="rw" cached="true" setvar_vaddr="pool1_vaddr" />
+        <map mr="tap" vaddr="0x2_400_000" perms="rw" cached="true" setvar_vaddr="tap_vaddr" />
+        <map mr="tap_consume" vaddr="0x2_500_000" perms="r" cached="true" setvar_vaddr="tap_consume_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_001_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
@@ -738,6 +937,16 @@
              published. Read-only because a domain that could write it would move
              this node's own idea of time from the one domain that answers the
              management-plane attacker; see the note beside that region.
+           * dl_request (rw) — the download this port has been asked for. It is
+             this domain's own statement of what an operator wants, so it is the
+             only domain that may write it.
+           * dl_reply (READ-ONLY) — the window of recorded bytes the recorder
+             answered with. Read-only for the reason `cfg` is: the answer is the
+             other domain's, and one that could write it would serve an operator
+             a recording no medium holds while the recorder reported having
+             served the one it does.
+           * stats_recorder (READ-ONLY) — the ninth shard, on exactly the terms
+             of the other seven that are not this domain's own.
 
          WHAT STAYS WITHHELD, and it is the whole of the isolation CONCEPT §9.1
          asks for: NO dataplane region of any kind — not a pool, not a
@@ -745,6 +954,17 @@
          virtqueue and NO ioport. A compromise of the domain that will one day
          terminate an operator's TLS session therefore reaches no frame in flight
          and no NIC.
+
+         AND NO BLOCK REGION EITHER, which the download handover is what makes
+         affordable. This domain maps no `blk_io`, no `blk_dma`, no `bar3` and no
+         `ecam3`: it never reaches the medium, only the bounded reply the
+         recorder composed for the range it asked about. The rejected design is
+         the cheaper one — hand it a read grant on the staging window and answer
+         a download out of that — and it fails on exactly the property this port
+         exists to have: that window holds whatever the recorder is staging at
+         the moment, so reading it is reading the capture rather than the
+         download. It maps no `tap` either, in either direction, so it cannot
+         watch the dataplane's observations go past on their way to the medium.
 
          AND NO `cfgack`, WHICH IS THE ONE WORTH DWELLING ON. This domain is not
          the consumer of the two-phase commit: it reads the COMMITTED generation
@@ -762,19 +982,27 @@
          two would be a claim nothing needs: no frame crosses from one to the
          other, which is the point of the port.
 
-         STACK 0x40000, and it is the HTTP server that decides it. This domain
+         STACK 0x80000, and it is the HTTP server that decides it. This domain
          holds, in the value `init` returns and therefore on its stack: two
          `BUFFER_SIZE` scratch buffers (the frame snapshotted out of the pool and
          the reply composed into storage of its own, the pool exposing no safe
          path to its bytes), a request slot of `lfw_http::MAX_REQUEST_BYTES` per
-         connection, and one `lfw_ip_endpoint::http::RESPONSE_CAPACITY` staging
-         buffer — about 29 KiB, because a Prometheus exposition of this node's
+         connection, one `lfw_ip_endpoint::http::RESPONSE_CAPACITY` staging
+         buffer — about 38 KiB, because a Prometheus exposition of this node's
          whole metric catalogue is that big and a response composed anywhere else
-         could not be retransmitted. That is roughly 50 KiB live, and `init`
-         moves the endpoint into place once, so the peak is about twice it. A
-         quarter of a mebibyte leaves the margin an unmeasured peak needs; it is
-         memory rather than authority, and no other domain's stack moves. -->
-    <protection_domain name="management" priority="2" stack_size="0x40000">
+         could not be retransmitted — and, since recordings became downloadable,
+         one `wire::DOWNLOAD_WINDOW_LEN` window of 32 KiB, which is where a
+         recorder's reply is copied before the transport takes it.
+
+         THE NUMBER DOUBLED BECAUSE THE MEASURED PEAK OVERRAN THE OLD ONE. With
+         the download window added, `init` builds roughly 90 KiB of value and
+         moves it into place twice on the way out of the function, and 0x40000
+         was not enough: the release image faulted the domain with
+         `potential stack overflow, fault address within one page outside of
+         stack region`, and the appliance stopped forwarding. Half a mebibyte
+         leaves the margin an unmeasured peak needs; it is memory rather than
+         authority, and no other domain's stack moves. -->
+    <protection_domain name="management" priority="2" stack_size="0x80000">
         <program_image path="management.elf" />
         <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_fwd_vaddr" />
         <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_free_vaddr" />
@@ -782,6 +1010,8 @@
         <map mr="mgmt_tx_fwd" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_fwd_vaddr" />
         <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_free_vaddr" />
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_pool_vaddr" />
+        <map mr="dl_request" vaddr="0x2_600_000" perms="rw" cached="true" setvar_vaddr="dl_request_vaddr" />
+        <map mr="dl_reply" vaddr="0x2_700_000" perms="r" cached="true" setvar_vaddr="dl_reply_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
@@ -794,6 +1024,7 @@
         <map mr="stats_console" vaddr="0x5_005_000" perms="r" cached="true" setvar_vaddr="stats_console_vaddr" />
         <map mr="stats_config" vaddr="0x5_006_000" perms="r" cached="true" setvar_vaddr="stats_config_vaddr" />
         <map mr="stats_clock" vaddr="0x5_007_000" perms="r" cached="true" setvar_vaddr="stats_clock_vaddr" />
+        <map mr="stats_recorder" vaddr="0x5_008_000" perms="r" cached="true" setvar_vaddr="stats_recorder_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -884,6 +1115,148 @@
         <setvar symbol="tx_pool_paddr" region_paddr="mgmt_tx_pool" />
     </protection_domain>
 
+    <!-- The recorder: the one domain in this system that owns a BLOCK device,
+         and the only one that can put a byte on persistent storage.
+
+         It brings a virtio-blk device up at the pinned function 00:05.0, proves
+         the path to the medium by reading a sector and writing a recognisable
+         one back (`lfw_blk::smoke`), and then idles. What it will do next —
+         encode the tap's observations as pcapng onto a segmented ring, and serve
+         a byte range of that ring back through the download handover — is the
+         next milestone; the regions it needs for both are granted here already,
+         and pds/recorder records which of them its code does not yet read.
+
+         =================================================================
+         WHAT IT MAPS, AND WHY EACH GRANT IS THE NARROWEST ONE THAT WORKS
+         =================================================================
+
+           * ecam3 (rw, uncached) — the 4 KiB configuration page of its one
+             pinned PCI function. It performs no enumeration and holds no other
+             function's page, so a device at any other address on the bus is
+             unreachable from here, exactly as it is from each NIC driver.
+           * bar3 (rw, uncached) — the window its device's BAR is relocated to.
+           * blk_dma (rw, cached) — the virtqueue, the per-request headers and
+             the status bytes the device writes. Driver bookkeeping; no payload.
+           * blk_io (rw, cached) — the staging window every recorded byte passes
+             through. See the note beside that region on why the management
+             domain does not map it.
+           * tap (READ-ONLY) / tap_consume (rw) — the capture ring, mirrored
+             against the forwarder's grant. This domain reads observations and
+             publishes how far it has read; it cannot write one, which is what
+             makes a stored capture the forwarder's testimony rather than this
+             domain's.
+           * dl_request (READ-ONLY) / dl_reply (rw) — the download handover,
+             mirrored against the management domain's grant. It reads what was
+             asked for and writes the answer.
+           * cfg (READ-ONLY) — which interfaces exist and what they are called,
+             for the pcapng interface descriptions a recording has to name.
+             Read-only for the reason every consumer's is: a domain that could
+             write it would rewrite the configuration it is about to be judged by.
+           * clock (READ-ONLY) — what a counter reading means, for the instant
+             every log record and every recorded observation is dated with.
+           * log_recorder (rw) / log_recorder_consume (READ-ONLY) — its own
+             console ring, on the same two-region footing as every other writer.
+           * stats_recorder (rw) — its own shard, which the management domain
+             reads and cannot write.
+
+         =================================================================
+         WHAT STAYS WITHHELD, AND IT IS MOST OF THE SYSTEM (ENG-1, SCM-6)
+         =================================================================
+
+         NO DATAPLANE POOL, of either direction and of either kind — not pool0,
+         not pool1, not mgmt_rx_pool, not mgmt_tx_pool. This is the grant that
+         matters most, because a recording appliance is exactly the component
+         that has a plausible-sounding reason to want one: "to capture a frame
+         you must read the frame". It is refused, and the tap is the answer —
+         what crosses to this domain is an annotation the forwarder composed, so
+         a compromised recorder cannot read a frame in flight, cannot corrupt one
+         under the routing decision that inspected it, and cannot reach the
+         memory a NIC is DMAing into.
+
+         NO `ForwardRings` AND NO `ReturnRing`, of any pipeline. It is not on any
+         frame's path, so it can neither delay one nor forge a buffer return —
+         the move the forwarder itself is refused, for the same reason.
+
+         NO NIC REGION AT ALL: not ecam0..ecam2, not bar0..bar2, not vq0..vq2. A
+         compromised recorder reaches no network device, so an attacker who
+         reaches the domain that owns the disk does not thereby reach the wire.
+         The converse holds by the same rows: no driver maps a block region, so a
+         compromised NIC driver cannot write the medium.
+
+         NO `<ioport>`. The two windows this system grants belong to the console
+         and the clock; this domain holds neither, so `in` and `out` are as
+         unavailable to it as they are to the forwarder and the drivers. A block
+         device reached by port invocation is a device this domain cannot reach.
+
+         NO `cfgack`, on the management domain's terms exactly: it reads the
+         COMMITTED generation to learn the interface names a recording must
+         carry, takes no part in the two-phase commit, cannot delay one, and
+         holds no region an acknowledgement could be forged in.
+
+         NO OTHER DOMAIN'S LOG RING and NO OTHER DOMAIN'S SHARD, in either
+         direction, which is what every writer here is held to.
+
+         PRIORITY 1, EQUAL TO THE DRIVERS AND THE CONSOLE, and for their reason.
+         This domain never leaves `init`: Microkit has no periodic wakeup, it
+         takes no interrupt from its device by design (no MSI-X, no INTx), and it
+         must poll both its request queue and the tap ring, so it busy-loops. At
+         a higher priority it would preempt the dataplane for as long as it held
+         the CPU — and a block completion can be milliseconds away, which is a
+         very long time to hold a forwarder off. Equal to them, seL4 round-robins
+         the four at priority 1 and this domain's share is a slice rather than a
+         stall; the forwarder at 2 and the configuration and clock domains at 3
+         still preempt it.
+
+         What that costs, named rather than left to be measured: a device that
+         withholds a completion cannot be waited on indefinitely here, because
+         waiting is spending a shared timeslice. `lfw_blk::smoke::POLL_BUDGET` is
+         what bounds it — a driver constant, not a device-controlled condition
+         (ENG-4) — and a device that exhausts it parks this domain on a refusal
+         rather than starving the other three.
+
+         STACK 0x8000, the drivers'. This domain holds a sector-sized buffer or
+         two on its stack at a time and nothing like the management domain's
+         response staging: the recording itself lives in `blk_io`, which is a
+         mapped region and not stack.
+
+         `cfg` ALONE CARRIES NO `setvar_vaddr`, AND THAT IS DELIBERATE
+
+         Every other region this domain maps is patched into a symbol the
+         program image declares. `cfg` is not: the recording's interface names
+         come from the configuration document, and the code that reads them is
+         a later change. The Microkit tool refuses a `setvar_vaddr` naming a
+         symbol no program image defines, so the attribute arrives with the code
+         that reads it and never before it — a symbol declared and left unread
+         would be machinery with no consumer (ENG-7). The address is fixed here
+         and the region is granted and mapped at it either way; README's status
+         records what is still deferred.
+
+         THE THREE `setvar region_paddr`s are the physical bases its device is
+         programmed with: the BAR it is relocated to, the DMA region the
+         virtqueue is placed in, and the staging window every data segment names.
+         Unlike a NIC driver, this domain MAPS all three — there is no equivalent
+         of the receive pool it hands over and never dereferences, because it is
+         both the composer and the reader of everything its device transfers. -->
+    <protection_domain name="recorder" priority="1" stack_size="0x8000">
+        <program_image path="recorder.elf" />
+        <map mr="ecam3" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
+        <map mr="bar3" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
+        <map mr="blk_dma" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="dma_vaddr" />
+        <map mr="blk_io" vaddr="0x10_300_000" perms="rw" cached="true" setvar_vaddr="io_vaddr" />
+        <map mr="tap" vaddr="0x2_400_000" perms="r" cached="true" setvar_vaddr="tap_vaddr" />
+        <map mr="tap_consume" vaddr="0x2_500_000" perms="rw" cached="true" setvar_vaddr="tap_consume_vaddr" />
+        <map mr="dl_request" vaddr="0x2_600_000" perms="r" cached="true" setvar_vaddr="dl_request_vaddr" />
+        <map mr="dl_reply" vaddr="0x2_700_000" perms="rw" cached="true" setvar_vaddr="dl_reply_vaddr" />
+        <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" />
+        <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="log_recorder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_recorder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_recorder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+        <setvar symbol="bar_paddr" region_paddr="bar3" />
+        <setvar symbol="dma_paddr" region_paddr="blk_dma" />
+        <setvar symbol="io_paddr" region_paddr="blk_io" />
+    </protection_domain>
+
     <!-- The console domain: the one holder of the serial controller.
 
          =================================================================
@@ -947,7 +1320,7 @@
          prints on boot and on faults, not per record — but it is the reason the
          single-writer claim is stated of the shipped profile.
 
-         WHAT IT MAPS: fourteen log regions in seven pairs, and the perms are the
+         WHAT IT MAPS: sixteen log regions in eight pairs, and the perms are the
          whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
          Each `log_<domain>` is READ-ONLY here: this domain renders those
          records and must read them, and a console that could also write one
@@ -999,6 +1372,8 @@
         <map mr="log_nic_driver2_consume" vaddr="0x4_510_000" perms="rw" cached="true" setvar_vaddr="log_nic_driver2_consume_vaddr" />
         <map mr="log_management" vaddr="0x4_600_000" perms="r" cached="true" setvar_vaddr="log_management_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_610_000" perms="rw" cached="true" setvar_vaddr="log_management_consume_vaddr" />
+        <map mr="log_recorder" vaddr="0x4_700_000" perms="r" cached="true" setvar_vaddr="log_recorder_vaddr" />
+        <map mr="log_recorder_consume" vaddr="0x4_710_000" perms="rw" cached="true" setvar_vaddr="log_recorder_consume_vaddr" />
         <map mr="stats_console" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
@@ -1055,6 +1430,34 @@
     <channel>
         <end pd="config" id="0" notify="true" />
         <end pd="forwarder" id="2" notify="true" />
+    </channel>
+
+    <!-- The download channel, granted in ONE direction only, and the direction
+         is the opposite of every other one-way channel here.
+
+         The RECORDER may signal the MANAGEMENT domain: a download window is
+         ready in `dl_reply`, and that domain is `notified`-driven — it is woken,
+         it drains, it returns — so without the signal it would learn of the
+         answer only when the next frame happened to wake it, which for an
+         operator waiting on a download is a stall of unbounded length.
+
+         THE MANAGEMENT DOMAIN MAY NOT SIGNAL BACK, and that end states
+         notify="false" rather than leaning on Microkit's default of true. The
+         recorder busy-polls `dl_request` on every pass of its loop, exactly as
+         it polls the tap and its own request queue, so a notification would tell
+         it nothing it is not about to read anyway — and a send capability that
+         no path consumes is reach granted for nothing (ENG-1). It would also be
+         a wakeup capability held by the domain an attacker reaches first on the
+         domain that owns the disk, which is authority worth refusing on its own
+         terms even if the recorder ever did block.
+
+         This is the management domain's SECOND end, id 1: id 0 is nic_driver2's
+         channel, where it is likewise the receiver and likewise holds no send
+         capability. So that domain still holds none at all, in this system or on
+         any channel, which is what MANAGEMENT_CHANNEL_ONE_WAY claims. -->
+    <channel>
+        <end pd="recorder" id="0" notify="true" />
+        <end pd="management" id="1" notify="false" />
     </channel>
 
     <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS

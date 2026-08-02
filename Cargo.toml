@@ -19,12 +19,17 @@ members = [
     "crates/tcp",
     "crates/metrics",
     "crates/http",
+    "crates/pcapng",
+    "crates/blk",
+    "crates/capture-ring",
+    "crates/recorder",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",
     "pds/console",
     "pds/clock",
     "pds/management",
+    "pds/recorder",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

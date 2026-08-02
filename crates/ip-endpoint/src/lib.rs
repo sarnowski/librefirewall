@@ -30,7 +30,11 @@
 //!
 //! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
 //! request per connection, answers `GET /metrics` with the Prometheus exposition
-//! its caller renders, answers everything else with a status, and closes. So an
+//! its caller renders, answers a target registered through
+//! [`Endpoint::serve_stream_at`] out of a body supplied a window at a time — it
+//! holds the string and knows nothing behind it, so an appliance serves a
+//! recording off a block device through an endpoint aware of neither — and
+//! everything else with a status, then closes. So an
 //! endpoint carries state between frames and is not `Copy`, and it needs a
 //! clock: with none, a segment is [`Outcome::Unclocked`] and ARP and ICMP go on
 //! as before. A response outgrows one segment by an order of magnitude, so
@@ -41,10 +45,10 @@
 //!
 //! CONCEPT §11 requires the management API to carry encryption, authentication
 //! and read/write authorization through an mTLS certificate pair. None of it
-//! exists: there is no TLS in this appliance, this endpoint authenticates
-//! nobody, and **anything that can reach the management port can read every
-//! metric the node exposes**. `GET /config` and `GET /logs` are absent too and
-//! answer 404 rather than being stubbed (ENG-7). README's status records it.
+//! exists: there is no TLS in this appliance, this endpoint authenticates nobody,
+//! and **anything that can reach the management port can read every metric the
+//! node exposes**, or any registered stream. `GET /config` and `GET /logs` are
+//! absent too and answer 404 rather than being stubbed (ENG-7). README records it.
 //!
 //! # Deliberate narrowness, and what each exclusion costs
 //!
@@ -74,12 +78,12 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_tcp::{ConnectionId, Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
+use lfw_tcp::{Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
 
 /// Re-exported rather than restated: the per-boot secret is obtained by the
 /// protection domain and the segment types are what a *test* composes one out
-/// of, and both reach this crate rather than the transport under it.
-pub use lfw_tcp::{Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber};
+/// of, and all reach this crate rather than the transport under it.
+pub use lfw_tcp::{ConnectionId, Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber};
 use net_headers::{
     ArpError, ArpOperation, ArpPacket, ArpReply, EchoReply, EtherType, Ethernet, IcmpEcho,
     IcmpError, Ipv4Address, Ipv4Frame, Ipv4Packet, MAX_PREFIX_LENGTH, MacAddress, ParseError,
@@ -575,6 +579,38 @@ impl Endpoint {
     /// staging buffer and answers its length.
     pub fn supply_body(&mut self, render: impl FnOnce(&mut [u8]) -> Option<usize>) {
         self.http.supply(render);
+    }
+
+    /// Register `target` as streamed, not `404`. See [`http::Server::serve_stream_at`].
+    pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
+        self.http.serve_stream_at(target)
+    }
+
+    /// The target a request awaits a decision on. See [`http::Server::pending_stream`].
+    #[must_use]
+    pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
+        self.http.pending_stream()
+    }
+
+    /// Answer it with a body of `total` bytes. See [`http::Server::supply_stream`].
+    pub fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+        self.http.supply_stream(total, content_type)
+    }
+
+    /// The window a streamed response needs. See [`http::Server::window_wanted`].
+    #[must_use]
+    pub fn window_wanted(&self) -> Option<(ConnectionId, u64)> {
+        self.http.window_wanted()
+    }
+
+    /// Hand over that window. See [`http::Server::supply_window`].
+    pub fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
+        self.http.supply_window(start, bytes)
+    }
+
+    /// Give up on the streamed response. See [`http::Server::abandon_stream`].
+    pub fn abandon_stream(&mut self) {
+        self.http.abandon_stream();
     }
 
     /// Compose the next segment any connection's response owes, writing it into

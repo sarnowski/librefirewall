@@ -1,0 +1,14 @@
+[package]
+# The geometry and superblock of a segmented recording ring on a block device.
+# It performs no I/O: it decides where bytes go, and the protection domain that
+# owns the device moves them.
+name = "lfw-capture-ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -84,11 +84,32 @@ it was emitted at**, rendered as RFC 3339 — and the records emitted before the
 carry the token `unsynchronized` rather than a fake 1970. It is **not** a trusted time source — see
 the status row above and its detail below.
 
+A seventh domain owns the appliance's **block device** and turns the traffic into a durable record.
+It brings a virtio-blk device up at a pinned PCI function, proves the path to the medium by reading a
+sector and writing a recognisable one back — which the QEMU harness checks by reading that sector off
+the disk image afterwards — and then writes **two pcapng recordings** onto that device: a *log*
+recording snapped to 128 bytes and a *capture* recording snapped to 2048. What it records is what the
+forwarder taps: every frame the router reached a decision about, copied out at the decision point
+*before* the forwarding rewrite, so what reaches the medium is what the wire carried. Either recording
+is downloadable whole over the management port — `GET /logs.pcapng`, `GET /capture.pcapng` — as a
+windowed body, and `tcpdump -r` opens both natively. That domain holds no dataplane pool, no NIC
+region and no I/O port; it is the only domain in the system that can put a byte on persistent
+storage, and the only path between it and the dataplane is a one-way tap ring that can never
+backpressure forwarding. See *[virtio-blk driver](#virtio-blk-driver)* and
+*[Recording and download](#recording-and-download)*.
+
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection tracking
 and no NAT, and the ARP and ICMP that exist belong to the management endpoint alone — the dataplane
 resolves a next hop from a static neighbour table and answers nothing for itself. What exists is a
 router on a firewall's substrate, not yet a firewall.
+
+That absence reaches the recordings, and is the largest gap in them. CONCEPT §15.1 splits the two
+sinks by *what* they record — the log sink connection lifecycle and policy events anchored to their
+causing packet, the capture sink filtered full content. Neither exists: with no connection tracking
+there are no connection events to record, and with no filtering the capture sink is unfiltered and on
+by default. **Today the two recordings differ only in their snap length**, and `/logs.pcapng` is the
+capture truncated to headers rather than an event log.
 
 ### Traffic inspection and enforcement
 
@@ -102,7 +123,7 @@ router on a firewall's substrate, not yet a firewall.
 | L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — [detail](#prometheus-metrics) |
 | OT/industrial protocol inspection | **open** | |
 | DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
-| Mirror port | **open** | |
+| Mirror port | **open** | CONCEPT §15.2 holds the recording sinks and a mirror to be complementary rather than alternatives; the sinks exist, the mirror does not |
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
 | Isolated sign-only CA protection domain | **open** | |
@@ -127,6 +148,26 @@ router on a firewall's substrate, not yet a firewall.
 | Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
 | Proxmox and bare-metal targets | **open** | QEMU only |
 
+### Recording and persistent storage
+
+| Capability | Status | Notes |
+|---|---|---|
+| First-party virtio-blk driver | **partial** | [detail](#virtio-blk-driver) |
+| pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. CONCEPT §15.2's Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — [detail](#recording-and-download) |
+| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no filtering, so the capture sink is unfiltered and on by default — [detail](#recording-and-download) |
+| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, and **no TLS and no authentication in front of them** — [detail](#recording-and-download) |
+| A recording that states its own loss in-band | **open** | `epb_dropcount` is written on every record and is always `0` because nothing feeds it, and no Interface Statistics Block is emitted; loss reaches `/metrics` and never the file — CONCEPT §15.2 |
+| Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — CONCEPT §15.2 |
+| Recording the management port | **open** | only the dataplane is tapped, so nothing on the management port — including a download — is recorded |
+| Retention bound and zeroization | **open** | the only bound is the ring's size; there is no time bound and nothing is erased on stop — CONCEPT §15 |
+| Rotation and checkpointing on a schedule | **open** | a superblock is written when the recorder decides to, never on a clock |
+| Resuming a recording across a boot | **open** | `Sink::resume` exists and is host-tested; nothing calls it, so a reboot starts a fresh ring over the old bytes |
+| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path — CONCEPT §15.4 |
+| Live event stream, OTEL and syslog exporters as ring readers | **open** | CONCEPT §11, §15.4 |
+| Registered Private Enterprise Number | **open** | the annotations are tagged `0xFFFFFFFF`, IANA-reserved so it cannot collide, but not ours — a recording must not leave a customer's premises under it |
+| Storage binding from the configuration document | **open** | the extents are compiled into `lfw_recorder::deck` and the device is the whole of one disk; nothing resolves a partition and no configuration item names one — CONCEPT §12.3, §15.5 |
+| Decryption Secrets Block (inspected flow as ciphertext plus keys) | **open** | nothing is inspected, so there is no key material — CONCEPT §15.2 |
+
 ### High availability
 
 | Capability | Status | Notes |
@@ -145,9 +186,9 @@ router on a firewall's substrate, not yet a firewall.
 | Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](#console-system-state-events) |
-| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists |
-| Prometheus `/metrics` | **partial** | `GET /metrics` answers a 52-family, 208-series exposition covering every protection domain, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](#prometheus-metrics) |
-| Local log buffer (`GET /logs`) | **open** | |
+| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists, and the exporter CONCEPT §11 makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](#prometheus-metrics) |
+| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](#recording-and-download)), a different artifact on a different medium |
 
 ### Lifecycle, boot and trust
 
@@ -155,7 +196,8 @@ router on a firewall's substrate, not yet a firewall.
 |---|---|---|
 | Signed A/B disk image and slot selection | **partial** | [detail](#ab-image-update) |
 | Signature-enforced boot chain (OVMF → GRUB → Multiboot2 → seL4) | **partial** | [detail](#signed-boot-chain) |
-| In-system update/health protection domain | **open** | nothing inside seL4 can write boot state |
+| In-system update/health protection domain | **open** | nothing inside seL4 holds a capability on the **boot** disk, so nothing can write boot state. The recorder's block device is a second, data-only disk and reaches no partition of the boot one — [detail](#ab-image-update) |
+| Configuration, identity or secrets on persistent storage | **open** | one domain now holds a disk capability, but it writes recordings and nothing else; the DATA partition is still an empty unformatted GPT entry with no consumer and no encryption — [detail](#configuration-management) |
 | UEFI Secure Boot enrolment | **open** | manifest records `secure_boot: false` |
 | TPM-backed anti-rollback | **open** | no TPM anywhere, including the QEMU harness |
 
@@ -223,21 +265,31 @@ SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership led
 (the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
 (the pipeline, pool owner and routing stage the protection domains are assembled from).
 
-Correctness is held by 191 unit and property tests across those four crates — including hostile-peer
+Correctness is held by 360 unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
 500,000-frame three-thread pipeline test that cycles every buffer through `rx → route → tx → free`
 far more times than the pool holds, exchanging the forwarding table at poll boundaries as it goes.
 
-A frame is copied twice per hop and never more: once out of the pool into the routing domain's own
-memory, because a decision made on bytes a peer may rewrite underneath it is no decision at all, and
-once back — 34 bytes of header, never the payload.
+A frame is copied twice per hop with the recorder switched out of the picture: once out of the pool
+into the routing domain's own memory, because a decision made on bytes a peer may rewrite underneath
+it is no decision at all, and once back — 34 bytes of header, never the payload.
+
+**The tap makes it three, and adds a second parse.** Every frame the router decides on is copied a
+third time, out of the routing domain's scratch into the tap ring the recorder reads
+([detail](#recording-and-download)) — up to 2048 bytes, the whole frame rather than its header. The
+copy is taken between the decision and the forwarding rewrite, which is what makes a recorded frame
+the one the wire delivered, and the cost of splitting the two is that the rewrite re-parses the frame
+the decision already parsed. Neither cost is measured: `crates/pd-runtime`'s Criterion routing bench
+passes no tap, so what it measures is the path with recording off.
 
 **Missing.**
 
 - No batching API — one descriptor per call, and one notification per drain. CONCEPT §6.1's
   batched notifications are incidental today, not designed.
 - Pool is 64 buffers of 2048 bytes; orders of magnitude short of a 10 Gbit/s working set.
-- Fixed 2048-byte buffers: no jumbo frames, no scatter-gather, no descriptor chaining.
+- Fixed 2048-byte buffers: no jumbo frames, no scatter-gather, and no descriptor chaining **on this
+  path** — `crates/virtio` grew chaining for the block driver's three-segment requests, and no NIC
+  pipeline uses it.
 - Exactly two pipelines, hard-coded in the forwarder PD. No per-core sharding, no multi-queue.
 - No backpressure policy beyond releasing the buffer. A peer that stalls a destination ring makes
   `RouteStage::poll` drop a descriptor it has already dequeued, and the buffer that descriptor
@@ -281,6 +333,234 @@ record and its ring (see *Engineering foundations*).
   parks on, writing `STATUS_FAILED` back to the device wherever the register is reachable. The
   domain is left idle rather than faulted — but nothing restarts it, and the port stays down until
   the node is rebooted.
+
+### virtio-blk driver
+
+A seventh protection domain, `recorder`, owns a virtio-blk device at the pinned PCI function
+00:05.0 and is the only domain in the system that can put a byte on persistent storage. The device
+class is `crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
+state machine over one virtqueue (`request`), and the sector-addressed staging window every data
+segment names (`io`). The split is `nic-driver-core`'s — every decision is in the library where a
+host test can drive it against a stand-in device, and the protection domain is an adapter (LAY-2).
+
+**What it proves today** is that the path reaches a real medium, and it proves it as a
+machine-observable contract rather than as a console line (TEST-13). `lfw_blk::smoke` reads sector 0,
+then writes a 512-byte pattern that names its own target sector to sector 64, waiting for each
+completion before starting the next. The QEMU harness creates a 64 MiB raw image per run, seeds a
+different recognisable pattern into sector 0 before boot, and afterwards reads sector 64 back and
+compares it against `lfw_blk::smoke::witness_pattern` — the appliance's own definition, called
+rather than copied. Every scenario that boots the appliance must show the pattern, and the two A/B
+halt scenarios, where no slot is bootable and no domain runs, must show the sector still zeroed.
+That pair is what makes either verdict evidence.
+
+The console record carries what the device said and what came back:
+
+```
+LFW-PD time=… domain=recorder state=starting
+LFW-PD time=… domain=recorder state=negotiated features=0x100000000
+LFW-PD time=… domain=recorder state=ready sectors=131072 leading=0x444545532d57464c
+```
+
+`sectors` is the device's claimed capacity and `leading` is the first eight bytes it actually
+returned — here the harness's `LFW-SEED` marker, little-endian, which is a second, independent sign
+that the *read* crossed to the medium and not merely to the driver's own staging window.
+
+**Missing:**
+
+- **No flush, no ordering guarantee, and no retry.** `lfw_blk` observes `VIRTIO_BLK_F_FLUSH` and
+  reports whether the device offered it, deliberately without accepting it, and issues no
+  `VIRTIO_BLK_T_FLUSH` at all — so nothing written here is durable across a power cut. The smoke
+  proof refuses and parks rather than retrying a device that answered badly, and a recording whose
+  write the medium failed **acknowledges the loss and advances**: stalling every later record behind
+  a fault that retrying cannot clear would be the worse recording.
+- **A failed transfer reaches no surface.** That loss is counted inside the recorder as
+  `medium_failures`, and that counter is published nowhere — no metric family carries it, no console
+  record states it, and the recording itself says nothing about the sectors it lost, because
+  `epb_dropcount` reports observations the *sink* dropped and not bytes the *device* refused. A
+  medium quietly failing every write is, today, indistinguishable from one that is merely idle.
+- **One device, one extent, no partition.** `systems/qemu-x86_64` declares a single block device and
+  the driver addresses the whole of it. CONCEPT §15.5's per-deployment device count and named-extent
+  binding are untouched.
+- **Nothing is measured.** The staging window is 256 KiB because that is a plausible amount to have
+  in flight, not because a benchmark said so, and there is no Criterion bench on the block path.
+
+### Recording and download
+
+**Partial.** Every frame the router decides on is observed, both recordings are written to the
+medium as pcapng, and either can be downloaded whole over HTTP.
+
+The forwarder taps its own routing stage. `RouteStage` already snapshots each frame into private
+scratch before deciding, so an observation costs one copy into a shared ring and no second read of
+the pool. What is recorded is the frame **as it arrived** — the tap is taken between the router's
+decision and the forwarding rewrite, which costs a second header parse on the forwarding path and
+buys the property that makes a recording usable as evidence: what reaches the medium is what the
+wire carried. Three classes of frame are counted and deliberately absent from a recording, because
+`wire::TapDropReason` mirrors `routing::DropReason` exactly and there is no honest encoding for
+them: a frame no routing decision was reached about (a malformed descriptor, a refused snapshot,
+bytes that are not IPv4 over Ethernet), a frame routed out of a port the stage is not wired to, and
+a frame recorded as forwarded that a later refusal still lost. **The tap never backpressures
+forwarding**: a full ring costs the newest observation and is counted — on both sides of the ring and
+on `/metrics` — because a tap that could stall the dataplane would make an observability feature a
+remote outage.
+
+The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` over
+`lfw_capture_ring`, differing only in extent and snap length:
+
+| Recording | Extent | Segment | Snap length |
+|---|---|---|---|
+| log (`/logs.pcapng`) | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
+| capture (`/capture.pcapng`) | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+
+Sectors 0–2047 are reserved and belong to neither, which is where the harness's seed and the smoke
+proof's witness pattern live. Within each extent the **first segment holds the superblock**, doubled
+and CRC32'd, its two 512-byte copies alternating by generation parity so a torn write never leaves
+the ring without a good one; payload therefore starts one segment in, giving the log recording 15
+payload segments and the capture recording 31. The 256 KiB `blk_io` staging window is carved into a
+64 KiB log buffer, a 128 KiB capture buffer, a 32.5 KiB download read buffer (a 32 KiB window plus
+one sector, so a window can start mid-sector) and a 1 KiB superblock buffer, each sector-aligned, and
+every DMA address is `io_paddr` plus one of those offsets.
+
+Each pass of the recorder's loop settles up to eight completions, drains up to sixteen tap records
+into both recordings, hands the medium whatever is ready, and services at most one download. A
+record a recording cannot take yet is **held**, not dropped: `wire::TapReader` consumes a slot
+irrevocably, so the pass stops drawing new records until both recordings have taken the one in hand.
+Every counter reading is converted to a wall-clock instant here, against the calibration the clock
+domain publishes; before there is one, a record states no instant rather than a counter value
+dressed as a time.
+
+A download pins a snapshot: offset zero seals the named recording, flushes it, and answers with the
+length the response commits to; later offsets are located against that same snapshot, read back off
+the medium, and delivered a window at a time. A ring that wrapped past a reader answers `Overrun`, a
+medium that refused answers `DeviceError`, and either ends the response rather than truncating it
+silently. The management domain drives that from `EndpointStage`'s windowed body, so nothing holds a
+second copy of a megabyte: the recorder answers 32 KiB per round trip, the endpoint copies each into
+a 16 KiB sliding window sized above the transport's retransmit span, and a client that stops reading
+abandons the stream. Serving a body larger than the response staging buffer is what the windowed body
+exists for — a scrape of `/metrics` fits in staging, a 12 KiB recording would too, and a 16 MiB one
+never will.
+
+**What a recording contains.** Each segment opens with a Section Header Block naming
+`librefirewall`, then one Interface Description Block per interface — Ethernet, microsecond
+timestamps, `if_snaplen` the sink's own. Every observation is an Enhanced Packet Block carrying
+`epb_flags` (direction), `epb_dropcount` (the field CONCEPT §15.2 wants the sink's own loss stated in
+— emitted, and always zero, because nothing feeds it), `epb_packetid`, `epb_verdict`, and a
+PEN-tagged custom option holding a layout version, the
+verdict, the drop reason, the interface, the direction and the **configuration generation the
+decision was made under**. A sealed segment is padded to a sector boundary with a Custom Block that
+any reader skips. MONITORING.md's *Recording download endpoints* is the operator-facing statement of
+all of it.
+
+The console names both extents at bring-up, which is the only way an operator learns where a
+recording is — there is no shell and no CLI:
+
+```
+LFW-PD time=… domain=recorder state=ready sectors=131072 leading=0x444545532d57464c
+LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
+LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
+```
+
+**What the gate proves.** Every scenario whose management port is reachable — three of the six —
+boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
+scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
+three to **each other** as well as to the wire: the packet blocks in the two recordings pair 1:1 by
+`epb_packetid`, neither exceeds the record count the recorder publishes for that sink, every
+injected probe appears in the capture byte-identically, and no block carries bytes the harness never
+injected (`tools/xtask/src/surface_contract.rs`). A fault that hides inside any one surface shows up
+as a disagreement between two. The harness walks the downloaded bytes block by block *by the lengths the file
+states* — the discipline a reader actually depends on — and holds each to carrying at least as many
+packet blocks as frames the harness put across the appliance, and to no captured length past the
+sink's snap length. Afterwards it reads the two extents straight off the disk image and requires
+each to carry a decodable superblock and a walkable recording. Two paths to one artifact, neither of
+them the appliance's own account of itself (TEST-13).
+
+**What the demonstration showed.** Separately from the gate, and by hand, the published release disk
+was booted under OVMF with a 64 MiB virtio-blk data device attached at 00:05.0, and 14 routable
+IPv4/UDP frames of 84 to 1384 bytes were injected on dataplane-0 for the appliance to route to
+dataplane-1. This was a one-off: the script and its artifacts live under the ignored `build/` tree
+and are not in the repository, so what is *repeatable* is the `recording-download` scenario above and
+this is corroboration beside it. Over the management port, `curl http://…/logs.pcapng` and
+`curl http://…/capture.pcapng` each returned a whole number of 512-byte sectors — which is the
+padding block doing its job — 3584 and 12288 bytes for that hand-run traffic.
+`tcpdump -r` reads both natively and lists all 14 packets with their real addresses, ports, lengths
+and wall-clock times. An independent parse of the two files established:
+
+- **capture:** captured length equals original length for all 14, and **every frame is byte-identical
+  to the bytes injected** — the whole point of tapping before the rewrite;
+- **log:** captured length clamped to 128 while the original length (84…1384) is preserved, and each
+  is a byte-exact prefix of what was sent;
+- every packet carries `epb_flags`, `epb_packetid` (0…13), `epb_dropcount` (0 throughout) and
+  `epb_verdict`, plus the PEN-tagged annotation, which reported configuration generation 1 — the
+  generation the console had just recorded as applied;
+- both files carry one Section Header Block, two Interface Description Blocks and a trailing padding
+  Custom Block, and the padding is transparent to `tcpdump`;
+- reading the two extents straight off the data-disk image after shutdown yields **exactly the bytes
+  the downloads returned**, so the medium is proved independently of the download path.
+
+**Missing:**
+
+- **No connection tracking, so no connection logs — the sinks differ only in snap length.**
+  CONCEPT §15.1's log sink records connection lifecycle and policy decisions — an open, each
+  refinement of protocol and application identity, notable events, the close — each anchored to the
+  packet that caused it. None of that exists. There are no connection events, no flow identity, no
+  application stack and no deny coalescing, so both recordings hold every dataplane observation and
+  one merely keeps less of each frame. The annotation carries a version byte precisely so the record
+  can grow when they land.
+- **No filtering.** CONCEPT §15.1's capture sink is filtered by design and this one is unfiltered and
+  on by default, which is development state rather than a shipping posture: a deployed node would
+  record every packet crossing it, indefinitely, with no way to say otherwise.
+- **No TLS and no authentication in front of either download.** This is the pre-existing CONCEPT §11
+  deviation ([detail](#full-port-role-model)), and recording makes it far more consequential: it used
+  to expose counters, and it now hands anyone who can reach the management port every packet the
+  appliance recorded. CONCEPT §11 makes authorization a *condition* of the payload exception; the
+  condition is unmet.
+- **One observation per frame.** CONCEPT §15.2's paired ingress and egress observation of one
+  forwarded frame — the thing a mirror port cannot give you — is not emitted: the packet identity
+  that would relate them is minted and monotone, and only the ingress observation is recorded, so
+  every `epb_flags` reads inbound.
+- **Only the dataplane is tapped.** The management port has no tap, so nothing on it — including the
+  download itself — appears in either recording.
+- **Some frames are counted and deliberately not recorded**, because `wire::TapDropReason` mirrors
+  `routing::DropReason` exactly and there is no honest encoding for them: a frame no routing decision
+  was reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
+  that a later refusal still lost. An operator reconciling a recording against `/metrics` subtracts
+  those; MONITORING.md states the reconciliation.
+- **A recording states none of its own loss.** CONCEPT §15.2 makes `epb_dropcount` and an Interface
+  Statistics Block the in-band report of what a sink did not record, and neither carries anything:
+  `Sink::note_drops` exists, is host-tested and fuzzed, and is called by no protection domain, so
+  every `epb_dropcount` written to the medium is `0`; no ISB is emitted at all. A file a burst outran
+  is indistinguishable from one that lost nothing, which is precisely the property the format was
+  chosen for. The loss *is* counted, on `/metrics`, so the numbers exist — they are just not in the
+  artifact that travels.
+- **The PEN is a placeholder.** Annotations are tagged `0xFFFF_FFFF`, IANA-reserved so it can never
+  collide with a real assignment — but it is not GROPYUS's, and a registered Private Enterprise Number
+  is needed before a recording leaves a customer's premises.
+- **The Interface Description Blocks name the port, not the interface.** They carry the literals
+  `port0` and `port1` rather than the configured id `dataplane-0`. The recorder maps the `cfg` region
+  read-only and could use the real names; it does not, and that row is the one `<map>` in the whole
+  system description still carrying no `setvar_vaddr`, because Microkit refuses a symbol no ELF
+  defines.
+- **The extents are compiled in.** `lfw_recorder::deck` fixes both, and the device is the whole of one
+  disk. CONCEPT §15.5's per-deployment device count and named-extent binding are untouched, and no
+  configuration item names either.
+- **No retention bound but the ring's size, and no zeroization.** CONCEPT §15 requires a time bound as
+  well; there is none, so how long a node holds traffic is whatever its ring yields at the offered
+  rate. Nothing is erased when recording stops, and nothing erases an extent on decommission.
+- **Nothing resumes, and nothing rotates or checkpoints on a schedule.** A superblock is written when
+  the recorder decides to — at bring-up and after a segment closes — never on a clock; and no boot
+  reads one back. `Sink::resume` exists and is host-tested and nothing calls it, so a restart begins a
+  fresh ring over the old bytes rather than continuing the segment it left open.
+- **One reader, and no live event stream.** The superblock carries four reader-cursor slots and
+  nothing registers one. CONCEPT §11 and §15.4 make the OTEL exporter, a syslog exporter and an
+  operator console's live event stream readers of this ring; the ring's only reader is the download
+  path.
+- **A download is the whole recording.** No `Range`, no `If-Match`, no `ETag`, and no way to ask for
+  one segment or a time range — CONCEPT §11 asks for a *time range* of a sink. A body over 2 GiB is
+  refused outright rather than served wrong.
+- **Nothing is measured.** There is no Criterion bench on the tap or the recording path, nothing has
+  been measured against CONCEPT §4's 10 Gbit/s target with recording on or off, and the segment size,
+  the staging split and the two drain budgets are plausible numbers rather than measured ones. The tap
+  adds a per-frame copy and a second header parse to the forwarding path
+  ([detail](#zero-copy-dataplane)), and the size of that is unknown.
 
 ### Configuration management
 
@@ -367,7 +647,7 @@ document that shares no address and no MAC with the first.
   it" half of a management API — is implemented, tested, and called by nothing at run time.
 - **No rollback.** CONCEPT §12.2's return to an earlier version does not exist. The datastore holds
   the running configuration and at most one candidate, so there is no version history to roll back
-  *to*; with no persistence and no channel to submit a second document over there could not be one
+  *to*; with no persisted configuration and no channel to submit a second document over there could not be one
   worth holding, every generation but the single one each boot commits being unreachable by
   construction. What is implemented of §12.2's versioning is the part that is reachable: monotonic
   generations, and a content hash beside them that makes re-committing what is already running an
@@ -377,9 +657,12 @@ document that shares no address and no MAC with the first.
   interrupt and no trusted time source anywhere in this system. It also needs a management channel
   to be *protecting* — the failure commit-confirm exists to survive is a commit that severs the
   operator's own access — and there is no such channel to sever.
-- **No persistence.** Nothing inside seL4 holds a disk capability and there is no block driver, so a
-  generation cannot outlive a reboot. The DATA partition, where configuration is meant to live, is
-  an empty unformatted GPT entry (see *[A/B image update](#ab-image-update)*).
+- **No persistence.** A block driver now exists and one domain holds a disk capability
+  ([detail](#virtio-blk-driver)) — but it is the recorder, it writes recordings and nothing else, and
+  it reaches a second data-only device rather than any partition of the boot disk. The configuration
+  domain holds no disk capability, there is no path from it to a medium, and a generation still
+  cannot outlive a reboot. The DATA partition, where configuration is meant to live, remains an empty
+  unformatted GPT entry (see *[A/B image update](#ab-image-update)*).
 - **No distributed rollout.** CONCEPT §12.2's staged commit across an HA pair needs a pair; the
   handover protocol is written for exactly one consumer, and "every consumer has staged" is one
   comparison rather than a conjunction.
@@ -449,7 +732,7 @@ asserts OBS-5 directly: no record the ABI accepts can put a byte outside printab
 rendered console line, and no text value can carry one outside `[a-z0-9-]`, so a hostile peer cannot
 paint terminal escape sequences onto an operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the five system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the six system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected. Both halves were needed to make the defect non-recurring: a missing
@@ -515,7 +798,7 @@ indifferent to whether anything is printed.
 
 ### Console system-state events
 
-**Done.** The five ad-hoc bring-up markers are gone. Call sites in all six protection-domain
+**Done.** The five ad-hoc bring-up markers are gone. Call sites in all seven protection-domain
 binaries emit **typed events** — a closed set of named fields — and rendering happens once, in the
 console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
 site rather than thrown away in a format string, and the structure is what crosses between domains
@@ -541,10 +824,13 @@ judges over every channel at once.
 
 - **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
   no `ready`, no failure — so MONITORING.md's "each stage reporting healthy or the specific fault"
-  holds for the driver, configuration, clock and management domains and not for the one that carries
-  traffic. (The management domain gained a refusal path with its transport: it refuses to start at all
-  when the hardware will not produce a per-boot secret for its sequence numbers, and reports a
-  published calibration it will not use without refusing to run.)
+  holds for the driver, configuration, clock, management and recorder domains and not for the one
+  that carries traffic. (The management domain gained a refusal path with its transport: it refuses
+  to start at all when the hardware will not produce a per-boot secret for its sequence numbers,
+  reports a published calibration it will not use without refusing to run, and — new with the
+  recordings — reports an endpoint that could not register both download targets, again without
+  refusing to run. The recorder reports the medium it found and where each recording lives, which is
+  the only place an operator learns an extent.)
 - **Nothing orders one domain's records against another's.** Within a domain they are totally
   ordered — one writer per ring, drained in the order it wrote them, with non-decreasing instants —
   and a `generation`/`seq` pair totally orders one commit's change records. Across domains there is
@@ -663,10 +949,10 @@ not satisfy it.
 
 **Missing.**
 
-- **No TLS.** HTTP now answers `GET /metrics` ([detail](#prometheus-metrics)), but in the clear:
-  CONCEPT §11 requires mutual TLS on the management interface and there is none, so anyone who can
-  reach the port can scrape it. `/config` and `/logs` do not exist either, so the management plane is
-  one endpoint of the three.
+- **No TLS.** HTTP answers `GET /metrics` ([detail](#prometheus-metrics)) and both recordings
+  ([detail](#recording-and-download)), but in the clear: CONCEPT §11 requires mutual TLS on the
+  management interface and there is none, so anyone who can reach the port can scrape it — and now
+  download every packet the appliance recorded. `/config` and `/logs` do not exist.
 - **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
   there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
@@ -783,8 +1069,8 @@ one.
 
 ### Prometheus metrics
 
-**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 52 metric
-families, 208 series, about 25 KiB — covering every one of the eight protection domains, and the
+**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 74 metric
+families, 253 series, about 32 KiB — covering every one of the nine protection domains, and the
 end-to-end gate scrapes it with `curl` off a booted release image and cross-checks a number in it
 against traffic the harness watched cross the wire itself.
 
@@ -810,7 +1096,7 @@ The decision that shapes it is **one shared-memory counter shard per protection 
 shared table. A shard is a 768-byte, cache-line aligned array of 96 `AtomicU64` slots, mapped
 read-write into the one domain that owns it and read-only into the management domain; slot order is
 the catalogue's series order, asserted statically. So a domain publishes by relaxed store into memory
-nobody else may write, and the management domain renders by reading eight regions — no lock, no
+nobody else may write, and the management domain renders by reading nine regions — no lock, no
 barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are individually
 meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
 last wrote; that is stated as a freshness boundary in MONITORING.md rather than papered over.
@@ -903,8 +1189,9 @@ after stamping, and that no domain's instants go backwards.
 
 ### Protection-domain decomposition
 
-**Done.** Eight protection domains from six binaries (one forwarder, one configuration domain, one
-console, one clock, one management endpoint, three driver instances of one driver binary) with real,
+**Done.** Nine protection domains from seven binaries (one forwarder, one configuration domain, one
+console, one clock, one management endpoint, one recorder, three driver instances of one driver
+binary) with real,
 verifiable least
 privilege: the
 forwarder holds no device capability at all
@@ -913,15 +1200,25 @@ second
 time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two pipelines.
 Each pipeline is three memory regions rather than one precisely so that those grants can differ; the
 forwarder maps the buffer pools, because a domain that rewrites a header must reach the bytes. The
+recorder is the mirror of that argument in the other direction: it is the only domain that reaches
+the block device — its ECAM page, BAR, DMA region and staging window are mapped by nothing else — and
+it maps no pool, no ring, no NIC region and no port, so the domain that owns the disk reaches no
+frame and the domains that move frames reach no medium. What crosses between them is a tap ring
+carrying annotations rather than packets, mirrored in perms so neither end can forge the other's
+half. The
 configuration domain's entire grant is two 4 KiB regions: no device, no pool, no ring, so the domain
 that parses attacker-supplied XML cannot reach a frame or a NIC. Those two regions are one per
 direction, and their perms are the argument — the forwarder maps the handover **read-only**, so it
 cannot rewrite the configuration it is about to be judged by, and the publisher maps the
 acknowledgement read-only, so it cannot forge the consent that releases its own generation.
 
-Four notification channels. The three driver channels are granted in **one direction only** — a driver
+Five notification channels. The three driver channels are granted in **one direction only** — a driver
 may signal its consumer, and that consumer's send capability on the driver does not exist rather
-than merely going unexercised. The fourth, between the configuration domain and the forwarder, is the
+than merely going unexercised. The recorder's channel to the management domain is one-directional
+too, and in the opposite sense: the recorder may announce a download window, and the management
+domain may not signal back, because the recorder busy-polls its request region and a send capability
+it does not need is one it must not hold. The fifth, between the configuration domain and the
+forwarder, is the
 one granted in **both**, and stated as a decision at both ends rather than inherited from Microkit's
 default: applying a configuration is a two-phase commit and each phase is a signal the other end
 cannot infer. The forwarder therefore holds exactly one send capability in the whole system, on the
@@ -1091,15 +1388,18 @@ forwarded and GRUB's halt record on the channel.
 
 **Missing.**
 
-- **The in-system update/health PD.** No component inside seL4 holds a disk capability, so the
-  health flag (`*_OK`) is only ever set by the build seed or the test harness. The confirm half of
-  the try/confirm cycle does not exist at runtime.
+- **The in-system update/health PD.** No component inside seL4 holds a capability on the **boot**
+  disk, so the health flag (`*_OK`) is only ever set by the build seed or the test harness. The
+  confirm half of the try/confirm cycle does not exist at runtime. The recorder's disk capability is
+  no help here and deliberately so: it names a second, data-only device at a different PCI function,
+  and nothing in the system can reach ESP, STATE, SLOT_A, SLOT_B or DATA once seL4 is running.
 - No staged installation into the inactive slot.
 - No multi-attempt counter (GRUB is single-attempt by design; the counter belongs to the missing PD).
 - No redundant, torn-write-safe boot state — a single `grubenv` block. A torn block is *detected*
   and refused, but there is no second copy to fall back to, so the outcome is a halt.
 - The DATA partition, where configuration, identity and secrets are meant to live, is an empty
-  unformatted GPT entry with no consumer and no encryption.
+  unformatted GPT entry with no consumer and no encryption — unchanged by the recorder, which writes
+  to a separate device entirely.
 
 ### Signed boot chain
 
@@ -1138,11 +1438,11 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the sixteen library crates, `xtask`, and all six protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage; measured 99.39% combined, weakest crate `routing` at 98.41%. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build |
-| QEMU end-to-end gate (five system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
-| Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back); `nic-driver-core`'s poll pass is a hot path with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | thirteen persistent targets, between them covering every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-two library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded AGENTS.md TEST-3 reason for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| QEMU end-to-end gate (six system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets (BLD-3) — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the three scenarios that reach the management endpoint judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; not a CI gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
@@ -1171,7 +1471,7 @@ prefix-length rule from `ConfigImage::check`, and the port-range rule from `crat
 fails the seed-corpus smoke test on the committed seed named after it, so the corpus alone catches a
 lost rule with no live fuzzing at all.
 
-**Live fuzzing is conditional.** All thirteen targets always build under AddressSanitizer, and the
+**Live fuzzing is conditional.** Every target always builds under AddressSanitizer, and the
 seed-corpus smoke tests always run. Whether libFuzzer can actually *execute* is established once per
 run by an explicit probe, the hermetic builder being able to stop ASan before it starts. When the
 probe passes, every subsequent non-zero exit is treated as a finding and fails the gate. When it
@@ -1192,7 +1492,8 @@ From a clean checkout:
 ```sh
 make image          # build the OCI builder, then assemble the release A/B disk + bundle
 make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
-make test-system    # boot five QEMU scenarios: forwarding, generation swap, alternate config, two metrics scrapes
+make test-system    # boot six QEMU scenarios; the three with a reachable endpoint judge metrics,
+                    #   logs and captures against each other and against the wire
 make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
 ```
 
@@ -1330,9 +1631,11 @@ enabled for every download. Do not commit the certificate.
 `make release` runs the complete acceptance gate and **boots nothing of its own**. It has nothing
 left to boot: `ci` already assembles the production-oriented Microkit release configuration into
 `dist/` and already holds that disk to both contracts a booted appliance owes — the forwarding
-contract on all five system scenarios and all eight A/B scenarios, the `LFW-CFG` transcript and
-the clock's established-time record on two of them, and a `curl` scrape of `/metrics` on two more —
-each judged against the configuration document its own image was built from. What `make release` adds is the other half of
+contract on all six system scenarios and all eight A/B scenarios, the `LFW-CFG` transcript and
+the clock's established-time record on two of them, a `curl` scrape of `/metrics` on two more, and a
+`curl` of both recordings — parsed as pcapng, then re-read straight off the data disk — on the
+sixth. Each is judged against the configuration document its own image was built from. What
+`make release` adds is the other half of
 BLD-3: if the gate did not prove the artifact, `dist/` is emptied rather than left holding an
 unproven image that looks finished. That covers a failure anywhere in the run, not a failed boot
 alone, because assembly populates `dist/` partway through and an incomplete release is no more

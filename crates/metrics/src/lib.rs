@@ -80,7 +80,8 @@ pub use sample::{
     CLOCK_SLOTS, CONFIG_SLOTS, CONSOLE_SLOTS, ClockSample, ConfigSample, ConsoleSample,
     DRIVER_SLOTS, DriverSample, EndpointSample, FORWARDER_SLOTS, ForwarderSample, HTTP_STATUSES,
     HttpSample, LogSample, MANAGEMENT_SLOTS, ManagementSample, PIPELINES, PipelineSample,
-    PoolSample, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, TcpSample, UartSample,
+    PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RecorderSample,
+    SINKS, SinkSample, TapSample, TcpSample, UartSample,
 };
 
 /// Counter slots one shard carries.

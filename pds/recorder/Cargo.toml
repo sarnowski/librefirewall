@@ -1,0 +1,24 @@
+[package]
+# The protection domain that owns the appliance's block device. `recorder.elf`,
+# named in `systems/qemu-x86_64/librefirewall.system`.
+name = "recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sel4-microkit.workspace = true
+virtio = { path = "../../crates/virtio" }
+lfw-blk = { path = "../../crates/blk" }
+# The recording pass: where each recording lives, how a segment rolls, and how a
+# download is pinned and answered. Everything this domain decides is there.
+lfw-recorder = { path = "../../crates/recorder" }
+# Its geometry refusals, which reach the console as numbers.
+lfw-capture-ring = { path = "../../crates/capture-ring" }
+lfw-log = { path = "../../crates/log" }
+lfw-metrics = { path = "../../crates/metrics" }
+pd-runtime = { path = "../../crates/pd-runtime" }
+wire = { path = "../../crates/wire" }
+
+[lints]
+workspace = true

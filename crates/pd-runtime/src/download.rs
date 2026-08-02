@@ -1,0 +1,302 @@
+//! The management domain's side of a recording download: turning a `GET` of a
+//! recording into windows of a body it reads out of the recorder, one round
+//! trip at a time.
+//!
+//! # Adversary
+//!
+//! CONCEPT §7.1's **management-plane attacker** in front and a **byzantine
+//! peer protection domain** behind. The attacker chooses when and how often to
+//! ask; nothing here allocates, waits or retries on their account, and a pass
+//! with no window yet does nothing and comes back. The recorder chooses every
+//! byte of the answer: `wire::download` refuses a reply that is not this
+//! request's, longer than the window, or longer than what was asked for, and
+//! what survives that is a byte range handed to the transport unread. Nothing
+//! in this crate parses a recording.
+//!
+//! # Why a body is a window and not a buffer
+//!
+//! A recording is megabytes and the domain that serves it has kilobytes. The
+//! transport therefore asks for the range it is about to send
+//! (`EndpointStage::stream_wanted`), this module asks the recorder for exactly
+//! that range, and the answer is copied straight into the transport's sliding
+//! window. Nothing here holds a second copy of the body, and nothing holds any
+//! of it between passes.
+
+use wire::{
+    DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply,
+    DownloadRequest, DownloadRequester, DownloadSink, PendingDownload,
+};
+
+use crate::endpoint::EndpointStage;
+
+/// The streamed-response half of an HTTP endpoint, as a download needs it.
+///
+/// A trait rather than the concrete stage for [`crate::tap::Tap`]'s reason in
+/// reverse: driving a real endpoint to the point of a pending stream is a TCP
+/// handshake and a parsed request, so the interesting states — a transport that
+/// asks for a range out of order, one that refuses the window it asked for, one
+/// that has no stream at all — are hours of protocol away there and one call
+/// away against a fake. The connection identity is deliberately absent: a
+/// recording is the same bytes whoever asked, and the endpoint holds one stream
+/// at a time.
+pub trait Stream {
+    /// The target a request is awaiting a decision on.
+    fn pending_stream(&self) -> Option<&'static str>;
+    /// Commit to a body of `total` bytes. `false` where the endpoint would not
+    /// begin one.
+    fn begin_stream(&mut self, total: u64, content_type: &str) -> bool;
+    /// The body offset the transport is waiting for.
+    fn stream_wanted(&self) -> Option<u64>;
+    /// Hand over the window starting at `start`. `false` where the endpoint
+    /// would not take it.
+    fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool;
+    /// Give up on the response in progress.
+    fn abandon_stream(&mut self);
+    /// Take this module's counters, so the domain's shard carries them without
+    /// the protection domain having to route a second value into it.
+    fn note_downloads(&mut self, counters: DownloadCounters);
+}
+
+impl Stream for EndpointStage<'_> {
+    fn pending_stream(&self) -> Option<&'static str> {
+        Self::pending_stream(self).map(|(_, target)| target)
+    }
+
+    fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+        Self::begin_stream(self, total, content_type)
+    }
+
+    fn stream_wanted(&self) -> Option<u64> {
+        Self::stream_wanted(self).map(|(_, offset)| offset)
+    }
+
+    fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
+        Self::supply_window(self, start, bytes)
+    }
+
+    fn abandon_stream(&mut self) {
+        Self::abandon_stream(self);
+    }
+
+    fn note_downloads(&mut self, counters: DownloadCounters) {
+        Self::note_downloads(self, counters);
+    }
+}
+
+/// The request target of each recording, as a client asks for it.
+///
+/// A `&'static str` pair rather than a lookup table, because
+/// `EndpointStage::serve_stream_at` takes exactly this and a target registered
+/// under one name and matched under another would answer 404 to the only two
+/// paths this appliance serves.
+pub const LOG_TARGET: &str = "/logs.pcapng";
+pub const CAPTURE_TARGET: &str = "/capture.pcapng";
+
+/// What a recording is served as. pcapng has no registered media type, and a
+/// browser that guessed at one would render an evidence artifact as text.
+const CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Saturating, monotone counts for MONITORING.md.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownloadCounters {
+    /// Streams begun — one per `GET` of a recording that the recorder answered.
+    pub started: u64,
+    /// Windows handed to the transport.
+    pub windows: u64,
+    /// Body bytes those windows carried.
+    pub bytes: u64,
+    /// Streams given up on, by whatever ended them: a refusal, a reply that
+    /// could not be believed, or a transport that would not take the window.
+    pub abandoned: u64,
+}
+
+/// Which recording a target names, or `None` for a target that is not one.
+#[must_use]
+pub fn sink_for(target: &str) -> Option<DownloadSink> {
+    match target {
+        LOG_TARGET => Some(DownloadSink::Log),
+        CAPTURE_TARGET => Some(DownloadSink::Capture),
+        _ => None,
+    }
+}
+
+/// A request out to the recorder, and what its answer is for.
+struct Outstanding {
+    pending: PendingDownload,
+    offset: u64,
+    /// True for the offset-zero request that opens a response: its answer
+    /// carries the length the response commits to, so it is the only one that
+    /// may begin the stream.
+    opening: bool,
+}
+
+/// The download half of the management endpoint.
+pub struct Downloads<'chan> {
+    requester: DownloadRequester<'chan>,
+    outstanding: Option<Outstanding>,
+    /// The recording the stream in progress is being read out of. Held because
+    /// `EndpointStage::stream_wanted` answers an offset and not a target: the
+    /// target was decided when the stream began.
+    serving: Option<DownloadSink>,
+    /// The window a reply is copied into before the transport takes it. A field
+    /// rather than a local because it is 32 KiB and a protection domain's stack
+    /// is not where that belongs.
+    window: [u8; DOWNLOAD_WINDOW_LEN],
+    counters: DownloadCounters,
+}
+
+impl<'chan> Downloads<'chan> {
+    /// Take the asking side of the channel — once per domain; a second would
+    /// restart at sequence zero and reuse numbers the first has outstanding
+    /// (`wire::DownloadRequest::requester`).
+    #[must_use]
+    pub const fn attach(request: &'chan DownloadRequest, reply: &'chan DownloadReply) -> Self {
+        Self {
+            requester: request.requester(reply),
+            outstanding: None,
+            serving: None,
+            window: [0; DOWNLOAD_WINDOW_LEN],
+            counters: DownloadCounters {
+                started: 0,
+                windows: 0,
+                bytes: 0,
+                abandoned: 0,
+            },
+        }
+    }
+
+    /// Register both recordings as streamed targets, so a `GET` of either is a
+    /// body this domain produces rather than a 404.
+    ///
+    /// Answers whether both were taken; a `false` means the endpoint's target
+    /// table is full, which is a build fact rather than a run-time condition.
+    pub fn register(&self, stage: &mut EndpointStage<'_>) -> bool {
+        stage.serve_stream_at(LOG_TARGET) && stage.serve_stream_at(CAPTURE_TARGET)
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> DownloadCounters {
+        self.counters
+    }
+
+    /// One bounded pass: claim a reply if one has arrived, and ask for the next
+    /// window if the transport is waiting on one.
+    ///
+    /// Never blocks and never spins. A pass with nothing to do returns having
+    /// done nothing, which is the whole of the contract with the event loop:
+    /// the recorder notifies this domain when a reply lands.
+    pub fn poll(&mut self, stage: &mut impl Stream) {
+        self.claim(stage);
+        self.ask(stage);
+        stage.note_downloads(self.counters);
+    }
+
+    /// Look once for the answer to the outstanding request.
+    fn claim(&mut self, stage: &mut impl Stream) {
+        let Some(Outstanding {
+            pending,
+            offset,
+            opening,
+        }) = self.outstanding.take()
+        else {
+            return;
+        };
+        match self.requester.poll(pending, &mut self.window) {
+            DownloadPoll::Outstanding(pending) => {
+                self.outstanding = Some(Outstanding {
+                    pending,
+                    offset,
+                    opening,
+                });
+            }
+            DownloadPoll::Delivered { bytes, total_len } => {
+                // The length is committed to before a byte of body is offered,
+                // so a response that could not state its own length is never
+                // begun rather than begun and truncated.
+                if opening && !stage.begin_stream(total_len, CONTENT_TYPE) {
+                    self.abandon(stage);
+                    return;
+                }
+                if opening {
+                    self.counters.started = self.counters.started.saturating_add(1);
+                }
+                if bytes.is_empty() {
+                    // The end of the body. `supply_window` of nothing would
+                    // tell the transport nothing, and the stream completes on
+                    // the length it was begun with.
+                    return;
+                }
+                if stage.supply_window(offset, bytes) {
+                    self.counters.windows = self.counters.windows.saturating_add(1);
+                    self.counters.bytes = self.counters.bytes.saturating_add(bytes.len() as u64);
+                } else {
+                    // The transport asked for a range and would not take it:
+                    // the two have come apart, and a stream that cannot be
+                    // completed is given up rather than left half-sent.
+                    self.abandon(stage);
+                }
+            }
+            // Every one of these ends the response. `Overrun` is a reader the
+            // traffic outran, `DeviceError` a medium that refused, and the
+            // others a recorder that has nothing to serve — none is a state a
+            // retry improves, and a client sees a truncated body rather than a
+            // wrong one.
+            DownloadPoll::Refused { reason, .. } => {
+                let _: DownloadRefusal = reason;
+                self.abandon(stage);
+            }
+            DownloadPoll::Faulted(fault) => {
+                let _: DownloadFault = fault;
+                self.abandon(stage);
+            }
+        }
+    }
+
+    /// Ask for whatever the transport is waiting on, if nothing is out.
+    fn ask(&mut self, stage: &mut impl Stream) {
+        if self.outstanding.is_some() {
+            return;
+        }
+        if let Some(target) = stage.pending_stream() {
+            let Some(sink) = sink_for(target) else {
+                // A target registered as streamed that this module has no
+                // recording for: a build inconsistency, answered rather than
+                // left hanging.
+                self.abandon(stage);
+                return;
+            };
+            self.serving = Some(sink);
+            self.request(sink, 0, true);
+            return;
+        }
+        let Some(offset) = stage.stream_wanted() else {
+            return;
+        };
+        let Some(sink) = self.serving else {
+            // A window wanted for a stream this module did not begin. Nothing
+            // can serve it, so the response is ended rather than stalled.
+            self.abandon(stage);
+            return;
+        };
+        self.request(sink, offset, false);
+    }
+
+    fn request(&mut self, sink: DownloadSink, offset: u64, opening: bool) {
+        let pending = self.requester.request(sink, offset, DOWNLOAD_WINDOW_LEN);
+        self.outstanding = Some(Outstanding {
+            pending,
+            offset,
+            opening,
+        });
+    }
+
+    fn abandon(&mut self, stage: &mut impl Stream) {
+        self.counters.abandoned = self.counters.abandoned.saturating_add(1);
+        self.serving = None;
+        self.outstanding = None;
+        stage.abandon_stream();
+    }
+}
+
+#[cfg(test)]
+mod tests;

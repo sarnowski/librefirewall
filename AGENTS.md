@@ -354,10 +354,25 @@ The decisions that constrain all observability code:
 - **Metrics** are exposed in **Prometheus format only** (OBS-3), with bounded cardinality (no
   per-flow, per-connection or per-packet labels) and no measurable dataplane cost.
 - **No distributed tracing** (OBS-4) — deliberately out of scope.
-- Observability surfaces never carry packet payloads, secrets, keys, or personal data (OBS-5).
-- `/metrics`, `/config`, `/logs` and the console are the **complete** debug surface (OBS-7). Adding
-  another introspection mechanism — a debug endpoint, a side channel, a diagnostic dump — changes
-  the product's attack surface and requires a CONCEPT change, not a commit.
+- Observability surfaces never carry packet payloads, secrets, keys, or personal data (OBS-5), **with
+  one named exception: the two recording sinks of CONCEPT §15**, which exist to carry the traffic
+  itself — the capture sink its payloads, the log sink the L2–L4 headers of the packet each event is
+  anchored to. CONCEPT §11 states the exception rather than tolerating it, and states its bounds with
+  it, which is what keeps this a rule and not a hole. Those bounds are conditions on the code:
+  - **It reaches exactly two artifacts.** The console, the Prometheus exposition, the OTEL log stream
+    and the local log buffer carry no payload and no secret, absolutely and without exception. A
+    payload that reaches one of those is a CRITICAL finding whatever the recording does.
+  - **A recording is authorized, never merely scraped.** It is a download gated by the management
+    plane's authentication and authorization, not an open endpoint beside `/metrics`.
+  - **An inspected flow is recorded as ciphertext plus its keys** (CONCEPT §15.2), never as decrypted
+    plaintext at rest. A sink writing plaintext of an inspected flow widens the exception and is a
+    CRITICAL finding.
+  - **Neither sink is a licence for a third.** Widening the exception to another surface, or adding a
+    sink, is a CONCEPT change under OBS-7 and not a commit.
+- `/metrics`, `/config`, `/logs`, the two recording downloads (`/logs.pcapng`, `/capture.pcapng`) and
+  the console are the **complete** debug surface (OBS-7). Adding another introspection mechanism — a
+  debug endpoint, a side channel, a diagnostic dump — changes the product's attack surface and
+  requires a CONCEPT change, not a commit.
 
 ## Build interface
 
@@ -533,6 +548,56 @@ booted in release form is not a guarantee.
   ENG-5's *safe rejection* of hostile input — rejecting an attacker's malformed frame is correct
   operation and is counted, not escalated; swallowing an internal error is a defect either way.
 
+## Interrogating a running appliance
+
+A booted node has no shell, no CLI and no debugger (CONCEPT §11). Everything you can learn about
+one, it tells you through four surfaces, and they are not a reporting afterthought — they are the
+**instrument**, and the only one. Reason about a running system through them rather than about it
+from the source.
+
+They answer different questions, and the order is almost always the same:
+
+| Surface | Answers | Reach it with |
+|---|---|---|
+| `GET /metrics` | **that** something is wrong, and where — which counter moved, in which domain | `curl` through the port forward |
+| `GET /capture.pcapng` | **which packet** — the frames themselves, with the firewall's verdict on each | `curl`, then `tcpdump -r` or Wireshark |
+| `GET /logs.pcapng` | **which observations**, at header fidelity and far more of them per byte | the same |
+| the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `build/image/` |
+
+A counter is a summary and a capture is evidence. When a dataplane question is open — is the frame
+arriving, is it being parsed, is the verdict what the table says, is the rewrite right — **download
+the recording and look at the packets**. Deducing it from a counter is slower and is frequently
+wrong, because a counter can only tell you that something in a category happened.
+
+**Use them while developing, not only at the end.** A capture answers "did my change do what I think
+it did" in one boot, against the shipped artifact, with the bytes in front of you. Every QEMU
+scenario now leaves its downloads at `build/image/qemu-<scenario>-{logs,capture}.pcapng` and its
+serial output beside them, so after any `make test-system` run the evidence is already on disk and
+costs nothing to read.
+
+The three HTTP surfaces are also **cross-checkable, and that is where they earn the most**. The
+recorder's own record counts, the packet blocks in each recording, and the frames the harness put on
+the wire all describe one traffic stream from three independent vantage points, so a fault that
+hides inside any one of them shows up as a disagreement between two. `xtask::surface_contract` holds
+them to exactly that on every management-reachable scenario; when you add a surface, add its
+agreement with the others rather than a second isolated smoke check.
+
+Two rules follow, and they are the point of this section:
+
+- **ENG-14 — Verify a behavioural change against the running appliance's own surfaces, not against
+  unit tests alone.** A change to the dataplane, the recording path, a protection domain's
+  lifecycle, or any exposed signal is verified by observing a booted node: scrape the metrics,
+  download the recording, read the console. Unit and property tests prove the logic; these prove the
+  system. "The gate is green" is necessary and is not this.
+- **ENG-15 — When the question is about packets, read the packets.** Do not settle a dataplane
+  question from a counter when a capture can answer it, and do not report a dataplane behaviour as
+  verified on the strength of a counter alone. Where a capture cannot reach the question, say so
+  explicitly rather than substituting the weaker evidence silently.
+
+The same instrument serves debugging and reporting. If you cannot show the behaviour on one of these
+surfaces, you have not observed it — you have inferred it, and the difference belongs in what you
+tell the reader.
+
 ## Definition of Done
 
 The author's bar. A change is done when, from a clean checkout:
@@ -546,10 +611,14 @@ The author's bar. A change is done when, from a clean checkout:
    (DOC-7).
 3. **README's status table is updated** where the change alters what works (STA-1), and
    **MONITORING.md** where it alters an exposed signal (OBS-6).
-4. The author has run the reviewer checklist below against their own change, and no CRITICAL or
+4. A behavioural change has been **observed on a running node**, not only tested: the metric that
+   should have moved has moved, the packets that should be in the recording are in it, and the
+   console says what it should (ENG-14, ENG-15). Where the change is not observable on any surface,
+   the author says so rather than leaving the reader to assume it was.
+5. The author has run the reviewer checklist below against their own change, and no CRITICAL or
    MAJOR finding remains.
 
-A green gate satisfies step 1 only. Steps 2–4 are the part the gate cannot see.
+A green gate satisfies step 1 only. Steps 2–5 are the part the gate cannot see.
 
 ## Reviewing a change
 
@@ -575,7 +644,10 @@ produce comparable output.
 8. **Residue.** **ENG-6** (no compatibility path), **ENG-7** (no dead code, stub, `TODO`), **LAY-2**
    (no correctness logic that drifted into a PD).
 9. **Signals.** **OBS-1..OBS-5, OBS-7** if anything is logged, counted, or exposed.
-10. **Verdict.** Report every finding as one line:
+10. **Observation.** **ENG-14/ENG-15** — did the author observe the change on a running node, or
+    only test it? For a dataplane change, ask for the capture. `build/image/` holds the last run's
+    recordings and serial output, so this costs a `tcpdump -r`, not a re-run.
+11. **Verdict.** Report every finding as one line:
 
     ```
     <RULE-ID> <CRITICAL|MAJOR|MINOR> <file>:<line> — <what is wrong, in one clause>
@@ -673,6 +745,8 @@ a command finds *candidates*, not violations — it makes the review reproducibl
 | ENG-11 | `unsafe` is confined to crates that genuinely need it (MMIO, DMA, shared-memory ABI) | MAJ | REVIEW · `rg -l 'unsafe' crates/` |
 | ENG-12 | Never paper over a failure with a silent fallback, default, or swallowed error; log with detail and return a typed error | CRIT | REVIEW · `rg -n -e unwrap_or -e 'let _ =' -e '.ok()' crates/ pds/` |
 | ENG-13 | Per-crate `unsafe` block count MUST NOT rise without human approval; every `unsafe` block mandates a DOC-6 claim the compiler cannot check | MAJ | GATE · `xtask test` (unsafe-count ratchet) |
+| ENG-14 | A behavioural change is verified by observing a booted node — metrics scraped, recording downloaded, console read — not by unit tests alone | MAJ | REVIEW · `build/image/qemu-*-{logs,capture}.pcapng`, `qemu-*.log` |
+| ENG-15 | A dataplane question is answered from a capture, not from a counter; where a capture cannot reach it, say so | MAJ | REVIEW · `tcpdump -r build/image/qemu-*-capture.pcapng` |
 
 ### LAY — repository layout
 
@@ -716,6 +790,6 @@ a command finds *candidates*, not violations — it makes the review reproducibl
 | OBS-2 | Logs are structured OpenTelemetry only; no syslog | MAJ | REVIEW |
 | OBS-3 | Metrics are Prometheus only, bounded cardinality (no per-flow/connection/packet labels), no measurable dataplane cost | CRIT | REVIEW · label sets in the exposition |
 | OBS-4 | No distributed tracing | MIN | REVIEW |
-| OBS-5 | No surface carries packet payloads, secrets, keys, or personal data | CRIT | REVIEW · every added log field and label |
+| OBS-5 | No surface carries packet payloads, secrets, keys, or personal data — **except** CONCEPT §15's two recording sinks, which exist to carry traffic; they stay authorized-download-only and record an inspected flow as ciphertext plus keys, and every other surface stays absolute | CRIT | REVIEW · every added log field and label; every write reaching a sink |
 | OBS-6 | A change to an exposed signal updates MONITORING.md in the same change | MAJ | REVIEW · diff touches `MONITORING.md` |
-| OBS-7 | `/metrics`, `/config`, `/logs` and the console are the complete debug surface; a new introspection mechanism needs a CONCEPT change | CRIT | REVIEW |
+| OBS-7 | `/metrics`, `/config`, `/logs`, `/logs.pcapng`, `/capture.pcapng` and the console are the complete debug surface; a new introspection mechanism — or a third payload-bearing sink — needs a CONCEPT change | CRIT | REVIEW |

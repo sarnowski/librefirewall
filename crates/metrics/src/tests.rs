@@ -351,6 +351,11 @@ fn a_shard_round_trips_a_published_sample() {
         generation: 1,
         images_applied: 1,
         images_refused: 0,
+        tap: TapSample {
+            observed: 51,
+            dropped: 52,
+            refused: 53,
+        },
         log: LogSample {
             dropped: 2,
             refused: 3,
@@ -877,5 +882,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 30_632);
+    assert_eq!(MAX_EXPOSITION_LEN, 39_018);
 }

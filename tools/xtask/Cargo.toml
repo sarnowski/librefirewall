@@ -63,6 +63,21 @@ lfw-metrics = { path = "../../crates/metrics" }
 # the curl scenario compares fields against the appliance's own vocabulary
 # rather than against literals beside it.
 lfw-http = { path = "../../crates/http" }
+# The block driver's three region extents, which `sysdesc` compares the
+# recorder's grants against, and — for the QEMU harness — the sector and the
+# pattern its boot-time proof commits to the data disk. The harness reads that
+# sector back and compares it byte for byte against `lfw_blk::smoke`'s own
+# definition, so the appliance and the thing judging it cannot come to disagree
+# about what was written: the drift every dependency above exists to close.
+lfw-blk = { path = "../../crates/blk" }
+# Where each recording lives on the medium and how much of a frame it keeps.
+# `data_disk` reads those extents straight off the disk image after a run and
+# `recording_contract` judges a downloaded body against the same snap lengths,
+# so the appliance's placement and the thing judging it are one statement.
+lfw-recorder = { path = "../../crates/recorder" }
+# The superblock the recorder writes at the head of each extent, decoded off
+# the disk image with the appliance's own decoder rather than a copy of it.
+lfw-capture-ring = { path = "../../crates/capture-ring" }
 
 [lints]
 workspace = true

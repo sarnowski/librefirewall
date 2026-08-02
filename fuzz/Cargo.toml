@@ -43,6 +43,14 @@ cargo-fuzz = true
 #   virtio          the device's PCI config space and virtqueue
 #   pd-runtime      the inter-PD pool-ownership protocol
 #   nic-driver-core the driver paths facing both the device and the peer
+#   lfw-recorder    the recording pass and the sink under it, where the tap's
+#                   annotations, a download's offset and the medium's
+#                   completions all meet
+#   lfw-capture-ring the superblock read back off that medium, and the ring a
+#                   decoded one is resumed into
+#   lfw-pcapng      the block encoders those two write through: a frame's
+#                   length on the wire and an annotation's bytes are the
+#                   network's and a peer's, and both become a length field
 [dependencies]
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
@@ -61,6 +69,22 @@ packet-buffer = { path = "../crates/packet-buffer" }
 virtio = { path = "../crates/virtio" }
 pd-runtime = { path = "../crates/pd-runtime" }
 nic-driver-core = { path = "../crates/nic-driver-core" }
+# The block device class: every byte it reads is a device's, so TEST-7 owes it
+# a target — the used-ring index decides which slot's status byte is read.
+lfw-blk = { path = "../crates/blk" }
+# The recording pass and the ring under it: the tap's annotations, a download's
+# offset and a superblock read back off the medium are all somebody else's
+# bytes, so TEST-7 owes both a target.
+lfw-recorder = { path = "../crates/recorder" }
+lfw-capture-ring = { path = "../crates/capture-ring" }
+# The encoder those two write through. It parses nothing, which is why it was
+# once left off this list — but TEST-7 is owed by a crate that *interprets*
+# bytes it did not write, and this one interprets two: the frame length the wire
+# stated and the annotation bytes a peer PD chose, both of which become a length
+# field and a padding run. A length that steered a write here would be a write
+# to a block device from the one domain holding its capability, so it gets a
+# target of its own rather than being reached incidentally through the pass.
+lfw-pcapng = { path = "../crates/pcapng" }
 
 # This workspace is standalone, so the root workspace's `[workspace.lints]` does
 # not reach it and its lint policy has to be stated here. `unused_must_use` is
@@ -95,6 +119,41 @@ bench = false
 [[bin]]
 name = "virtqueue_poll"
 path = "fuzz_targets/virtqueue_poll.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blk_requests"
+path = "fuzz_targets/blk_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcapng_encode"
+path = "fuzz_targets/pcapng_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_superblock"
+path = "fuzz_targets/capture_superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_sink"
+path = "fuzz_targets/recorder_sink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recording_pass"
+path = "fuzz_targets/recording_pass.rs"
 test = false
 doc = false
 bench = false

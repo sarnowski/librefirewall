@@ -36,6 +36,7 @@
 
 use crate::sample::{
     ClockSample, ConfigSample, ConsoleSample, DriverSample, ForwarderSample, ManagementSample,
+    RecorderSample,
 };
 
 /// Whether a series is a monotonic total or a value that may move in either
@@ -136,6 +137,21 @@ pub const ROUTE_STAGE_DROPS: Metric = metric(
     "librefirewall_route_stage_drops_total",
     Kind::Counter,
     "Frames the routing stage refused around the router's own decision.",
+);
+
+// ── The recording tap, on the forwarder that fills it ───────────────────────
+
+pub const TAP_OBSERVATIONS: Metric = metric(
+    "librefirewall_tap_observations_total",
+    Kind::Counter,
+    "Frame observations the forwarder published to the recorder.",
+);
+
+pub const TAP_OBSERVATIONS_LOST: Metric = metric(
+    "librefirewall_tap_observations_lost_total",
+    Kind::Counter,
+    "Observations the tap could not publish; `ring_full` is the recorder falling behind, \
+     `inconsistent` is ours and expected to stay zero.",
 );
 
 // ── Configuration, on both of its readers ───────────────────────────────────
@@ -425,6 +441,131 @@ pub const HTTP_SLOTS_EXHAUSTED: Metric = metric(
     "Connections the server had no slot for; ours, the tables being one size, expected to stay zero.",
 );
 
+// ── The recorder and its block device ───────────────────────────────────────
+
+pub const BLOCK_CAPACITY_SECTORS: Metric = metric(
+    "librefirewall_block_capacity_sectors",
+    Kind::Gauge,
+    "Sectors the block device claimed at bring-up; the bound every range is judged against.",
+);
+
+pub const BLOCK_REQUESTS: Metric = metric(
+    "librefirewall_block_requests_total",
+    Kind::Counter,
+    "Block requests the device completed successfully, by operation.",
+);
+
+pub const BLOCK_BYTES: Metric = metric(
+    "librefirewall_block_bytes_total",
+    Kind::Counter,
+    "Bytes those requests moved, as the driver derived them rather than as the device claimed.",
+);
+
+pub const BLOCK_STATUS_UNDECODABLE: Metric = metric(
+    "librefirewall_block_status_undecodable_total",
+    Kind::Counter,
+    "Completions whose status byte was none of the three virtio-blk defines; the device's fault.",
+);
+
+// ── The two recordings the recorder writes ──────────────────────────────────
+
+pub const RECORDING_RECORDS: Metric = metric(
+    "librefirewall_recording_records_total",
+    Kind::Counter,
+    "Observations encoded into a recording, by sink.",
+);
+
+pub const RECORDING_RECORD_BYTES: Metric = metric(
+    "librefirewall_recording_record_bytes_total",
+    Kind::Counter,
+    "Bytes those records occupy, padding excluded.",
+);
+
+pub const RECORDING_RECORDS_DROPPED: Metric = metric(
+    "librefirewall_recording_records_dropped_total",
+    Kind::Counter,
+    "Observations a sink could not encode, by why; every one is a gap the recording states.",
+);
+
+pub const RECORDING_SEGMENTS_CLOSED: Metric = metric(
+    "librefirewall_recording_segments_closed_total",
+    Kind::Counter,
+    "Segments sealed and rolled past, by sink.",
+);
+
+pub const RECORDING_WRAPS: Metric = metric(
+    "librefirewall_recording_wraps_total",
+    Kind::Counter,
+    "Times a ring returned to its first segment, evicting the oldest history it held.",
+);
+
+pub const RECORDING_SECTORS_WRITTEN: Metric = metric(
+    "librefirewall_recording_sectors_written_total",
+    Kind::Counter,
+    "Sectors of a recording the device acknowledged.",
+);
+
+pub const RECORDING_PADDING_BYTES: Metric = metric(
+    "librefirewall_recording_padding_bytes_total",
+    Kind::Counter,
+    "Bytes of pcapng padding written to keep every device write a whole sector.",
+);
+
+pub const RECORDING_TAP_RECORDS: Metric = metric(
+    "librefirewall_recording_tap_records_total",
+    Kind::Counter,
+    "Observations the recorder drained from the tap ring.",
+);
+
+pub const RECORDING_TAP_REFUSED: Metric = metric(
+    "librefirewall_recording_tap_refused_total",
+    Kind::Counter,
+    "Tap annotations the recorder would not decode; the forwarder's fault, expected to stay zero.",
+);
+
+pub const RECORDING_TAP_DROPPED_BY_WRITER: Metric = metric(
+    "librefirewall_recording_tap_dropped_by_writer_total",
+    Kind::Counter,
+    "Observations the forwarder says the ring had no slot for; its claim about itself.",
+);
+
+pub const RECORDING_DOWNLOADS: Metric = metric(
+    "librefirewall_recording_downloads_total",
+    Kind::Counter,
+    "Download windows the recorder answered, by whether it served bytes or refused.",
+);
+
+pub const RECORDING_RECORDS_UNCLOCKED: Metric = metric(
+    "librefirewall_recording_records_unclocked_total",
+    Kind::Counter,
+    "Records placed before any calibration was published, so the recording states no instant \
+     for them rather than a counter reading.",
+);
+
+pub const RECORDING_DOWNLOAD_OVERRUNS: Metric = metric(
+    "librefirewall_recording_download_overruns_total",
+    Kind::Counter,
+    "Downloads the ring wrapped past mid-read, by sink; a reader the traffic outran.",
+);
+
+pub const RECORDING_STREAMS: Metric = metric(
+    "librefirewall_recording_streams_total",
+    Kind::Counter,
+    "Recording downloads the management endpoint began, and those it gave up on part-sent.",
+);
+
+pub const RECORDING_STREAM_WINDOWS: Metric = metric(
+    "librefirewall_recording_stream_windows_total",
+    Kind::Counter,
+    "Windows of a recording handed to the transport.",
+);
+
+pub const RECORDING_STREAM_BYTES: Metric = metric(
+    "librefirewall_recording_stream_bytes_total",
+    Kind::Counter,
+    "Body bytes those windows carried.",
+);
+
 // ── The console and its device ──────────────────────────────────────────────
 
 pub const CONSOLE_RECORDS: Metric = metric(
@@ -462,6 +603,8 @@ pub const ALL_METRICS: &[&Metric] = &[
     &FORWARDED_FRAMES,
     &ROUTE_DROPS,
     &ROUTE_STAGE_DROPS,
+    &TAP_OBSERVATIONS,
+    &TAP_OBSERVATIONS_LOST,
     &RECEIVE_FRAMES,
     &RECEIVE_BYTES,
     &TRANSMIT_FRAMES,
@@ -499,6 +642,26 @@ pub const ALL_METRICS: &[&Metric] = &[
     &HTTP_EXPOSITIONS_REFUSED,
     &HTTP_RETRANSMITS_UNAVAILABLE,
     &HTTP_SLOTS_EXHAUSTED,
+    &BLOCK_CAPACITY_SECTORS,
+    &BLOCK_REQUESTS,
+    &BLOCK_BYTES,
+    &BLOCK_STATUS_UNDECODABLE,
+    &RECORDING_RECORDS,
+    &RECORDING_RECORD_BYTES,
+    &RECORDING_RECORDS_DROPPED,
+    &RECORDING_SEGMENTS_CLOSED,
+    &RECORDING_WRAPS,
+    &RECORDING_SECTORS_WRITTEN,
+    &RECORDING_PADDING_BYTES,
+    &RECORDING_TAP_RECORDS,
+    &RECORDING_TAP_REFUSED,
+    &RECORDING_TAP_DROPPED_BY_WRITER,
+    &RECORDING_DOWNLOADS,
+    &RECORDING_DOWNLOAD_OVERRUNS,
+    &RECORDING_RECORDS_UNCLOCKED,
+    &RECORDING_STREAMS,
+    &RECORDING_STREAM_WINDOWS,
+    &RECORDING_STREAM_BYTES,
     &CONSOLE_RECORDS,
     &UART_BYTES_WRITTEN,
     &UART_TRANSMITTER_TIMEOUTS,
@@ -528,10 +691,14 @@ pub struct ShardSpec {
 
 /// Shards this system has, in the fixed order a snapshot holds them: the
 /// forwarder, the three driver instances, the management endpoint, the console,
-/// the configuration publisher and the clock.
+/// the configuration publisher, the clock and the recorder.
 ///
 /// One per protection domain and no exceptions, which is what makes "every
 /// writing domain's own drop counters are exposed" true rather than nearly true.
+///
+/// A new shard is APPENDED. The order **is** the ABI a snapshot is read through
+/// (`pd_runtime::StatsRegions`), so one inserted in the middle re-numbers every
+/// shard after it and attributes one domain's numbers to another.
 pub const SHARDS: [ShardSpec; SHARD_COUNT] = [
     ShardSpec {
         domain: "forwarder",
@@ -565,12 +732,16 @@ pub const SHARDS: [ShardSpec; SHARD_COUNT] = [
         domain: "clock",
         series: ClockSample::SERIES,
     },
+    ShardSpec {
+        domain: "recorder",
+        series: RecorderSample::SERIES,
+    },
 ];
 
 /// How many shards a snapshot carries. A build fact — the system description
 /// declares one region per protection domain — and `xtask::sysdesc` holds the
 /// description to it from the other side.
-pub const SHARD_COUNT: usize = 8;
+pub const SHARD_COUNT: usize = 9;
 
 /// Where the forwarder's shard sits in [`SHARDS`], for the cross-check the QEMU
 /// gate makes against traffic it observed itself.

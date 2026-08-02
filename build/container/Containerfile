@@ -216,15 +216,30 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
       : > "$stub/lib.rs"; \
       : > "$stub/main.rs"; \
     done < /tmp/manifests.list; \
-    # Explicit bench and fuzz-target files so target validation during fetch
-    # sees them (the manifests declare `[[bench]]`/`[[bin]]` paths).
-    for bench in crates/queue/benches/ring crates/packet-buffer/benches/pool crates/virtio/benches/virtio; do \
-      mkdir -p "$(dirname "$bench")"; \
-      : > "$bench.rs"; \
-    done; \
-    mkdir -p fuzz/fuzz_targets; \
-    : > fuzz/fuzz_targets/find_virtio_caps.rs; \
-    : > fuzz/fuzz_targets/virtqueue_poll.rs; \
+    # Bench and fuzz-target files, so target validation during fetch sees them:
+    # a manifest declaring `[[bench]]` or `[[bin]]` is held to the file, and the
+    # sources themselves are excluded from this context by containerignore.
+    #
+    # DERIVED FROM THE MANIFESTS, never listed. Three hand-written lists lived
+    # here and every one of them went stale the moment a crate gained a bench —
+    # invisibly, because this layer is cached until a manifest changes, so the
+    # failure surfaced on some later, unrelated edit as `can't find <name> bench`
+    # in a crate that edit never touched. Reading the declarations is what makes
+    # a new bench or fuzz target need no edit here, which is the same property
+    # containerignore's wildcards give the `COPY` above.
+    while IFS= read -r manifest; do \
+      dir="$(dirname "$manifest")"; \
+      awk '/^\[\[bench\]\]/{inb=1;next} /^\[/{inb=0} inb && $1=="name"{gsub(/"/,"",$3); print $3}' "$manifest" \
+      | while IFS= read -r bench; do \
+          mkdir -p "$dir/benches"; \
+          : > "$dir/benches/$bench.rs"; \
+        done; \
+    done < /tmp/manifests.list; \
+    awk '/^\[\[bin\]\]/{inb=1;next} /^\[/{inb=0} inb && $1=="path"{gsub(/"/,"",$3); print $3}' fuzz/Cargo.toml \
+    | while IFS= read -r target; do \
+        mkdir -p "fuzz/$(dirname "$target")"; \
+        : > "fuzz/$target"; \
+      done; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked; \
     SSL_CERT_FILE="$ca_bundle" cargo fetch --locked --manifest-path fuzz/Cargo.toml; \
     sysroot="$(rustc --print sysroot)/lib/rustlib/src/rust/library/sysroot/Cargo.toml"; \

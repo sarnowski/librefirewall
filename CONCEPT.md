@@ -313,7 +313,13 @@ unit. Four roles exist:
   neutral: a pair may equally carry east-west traffic between two internal zones. A deployment has
   one or more dataplane pairs.
 - **Mirror port** — an optional, egress-only port that emits a copy of selected traffic to an
-  external capture/IDS system.
+  external capture/IDS system. It is **complementary to the on-box recording sinks (§15), not an
+  alternative to them**: a mirror moves traffic off the box at full rate but can annotate none of
+  it, cannot render several interfaces into one artifact, and costs both a spare port and a
+  dedicated machine able to absorb the mirrored rate; the sinks record annotated,
+  verdict-bearing evidence on the box and need neither. A deployment that wants full-rate capture
+  on dedicated hardware uses the mirror; one that wants to know why the appliance did what it did
+  uses the sinks; a deployment may want both.
 
 ### 9.2 NIC configurations
 
@@ -403,6 +409,7 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   | `GET /metrics` | Metrics in Prometheus format |
   | `GET /config` | Read the current running configuration (XML) |
   | `GET /logs` | Read the most recent structured log records held in the node's local buffer |
+  | Recording download | Retrieve a time range of either recording sink (§15) as a pcapng file |
   | Configuration change | The candidate/commit-confirmed workflow of §12: submit a candidate, validate, commit (with commit-confirmed), confirm, and roll back to a previous version |
 
   Configuration is never changed by a single unqualified write; every change goes through the
@@ -419,7 +426,9 @@ Azure support is a substantial platform effort rather than a single NIC driver �
 - **Logs:** emitted as **structured OpenTelemetry logs** to an external receiver — the single log
   transport; syslog is not used. Audit logs (management/user actions), traffic logs, and
   per-subsystem logs are OTEL-only. System-state events (see *Console*) are additionally written to
-  the console.
+  the console. Connection and policy events are not composed for the wire: they are written to the
+  log sink (§15.1) and the OTEL exporter is one reader of that ring (§15.4), which is what lets a
+  collector that was unreachable catch up rather than lose them.
 - **Local log buffer:** the node retains a **bounded ring of its most recent structured log
   records** and exposes it via `GET /logs`. External OTEL collection is routinely delayed by minutes
   and can be unavailable outright, and there is no shell — so without this ring there is no way to
@@ -427,6 +436,20 @@ Azure support is a substantial platform effort rather than a single NIC driver �
   debugging surface, not a log archive: bounded, deliberately lossy (overflow is dropped and
   counted, and the drop count is exposed), and bound by the same rule as every other surface — no
   payloads, secrets, or personal data.
+- **Recording:** the two pcapng sinks (§15) are retrieved through the management API as pcapng
+  files, over the same mTLS-authenticated, authorized and rate-limited surface as everything else,
+  and a **live event stream** for an operator console — another reader of the log ring (§15.4) —
+  is developed later. This is the one surface bounded by storage rather than by memory, and the
+  only one that carries the traffic itself.
+- **The recording sinks are a deliberate exception to the no-payload rule, not an oversight in
+  it.** Every other surface named here is barred from carrying packet payloads, and that bar
+  stands unchanged: metrics, logs, the local log buffer, and the console carry none. The capture
+  sink exists precisely to carry them and the log sink carries packet headers by construction —
+  recording the evidence *is* the feature, and a capture that omitted the payload would not be
+  one. The exception is therefore scoped and stated: it applies to these two sinks and to nothing
+  else, it is why they are gated by an authorization decision rather than merely scraped, and it
+  is why an inspected flow is recorded as ciphertext plus its keys (§15.2) rather than as
+  decrypted plaintext at rest.
 - **Console:** carries **system state only** — the startup sequence and its success/failure, and
   runtime configuration changes (an interface brought up, a MAC reconfigured, a config version
   applied). It never carries traffic or per-request data. It is the last-resort survivability
@@ -434,9 +457,10 @@ Azure support is a substantial platform effort rather than a single NIC driver �
 - **No distributed tracing.** OpenTelemetry is used for structured logs only; tracing — including
   of the management API — is deliberately out of scope.
 - **The exposed interfaces are the complete debug surface.** There is no shell, no CLI, and no
-  other introspection mechanism. Scraping `GET /metrics`, reading `GET /config`, and tailing
-  `GET /logs` once yields the entire observable state of a node — applied configuration, every
-  metric around it, and what it has just been doing — which is, by design, all that is available to
+  other introspection mechanism. Scraping `GET /metrics`, reading `GET /config`, tailing
+  `GET /logs`, and downloading the recording sinks once yields the entire observable state of a
+  node — applied configuration, every metric around it, what it has just been doing, and the
+  recorded evidence of what it did to traffic — which is, by design, all that is available to
   debug it. The externalized logs and metrics are therefore a first-class operator contract,
   specified in **MONITORING.md**.
 - **Management application:** configuration management, log analysis, and metric analysis are
@@ -501,22 +525,28 @@ rollout is a **two-phase "stage & validate" → "commit"** process:
 
 The line between what needs a new image and what is applied at runtime is drawn at **hardware**:
 
-- **Hardware topology is static.** The set of physical devices the system drives — the NICs and
-  their PCI addressing, and the protection domains, memory regions, and capabilities that follow
-  from them — is fixed in the Microkit system description at build time (§6.1). Changing it (adding
-  a NIC, moving to a different NIC count) is a **different image**, delivered through the A/B update
-  mechanism (§14). Hardware reconfiguration of a running system is not supported; each hardware
-  configuration of §9.2 is a build-time image variant.
+- **Hardware topology is static.** The set of physical devices the system drives — the NICs and the
+  block devices (§15.5), their PCI addressing, and the protection domains, memory regions, and
+  capabilities that follow from them — is fixed in the Microkit system description at build time
+  (§6.1). Changing it (adding a NIC, moving to a different NIC count, giving a node a device to
+  record onto) is a **different image**, delivered through the A/B update mechanism (§14). Hardware
+  reconfiguration of a running system is not supported; each hardware configuration of §9.2 is a
+  build-time image variant.
 - **Everything above the hardware is dynamic.** Interface configuration and upwards is applied
   through the commit workflow without a restart: whether a present interface is used at all, its
   role, mode (§6.4) and addressing, zones, filtering rules, routes, NAT bindings, inspection policy,
-  and every other policy object. A port a deployment does not need is administratively disabled by
-  configuration, not omitted from a build.
+  which recording sinks are enabled and what they filter (§15), and every other policy object. A
+  port a deployment does not need is administratively disabled by configuration, not omitted from a
+  build.
 
 Two consequences follow, and both simplify the design:
 
-- **A configuration change never requires a reboot.** Commit-confirmed (§12.1) therefore always
-  operates within one running system, and its rollback timer never has to survive a restart.
+- **A configuration change never requires a reboot to be committed.** Exactly one item defers its
+  *effect*: storage binding — which extent a recording ring occupies (§15.5) — is committed like
+  any other item but takes hold at the next boot, because moving a ring invalidates what the old
+  extent holds. The commit itself remains an operation on the running system, so commit-confirmed
+  (§12.1) still operates within one running system and its rollback timer still never has to
+  survive a restart.
 - **A hardware change is an image change**, so it is governed by the A/B slot mechanism's own
   try/confirm/fallback semantics (§14.2) rather than by the configuration workflow. The two
   mechanisms stay separate and each keeps its own safety property intact.
@@ -529,8 +559,9 @@ built for a given hardware configuration serves every deployment sharing that ha
 
 ## 13. Open Items and Risks
 
-Everything above is the settled target picture. The following are, respectively, decisions not yet
-made and known risks. They are recorded here so they are not mistaken for oversights.
+Everything else in this document is the settled target picture. The following are, respectively,
+decisions not yet made and known risks. They are recorded here so they are not mistaken for
+oversights.
 
 ### 13.1 Open decisions
 
@@ -569,6 +600,18 @@ made and known risks. They are recorded here so they are not mistaken for oversi
 - **FPU/SIMD in protection domains.** Dataplane PDs run without FPU/SSE state. Sustaining
   checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU context for the
   relevant PDs or staying scalar — a design constraint to resolve when performance work begins.
+- **Full-rate capture of everything is not reachable, and the filter is the sizing control.** A
+  capture sink (§15.1) recording all traffic at the target rate would have to sustain writes at the
+  dataplane's own rate, which no practical device does and which would consume the medium's write
+  endurance in short order. The sink is therefore sized by its filter rather than by the link, and
+  a filter drawn too broadly yields loss. The loss is reported in-band and is measurable (§15.2,
+  §15.4) rather than silent, which is the mitigation available — but it remains loss, and choosing
+  filters narrow enough is an operational discipline the appliance can measure and cannot impose.
+- **The throughput target and the recording sinks compete for one memory-bandwidth budget.**
+  Copying frames into a ring and writing them out draws on the same bandwidth the inspection path
+  (§4) is already sized to consume. How much recording the target rate can carry is unmeasured, and
+  it is the class of cost that does not appear until both run at once — so it belongs to the same
+  early benchmarking as the crypto provider and the signature engines.
 ---
 
 ## 14. Software Update & Secure Boot
@@ -588,10 +631,19 @@ The deployable artifact is a GPT disk image (`librefirewall-qemu-x86_64.img`) wi
 | **STATE** | Mutable boot-selection state (`grubenv`) |
 | **SLOT_A** | A complete signed release: seL4 kernel + Microkit system image (+ detached signatures) |
 | **SLOT_B** | The second release slot, identical structure |
-| **DATA** | Reserved for configuration, identity, and secrets (§11, §12) |
+| **DATA** | The node's own state — configuration, identity, and secrets (§11, §12) — and nothing that grows with traffic |
 
 Each slot is self-contained because x86 Microkit boots a separate seL4 kernel ELF plus the Microkit
 system image as a Multiboot2 module — both must be present and version-matched in the slot.
+
+**This table describes the boot medium, not the whole of a node's storage.** Configuration and
+identity are written in bytes per day and belong here, so that a node carries everything it needs to
+come up as itself. The recording rings (§15) do not: a capture ring rewrites its medium
+continuously, its write-endurance profile is not comparable to configuration's, and a single
+sequential writer per device is what obtains a device's bandwidth. Rings are therefore bound to
+their own devices or partitions, resolved at boot (§15.5), and how many devices a build drives is
+part of its static topology (§12.3) — so a deployment target's storage is this layout plus whatever
+that variant grants it to record onto.
 
 ### 14.2 Boot manager and slot selection
 
@@ -650,3 +702,158 @@ UEFI+GRUB imposes hand-off constraints that shape the boot chain:
 - **Virtualised/cloud targets** (Proxmox, Azure) are expected to use image/generation replacement at
   the hypervisor or load-balancer level rather than guest-managed A/B, reusing the same signed
   release and compatibility contract.
+
+---
+
+## 15. Recording and Persistent Storage
+
+The appliance keeps its own durable record of the traffic it handled, on block storage it owns, in a
+format an analyst opens without conversion. For the connection and policy events of §11 this is not
+a second copy beside the log transport but the source beneath it: what is written here is what the
+exporters ship onward, and it is what remains when nothing is listening.
+
+### 15.1 Two sinks, one format
+
+Two independent pcapng streams are written, and the split between them is the design:
+
+- **The log sink** is always on, covers every interface, and applies no filter. It records
+  connection lifecycle and policy decisions — a connection opening, each refinement of its protocol
+  and application identity, notable events on it such as a threat or a policy deny, and its close —
+  and anchors every one of them to the packet that caused it, carrying that packet's L2–L4 headers
+  and nothing beyond them. It is **breadth**: every connection the appliance saw, for as long as its
+  ring holds.
+- **The capture sink** is filtered and records full packet content. It is **depth**: everything about
+  a little.
+
+Anchoring a log record to its causing packet, rather than composing an abstract event beside it, is
+what makes the log open natively in a pcapng reader: the record renders as a packet list with real
+addresses and ports, sortable and filterable with the tools an analyst already has, and needing no
+bespoke viewer. A policy may raise the evidence length for the events it generates, up to the full
+frame, where what was decided is worth more than the headers it was decided on.
+
+The two sinks are the same encoder, the same ring machinery, and the same download path; only the
+ring differs. They are **separate rings because their rates differ by three to four orders of
+magnitude** — one record per connection against one per packet — and a traffic burst must not be
+able to evict connection history.
+
+### 15.2 pcapng as the internal representation
+
+pcapng is the representation on the medium, not a format the appliance converts to on export. It is
+chosen because it carries more than packets, and a format that carried only packets would force a
+second, parallel record beside them that no reader could relate back:
+
+- An **Interface Description Block per NIC** lets one file record every interface, so a single
+  artifact holds both sides of a forwarded flow rather than one file per port.
+- **`epb_packetid`** correlates the ingress and egress observations of one forwarded frame, so the
+  rewrite the appliance applied — translation (§6.5), re-origination (§6.2) — is a relation between
+  two records instead of something an analyst infers by comparing tuples.
+- **`epb_flags`** carries direction and **`epb_verdict`** the verdict, so what the appliance decided
+  sits on the packet it decided about.
+- A **PEN-tagged Custom Option** carries the structured firewall state for which the format has no
+  standard field: zone pair, flow identity, policy identity, application protocol stack, decryption
+  status, and risk. A reader that does not know the option ignores it and still sees a valid capture.
+- **`epb_dropcount`** and the **Interface Statistics Block** report the sink's own loss in-band, so
+  a file is self-describing about what it did not record. A capture that silently omits is worse
+  than one that states how much it omitted, because only the second can be reasoned about.
+- A **Decryption Secrets Block** carries the TLS key material for the flows in the file, so an
+  inspected capture is ciphertext plus keylog rather than plaintext at rest — which is what keeps
+  the payload exception of §11 as narrow as it can be made.
+
+**A mirror port is not a substitute for this, and neither replaces the other** (§9.1). A mirror
+emits copies of frames and can annotate none of them: it cannot say within one artifact which
+interface a frame crossed, cannot attach the verdict or the flow's application identity, and cannot
+report what it dropped. It also costs a spare port and a dedicated machine able to absorb the
+mirrored rate. The two are complementary — the mirror for full-rate capture off the box onto
+hardware built for it, the sinks for annotated recording on the box with no additional equipment.
+
+### 15.3 Append-only events, and reduction as a reader's view
+
+The rings are **append-only**: a record, once written, is never rewritten. That is what makes the
+writer sequential and cheap and lets a reader work from any point without coordinating with it, and
+it dictates how the appliance represents a thing that changes.
+
+A connection's identity is discovered progressively — first the transport, then that it is TLS, then
+HTTP/2, then the application protocol carried over it. Each refinement is **a new event carrying the
+complete protocol stack as then known**, never a delta against an earlier one. Two properties are
+worth that duplication: every event is interpretable on its own, without the reader having seen its
+predecessors; and the refinement history is itself evidence, because *when* the appliance learned
+what a connection was is frequently the question being asked.
+
+The merged one-row-per-connection view an operator usually wants is therefore **a fold over the
+events sharing a flow identity, performed by a reader** — never a mutable table the appliance
+maintains. Such a table would have to be updated in place, which an append-only medium does not do
+and a partly-evicted ring could not reconcile. Because every event carries the five-tuple and the
+stack current at the time, **a flow whose earlier events have already been evicted still reduces to
+a usable record**, and a periodic state event re-anchors long-lived connections so a reader's
+reconstruction window is bounded rather than growing with a connection's age.
+
+**Flow identity is an (index, generation) pair, never a bare connection-table index.** Slots in the
+connection table are reused as connections come and go; across a ring holding hours of history a
+bare index would silently merge two unrelated connections that happened to occupy one slot at
+different times — and the merge would be invisible, since the reduced record would look ordinary and
+be wrong. The generation counter makes reuse explicit and the merge impossible.
+
+**Log events derive from connection-state transitions, not from packet arrival.** The log's rate is
+therefore bounded by the rate at which connections are admitted rather than by the packet rate,
+which is what keeps it usable under exactly the conditions it is wanted in: a SYN flood that
+produced a record per packet would evict the entire connection history in seconds and blind the log
+at the moment of the attack. Policy denies create no connection and so have no transition to hang
+on; they are **coalesced at their source into counted per-bucket events** for the same reason — a
+port scan must cost a bounded number of records, not one per probe.
+
+### 15.4 One writer, many readers
+
+Each ring has **exactly one writer and any number of independent readers**, each holding its own
+cursor. The ring is the single durable copy; a reader is a position in it, not a copy of it. The
+readers are the pcapng download of the management API, the OpenTelemetry exporter that ships
+connection events onward (§11), and a live event stream for an operator console. None is privileged;
+adding one adds a cursor and nothing else.
+
+Three properties follow, and they are the reason for the shape:
+
+- **A collector that was unreachable catches up rather than losing data.** External collection is
+  routinely delayed and can be unavailable outright (§11); with the ring as the durable copy an
+  exporter resumes from its cursor instead of dropping what it could not send.
+- **A slow or dead reader costs the dataplane nothing.** The writer always wins: it never waits, and
+  a reader that has been overtaken detects this on its next read and reports a gap. Loss is
+  therefore not merely bounded but *measurable* — the gap is the distance by which the cursor was
+  overtaken, a number rather than a suspicion.
+- **Delivery to an external collector is at-least-once.** A cursor advances only after the data is
+  accepted, so a failure between the two replays rather than skips. Exactly-once would require the
+  collector to participate in the appliance's commit, which is not a dependency an inline firewall
+  takes on for the sake of avoiding a duplicate.
+
+**Reader cursors live in the ring's own superblock**, so the medium carries the data and the delivery
+state together. A node that restarts, or one that falls back to its other slot (§14.2), resumes every
+reader where it stood without a separate store that could disagree with the ring.
+
+**Rings are segmented** into fixed-size units, each beginning with its own Section Header Block and
+the full interface set. Any one segment is independently parseable; any contiguous run of segments
+is itself a valid pcapng file; a reader that has lost its place resynchronises at the next boundary
+instead of scanning; and wrap replaces a whole segment rather than tearing one. The operational
+consequence is that **a download of a time range is a byte-range read off the device with no
+transformation** — the appliance does not parse, re-encode, or reassemble to serve one, so an
+analyst pulling a window costs what reading it costs.
+
+### 15.5 Storage devices and binding
+
+Block devices are reached by a **first-party virtio-blk driver protection domain, one instance per
+device** — the same pattern as the NIC drivers, where one driver binary serves several ports as
+separate PDs (§6.3, §9.4). A ring's **extent** is either a whole device or a named partition on one,
+resolved at boot.
+
+**How many devices exist, and the capabilities each driver PD holds over them, is fixed in the
+system description** and is therefore a per-deployment-target image variant, exactly as the NIC
+count is (§9.2, §12.3). Which object lives on which extent is runtime configuration.
+
+**Rate classes are deliberately not mixed.** Configuration and identity are written in bytes per day
+and belong on the boot medium, so that a node is self-contained (§14.1). A capture ring rewrites its
+device continuously and wants a device to itself: a single sequential writer per device is what
+obtains that device's bandwidth, and the write-endurance profiles of the two workloads are not
+comparable — sizing a medium for one says nothing about its life under the other.
+
+**Storage binding is the first configuration item that is not hot-swappable.** Moving a ring to a
+different extent invalidates the contents of the one it leaves, so the binding is committed like any
+other configuration item but takes effect at the next boot (§12.3). The exception is confined to
+this one item: which sinks are enabled, what the capture sink filters, the evidence length a policy
+raises, and retention all apply through the ordinary commit workflow.

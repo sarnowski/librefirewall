@@ -65,7 +65,10 @@
 use core::num::NonZeroU64;
 
 use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
-use lfw_ip_endpoint::{Endpoint, IsnSecret};
+use lfw_ip_endpoint::{
+    ConnectionId, Endpoint, IsnSecret,
+    http::{MAX_STREAM_TARGETS, METRICS_TARGET},
+};
 use lfw_log::RejectReason;
 use lfw_metrics::{InterfaceInventory, LogSample};
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
@@ -219,6 +222,10 @@ pub struct EndpointStageCounters {
     /// Segments this stage's transport composed out of its own timers — a
     /// retransmission, a reset, a close — as against a reply to a frame.
     pub timer_segments: u64,
+    /// What the recording downloads served through this endpoint have done.
+    /// Carried here rather than passed to `publish` so the protection domain
+    /// routes one value into its shard and not two (`crate::download`).
+    pub downloads: crate::download::DownloadCounters,
 }
 
 /// A pipeline's consuming end where the descriptor goes no further: it counts
@@ -250,6 +257,11 @@ pub struct EndpointStage<'ring> {
     /// than derived from it: the endpoint is the *management* port's addressing
     /// alone, and the info series cover every port the document configured.
     interfaces: InterfaceInventory,
+    /// The targets this domain answers by streaming. Held here as well as in the
+    /// endpoint because a committed generation builds a **new** endpoint: a
+    /// registration made at start-up would otherwise be lost the first time an
+    /// operator published a document, and the target would start answering 404.
+    targets: [Option<&'static str>; MAX_STREAM_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
     /// each pass, and the seven it reads to answer a scrape.
     stats: StatsRegions<'ring>,
@@ -310,6 +322,7 @@ impl<'ring> EndpointStage<'ring> {
             clock_generation: 0,
             config: CommittedReader::new(),
             interfaces: InterfaceInventory::EMPTY,
+            targets: [None; MAX_STREAM_TARGETS],
             stats,
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
@@ -336,6 +349,7 @@ impl<'ring> EndpointStage<'ring> {
                 match crate::endpoint_from(&checked, self.secret.clone()) {
                     Ok(endpoint) => {
                         self.endpoint = endpoint;
+                        self.apply_targets();
                         // Replaced wholesale rather than merged: what the metric
                         // surface reports is the generation in force, and an
                         // interface the new document dropped must stop being
@@ -409,6 +423,100 @@ impl<'ring> EndpointStage<'ring> {
                 bump(&mut self.counters.clocks_refused);
                 Some(refusal)
             }
+        }
+    }
+
+    /// Register `target` as one this domain answers by streaming a body it
+    /// produces window by window, rather than with `404`.
+    ///
+    /// Called once at start-up: the registration outlives every committed
+    /// generation, because a new document replaces the endpoint and this is what
+    /// puts the target back on it. Answers `false` where the target is already
+    /// registered, where it is the exposition's own, or where the table is full
+    /// — none of which a fixed set of start-up registrations can reach, and all
+    /// of which are answered rather than asserted so a caller learns of its own
+    /// mistake (ENG-12).
+    pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
+        if target == METRICS_TARGET || self.targets.iter().flatten().any(|it| *it == target) {
+            return false;
+        }
+        let Some(slot) = self.targets.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(target);
+        self.apply_targets();
+        true
+    }
+
+    /// Put every registered target on the endpoint in force.
+    ///
+    /// Each registration takes: the endpoint's own table is [`MAX_STREAM_TARGETS`]
+    /// entries and this one is bounded by the same constant, holds no duplicate
+    /// and holds no [`METRICS_TARGET`], which is the whole of what that table
+    /// refuses. Re-registering one it already holds is refused there and changes
+    /// nothing here.
+    fn apply_targets(&mut self) {
+        let targets = self.targets;
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return;
+        };
+        for target in targets.iter().flatten() {
+            endpoint.serve_stream_at(target);
+        }
+    }
+
+    /// The registered target a request is waiting on a decision about, and the
+    /// connection that asked.
+    ///
+    /// Answered with [`begin_stream`](Self::begin_stream) where this domain can
+    /// produce the body and [`abandon_stream`](Self::abandon_stream) where it
+    /// cannot; leaving it unanswered holds the endpoint's one staging buffer and
+    /// refuses every scrape made in the meantime.
+    #[must_use]
+    pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
+        self.endpoint.as_ref()?.pending_stream()
+    }
+
+    /// Answer that target with a body of `total` bytes, delivered window by
+    /// window. `false` leaves the request unanswered, and this domain then owes
+    /// it an [`abandon_stream`](Self::abandon_stream).
+    pub fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+        self.endpoint
+            .as_mut()
+            .is_some_and(|endpoint| endpoint.begin_stream(total, content_type))
+    }
+
+    /// The body byte a window must begin at before the streamed response can go
+    /// on, and the connection waiting on it.
+    ///
+    /// It is a window **start** and not the next byte to send: it lies a
+    /// retransmit span behind, because the transport owns no copy of a range it
+    /// may re-ask for. Fetch exactly that window and hand it to
+    /// [`supply_window`](Self::supply_window).
+    #[must_use]
+    pub fn stream_wanted(&self) -> Option<(ConnectionId, u64)> {
+        self.endpoint.as_ref()?.window_wanted()
+    }
+
+    /// Hand the endpoint the window beginning at body byte `start`. `false`
+    /// where it is not the window that was asked for, which is counted there and
+    /// leaves the response where it was.
+    pub fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
+        self.endpoint
+            .as_mut()
+            .is_some_and(|endpoint| endpoint.supply_window(start, bytes))
+    }
+
+    /// Give up on the streamed response: the connection closes short of the
+    /// length its head announced rather than being padded to it.
+    /// Take the download half's counters, so this domain's shard carries them.
+    pub fn note_downloads(&mut self, counters: crate::download::DownloadCounters) {
+        self.counters.downloads = counters;
+    }
+
+    pub fn abandon_stream(&mut self) {
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.abandon_stream();
         }
     }
 

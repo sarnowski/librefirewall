@@ -159,6 +159,18 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
         DomainDetail::Received { frames, bytes } => {
             write!(cursor, " frames={frames} bytes={bytes}")
         }
+        // Decimal against a disk's size, hexadecimal against bytes.
+        DomainDetail::Medium {
+            capacity_sectors,
+            leading_word,
+        } => write!(
+            cursor,
+            " sectors={capacity_sectors} leading={leading_word:#018x}"
+        ),
+        DomainDetail::Extent {
+            start_sector,
+            sectors,
+        } => write!(cursor, " start={start_sector} sectors={sectors}"),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -387,6 +399,32 @@ mod tests {
             received(u64::MAX, u64::MAX),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
              frames=18446744073709551615 bytes=18446744073709551615"
+        );
+    }
+
+    /// Both at the widest a `u64` carries: the line is fixed-width, so the
+    /// widest pair is what could overrun it.
+    #[test]
+    fn a_recorder_renders_the_capacity_and_the_word_it_read() {
+        let medium = |capacity_sectors, leading_word| {
+            rendered(&Event::Domain {
+                domain: Domain::Recorder,
+                state: DomainState::Ready,
+                detail: DomainDetail::Medium {
+                    capacity_sectors,
+                    leading_word,
+                },
+            })
+        };
+        assert_eq!(
+            medium(131_072, 0x0000_0000_0000_00EB),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=ready \
+             sectors=131072 leading=0x00000000000000eb"
+        );
+        assert_eq!(
+            medium(u64::MAX, u64::MAX),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=ready \
+             sectors=18446744073709551615 leading=0xffffffffffffffff"
         );
     }
 
@@ -711,6 +749,14 @@ mod tests {
                 frames: u64::MAX,
                 bytes: u64::MAX,
             },
+            DomainDetail::Medium {
+                capacity_sectors: u64::MAX,
+                leading_word: u64::MAX,
+            },
+            DomainDetail::Extent {
+                start_sector: u64::MAX,
+                sectors: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -740,6 +786,16 @@ mod tests {
             (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
             any::<(u64, u64)>()
                 .prop_map(|(frames, bytes)| DomainDetail::Received { frames, bytes }),
+            any::<(u64, u64)>().prop_map(|(capacity_sectors, leading_word)| {
+                DomainDetail::Medium {
+                    capacity_sectors,
+                    leading_word,
+                }
+            }),
+            any::<(u64, u64)>().prop_map(|(start_sector, sectors)| DomainDetail::Extent {
+                start_sector,
+                sectors,
+            }),
             (
                 (0..causes.len()),
                 prop_oneof![

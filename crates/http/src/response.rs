@@ -20,15 +20,20 @@ use crate::Status;
 /// format, verbatim.
 pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// Digits a `usize` content length can take.
+/// Opaque bytes: this crate parses no format and would be claiming to know one.
+pub const OCTET_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Every type this crate names, so a third moves [`MAX_HEAD_LEN`] in one diff.
+const CONTENT_TYPES: [&str; 2] = [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE];
+
+/// Digits a `u64` content length can take.
 const MAX_LENGTH_DIGITS: usize = 20;
 
 /// Bytes the longest head this crate can write occupies, derived from the status
-/// table and the one content type rather than measured.
+/// table and [`CONTENT_TYPES`] rather than measured.
 ///
 /// A caller reserves this much in front of its body and can then never be
-/// refused a head, which is what keeps a rendered body from being thrown away
-/// because its own header would not fit.
+/// refused a head, for a content type this crate names.
 pub const MAX_HEAD_LEN: usize = head_bound();
 
 pub(crate) const fn head_bound() -> usize {
@@ -42,8 +47,17 @@ pub(crate) const fn head_bound() -> usize {
         }
         index += 1;
     }
+    let mut longest_type = 0;
+    let mut index = 0;
+    while index < CONTENT_TYPES.len() {
+        let content_type = CONTENT_TYPES[index].len();
+        if content_type > longest_type {
+            longest_type = content_type;
+        }
+        index += 1;
+    }
     let status_line = 9 + 3 + 1 + longest_reason + 2;
-    let content_type = 14 + METRICS_CONTENT_TYPE.len() + 2;
+    let content_type = 14 + longest_type + 2;
     let content_length = 16 + MAX_LENGTH_DIGITS + 2;
     let connection = 19;
     status_line + content_type + content_length + connection + 2
@@ -63,13 +77,17 @@ pub struct HeadDoesNotFit {
 /// always written, so a client always knows where the message ends without
 /// relying on the close.
 ///
+/// `content_length` is a `u64` because it counts bytes on the wire, not bytes
+/// anybody holds: a streamed body outruns every buffer a domain owns.
+///
 /// # Errors
 /// [`HeadDoesNotFit`] when `out` is shorter than the head. A slice of
-/// [`MAX_HEAD_LEN`] bytes can never provoke it.
+/// [`MAX_HEAD_LEN`] bytes can never provoke it, for a content type this crate
+/// names.
 pub fn write_head(
     status: Status,
     content_type: Option<&str>,
-    content_length: usize,
+    content_length: u64,
     out: &mut [u8],
 ) -> Result<usize, HeadDoesNotFit> {
     let capacity = out.len();
@@ -86,7 +104,7 @@ pub fn write_head(
             writer.bytes(b"\r\n")?;
         }
         writer.bytes(b"Content-Length: ")?;
-        writer.number(content_length as u64)?;
+        writer.number(content_length)?;
         writer.bytes(b"\r\n")?;
         writer.bytes(b"Connection: close\r\n\r\n")
     };

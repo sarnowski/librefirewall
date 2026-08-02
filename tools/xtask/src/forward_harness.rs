@@ -91,6 +91,8 @@ use std::{
 use crate::management_contract::{self, ManagementInjection};
 use crate::metrics_contract::{self, Scrape};
 use crate::qemu::{GuestNic, every_guest_nic};
+use crate::recording_contract::{self, Download};
+use crate::surface_contract::Injected;
 use crate::topology::{Endpoint, ManagementPort, PORTS, Topology};
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
@@ -569,6 +571,17 @@ struct Probe {
     from: Endpoint,
     frame: Vec<u8>,
     expectation: Expectation,
+    /// Whether the appliance's recording tap must have observed this frame,
+    /// which is what [`crate::surface_contract`] holds the recordings to.
+    ///
+    /// Not every injected frame is one the recorder can be held to, and the
+    /// line is not "was it forwarded" — a refused packet is observed, with its
+    /// refusal. The tap is driven from the *routing decision*, so a frame the
+    /// router's parser cannot read produces no decision and therefore no
+    /// observation; `Routed::Discarded` and its `observed` in
+    /// `crates/pd-runtime/src/lib.rs` are where that happens, and the comment
+    /// there says so. Only [`legacy_broadcast_frame`] is such a frame here.
+    observed: bool,
 }
 
 impl Probe {
@@ -999,6 +1012,10 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
             expectation: Expectation::Dropped {
                 because: "it is neither IPv4 nor addressed to the port's own MAC",
             },
+            // The one probe no recording holds, and the reason [`Probe`]'s
+            // field exists: the router's parser cannot read it, so it is
+            // discarded before a decision the tap could record.
+            observed: false,
         },
     ])
 }
@@ -1046,6 +1063,9 @@ fn routed(
             sent,
             delivered,
         },
+        // Built from a [`UdpPacket`], so the router parses it and reaches a
+        // decision on it — which is what the tap records.
+        observed: true,
     }
 }
 
@@ -1062,6 +1082,10 @@ fn dropped(
         from,
         frame: sent.build(),
         expectation: Expectation::Dropped { because },
+        // A refusal is a decision, and the tap records it with the reason. Only
+        // a frame the parser cannot read at all escapes observation, and every
+        // probe built from a [`UdpPacket`] parses.
+        observed: true,
     }
 }
 
@@ -1143,8 +1167,10 @@ pub enum ManagementBacking {
 
 impl ManagementBacking {
     /// Whether the harness holds a socket for the management port, and so
-    /// whether there is a stream to accept and a station to play.
-    const fn is_socket(self) -> bool {
+    /// whether there is a stream to accept and a station to play — and,
+    /// negated, whether a real client can reach the endpoint and pull what it
+    /// serves.
+    pub const fn is_socket(self) -> bool {
         matches!(self, Self::Socket)
     }
 }
@@ -2562,6 +2588,18 @@ pub struct Booted {
     /// re-injected before its first delivery was observed is forwarded twice,
     /// and both counters see both.
     pub dataplane_frames: u64,
+    /// What `curl` got out of `/logs.pcapng` and `/capture.pcapng`, in that
+    /// order, on every boot whose management port a real client can reach.
+    /// Empty on every socket-backed boot.
+    pub recordings: Vec<Download>,
+    /// Every frame this boot put on a dataplane port, with the probe that put
+    /// it there and whether the appliance's tap must have observed it.
+    ///
+    /// Returned so [`crate::surface_contract`] can hold the recordings to the
+    /// bytes the harness itself injected rather than to a literal: the probes
+    /// are derived from the configuration document, so an image built from the
+    /// other document is judged against the probes *that* bench produced.
+    pub injected: Vec<Injected>,
 }
 
 /// Spawn the prepared QEMU `command` (which must carry this harness's NIC
@@ -2647,6 +2685,7 @@ fn run_boot(
     // so they survive every exit path.
     let mut dataplane_frames: u64 = 0;
     let mut scrapes: Vec<Scrape> = Vec::new();
+    let mut recordings: Vec<Download> = Vec::new();
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -3018,6 +3057,25 @@ fn run_boot(
                                 log_path.display()
                             ));
                         }
+                        // After the metrics, and through the same client: what
+                        // an operator runs is `curl`, and a body this harness
+                        // composed itself would prove nothing about the
+                        // transport that carries a megabyte. Every boot that
+                        // reaches the endpoint pulls both, because a scenario
+                        // that booted a reachable endpoint and judged one
+                        // surface of the three is the gap the cross-surface
+                        // contract closes.
+                        for target in [pd_runtime::LOG_TARGET, pd_runtime::CAPTURE_TARGET] {
+                            match recording_contract::fetch(host_port, target) {
+                                Ok(one) => recordings.push(one),
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                        }
                         scrapes = fetched;
                         break 'run Ok(());
                     }
@@ -3134,6 +3192,15 @@ fn run_boot(
         management_replies: answered,
         scrapes,
         dataplane_frames,
+        recordings,
+        injected: probes
+            .iter()
+            .map(|probe| Injected {
+                name: probe.name,
+                frame: probe.frame.clone(),
+                observed: probe.observed,
+            })
+            .collect(),
     })
 }
 

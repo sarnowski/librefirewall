@@ -39,21 +39,23 @@
 //! them `Release`, and nothing stops the writer rewriting them afterwards,
 //! which is why a [`CheckedConfig`] owns decoded values rather than borrowing.
 //!
-//! The log transport is a third object of the same kind and [`ClockCalibration`] a
-//! fourth, published under a seqlock for the reason it states. Both are here
-//! because a region's layout cannot be expressed in terms of the crate that reads
-//! it. A [`LogRecord`] is `lfw_log::Event` reduced to integers and fixed arrays,
-//! [`LogRecords`] and [`LogConsume`] are the ring's two halves — one region per
-//! direction, as the handover is — and [`LogRecord::check`] turns peer-written
-//! bytes back into fields a console may render, text included, because this
-//! decode is the last thing between a hostile writer and a serial line (OBS-5).
+//! Four more objects of the same kind follow, all here because a region's
+//! layout cannot be expressed in terms of the crate that reads it: the log
+//! transport, whose [`LogRecord`] is `lfw_log::Event` reduced to integers and
+//! whose two halves are one region per direction as the handover is;
+//! [`ClockCalibration`] under a seqlock; the recording tap [`TapRecords`] feeds;
+//! and the window a recording is downloaded through. Each decodes peer-written
+//! bytes first — the last step before a hostile writer reaches a serial line
+//! (OBS-5), or before those bytes reach a file offered as evidence.
 
 #![cfg_attr(not(test), no_std)]
 
 mod clock;
+mod download;
 mod log_record;
 mod log_ring;
 mod log_slot;
+mod tap;
 
 use core::{
     fmt,
@@ -62,6 +64,11 @@ use core::{
 };
 
 pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, LOAD_ATTEMPTS};
+pub use download::{
+    DOWNLOAD_REPLY_REGION_SIZE, DOWNLOAD_REQUEST_REGION_SIZE, DOWNLOAD_WINDOW_LEN, DownloadDemand,
+    DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply, DownloadRequest,
+    DownloadRequester, DownloadResponder, DownloadSink, DownloadStatus, PendingDownload,
+};
 pub use log_record::{
     CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,
     CheckedRecord, CheckedStamp, CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES,
@@ -73,6 +80,12 @@ pub use log_record::{
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
     LogReader, LogRecords, LogRingFull, LogWriter,
+};
+pub use tap::{
+    CheckedTap, TAP_CONSUME_REGION_SIZE, TAP_DROP_REASON_COUNT, TAP_FLAG_OUTBOUND, TAP_FLAGS_KNOWN,
+    TAP_RECORDS_REGION_SIZE, TAP_RESERVED_WORDS, TAP_SLOTS, TAP_SNAP_LEN, TapAnnotation,
+    TapConsume, TapDirection, TapDropReason, TapFault, TapOutcome, TapReader, TapRecords,
+    TapRingFull, TapVerdict, TapWriteError, TapWriter,
 };
 
 use log_record::check_bounded_text;
@@ -1795,6 +1808,11 @@ mod tests {
                 index: 7,
                 fault: TextFault::NotInAlphabet { offset: 3 },
             },
+            ConfigImageError::ManagementEnabledNotBoolean { enabled: 9 },
+            ConfigImageError::ManagementPrefixLengthTooLong { prefix_length: 99 },
+            ConfigImageError::ManagementMacNotUnicast {
+                mac: [0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa],
+            },
         ]
         .iter()
         .map(|error| format!("{error}"))
@@ -1812,6 +1830,9 @@ mod tests {
                 "interface 5 MAC 01:02:03:04:05:06 is not unicast",
                 "neighbour 6 MAC 00:00:00:00:00:00 is not unicast",
                 "interface 7 id byte 3 is outside [a-z0-9-]",
+                "management enabled byte 9 is not 0 or 1",
+                "management prefix length 99 exceeds 32",
+                "management MAC ff:ee:dd:cc:bb:aa is not unicast",
             ]
         );
     }

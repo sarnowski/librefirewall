@@ -1,0 +1,15 @@
+[package]
+# `pcapng` is the format's own name and a plausible crates.io name; the
+# directory keeps the short name and the package carries the project prefix, so
+# the lib target is `lfw_pcapng` — the same split `crates/http`, `crates/clock`,
+# `crates/log`, `crates/tcp` and `crates/metrics` make.
+name = "lfw-pcapng"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

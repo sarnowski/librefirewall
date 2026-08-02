@@ -21,6 +21,14 @@ lfw-log = { path = "../log" }
 # counters into that crate's samples live here (`stats`), because this is where
 # both halves are visible.
 lfw-metrics = { path = "../metrics" }
+# The block driver's own fault counters, whose conversion into the recorder's
+# shard lives here for the reason every other conversion does: `lfw_metrics`
+# depends on neither side, and a conversion in `lfw_blk` would put the metric
+# vocabulary inside a device-class layer whose dependency set is `virtio` alone.
+lfw-blk = { path = "../blk" }
+# The recording pass's counters, whose conversion into the recorder's shard
+# lives here for the same reason every other conversion does.
+lfw-recorder = { path = "../recorder" }
 
 [dev-dependencies]
 proptest = { workspace = true }

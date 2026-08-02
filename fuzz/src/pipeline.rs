@@ -277,7 +277,7 @@ pub fn pipeline_harness(data: &[u8]) {
                 );
             }
             4 => {
-                let handed_on = stage.poll(Configuration::new(GENERATION, &ROUTER));
+                let handed_on = stage.poll(Configuration::new(GENERATION, &ROUTER), None);
                 assert!(
                     handed_on <= DRAIN_LIMIT,
                     "the forwarder handed on {handed_on} descriptors, past the {DRAIN_LIMIT} bound"

@@ -1,0 +1,22 @@
+[package]
+# One recording sink: pcapng encoding onto a segmented ring, and the placement
+# of whole sectors for the protection domain that owns the block device to move.
+name = "lfw-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lfw-capture-ring = { path = "../capture-ring" }
+lfw-pcapng = { path = "../pcapng" }
+wire = { path = "../wire" }
+# Turning a tap record's raw counter reading into the instant a recording
+# states. The conversion is here rather than on the dataplane because the
+# forwarder would have to re-read another domain's region per frame to do it.
+lfw-clock = { path = "../clock" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -268,7 +268,7 @@ fn a_head_is_read_as_ascii_and_arbitrary_bytes_are_refused() {
 
 // ── Responses ───────────────────────────────────────────────────────────────
 
-fn head_to_string(status: Status, content_type: Option<&str>, length: usize) -> String {
+fn head_to_string(status: Status, content_type: Option<&str>, length: u64) -> String {
     let mut out = [0u8; MAX_HEAD_LEN];
     let len = write_head(status, content_type, length, &mut out).expect("the declared bound fits");
     String::from_utf8(out[..len].to_vec()).expect("ASCII")
@@ -296,30 +296,37 @@ fn a_head_with_no_body_type_still_carries_a_length() {
 }
 
 /// The bound is what lets a caller reserve room in front of a body and never be
-/// refused: every status, with the longest content type and the longest length,
-/// must fit it.
+/// refused: every status, with every content type this crate names and the
+/// longest length, must fit it.
 #[test]
 fn the_declared_head_bound_holds_every_status() {
     for status in Status::ALL {
-        let mut out = [0u8; MAX_HEAD_LEN];
-        let len = write_head(status, Some(METRICS_CONTENT_TYPE), usize::MAX, &mut out)
-            .expect("the bound holds every status");
-        assert!(len <= MAX_HEAD_LEN);
-        let text = core::str::from_utf8(&out[..len]).expect("ASCII");
-        assert!(text.starts_with(&format!("HTTP/1.1 {} {}", status.code(), status.reason())));
-        assert!(text.ends_with("\r\n\r\n"));
-        assert!(text.contains(&format!("Content-Length: {}\r\n", usize::MAX)));
+        for content_type in [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE] {
+            let mut out = [0u8; MAX_HEAD_LEN];
+            let len = write_head(status, Some(content_type), u64::MAX, &mut out)
+                .expect("the bound holds every status");
+            assert!(len <= MAX_HEAD_LEN);
+            let text = core::str::from_utf8(&out[..len]).expect("ASCII");
+            assert!(text.starts_with(&format!("HTTP/1.1 {} {}", status.code(), status.reason())));
+            assert!(text.ends_with("\r\n\r\n"));
+            assert!(text.contains(&format!("Content-Length: {}\r\n", u64::MAX)));
+            assert!(text.contains(&format!("Content-Type: {content_type}\r\n")));
+        }
     }
 }
 
-/// The bound is derived from the status table and the one content type, so it is
-/// held to the longest head those actually produce rather than only to fitting
-/// one: a bound computed from a *different* string would agree by luck.
+/// The bound is derived from the status table and the content types this crate
+/// names, so it is held to the longest head those actually produce rather than
+/// only to fitting one: a bound computed from a *different* string would agree
+/// by luck.
 #[test]
 fn the_head_bound_is_the_longest_head_it_bounds() {
     let longest = Status::ALL
         .iter()
-        .map(|status| head_to_string(*status, Some(METRICS_CONTENT_TYPE), usize::MAX).len())
+        .flat_map(|status| {
+            [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE]
+                .map(|content_type| head_to_string(*status, Some(content_type), u64::MAX).len())
+        })
         .max()
         .expect("the table is not empty");
     assert_eq!(crate::response::head_bound(), MAX_HEAD_LEN);
@@ -437,7 +444,7 @@ proptest! {
     /// Every head fits the bound and round-trips its own length, whatever the
     /// body length is.
     #[test]
-    fn a_head_states_the_length_it_was_given(length in any::<usize>()) {
+    fn a_head_states_the_length_it_was_given(length in any::<u64>()) {
         for status in Status::ALL {
             let head = head_to_string(status, Some(METRICS_CONTENT_TYPE), length);
             let stated = format!("Content-Length: {length}\r\n");
@@ -456,4 +463,54 @@ fn has_bad_line_ending(bytes: &[u8]) -> bool {
         .iter()
         .enumerate()
         .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+}
+
+/// A complete head is read the same whatever follows it.
+///
+/// Found by `fuzz/src/http_request.rs`, which feeds one stream cut at arbitrary
+/// points and holds the verdicts to agreeing: a prefix ending at the blank line
+/// completed, and the same bytes with a malformed byte appended were refused
+/// `BadRequest`. The line-ending scan ran over the whole buffer rather than
+/// over the head, so what came *after* the terminator decided the verdict on
+/// what came before it — a disagreement about where a message ends, which is
+/// precisely the shape of request smuggling, and one an attacker steers by
+/// appending.
+#[test]
+fn a_completed_head_is_read_the_same_whatever_follows_it() {
+    let head = b"POST /metrics HTTP/1.1\r\n\r\n";
+    let Ok(Parsed::Complete { consumed, .. }) = parse(head) else {
+        panic!("a well-formed head completes");
+    };
+    assert_eq!(consumed, head.len());
+
+    for trailing in [
+        &b"\n"[..],
+        b"\r",
+        b" /mets\n\n",
+        b"GET / HTTP/1.1\r\n\r\n",
+        b"\x00\xff",
+    ] {
+        let mut stream = head.to_vec();
+        stream.extend_from_slice(trailing);
+        match parse(&stream) {
+            Ok(Parsed::Complete {
+                consumed: again, ..
+            }) => assert_eq!(
+                again, consumed,
+                "the head ends where it ends, whatever follows: {trailing:?}"
+            ),
+            other => panic!("bytes past the head changed the verdict on it: {other:?}"),
+        }
+    }
+}
+
+/// And a malformed line ending *inside* an incomplete head is still refused,
+/// which is the half of the scan the fix above must not have removed.
+#[test]
+fn a_bare_line_feed_inside_the_head_is_still_refused() {
+    assert_eq!(parse(b"GET / HTTP/1.1\n"), Err(RequestError::BareLineFeed));
+    assert_eq!(
+        parse(b"GET / HTTP/1.1\r\nHost: a\nb: c\r\n\r\n"),
+        Err(RequestError::BareLineFeed)
+    );
 }

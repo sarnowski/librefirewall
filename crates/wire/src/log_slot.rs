@@ -117,6 +117,8 @@ pub(crate) struct LogSlot {
     unix_nanos: AtomicU64,
     frames: AtomicU64,
     frame_bytes: AtomicU64,
+    capacity_sectors: AtomicU64,
+    leading_word: AtomicU64,
     stamp_nanos: AtomicU64,
     kind: AtomicU32,
     generation: AtomicU32,
@@ -151,6 +153,8 @@ impl LogSlot {
             unix_nanos: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             frame_bytes: AtomicU64::new(0),
+            capacity_sectors: AtomicU64::new(0),
+            leading_word: AtomicU64::new(0),
             stamp_nanos: AtomicU64::new(0),
             kind: AtomicU32::new(0),
             generation: AtomicU32::new(0),
@@ -187,6 +191,10 @@ impl LogSlot {
         self.frames.store(record.frames, Ordering::Relaxed);
         self.frame_bytes
             .store(record.frame_bytes, Ordering::Relaxed);
+        self.capacity_sectors
+            .store(record.capacity_sectors, Ordering::Relaxed);
+        self.leading_word
+            .store(record.leading_word, Ordering::Relaxed);
         self.stamp_nanos
             .store(record.stamp_nanos, Ordering::Relaxed);
         self.kind.store(record.kind, Ordering::Relaxed);
@@ -228,6 +236,8 @@ impl LogSlot {
             unix_nanos: self.unix_nanos.load(Ordering::Relaxed),
             frames: self.frames.load(Ordering::Relaxed),
             frame_bytes: self.frame_bytes.load(Ordering::Relaxed),
+            capacity_sectors: self.capacity_sectors.load(Ordering::Relaxed),
+            leading_word: self.leading_word.load(Ordering::Relaxed),
             stamp_nanos: self.stamp_nanos.load(Ordering::Relaxed),
             kind: self.kind.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
@@ -292,6 +302,8 @@ const _: () = {
     assert!(offset_of!(LogSlot, unix_nanos) == offset_of!(LogRecord, unix_nanos));
     assert!(offset_of!(LogSlot, frames) == offset_of!(LogRecord, frames));
     assert!(offset_of!(LogSlot, frame_bytes) == offset_of!(LogRecord, frame_bytes));
+    assert!(offset_of!(LogSlot, capacity_sectors) == offset_of!(LogRecord, capacity_sectors));
+    assert!(offset_of!(LogSlot, leading_word) == offset_of!(LogRecord, leading_word));
     assert!(offset_of!(LogSlot, stamp_nanos) == offset_of!(LogRecord, stamp_nanos));
     assert!(offset_of!(LogSlot, kind) == offset_of!(LogRecord, kind));
     assert!(offset_of!(LogSlot, generation) == offset_of!(LogRecord, generation));

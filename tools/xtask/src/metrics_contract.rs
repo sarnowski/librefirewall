@@ -103,6 +103,7 @@ const DOMAINS: &[&str] = &[
     "console",
     "config",
     "clock",
+    "recorder",
 ];
 
 /// What a real client got out of the endpoint.
@@ -653,6 +654,28 @@ fn judge_one(
         exposition.families.len(),
         exposition.samples.len(),
     ) + &format!("\n{}", render(&asserted)))
+}
+
+/// The recorder's own count of what it encoded into one sink, read out of an
+/// exposition body.
+///
+/// Exposed for [`crate::surface_contract`], which holds it against the packet
+/// blocks the same boot's download actually carried. It is a function of the
+/// body alone so that judgement stays pure: the parse is here, where the
+/// exposition format lives, and the comparison is there, where the disagreement
+/// between surfaces is stated.
+///
+/// # Errors
+/// A body that is not an exposition, or one that carries no single
+/// `librefirewall_recording_records_total` for that sink.
+pub fn sink_records(body: &str, sink: &str) -> Result<u64, String> {
+    let exposition = parse(body)?;
+    one(
+        &exposition,
+        "librefirewall_recording_records_total",
+        &[("sink", sink)],
+    )
+    .map(|sample| sample.value)
 }
 
 /// The one sample of `name` matching `labels`, or a verdict naming what was

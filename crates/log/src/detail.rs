@@ -148,6 +148,18 @@ pub enum DomainDetail<C = &'static str> {
         frames: u64,
         bytes: u64,
     },
+    /// What a domain established about the block medium under it: a capacity is
+    /// volunteered before a byte crosses, a word says nothing without a size.
+    Medium {
+        capacity_sectors: u64,
+        leading_word: u64,
+    },
+    /// Where one of a domain's recordings lives on that medium — the only way
+    /// an operator learns it, there being no shell and no CLI (CONCEPT §11).
+    Extent {
+        start_sector: u64,
+        sectors: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.
@@ -305,6 +317,10 @@ mod tests {
             DomainDetail::Received {
                 frames: 0,
                 bytes: 0,
+            },
+            DomainDetail::Medium {
+                capacity_sectors: 0,
+                leading_word: 0,
             },
             DomainDetail::Established {
                 tsc_hz: NonZeroU64::MIN,

@@ -94,6 +94,25 @@ impl DmaRegion {
     }
 }
 
+/// The block driver's DMA-visible staging window: payload only, and page-aligned
+/// because that is what `IoRegion::attach` is handed and what its physical base
+/// is checked to be.
+///
+/// Sized to `lfw_blk::BLK_IO_REGION_SIZE` exactly, because that constant is the
+/// bound `IoSector` is derived from: a smaller allocation would let a sector the
+/// type says is in range run off the end of the harness's own memory, which is
+/// the harness reporting its own defect as a finding.
+#[repr(C, align(4096))]
+pub struct BlkIoRegion(pub [u8; lfw_blk::BLK_IO_REGION_SIZE]);
+
+impl BlkIoRegion {
+    /// A zeroed, page-aligned staging window on the heap.
+    #[must_use]
+    pub fn zeroed() -> ZeroedRegion<Self> {
+        ZeroedRegion::new()
+    }
+}
+
 /// One PCI function's 4 KiB configuration space, page-aligned.
 ///
 /// The alignment is load-bearing rather than decorative: `virtio::pci`'s

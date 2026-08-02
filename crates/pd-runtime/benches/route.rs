@@ -193,7 +193,7 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
             b.iter(|| {
                 publish(&regions.pool, &mut owner, &mut rx_in, frame);
                 assert_eq!(
-                    black_box(stage.poll(configuration)),
+                    black_box(stage.poll(configuration, None)),
                     1,
                     "the frame must be handed on"
                 );

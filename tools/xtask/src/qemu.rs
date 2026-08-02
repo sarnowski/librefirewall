@@ -13,13 +13,16 @@
 //! printed and written into the run log, so an unnoticed degradation to
 //! emulation cannot pass for an accelerated run.
 //!
-//! [`test_system`] is the black-box system gate. It boots five [`Scenario`]s,
+//! [`test_system`] is the black-box system gate. It boots six [`Scenario`]s,
 //! each of which asserts the machine-observable routed contract — a datagram
 //! sent from the host endpoint on each NIC port reaches the endpoint on the
 //! other rewritten for its next hop, and the packets the appliance must refuse
-//! reach nobody — driven by [`crate::forward_harness`]; two of them
+//! reach nobody — driven by [`crate::forward_harness`]. Two of them
 //! additionally judge the `LFW-CFG` console channel through
-//! [`crate::config_transcript`].
+//! [`crate::config_transcript`], and the three whose management port a real
+//! client can reach ([`ManagementRole::Client`]) pull every surface the
+//! endpoint serves and hold the three of them to each other
+//! ([`crate::surface_contract`]).
 //!
 //! Every scenario boots the RELEASE kernel configuration, because that is the
 //! image a release publishes (BLD-3). A scenario that fails there is re-run
@@ -41,9 +44,12 @@ use crate::{
     artifacts::DIST_DISK,
     clock_contract,
     config_transcript::ConfigContract,
+    data_disk::DataDisk,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking},
-    image, management_contract, metrics_contract, stamp_contract,
+    image, management_contract, metrics_contract,
+    recording_contract::{self, Download},
+    stamp_contract, surface_contract,
     topology::{PORTS, Topology},
     util::{copy_file, locate, require_file, run_command},
 };
@@ -139,6 +145,12 @@ impl Acceleration {
 struct Invocation {
     command: Command,
     acceleration: Acceleration,
+    /// The data device this run created and attached, kept so the caller can
+    /// read it back once QEMU has exited. Every invocation gets one — including
+    /// the interactive `run`, whose guest would otherwise find no device at
+    /// 00:05.0 and park the recorder on a refusal, which is a boot no shipped
+    /// image would ever perform.
+    data: DataDisk,
 }
 
 /// Which disk a scenario boots on a [`Run::Shipping`] run.
@@ -165,13 +177,32 @@ enum ManagementRole {
     /// ICMP echo request and a whole TCP exchange, and judges every answer field
     /// by field.
     Station,
-    /// QEMU's user-mode stack carries the port and `curl` scrapes `GET /metrics`
-    /// through a host port forward. Nothing at frame level is asserted on that
-    /// wire; what is asserted is the HTTP response, one metric value against
+    /// The harness is a client. QEMU's user-mode stack carries the port and
+    /// `curl` pulls **every surface the endpoint serves** through a host port
+    /// forward — `GET /metrics`, `GET /logs.pcapng` and `GET /capture.pcapng` —
+    /// and all three are judged, together.
+    ///
+    /// All three, on every scenario that reaches the endpoint, because judging
+    /// one of them is the gap: a recording that silently drops, a metric that
+    /// double-counts and a tap that loses a record are each invisible in the
+    /// surface they occur in and each a disagreement between two of them
+    /// ([`crate::surface_contract`]). Nothing at frame level is asserted on this
+    /// wire; what is asserted is the HTTP responses, one metric value against
     /// traffic the harness observed on the *dataplane* ports in the same boot,
-    /// and every label of the interface info family against the configuration
-    /// document this image was built from.
-    Scraped,
+    /// every label of the interface info family against the configuration
+    /// document this image was built from, the two recordings against each
+    /// other and against the bytes the harness injected, and the same two
+    /// extents read straight off the disk image after the run — one artifact
+    /// reached two ways, neither of them the appliance's own account of itself.
+    Client,
+}
+
+impl ManagementRole {
+    /// Whether QEMU's user-mode stack carries the port, which is what a real
+    /// client needs and what a frame-level station forbids.
+    const fn user_network(&self) -> bool {
+        matches!(self, Self::Client)
+    }
 }
 
 /// Whether a scenario reads the console beside the traffic.
@@ -203,7 +234,7 @@ struct Scenario {
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour across five scenarios, in the kernel configuration a release
+/// behaviour across six scenarios, in the kernel configuration a release
 /// ships. Returns what the run proved.
 ///
 /// 1. **routed-forwarding** — the published disk, judged by the routed contract
@@ -222,13 +253,22 @@ struct Scenario {
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
 ///    table would satisfy scenarios 1 and 2 and fail every probe here.
-/// 4. **metrics-endpoint** and 5. **metrics-endpoint-alternate** — `curl`
-///    scrapes `GET /metrics` through QEMU's own user-mode stack, once against the
-///    published disk and once against a disk built from the second document. Each
-///    is judged against *its own* document, which is what makes the interface
-///    info family a checked statement about the running configuration: the two
-///    documents share no identity, so a label the build carried rather than read
-///    would pass one and fail the other.
+/// 4. **metrics-endpoint**, 5. **metrics-endpoint-alternate** and
+///    6. **recording-download** — `curl` pulls every surface the endpoint serves
+///    through QEMU's own user-mode stack: `GET /metrics`, `GET /logs.pcapng` and
+///    `GET /capture.pcapng`. Scenarios 4 and 6 run against the published disk and
+///    5 against a disk built from the second document, and each is judged
+///    against *its own* document — which is what makes the interface info family
+///    a checked statement about the running configuration, the two documents
+///    sharing no identity, so a label the build carried rather than read would
+///    pass one and fail the other. The same holds the probes the recordings are
+///    compared against: the two benches inject different bytes.
+///
+///    All three surfaces are judged on all three scenarios, and then against
+///    each other ([`crate::surface_contract`]). A scenario that booted a
+///    reachable endpoint and judged one of them is the gap that closes: a
+///    recording that silently drops, a metric that double-counts and a tap that
+///    loses a record are each invisible in the surface they occur in.
 ///
 /// Every scenario additionally injects frames into the dedicated management port
 /// and holds that port to carrying nothing back, whatever else it judges; the
@@ -266,7 +306,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             // equality the other two hold the console to has nothing to be
             // stated against. What it judges instead is the endpoint's answer.
             console: Console::Ignored,
-            management: ManagementRole::Scraped,
+            management: ManagementRole::Client,
         },
         // The same scrape against a disk built from the second document, and the
         // one thing the scenario above cannot show: that the identity the
@@ -285,7 +325,23 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             document: ALTERNATE_DOCUMENT,
             image: ImageUnderTest::BuiltForTheScenario,
             console: Console::Ignored,
-            management: ManagementRole::Scraped,
+            management: ManagementRole::Client,
+        },
+        // The recording milestone's own scenario. It is no longer the only one
+        // that pulls the recordings — every [`ManagementRole::Client`] scenario
+        // does, which is the point of there being one role — and it remains
+        // because it is the pairing of the published disk with the recording
+        // surfaces, where the two above pair the same surfaces with the two
+        // documents. The download proves the whole chain from tap to HTTP; the
+        // disk read after it proves what is on the medium independently, so a
+        // recorder that composed a plausible body out of nothing would pass one
+        // and fail the other.
+        Scenario {
+            name: "recording-download",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
         },
     ];
 
@@ -295,7 +351,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
         .count();
     let scraped = scenarios
         .iter()
-        .filter(|scenario| matches!(scenario.management, ManagementRole::Scraped))
+        .filter(|scenario| scenario.management.user_network())
         .count();
 
     // What each boot chose for its one management connection, kept so the
@@ -412,12 +468,13 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     let disk = scenario_disk(root, scenario, run)?;
 
     let log_name = format!("qemu-{name}{}.log", run.name_suffix());
-    let backing = match scenario.management {
-        ManagementRole::Station => ManagementBacking::Socket,
-        ManagementRole::Scraped => ManagementBacking::UserNetwork {
+    let backing = if scenario.management.user_network() {
+        ManagementBacking::UserNetwork {
             host_port: forward_harness::reserve_host_port()
                 .map_err(|error| format!("scenario {name}: {error}"))?,
-        },
+        }
+    } else {
+        ManagementBacking::Socket
     };
     let booted = boot_and_forward(root, &disk, &log_name, &topology, backing)
         .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -436,14 +493,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     // scenario proves and its evidence belongs where a reader looks first.
     let scraped = match &scenario.management {
         ManagementRole::Station => String::new(),
-        ManagementRole::Scraped if booted.scrapes.is_empty() => {
+        ManagementRole::Client if booted.scrapes.is_empty() => {
             return Err(format!(
                 "scenario {name}: the boot met its routed contract and no scrape was taken, so \
                  nothing was proved about the metrics endpoint\n  full run log: {}",
                 log.display()
             ));
         }
-        ManagementRole::Scraped => {
+        ManagementRole::Client => {
             let judged =
                 metrics_contract::judge(&booted.scrapes, booted.dataplane_frames, &topology)
                     .map_err(|error| {
@@ -454,9 +511,26 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
                     })?;
             let evidence = metrics_contract::evidence(&booted.scrapes, &judged);
             println!("{evidence}");
-            append_evidence(&log, &evidence)
+            append_evidence(
+                &log,
+                "the metrics scrape this boot was judged by",
+                &evidence,
+            )
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+            let judged = judge_recordings(root, name, &booted, &topology, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!("; {} scrapes judged", booted.scrapes.len())
+            println!("{judged}");
+            append_evidence(
+                &log,
+                "the two recordings this boot was judged by, and their agreement with the \
+                 exposition and the wire",
+                &judged,
+            )
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!(
+                "; {} scrapes and both recordings judged together",
+                booted.scrapes.len()
+            )
         }
     };
     let judged = match scenario.console {
@@ -517,23 +591,144 @@ pub(crate) fn boot_and_forward(
     )
 }
 
-/// Write one scrape's evidence into the run log, behind the guest's own output.
+/// Judge both recordings a boot pulled — each on its own terms, then the two of
+/// them against each other, against the exposition the same boot answered, and
+/// against the bytes the harness put on the wire.
+///
+/// The order is the order the findings are worth reading in. A body that is not
+/// a pcapng file at all is reported as that and not as a pairing failure; only
+/// once both parse is the interesting question reachable, which is whether the
+/// three surfaces tell one story ([`crate::surface_contract`]).
+///
+/// Both bodies are also written into the build tree, so a human can open them
+/// in Wireshark or `tcpdump -r` after a run without booting anything again.
+///
+/// The disk half — read separately by [`crate::data_disk`] — is what makes the
+/// download evidence rather than a round trip through the appliance's own
+/// memory: a recorder that answered a plausible body out of nothing would
+/// satisfy the client and leave the medium empty, and a harness that only asked
+/// over HTTP would not notice.
+fn judge_recordings(
+    root: &Path,
+    scenario: &str,
+    booted: &Booted,
+    topology: &Topology,
+    log: &Path,
+) -> Result<String, String> {
+    let expectations = [
+        recording_contract::Expectation {
+            target: pd_runtime::LOG_TARGET,
+            snap_len: lfw_recorder::deck::LOG_SNAP_LEN as usize,
+            // The frames the harness itself put across the appliance, which is
+            // the number of observations the router must have decided on. At
+            // least, not exactly: the management port's own frames and any
+            // re-injection are decided on too.
+            least_packets: booted.dataplane_frames as usize,
+        },
+        recording_contract::Expectation {
+            target: pd_runtime::CAPTURE_TARGET,
+            snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN as usize,
+            least_packets: booted.dataplane_frames as usize,
+        },
+    ];
+    if booted.recordings.len() != expectations.len() {
+        return Err(format!(
+            "the boot met its contract and pulled {} recordings rather than {}, so nothing was \
+             proved about the download path\n  full run log: {}",
+            booted.recordings.len(),
+            expectations.len(),
+            log.display()
+        ));
+    }
+    let mut evidence = String::from("  both recordings, downloaded and parsed as pcapng:");
+    let mut parsed = Vec::new();
+    for (download, expected) in booted.recordings.iter().zip(&expectations) {
+        let found = recording_contract::judge(download, expected)?;
+        evidence.push('\n');
+        evidence.push_str(&recording_contract::evidence(
+            download,
+            &found,
+            expected.snap_len,
+        ));
+        evidence.push('\n');
+        evidence.push_str(&keep(root, scenario, download)?);
+        parsed.push(found);
+    }
+
+    // The second scrape, which is the one `metrics_contract` judges and the one
+    // whose counters have advanced past the first connection.
+    let exposition = booted.scrapes.last().ok_or(
+        "the recordings were pulled and no scrape was taken, so the recorder's own published \
+         counts are not available to compare them against",
+    )?;
+    let [log_parsed, capture_parsed] = parsed.as_slice() else {
+        return Err(format!(
+            "{} recordings parsed and the contract is stated over two",
+            parsed.len()
+        ));
+    };
+    let agreement = surface_contract::judge(
+        &surface_contract::Surface {
+            target: pd_runtime::LOG_TARGET,
+            snap_len: lfw_recorder::deck::LOG_SNAP_LEN,
+            parsed: log_parsed,
+            published_records: metrics_contract::sink_records(&exposition.body, "log")?,
+        },
+        &surface_contract::Surface {
+            target: pd_runtime::CAPTURE_TARGET,
+            snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN,
+            parsed: capture_parsed,
+            published_records: metrics_contract::sink_records(&exposition.body, "capture")?,
+        },
+        &surface_contract::Wire {
+            injected: &booted.injected,
+            ports: topology.interfaces().len(),
+        },
+    )
+    .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
+    evidence.push('\n');
+    evidence.push_str(&agreement.evidence());
+    Ok(evidence)
+}
+
+/// Write one downloaded recording into the build tree, answering the line that
+/// says where it landed.
+///
+/// A run that proves something about a file and then discards it leaves a
+/// reader with nothing to open: the next question after "the contract held" is
+/// always "what was in it", and re-running a ten-minute boot to ask it is the
+/// cost this avoids. The name carries the scenario, so two scenarios' captures
+/// cannot overwrite each other.
+fn keep(root: &Path, scenario: &str, download: &Download) -> Result<String, String> {
+    let file = download.target.trim_start_matches('/');
+    let path = root
+        .join("build/image")
+        .join(format!("qemu-{scenario}-{file}"));
+    fs::write(&path, &download.body)
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(format!(
+        "    kept at {} — open it with `tcpdump -r` or Wireshark",
+        path.display()
+    ))
+}
+
+/// Write one body of evidence into the run log, behind the guest's own output,
+/// under a heading that says what it is.
 ///
 /// The log is the artifact a reader opens after a failure, and a proof that
-/// exists only in a terminal that has scrolled away is not evidence. Appended
-/// rather than interleaved: the capture above it is the guest's, byte for byte,
-/// and nothing this harness writes may land inside it.
-fn append_evidence(log: &Path, evidence: &str) -> Result<(), String> {
+/// exists only in a terminal that has scrolled away is not evidence. The
+/// heading is the caller's rather than fixed here: a log carrying three
+/// different proofs under one title tells a reader the first thing wrong about
+/// the other two. Appended rather than interleaved: the capture above it is the
+/// guest's, byte for byte, and nothing this harness writes may land inside it.
+fn append_evidence(log: &Path, heading: &str, evidence: &str) -> Result<(), String> {
     use std::io::Write as _;
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(log)
-        .map_err(|error| format!("open {} to append the scrape: {error}", log.display()))?;
-    writeln!(
-        file,
-        "\n# the metrics scrape this boot was judged by\n{evidence}"
-    )
-    .map_err(|error| format!("append the scrape to {}: {error}", log.display()))
+        .map_err(|error| format!("open {} to append the evidence: {error}", log.display()))?;
+    writeln!(file, "\n# {heading}\n{evidence}")
+        .map_err(|error| format!("append the evidence to {}: {error}", log.display()))
 }
 
 /// Boot `disk` expecting NO slot to be bootable: no injected packet may come
@@ -566,10 +761,16 @@ fn boot(
     management: ManagementBacking,
 ) -> Result<Booted, String> {
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
+    // Whether this boot reads the recordings back follows from the backing
+    // rather than being a second decision beside it: a real client is exactly
+    // what a download needs, and there is no scenario that has one and does not
+    // use it ([`ManagementRole::Client`]).
+    let recordings = !management.is_socket();
     let backends = forward_harness::NicBackends::new(management)?;
     let Invocation {
         mut command,
         acceleration,
+        data,
     } = qemu_base(root, "stdio", disk, run_label)?;
     command.arg("-monitor").arg("none");
     backends.apply(&mut command, topology)?;
@@ -586,7 +787,11 @@ fn boot(
          # {description}\n\
          {GUEST_OUTPUT_MARKER}"
     );
-    forward_harness::run_boot_test(
+    // Which data-disk verdict this boot owes, taken before the contract is
+    // handed over: a boot that runs the appliance must leave the witness pattern
+    // on the medium, and one with no bootable slot must leave the sector alone.
+    let ran_the_appliance = matches!(contract, BootContract::Routed);
+    let booted = forward_harness::run_boot_test(
         command,
         backends,
         BootTest {
@@ -595,7 +800,35 @@ fn boot(
             log_header: &header,
             topology,
         },
-    )
+    )?;
+
+    // The data disk, judged after the boot contract and never instead of it.
+    // Which verdict is owed follows from the contract, and the pair is what
+    // makes either one evidence: a boot that ran the appliance must have left
+    // the witness pattern on the medium, and a boot with no bootable slot must
+    // have left the same sector untouched. A harness asserting only the first
+    // would pass on a host that wrote the file itself.
+    let verdict = if ran_the_appliance {
+        data.judge_written()
+    } else {
+        data.judge_untouched()
+    }
+    .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
+    println!("  data disk {run_label}: {verdict}");
+    // And, on every boot that pulled the recordings, the medium itself: the
+    // extents the appliance wrote, read by a process the guest cannot reach.
+    if recordings {
+        let on_disk = data
+            .judge_recordings()
+            .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
+        println!("  data disk {run_label}: {on_disk}");
+        append_evidence(
+            &log,
+            "the two recording extents, read off the disk image after shutdown",
+            &on_disk,
+        )?;
+    }
+    Ok(booted)
 }
 
 /// Boot the disk `dist/` holds interactively, on QEMU's own user-mode network.
@@ -611,6 +844,7 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
     let Invocation {
         mut command,
         acceleration,
+        data: _,
     } = qemu_base(root, "mon:stdio", &disk, "run")?;
     println!("QEMU run: {}", acceleration.describe());
     // Interactive runs have no harness peer to dial into, so back every NIC
@@ -733,6 +967,7 @@ fn qemu_base(
     copy_file(&vars_template, &vars)?;
 
     let acceleration = Acceleration::detect();
+    let data = DataDisk::create(root, run_label)?;
 
     let mut command = Command::new("qemu-system-x86_64");
     command
@@ -775,9 +1010,15 @@ fn qemu_base(
         // guest-initiated exit degrades into the 180 s timeout — and it is what
         // makes the boot manager's halt path observable as an exit at all.
         .args(["-serial", serial, "-no-reboot"]);
+    // The recorder's device, beside the boot disk and before the NICs. It is
+    // attached to every invocation rather than to the scenarios that judge it,
+    // because a domain staring at an absent device is a different boot from the
+    // one the image was assembled for (BLD-3).
+    data.attach(&mut command);
     Ok(Invocation {
         command,
         acceleration,
+        data,
     })
 }
 

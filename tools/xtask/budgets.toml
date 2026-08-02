@@ -16,6 +16,13 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
+"crates/blk/src/bringup.rs" = 0.3362
+"crates/blk/src/io.rs" = 0.4798
+"crates/blk/src/lib.rs" = 0.5912
+"crates/blk/src/request.rs" = 0.4022
+"crates/blk/src/smoke.rs" = 0.3659
+"crates/capture-ring/src/lib.rs" = 0.4240
+"crates/capture-ring/src/superblock.rs" = 0.2664
 "crates/clock/src/lib.rs" = 0.4182
 "crates/config/src/diff.rs" = 0.1827
 "crates/config/src/hash.rs" = 0.2703
@@ -30,35 +37,40 @@
 "crates/config/src/xml.rs" = 0.1947
 "crates/hpet/src/lib.rs" = 0.5613
 "crates/http/src/lib.rs" = 0.5176
-"crates/http/src/request.rs" = 0.2440
-"crates/http/src/response.rs" = 0.2824
-"crates/ip-endpoint/src/http.rs" = 0.2890
-"crates/ip-endpoint/src/lib.rs" = 0.2827
+"crates/http/src/request.rs" = 0.2412
+"crates/http/src/response.rs" = 0.2819
+"crates/ip-endpoint/src/http.rs" = 0.2889
+"crates/ip-endpoint/src/lib.rs" = 0.2825
 "crates/log/src/console.rs" = 0.5084
-"crates/log/src/detail.rs" = 0.4033
-"crates/log/src/event.rs" = 0.2017
+"crates/log/src/detail.rs" = 0.3990
+"crates/log/src/event.rs" = 0.2009
 "crates/log/src/identifier.rs" = 0.2097
 "crates/log/src/lib.rs" = 0.4065
-"crates/log/src/record.rs" = 0.1696
-"crates/log/src/render.rs" = 0.1542
+"crates/log/src/record.rs" = 0.1632
+"crates/log/src/render.rs" = 0.1502
 "crates/log/src/ring.rs" = 0.3667
 "crates/log/src/stamp.rs" = 0.4681
-"crates/metrics/src/catalog.rs" = 0.1575
+"crates/metrics/src/catalog.rs" = 0.1319
 "crates/metrics/src/interfaces.rs" = 0.3625
-"crates/metrics/src/lib.rs" = 0.5771
+"crates/metrics/src/lib.rs" = 0.5739
 "crates/metrics/src/render.rs" = 0.2850
-"crates/metrics/src/sample.rs" = 0.0738
+"crates/metrics/src/sample.rs" = 0.0713
 "crates/net-headers/src/lib.rs" = 0.1887
 "crates/nic-driver-core/src/bringup.rs" = 0.3404
 "crates/nic-driver-core/src/lib.rs" = 0.4598
 "crates/nic-driver-core/src/port.rs" = 0.4521
 "crates/packet-buffer/src/lib.rs" = 0.4529
+"crates/pcapng/src/lib.rs" = 0.2776
 "crates/pd-runtime/src/clock.rs" = 0.6224
-"crates/pd-runtime/src/endpoint.rs" = 0.4620
+"crates/pd-runtime/src/download.rs" = 0.3433
+"crates/pd-runtime/src/endpoint.rs" = 0.4583
 "crates/pd-runtime/src/handover.rs" = 0.3395
-"crates/pd-runtime/src/lib.rs" = 0.4869
-"crates/pd-runtime/src/stats.rs" = 0.1747
+"crates/pd-runtime/src/lib.rs" = 0.4700
+"crates/pd-runtime/src/stats.rs" = 0.1595
+"crates/pd-runtime/src/tap.rs" = 0.4260
 "crates/queue/src/lib.rs" = 0.4260
+"crates/recorder/src/deck.rs" = 0.2337
+"crates/recorder/src/lib.rs" = 0.2187
 "crates/routing/src/lib.rs" = 0.2716
 "crates/rtc/src/lib.rs" = 0.5119
 "crates/tcp/src/connection.rs" = 0.3051
@@ -71,25 +83,30 @@
 "crates/uart-16550/src/lib.rs" = 0.5125
 "crates/virtio/src/lib.rs" = 0.6000
 "crates/virtio/src/net.rs" = 0.4638
-"crates/virtio/src/pci.rs" = 0.3866
-"crates/virtio/src/queue.rs" = 0.3538
+"crates/virtio/src/pci.rs" = 0.3865
+"crates/virtio/src/queue.rs" = 0.3532
 "crates/wire/src/clock.rs" = 0.5176
-"crates/wire/src/lib.rs" = 0.1810
-"crates/wire/src/log_record.rs" = 0.2199
+"crates/wire/src/download.rs" = 0.3633
+"crates/wire/src/lib.rs" = 0.1790
+"crates/wire/src/log_record.rs" = 0.2193
 "crates/wire/src/log_ring.rs" = 0.4120
-"crates/wire/src/log_slot.rs" = 0.1129
+"crates/wire/src/log_slot.rs" = 0.1088
+"crates/wire/src/tap.rs" = 0.3415
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
 "pds/clock/src/main.rs" = 0.3995
 "pds/config/src/main.rs" = 0.4251
 "pds/console/src/com1.rs" = 0.6400
-"pds/console/src/main.rs" = 0.5282
-"pds/forwarder/src/main.rs" = 0.3829
+"pds/console/src/main.rs" = 0.5198
+"pds/forwarder/src/main.rs" = 0.3804
 "pds/management/src/entropy.rs" = 0.6489
-"pds/management/src/main.rs" = 0.5060
+"pds/management/src/main.rs" = 0.4918
 "pds/nic-driver/src/main.rs" = 0.4529
+"pds/recorder/src/main.rs" = 0.3052
 
 [unsafe-blocks]
+"crates/blk" = 8
+"crates/capture-ring" = 0
 "crates/clock" = 0
 "crates/config" = 0
 "crates/hpet" = 0
@@ -100,8 +117,10 @@
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 3
 "crates/packet-buffer" = 3
+"crates/pcapng" = 0
 "crates/pd-runtime" = 5
 "crates/queue" = 0
+"crates/recorder" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
 "crates/tcp" = 0
@@ -114,8 +133,11 @@
 "pds/forwarder" = 0
 "pds/management" = 1
 "pds/nic-driver" = 4
+"pds/recorder" = 5
 
 [unsafe-fns]
+"crates/blk" = 3
+"crates/capture-ring" = 0
 "crates/clock" = 0
 "crates/config" = 0
 "crates/hpet" = 0
@@ -126,8 +148,10 @@
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 1
 "crates/packet-buffer" = 3
+"crates/pcapng" = 0
 "crates/pd-runtime" = 1
 "crates/queue" = 0
+"crates/recorder" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
 "crates/tcp" = 0
@@ -140,8 +164,11 @@
 "pds/forwarder" = 0
 "pds/management" = 0
 "pds/nic-driver" = 0
+"pds/recorder" = 0
 
 [unsafe-impls]
+"crates/blk" = 0
+"crates/capture-ring" = 0
 "crates/clock" = 0
 "crates/config" = 0
 "crates/hpet" = 0
@@ -152,8 +179,10 @@
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 0
 "crates/packet-buffer" = 1
+"crates/pcapng" = 0
 "crates/pd-runtime" = 0
 "crates/queue" = 0
+"crates/recorder" = 0
 "crates/routing" = 0
 "crates/rtc" = 0
 "crates/tcp" = 0
@@ -166,3 +195,4 @@
 "pds/forwarder" = 0
 "pds/management" = 0
 "pds/nic-driver" = 0
+"pds/recorder" = 0

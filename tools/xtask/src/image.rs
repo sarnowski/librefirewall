@@ -91,6 +91,7 @@ pub(crate) const SYSTEM_PDS: &[&str] = &[
     "console",
     "clock",
     "management",
+    "recorder",
 ];
 
 /// The pinned SDK's include directory for one seL4 kernel configuration.

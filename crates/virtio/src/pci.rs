@@ -49,6 +49,8 @@ use crate::queue::QueueLayout;
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 /// A modern (virtio 1.0) network device.
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
+/// A modern (virtio 1.0) block device.
+pub const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
 
 /// Byte extent of one PCI function's configuration space, as ECAM maps it.
 pub const PCI_CONFIG_LEN: usize = 4096;
@@ -380,11 +382,11 @@ pub struct VirtioCaps {
     /// `notify + queue_notify_off * notify_multiplier`.
     pub notify: u32,
     pub notify_multiplier: u32,
-    /// The device-specific structure — for virtio-net, the MAC address and
-    /// status fields. [`within`](Self::within) bounds it against a one-byte
-    /// extent and requires no alignment of it, which suffices only while
-    /// nothing forms a pointer from it: virtio-net's `status` is a `u16`, so
-    /// reading it needs a wider extent and an alignment check first.
+    /// The device-specific structure: virtio-net's MAC and status, virtio-blk's
+    /// capacity. [`within`](Self::within) bounds it at one byte and demands no
+    /// alignment — enough only while nothing forms a pointer from it, so a
+    /// driver that reads it runs [`device_cfg_within`](Self::device_cfg_within)
+    /// and [`device_is_aligned`](Self::device_is_aligned) for its own access.
     pub device: u32,
 }
 
@@ -455,6 +457,25 @@ impl VirtioCaps {
     #[must_use]
     pub fn common_is_aligned(&self) -> bool {
         (self.common as usize).is_multiple_of(COMMON_CFG_ALIGN)
+    }
+
+    /// Whether the device-configuration structure has `needed` bytes inside a
+    /// BAR window of `bar_size` bytes. [`within`](Self::within) asks for one —
+    /// all a transport that never reads the structure needs; a driver reads a
+    /// field, a `u64` capacity say, and must name the extent it accesses.
+    #[must_use]
+    pub fn device_cfg_within(&self, bar_size: usize, needed: usize) -> bool {
+        (self.device as usize)
+            .checked_add(needed)
+            .is_some_and(|end| end <= bar_size)
+    }
+
+    /// Whether `device` is `align`-aligned — the half
+    /// [`device_cfg_within`](Self::device_cfg_within) cannot answer. `align` is
+    /// the access's: a `u16` status and a `u64` capacity share this structure.
+    #[must_use]
+    pub fn device_is_aligned(&self, align: usize) -> bool {
+        (self.device as usize).is_multiple_of(align)
     }
 
     /// Whether the doorbell of a queue whose `queue_notify_off` is `notify_off`
@@ -1260,6 +1281,104 @@ mod tests {
         };
         assert!(aligned_but_outside.common_is_aligned());
         assert!(!aligned_but_outside.within(0x4000));
+    }
+
+    #[test]
+    fn device_cfg_extent_is_judged_against_the_access_not_against_one_byte() {
+        // `within` clears a device structure that has a single byte left in the
+        // window. A driver reading a `u64` capacity out of it would run seven
+        // bytes past the end on exactly that offset, so it has to ask its own
+        // question — this pins that the two answers really do differ.
+        let caps = VirtioCaps {
+            bar: 4,
+            common: 0,
+            notify: 0,
+            notify_multiplier: 4,
+            device: 0x4000 - 1,
+        };
+        assert!(caps.within(0x4000), "one byte is all `within` requires");
+        assert!(caps.device_cfg_within(0x4000, 1));
+        assert!(!caps.device_cfg_within(0x4000, 8));
+
+        // Exactly filling the window is inside it; one byte more is not.
+        let flush = VirtioCaps {
+            device: 0x4000 - 8,
+            ..caps
+        };
+        assert!(flush.device_cfg_within(0x4000, 8));
+        assert!(!flush.device_cfg_within(0x4000, 9));
+    }
+
+    #[test]
+    fn device_cfg_extent_refuses_an_offset_whose_sum_would_wrap() {
+        // The offset is the device's `u32` and the extent is the driver's, so
+        // the sum is checked: a wrap would fold a far-out structure back into
+        // the window and clear it.
+        let caps = VirtioCaps {
+            bar: 4,
+            common: 0,
+            notify: 0,
+            notify_multiplier: 0,
+            device: u32::MAX,
+        };
+        assert!(!caps.device_cfg_within(usize::MAX, usize::MAX));
+        // The same offset with an extent that does not wrap is judged on its
+        // merits rather than refused for the arithmetic.
+        assert!(caps.device_cfg_within(usize::MAX, 8));
+    }
+
+    #[test]
+    fn device_cfg_alignment_is_independent_of_the_extent_check() {
+        // The `common` pairing's argument, applied to the structure `within`
+        // does not align at all: an offset can sit comfortably inside the
+        // window and still misalign every wide read a driver makes into it.
+        let misaligned = VirtioCaps {
+            bar: 4,
+            common: 0,
+            notify: 0,
+            notify_multiplier: 4,
+            device: 0x2004,
+        };
+        assert!(
+            misaligned.device_cfg_within(0x4000, 8),
+            "the extent fits — which is precisely why an extent check misses it"
+        );
+        assert!(misaligned.device_is_aligned(4));
+        assert!(!misaligned.device_is_aligned(8));
+
+        // And the converse: an 8-aligned offset that does not fit is still
+        // refused, by the other predicate.
+        let aligned_but_outside = VirtioCaps {
+            device: 0x4000,
+            ..misaligned
+        };
+        assert!(aligned_but_outside.device_is_aligned(8));
+        assert!(!aligned_but_outside.device_cfg_within(0x4000, 8));
+    }
+
+    #[test]
+    fn device_cfg_alignment_admits_exactly_the_multiples_of_the_requested_align() {
+        // Every residue class at two boundaries, because the alignment a caller
+        // needs is the access's and not the structure's: the same offset is
+        // sound for virtio-net's `u16` and unsound for virtio-blk's `u64`.
+        // Judged against the power-of-two mask rather than against a second
+        // `is_multiple_of`, so the expectation is arrived at independently.
+        for offset in 0u32..=16 {
+            let caps = VirtioCaps {
+                bar: 0,
+                common: 0,
+                notify: 0,
+                notify_multiplier: 0,
+                device: offset,
+            };
+            for align in [2usize, 8] {
+                assert_eq!(
+                    caps.device_is_aligned(align),
+                    offset as usize & (align - 1) == 0,
+                    "offset {offset} was judged wrongly against {align}"
+                );
+            }
+        }
     }
 
     #[test]

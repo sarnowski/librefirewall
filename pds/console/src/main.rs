@@ -104,10 +104,10 @@ use uart_16550::{Transmitter, Uart, WriteError};
 use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
-/// per writing domain, matching the seven pairs of `<map>` rows on the console
+/// per writing domain, matching the eight pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
 /// fixed by the system description (CONCEPT §12.3), so this is a build fact.
-const RINGS: usize = 7;
+const RINGS: usize = 8;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
 /// the trait and the transmitter are foreign here, and that is all it adds.
@@ -139,6 +139,7 @@ fn init() -> Console {
     let clock: &'static LogRecords = attach_region!(log_clock_vaddr: LogRecords);
     let nic_driver2: &'static LogRecords = attach_region!(log_nic_driver2_vaddr: LogRecords);
     let management: &'static LogRecords = attach_region!(log_management_vaddr: LogRecords);
+    let recorder: &'static LogRecords = attach_region!(log_recorder_vaddr: LogRecords);
     let forwarder_consume: &'static LogConsume =
         attach_region!(log_forwarder_consume_vaddr: LogConsume);
     let nic_driver0_consume: &'static LogConsume =
@@ -151,6 +152,8 @@ fn init() -> Console {
         attach_region!(log_nic_driver2_consume_vaddr: LogConsume);
     let management_consume: &'static LogConsume =
         attach_region!(log_management_consume_vaddr: LogConsume);
+    let recorder_consume: &'static LogConsume =
+        attach_region!(log_recorder_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     // For its own two records alone: a peer's instant is rendered, never minted.
     let stamps = PdClock::new(attach_region!(clock_vaddr: ClockCalibration));
@@ -198,6 +201,7 @@ fn init() -> Console {
         clock_consume.reader(clock),
         nic_driver2_consume.reader(nic_driver2),
         management_consume.reader(management),
+        recorder_consume.reader(recorder),
     ];
     printer.print(stamps.now(), &announce(DomainState::Ready));
 

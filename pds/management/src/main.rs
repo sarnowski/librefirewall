@@ -118,12 +118,12 @@ use entropy::EntropyError;
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    CalibrationRefused, ClockCalibration, ConfigHandover, EndpointRegions, EndpointStage,
-    ForwardRings, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region, log_sample,
-    read_timestamp_counter,
+    CalibrationRefused, ClockCalibration, ConfigHandover, Downloads, EndpointRegions,
+    EndpointStage, ForwardRings, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region,
+    log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
-use wire::{LogConsume, LogRecords};
+use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
 
 /// How many dataplane ports the build has, and so the bound a committed image's
 /// interface entries are checked against — the same build fact `pds/forwarder`
@@ -221,6 +221,7 @@ fn init() -> Management {
             attach_region!(stats_console_vaddr: StatsShard),
             attach_region!(stats_config_vaddr: StatsShard),
             attach_region!(stats_clock_vaddr: StatsShard),
+            attach_region!(stats_recorder_vaddr: StatsShard),
         ],
     };
     let stage = EndpointStage::attach(
@@ -236,13 +237,35 @@ fn init() -> Management {
         stats,
     );
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
+    let request: &'static DownloadRequest = attach_region!(dl_request_vaddr: DownloadRequest);
+    let reply: &'static DownloadReply = attach_region!(dl_reply_vaddr: DownloadReply);
+    let downloads = Downloads::attach(request, reply);
+    let mut stage = stage;
+    // Both recordings, before the first frame: a target registered late would
+    // answer `404` to a client that asked at exactly the wrong moment.
+    let registered = downloads.register(&mut stage);
     // The port is unaddressed until a generation is committed and unclocked until
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
     announce(&sink, DomainState::Ready, DomainDetail::None);
+    if !registered {
+        // A build fact rather than a run-time condition — the endpoint's target
+        // table is one size — so it is recorded and the port carries on serving
+        // everything else (ENG-12).
+        announce(
+            &sink,
+            DomainState::Ready,
+            DomainDetail::Refusal(Refusal {
+                cause: "recording-targets-unregistered",
+                detail: RefusalDetail::None,
+                signalled: false,
+            }),
+        );
+    }
 
     Management::Running(Running {
         stage,
+        downloads,
         handover,
         clock,
         sink,
@@ -274,6 +297,9 @@ struct Running {
     /// Kept for the domain's life, as the handles inside it are this domain's
     /// positions in four rings; a second stage would restart at slot zero.
     stage: EndpointStage<'static>,
+    /// The recording downloads this port serves. Kept for the same reason: it
+    /// holds this domain's position in the request channel's sequence.
+    downloads: Downloads<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
     sink: RingSink<'static, PdClock<'static>>,
@@ -317,8 +343,16 @@ impl Handler for Management {
         // The log ring's own counts travel in with it, because the shard the
         // pass publishes carries them and this domain is the only thing that can
         // read them.
+        // Before the frames, so a window the recorder answered between wakeups
+        // is in the transport's hands by the time this pass composes a segment.
+        // It never blocks: a pass with no reply yet does nothing.
+        running.downloads.poll(&mut running.stage);
         let log = log_sample(running.sink.dropped(), running.sink.refused());
-        if running.stage.poll(read_timestamp_counter(), log) > 0 {
+        let moved = running.stage.poll(read_timestamp_counter(), log);
+        // And after them, because a request parsed in this very pass is what
+        // puts a stream in `pending_stream`.
+        running.downloads.poll(&mut running.stage);
+        if moved > 0 {
             let counters = running.stage.counters();
             announce(
                 &running.sink,

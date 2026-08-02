@@ -111,6 +111,11 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
             applied: 3,
             refused: 1,
         },
+        TapCounters {
+            observed: 33,
+            dropped: 4,
+            refused: 0,
+        },
         log_sample(5, 2),
     );
     assert_eq!(sample.pipelines[0].forwarded, 11);
@@ -118,6 +123,8 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
     assert_eq!(sample.generation, 7);
     assert_eq!(sample.images_applied, 3);
     assert_eq!(sample.images_refused, 1);
+    assert_eq!(sample.tap.observed, 33);
+    assert_eq!(sample.tap.dropped, 4);
     assert_eq!(sample.log.dropped, 5);
     assert_eq!(sample.log.refused, 2);
     assert!(sample.values().len() <= STATS_SLOTS);
@@ -228,4 +235,110 @@ fn a_log_sample_widens_rather_than_truncates() {
         config_sample(u32::MAX, sample).generation,
         u64::from(u32::MAX)
     );
+}
+
+/// The recorder's shard lays its two operations out in the order its series
+/// name them, and a flush — which moves nothing — inflates neither.
+#[test]
+fn the_block_counters_keep_reads_and_writes_apart() {
+    let mut blocks = BlockCounters::default();
+    blocks.completed(Operation::Read, 512);
+    blocks.completed(Operation::Read, 1024);
+    blocks.completed(Operation::Write, 4096);
+    blocks.completed(Operation::Flush, u32::MAX);
+
+    assert_eq!(
+        blocks,
+        BlockCounters {
+            reads: 2,
+            read_bytes: 1536,
+            writes: 1,
+            write_bytes: 4096,
+        }
+    );
+
+    let recording = RecorderCounters {
+        sinks: [
+            lfw_recorder::SinkCounters {
+                records: 9,
+                record_bytes: 900,
+                ..lfw_recorder::SinkCounters::default()
+            },
+            lfw_recorder::SinkCounters {
+                records: 8,
+                record_bytes: 8000,
+                ..lfw_recorder::SinkCounters::default()
+            },
+        ],
+        tap_records: 9,
+        downloads_served: 2,
+        ..RecorderCounters::default()
+    };
+    let sample = recorder_sample(
+        2048,
+        blocks,
+        RequestFaults::default(),
+        recording,
+        log_sample(3, 4),
+    );
+    assert_eq!(sample.capacity_sectors, 2048);
+    assert_eq!(sample.requests, [2, 1]);
+    assert_eq!(sample.bytes, [1536, 4096]);
+    assert_eq!(sample.sinks[0].records, 9);
+    assert_eq!(sample.sinks[1].record_bytes, 8000);
+    assert_eq!(sample.tap[0], 9);
+    assert_eq!(sample.downloads, [2, 0]);
+    assert_eq!(sample.log.dropped, 3);
+    assert_eq!(sample.log.refused, 4);
+}
+
+/// Every fault the request layer can raise reaches its own slot, and no two
+/// share one: a device replaying completions and a device writing garbage
+/// statuses must be distinguishable in a scrape.
+#[test]
+fn every_request_fault_reaches_a_slot_of_its_own() {
+    let faults = RequestFaults {
+        device: lfw_blk::request::DeviceFaults {
+            completion_out_of_range: 1,
+            completion_not_posted: 2,
+            completion_length_over_reported: 3,
+        },
+        status_undecodable: 4,
+        completion_unmapped: 5,
+    };
+    let sample = recorder_sample(
+        0,
+        BlockCounters::default(),
+        faults,
+        RecorderCounters::default(),
+        LogSample::default(),
+    );
+    assert_eq!(sample.device_faults, [1, 2, 3]);
+    assert_eq!(sample.status_undecodable, 4);
+    assert_eq!(sample.completion_unmapped, 5);
+
+    let values = sample.values();
+    let mut seen: Vec<u64> = values.iter().copied().filter(|value| *value != 0).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (1..=5).collect::<Vec<u64>>());
+}
+
+/// The counters saturate rather than wrapping, for the reason every counter on
+/// this surface does: a scraper differences successive samples, so a wrap turns
+/// a sustained rate into a negative one.
+#[test]
+fn a_block_counter_saturates_rather_than_wrapping() {
+    let mut blocks = BlockCounters {
+        reads: u64::MAX,
+        read_bytes: u64::MAX,
+        writes: u64::MAX - 1,
+        write_bytes: 0,
+    };
+    blocks.completed(Operation::Read, 512);
+    blocks.completed(Operation::Write, 512);
+    blocks.completed(Operation::Write, 512);
+    assert_eq!(blocks.reads, u64::MAX);
+    assert_eq!(blocks.read_bytes, u64::MAX);
+    assert_eq!(blocks.writes, u64::MAX);
+    assert_eq!(blocks.write_bytes, 1024);
 }

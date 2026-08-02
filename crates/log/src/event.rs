@@ -55,6 +55,7 @@ closed_vocabulary! {
         Console => "console",
         Clock => "clock",
         Management => "management",
+        Recorder => "recorder",
     }
 }
 

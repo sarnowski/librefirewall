@@ -835,12 +835,12 @@ proptest! {
         key_len in any::<u8>(),
         tsc_hz in any::<u64>(),
         unix_nanos in any::<u64>(),
-        counts in any::<[u64; 2]>(),
+        counts in any::<[u64; 4]>(),
         stamp_kind in any::<u8>(),
         stamp_nanos in any::<u64>(),
     ) {
         let [generation, sequence, changes, reject_offset, receive_posted] = numbers;
-        let [frames, frame_bytes] = counts;
+        let [frames, frame_bytes, capacity_sectors, leading_word] = counts;
         let [domain, state, detail, operand_count, signalled, change, object, field, outcome, reason] =
             tokens;
         let record = LogRecord {
@@ -873,6 +873,8 @@ proptest! {
             stamp_nanos,
             frames,
             frame_bytes,
+            capacity_sectors,
+            leading_word,
         };
         match record.check() {
             Err(_) => {}

@@ -6,8 +6,8 @@
 //! real device observes or produces the indices. The fences order CPU-visible
 //! memory only, which suffices because x86 DMA is cache-coherent and the region
 //! is mapped cached; a non-coherent platform would need cache maintenance here
-//! as well. virtio-net needs no per-buffer chaining, so only single-descriptor
-//! buffers are used and no `NEXT` chain is ever walked.
+//! as well. A request may span several descriptors ([`add_chain`]): virtio-blk
+//! needs a header, data and status at three different permissions.
 //!
 //! # The device is untrusted
 //!
@@ -24,8 +24,10 @@
 //! rather than in each descriptor's shared `next` field, because reading that
 //! field back would hand the device the allocator: a scribbled `next` becomes
 //! `free_head`, and the very next [`add_writable`] writes a descriptor at
-//! `free_head * 16` — anywhere in a `u16`, far outside the region. The `next`
-//! field is still written, because the ABI the device reads includes it, and
+//! `free_head * 16` — anywhere in a `u16`, far outside the region. A chain's
+//! links are held apart for the same reason, in `chain_next`: they decide what
+//! [`Completion::recycle`] frees, so believing the shared field would let a
+//! device free a descriptor twice. That field is written for the ABI, and
 //! never read.
 //!
 //! What is **not** checked, because it is not checkable from this side: the
@@ -38,6 +40,7 @@
 //! [`poll`]: SplitVirtqueue::poll
 //! [`posted_count`]: SplitVirtqueue::posted_count
 //! [`add_writable`]: SplitVirtqueue::add_writable
+//! [`add_chain`]: SplitVirtqueue::add_chain
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -51,6 +54,9 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 /// virtio 1.0 starts the device (used) ring at a 4-byte boundary.
 const USED_RING_ALIGN: usize = 4;
 
+/// Terminates a `chain_next` list.
+const NO_LINK: u16 = u16::MAX;
+
 /// Round `value` up to the device ring's alignment.
 const fn align_to_used_ring(value: usize) -> usize {
     (value + (USED_RING_ALIGN - 1)) & !(USED_RING_ALIGN - 1)
@@ -63,10 +69,25 @@ fn bump(counter: &mut u64) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DescriptorState {
     Free,
+    /// Head of a posted chain, and the only descriptor of it the device may
+    /// complete.
     Posted,
+    /// A posted chain member that is not its head. Distinct from
+    /// [`Posted`](Self::Posted) so completing one is refused rather than
+    /// freeing the chain a second time, through the middle.
+    PostedLink,
     /// Completed by the device and handed to the driver as a [`Completion`];
     /// the descriptor stays allocated until that completion is recycled.
     Reaped,
+}
+
+/// One buffer of a descriptor chain, in the order the device reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub paddr: u64,
+    pub len: u32,
+    /// True for a descriptor the *device* writes — virtio's own sense.
+    pub device_writable: bool,
 }
 
 /// Counts of the used-ring completions this queue refused, which are otherwise
@@ -157,6 +178,8 @@ pub struct SplitVirtqueue<const SIZE: usize> {
     /// The free list's successor links. Only entries of free descriptors are
     /// meaningful.
     free_next: [u16; SIZE],
+    /// A posted chain's successor links, [`NO_LINK`]-terminated.
+    chain_next: [u16; SIZE],
     free_head: u16,
     num_free: u16,
     num_posted: u16,
@@ -170,6 +193,7 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         assert!(SIZE.is_power_of_two(), "queue size must be a power of two");
         assert!(SIZE >= 2, "queue size must be at least 2");
         assert!(SIZE <= 32768, "queue size must fit a u16 ring index");
+        assert!(SIZE <= NO_LINK as usize, "NO_LINK must name no descriptor");
     };
 
     const DESC_BYTES: usize = SIZE * DESC_STRIDE;
@@ -220,6 +244,7 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
             state: [DescriptorState::Free; SIZE],
             posted_len: [0; SIZE],
             free_next,
+            chain_next: [NO_LINK; SIZE],
             free_head: 0,
             num_free: SIZE as u16,
             num_posted: 0,
@@ -245,9 +270,9 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         self.num_free as usize
     }
 
-    /// Descriptors published to the device and not yet completed — the only
-    /// quantity a completion can legitimately consume, and so the bound on how
-    /// many [`poll`](Self::poll) can hand out before the driver posts again.
+    /// Requests published and not yet completed — one per chain, however long.
+    /// The only quantity a completion can legitimately consume, and so the
+    /// bound on how many [`poll`](Self::poll) hands out before posting again.
     #[must_use]
     pub fn posted_count(&self) -> usize {
         self.num_posted as usize
@@ -261,31 +286,74 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     /// Publish a receive buffer at physical address `paddr`, returning the
     /// descriptor index it went into or `None` when none is free.
     pub fn add_writable(&mut self, paddr: u64, len: u32) -> Option<u16> {
-        self.add(paddr, len, VIRTQ_DESC_F_WRITE)
+        self.add(paddr, len, true)
     }
 
     /// Publish a transmit buffer at physical address `paddr`.
     pub fn add_readable(&mut self, paddr: u64, len: u32) -> Option<u16> {
-        self.add(paddr, len, 0)
+        self.add(paddr, len, false)
     }
 
-    fn add(&mut self, paddr: u64, len: u32, flags: u16) -> Option<u16> {
-        if self.num_free == 0 {
+    fn add(&mut self, paddr: u64, len: u32, device_writable: bool) -> Option<u16> {
+        self.add_chain(&[Segment {
+            paddr,
+            len,
+            device_writable,
+        }])
+    }
+
+    /// Publish `segments` as one request the device consumes and completes as
+    /// a unit, returning its head descriptor — the only one the device may
+    /// name back, and the one [`Completion::recycle`] frees the chain through.
+    ///
+    /// `None`, with nothing allocated, when the chain is empty or wants more
+    /// descriptors than are free: a part-allocated chain would strand every
+    /// descriptor it had taken, since only a head can be completed.
+    pub fn add_chain(&mut self, segments: &[Segment]) -> Option<u16> {
+        // `num_free` never exceeds `SIZE`, so this refuses a chain longer than
+        // the whole queue as well.
+        if segments.is_empty() || segments.len() > self.num_free as usize {
             return None;
         }
-        let head = Self::wrap(self.free_head);
-        self.free_head = self.free_next[head];
-        // Nothing here chains, so a NEXT flag is stripped rather than trusted.
-        self.publish_descriptor(head, paddr, len, flags & !VIRTQ_DESC_F_NEXT);
+        // Built tail first, because a descriptor's `next` is written with the
+        // rest of it and the free list yields one index at a time: the
+        // successor must exist already. Chain order is the links, not the
+        // indices, so running backwards through the free list costs nothing.
+        let mut successor = NO_LINK;
+        let mut writable_len = 0u32;
+        for segment in segments.iter().rev() {
+            let index = Self::wrap(self.free_head);
+            self.free_head = self.free_next[index];
+            self.num_free -= 1;
+
+            let mut flags = 0;
+            if segment.device_writable {
+                flags |= VIRTQ_DESC_F_WRITE;
+                writable_len = writable_len.saturating_add(segment.len);
+            }
+            let next = if successor == NO_LINK {
+                0
+            } else {
+                flags |= VIRTQ_DESC_F_NEXT;
+                successor
+            };
+            self.publish_descriptor(index, segment.paddr, segment.len, flags, next);
+            self.chain_next[index] = successor;
+            self.state[index] = DescriptorState::PostedLink;
+            successor = index as u16;
+        }
+
+        let head = Self::wrap(successor);
         self.state[head] = DescriptorState::Posted;
-        self.posted_len[head] = len;
-        self.num_free -= 1;
+        // The clamp on what the device may report: virtio counts only the bytes
+        // it wrote, so a chain it never writes into admits none.
+        self.posted_len[head] = writable_len;
         self.num_posted += 1;
 
         let head = head as u16;
         self.publish_avail(self.avail_idx, head);
         self.avail_idx = self.avail_idx.wrapping_add(1);
-        // Publish the descriptor and ring entry before the index the device
+        // Publish the descriptors and ring entry before the index the device
         // reads to discover them.
         fence(Ordering::Release);
         self.set_avail_idx(self.avail_idx);
@@ -344,13 +412,22 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
     }
 
     /// Reachable only by consuming a [`Completion`], which exists only for a
-    /// descriptor this queue itself moved into the reaped state.
+    /// chain head this queue moved into the reaped state; its links come too.
     fn release(&mut self, head: u16) {
-        let head = Self::wrap(head);
-        self.state[head] = DescriptorState::Free;
-        self.free_next[head] = self.free_head;
-        self.free_head = head as u16;
-        self.num_free += 1;
+        let mut index = Self::wrap(head);
+        // A chain holds each descriptor at most once, so the bound never ends
+        // this walk — it makes termination the loop's property, not the list's.
+        for _ in 0..SIZE {
+            let successor = self.chain_next[index];
+            self.state[index] = DescriptorState::Free;
+            self.free_next[index] = self.free_head;
+            self.free_head = index as u16;
+            self.num_free += 1;
+            if successor == NO_LINK {
+                break;
+            }
+            index = Self::wrap(successor);
+        }
     }
 
     // Each accessor below takes a descriptor index or a ring position rather
@@ -375,7 +452,7 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
         }
     }
 
-    fn publish_descriptor(&self, index: usize, paddr: u64, len: u32, flags: u16) {
+    fn publish_descriptor(&self, index: usize, paddr: u64, len: u32, flags: u16, next: u16) {
         let base = desc_addr_off(index % SIZE);
         // SAFETY: reducing the index modulo `SIZE` puts
         // `base + DESC_STRIDE <= SIZE * DESC_STRIDE <= TOTAL`, and `region`
@@ -389,7 +466,10 @@ impl<const SIZE: usize> SplitVirtqueue<SIZE> {
                 .add(base + 12)
                 .cast::<u16>()
                 .write_volatile(flags);
-            self.region.add(base + 14).cast::<u16>().write_volatile(0);
+            self.region
+                .add(base + 14)
+                .cast::<u16>()
+                .write_volatile(next);
         }
     }
 
@@ -652,6 +732,69 @@ mod tests {
         }
     }
 
+    /// One descriptor as it stands in the shared table — `(paddr, len, flags,
+    /// next)` — read from exactly where the device reads it.
+    fn read_descriptor(region: *mut u8, index: u16) -> (u64, u32, u16, u16) {
+        let slot = index as usize;
+        // SAFETY: single-threaded test driving the ring's far side; a descriptor index lies within the live, test-owned region.
+        unsafe {
+            (
+                region
+                    .add(desc_addr_off(slot))
+                    .cast::<u64>()
+                    .read_volatile(),
+                region.add(desc_len_off(slot)).cast::<u32>().read_volatile(),
+                region
+                    .add(desc_flags_off(slot))
+                    .cast::<u16>()
+                    .read_volatile(),
+                region
+                    .add(desc_next_off(slot))
+                    .cast::<u16>()
+                    .read_volatile(),
+            )
+        }
+    }
+
+    /// The descriptor indices of a posted chain, from the driver's own links
+    /// rather than the shared `next` field the device can rewrite. Bounded by
+    /// `SIZE`, so a corrupt list fails an assertion instead of hanging.
+    fn chain_indices<const N: usize>(queue: &SplitVirtqueue<N>, head: u16) -> Vec<u16> {
+        let mut indices = Vec::new();
+        let mut index = head;
+        for _ in 0..N {
+            indices.push(index);
+            let successor = queue.chain_next[index as usize];
+            if successor == NO_LINK {
+                break;
+            }
+            index = successor;
+        }
+        indices
+    }
+
+    /// A three-descriptor request shaped like virtio-blk's: a device-readable
+    /// header, a device-writable data buffer, a device-writable status byte.
+    fn block_request() -> [Segment; 3] {
+        [
+            Segment {
+                paddr: 0x1000,
+                len: 16,
+                device_writable: false,
+            },
+            Segment {
+                paddr: 0x2000,
+                len: 512,
+                device_writable: true,
+            },
+            Segment {
+                paddr: 0x3000,
+                len: 1,
+                device_writable: true,
+            },
+        ]
+    }
+
     /// A queue over a fresh region plus the device on its far side, which is
     /// what nearly every case below needs.
     struct Fixture {
@@ -900,6 +1043,283 @@ mod tests {
     }
 
     #[test]
+    fn add_chain_publishes_one_request_spanning_three_descriptors() {
+        let mut fx = Fixture::new();
+        let region_ptr = fx.device.region;
+        let segments = block_request();
+        let head = fx
+            .queue
+            .add_chain(&segments)
+            .expect("three descriptors are free");
+
+        assert_eq!(fx.queue.free_count(), SIZE - 3);
+        assert_eq!(
+            fx.queue.posted_count(),
+            1,
+            "a chain is one request however many descriptors it spans"
+        );
+
+        // Walk the chain the device's way — from the head through the shared
+        // `next` field — and check it names the segments in order, with the
+        // permissions they asked for.
+        let mut index = head;
+        let mut walked = Vec::new();
+        for (position, segment) in segments.iter().enumerate() {
+            let (paddr, len, flags, next) = read_descriptor(region_ptr, index);
+            assert_eq!(paddr, segment.paddr, "segment {position} address");
+            assert_eq!(len, segment.len, "segment {position} length");
+            assert_eq!(
+                flags & VIRTQ_DESC_F_WRITE != 0,
+                segment.device_writable,
+                "segment {position} permission"
+            );
+            walked.push(index);
+            if position + 1 == segments.len() {
+                assert_eq!(flags & VIRTQ_DESC_F_NEXT, 0, "the tail must not chain on");
+                assert_eq!(next, 0, "the tail's `next` names nothing");
+            } else {
+                assert_eq!(
+                    flags & VIRTQ_DESC_F_NEXT,
+                    VIRTQ_DESC_F_NEXT,
+                    "segment {position} must chain on"
+                );
+                index = next;
+            }
+        }
+        assert_eq!(
+            chain_indices(&fx.queue, head),
+            walked,
+            "the driver's private links and the device's must describe one chain"
+        );
+        walked.sort_unstable();
+        walked.dedup();
+        assert_eq!(walked.len(), 3, "a chain must not reuse a descriptor");
+
+        assert_eq!(fx.device.next_avail(), Some(head));
+        assert_eq!(
+            fx.device.next_avail(),
+            None,
+            "only the head enters the available ring"
+        );
+    }
+
+    #[test]
+    fn recycling_a_chain_head_returns_every_descriptor_in_the_chain() {
+        let mut fx = Fixture::new();
+        let head = fx
+            .queue
+            .add_chain(&block_request())
+            .expect("three descriptors are free");
+        assert_eq!(fx.queue.free_count(), SIZE - 3);
+
+        fx.device.complete(u32::from(head), 513);
+        let (completion, len) = fx.queue.poll().expect("the head completes");
+        assert_eq!(completion.index(), head);
+        assert_eq!(len, 513);
+        completion.recycle();
+
+        assert_eq!(fx.queue.free_count(), SIZE, "the whole chain came back");
+        assert_eq!(fx.queue.posted_count(), 0);
+
+        // And it came back usable: every descriptor allocates again, once.
+        let mut seen = [false; SIZE];
+        for _ in 0..SIZE {
+            let index = fx
+                .queue
+                .add_writable(0x1000, 64)
+                .expect("a descriptor is free") as usize;
+            assert!(!seen[index], "descriptor {index} was handed out twice");
+            seen[index] = true;
+        }
+        assert_eq!(fx.queue.device_faults(), DeviceFaults::default());
+    }
+
+    #[test]
+    fn poll_refuses_a_completion_naming_a_chain_link() {
+        // The double-free this closes: a link accepted on its own would go back
+        // on the free list while the head still owns it, and recycling the head
+        // would put the same descriptor there a second time.
+        let mut fx = Fixture::new();
+        let head = fx
+            .queue
+            .add_chain(&block_request())
+            .expect("three descriptors are free");
+        let links = &chain_indices(&fx.queue, head)[1..];
+        assert_eq!(links.len(), 2);
+
+        for &link in links {
+            fx.device.complete(u32::from(link), 64);
+        }
+        assert!(
+            fx.queue.poll().is_none(),
+            "a chain is completable only through its head"
+        );
+        assert_eq!(fx.queue.device_faults().completion_not_posted, 2);
+        assert_eq!(
+            fx.queue.free_count(),
+            SIZE - 3,
+            "a refused completion frees nothing"
+        );
+        assert_eq!(fx.queue.posted_count(), 1);
+
+        // The head still completes, and the chain still returns whole.
+        fx.device.complete(u32::from(head), 0);
+        fx.queue
+            .poll()
+            .expect("the head is still posted")
+            .0
+            .recycle();
+        assert_eq!(fx.queue.free_count(), SIZE);
+    }
+
+    #[test]
+    fn a_chain_clamps_to_the_sum_of_its_device_writable_segments() {
+        let mut fx = Fixture::new();
+        // 16 readable + 512 + 1 writable: 513 bytes the device may claim to
+        // have written, and 16 it may not.
+        let head = fx
+            .queue
+            .add_chain(&block_request())
+            .expect("three descriptors are free");
+        fx.device.complete(u32::from(head), u32::MAX);
+        let (completion, len) = fx.queue.poll().expect("a completion is pending");
+        assert_eq!(
+            len, 513,
+            "a segment the device only reads is not room it may claim to have filled"
+        );
+        completion.recycle();
+        assert_eq!(fx.queue.device_faults().completion_length_over_reported, 1);
+
+        // A chain the device only reads admits nothing at all.
+        let readable = [
+            Segment {
+                paddr: 0x1000,
+                len: 16,
+                device_writable: false,
+            },
+            Segment {
+                paddr: 0x2000,
+                len: 64,
+                device_writable: false,
+            },
+        ];
+        let head = fx.queue.add_chain(&readable).expect("two are free");
+        fx.device.complete(u32::from(head), 1);
+        let (completion, len) = fx.queue.poll().expect("a completion is pending");
+        assert_eq!(len, 0);
+        completion.recycle();
+        assert_eq!(fx.queue.device_faults().completion_length_over_reported, 2);
+    }
+
+    #[test]
+    fn add_chain_refuses_a_chain_it_cannot_allocate_whole() {
+        // A part-allocated chain would strand every descriptor it had taken:
+        // only a head can be completed, and a chain that was never published
+        // never gets one.
+        let mut fx = Fixture::new();
+        let filler = Segment {
+            paddr: 0x1000,
+            len: 64,
+            device_writable: true,
+        };
+
+        assert!(
+            fx.queue.add_chain(&[]).is_none(),
+            "an empty chain has no head to return"
+        );
+        assert!(
+            fx.queue.add_chain(&[filler; SIZE + 1]).is_none(),
+            "a chain longer than the queue is refused, not truncated"
+        );
+        assert_eq!(fx.queue.free_count(), SIZE, "a refusal allocates nothing");
+
+        for _ in 0..4 {
+            fx.queue.add_writable(0x2000, 64).expect("a descriptor");
+        }
+        let remaining = fx.queue.free_count();
+        assert!(fx.queue.add_chain(&vec![filler; remaining + 1]).is_none());
+        assert_eq!(fx.queue.free_count(), remaining);
+        assert_eq!(
+            fx.queue.posted_count(),
+            4,
+            "the refused chain published nothing"
+        );
+
+        // Exactly what is free still succeeds, so the bound is the free count
+        // and not something short of it.
+        assert!(fx.queue.add_chain(&vec![filler; remaining]).is_some());
+        assert_eq!(fx.queue.free_count(), 0);
+        assert_eq!(fx.queue.posted_count(), 5);
+    }
+
+    #[test]
+    fn add_chain_survives_a_reordered_free_list_and_a_ring_wrap() {
+        let mut fx = Fixture::new();
+        let region_ptr = fx.device.region;
+
+        // Force both ring positions to just below the u16 wrap, so the chain
+        // path publishes across 0xFFFF -> 0x0000.
+        fx.queue.avail_idx = u16::MAX - 1;
+        fx.queue.last_used = u16::MAX - 1;
+        // SAFETY: single-threaded test driving the ring's far side; the offset lies within the live, test-owned region.
+        unsafe {
+            region_ptr
+                .add(used_area_off::<SIZE>() + 2)
+                .cast::<u16>()
+                .write_volatile(u16::MAX - 1);
+        }
+        fx.device.last_avail = u16::MAX - 1;
+        fx.device.used_idx = u16::MAX - 1;
+
+        // Hand four descriptors back in an order that is not the order they
+        // were taken, so `free_head` is no longer 0 and the free list no longer
+        // runs in index order — the state a fresh queue never shows.
+        let taken: Vec<u16> = (0..4)
+            .map(|_| fx.queue.add_writable(0x1000, 64).expect("a descriptor"))
+            .collect();
+        for &head in &[taken[2], taken[0], taken[3], taken[1]] {
+            fx.device.complete(u32::from(head), 0);
+            fx.queue
+                .poll()
+                .expect("a completion is pending")
+                .0
+                .recycle();
+        }
+        assert_eq!(fx.queue.free_count(), SIZE);
+        assert_ne!(
+            fx.queue.free_head, 0,
+            "the free list is no longer in index order"
+        );
+
+        // Chains and singles interleaved, each round taking four descriptors
+        // and giving all four back.
+        for round in 0..6u32 {
+            let chain = fx.queue.add_chain(&block_request()).expect("three free");
+            let single = fx.queue.add_writable(0x5000, 64).expect("a fourth");
+            let members = chain_indices(&fx.queue, chain);
+            assert_eq!(members.len(), 3, "round {round}");
+            assert!(
+                !members.contains(&single),
+                "round {round}: the single took a descriptor the chain holds"
+            );
+            assert_eq!(fx.queue.free_count(), SIZE - 4, "round {round}");
+
+            fx.device.complete(u32::from(chain), 513);
+            fx.device.complete(u32::from(single), 64);
+            for _ in 0..2 {
+                fx.queue
+                    .poll()
+                    .expect("a completion is pending")
+                    .0
+                    .recycle();
+            }
+            assert_eq!(fx.queue.free_count(), SIZE, "round {round}");
+            assert_eq!(fx.queue.posted_count(), 0, "round {round}");
+        }
+        assert_eq!(fx.queue.device_faults(), DeviceFaults::default());
+    }
+
+    #[test]
     fn ring_indices_wrap_through_the_u16_boundary() {
         let mut fx = Fixture::new();
         let mut buffers: Vec<Box<[u8; BUF]>> = (0..SIZE).map(|_| Box::new([0u8; BUF])).collect();
@@ -1079,15 +1499,18 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(96))]
 
-        /// Random add/complete/poll/recycle sequences, with the device
-        /// completing descriptors in and out of posting order, must never panic,
-        /// never hand out a descriptor index that is already in flight, and
-        /// conserve the descriptor count: `free_count` equals the queue size
-        /// minus every descriptor currently posted, completed-but-unpolled, or
+        /// Random add/chain/complete/poll/recycle sequences, with the device
+        /// completing requests in and out of posting order, must never panic,
+        /// never hand out a descriptor that is already in flight, and conserve
+        /// the descriptor count: `free_count` equals the queue size minus every
+        /// descriptor currently posted, completed-but-unpolled, or
         /// polled-but-stranded, and returns to full once all are recycled.
+        /// Chains make that a sum over chain lengths rather than a count of
+        /// heads, and add the invariant that a chain neither loses nor gains a
+        /// link between its publication and its release.
         #[test]
         fn split_virtqueue_accounting_holds_under_random_operations(
-            ops in prop::collection::vec((0u8..4, any::<u16>()), 0..200),
+            ops in prop::collection::vec((0u8..5, any::<u16>()), 0..200),
         ) {
             const N: usize = 8;
             let region = MappedRegion::zeroed();
@@ -1095,32 +1518,43 @@ mod tests {
             // SAFETY: `MappedRegion` is 16-byte-aligned, zeroed, larger than the queue layout, and live until its `Drop` — `SplitVirtqueue::new`'s contract.
             let mut queue = unsafe { SplitVirtqueue::<N>::new(region_ptr) };
 
-            let mut outstanding: Vec<u16> = Vec::new(); // posted, device not done
-            let mut completed: VecDeque<u16> = VecDeque::new(); // device done, unpolled
-            let mut stranded: Vec<u16> = Vec::new(); // polled, completion dropped
+            // Each entry is a request: its head, and how many descriptors the
+            // chain behind that head is supposed to hold.
+            let mut outstanding: Vec<(u16, usize)> = Vec::new(); // posted, device not done
+            let mut completed: VecDeque<(u16, usize)> = VecDeque::new(); // device done, unpolled
+            let mut stranded: Vec<(u16, usize)> = Vec::new(); // polled, completion dropped
             let mut used_idx: u16 = 0;
 
             let check_invariants =
                 |q: &SplitVirtqueue<N>,
-                 outstanding: &[u16],
-                 completed: &VecDeque<u16>,
-                 stranded: &[u16]|
+                 outstanding: &[(u16, usize)],
+                 completed: &VecDeque<(u16, usize)>,
+                 stranded: &[(u16, usize)]|
                  -> Result<(), TestCaseError> {
-                    let allocated = outstanding.len() + completed.len() + stranded.len();
-                    prop_assert_eq!(q.free_count(), N - allocated);
-                    // Only descriptors the device has not completed are posted.
+                    // Only requests the device has not completed are posted.
                     prop_assert_eq!(q.posted_count(), outstanding.len() + completed.len());
-                    // A descriptor index is in exactly one state at a time.
+                    // A descriptor is in exactly one state at a time, counting
+                    // the links a head holds and not only the head itself.
                     let mut seen = [false; N];
-                    for head in outstanding
+                    let mut allocated = 0usize;
+                    for (head, length) in outstanding
                         .iter()
                         .chain(completed.iter())
                         .chain(stranded.iter())
                     {
-                        let i = *head as usize;
-                        prop_assert!(!seen[i], "descriptor {} held in two states", i);
-                        seen[i] = true;
+                        let chain = chain_indices(q, *head);
+                        prop_assert_eq!(
+                            chain.len(), *length,
+                            "chain {} lost or gained a link", head
+                        );
+                        for index in chain {
+                            let i = index as usize;
+                            prop_assert!(!seen[i], "descriptor {} held in two states", i);
+                            seen[i] = true;
+                            allocated += 1;
+                        }
                     }
+                    prop_assert_eq!(q.free_count(), N - allocated);
                     Ok(())
                 };
 
@@ -1129,36 +1563,57 @@ mod tests {
                     0 => {
                         if queue.free_count() > 0 {
                             let head = queue.add_writable(0x1000, 64).unwrap();
-                            outstanding.push(head);
+                            outstanding.push((head, 1));
                         }
                     }
+                    // Two to four segments, so links exist and the
+                    // all-or-nothing refusal is reached from both sides.
                     1 => {
+                        let want = 2 + (sel as usize % 3);
+                        let segments: Vec<Segment> = (0..want)
+                            .map(|i| Segment {
+                                paddr: 0x4000 + i as u64,
+                                len: 64,
+                                device_writable: i % 2 == 0,
+                            })
+                            .collect();
+                        match queue.add_chain(&segments) {
+                            Some(head) => outstanding.push((head, want)),
+                            None => prop_assert!(
+                                want > queue.free_count(),
+                                "a chain that fits was refused"
+                            ),
+                        }
+                    }
+                    2 => {
                         if !outstanding.is_empty() {
                             let i = (sel as usize) % outstanding.len();
-                            let head = outstanding.remove(i);
-                            device_complete(region_ptr, &mut used_idx, head);
-                            completed.push_back(head);
+                            let request = outstanding.remove(i);
+                            device_complete(region_ptr, &mut used_idx, request.0);
+                            completed.push_back(request);
                         }
                     }
                     // Poll and recycle at once: a completion is the queue's
                     // exclusive borrow, so it cannot be parked and surrendered
                     // later — which is the property under test elsewhere.
-                    2 => match queue.poll() {
+                    3 => match queue.poll() {
                         Some((got, _)) => {
-                            prop_assert_eq!(Some(got.index()), completed.pop_front());
+                            let expected = completed.pop_front();
+                            prop_assert_eq!(Some(got.index()), expected.map(|(head, _)| head));
                             got.recycle();
                         }
                         None => prop_assert!(completed.is_empty()),
                     },
-                    // Poll and drop: the descriptor stays reaped and out of the
-                    // free list for good, which is the other terminal state a
+                    // Poll and drop: the chain stays reaped and out of the free
+                    // list for good, which is the other terminal state a
                     // completion has.
                     _ => match queue.poll() {
                         Some((got, _)) => {
                             let head = got.index();
-                            prop_assert_eq!(Some(head), completed.pop_front());
+                            let expected = completed.pop_front();
+                            prop_assert_eq!(Some(head), expected.map(|(head, _)| head));
                             drop(got);
-                            stranded.push(head);
+                            stranded.push(expected.expect("a completion was pending"));
                         }
                         None => prop_assert!(completed.is_empty()),
                     },
@@ -1168,14 +1623,15 @@ mod tests {
 
             // Drain everything and confirm the free list is whole but for the
             // descriptors deliberately stranded above.
-            while let Some(head) = outstanding.pop() {
-                device_complete(region_ptr, &mut used_idx, head);
-                completed.push_back(head);
+            while let Some(request) = outstanding.pop() {
+                device_complete(region_ptr, &mut used_idx, request.0);
+                completed.push_back(request);
             }
             while let Some((got, _)) = queue.poll() {
                 got.recycle();
             }
-            prop_assert_eq!(queue.free_count(), N - stranded.len());
+            let held: usize = stranded.iter().map(|(_, length)| length).sum();
+            prop_assert_eq!(queue.free_count(), N - held);
             prop_assert_eq!(queue.posted_count(), 0);
             // Every completion in this run named a posted descriptor exactly
             // once, so a fault here would mean the queue refused a legitimate
@@ -1186,12 +1642,19 @@ mod tests {
         /// Arbitrary device bytes across the **whole** region — descriptor
         /// table, driver ring and device ring alike, all of which the device
         /// can write: `poll` must terminate, never name a descriptor outside
-        /// the table, never hand out more completions than were posted, never
-        /// report more bytes than were programmed, and count every over-report
-        /// it clamped; and the free list must still be intact enough to re-post
-        /// afterwards.
+        /// the table, never hand out a descriptor that was not published as a
+        /// chain head, never hand out one twice, never hand out more
+        /// completions than were posted, never report more bytes than were
+        /// programmed, and count every over-report it clamped; and the free
+        /// list must still be intact enough to re-post afterwards.
+        ///
+        /// Chains are posted before the scribble because they are what a
+        /// rewritten `next` field would steer: the links this driver frees a
+        /// chain by are its own, so no arrangement of the region can make a
+        /// completion release a descriptor the device chose.
         #[test]
         fn poll_survives_an_arbitrary_used_ring(
+            chains in prop::collection::vec(1usize..=3, 0..4),
             posts in 0usize..=8,
             bytes in prop::collection::vec(any::<u8>(), 0..256),
             used_idx in any::<u16>(),
@@ -1202,10 +1665,32 @@ mod tests {
             let ptr = region.base();
             // SAFETY: `MappedRegion` is 16-byte-aligned, zeroed, larger than the queue layout, and live until its `Drop` — `SplitVirtqueue::new`'s contract.
             let mut queue = unsafe { SplitVirtqueue::<N>::new(ptr) };
-            for _ in 0..posts {
-                if queue.add_writable(0x1000, POSTED_LEN).is_none() {
-                    break;
+
+            // What each published head is allowed to report back, which is the
+            // clamp the drain below holds every completion to.
+            let mut writable_of = std::collections::HashMap::new();
+            for want in &chains {
+                let segments: Vec<Segment> = (0..*want)
+                    .map(|i| Segment {
+                        paddr: 0x1000,
+                        len: POSTED_LEN,
+                        device_writable: i % 2 == 0,
+                    })
+                    .collect();
+                if let Some(head) = queue.add_chain(&segments) {
+                    let writable: u32 = segments
+                        .iter()
+                        .filter(|segment| segment.device_writable)
+                        .map(|segment| segment.len)
+                        .sum();
+                    writable_of.insert(head, writable);
                 }
+            }
+            for _ in 0..posts {
+                let Some(head) = queue.add_writable(0x1000, POSTED_LEN) else {
+                    break;
+                };
+                writable_of.insert(head, POSTED_LEN);
             }
             let posted = queue.posted_count();
 
@@ -1227,12 +1712,19 @@ mod tests {
 
             let mut handed_out = 0usize;
             let mut guard = 0usize;
+            let mut released = [false; N];
             while let Some((completion, len)) = queue.poll() {
-                prop_assert!((completion.index() as usize) < N);
-                prop_assert!(len <= POSTED_LEN, "a device length escaped the clamp");
+                let head = completion.index();
+                prop_assert!((head as usize) < N);
+                let writable = *writable_of.get(&head).ok_or_else(|| TestCaseError::fail(
+                    "a completion named a descriptor that was never published as a chain head"
+                ))?;
+                prop_assert!(len <= writable, "a device length escaped the clamp");
+                prop_assert!(!released[head as usize], "head {} was freed twice", head);
+                released[head as usize] = true;
                 handed_out += 1;
                 guard += 1;
-                prop_assert!(guard <= N, "the drain loop outran the posted descriptors");
+                prop_assert!(guard <= N, "the drain loop outran the posted requests");
                 completion.recycle();
             }
             prop_assert!(handed_out <= posted);

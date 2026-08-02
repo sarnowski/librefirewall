@@ -763,10 +763,13 @@ mod tests {
 
     /// The committed seed of that name, so a demonstration and the corpus entry
     /// that preserves it cannot drift apart.
+    /// The corpus directory these seeds live in.
+    const TARGET: &str = "log_ring";
+
     fn seed(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("corpus")
-            .join("log_ring")
+            .join(TARGET)
             .join(name);
         fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     }
@@ -895,6 +898,8 @@ mod tests {
             unix_nanos: u64::MAX,
             frames: u64::MAX,
             frame_bytes: u64::MAX,
+            capacity_sectors: u64::MAX,
+            leading_word: u64::MAX,
         };
         // Every slot, not a sample of them: the seed stands for a region pair
         // in which the peer has set every byte it can reach, and a drain that
@@ -964,6 +969,25 @@ mod tests {
     /// byte, so a cold fuzz run starts from the shapes above and an edit that
     /// changed the operation encoding could not leave the corpus silently
     /// meaning something else.
+    /// Rewrite every committed seed from the demonstration of the same name.
+    ///
+    /// Ignored by default and run by hand — `cargo test --manifest-path
+    /// fuzz/Cargo.toml -- --ignored rewrite_the_committed_seeds` — after a
+    /// deliberate change to the record ABI, which shifts every field a seed's
+    /// byte image places. The test below is what holds the corpus to the
+    /// demonstrations afterwards, so this is a regeneration step and never a
+    /// substitute for it.
+    #[test]
+    #[ignore = "regenerates the committed corpus; run by hand after an ABI change"]
+    fn rewrite_the_committed_seeds() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("corpus")
+            .join(TARGET);
+        for (name, built) in demonstrations() {
+            fs::write(dir.join(name), &built).expect("write the seed");
+        }
+    }
+
     #[test]
     fn every_demonstration_is_the_committed_seed_of_its_name() {
         for (name, built) in demonstrations() {

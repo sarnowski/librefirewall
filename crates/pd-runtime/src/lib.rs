@@ -92,10 +92,11 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
-use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, TtlExpired};
+use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, MacAddress, TtlExpired};
 use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError, WriteOutsideBuffer};
 use queue::SpscRing;
 use routing::{Decision, DropCounters, DropReason, PortId, Router};
+use wire::{TapDirection, TapOutcome};
 
 pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
@@ -386,11 +387,14 @@ macro_rules! attach_region {
 }
 
 pub mod clock;
+pub mod download;
 pub mod endpoint;
 pub mod handover;
 pub mod stats;
+pub mod tap;
 
 pub use clock::{PdClock, read_timestamp_counter};
+pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
     MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,
@@ -401,8 +405,10 @@ pub use handover::{
 };
 pub use lfw_ip_endpoint::IsnSecret;
 pub use stats::{
-    StatsRegions, config_sample, forwarder_sample, log_sample, management_sample, pipeline_sample,
+    BlockCounters, StatsRegions, config_sample, forwarder_sample, log_sample, management_sample,
+    pipeline_sample, recorder_sample,
 };
+pub use tap::{Observation, Tap, TapCounters, tap_drop_reason};
 pub use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
     ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS,
@@ -654,6 +660,25 @@ impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
 /// does. This domain maps no `free` ring — that is what denies it the ability
 /// to forge a return — so the transmitting driver is the only domain that can
 /// give the buffer back, and the verdict is how it is told to.
+///
+/// # What an attached [`Tap`] records, and what it does not
+///
+/// One observation per frame the *router* decided on, taken from the snapshot
+/// before the forwarding rewrite, so a recording holds the frame as it arrived.
+/// Three classes of frame are therefore absent from a recording and present in
+/// the counters, which is the honest split rather than an omission:
+///
+/// * a frame no decision was reached about — a descriptor outside the pool, a
+///   snapshot the pool refused, or bytes that are not the IPv4-over-Ethernet
+///   packet a router can read — has no verdict to record;
+/// * a frame routed out of a port this stage is not wired to, which
+///   `wire::TapDropReason` has no encoding for: it mirrors
+///   `routing::DropReason` exactly, and recording one under a neighbouring
+///   reason would put a false claim in an artifact that is evidence;
+/// * a frame recorded as forwarded that a later refusal still lost — the pool
+///   declining the rewritten header, the destination ring declining the
+///   descriptor, or `rewrite_for_forwarding` refusing a TTL the router had
+///   already accepted. Each has its own series in MONITORING.md.
 pub struct RouteStage<'ring> {
     ingress: PortId,
     egress: PortId,
@@ -706,6 +731,7 @@ impl<'ring> RouteStage<'ring> {
     pub fn poll<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
         &mut self,
         configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+        mut tap: Option<&mut Tap<'_>>,
     ) -> usize {
         let Self {
             ingress,
@@ -727,16 +753,50 @@ impl<'ring> RouteStage<'ring> {
                 bump(&mut counters.malformed_descriptor);
                 continue;
             }
-            let verdict = match snapshot(pool, &descriptor, scratch) {
-                Ok(frame_bytes) => route_frame(router, *ingress, *egress, frame_bytes, counters),
+            let (routed, frame_len) = match snapshot(pool, &descriptor, scratch) {
+                Ok(frame_bytes) => {
+                    let len = frame_bytes.len();
+                    (
+                        decide(router, *ingress, *egress, frame_bytes, counters),
+                        len,
+                    )
+                }
                 Err(_) => {
                     bump(&mut counters.snapshot_failed);
-                    Verdict::Discard
+                    (Routed::Discarded, 0)
                 }
             };
-            let verdict = match verdict {
-                Verdict::Transmit => write_back(pool, &descriptor, scratch, counters),
-                Verdict::Discard => Verdict::Discard,
+            // Before the rewrite below, which is what makes the recorded bytes
+            // the frame as it arrived rather than as it leaves.
+            if let Some(tap) = tap.as_deref_mut()
+                && let Some(outcome) = routed.observed()
+            {
+                tap.observe(Observation {
+                    timestamp: read_timestamp_counter().0,
+                    interface_id: ingress.0,
+                    outcome,
+                    direction: TapDirection::Inbound,
+                    generation: configuration.generation,
+                    // The snapshot's own length, so the slice is the frame; the
+                    // fallback records nothing rather than branching on a span
+                    // `snapshot` cannot produce.
+                    frame: scratch.get(..frame_len).unwrap_or_default(),
+                });
+            }
+            let verdict = match routed {
+                Routed::Forward {
+                    source,
+                    destination,
+                } => forward(
+                    pool,
+                    &descriptor,
+                    scratch,
+                    frame_len,
+                    source,
+                    destination,
+                    counters,
+                ),
+                Routed::Dropped(_) | Routed::Discarded => Verdict::Discard,
             };
             if to
                 .try_enqueue(Descriptor {
@@ -817,15 +877,89 @@ fn snapshot<'scratch>(
     Ok(frame_bytes)
 }
 
-/// The verdict on one snapshotted frame, rewritten in place for its next hop
-/// when the verdict is to forward it.
-fn route_frame<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+/// What the stage resolved about one snapshotted frame, before a byte of it is
+/// rewritten.
+///
+/// The decision is separated from the rewrite so an attached [`Tap`] can record
+/// the frame as it arrived. That costs a second [`Frame::parse`] on the
+/// forwarding path — the first borrow must end before the bytes can be read —
+/// and buys the property that makes a recording usable as evidence: what is on
+/// the medium is what the wire carried.
+enum Routed {
+    Forward {
+        source: MacAddress,
+        destination: MacAddress,
+    },
+    Dropped(DropReason),
+    /// Discarded for something `routing` does not name; see [`RouteStage`] on
+    /// why no tap records it.
+    Discarded,
+}
+
+impl Routed {
+    /// This resolution as a tap outcome, or `None` where the ABI has no honest
+    /// encoding for it.
+    const fn observed(&self) -> Option<TapOutcome> {
+        match self {
+            Self::Forward { .. } => Some(TapOutcome::Forwarded),
+            Self::Dropped(reason) => Some(TapOutcome::Dropped(tap_drop_reason(*reason))),
+            Self::Discarded => None,
+        }
+    }
+}
+
+/// Parse one snapshotted frame and put it to the router, leaving it untouched.
+fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
     router: &Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
     ingress: PortId,
     egress: PortId,
     frame_bytes: &mut [u8],
     counters: &mut RouteCounters,
+) -> Routed {
+    let frame = match Frame::parse(frame_bytes) {
+        Ok(frame) => frame,
+        Err(_) => {
+            bump(&mut counters.unparsable);
+            return Routed::Discarded;
+        }
+    };
+    match router.decide(ingress, &frame) {
+        Decision::Drop(reason) => {
+            counters.drops.record(reason);
+            Routed::Dropped(reason)
+        }
+        Decision::Forward {
+            egress: decided, ..
+        } if decided != egress => {
+            bump(&mut counters.misrouted);
+            Routed::Discarded
+        }
+        Decision::Forward {
+            source,
+            destination,
+            ..
+        } => Routed::Forward {
+            source,
+            destination,
+        },
+    }
+}
+
+/// Rewrite the snapshot for its next hop and put the changed headers back into
+/// the pool, answering the verdict the transmitting driver acts on.
+fn forward(
+    pool: &Pool,
+    descriptor: &Descriptor,
+    scratch: &mut [u8; BUFFER_SIZE],
+    frame_len: usize,
+    source: MacAddress,
+    destination: MacAddress,
+    counters: &mut RouteCounters,
 ) -> Verdict {
+    // The snapshot's own length, which `decide` already parsed successfully at;
+    // an empty slice fails the same parse and discards rather than branching on
+    // a span `snapshot` cannot produce.
+    let frame_bytes: &mut [u8] = scratch.get_mut(..frame_len).unwrap_or_default();
     let mut frame = match Frame::parse(frame_bytes) {
         Ok(frame) => frame,
         Err(_) => {
@@ -833,32 +967,16 @@ fn route_frame<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
             return Verdict::Discard;
         }
     };
-    match router.decide(ingress, &frame) {
-        Decision::Drop(reason) => {
-            counters.drops.record(reason);
+    match frame.rewrite_for_forwarding(source, destination) {
+        Ok(()) => write_back(pool, descriptor, scratch, counters),
+        // The router refuses a TTL that cannot survive a hop before it
+        // resolves a route, so this is one rejection reached through the
+        // second of two enforcers. Recording it under the reason the first
+        // would have used keeps one refused packet to one drop.
+        Err(TtlExpired { .. }) => {
+            counters.drops.record(DropReason::TtlExpired);
             Verdict::Discard
         }
-        Decision::Forward {
-            egress: decided, ..
-        } if decided != egress => {
-            bump(&mut counters.misrouted);
-            Verdict::Discard
-        }
-        Decision::Forward {
-            source,
-            destination,
-            ..
-        } => match frame.rewrite_for_forwarding(source, destination) {
-            Ok(()) => Verdict::Transmit,
-            // The router refuses a TTL that cannot survive a hop before it
-            // resolves a route, so this is one rejection reached through the
-            // second of two enforcers. Recording it under the reason the first
-            // would have used keeps one refused packet to one drop.
-            Err(TtlExpired { .. }) => {
-                counters.drops.record(DropReason::TtlExpired);
-                Verdict::Discard
-            }
-        },
     }
 }
 
@@ -1412,7 +1530,7 @@ mod tests {
 
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(running()), 1);
+        assert_eq!(stage.poll(running(), None), 1);
         assert_eq!(stage.counters().forwarded, 1);
         assert_eq!(stage.counters().drops.total(), 0);
 
@@ -1471,7 +1589,7 @@ mod tests {
         let sent = FrameSpec::a_to_b().build();
         let index =
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(running()), 1);
+        assert_eq!(stage.poll(running(), None), 1);
 
         let mut whole = [0u8; BUFFER_SIZE];
         // SAFETY: the buffer is lent, and this test is the only other party to
@@ -1547,7 +1665,7 @@ mod tests {
                 .expect("the ring is empty");
             drop(buffer);
 
-            assert_eq!(stage.poll(running()), 1);
+            assert_eq!(stage.poll(running(), None), 1);
             let handed_on = tx_out.try_dequeue().expect("the frame was handed on");
             assert_eq!(
                 Verdict::from_bits(handed_on.verdict),
@@ -1583,7 +1701,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            stage.poll(running()),
+            stage.poll(running(), None),
             capacity,
             "the destination is now full"
         );
@@ -1594,7 +1712,7 @@ mod tests {
                 .try_enqueue(Descriptor::new(index, 0, 64, Verdict::Transmit))
                 .unwrap();
         }
-        assert_eq!(stage.poll(running()), 0);
+        assert_eq!(stage.poll(running(), None), 0);
         assert_eq!(stage.counters().egress_full, 1);
         // Draining stopped at the first refusal rather than emptying `rx` into
         // a full destination and losing every buffer with it.
@@ -1610,7 +1728,7 @@ mod tests {
         let mut tx_out = r.rings.tx.consumer();
         for round in 0..8u32 {
             forge_cursors(&r.rings.rx, 0, round.wrapping_mul(37).wrapping_add(11));
-            let handed_on = stage.poll(running());
+            let handed_on = stage.poll(running(), None);
             assert!(
                 handed_on <= DRAIN_LIMIT,
                 "poll handled {handed_on} descriptors"
@@ -1642,7 +1760,7 @@ mod tests {
             rx_in.try_enqueue(forged).expect("the ring has room");
         }
 
-        assert_eq!(stage.poll(running()), 0, "nothing may be handed on");
+        assert_eq!(stage.poll(running(), None), 0, "nothing may be handed on");
         assert_eq!(stage.counters().malformed_descriptor, 4);
         assert_eq!(stage.counters().snapshot_failed, 0);
         assert_eq!(tx_out.try_dequeue(), None);
@@ -1774,7 +1892,7 @@ mod tests {
             let sent = spec.build();
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
             assert_eq!(
-                stage.poll(Configuration::new(1, table)),
+                stage.poll(Configuration::new(1, table), None),
                 1,
                 "{reason}: the descriptor must travel on"
             );
@@ -1831,7 +1949,7 @@ mod tests {
             receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
         }
 
-        assert_eq!(stage.poll(running()), unroutable.len());
+        assert_eq!(stage.poll(running(), None), unroutable.len());
         assert_eq!(stage.counters().unparsable, unroutable.len() as u64);
         assert_eq!(
             stage.counters().drops.total(),
@@ -1866,7 +1984,7 @@ mod tests {
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
 
-        assert_eq!(stage.poll(running()), 1);
+        assert_eq!(stage.poll(running(), None), 1);
         assert_eq!(stage.counters().misrouted, 1);
         assert_eq!(stage.counters().forwarded, 0);
         assert_eq!(
@@ -1879,6 +1997,150 @@ mod tests {
             Verdict::from_bits(handed_on.verdict),
             Some(Verdict::Discard)
         );
+    }
+
+    /// The tap ring is far larger than a stack frame, so every test heaps it.
+    struct TapRing {
+        records: Box<wire::TapRecords>,
+        consume: Box<wire::TapConsume>,
+    }
+
+    impl TapRing {
+        fn new() -> Self {
+            Self {
+                records: Box::new(wire::TapRecords::zero()),
+                consume: Box::new(wire::TapConsume::zero()),
+            }
+        }
+
+        fn drain(&self) -> Vec<(wire::CheckedTap, Vec<u8>)> {
+            let mut reader = self.consume.reader(&self.records);
+            let mut into = [0u8; wire::TAP_SNAP_LEN];
+            let mut read = Vec::new();
+            reader.drain(usize::MAX, &mut into, |one| {
+                let (checked, bytes) = one.expect("this producer writes decodable annotations");
+                read.push((checked, bytes.to_vec()));
+            });
+            read
+        }
+    }
+
+    #[test]
+    fn a_tapped_pass_records_one_observation_per_decided_frame_as_it_arrived() {
+        // The whole of Part A in one run: a forwarded frame and a dropped one,
+        // each recorded once, under the verdict the stage reached and with the
+        // bytes the wire carried — not the rewritten headers the next hop sees.
+        let r = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+
+        let forwarded = FrameSpec::a_to_b().build();
+        let dropped = FrameSpec {
+            ttl: 1,
+            ..FrameSpec::a_to_b()
+        }
+        .build();
+        for frame in [&forwarded, &dropped] {
+            receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
+        }
+
+        assert_eq!(stage.poll(running(), Some(&mut tap)), 2);
+        assert_eq!(stage.counters().forwarded, 1);
+
+        let read = ring.drain();
+        assert_eq!(read.len(), 2, "one observation per decided frame");
+        let (first, first_bytes) = &read[0];
+        assert_eq!(first.outcome, wire::TapOutcome::Forwarded);
+        assert_eq!(first.interface_id, PORT0.0);
+        assert_eq!(first.direction, wire::TapDirection::Inbound);
+        assert_eq!(
+            first.generation, 1,
+            "the generation `running` decides under"
+        );
+        assert_eq!(first.original_len, forwarded.len() as u32);
+        assert_eq!(
+            first_bytes.as_slice(),
+            forwarded.as_slice(),
+            "the recorded bytes are the frame as it arrived"
+        );
+        let (second, second_bytes) = &read[1];
+        assert_eq!(
+            second.outcome,
+            wire::TapOutcome::Dropped(wire::TapDropReason::TtlExpired)
+        );
+        assert_eq!(second_bytes.as_slice(), dropped.as_slice());
+        // Identities are per appliance and monotone, which is what relates two
+        // observations of one frame once the egress one is recorded too.
+        assert_eq!(second.packet_id, first.packet_id + 1);
+        assert_eq!(tap.counters().observed, 2);
+        assert_eq!(tap.counters().dropped, 0);
+    }
+
+    #[test]
+    fn a_frame_no_routing_decision_was_reached_about_is_counted_and_not_recorded() {
+        // `wire::TapDropReason` mirrors `routing::DropReason` exactly, so a
+        // frame the router never saw has no honest encoding — and inventing one
+        // would put a claim in an artifact that is evidence.
+        let r = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+
+        receive(&r.pool, &mut owner, &mut rx_in, &std::vec![0xAA; 64])
+            .expect("a full pool has buffers");
+        assert_eq!(stage.poll(running(), Some(&mut tap)), 1);
+
+        assert_eq!(stage.counters().unparsable, 1);
+        assert_eq!(tap.counters().observed, 0);
+        assert!(ring.drain().is_empty());
+    }
+
+    #[test]
+    fn a_full_tap_ring_costs_frames_nothing() {
+        // The rule the whole tap rests on: anyone who can send packets must not
+        // be able to stall forwarding by outrunning the recorder's medium.
+        let r = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+        let mut tx_out = r.rings.tx.consumer();
+        let mut free_in = r.returns.free.producer();
+
+        // Fill the tap to refusal before a frame is ever offered, so every one
+        // of the frames below is decided against a ring with no slot left.
+        let filler = [0u8; 16];
+        for _ in 0..ring.records.capacity() {
+            tap.observe(Observation {
+                timestamp: 0,
+                interface_id: 0,
+                outcome: wire::TapOutcome::Forwarded,
+                direction: wire::TapDirection::Inbound,
+                generation: 0,
+                frame: &filler,
+            });
+        }
+
+        let sent = FrameSpec::a_to_b().build();
+        let offered = 8;
+        let mut forwarded = 0;
+        for _ in 0..offered {
+            receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+            forwarded += stage.poll(running(), Some(&mut tap));
+            transmit(&r.pool, &mut tx_out, &mut free_in, |_, _| {});
+            owner.reclaim();
+        }
+
+        assert_eq!(forwarded, offered, "no frame was held back by a full tap");
+        assert_eq!(stage.counters().forwarded, offered as u64);
+        assert_eq!(tap.counters().dropped, offered as u64);
+        assert_eq!(owner.owned(), POOL_BUFFERS, "no buffer was lost either");
     }
 
     #[test]
@@ -1965,7 +2227,7 @@ mod tests {
         }
         assert_eq!(owner.owned(), POOL_BUFFERS - 2);
 
-        assert_eq!(stage.poll(running()), 2);
+        assert_eq!(stage.poll(running(), None), 2);
 
         let mut seen = Vec::new();
         let transmitted = transmit(&r.pool, &mut tx_out, &mut free_in, |_, bytes| {
@@ -2271,7 +2533,7 @@ mod tests {
         for (tag, port0_up) in [(1u8, true), (2u8, true), (3u8, false)] {
             let (number, table) = generation(tag, port0_up);
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-            assert_eq!(stage.poll(Configuration::new(number, &table)), 1);
+            assert_eq!(stage.poll(Configuration::new(number, &table), None), 1);
             assert_eq!(stage.counters().generation, number);
 
             let expected = port0_up.then(|| generation_macs(tag));
@@ -2392,7 +2654,7 @@ mod tests {
                 let mut idle = 0u64;
                 while handed_on < TOTAL {
                     let (number, table) = &generations[current];
-                    let moved = stage.poll(Configuration::new(*number, table));
+                    let moved = stage.poll(Configuration::new(*number, table), None);
                     if moved > 0 {
                         handed_on += moved as u64;
                         // The commit, and the only point one can occur: the
@@ -2610,7 +2872,7 @@ mod tests {
                         }
                     }
                     PeerStep::Route => {
-                        prop_assert!(stage.poll(running()) <= DRAIN_LIMIT);
+                        prop_assert!(stage.poll(running(), None) <= DRAIN_LIMIT);
                         // Play the tx driver: take what arrived and hand each
                         // buffer straight back, as a well-behaved peer would.
                         for descriptor in tx_out.drain(DRAIN_LIMIT) {
@@ -2706,7 +2968,7 @@ mod tests {
             // Fewer than the pool holds and far fewer than a ring, so nothing
             // here can be refused for want of room: what the stage does with a
             // descriptor is the only thing under test.
-            let handed_on = stage.poll(running());
+            let handed_on = stage.poll(running(), None);
             let counters = stage.counters();
             prop_assert_eq!(counters.egress_full, 0);
             prop_assert_eq!(handed_on, published, "a real descriptor did not travel on");
@@ -2757,7 +3019,7 @@ mod tests {
                         published += 1;
                     }
                 }
-                prop_assert_eq!(stage.poll(Configuration::new(number, &table)), published);
+                prop_assert_eq!(stage.poll(Configuration::new(number, &table), None), published);
                 prop_assert_eq!(stage.counters().generation, number);
 
                 let (egress_mac, next_hop_mac) = generation_macs(tag);

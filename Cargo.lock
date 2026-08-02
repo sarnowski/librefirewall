@@ -429,6 +429,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-blk"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "virtio",
+]
+
+[[package]]
+name = "lfw-capture-ring"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "lfw-clock"
 version = "0.1.0"
 dependencies = [
@@ -477,6 +492,24 @@ dependencies = [
 name = "lfw-metrics"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "wire",
+]
+
+[[package]]
+name = "lfw-pcapng"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
+name = "lfw-recorder"
+version = "0.1.0"
+dependencies = [
+ "lfw-capture-ring",
+ "lfw-clock",
+ "lfw-pcapng",
  "proptest",
  "wire",
 ]
@@ -643,11 +676,13 @@ name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "lfw-blk",
  "lfw-clock",
  "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
+ "lfw-recorder",
  "lfw-tcp",
  "net-headers",
  "packet-buffer",
@@ -872,6 +907,21 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "recorder"
+version = "0.1.0"
+dependencies = [
+ "lfw-blk",
+ "lfw-capture-ring",
+ "lfw-log",
+ "lfw-metrics",
+ "lfw-recorder",
+ "pd-runtime",
+ "sel4-microkit",
+ "virtio",
+ "wire",
 ]
 
 [[package]]
@@ -1440,11 +1490,14 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "config",
+ "lfw-blk",
+ "lfw-capture-ring",
  "lfw-clock",
  "lfw-hpet",
  "lfw-http",
  "lfw-log",
  "lfw-metrics",
+ "lfw-recorder",
  "lfw-rtc",
  "net-headers",
  "nic-driver-core",

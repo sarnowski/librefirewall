@@ -1,0 +1,18 @@
+[package]
+# The virtio-blk device class and the request state machine over it. The
+# directory keeps the short name and the package carries the project prefix, so
+# the lib target is `lfw_blk` — the split `crates/http`, `crates/pcapng` and
+# `crates/metrics` make.
+name = "lfw-blk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+virtio = { path = "../virtio" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

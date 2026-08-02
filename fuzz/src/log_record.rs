@@ -92,7 +92,7 @@ use wire::{
 /// Restated from the ABI contract rather than taken from `size_of`, so a record
 /// that changed size would show up as a seed that no longer means what it was
 /// committed for rather than as a silently re-laid-out input.
-pub const RECORD_BYTES: usize = 232;
+pub const RECORD_BYTES: usize = 248;
 
 /// The four record kinds, as the ABI numbers them. Restated here rather than
 /// reached for through `LogKind::to_bits`, which is the code under test.
@@ -108,14 +108,16 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The six `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The seven `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
 const DETAIL_REFUSAL: u8 = 3;
 const DETAIL_ESTABLISHED: u8 = 4;
 const DETAIL_RECEIVED: u8 = 5;
-const DETAIL_COUNT: u8 = 6;
+const DETAIL_MEDIUM: u8 = 6;
+const DETAIL_EXTENT: u8 = 7;
+const DETAIL_COUNT: u8 = 7;
 
 /// The nine `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -450,10 +452,12 @@ const POISON: LogRecord = LogRecord {
     // And no value of this one is refused, so the pattern is only here to be
     // visible if a decode read it under a detail that never named it.
     unix_nanos: 0xAAAA_AAAA_AAAA_AAAA,
-    // Nor of these two: `Received` refuses nothing, so the pattern is here for
-    // the same reason.
+    // Nor of these four: neither `Received` nor `Medium` refuses anything, so
+    // the pattern is here for the same reason.
     frames: 0xAAAA_AAAA_AAAA_AAAA,
     frame_bytes: 0xAAAA_AAAA_AAAA_AAAA,
+    capacity_sectors: 0xAAAA_AAAA_AAAA_AAAA,
+    leading_word: 0xAAAA_AAAA_AAAA_AAAA,
     // Nor of this one, under either discriminant: an instant is unranged and an
     // unsynchronized record reads the field not at all.
     stamp_nanos: 0xAAAA_AAAA_AAAA_AAAA,
@@ -511,6 +515,14 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                     kept.frames = record.frames;
                     kept.frame_bytes = record.frame_bytes;
                 }
+                DETAIL_MEDIUM => {
+                    kept.capacity_sectors = record.capacity_sectors;
+                    kept.leading_word = record.leading_word;
+                }
+                // The two words a refusal would carry, read here as an extent:
+                // whole, not to `operand_count`, because this detail names both
+                // unconditionally.
+                DETAIL_EXTENT => kept.operands = record.operands,
                 DETAIL_REFUSAL => {
                     kept.cause = record.cause;
                     kept.operand_count = record.operand_count;
@@ -638,9 +650,14 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         )
     })
     .or_else(|| match record.detail {
-        // `Received` joins these three: two counts, neither ranged, so the
-        // detail carries nothing a rule can refuse it for.
-        DETAIL_NONE | DETAIL_FEATURES | DETAIL_RECEIVE_POSTED | DETAIL_RECEIVED => None,
+        // `Received`, `Medium` and `Extent` join these: two unranged numbers
+        // each, so the detail carries nothing a rule can refuse it for.
+        DETAIL_NONE
+        | DETAIL_FEATURES
+        | DETAIL_RECEIVE_POSTED
+        | DETAIL_RECEIVED
+        | DETAIL_MEDIUM
+        | DETAIL_EXTENT => None,
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.
@@ -782,6 +799,8 @@ pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
         unix_nanos: quad(unstructured),
         frames: quad(unstructured),
         frame_bytes: quad(unstructured),
+        capacity_sectors: quad(unstructured),
+        leading_word: quad(unstructured),
         stamp_nanos: quad(unstructured),
         kind: word(unstructured),
         generation: word(unstructured),
@@ -871,6 +890,8 @@ pub(crate) fn region_from_record(record: &LogRecord) -> Vec<u8> {
     out.extend_from_slice(&record.unix_nanos.to_le_bytes());
     out.extend_from_slice(&record.frames.to_le_bytes());
     out.extend_from_slice(&record.frame_bytes.to_le_bytes());
+    out.extend_from_slice(&record.capacity_sectors.to_le_bytes());
+    out.extend_from_slice(&record.leading_word.to_le_bytes());
     out.extend_from_slice(&record.stamp_nanos.to_le_bytes());
     for word in [
         record.kind,
@@ -925,12 +946,15 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// The corpus directory these seeds live in.
+    const TARGET: &str = "log_record";
+
     /// The committed seed of that name, so a demonstration and the corpus entry
     /// that preserves it cannot drift apart.
     fn seed(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("corpus")
-            .join("log_record")
+            .join(TARGET)
             .join(name);
         fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     }
@@ -1194,6 +1218,25 @@ mod tests {
     /// byte, so a cold fuzz run starts from the shapes above and an edit that
     /// changed the region encoding could not leave the corpus silently meaning
     /// something else.
+    /// Rewrite every committed seed from the demonstration of the same name.
+    ///
+    /// Ignored by default and run by hand — `cargo test --manifest-path
+    /// fuzz/Cargo.toml -- --ignored rewrite_the_committed_seeds` — after a
+    /// deliberate change to the record ABI, which shifts every field a seed's
+    /// byte image places. The test below is what holds the corpus to the
+    /// demonstrations afterwards, so this is a regeneration step and never a
+    /// substitute for it.
+    #[test]
+    #[ignore = "regenerates the committed corpus; run by hand after an ABI change"]
+    fn rewrite_the_committed_seeds() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("corpus")
+            .join(TARGET);
+        for (name, built) in demonstrations() {
+            fs::write(dir.join(name), &built).expect("write the seed");
+        }
+    }
+
     #[test]
     fn every_demonstration_is_the_committed_seed_of_its_name() {
         for (name, built) in demonstrations() {

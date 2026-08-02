@@ -322,6 +322,21 @@ impl Event<Cause> {
                     record.frames = *frames;
                     record.frame_bytes = *bytes;
                 }
+                DomainDetail::Medium {
+                    capacity_sectors,
+                    leading_word,
+                } => {
+                    record.detail = LogDetailKind::Medium.to_bits();
+                    record.capacity_sectors = *capacity_sectors;
+                    record.leading_word = *leading_word;
+                }
+                DomainDetail::Extent {
+                    start_sector,
+                    sectors,
+                } => {
+                    record.detail = LogDetailKind::Extent.to_bits();
+                    record.operands = [*start_sector, *sectors];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -431,6 +446,24 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             frames: *frames,
             bytes: *bytes,
         },
+        // Total for the same reason: two numbers, every bit pattern of which a
+        // real medium could produce.
+        CheckedDetail::Medium {
+            capacity_sectors,
+            leading_word,
+        } => DomainDetail::Medium {
+            capacity_sectors: *capacity_sectors,
+            leading_word: *leading_word,
+        },
+        // And here: a start and a length are two numbers a configuration
+        // produced, both readable whatever they are.
+        CheckedDetail::Extent {
+            start_sector,
+            sectors,
+        } => DomainDetail::Extent {
+            start_sector: *start_sector,
+            sectors: *sectors,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -472,6 +505,20 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::Received { frames, bytes } => {
                         DomainDetail::Received { frames, bytes }
                     }
+                    DomainDetail::Medium {
+                        capacity_sectors,
+                        leading_word,
+                    } => DomainDetail::Medium {
+                        capacity_sectors,
+                        leading_word,
+                    },
+                    DomainDetail::Extent {
+                        start_sector,
+                        sectors,
+                    } => DomainDetail::Extent {
+                        start_sector,
+                        sectors,
+                    },
                     DomainDetail::Refusal(Refusal {
                         cause,
                         detail,

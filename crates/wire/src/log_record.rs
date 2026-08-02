@@ -49,7 +49,7 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 6;
+pub const LOG_DOMAIN_COUNT: u8 = 7;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -149,6 +149,8 @@ pub enum LogDetailKind {
     Refusal,
     Established,
     Received,
+    Medium,
+    Extent,
 }
 
 impl LogDetailKind {
@@ -161,6 +163,8 @@ impl LogDetailKind {
             Self::Refusal => 3,
             Self::Established => 4,
             Self::Received => 5,
+            Self::Medium => 6,
+            Self::Extent => 7,
         }
     }
 
@@ -173,6 +177,8 @@ impl LogDetailKind {
             3 => Some(Self::Refusal),
             4 => Some(Self::Established),
             5 => Some(Self::Received),
+            6 => Some(Self::Medium),
+            7 => Some(Self::Extent),
             _ => None,
         }
     }
@@ -345,8 +351,10 @@ pub struct LogRecord {
     /// [`LogDetailKind::Features`]. Which bit means what is `virtio`'s
     /// vocabulary and is not decoded anywhere on this path.
     pub features: u64,
-    /// The numbers a refusal cause names, in the order it names them, under
-    /// [`LogDetailKind::Refusal`]. `operand_count` says how many are the value.
+    /// The two numbers a detail names positionally: a refusal's, with
+    /// `operand_count` saying how many are the value, or an extent's first
+    /// sector and length. Shared, a record being one or the other, which keeps
+    /// this ABI's size — and every log region — unchanged by a detail added.
     pub operands: [u64; 2],
     /// The counter frequency in hertz, under [`LogDetailKind::Established`].
     /// Zero is refused: it is the divisor every later reading is scaled by.
@@ -361,6 +369,10 @@ pub struct LogRecord {
     /// Bytes those frames carried. `frame_bytes` rather than `bytes` so it
     /// cannot read as a size of this record.
     pub frame_bytes: u64,
+    /// Under [`LogDetailKind::Medium`]: a device's claimed capacity in 512-byte
+    /// sectors, and the first eight bytes read off it — a number, not payload.
+    pub capacity_sectors: u64,
+    pub leading_word: u64,
     /// Nanoseconds since the Unix epoch at which the writing domain emitted
     /// this record, read by nothing unless `stamp_kind` says so.
     pub stamp_nanos: u64,
@@ -430,6 +442,8 @@ impl LogRecord {
         unix_nanos: 0,
         frames: 0,
         frame_bytes: 0,
+        capacity_sectors: 0,
+        leading_word: 0,
         stamp_nanos: 0,
         kind: 0,
         generation: 0,
@@ -549,6 +563,15 @@ impl LogRecord {
             Some(LogDetailKind::Received) => CheckedDetail::Received {
                 frames: self.frames,
                 bytes: self.frame_bytes,
+            },
+            // Nothing to refuse either: every bit pattern is one a medium makes.
+            Some(LogDetailKind::Medium) => CheckedDetail::Medium {
+                capacity_sectors: self.capacity_sectors,
+                leading_word: self.leading_word,
+            },
+            Some(LogDetailKind::Extent) => CheckedDetail::Extent {
+                start_sector: self.operands[0],
+                sectors: self.operands[1],
             },
         };
         Ok(CheckedBody::Domain {
@@ -872,6 +895,16 @@ pub enum CheckedDetail {
         frames: u64,
         bytes: u64,
     },
+    /// What a domain established about the block medium under it.
+    Medium {
+        capacity_sectors: u64,
+        leading_word: u64,
+    },
+    /// Where one of a domain's recordings lives on that medium.
+    Extent {
+        start_sector: u64,
+        sectors: u64,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1096,7 +1129,7 @@ const _: () = {
     assert!(offset_of!(ValueImage, _pad) == 11);
     assert!(offset_of!(ValueImage, id) == 12);
 
-    assert!(size_of::<LogRecord>() == 232);
+    assert!(size_of::<LogRecord>() == 248);
     assert!(align_of::<LogRecord>() == 8);
     assert!(offset_of!(LogRecord, features) == 0);
     assert!(offset_of!(LogRecord, operands) == 8);
@@ -1104,29 +1137,31 @@ const _: () = {
     assert!(offset_of!(LogRecord, unix_nanos) == 32);
     assert!(offset_of!(LogRecord, frames) == 40);
     assert!(offset_of!(LogRecord, frame_bytes) == 48);
-    assert!(offset_of!(LogRecord, stamp_nanos) == 56);
-    assert!(offset_of!(LogRecord, kind) == 64);
-    assert!(offset_of!(LogRecord, generation) == 68);
-    assert!(offset_of!(LogRecord, sequence) == 72);
-    assert!(offset_of!(LogRecord, changes) == 76);
-    assert!(offset_of!(LogRecord, reject_offset) == 80);
-    assert!(offset_of!(LogRecord, receive_posted) == 84);
-    assert!(offset_of!(LogRecord, domain) == 88);
-    assert!(offset_of!(LogRecord, state) == 89);
-    assert!(offset_of!(LogRecord, detail) == 90);
-    assert!(offset_of!(LogRecord, operand_count) == 91);
-    assert!(offset_of!(LogRecord, signalled) == 92);
-    assert!(offset_of!(LogRecord, change) == 93);
-    assert!(offset_of!(LogRecord, object) == 94);
-    assert!(offset_of!(LogRecord, field) == 95);
-    assert!(offset_of!(LogRecord, outcome) == 96);
-    assert!(offset_of!(LogRecord, reason) == 97);
-    assert!(offset_of!(LogRecord, stamp_kind) == 98);
-    assert!(offset_of!(LogRecord, _pad) == 99);
-    assert!(offset_of!(LogRecord, cause) == 104);
-    assert!(offset_of!(LogRecord, key) == 148);
-    assert!(offset_of!(LogRecord, from) == 168);
-    assert!(offset_of!(LogRecord, to) == 200);
+    assert!(offset_of!(LogRecord, capacity_sectors) == 56);
+    assert!(offset_of!(LogRecord, leading_word) == 64);
+    assert!(offset_of!(LogRecord, stamp_nanos) == 72);
+    assert!(offset_of!(LogRecord, kind) == 80);
+    assert!(offset_of!(LogRecord, generation) == 84);
+    assert!(offset_of!(LogRecord, sequence) == 88);
+    assert!(offset_of!(LogRecord, changes) == 92);
+    assert!(offset_of!(LogRecord, reject_offset) == 96);
+    assert!(offset_of!(LogRecord, receive_posted) == 100);
+    assert!(offset_of!(LogRecord, domain) == 104);
+    assert!(offset_of!(LogRecord, state) == 105);
+    assert!(offset_of!(LogRecord, detail) == 106);
+    assert!(offset_of!(LogRecord, operand_count) == 107);
+    assert!(offset_of!(LogRecord, signalled) == 108);
+    assert!(offset_of!(LogRecord, change) == 109);
+    assert!(offset_of!(LogRecord, object) == 110);
+    assert!(offset_of!(LogRecord, field) == 111);
+    assert!(offset_of!(LogRecord, outcome) == 112);
+    assert!(offset_of!(LogRecord, reason) == 113);
+    assert!(offset_of!(LogRecord, stamp_kind) == 114);
+    assert!(offset_of!(LogRecord, _pad) == 115);
+    assert!(offset_of!(LogRecord, cause) == 120);
+    assert!(offset_of!(LogRecord, key) == 164);
+    assert!(offset_of!(LogRecord, from) == 184);
+    assert!(offset_of!(LogRecord, to) == 216);
 
     // Every byte of the record belongs to a declared field: the fields sum to
     // the whole size, so the compiler inserted no padding of its own. That is
@@ -1135,7 +1170,7 @@ const _: () = {
     // on.
     assert!(
         size_of::<LogRecord>()
-            == size_of::<[u64; 8]>()
+            == size_of::<[u64; 10]>()
                 + 6 * size_of::<u32>()
                 + 11
                 + 5

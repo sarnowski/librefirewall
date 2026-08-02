@@ -74,7 +74,7 @@ mod request;
 mod response;
 
 pub use request::{Header, Parsed, Request, RequestError, parse};
-pub use response::{MAX_HEAD_LEN, METRICS_CONTENT_TYPE, write_head};
+pub use response::{MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE, write_head};
 
 /// Bytes of request head a caller may accumulate before the head must have
 /// ended.

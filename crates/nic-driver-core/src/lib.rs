@@ -589,9 +589,9 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
             let paddr = buffer_paddr(self.pool_paddr, descriptor.buffer) + header_offset as u64;
             // A first-party invariant, not device or peer input, so it fails
             // visibly rather than being counted (ENG-5). The guarantor is
-            // `virtio::queue::SplitVirtqueue::add` — the single body behind
-            // both `add_*` methods — whose only early return is `if
-            // self.num_free == 0`, and whose `free_count()` *is* `num_free`.
+            // `virtio::queue::SplitVirtqueue::add_chain` — the body behind both
+            // `add_*` methods — which refuses a one-segment chain only when
+            // `num_free` is zero, and whose `free_count()` *is* `num_free`.
             // This iteration refused `free_count() == 0` at the top and has not
             // touched `tx` since: the dequeue, the validation and the header
             // write are all on the pipeline and the pool, so no descriptor was

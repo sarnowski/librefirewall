@@ -46,6 +46,10 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-http",
     "lfw-log",
     "lfw-metrics",
+    "lfw-pcapng",
+    "lfw-blk",
+    "lfw-capture-ring",
+    "lfw-recorder",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
@@ -77,6 +81,10 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-http",
     "lfw-log",
     "lfw-metrics",
+    "lfw-pcapng",
+    "lfw-blk",
+    "lfw-capture-ring",
+    "lfw-recorder",
     "virtio",
     "pd-runtime",
     "nic-driver-core",
@@ -152,6 +160,11 @@ const FUZZ_TARGETS: &[&str] = &[
     "spsc_ring_peer",
     "log_ring",
     "virtqueue_poll",
+    "blk_requests",
+    "pcapng_encode",
+    "capture_superblock",
+    "recorder_sink",
+    "recording_pass",
     "pd_runtime_pipeline",
     "nic_driver_paths",
     "find_virtio_caps",
@@ -852,6 +865,41 @@ mod tests {
                      has a byzantine driver to raise either and no surface exposes them \
                      (MONITORING.md — the counts reach the console only as the frames/bytes \
                      pair), which needs the metrics endpoint of CONCEPT §11.",
+                ),
+            },
+        ),
+        (
+            "recorder",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk with a second raw \
+                                disk attached at 00:05.0, and afterwards reads the sector \
+                                `lfw_blk::smoke::WITNESS_SECTOR` names out of that file and \
+                                compares its 512 bytes against `lfw_blk::smoke::witness_pattern` \
+                                — the appliance's own definition, so the two sides cannot drift. \
+                                Nothing but this domain can put those bytes there: the harness \
+                                zero-fills the image and writes a different, recognisable pattern \
+                                into sector 0 before boot, so a witness sector that matches proves \
+                                the whole chain ran against the real device — identify, place_bar, \
+                                map, acknowledge, negotiate_features, configure_queue, go_live, and \
+                                then a submitted chain, a rung doorbell and a polled completion \
+                                through the mapped staging window at the physical address the \
+                                system description patched in. The same run asserts the negative \
+                                on the halt scenarios, where no slot boots and the sector must \
+                                still be zero.",
+                residue: Some(
+                    "Every refusal path is reached by no QEMU test: each scenario attaches one \
+                     conforming virtio-blk device at the pinned address, so `bring_up`'s \
+                     `StartupError` arm, the `IoRegionUnusable` branch and the `state=refused` \
+                     record are never taken. The decisions behind them are not in this domain — \
+                     `lfw_blk::bringup`, `lfw_blk::io` and `lfw_blk::smoke` hold every one and \
+                     are exercised exhaustively against hostile stand-in devices under the host \
+                     floor — so what stays uncovered here is the adapter's own wiring: which \
+                     region is attached to which symbol, and the conversion of a `lfw_blk::Refusal` \
+                     into the console's. That conversion is the LAY-2 residue this entry records: \
+                     it is first-party logic in a PD, and closing it means moving the \
+                     `lfw_blk::Refusal`-to-`lfw_log::Refusal` conversion into `pd_runtime`, beside \
+                     the `log_sample` that already lives there, which would put it under the host \
+                     coverage floor.",
                 ),
             },
         ),

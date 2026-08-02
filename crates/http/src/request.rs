@@ -165,8 +165,18 @@ const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
 /// [`RequestError`] for a head this server will not read; each names the status
 /// the client is owed.
 pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
-    check_line_endings(bytes)?;
-    let Some(end) = find(bytes, HEAD_TERMINATOR) else {
+    let terminator = find(bytes, HEAD_TERMINATOR);
+    // The head's own bytes and no others: a verdict on *this* head that
+    // depended on what follows it is the disagreement about where a message
+    // ends that request smuggling is.
+    let head_bytes = match terminator {
+        Some(end) => bytes
+            .get(..end.saturating_add(HEAD_TERMINATOR.len()))
+            .unwrap_or(bytes),
+        None => bytes,
+    };
+    check_line_endings(head_bytes)?;
+    let Some(end) = terminator else {
         return Ok(Parsed::NeedMore);
     };
     let head = bytes.get(..end).unwrap_or_default();
@@ -199,10 +209,8 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
 }
 
 /// Every LF is preceded by a CR and every CR is followed by an LF, so the only
-/// line ending in the buffer is `\r\n`.
-///
-/// A trailing CR with nothing after it yet is not a fault: it is the first half
-/// of a terminator whose second half is still on the wire.
+/// line ending in the head is `\r\n`. A trailing CR is not a fault: it is the
+/// first half of a terminator whose second half is still on the wire.
 fn check_line_endings(bytes: &[u8]) -> Result<(), RequestError> {
     let mut previous: Option<u8> = None;
     for (index, byte) in bytes.iter().enumerate() {

@@ -17,14 +17,17 @@
 //! operator can act on, and what makes the read-only grant on the reader's side
 //! the whole of the argument (see the system description).
 
+use lfw_blk::request::{Operation, RequestFaults};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, ForwarderSample, HttpSample, LogSample, ManagementSample,
-    PipelineSample, PoolSample, ROUTE_DROP_REASONS, SHARD_COUNT, Snapshot, StatsShard, TcpSample,
+    PipelineSample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS, SinkSample,
+    Snapshot, StatsShard, TapSample, TcpSample,
 };
+use lfw_recorder::RecorderCounters;
 use routing::DropReason;
 
-use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters};
+use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, TapCounters};
 
 /// Every stats region the management domain is granted, in `lfw_metrics::SHARDS`
 /// order.
@@ -96,6 +99,7 @@ pub fn forwarder_sample(
     pipelines: [&RouteCounters; 2],
     generation: u32,
     configuration: ConfigCounters,
+    tap: TapCounters,
     log: LogSample,
 ) -> ForwarderSample {
     ForwarderSample {
@@ -103,6 +107,11 @@ pub fn forwarder_sample(
         generation: u64::from(generation),
         images_applied: configuration.applied,
         images_refused: configuration.refused,
+        tap: TapSample {
+            observed: tap.observed,
+            dropped: tap.dropped,
+            refused: tap.refused,
+        },
         log,
     }
 }
@@ -214,6 +223,12 @@ pub fn management_sample(
         endpoint: endpoint_sample,
         tcp,
         http,
+        streams: [
+            stage.downloads.started,
+            stage.downloads.abandoned,
+            stage.downloads.windows,
+            stage.downloads.bytes,
+        ],
         log,
     }
 }
@@ -223,6 +238,88 @@ pub fn management_sample(
 pub const fn config_sample(generation: u32, log: LogSample) -> ConfigSample {
     ConfigSample {
         generation: generation as u64,
+        log,
+    }
+}
+
+/// What one block operation moved. Reads and writes apart rather than summed: a
+/// medium refusing writes is invisible in a total the reads dominate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockCounters {
+    pub reads: u64,
+    pub read_bytes: u64,
+    pub writes: u64,
+    pub write_bytes: u64,
+}
+
+impl BlockCounters {
+    /// Record one successful completion, saturating for the reason every counter
+    /// here does: a wrap forges a negative rate between two scrapes.
+    pub fn completed(&mut self, operation: Operation, bytes: u32) {
+        let (count, total) = match operation {
+            Operation::Read => (&mut self.reads, &mut self.read_bytes),
+            Operation::Write => (&mut self.writes, &mut self.write_bytes),
+            // A flush moves no data, so counting it as either would inflate a
+            // series an operator reads as bytes that crossed the bus.
+            Operation::Flush => return,
+        };
+        *count = count.saturating_add(1);
+        *total = total.saturating_add(u64::from(bytes));
+    }
+}
+
+/// The recorder's whole shard. `capacity_sectors` is the device's own claim,
+/// taken once at bring-up: it bounds every range the domain names, so exposing
+/// it shows an operator a device smaller than the recording configured for it.
+#[must_use]
+pub fn recorder_sample(
+    capacity_sectors: u64,
+    blocks: BlockCounters,
+    faults: RequestFaults,
+    recording: RecorderCounters,
+    log: LogSample,
+) -> RecorderSample {
+    let mut sinks = [SinkSample::default(); SINKS];
+    for (slot, counters) in sinks.iter_mut().zip(recording.sinks) {
+        *slot = SinkSample {
+            records: counters.records,
+            record_bytes: counters.record_bytes,
+            dropped: [
+                counters.dropped_oversized,
+                counters.dropped_staging_full,
+                counters.dropped_refused,
+            ],
+            segments_closed: counters.segments_closed,
+            wraps: counters.wraps,
+            sectors_written: counters.sectors_written,
+            padding_bytes: counters.padding_bytes,
+            download_overruns: counters.download_overruns,
+        };
+    }
+    RecorderSample {
+        capacity_sectors,
+        requests: [blocks.reads, blocks.writes],
+        bytes: [blocks.read_bytes, blocks.write_bytes],
+        device_faults: [
+            faults.device.completion_out_of_range,
+            faults.device.completion_not_posted,
+            faults.device.completion_length_over_reported,
+        ],
+        status_undecodable: faults.status_undecodable,
+        // The recorder's own invariant fault joins the block driver's: both are
+        // a completion nothing was waiting on, one seen by the request layer
+        // and one by the pass above it.
+        completion_unmapped: faults
+            .completion_unmapped
+            .saturating_add(recording.completions_unexpected),
+        sinks,
+        tap: [
+            recording.tap_records,
+            recording.tap_refused,
+            recording.tap_dropped_by_writer,
+        ],
+        downloads: [recording.downloads_served, recording.downloads_refused],
+        records_unclocked: recording.records_unclocked,
         log,
     }
 }

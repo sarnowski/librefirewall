@@ -23,6 +23,8 @@
 //! | [`log_ring`] | `wire`'s log records and consume regions, from both sides | a byzantine neighbour PD |
 //! | [`pipeline`] | `pd_runtime` pool ownership and forwarding | a byzantine neighbour PD |
 //! | [`driver`] | `nic_driver_core` rx/tx paths | a hostile device **and** a byzantine neighbour PD |
+//! | [`recording`] | `lfw_recorder`'s pass and sink, and `lfw_capture_ring`'s superblock and ring | a byzantine neighbour PD on two channels **and** a hostile medium |
+//! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
 //!
 //! Every crate in the workspace that interprets bytes it did not write appears
 //! in that table, which is the reviewable form of AGENTS.md TEST-7: the
@@ -126,10 +128,12 @@
 //! guarantees every target still *builds* and the smoke tests still drive every
 //! harness over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
 
+pub mod blk;
 pub mod document;
 pub mod driver;
 pub mod frame;
 pub mod free_list;
+pub mod guard;
 pub mod handover;
 pub mod http_request;
 pub mod ip_endpoint;
@@ -137,7 +141,9 @@ pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
 pub mod metrics_render;
+pub mod pcapng;
 pub mod pipeline;
+pub mod recording;
 pub mod region;
 pub mod ring_abi;
 pub mod spsc_ring;
@@ -183,6 +189,11 @@ pub(crate) fn any_u32(unstructured: &mut Unstructured<'_>) -> u32 {
 /// Pull an arbitrary `u16` the adversary controls; see [`any_u32`].
 pub(crate) fn any_u16(unstructured: &mut Unstructured<'_>) -> u16 {
     u16::arbitrary(unstructured).unwrap_or(0)
+}
+
+/// Pull an arbitrary `u64` the adversary controls; see [`any_u32`].
+pub(crate) fn any_u64(unstructured: &mut Unstructured<'_>) -> u64 {
+    u64::arbitrary(unstructured).unwrap_or(0)
 }
 
 /// Pull an arbitrary `usize` in `0..modulus`, or 0 when `modulus` is 0.
@@ -237,6 +248,11 @@ mod tests {
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),
         ("virtqueue_poll", crate::virtqueue::virtqueue_poll_harness),
+        ("blk_requests", crate::blk::blk_requests_harness),
+        ("pcapng_encode", crate::pcapng::pcapng_encode_harness),
+        ("capture_superblock", crate::recording::capture_superblock),
+        ("recorder_sink", crate::recording::recorder_sink),
+        ("recording_pass", crate::recording::recording_pass),
         ("pd_runtime_pipeline", crate::pipeline::pipeline_harness),
         ("nic_driver_paths", crate::driver::driver_paths_harness),
         (

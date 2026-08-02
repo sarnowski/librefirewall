@@ -64,6 +64,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-blk"
+version = "0.1.0"
+dependencies = [
+ "virtio",
+]
+
+[[package]]
+name = "lfw-capture-ring"
+version = "0.1.0"
+
+[[package]]
 name = "lfw-clock"
 version = "0.1.0"
 
@@ -100,6 +111,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-pcapng"
+version = "0.1.0"
+
+[[package]]
+name = "lfw-recorder"
+version = "0.1.0"
+dependencies = [
+ "lfw-capture-ring",
+ "lfw-clock",
+ "lfw-pcapng",
+ "wire",
+]
+
+[[package]]
 name = "lfw-tcp"
 version = "0.1.0"
 dependencies = [
@@ -129,11 +154,15 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "config",
+ "lfw-blk",
+ "lfw-capture-ring",
  "lfw-clock",
  "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
+ "lfw-pcapng",
+ "lfw-recorder",
  "lfw-tcp",
  "libfuzzer-sys",
  "net-headers",
@@ -168,10 +197,12 @@ version = "0.1.0"
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "lfw-blk",
  "lfw-clock",
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
+ "lfw-recorder",
  "net-headers",
  "packet-buffer",
  "queue",

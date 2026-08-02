@@ -88,7 +88,7 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
     assert_eq!(size_of::<IdentifierImage>(), 20);
     assert_eq!(size_of::<CauseImage>(), 44);
     assert_eq!(size_of::<ValueImage>(), 32);
-    assert_eq!(size_of::<LogRecord>(), 232);
+    assert_eq!(size_of::<LogRecord>(), 248);
     assert_eq!(align_of::<LogRecord>(), 8);
     assert_eq!(
         [
@@ -98,6 +98,8 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
             offset_of!(LogRecord, unix_nanos),
             offset_of!(LogRecord, frames),
             offset_of!(LogRecord, frame_bytes),
+            offset_of!(LogRecord, capacity_sectors),
+            offset_of!(LogRecord, leading_word),
             offset_of!(LogRecord, stamp_nanos),
             offset_of!(LogRecord, kind),
             offset_of!(LogRecord, stamp_kind),
@@ -106,7 +108,9 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
             offset_of!(LogRecord, from),
             offset_of!(LogRecord, to),
         ],
-        [0, 8, 24, 32, 40, 48, 56, 64, 98, 104, 148, 168, 200]
+        [
+            0, 8, 24, 32, 40, 48, 56, 64, 72, 80, 114, 120, 164, 184, 216
+        ]
     );
 }
 
@@ -127,11 +131,11 @@ fn a_record_has_a_stable_little_endian_byte_image() {
         &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
     );
     assert_eq!(
-        &bytes[56..64],
+        &bytes[72..80],
         &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
     );
-    assert_eq!(&bytes[64..68], &[0xff, 0x00, 0x00, 0x00]);
-    assert_eq!(&bytes[98..99], &[0x01]);
+    assert_eq!(&bytes[80..84], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(&bytes[114..115], &[0x01]);
     assert_eq!(record_from_bytes(bytes), record);
 }
 
@@ -641,10 +645,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 6,
+                detail: 8,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 6 },
+            LogRecordError::DetailKindUnknown { detail: 8 },
         ),
         // The one detail whose own field can refuse it: a frequency of zero
         // scales no reading, so it is refused rather than carried on as a
@@ -874,7 +878,7 @@ fn every_refusal_names_the_field_and_the_value() {
         LogRecordError::KindUnknown { kind: 9 },
         LogRecordError::DomainUnknown { domain: 4 },
         LogRecordError::DomainStateUnknown { state: 4 },
-        LogRecordError::DetailKindUnknown { detail: 6 },
+        LogRecordError::DetailKindUnknown { detail: 7 },
         LogRecordError::ClockFrequencyZero,
         LogRecordError::OperandCountUnknown { operands: 3 },
         LogRecordError::SignalledNotBoolean { signalled: 2 },
@@ -913,9 +917,9 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 6",
+            "domain token 4 is not below 7",
             "state token 4 is not below 4",
-            "detail kind 6 names no payload",
+            "detail kind 7 names no payload",
             "the established counter frequency is zero, which scales no reading",
             "operand count 3 exceeds the 2 the record holds",
             "signalled byte 2 is not 0 or 1",
@@ -955,10 +959,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Refusal,
         LogDetailKind::Established,
         LogDetailKind::Received,
+        LogDetailKind::Medium,
+        LogDetailKind::Extent,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(6), None);
+    assert_eq!(LogDetailKind::from_bits(8), None);
 
     for value in [
         LogValueKind::Absent,

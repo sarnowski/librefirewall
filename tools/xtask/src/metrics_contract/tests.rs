@@ -130,6 +130,13 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
         "Hertz.",
     );
     text.push_str("librefirewall_clock_frequency_hertz{domain=\"clock\"} 1000000000\n");
+    family(
+        &mut text,
+        "librefirewall_block_capacity_sectors",
+        "gauge",
+        "Sectors.",
+    );
+    text.push_str("librefirewall_block_capacity_sectors{domain=\"recorder\"} 131072\n");
     family(&mut text, INTERFACE_INFO, "gauge", "Identity.");
     // The shipped document's own values, so the base case agrees with the
     // topology every test below judges against.

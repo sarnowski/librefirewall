@@ -113,23 +113,24 @@ impl Width {
 /// fail there rather than silently putting a peer store in the wrong place.
 ///
 /// The runs, in order: `features`, the two `operands`, the two quads a measured
-/// clock carries, the two a terminal endpoint's counts do and the record's own
+/// clock carries, the two a terminal endpoint's counts do, the two a block
+/// medium's capacity and leading word do, and the record's own
 /// instant; the six `u32` counters from `kind` to `receive_posted`; the ten
 /// vocabulary bytes, the stamp discriminant, the five pad bytes and the whole of
 /// `cause` and `key`; `from.number`; the rest of `from`; `to.number`; the rest
 /// of `to`.
 const SEGMENTS: &[(usize, usize, usize, Width)] = &[
-    (0, 0, 8, Width::Quad),
-    (8, 64, 6, Width::Word),
-    (14, 88, 80, Width::Byte),
-    (94, 168, 1, Width::Word),
-    (95, 172, 28, Width::Byte),
-    (123, 200, 1, Width::Word),
-    (124, 204, 28, Width::Byte),
+    (0, 0, 10, Width::Quad),
+    (10, 80, 6, Width::Word),
+    (16, 104, 80, Width::Byte),
+    (96, 184, 1, Width::Word),
+    (97, 188, 28, Width::Byte),
+    (125, 216, 1, Width::Word),
+    (126, 220, 28, Width::Byte),
 ];
 
 /// How many separately writable atomics one slot holds.
-pub const LOCATION_COUNT: usize = 152;
+pub const LOCATION_COUNT: usize = 154;
 
 /// Which atomic of a slot a peer store lands in.
 ///
@@ -163,7 +164,7 @@ impl Location {
     /// Where this location sits within a slot, and how wide it is.
     ///
     /// Total by construction: `Location` is only ever built from a value
-    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..152`
+    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..154`
     /// without a gap — which [`tests::the_segments_partition_the_whole_record`]
     /// is what proves. The fallback is the last run rather than a panic
     /// because a branch safe Rust cannot delete is not a failure to surface.

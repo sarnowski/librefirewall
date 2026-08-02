@@ -11,60 +11,63 @@
 //!
 //! Untrusted network traffic **and** a byzantine neighbour PD (CONCEPT §7.1).
 //! Every descriptor read here, every byte parsed, and the configuration decided
-//! under were all written by another domain or by whatever is attached to a
-//! dataplane port. All three are rejected by a counted drop rather than a
-//! fault, in `net_headers`, `routing` and `pd_runtime`, where it is tested.
+//! under were written by another domain or by whatever is attached to a
+//! dataplane port. All three are rejected by a counted drop rather than a fault,
+//! in `net_headers`, `routing` and `pd_runtime`.
 //!
 //! # Constraints
 //!
 //! Two [`ForwardRings`] regions, the two [`Pool`]s they index, the two
-//! configuration regions, its own log ring and its own metric shard are the
-//! entire grant — no device capability, and of each pipeline not the `free`
-//! ring, on which a forged return would put a live DMA target back onto an
-//! owner's free stack. The pool is mapped because a routed frame's headers are
-//! rewritten in place, so a compromised forwarder can corrupt a frame in flight;
-//! it still cannot forge a return. The handover region is read-only.
+//! configuration regions, the capture tap, its own log ring and its own metric
+//! shard are the entire grant — no device capability, and of each pipeline not
+//! the `free` ring, on which a forged return would put a live DMA target back
+//! onto an owner's free stack. The pool is mapped because a routed frame's
+//! headers are rewritten in place, so a compromised forwarder can corrupt a
+//! frame in flight; it still cannot forge a return.
 //!
-//! Ring handles are taken once and kept for the domain's life, a handle being
-//! this domain's position: one per notification would restart at slot zero and
-//! re-deliver. A wakeup names no port, so both pipelines drain unconditionally;
-//! the drivers poll, so nothing is notified onward.
+//! Ring handles are taken once and kept, a handle being this domain's position.
+//! A wakeup names no port, so both pipelines drain unconditionally; the drivers
+//! poll, so nothing is notified onward.
 //!
 //! # There is no configuration in this file
 //!
-//! The forwarding table arrives at run time from the configuration domain, and
-//! generation 0 — no interfaces, no neighbours, nothing forwarded — is what this
-//! domain runs under until one does: the absence of policy rather than a
-//! default. What is still compiled in is the *wiring* (CONCEPT §12.3).
+//! The forwarding table arrives at run time, and generation 0 — no interfaces,
+//! nothing forwarded — is what this domain runs under until one does: the
+//! absence of policy rather than a default. What is compiled in is the
+//! *wiring* (CONCEPT §12.3).
 //!
-//! # Records go to a ring, not to `debug_println!`
+//! Records go to a ring, not `debug_println!` — no `seL4_DebugPutChar` in the
+//! release kernel.
 //!
-//! That macro compiles to `seL4_DebugPutChar`, absent from the release kernel.
+//! # Every frame the router decides on is offered to the recorder
+//!
+//! This domain never waits on the tap ring: a full one costs the newest
+//! observation and is counted, because a tap that backpressured forwarding
+//! would let a traffic generator stall the dataplane. What is recorded is
+//! `pd_runtime::RouteStage`'s.
 //!
 //! # Numbers go to a shard, once per wakeup
 //!
-//! Every drop this domain counts now reaches one shared region it is the sole
-//! writer of, which the management domain maps read-only and renders into
-//! `GET /metrics`. The write is at the end of a wakeup and not per frame, so a
-//! pass of up to `DRAIN_LIMIT` descriptors costs one bounded run of relaxed
-//! stores (OBS-3).
+//! Every drop this domain counts reaches one region it is the sole writer of,
+//! which the management domain maps read-only and renders into `GET /metrics`.
+//! The write is at the end of a wakeup and not per frame (OBS-3).
 
 use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch, ForwardRings, MAX_INTERFACES,
-    MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, attach_region, forwarder_sample, log_sample,
+    MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, Tap, attach_region, forwarder_sample,
+    log_sample,
 };
 use routing::PortId;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
-use wire::{ClockCalibration, LogConsume, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogRecords, TapConsume, TapRecords};
 
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
 
-/// How many dataplane ports this domain is wired to — the same build fact
-/// [`PORT0`] and [`PORT1`] express. An offered configuration is held to it, so
-/// a table naming a port with no driver is refused here too.
+/// How many dataplane ports this domain is wired to. An offered configuration
+/// is held to it, so a table naming a port with no driver is refused here too.
 const PORTS: u8 = 2;
 
 /// The configuration domain. Unlike the driver channels, this one carries
@@ -83,6 +86,8 @@ fn init() -> Forwarder {
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let tap_records: &'static TapRecords = attach_region!(tap_vaddr: TapRecords);
+    let tap_consume: &'static TapConsume = attach_region!(tap_consume_vaddr: TapConsume);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     sink.emit(&Event::Domain {
@@ -100,6 +105,7 @@ fn init() -> Forwarder {
             RouteStage::attach(fwd1, pool1, PORT1, PORT0),
         ],
         switch: ConfigurationSwitch::new(PORTS),
+        tap: Tap::attach(tap_records, tap_consume),
         handover,
         ack,
         stats,
@@ -119,6 +125,8 @@ const fn applied(generation: u32) -> Event {
 struct Forwarder {
     stages: [RouteStage<'static>; 2],
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
+    /// One per domain: a packet identity is per appliance.
+    tap: Tap<'static>,
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,
     /// The one region this domain writes its counters into.
@@ -137,6 +145,7 @@ impl Forwarder {
             [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
             self.switch.generation(),
             self.switch.counters(),
+            self.tap.counters(),
             log_sample(self.sink.dropped(), self.sink.refused()),
         );
         self.stats.publish(&sample.values());
@@ -167,7 +176,7 @@ impl Handler for Forwarder {
         let configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS> =
             self.switch.configuration();
         for stage in &mut self.stages {
-            stage.poll(configuration);
+            stage.poll(configuration, Some(&mut self.tap));
         }
         self.publish();
         Ok(())

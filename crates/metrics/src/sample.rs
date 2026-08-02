@@ -22,6 +22,7 @@
 //! untested assertion beside it.
 
 use crate::catalog::{
+    BLOCK_BYTES, BLOCK_CAPACITY_SECTORS, BLOCK_REQUESTS, BLOCK_STATUS_UNDECODABLE,
     CLOCK_CALIBRATIONS_REFUSED, CLOCK_FREQUENCY_HERTZ, CLOCK_GENERATION, CONFIGURATION_GENERATION,
     CONFIGURATION_IMAGES, CONSOLE_RECORDS, DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES,
     ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US, ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST,
@@ -30,7 +31,12 @@ use crate::catalog::{
     HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
     HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
     INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POOL_RETURNS_REFUSED,
-    RECEIVE_BYTES, RECEIVE_FRAMES, ROUTE_DROPS, ROUTE_STAGE_DROPS, Series, TCP_BYTES,
+    RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS,
+    RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
+    RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
+    RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS, RECORDING_STREAMS,
+    RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS,
+    ROUTE_DROPS, ROUTE_STAGE_DROPS, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES,
     TCP_CHALLENGE_ACKS, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS,
     TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN,
     UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
@@ -94,8 +100,16 @@ pub struct PipelineSample {
     pub stage_drops: [u64; ROUTE_STAGE_DROP_REASONS.len()],
 }
 
+/// What the forwarder published to the recorder, and what it could not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TapSample {
+    pub observed: u64,
+    pub dropped: u64,
+    pub refused: u64,
+}
+
 /// Slots [`ForwarderSample`] occupies.
-pub const FORWARDER_SLOTS: usize = PIPELINES * (1 + ROUTE_DROP_REASONS.len() + 6) + 5;
+pub const FORWARDER_SLOTS: usize = PIPELINES * (1 + ROUTE_DROP_REASONS.len() + 6) + 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForwarderSample {
@@ -103,6 +117,7 @@ pub struct ForwarderSample {
     pub generation: u64,
     pub images_applied: u64,
     pub images_refused: u64,
+    pub tap: TapSample,
     pub log: LogSample,
 }
 
@@ -355,6 +370,12 @@ impl ForwarderSample {
         plain(&CONFIGURATION_GENERATION),
         s(&CONFIGURATION_IMAGES, &[Label::new("outcome", "applied")]),
         s(&CONFIGURATION_IMAGES, &[Label::new("outcome", "refused")]),
+        plain(&TAP_OBSERVATIONS),
+        s(&TAP_OBSERVATIONS_LOST, &[Label::new("reason", "ring_full")]),
+        s(
+            &TAP_OBSERVATIONS_LOST,
+            &[Label::new("reason", "inconsistent")],
+        ),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
@@ -371,6 +392,9 @@ impl ForwarderSample {
         put(&mut values, &mut at, self.generation);
         put(&mut values, &mut at, self.images_applied);
         put(&mut values, &mut at, self.images_refused);
+        put(&mut values, &mut at, self.tap.observed);
+        put(&mut values, &mut at, self.tap.dropped);
+        put(&mut values, &mut at, self.tap.refused);
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);
         values
@@ -565,7 +589,7 @@ pub struct HttpSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 75;
+pub const MANAGEMENT_SLOTS: usize = 79;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -583,6 +607,8 @@ pub struct ManagementSample {
     pub endpoint: EndpointSample,
     pub tcp: TcpSample,
     pub http: HttpSample,
+    /// Streams begun, given up on, windows handed over, and their bytes.
+    pub streams: [u64; 4],
     pub log: LogSample,
 }
 
@@ -715,6 +741,10 @@ impl ManagementSample {
         plain(&HTTP_EXPOSITIONS_REFUSED),
         plain(&HTTP_RETRANSMITS_UNAVAILABLE),
         plain(&HTTP_SLOTS_EXHAUSTED),
+        s(&RECORDING_STREAMS, &[Label::new("outcome", "started")]),
+        s(&RECORDING_STREAMS, &[Label::new("outcome", "abandoned")]),
+        plain(&RECORDING_STREAM_WINDOWS),
+        plain(&RECORDING_STREAM_BYTES),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
@@ -783,6 +813,7 @@ impl ManagementSample {
         put(&mut values, &mut at, http.retransmits_unavailable);
         put(&mut values, &mut at, http.slots_exhausted);
 
+        put_all(&mut values, &mut at, &self.streams);
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);
         values
@@ -883,6 +914,174 @@ impl ClockSample {
     }
 }
 
+/// One recording, in `lfw_recorder::SinkCounters` order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SinkSample {
+    pub records: u64,
+    pub record_bytes: u64,
+    pub dropped: [u64; 3],
+    pub segments_closed: u64,
+    pub wraps: u64,
+    pub sectors_written: u64,
+    pub padding_bytes: u64,
+    pub download_overruns: u64,
+}
+
+/// Recordings this appliance keeps, which is CONCEPT §15.1's two.
+pub const SINKS: usize = 2;
+
+const SINK_SLOTS: usize = 10;
+
+/// Slots [`RecorderSample`] occupies.
+pub const RECORDER_SLOTS: usize = 12 + SINKS * SINK_SLOTS + 6;
+
+/// What the domain owning the block device has to say about itself. Its faults
+/// carry `queue="request"` on the family a driver's carry `queue="receive"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecorderSample {
+    pub capacity_sectors: u64,
+    /// Read then write, as the series name them.
+    pub requests: [u64; 2],
+    pub bytes: [u64; 2],
+    /// In `virtio::queue::DeviceFaults` field order.
+    pub device_faults: [u64; 3],
+    pub status_undecodable: u64,
+    pub completion_unmapped: u64,
+    pub sinks: [SinkSample; SINKS],
+    /// Tap records drained, annotations refused, and drops the forwarder
+    /// claims about itself.
+    pub tap: [u64; 3],
+    /// Downloads served then refused.
+    pub downloads: [u64; 2],
+    pub records_unclocked: u64,
+    pub log: LogSample,
+}
+
+impl RecorderSample {
+    pub const SERIES: &'static [Series] = &[
+        plain(&BLOCK_CAPACITY_SECTORS),
+        s(&BLOCK_REQUESTS, &[Label::new("operation", "read")]),
+        s(&BLOCK_REQUESTS, &[Label::new("operation", "write")]),
+        s(&BLOCK_BYTES, &[Label::new("operation", "read")]),
+        s(&BLOCK_BYTES, &[Label::new("operation", "write")]),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_out_of_range"),
+            ],
+        ),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_not_posted"),
+            ],
+        ),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_length_over_reported"),
+            ],
+        ),
+        plain(&BLOCK_STATUS_UNDECODABLE),
+        s(
+            &INVARIANT_FAULTS,
+            &[Label::new("fault", "block_completion_unmapped")],
+        ),
+        s(&RECORDING_RECORDS, &[Label::new("sink", "log")]),
+        s(&RECORDING_RECORD_BYTES, &[Label::new("sink", "log")]),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[Label::new("sink", "log"), Label::new("reason", "oversized")],
+        ),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[
+                Label::new("sink", "log"),
+                Label::new("reason", "staging_full"),
+            ],
+        ),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[Label::new("sink", "log"), Label::new("reason", "refused")],
+        ),
+        s(&RECORDING_SEGMENTS_CLOSED, &[Label::new("sink", "log")]),
+        s(&RECORDING_WRAPS, &[Label::new("sink", "log")]),
+        s(&RECORDING_SECTORS_WRITTEN, &[Label::new("sink", "log")]),
+        s(&RECORDING_PADDING_BYTES, &[Label::new("sink", "log")]),
+        s(&RECORDING_DOWNLOAD_OVERRUNS, &[Label::new("sink", "log")]),
+        s(&RECORDING_RECORDS, &[Label::new("sink", "capture")]),
+        s(&RECORDING_RECORD_BYTES, &[Label::new("sink", "capture")]),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[
+                Label::new("sink", "capture"),
+                Label::new("reason", "oversized"),
+            ],
+        ),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[
+                Label::new("sink", "capture"),
+                Label::new("reason", "staging_full"),
+            ],
+        ),
+        s(
+            &RECORDING_RECORDS_DROPPED,
+            &[
+                Label::new("sink", "capture"),
+                Label::new("reason", "refused"),
+            ],
+        ),
+        s(&RECORDING_SEGMENTS_CLOSED, &[Label::new("sink", "capture")]),
+        s(&RECORDING_WRAPS, &[Label::new("sink", "capture")]),
+        s(&RECORDING_SECTORS_WRITTEN, &[Label::new("sink", "capture")]),
+        s(&RECORDING_PADDING_BYTES, &[Label::new("sink", "capture")]),
+        s(
+            &RECORDING_DOWNLOAD_OVERRUNS,
+            &[Label::new("sink", "capture")],
+        ),
+        plain(&RECORDING_TAP_RECORDS),
+        plain(&RECORDING_TAP_REFUSED),
+        plain(&RECORDING_TAP_DROPPED_BY_WRITER),
+        s(&RECORDING_DOWNLOADS, &[Label::new("outcome", "served")]),
+        s(&RECORDING_DOWNLOADS, &[Label::new("outcome", "refused")]),
+        plain(&RECORDING_RECORDS_UNCLOCKED),
+        plain(&LOG_RECORDS_DROPPED),
+        plain(&LOG_RECORDS_REFUSED),
+    ];
+
+    #[must_use]
+    pub fn values(&self) -> [u64; RECORDER_SLOTS] {
+        let mut values = [0u64; RECORDER_SLOTS];
+        let mut at = 0;
+        put(&mut values, &mut at, self.capacity_sectors);
+        put_all(&mut values, &mut at, &self.requests);
+        put_all(&mut values, &mut at, &self.bytes);
+        put_all(&mut values, &mut at, &self.device_faults);
+        put(&mut values, &mut at, self.status_undecodable);
+        put(&mut values, &mut at, self.completion_unmapped);
+        for sink in &self.sinks {
+            put(&mut values, &mut at, sink.records);
+            put(&mut values, &mut at, sink.record_bytes);
+            put_all(&mut values, &mut at, &sink.dropped);
+            put(&mut values, &mut at, sink.segments_closed);
+            put(&mut values, &mut at, sink.wraps);
+            put(&mut values, &mut at, sink.sectors_written);
+            put(&mut values, &mut at, sink.padding_bytes);
+            put(&mut values, &mut at, sink.download_overruns);
+        }
+        put_all(&mut values, &mut at, &self.tap);
+        put_all(&mut values, &mut at, &self.downloads);
+        put(&mut values, &mut at, self.records_unclocked);
+        put(&mut values, &mut at, self.log.dropped);
+        put(&mut values, &mut at, self.log.refused);
+        values
+    }
+}
+
 /// Place one value at the running slot. Bounded by the array rather than by the
 /// cursor, so an arithmetic slip is a dropped write and never an index that
 /// leaves it (ENG-5) — and the assertions below make even that unreachable.
@@ -909,6 +1108,7 @@ const _: () = {
     assert!(ConsoleSample::SERIES.len() == CONSOLE_SLOTS);
     assert!(ConfigSample::SERIES.len() == CONFIG_SLOTS);
     assert!(ClockSample::SERIES.len() == CLOCK_SLOTS);
+    assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
 
     // Every table fits the shard it is published into, so `StatsShard::publish`
     // can truncate without any first-party caller ever reaching the truncation.
@@ -918,4 +1118,5 @@ const _: () = {
     assert!(CONSOLE_SLOTS <= crate::STATS_SLOTS);
     assert!(CONFIG_SLOTS <= crate::STATS_SLOTS);
     assert!(CLOCK_SLOTS <= crate::STATS_SLOTS);
+    assert!(RECORDER_SLOTS <= crate::STATS_SLOTS);
 };

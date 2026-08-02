@@ -16,7 +16,7 @@ operator can rely on it as a stable contract.
 > contract, not a gap in it. Nothing is named in an empty inventory ahead of time: a name published
 > before the signal it belongs to exists is a guess an operator would go on to build against.
 
-## The four surfaces, and the complete-state principle
+## The surfaces, and the complete-state principle
 
 - **Console** — a last-resort, human-readable channel carrying **system state only**. It exists so a
   node whose log streaming is down can still be diagnosed. It never carries traffic or per-request
@@ -33,11 +33,20 @@ operator can rely on it as a stable contract.
 - **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
   measurable moving part at bounded cardinality and no measurable dataplane cost.
 
-**Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, and tailing
-`GET /logs` **once** yields the entire observable state of a node: the exact configuration in force,
-every metric around it, and what it has just been doing. That triple *is* the debug dump — there is
-deliberately no other mechanism to extract state, so those endpoints together are designed to be
-sufficient to diagnose the system.
+- **Recording download** — `GET /logs.pcapng` and `GET /capture.pcapng`, the two pcapng sinks of
+  CONCEPT §15. This surface carries **evidence rather than state**: nothing on it is summarised, a
+  reader is a packet analyser rather than a dashboard, and it is the one surface bounded by storage
+  rather than by memory and the only one that carries the traffic itself. It is served by the same
+  HTTP endpoint as the four above and counted by the same metrics, so the families describing it are
+  specified here — but the *format* of what it returns is pcapng, and pcapng's specification, not
+  this document, is the contract for the bytes inside the file.
+
+**Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, tailing `GET /logs`,
+and downloading the two recordings **once** yields the entire observable state of a node: the exact
+configuration in force, every metric around it, what it has just been doing, and the recorded
+evidence of what it did to traffic. That *is* the debug dump — there is deliberately no other
+mechanism to extract state, so those endpoints together are designed to be sufficient to diagnose the
+system.
 
 ## Conventions (binding)
 
@@ -47,11 +56,12 @@ These apply to every signal and are the rules an operator can depend on.
 
 Every signal is attributable to a node and a configuration. The full common context is the **node
 identity**, the **software build and trust profile**, and the **configuration generation** in force,
-carried across all four surfaces as OTEL resource/log attributes, Prometheus labels, and console
-fields.
+carried across the observability surfaces as OTEL resource/log attributes, Prometheus labels, and
+console fields. A recording carries its own share of it differently, in the per-record annotation
+rather than as a label — see *Recording download endpoints*.
 
-The console is the only surface that exists, and it carries one part of that context. What it does
-carry, and what it does not:
+The console and the Prometheus exposition are the surfaces that exist, and the console carries one
+part of that context. What it does carry, and what it does not:
 
 | context | on the console | what fixes it there |
 |---|---|---|
@@ -93,10 +103,28 @@ implementation and binds the two that follow.
   in advance.
 - Labels and attributes are **low, bounded cardinality**: aggregate dimensions (interface, core,
   queue, subsystem, verdict class), never per-flow, per-connection, or per-packet identifiers.
-- No signal — on any surface — carries packet payloads, secrets, keys, or personal data. On the
-  console this is structural rather than a rule to remember: the only value type that can carry text
-  out of a configuration document is an identifier validated to `[a-z0-9-]{1,16}`, and a refusal
-  names a *location* in the document and never the bytes at it.
+- **No signal carries packet payloads, secrets, keys, or personal data — with one named exception,
+  the two recording sinks.** For the console, the OTEL log stream, the local log buffer and the
+  Prometheus exposition the rule is absolute and unqualified: none of them carries a byte of traffic,
+  and none ever will. On the console it is structural rather than a rule to remember — the only value
+  type that can carry text out of a configuration document is an identifier validated to
+  `[a-z0-9-]{1,16}`, and a refusal names a *location* in the document and never the bytes at it. On
+  the exposition it is structural too: a metric value is a number and a label comes from a closed
+  vocabulary or a validated identifier.
+
+  The exception is `GET /logs.pcapng` and `GET /capture.pcapng` (CONCEPT §11, §15), and it is stated
+  rather than tolerated: a recording exists **to** carry the traffic, and a capture that omitted the
+  payload would not be one. It is bounded to those two artifacts — the capture sink records payloads,
+  the log sink the L2–L4 headers of the packet each record is anchored to — it is why a recording is
+  an authorized download rather than an open scrape, and it is why an inspected flow is meant to be
+  recorded as ciphertext plus its keys rather than as plaintext at rest. Nothing else on any surface
+  moves because of it. **Today that authorization does not exist**: the management port has neither
+  TLS nor authentication, so anyone who can reach it can download every recorded packet — see
+  *Recording download endpoints* below.
+
+  One consequence worth stating where a reader will look for it: `sectors=`/`leading=` on the console
+  is **not** an instance of the exception. It is eight bytes of a sector rendered as an integer, and
+  the paragraph on that field says why it is not payload.
 - **The console alphabet is a guarantee, not a convention.** Every value carrying *text* is
   restricted to `[a-z0-9-]`, and the rendered line as a whole is printable ASCII — no control
   character, no ESC, and no newline but the single terminator the console appends. Values that are
@@ -240,13 +268,13 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ### `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
-**`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`** — the domain names in the
-Microkit system description. `state=` is one of **`starting`**, **`negotiated`**, **`ready`**,
-**`refused`**.
+**`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`**, **`recorder`** — the
+domain names in the Microkit system description. `state=` is one of **`starting`**,
+**`negotiated`**, **`ready`**, **`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
 written waits forever:
@@ -258,7 +286,8 @@ written waits forever:
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
+| `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -330,6 +359,35 @@ holding a silent appliance still has only the external act.
   monitor's to report. **An unaddressed port is not a refusal either** — before the first commit, and
   under a configuration that disables the interface, the port takes frames and answers nothing, which
   is `ready` with a rising count and no reply on the wire.
+- `sectors=<n> leading=<0x…>` — what a domain established about the **block medium** under it:
+  the capacity the device claimed, in 512-byte sectors and decimal, and the first eight bytes it
+  actually returned from sector 0, little-endian and hexadecimal. The pair travels together because
+  either alone proves less — a capacity is volunteered before a byte crosses, and eight bytes say
+  nothing without the size of what claims to hold them — so together they are the one line saying
+  the path to the medium works rather than merely that a device answered a handshake.
+
+  **The eight bytes are an integer and never rendered as text** (OBS-5). They are a sector this
+  appliance did not write, so they are not its data; they are carried at all because an operator
+  reading a partition signature or a filesystem magic off them can tell a device that answered from
+  one that returned a driver's own untouched buffer. Nothing in the appliance reads them back.
+
+  This is the **device** under the recordings and not a recording: it is emitted once, on the first
+  `recorder state=ready`, and the two records after it name the extents. It is not the payload
+  exception — no byte of a recording reaches the console, on which nothing about recorded *traffic*
+  ever appears.
+- `start=<n> sectors=<n>` — where one of a domain's **recordings** lives on that medium: the first
+  512-byte sector of its extent and how many sectors it spans, both decimal. One record per
+  recording, in the order the domain brings them up — log first, then capture — and they follow the
+  `sectors=`/`leading=` record on the same `state=ready`.
+
+  This is **the only way an operator learns where a recording is.** There is no shell and no CLI
+  (CONCEPT §11), the extents are compiled in rather than configured, and nothing else on any surface
+  states them: `/metrics` says how much a recording has written, never where. A reader taking an
+  extent off a decommissioned disk needs these two numbers and gets them nowhere else.
+
+  The key is `sectors=` on both records and it means two different things — a capacity on the first,
+  an extent length on the rest — which is exactly why the pairing rule at the top of this section
+  matters: read `sectors=` with the key beside it, `leading=` or `start=`, never alone.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. `signalled` says whether the
   device was told to stop (`STATUS_FAILED` written) or was left decoding nothing, which depends on
   whether its BAR had been placed when the rejection happened. `detail=` carries up to two numbers,
@@ -353,10 +411,20 @@ holding a silent appliance still has only the external act.
 
 ### `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the three tables together are the complete set: 23 the
-`nic-driver` domain raises, 25 the `clock` domain raises, and 4 the `management` domain raises, with
-no token shared between them. A token outside all three is a defect, not an extension. The
+Every `cause=` token is listed below and the four tables together are the complete set: 23 the
+`nic-driver` domain raises, 25 the `clock` domain raises, 5 the `management` domain raises, and 37
+the `recorder` domain raises. A token outside all four is a defect, not an extension. The
 `forwarder` and `console` domains raise none, having no `refused` record.
+
+**`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
+are virtio 1.0 PCI device classes and both run the same handshake in the same order, so a
+capability chain that is malformed, a BAR that is not 64-bit, a reset that is not acknowledged and
+a doorbell outside the window are literally the same fault twice — described by two independent
+crates (`nic_driver_core::bringup` and `lfw_blk::bringup`, which share no code) that arrived at the
+same names because the names are the specification's. Renaming one side to make the sets disjoint
+would make a reader learn two vocabularies for one fault. **Read the token with the domain**, never
+alone: `not-virtio-net` and `not-virtio-blk` are the two that already differ, and they differ
+because the *identity* being checked differs.
 
 **`nic-driver`.** The first two are the domain's own, raised before the device is touched at all;
 the rest are the driver's bring-up tree.
@@ -387,7 +455,7 @@ being known without being transmitted.
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
-**`management`.** Four tokens, and the two halves differ in what they mean for the domain.
+**`management`.** Five tokens, and the three groups differ in what they mean for the domain.
 
 The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
 its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
@@ -396,16 +464,48 @@ than answering a connection weakly, and the management port stays unaddressed fo
 either of them as "this node has no management port at all until it is rebooted on hardware that
 answers".
 
-The last two ride on a **`state=ready`** record instead, and mean something much narrower: the clock
+The next two ride on a **`state=ready`** record instead, and mean something much narrower: the clock
 domain published a calibration this domain will not convert readings with, so the port answers ARP
 and ICMP echo — neither needs a time — and refuses TCP, counting each segment as unclocked. They are
-reported once per calibration rather than once per frame. `signalled=` is always `false` on all four:
-no device was told to stop, because none was told anything.
+reported once per calibration rather than once per frame.
+
+The fifth also rides on **`state=ready`**, and is narrower still: the endpoint's streamed-target
+table would not take both recording targets, so `GET /logs.pcapng` and `GET /capture.pcapng` answer
+`404` while everything else on the port — ARP, ICMP echo, TCP, `GET /metrics` — serves normally. It
+is a **build fact rather than a run-time condition** (the table is a fixed size), so it is stated
+once at bring-up and never again, and the port carries on rather than refusing to start. An operator
+seeing it should read it as "this image cannot serve its recordings", not as a fault in the recorder,
+which is unaffected and still writing them to the medium.
+
+`signalled=` is always `false` on all five: no device was told to stop, because none was told
+anything.
 
 | group | tokens |
 |---|---|
 | the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the two 64-bit draws failed) |
 | the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused) |
+| the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
+
+**`recorder`.** Its first token is the domain's own, raised before the device is touched at all;
+the middle group is `lfw_blk`'s bring-up tree, which is `nic-driver`'s with three differences —
+`not-virtio-blk` for the identity, `device-read-only` and `capacity-zero` for two facts only a block
+device has, no transmit queue, and `device-cfg-` tokens for the structure `capacity` is read from;
+and the last group is the boot-time proof of the path to the medium, which has no counterpart on any
+other domain.
+
+`signalled=` is `true` only where the bring-up tree wrote `STATUS_FAILED`, exactly as on
+`nic-driver`. Every token in the proof group carries `signalled=false`: the device is past
+`DRIVER_OK` by then and is deliberately left running, so a later milestone can retry it without a
+reset.
+
+| group | tokens |
+|---|---|
+| staging region (`signalled=false`; `detail=` is the rejected address, `0x0` meaning the `setvar` is missing or misspelled in the system description) | `staging-region-dma-base` |
+| capability chain (no `detail=`) | `no-capability-list`, `malformed-capability-list`, `structures-across-bars`, `invalid-structure-bar`, `missing-virtio-structure` |
+| identity and BAR placement | `not-virtio-blk` (vendor, device), `structures-outside-bar` (window), `common-cfg-misaligned` (offset, required), `device-cfg-outside-bar` (offset, window), `device-cfg-misaligned` (offset, required), `bar-not-64-bit` (bar), `bar-index-out-of-range` (bar), `bar-has-no-high-half` (bar), `bar-target-unusable` (paddr) |
+| handshake | `reset-not-acknowledged` (status), `no-virtio-1` (offered features), `device-read-only` (offered features), `features-rejected` (status), `capacity-zero` |
+| the queue and its doorbell | `dma-region-unusable` (paddr), `queue-absent` (offered, required), `queue-size-zero` (index), `queue-too-small` (device maximum, required), `doorbell-outside-bar` (slot end, BAR size — or BAR size alone where the offset overflowed), `doorbell-misaligned` (offset) |
+| the proof of the medium (`signalled=false` throughout; `detail=` numbers are hexadecimal like every other refusal's, so a byte count reads as `0x200`) | `block-device-too-small` (capacity, sectors needed), `block-probe-refused` / `block-witness-refused` (which submit refusal, as a small code), `block-probe-silent` / `block-witness-silent` (the poll budget spent), `block-probe-misattributed` / `block-witness-misattributed` (no `detail=`), `block-probe-failed` / `block-witness-failed` (the outcome, `0x1` device error, `0x2` unsupported, `0x1nn` an undefined status byte `nn`), `block-probe-short` / `block-witness-short` (bytes moved, bytes asked for) |
 
 ### `LFW-CFG` — configuration
 
@@ -693,10 +793,9 @@ in the *next* one.
 
 ### Metric inventory
 
-52 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. The whole document is 208 series and about 25 KiB on the shipped
-configuration — 205 counter and gauge series from the eight shards, plus one info series per
-configured interface.
+74 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. The whole document is about 32 KiB on the shipped configuration —
+250 counter and gauge series from the nine shards, plus one info series per configured interface.
 
 #### Dataplane: what the forwarder decided
 
@@ -705,14 +804,28 @@ configured interface.
 | `librefirewall_forwarded_frames_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`) | Frames rewritten for their next hop and handed to the transmitting driver. |
 | `librefirewall_route_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`addressed_to_this_router`, `egress_is_ingress`, `interface_disabled`, `martian_source`, `no_neighbour`, `no_route`, `not_addressed_to_us`, `ttl_expired`, `unconfigured_ingress_port`, `unroutable_destination`, `vlan_tagged`) | Frames the router refused, by the reason it named. |
 | `librefirewall_route_stage_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`egress_full`, `malformed_descriptor`, `misrouted`, `snapshot_failed`, `unparsable`, `writeback_failed`) | Frames the routing stage refused around the router's own decision. |
+| `librefirewall_tap_observations_total` | counter | `forwarder` | — | Frame observations the forwarder published to the recorder. |
+| `librefirewall_tap_observations_lost_total` | counter | `forwarder` | `reason`&nbsp;(`inconsistent`, `ring_full`) | Observations the tap could not publish; `ring_full` is the recorder falling behind, `inconsistent` is ours and expected to stay zero. |
+
+The tap is one ring for the domain, not one per pipeline, so neither family carries `pipeline`: the
+packet identity a recording relates two observations by is per appliance, and a per-pipeline split
+would be two halves of a number nothing produces.
+
+**`observations + observations_lost` is below `forwarded + route_drops`, and the gap is not loss.**
+Three classes of frame are counted on the tables above and deliberately recorded nowhere, because
+the tap ABI mirrors the router's own drop reasons exactly and has no honest encoding for them: a
+frame no routing decision was reached about (`malformed_descriptor`, `snapshot_failed`,
+`unparsable`), one routed out of a port the stage is not wired to (`misrouted`), and one recorded as
+forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, and the second
+`ttl_expired` enforcer). An operator reconciling a recording against the counters subtracts those.
 
 #### Dataplane: what each NIC moved, and what it got wrong
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_device_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `fault`&nbsp;(`completion_length_over_reported`, `completion_not_posted`, `completion_out_of_range`), `queue`&nbsp;(`receive`, `transmit`) | Virtqueue completions the device got wrong about its own protocol. |
+| `librefirewall_device_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | `fault`&nbsp;(`completion_length_over_reported`, `completion_not_posted`, `completion_out_of_range`), `queue`&nbsp;(`receive`, `request`, `transmit`) | Virtqueue completions the device got wrong about its own protocol. `queue="request"` is the block device's single queue; the other two are a NIC's. |
 | `librefirewall_input_drops_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `reason`&nbsp;(`rx_peer_ring_full`, `rx_runt`, `tx_discarded`, `tx_duplicate`, `tx_free_ring_full`, `tx_malformed`, `tx_verdict_undecodable`) | Frames this driver did not move for a reason outside itself: a peer or the wire. |
-| `librefirewall_invariant_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `fault`&nbsp;(`rx_completion_unmapped`, `rx_slot_occupied`, `tx_completion_unmapped`, `tx_slot_occupied`) | This driver's own broken bookkeeping; ours, never traffic, expected to stay zero. |
+| `librefirewall_invariant_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | `fault`&nbsp;(`block_completion_unmapped`, `rx_completion_unmapped`, `rx_slot_occupied`, `tx_completion_unmapped`, `tx_slot_occupied`) | This driver's own broken bookkeeping; ours, never traffic, expected to stay zero. |
 | `librefirewall_pool_returns_refused_total` | counter | `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | `pool`&nbsp;(`receive`, `transmit`), `reason`&nbsp;(`ledger_refused`, `not_lent`) | Buffer returns a pool owner refused: forged, out of range, duplicated or never lent. |
 | `librefirewall_receive_bytes_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Bytes those frames carried, after the device's own header. |
 | `librefirewall_receive_frames_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Frames this port's device delivered and the driver handed to its peer. |
@@ -768,11 +881,81 @@ configured interface.
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_console_records_total` | counter | `console` | `outcome`&nbsp;(`malformed`, `printed`, `unknown`, `unrenderable`, `write_failed`) | Records the console path resolved, by outcome; each outcome accuses a different party. |
-| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Records this domain could not publish because its ring had no slot. |
-| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Events this domain minted that the record ABI cannot carry; ours, expected to stay zero. |
+| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain could not publish because its ring had no slot. |
+| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Events this domain minted that the record ABI cannot carry; ours, expected to stay zero. |
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
 | `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. |
 | `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
+
+#### The block device the recorder owns
+
+`librefirewall_block_capacity_sectors` is the device's own claim, taken once at bring-up and
+republished unchanged: it bounds every sector range the domain will name, so a device that came up
+smaller than the recording configured for it is visible in a scrape rather than only in a refusal.
+A sector is 512 bytes, fixed by virtio 1.0 §5.2 regardless of the `blk_size` a device reports.
+
+The two `_total` families count only **successful** completions and the bytes those moved, derived
+by the driver from what it submitted rather than taken from the device's own byte count — which
+answers a different question per operation and is only informative on a short read. Nothing here
+counts a refused submit: a request the driver would not publish is a defect in this appliance, and
+it reaches an operator as a console refusal rather than as a series.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_block_bytes_total` | counter | `recorder` | `operation`&nbsp;(`read`, `write`) | Bytes those requests moved, as the driver derived them rather than as the device claimed. |
+| `librefirewall_block_capacity_sectors` | gauge | `recorder` | — | Sectors the block device claimed at bring-up; the bound every range is judged against. |
+| `librefirewall_block_requests_total` | counter | `recorder` | `operation`&nbsp;(`read`, `write`) | Block requests the device completed successfully, by operation. |
+| `librefirewall_block_status_undecodable_total` | counter | `recorder` | — | Completions whose status byte was none of the three virtio-blk defines; the device's fault. |
+
+The recorder's virtqueue faults are **not** a family of their own: they are
+`librefirewall_device_faults_total{queue="request"}` and
+`librefirewall_invariant_faults_total{fault="block_completion_unmapped"}`, on the tables above. A
+virtqueue that lied about its own protocol is one kind of event whatever the queue carries, and an
+operator alerting on it should not have to know which domain owns which device.
+
+#### The two recordings, and the downloads served out of them
+
+Every family here carries `sink` where it describes one recording and omits it where it describes
+the tap between the forwarder and this domain, which is one ring feeding both.
+
+`librefirewall_recording_records_total` is what a recording **encoded**, not what reached the
+medium: bytes become durable one whole sector at a time, so the tail of a recording sits in staging
+until a seal — which a download performs — pushes it out. Compare it against
+`librefirewall_recording_sectors_written_total` for what the device has acknowledged.
+
+`librefirewall_recording_tap_dropped_by_writer_total` is the **forwarder's** claim about itself,
+read out of the shared ring and republished here beside this domain's own counts rather than
+instead of them. It is the same number as
+`librefirewall_tap_observations_lost_total{reason="ring_full"}`, and the two disagreeing is a peer
+misreporting rather than a lost record.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_recording_download_overruns_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Downloads the ring wrapped past mid-read, by sink; a reader the traffic outran. |
+| `librefirewall_recording_downloads_total` | counter | `recorder` | `outcome`&nbsp;(`refused`, `served`) | Download windows the recorder answered, by whether it served bytes or refused. |
+| `librefirewall_recording_padding_bytes_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Bytes of pcapng padding written to keep every device write a whole sector. |
+| `librefirewall_recording_record_bytes_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Bytes those records occupy, padding excluded. |
+| `librefirewall_recording_records_dropped_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`), `reason`&nbsp;(`oversized`, `refused`, `staging_full`) | Observations a sink could not encode, by why; every one is a gap the recording states. |
+| `librefirewall_recording_records_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Observations encoded into a recording, by sink. |
+| `librefirewall_recording_records_unclocked_total` | counter | `recorder` | — | Records placed before any calibration was published, so the recording states no instant for them rather than a counter reading. |
+| `librefirewall_recording_sectors_written_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Sectors of a recording the device acknowledged. |
+| `librefirewall_recording_segments_closed_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Segments sealed and rolled past, by sink. |
+| `librefirewall_recording_tap_dropped_by_writer_total` | counter | `recorder` | — | Observations the forwarder says the ring had no slot for; its claim about itself. |
+| `librefirewall_recording_tap_records_total` | counter | `recorder` | — | Observations the recorder drained from the tap ring. |
+| `librefirewall_recording_tap_refused_total` | counter | `recorder` | — | Tap annotations the recorder would not decode; the forwarder's fault, expected to stay zero. |
+| `librefirewall_recording_wraps_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Times a ring returned to its first segment, evicting the oldest history it held. |
+
+The download's other half is on the management domain, because that is the domain that serves it:
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_recording_stream_bytes_total` | counter | `management` | — | Body bytes those windows carried. |
+| `librefirewall_recording_stream_windows_total` | counter | `management` | — | Windows of a recording handed to the transport. |
+| `librefirewall_recording_streams_total` | counter | `management` | `outcome`&nbsp;(`abandoned`, `started`) | Recording downloads the management endpoint began, and those it gave up on part-sent. |
+
+**No series describes ring occupancy**, and none describes how much history a recording holds: a
+wrap count says a segment was evicted and not how far behind a reader is, because no reader
+registers a cursor yet (CONCEPT §15.4).
 
 #### What each configured interface is
 
@@ -900,8 +1083,9 @@ measurement: a counter update is a relaxed add to a `u64` in the publishing doma
 aligned region, and the exposition is rendered in the management domain out of a read of those
 regions. No dataplane domain does any work on a scrape, and no lock is shared with one.
 
-**Still absent.** `/config` and `/logs` (below and above) are unimplemented, so the debug dump has
-only its state half. The endpoint is **plain HTTP with no client authentication**: CONCEPT.md §11
+**Still absent.** `/config` and `/logs` (below and above) are unimplemented, so of the debug dump
+only the state half and the recordings exist. The endpoint is **plain HTTP with no client
+authentication**: CONCEPT.md §11
 requires mutual TLS on the management interface, and until that lands anyone who can reach the
 management interface can scrape it. That is a deviation, recorded in README's status table and in
 `lfw_ip_endpoint`'s crate header. The endpoint stages one response at a time, so a scrape arriving
@@ -914,3 +1098,135 @@ while another is still going out is answered `503` and counted as
 intent half of the debug dump: paired with a `/metrics` scrape and a `/logs` read it gives the
 complete picture of *what the node is configured to do* alongside *what it is doing* and *what it
 has just done*.
+
+## Recording download endpoints
+
+**Purpose:** hand an analyst the appliance's own record of the traffic it handled, in a format their
+tools already open. This is the evidence half of the debug dump, and the one surface that carries the
+traffic itself.
+
+**Endpoints:** `GET /logs.pcapng` and `GET /capture.pcapng` on the management interface. Each returns
+one of the two sinks of CONCEPT §15 — the same encoder, the same ring machinery, the same download
+path, differing today only in extent and snap length.
+
+> **These bodies carry packet payloads.** They are the single named exception to the no-payload rule
+> stated under *Conventions* above, and nothing else on any surface carries a byte of traffic.
+> **Today they are unauthenticated**: the port has neither TLS nor client authentication, so anyone
+> who can reach it can download every packet the appliance recorded. CONCEPT §11 requires the
+> exception to be gated by an authorization decision; that gate does not exist yet. Treat reachability
+> of the management port as equivalent to handing over the recordings.
+
+### What a response is
+
+| property | value |
+|---|---|
+| method | `GET`; anything else is `405` |
+| `Content-Type` | `application/octet-stream` — this appliance's HTTP layer names no pcapng type and would be claiming to know a format it does not parse |
+| `Content-Length` | always present, always exact, and **committed before the first body byte** |
+| `Connection` | `close`, on every response, as on every other endpoint here |
+| concurrency | one response at a time; a request arriving while another is going out is answered `503` |
+| conditional and partial requests | none — no `Range`, no `If-Match`, no `ETag`. A client takes the whole recording or nothing |
+
+**The length is pinned, not estimated.** The first window of a download seals the named recording —
+flushing whatever was still in staging out to the medium — and takes a snapshot: the oldest segment
+the ring still holds, and the durable write position. That snapshot fixes the body length, the
+response commits to it in `Content-Length`, and every later window is located against the *same*
+snapshot even though the recording keeps growing underneath it. A recording whose length could not be
+stated is never begun rather than begun and truncated, and one longer than 2 GiB is refused outright
+rather than served wrong.
+
+**A body is assembled a window at a time and never held whole.** The recorder answers 32 KiB per
+round trip out of its staging window, the endpoint copies each into a 16 KiB sliding transport window
+sized above the retransmit span, and no domain holds a second copy of a megabyte. Nothing between the
+medium and the wire parses the recording.
+
+### When it goes wrong
+
+There is no error body, and **where the failure falls decides what a client sees**:
+
+- **Before the head is written** — nothing is on the wire yet, so the request is answered
+  `503 Service Unavailable` with no body. A recorder that has nothing to serve, and a recording whose
+  length exceeds the 2 GiB a windowed response can address, both land here.
+- **After the head** — `Content-Length` has already been committed, so the connection simply closes
+  short of it. **A client sees a truncated body, never a wrong one**, and a truncated body is
+  detectable by anything that counts what it received; `curl` reports it.
+
+The ways a download ends early, wherever it falls:
+
+| condition | what it means | counted as |
+|---|---|---|
+| `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-download | `librefirewall_recording_download_overruns_total{sink}` and `librefirewall_recording_streams_total{outcome="abandoned"}` |
+| `DeviceError` | the block device refused the read | `librefirewall_recording_streams_total{outcome="abandoned"}` |
+| `NotReady` / `OutOfRange` / `NoSuchSink` | the recorder has nothing to serve for that request | `librefirewall_recording_streams_total{outcome="abandoned"}` |
+| the transport and the recorder disagree about the range in flight | ours, and expected never to happen | `librefirewall_recording_streams_total{outcome="abandoned"}` |
+
+None is retried: none is a state a retry improves. A download that completed is
+`librefirewall_recording_streams_total{outcome="started"}` with no matching `abandoned`, and the
+bytes and windows it took are `librefirewall_recording_stream_bytes_total` and
+`librefirewall_recording_stream_windows_total`.
+
+**A `404` on either target is a build fact, not a fault.** It means the endpoint's streamed-target
+table would not take both recordings, which is stated once on the console as
+`recording-targets-unregistered`. The recorder is unaffected and still writing to the medium.
+
+### What is inside the file
+
+The bytes are pcapng, and **pcapng's own specification is the contract for them** — this section
+states only what this appliance puts there. A standard reader opens either file directly: `tcpdump -r`
+lists the packets with their addresses, ports, lengths and wall-clock times, and ignores everything
+below that it does not know.
+
+- **A Section Header Block** opens every segment, carrying `shb_os` = `librefirewall`,
+  `shb_userappl` = `librefirewall recorder`, and a PEN-tagged custom option holding the annotation
+  layout version.
+- **One Interface Description Block per interface**, link type `LINKTYPE_ETHERNET`, `if_tsresol` = 6
+  (microsecond timestamps). `if_name` is the **port**, `port0` and `port1` — not the interface id the
+  configuration document names (`dataplane-0`). `if_snaplen` is the sink's snap length: **128 bytes**
+  on the log recording, **2048** on the capture recording.
+- **One Enhanced Packet Block per observation**, carrying the frame **as it arrived** — the tap is
+  taken between the router's decision and the forwarding rewrite, so a recorded frame is what the
+  wire delivered, not what the appliance sent on. Captured length is the snap length or the frame,
+  whichever is smaller; original length is always the frame's true length, so a truncated record
+  still states what it truncated. Each carries:
+
+  | option | what it holds |
+  |---|---|
+  | `epb_flags` | direction. Only *inbound* is emitted today — see below |
+  | `epb_dropcount` | tap-ring observations lost before this record. **Always `0` today** — the field is emitted and nothing feeds it, so a recording does *not* yet state its own gaps in-band (CONCEPT §15.2 requires that it does). Reconcile against `/metrics` instead |
+  | `epb_packetid` | the appliance-wide packet identity |
+  | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped |
+  | custom option, PEN-tagged | 16 bytes: layout version, verdict, drop reason, interface id, direction, and the **configuration generation** the decision was made under |
+
+- **A Custom Block of padding** closes a sealed segment, so every write to the device is a whole
+  sector. It is skipped by any reader that does not know the PEN, and by `tcpdump`.
+- **The PEN is `0xFFFFFFFF`, a placeholder.** GROPYUS holds no registered Private Enterprise Number.
+  The value is IANA-reserved so it can never collide with a real assignment, but it is not ours, and
+  a reader must not treat a PEN-tagged option in these files as a stable identifier until a
+  registered number replaces it.
+- **No Interface Statistics Block is emitted yet**, and no Decryption Secrets Block. Between that and
+  the unfed `epb_dropcount`, **a recording reports none of its own loss in-band**: a file that a burst
+  outran looks exactly like one that lost nothing. Until both land, the loss families under *The two
+  recordings, and the downloads served out of them* are the only account of it, and a recording must
+  be read beside a scrape rather than alone.
+
+### What the two recordings currently differ by
+
+**Only the snap length.** CONCEPT §15.1 defines the log sink as connection lifecycle and policy
+events anchored to their causing packet, and the capture sink as filtered full content. Neither is
+what exists: there is no connection tracking and no filtering, so **both recordings hold every
+dataplane observation**, one keeping the first 128 bytes and the other up to 2048. An operator should
+read `/logs.pcapng` today as "the capture, truncated to headers", not as an event log. The annotation
+carries a version byte precisely so the record can grow when the events land.
+
+Three further limits an operator will otherwise infer wrongly:
+
+- **Only the dataplane is recorded.** The management port is not tapped, so nothing on it — including
+  the download itself — appears in either file.
+- **One observation per frame.** CONCEPT §15.2's paired ingress and egress observation of a forwarded
+  frame is not made; `epb_packetid` is minted and monotone, but there is only ever one record to
+  relate. Every `epb_flags` therefore reads inbound.
+- **Some frames are counted and deliberately absent.** A frame no routing decision was reached about,
+  one routed out of a port the stage is not wired to, and one recorded as forwarded that a later
+  refusal lost are all counted on the dataplane families and encoded in no recording, because the tap
+  ABI mirrors the router's drop reasons exactly and has none for them. See *The two recordings, and
+  the downloads served out of them* above for the reconciliation.

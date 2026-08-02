@@ -68,6 +68,10 @@
 
 use std::{fs, path::Path};
 
+use lfw_blk::{
+    BAR_WINDOW_SIZE as BLK_BAR_WINDOW_SIZE, BLK_IO_REGION_SIZE,
+    DMA_REGION_SIZE as BLK_DMA_REGION_SIZE,
+};
 use lfw_hpet::MMIO_REGION_SIZE;
 use lfw_metrics::{MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, STATS_REGION_SIZE};
 use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
@@ -77,7 +81,8 @@ use uart_16550::{COM1_BASE, PORT_COUNT as COM1_PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
-    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
+    DOWNLOAD_REPLY_REGION_SIZE, DOWNLOAD_REQUEST_REGION_SIZE, LOG_CONSUME_REGION_SIZE,
+    LOG_RECORDS_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -299,6 +304,45 @@ const RETURN_WITHHELD: &str = "the forwarder maps no return ring. It is a region
      what a compromised forwarder is still unable to do: it can corrupt a frame in flight, and it \
      cannot hand a live DMA target back to be issued a second time";
 
+/// What the block device's four regions withhold, quoted into the finding on
+/// any of them gaining a second mapper.
+///
+/// It is the mirror image of the NIC regions' exclusions, and the sentence
+/// worth having is the one about the direction nobody asks for: not only does
+/// no other domain reach the medium, this domain reaches no wire.
+const RECORDER_DEVICE_WITHHELD: &str = "the recorder is the only domain that maps any part of \
+     the block device, and it maps no part of any network one. No other domain holds its ECAM \
+     page, its BAR window, its DMA region or its staging window, so nothing else in this system \
+     can put a byte on persistent storage or read one back — and this domain holds no ecam0..2, \
+     no bar0..2, no vq0..2, no buffer pool of either dataplane or management pipeline, no \
+     `ForwardRings`, no `ReturnRing` and no `<ioport>`, so an attacker who reaches the domain \
+     that owns the disk reaches no network device by doing so. The staging window in particular \
+     is withheld from the management domain deliberately rather than by omission: a download is \
+     answered out of `dl_reply`, a bounded copy the recorder composed, because a read grant here \
+     would expose whatever that domain happened to be staging at the time (ENG-1, SCM-6)";
+
+/// What the capture tap's two regions withhold — the mirrored permissions that
+/// make a stored capture the forwarder's testimony rather than the recorder's.
+const TAP_WITHHELD: &str = "exactly two domains map the tap, and no third maps either half in \
+     either direction: no driver, so a compromised driver cannot see what was decided about the \
+     frames it delivered; not the management domain, so the domain that answers a download \
+     cannot read the ring ahead of the recorder or write into it; and not the console, which \
+     keeps the two output channels disjoint. What the perms withhold between the two that do map \
+     it is the other half and is stated in the grants: the forwarder produces and cannot move the \
+     consume cursor, so it cannot discard observations while reporting none lost, and the \
+     recorder consumes and cannot write a record, so it cannot commit to the medium an \
+     observation the forwarding domain never made";
+
+/// What the download handover's two regions withhold, on the tap's terms and
+/// with the forwarder's exclusion as the load-bearing half.
+const DOWNLOAD_WITHHELD: &str = "the forwarder maps NEITHER download region, in either \
+     direction, which is the counterpart of it mapping no `blk_io`: the dataplane can neither see \
+     what an operator is downloading nor influence what comes back. A forwarder able to write \
+     `dl_reply` would answer a download with bytes of its own while the recorder reported having \
+     served the medium's. No driver and no console maps either half. Between the two domains that \
+     do, the withholding is in the perms: the management domain states the request and cannot \
+     write the answer, and the recorder answers and cannot write the question";
+
 /// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
 /// the finding on the management domain gaining the acknowledgement region.
 const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `cfgack` NOT AT \
@@ -381,6 +425,54 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Uncached,
         grants: &[read_write("nic_driver2")],
         withheld: None,
+    },
+    // The block device's four regions. Its ECAM page and BAR window are the same
+    // two kinds of grant the NIC drivers hold, and the constants they are
+    // compared against are deliberately `lfw_blk`'s own rather than
+    // `nic_driver_core`'s: the two are independent device classes with
+    // independent bounds, and citing one for the other would let a change to
+    // either move the other's mapped window with nothing failing. That the two
+    // BAR windows are the same number today is a coincidence neither crate
+    // promises.
+    RegionRule {
+        name: "ecam3",
+        size: ExpectedSize {
+            rust_name: "virtio::pci::PCI_CONFIG_LEN",
+            bytes: PCI_CONFIG_LEN,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("recorder")],
+        withheld: Some(RECORDER_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "bar3",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::BAR_WINDOW_SIZE",
+            bytes: BLK_BAR_WINDOW_SIZE,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("recorder")],
+        withheld: Some(RECORDER_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "blk_dma",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::DMA_REGION_SIZE",
+            bytes: BLK_DMA_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("recorder")],
+        withheld: Some(RECORDER_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "blk_io",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::BLK_IO_REGION_SIZE",
+            bytes: BLK_IO_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("recorder")],
+        withheld: Some(RECORDER_DEVICE_WITHHELD),
     },
     // The timer block, and the one region whose rule cites a constant that is
     // NOT the extent of the thing inside it. `lfw_hpet::MMIO_LENGTH` is the
@@ -606,6 +698,7 @@ const REGIONS: &[RegionRule] = &[
             read_write("config"),
             read_only("forwarder"),
             read_only("management"),
+            read_only("recorder"),
         ],
         withheld: None,
     },
@@ -632,6 +725,7 @@ const REGIONS: &[RegionRule] = &[
             read_only("nic_driver0"),
             read_only("nic_driver1"),
             read_only("nic_driver2"),
+            read_only("recorder"),
         ],
         withheld: None,
     },
@@ -644,6 +738,50 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("config"), read_write("forwarder")],
         withheld: Some(CONFIG_ACK_WITHHELD),
+    },
+    // The capture tap, and the download handover: two more two-region handovers
+    // built the way `cfg`/`cfgack` and every log ring are, and read here the same
+    // way. In both, the two rows of a pair are each other's mirror, and a pair
+    // that stopped mirroring is the edit these rules exist to refuse.
+    RegionRule {
+        name: "tap",
+        size: ExpectedSize {
+            rust_name: "wire::TAP_RECORDS_REGION_SIZE",
+            bytes: TAP_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("forwarder"), read_only("recorder")],
+        withheld: Some(TAP_WITHHELD),
+    },
+    RegionRule {
+        name: "tap_consume",
+        size: ExpectedSize {
+            rust_name: "wire::TAP_CONSUME_REGION_SIZE",
+            bytes: TAP_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("forwarder"), read_write("recorder")],
+        withheld: Some(TAP_WITHHELD),
+    },
+    RegionRule {
+        name: "dl_request",
+        size: ExpectedSize {
+            rust_name: "wire::DOWNLOAD_REQUEST_REGION_SIZE",
+            bytes: DOWNLOAD_REQUEST_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("management"), read_only("recorder")],
+        withheld: Some(DOWNLOAD_WITHHELD),
+    },
+    RegionRule {
+        name: "dl_reply",
+        size: ExpectedSize {
+            rust_name: "wire::DOWNLOAD_REPLY_REGION_SIZE",
+            bytes: DOWNLOAD_REPLY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("management"), read_write("recorder")],
+        withheld: Some(DOWNLOAD_WITHHELD),
     },
     // The log transport: one ring per writing domain, split into two regions so
     // the two directions can carry opposite authority. Every pair below is the
@@ -789,6 +927,26 @@ const REGIONS: &[RegionRule] = &[
         withheld: Some(LOG_WITHHELD),
     },
     RegionRule {
+        name: "log_recorder",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("recorder"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_recorder_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("recorder"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
         name: "log_config",
         size: ExpectedSize {
             rust_name: "wire::LOG_RECORDS_REGION_SIZE",
@@ -874,6 +1032,13 @@ const REGIONS: &[RegionRule] = &[
         size: STATS_SIZE,
         cacheability: Cacheability::Cached,
         grants: &[read_write("clock"), read_only("management")],
+        withheld: Some(STATS_WITHHELD),
+    },
+    RegionRule {
+        name: "stats_recorder",
+        size: STATS_SIZE,
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("recorder"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
 ];
@@ -1018,6 +1183,7 @@ const DOMAINS: &[&str] = &[
     "console",
     "clock",
     "management",
+    "recorder",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is
@@ -1129,6 +1295,23 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         domain: "config",
         id: "0",
         notification: Notification::MaySend,
+    },
+    // The download channel. The recorder signals that a window is ready; the
+    // management domain answers nothing back, and this is its SECOND end — id 0
+    // being nic_driver2's, where it is likewise the receiver. Both ends carry
+    // notify="false" on its side, which is what keeps "this domain holds no send
+    // capability at all" true rather than nearly true.
+    ChannelEnd {
+        domain: "recorder",
+        id: "0",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "management",
+        id: "1",
+        notification: Notification::MayNotSend {
+            claim: MANAGEMENT_CHANNEL_ONE_WAY,
+        },
     },
 ];
 
