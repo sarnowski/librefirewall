@@ -14,7 +14,10 @@
 //! routable exactly when some interface's prefix covers it, and the next hop is
 //! then the destination itself. That is a real restriction — no default route,
 //! no gateway indirection — and it is what a two-port appliance between two
-//! directly attached subnets needs.
+//! directly attached subnets needs, and [`Router::route`] holds it: a prefix
+//! length of zero would cover every destination, so such an interface is never
+//! a route. It stays an address the appliance holds — an ingress, and a
+//! destination that is not forwarded onward — and nothing is routed through it.
 //!
 //! Neighbours are configured, never learned: this crate carries no discovery
 //! state. Resolution stays a table because the forwarder cannot *originate* a
@@ -45,8 +48,9 @@ pub struct Interface {
     /// The MAC this port answers to, and the source MAC it forwards under.
     pub mac: MacAddress,
     pub address: Ipv4Address,
-    /// Bits of `address` that form the network. Every `u8` is a valid one:
-    /// `Ipv4Address::shares_prefix` saturates rather than rejecting.
+    /// Bits of `address` that form the network. `Ipv4Address::shares_prefix`
+    /// saturates rather than rejecting, so every `u8` behaves; zero makes the
+    /// interface a default route, which [`Router::route`] does not select.
     pub prefix_length: u8,
     /// Administratively up. A disabled interface is neither a valid ingress
     /// nor a selectable egress.
@@ -104,7 +108,8 @@ pub enum DropReason {
     /// An 802.1Q tag with no sub-interface to interpret it.
     VlanTagged,
     /// A source address that may not appear as one: multicast, broadcast,
-    /// loopback, or unspecified.
+    /// loopback, unspecified, or an address the appliance itself holds — the
+    /// forged case, since nothing on a wire may claim to be this router.
     MartianSource,
     /// A destination no unicast routing decision may be made for.
     UnroutableDestination,
@@ -315,17 +320,40 @@ impl<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
             .find(|entry| entry.port == port)
     }
 
-    /// The interface whose connected prefix covers `destination`, longest
-    /// prefix first. Ordering by prefix length rather than by table position is
-    /// what keeps the result independent of how the configuration was written.
+    /// The interface whose connected prefix covers `destination`: the longest
+    /// prefix, and among equal-length prefixes the lowest port, then address,
+    /// then MAC.
     ///
-    /// A disabled interface is not a candidate, this being where an egress is
-    /// chosen: a route out of a link that is down is not a route.
+    /// Prefix length alone does not decide it — two enabled interfaces of equal
+    /// length can both cover one destination — so the key continues over the
+    /// fields the verdict is built from. That is a total order and table
+    /// position is not in it, which is what makes any permutation of the same
+    /// interfaces answer the same way. Which of two equal-length prefixes wins
+    /// is arbitrary; that it is the same one every time is not.
+    ///
+    /// Two kinds of interface are not candidates, this being where an egress is
+    /// chosen. A disabled one, because a route out of a link that is down is not
+    /// a route. And one whose prefix length is zero, because its prefix covers
+    /// every destination: selecting it would be a default route, and this crate
+    /// forwards on connected prefixes alone. Such an interface is still an
+    /// address the appliance holds, so traffic *to* it is still refused as its
+    /// own and traffic *through* it is refused as having no route — which is a
+    /// named, counted reason rather than a silent default hop. Refusing the
+    /// whole table instead would be this crate rejecting a configuration the
+    /// layer that validates one accepts, and it is that layer's rule to add.
     #[must_use]
     pub fn route(&self, destination: Ipv4Address) -> Option<&Interface> {
         self.configured_interfaces()
-            .filter(|entry| entry.enabled && entry.covers(destination))
-            .max_by_key(|entry| entry.prefix_length)
+            .filter(|entry| entry.enabled && entry.prefix_length > 0 && entry.covers(destination))
+            .min_by_key(|entry| {
+                (
+                    // Longest prefix first, inside an otherwise ascending key.
+                    core::cmp::Reverse(entry.prefix_length),
+                    entry.port,
+                    entry.address,
+                    entry.mac,
+                )
+            })
     }
 
     #[must_use]
@@ -369,7 +397,7 @@ impl<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
 
         let header = frame.ipv4();
         let source = header.source;
-        if !source.is_unicast() {
+        if !source.is_unicast() || self.is_local_address(source) {
             return Decision::Drop(DropReason::MartianSource);
         }
         let destination = header.destination;
@@ -388,6 +416,13 @@ impl<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
         let Some(egress) = self.route(destination) else {
             return Decision::Drop(DropReason::NoRoute);
         };
+        // Looked up across every interface and only then compared with the
+        // ingress, so a longer prefix on the ingress port beats a shorter one
+        // elsewhere and the frame is dropped rather than carried by it. The
+        // longest match is the most specific statement about where the
+        // destination lives; if that is the link it arrived on, the sender
+        // should have addressed the host directly, and carrying it out of a
+        // less specific route would put it on the wrong link.
         if egress.port == ingress {
             return Decision::Drop(DropReason::EgressIsIngress);
         }
@@ -695,6 +730,104 @@ mod tests {
             };
             expect_drop(&spec, PORT0, DropReason::UnroutableDestination);
         }
+    }
+
+    #[test]
+    fn a_frame_claiming_one_of_the_appliances_own_addresses_as_its_source_is_martian() {
+        // Both interfaces' addresses: a forgery aimed at either link is refused
+        // on the port it arrived on, not only the one that holds the address.
+        for source in [
+            Ipv4Address::from_octets([10, 0, 0, 1]),
+            Ipv4Address::from_octets([10, 0, 1, 1]),
+        ] {
+            let spec = FrameSpec {
+                source,
+                ..FrameSpec::a_to_b()
+            };
+            expect_drop(&spec, PORT0, DropReason::MartianSource);
+        }
+    }
+
+    #[test]
+    fn a_source_of_a_disabled_interfaces_address_is_still_martian() {
+        let mut down = interfaces();
+        down[1].enabled = false;
+        let table = Router::<2, 2>::from_slices(&down, &neighbours()).expect("two fit in two");
+        let spec = FrameSpec {
+            source: Ipv4Address::from_octets([10, 0, 1, 1]),
+            ..FrameSpec::a_to_b()
+        };
+        expect_drop_on(&table, &spec, PORT0, DropReason::MartianSource);
+    }
+
+    #[test]
+    fn two_equal_length_covering_prefixes_choose_the_same_egress_in_either_order() {
+        let low = Interface {
+            port: PORT0,
+            mac: GATEWAY0_MAC,
+            address: Ipv4Address::from_octets([10, 0, 0, 0]),
+            prefix_length: 8,
+            enabled: true,
+        };
+        let high = Interface {
+            port: PORT1,
+            mac: GATEWAY1_MAC,
+            address: Ipv4Address::from_octets([10, 0, 0, 0]),
+            prefix_length: 8,
+            enabled: true,
+        };
+        let target = Ipv4Address::from_octets([10, 0, 1, 2]);
+        assert!(low.covers(target) && high.covers(target), "both must cover");
+
+        let in_order = Router::<2, 0>::from_slices(&[low, high], &[]).expect("two fit in two");
+        let reversed = Router::<2, 0>::from_slices(&[high, low], &[]).expect("two fit in two");
+        assert_eq!(in_order.route(target), Some(&low));
+        assert_eq!(
+            reversed.route(target),
+            Some(&low),
+            "the egress followed the table position rather than the interfaces"
+        );
+    }
+
+    #[test]
+    fn an_interface_with_a_zero_prefix_length_is_never_a_route() {
+        // A /0 covers every destination, so selecting it would be a default
+        // route. It stays an address the appliance holds and an ingress it
+        // receives on; what it never is, is an egress.
+        let mut with_default = interfaces();
+        with_default[1].prefix_length = 0;
+        let table = Router::<2, 2>::from_slices(&with_default, &neighbours()).expect("two fit");
+
+        let far = Ipv4Address::from_octets([203, 0, 113, 4]);
+        assert!(
+            with_default[1].covers(far),
+            "the /0 must cover the destination, or this proves nothing"
+        );
+        assert_eq!(table.route(far), None, "a /0 became a default route");
+        let spec = FrameSpec {
+            destination: far,
+            ..FrameSpec::a_to_b()
+        };
+        expect_drop_on(&table, &spec, PORT0, DropReason::NoRoute);
+
+        // Still the appliance's own address, and still a usable ingress: the
+        // narrowing is to route selection alone.
+        assert!(table.is_local_address(with_default[1].address));
+        let onto_the_default_port = FrameSpec {
+            destination_mac: GATEWAY1_MAC,
+            source: host_b(),
+            destination: host_a(),
+            ..FrameSpec::a_to_b()
+        };
+        assert_eq!(
+            decide_on(&table, &onto_the_default_port, PORT1),
+            Decision::Forward {
+                egress: PORT0,
+                source: GATEWAY0_MAC,
+                destination: HOST_A_MAC,
+            },
+            "a /0 interface must still receive"
+        );
     }
 
     #[test]
@@ -1031,6 +1164,62 @@ mod tests {
                     table.neighbour(egress, Ipv4Address::from_octets(destination))
                         .is_some_and(|entry| entry.mac == to),
                     "the next-hop MAC is not a configured neighbour's",
+                );
+            }
+        }
+
+        /// The egress a destination resolves to does not depend on the order
+        /// the interfaces were written in: every rotation of one table answers
+        /// the same way, equal-length covering prefixes included.
+        #[test]
+        fn the_route_is_the_same_under_every_table_order(
+            (interfaces, neighbours) in any_configuration(),
+            destination in any_address(),
+            rotation in 0usize..5,
+        ) {
+            let written = Router::<4, 4>::from_slices(&interfaces, &neighbours)
+                .expect("the strategy generates tables of at most the capacity");
+            let mut rotated = interfaces.clone();
+            let steps = rotation.checked_rem(rotated.len()).unwrap_or(0);
+            rotated.rotate_left(steps);
+            let permuted = Router::<4, 4>::from_slices(&rotated, &neighbours)
+                .expect("a rotation holds the same entries");
+            prop_assert_eq!(written.route(destination), permuted.route(destination));
+
+            let mut reversed = interfaces;
+            reversed.reverse();
+            let backwards = Router::<4, 4>::from_slices(&reversed, &neighbours)
+                .expect("a reversal holds the same entries");
+            prop_assert_eq!(written.route(destination), backwards.route(destination));
+        }
+
+        /// Whatever the table holds and wherever a zero prefix length sits in
+        /// it, the interface it names is never the route: a default route cannot
+        /// be reached through a configuration this crate accepts.
+        #[test]
+        fn a_zero_prefix_length_is_never_the_route(
+            (interfaces, neighbours) in any_configuration(),
+            at in 0usize..5,
+            port in 0u8..4,
+            destination in any::<[u8; 4]>(),
+        ) {
+            let mut with_default = interfaces;
+            let at = at.min(with_default.len());
+            with_default.insert(at, Interface {
+                port: PortId(port),
+                mac: MacAddress([0; 6]),
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                prefix_length: 0,
+                enabled: true,
+            });
+            let table = Router::<8, 8>::from_slices(&with_default, &neighbours)
+                .expect("six entries fit in eight");
+            let destination = Ipv4Address::from_octets(destination);
+            if let Some(egress) = table.route(destination) {
+                prop_assert!(
+                    egress.prefix_length > 0,
+                    "a zero prefix length was selected as the route for {}",
+                    destination,
                 );
             }
         }

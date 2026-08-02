@@ -60,10 +60,17 @@ pub fn read_timestamp_counter() -> Ticks {
 /// A domain's view of what time it is: the calibration region, read afresh on
 /// every question.
 ///
-/// Afresh rather than cached, because the clock domain may republish and a
-/// cached triple would be a stopped clock that no longer says so. The read is
-/// three loads and a seqlock check, which is cheaper than the counter read it
-/// accompanies.
+/// Afresh rather than cached, because the clock domain may republish and a cached
+/// triple would go on converting readings with a calibration the writer has
+/// withdrawn. [`EndpointStage`](crate::EndpointStage) holds one and re-reads on a
+/// generation change for the same end and not a different one — neither may keep a
+/// superseded triple; they differ only in how often the question is asked. The read
+/// is three loads and a seqlock check, cheaper than the counter read beside it.
+///
+/// So a domain that has stamped a record is **not** thereby one that stamps every
+/// later record. The clock domain publishes once and parks, which makes the
+/// transition one-way in practice — but that is its behaviour, not this reader's
+/// guarantee, and a latch asserting it would be the cache above under another name.
 pub struct PdClock<'region> {
     published: &'region ClockCalibration,
 }
@@ -77,10 +84,10 @@ impl<'region> PdClock<'region> {
     /// The calibration now in force, or `None` where there is none this domain
     /// will convert a reading with.
     ///
-    /// The three cases collapse deliberately: nothing published yet, a triple
-    /// torn under the read, and a frequency outside the band
-    /// [`calibration_from`] accepts all mean "no instant to give a record", and
-    /// a caller that told them apart would still do the same thing.
+    /// The cases collapse deliberately: nothing published, a triple torn under the
+    /// read, and a triple whose frequency or epoch is outside the band all mean
+    /// "no instant to give a record", and a caller telling them apart would still
+    /// do the same thing.
     #[must_use]
     pub fn calibration(&self) -> Option<Calibration> {
         calibration_from(self.published.load()?).ok()

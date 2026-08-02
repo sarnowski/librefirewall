@@ -1,7 +1,8 @@
 #!/bin/sh
-# Full CI gate: the host gate plus image assembly and the QEMU system and A/B
-# scenarios. Runs before every push so trunk stays green through the same
-# commands CI runs.
+# Full CI gate: the host gate plus the fuzz targets, release image assembly, and
+# the QEMU system and A/B scenarios. Runs once per push, against the tip, so
+# trunk's head stays green through the same command CI runs. The commits behind
+# the tip in a multi-commit push have passed the pre-commit gate only.
 set -e
 echo "pre-push: running 'make ci' (full gate: host + QEMU system + A/B)"
 exec make ci

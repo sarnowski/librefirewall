@@ -147,17 +147,22 @@ proptest! {
     }
 }
 
+/// The whole window as one span, which only a test asks for.
+fn whole_window() -> IoSpan {
+    IoSpan::new(IoSector::FIRST, BLK_IO_REGION_SIZE as u32).expect("the window fits itself")
+}
+
 #[test]
-fn the_staging_slice_is_the_whole_window_and_what_a_sector_addresses() {
+fn the_staging_slice_is_the_span_it_names_and_what_a_sector_addresses() {
     // The two views of the region must agree, or a recording composed through
     // the slice would be DMA'd from somewhere else.
     let mut backing = Backing::new();
     let mut region = backing.attach();
-    assert_eq!(region.staging().len(), BLK_IO_REGION_SIZE);
+    assert_eq!(region.staging(whole_window()).len(), BLK_IO_REGION_SIZE);
 
     let at = IoSector::new(7).expect("the window has an eighth sector");
     let offset = at.get() * SECTOR_SIZE;
-    if let Some(slot) = region.staging().get_mut(offset) {
+    if let Some(slot) = region.staging(whole_window()).get_mut(offset) {
         *slot = 0xA5;
     }
     let mut read = [0u8; SECTOR_SIZE];
@@ -174,7 +179,101 @@ fn a_sector_placed_by_put_is_visible_through_the_staging_slice() {
     region.put(IoSector::SECOND, &sector);
     let offset = IoSector::SECOND.get() * SECTOR_SIZE;
     assert_eq!(
-        region.staging().get(offset..offset + SECTOR_SIZE),
+        region
+            .staging(whole_window())
+            .get(offset..offset + SECTOR_SIZE),
         Some(&sector[..])
     );
+}
+
+#[test]
+fn a_staging_slice_starts_at_its_span_and_stops_at_its_end() {
+    // A span is what a caller composes a transfer in, so it must be exactly the
+    // bytes the matching data segment will cover and not one more.
+    let mut backing = Backing::new();
+    let mut region = backing.attach();
+    let start = IoSector::new(3).expect("the window has a fourth sector");
+    let span = IoSpan::new(start, 2 * SECTOR_SIZE as u32).expect("two sectors fit");
+    let slice = region.staging(span);
+    assert_eq!(slice.len(), 2 * SECTOR_SIZE);
+    slice.fill(0xC3);
+
+    for index in 0..IO_SECTORS {
+        let mut sector = [0u8; SECTOR_SIZE];
+        region.take(IoSector::new(index).expect("in range"), &mut sector);
+        let expected = if (3..5).contains(&index) { 0xC3 } else { 0 };
+        assert_eq!(sector, [expected; SECTOR_SIZE], "sector {index}");
+    }
+}
+
+#[test]
+fn a_span_that_would_leave_the_window_cannot_be_named() {
+    // The bound nothing below this type re-derives: `Requests::submit` checks
+    // the sector range against the device's capacity and the address against
+    // its alignment, and knows nothing of the staging region's extent.
+    let last = IoSector::new(IO_SECTORS - 1).expect("the window has a last sector");
+    assert_eq!(
+        IoSpan::new(last, SECTOR_SIZE as u32).map(IoSpan::bytes),
+        Some(SECTOR_SIZE as u32),
+        "the last sector is a span in its own right"
+    );
+    assert_eq!(
+        IoSpan::new(last, SECTOR_SIZE as u32 + 1),
+        None,
+        "one byte past the window is one byte the device must not be handed"
+    );
+    assert_eq!(IoSpan::new(last, u32::MAX), None);
+    assert_eq!(IoSpan::new(IoSector::FIRST, u32::MAX), None);
+    assert_eq!(
+        IoSpan::new(IoSector::FIRST, 0),
+        None,
+        "a span of no bytes is not a data segment"
+    );
+    let whole = IoSpan::new(IoSector::FIRST, BLK_IO_REGION_SIZE as u32)
+        .expect("the window is a span of itself");
+    assert_eq!(whole.sector(), IoSector::FIRST);
+    assert_eq!(whole.bytes(), BLK_IO_REGION_SIZE as u32);
+}
+
+#[test]
+fn a_span_at_a_byte_offset_refuses_anything_but_a_sector_boundary() {
+    let span = IoSpan::at_offset(2 * SECTOR_SIZE, SECTOR_SIZE as u32).expect("a sector boundary");
+    assert_eq!(span.sector(), IoSector::new(2).expect("in range"));
+    assert_eq!(span.bytes(), SECTOR_SIZE as u32);
+
+    assert_eq!(
+        IoSpan::at_offset(1, SECTOR_SIZE as u32),
+        None,
+        "an offset part-way into a sector is a caller's arithmetic gone wrong"
+    );
+    assert_eq!(IoSpan::at_offset(SECTOR_SIZE - 1, 4), None);
+    assert_eq!(
+        IoSpan::at_offset(BLK_IO_REGION_SIZE, SECTOR_SIZE as u32),
+        None,
+        "the first byte past the window names no sector"
+    );
+    assert_eq!(
+        IoSpan::at_offset(BLK_IO_REGION_SIZE - SECTOR_SIZE, SECTOR_SIZE as u32 + 4),
+        None,
+        "and neither does a span whose end runs past it"
+    );
+    assert_eq!(
+        IoSpan::at_offset(0, BLK_IO_REGION_SIZE as u32).map(IoSpan::bytes),
+        Some(BLK_IO_REGION_SIZE as u32)
+    );
+}
+
+#[test]
+fn a_span_address_is_its_first_sector_address() {
+    let mut backing = Backing::new();
+    let region = backing.attach();
+    for index in [0, 1, 7, IO_SECTORS - 1] {
+        let sector = IoSector::new(index).expect("in range");
+        let span = IoSpan::new(sector, SECTOR_SIZE as u32).expect("one sector fits");
+        assert_eq!(region.span_paddr(span), region.sector_paddr(sector));
+        assert!(
+            region.span_paddr(span) + u64::from(span.bytes()) <= BASE + BLK_IO_REGION_SIZE as u64,
+            "a span's far end is inside the region too"
+        );
+    }
 }

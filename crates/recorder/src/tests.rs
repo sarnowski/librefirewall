@@ -5,6 +5,8 @@
 
 use super::*;
 
+use lfw_capture_ring::SUPERBLOCK_COPY_BYTES;
+
 const SEGMENT: usize = 8 * 1024;
 const STAGING: usize = 16 * 1024;
 const CAPACITY_SECTORS: u64 = 512;
@@ -103,9 +105,8 @@ struct Harness {
 
 impl Harness {
     fn new(snap_len: u32, segments: u64) -> Self {
-        let mut sink = Sink::new(config(snap_len, segments)).expect("a legal sink");
         let mut staging = vec![0u8; STAGING];
-        sink.open(&mut staging).expect("the opening prologue");
+        let sink = Sink::new(config(snap_len, segments), &mut staging).expect("a legal sink");
         Self {
             sink,
             staging,
@@ -164,6 +165,31 @@ impl Harness {
             }
         }
         self.drain();
+    }
+
+    /// Checkpoint the way the protection domain does — compose the region, put
+    /// the part the sink named on the device, and read the state back off it —
+    /// so what a test asserts on is what a later boot would actually find.
+    fn checkpoint(&mut self) -> RingState {
+        let mut image = [0u8; SUPERBLOCK_BYTES];
+        let write = self
+            .sink
+            .superblock(&mut image)
+            .expect("a representable cursor");
+        assert!(write.at.is_multiple_of(SUPERBLOCK_COPY_BYTES));
+        assert!(write.len.is_multiple_of(SUPERBLOCK_COPY_BYTES));
+        assert!(write.at + write.len <= SUPERBLOCK_BYTES);
+        let sector = self.sink.superblock_sector() + (write.at / SECTOR_SIZE) as u64;
+        let at = sector as usize * SECTOR_SIZE;
+        self.device.bytes[at..at + write.len]
+            .copy_from_slice(&image[write.at..write.at + write.len]);
+        self.sink.acknowledge_checkpoint();
+
+        let region = self
+            .device
+            .read(self.sink.superblock_sector(), SUPERBLOCK_BYTES);
+        let region: &[u8; SUPERBLOCK_BYTES] = region.try_into().expect("two sectors");
+        lfw_capture_ring::decode_superblock(region).expect("what the sink wrote it reads")
     }
 
     /// The snapshot's bytes, gathered the way the management domain gathers
@@ -289,7 +315,11 @@ fn parse(bytes: &[u8]) -> ReadFile {
                     }
                     7 => packet.verdict = Some(value.to_vec()),
                     2989 => {
-                        assert_eq!(le32(value, 0), lfw_pcapng::GROPYUS_PEN, "enterprise number");
+                        assert_eq!(
+                            le32(value, 0),
+                            lfw_pcapng::UNREGISTERED_PEN,
+                            "enterprise number"
+                        );
                         packet.annotation = Some(value[4..].to_vec());
                     }
                     _ => {}
@@ -297,7 +327,11 @@ fn parse(bytes: &[u8]) -> ReadFile {
                 file.packets.push(packet);
             }
             0x0000_0BAD => {
-                assert_eq!(le32(block, 8), lfw_pcapng::GROPYUS_PEN, "padding block PEN");
+                assert_eq!(
+                    le32(block, 8),
+                    lfw_pcapng::UNREGISTERED_PEN,
+                    "padding block PEN"
+                );
                 file.padding_blocks += 1;
             }
             other => panic!("an unexpected block type {other:#010x} at {at}"),
@@ -502,9 +536,8 @@ fn a_record_no_segment_could_hold_is_refused_and_the_sink_carries_on() {
 
 #[test]
 fn a_staging_buffer_too_small_for_a_record_is_refused_rather_than_overrun() {
-    let mut sink = Sink::new(config(2048, 4)).expect("a legal sink");
     let mut staging = vec![0u8; 4096];
-    sink.open(&mut staging).expect("a prologue");
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
     let bytes = frame(2000, 3);
     // Fill the staging buffer without flushing.
     let mut refused = None;
@@ -520,7 +553,7 @@ fn a_staging_buffer_too_small_for_a_record_is_refused_rather_than_overrun() {
     }
     let (needed, free) = refused.expect("the buffer fills");
     assert!(needed > free);
-    assert_eq!(sink.counters().dropped_staging_full, 1);
+    assert_eq!(sink.counters().staging_deferrals, 1);
 }
 
 #[test]
@@ -586,6 +619,46 @@ fn an_empty_recording_has_nothing_to_download() {
 }
 
 #[test]
+fn a_durable_cursor_older_than_the_live_history_promises_nothing() {
+    // Flushing far enough behind the writer that the durable segment has been
+    // evicted. A snapshot that clamped the segment count to zero here would
+    // keep the durable offset in its total and hand a reader that many bytes out
+    // of a segment holding something else entirely.
+    let mut harness = Harness::new(2048, 4);
+    harness.record(&tap(1, 0, 300), &frame(300, 1));
+    harness.record(&tap(2, 0, 300), &frame(300, 1));
+    harness.drain();
+    let durable = harness.sink.snapshot();
+    assert!(
+        durable.total_len() > 0,
+        "the first segment has durable bytes to be left behind"
+    );
+
+    // Reopen segments without ever handing their bytes over, so the write
+    // cursor runs away from the durable one.
+    for _ in 0..4 {
+        harness
+            .sink
+            .begin_segment(&mut harness.staging)
+            .expect("a prologue fits a fresh buffer");
+    }
+    let (oldest, _) = harness.sink.ring.readable();
+    assert!(
+        oldest > 0,
+        "the oldest live segment is past the durable one at zero"
+    );
+    assert_eq!(
+        harness.sink.snapshot().total_len(),
+        0,
+        "nothing durable is still on the medium, so nothing may be promised"
+    );
+    assert_eq!(
+        harness.sink.locate(&harness.sink.snapshot(), 0),
+        Locate::PastEnd
+    );
+}
+
+#[test]
 fn a_sink_survives_a_reboot_through_its_superblock() {
     let mut harness = Harness::new(2048, 4);
     let bytes = frame(256, 6);
@@ -593,23 +666,86 @@ fn a_sink_survives_a_reboot_through_its_superblock() {
         harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
     }
     harness.seal();
-    let state = harness.sink.state().expect("a checkpoint");
+    let state = harness.checkpoint();
 
-    let mut resumed = Sink::resume(config(2048, 4), &state).expect("a resumed sink");
     let mut staging = vec![0u8; STAGING];
-    resumed.open(&mut staging).expect("a prologue");
+    let resumed = Sink::resume(config(2048, 4), &state, &mut staging).expect("a resumed sink");
     assert!(
         resumed.cursor().sequence > 0,
         "a resumed ring continues past what the last boot left open"
     );
+    assert!(
+        resumed.staged() > 0,
+        "and its segment's prologue is staged without a second call to ask for it"
+    );
+}
+
+#[test]
+fn a_resumed_recording_claims_no_byte_of_the_segment_the_last_boot_left_open() {
+    // The previous boot's open segment was never padded to its end, so its tail
+    // still holds an older wrap's bytes. A snapshot is one contiguous range, so
+    // the only honest range is one starting after it — counting it would put
+    // those bytes mid-body under an exact length.
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    for index in 0..4u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+    let state = harness.checkpoint();
+    assert!(
+        harness.sink.snapshot().total_len() > 0,
+        "the boot being resumed from did record something"
+    );
+
+    let mut staging = vec![0u8; STAGING];
+    let resumed = Sink::resume(config(2048, 4), &state, &mut staging).expect("a resumed sink");
+    assert_eq!(
+        resumed.snapshot().total_len(),
+        0,
+        "a resumed recording promises nothing until it has made bytes durable itself"
+    );
+}
+
+#[test]
+fn a_superblock_records_the_durable_cursor_and_not_the_append_cursor() {
+    // The superblock is what anything holding the disk reads to learn where the
+    // recording ends, so it must never name bytes still sitting in the staging
+    // buffer: a resume from an over-stated cursor would append past the end of
+    // what was written and leave a hole no reader can cross.
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(300, 2);
+    for index in 0..3u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    assert!(
+        harness.sink.staged() > 0,
+        "records are staged and not yet handed to the device"
+    );
+    let appended = harness.sink.cursor();
+    let state = harness.checkpoint();
+    assert!(
+        state.writer().offset < appended.offset,
+        "the checkpoint recorded {} where the append cursor stood at {}",
+        state.writer().offset,
+        appended.offset
+    );
+
+    // And what it recorded is exactly what the device has taken.
+    harness.drain();
+    let durable = harness.checkpoint();
+    let flushed = harness.sink.counters().sectors_written as usize * SECTOR_SIZE;
+    assert_eq!(durable.writer().offset, flushed);
 }
 
 #[test]
 fn a_superblock_from_another_geometry_is_refused_by_name() {
     let mut harness = Harness::new(2048, 4);
     harness.record(&tap(1, 0, 64), &frame(64, 0));
-    let state = harness.sink.state().expect("a checkpoint");
-    let error = Sink::resume(config(2048, 8), &state).expect_err("a different extent");
+    let state = harness.checkpoint();
+    let mut staging = vec![0u8; STAGING];
+    let error =
+        Sink::resume(config(2048, 8), &state, &mut staging).expect_err("a different extent");
     assert!(matches!(error, SinkError::State(_)), "{error:?}");
 }
 
@@ -641,10 +777,10 @@ fn the_widest_prologue_this_build_admits_leaves_a_usable_segment() {
     };
     let prologue = prologue_len(&config).expect("a measurable prologue");
     assert!(payload_fits(prologue, lfw_capture_ring::MIN_SEGMENT_BYTES));
-    let mut sink = Sink::new(config).expect("a usable sink");
     let mut staging = vec![0u8; STAGING];
+    let sink = Sink::new(config, &mut staging).expect("a usable sink");
     assert_eq!(
-        sink.open(&mut staging).expect("a prologue"),
+        sink.staged(),
         prologue,
         "the measured prologue is the written one"
     );
@@ -654,8 +790,9 @@ fn the_widest_prologue_this_build_admits_leaves_a_usable_segment() {
 fn more_interfaces_than_a_recording_may_describe_are_refused() {
     let mut config = config(2048, 4);
     config.interface_count = MAX_INTERFACES + 1;
+    let mut staging = vec![0u8; STAGING];
     assert!(matches!(
-        Sink::new(config),
+        Sink::new(config, &mut staging),
         Err(SinkError::TooManyInterfaces { .. })
     ));
     assert!(matches!(
@@ -692,9 +829,8 @@ fn only_one_flush_is_outstanding_at_a_time() {
 
 #[test]
 fn nothing_to_flush_is_not_a_flush() {
-    let mut sink = Sink::new(config(2048, 4)).expect("a legal sink");
     let mut staging = vec![0u8; STAGING];
-    sink.open(&mut staging).expect("a prologue");
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
     // A prologue alone is shorter than a sector.
     assert!(sink.take_flush().is_none());
     assert!(sink.staged() > 0);
@@ -732,9 +868,8 @@ fn a_flush_reports_the_bytes_and_the_sector_it_names() {
 
 #[test]
 fn a_padding_request_below_a_representable_block_is_refused() {
-    let mut sink = Sink::new(config(2048, 4)).expect("a legal sink");
     let mut staging = vec![0u8; STAGING];
-    sink.open(&mut staging).expect("a prologue");
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
     let error = sink.pad(4, &mut staging).expect_err("too small to encode");
     assert!(
         matches!(error, EncodeError::BlockTooShort { .. }),
@@ -744,9 +879,8 @@ fn a_padding_request_below_a_representable_block_is_refused() {
 
 #[test]
 fn a_seal_with_no_room_in_staging_is_refused_rather_than_silently_short() {
-    let mut sink = Sink::new(config(2048, 4)).expect("a legal sink");
     let mut staging = vec![0u8; 2048];
-    sink.open(&mut staging).expect("a prologue");
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
     let bytes = frame(900, 2);
     while matches!(
         sink.record(&tap(1, 0, bytes.len() as u32), &bytes, &mut staging),
@@ -766,9 +900,8 @@ fn a_tap_claiming_a_shorter_frame_than_it_carries_is_refused_by_name() {
     // The wire layer holds a peer to captured <= original, but the frame this
     // sink is handed is a separate value: a tap saying ten bytes while carrying
     // a hundred would encode a block no reader could believe.
-    let mut sink = Sink::new(config(2048, 4)).expect("a legal sink");
     let mut staging = vec![0u8; STAGING];
-    sink.open(&mut staging).expect("a prologue");
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
     let bytes = frame(100, 1);
     let mut observation = tap(1, 0, 100);
     observation.original_len = 10;

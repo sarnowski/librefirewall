@@ -384,9 +384,10 @@ pub struct Expectation {
 /// Judge one download against its expectation, answering the evidence line.
 ///
 /// # Errors
-/// A response that is not `200`, one whose declared length disagrees with its
-/// body, a body that does not parse as pcapng, a body the walk did not consume
-/// whole, too few packets, or a captured length past the sink's snap length.
+/// A response that is not `200`, one that declares no length at all or whose
+/// declared length disagrees with its body, a body that does not parse as
+/// pcapng, a body the walk did not consume whole, too few packets, or a
+/// captured length past the sink's snap length.
 pub fn judge(download: &Download, expected: &Expectation) -> Result<Parsed, String> {
     let target = expected.target;
     if download.target != target {
@@ -402,16 +403,19 @@ pub fn judge(download: &Download, expected: &Expectation) -> Result<Parsed, Stri
             download.command, download.status_line
         ));
     }
-    if let Some(stated) = download.header("content-length") {
-        let stated: usize = stated.parse().map_err(|error| {
-            format!("GET {target} stated an unreadable Content-Length: {error}")
-        })?;
-        if stated != download.body.len() {
-            return Err(format!(
-                "GET {target} states a Content-Length of {stated} and carries {} body bytes",
-                download.body.len()
-            ));
-        }
+    // Mandatory, not conditional: the endpoint answers an exact length, and a
+    // regression that stopped emitting one would leave this contract green
+    // because `curl` reads to close and the body still parses.
+    let stated: usize = download
+        .header("content-length")
+        .ok_or_else(|| format!("GET {target} carries no Content-Length"))?
+        .parse()
+        .map_err(|error| format!("GET {target} stated an unreadable Content-Length: {error}"))?;
+    if stated != download.body.len() {
+        return Err(format!(
+            "GET {target} states a Content-Length of {stated} and carries {} body bytes",
+            download.body.len()
+        ));
     }
     let parsed = parse(&download.body)
         .map_err(|error| format!("GET {target} did not answer a pcapng file: {error}"))?;
@@ -467,4 +471,4 @@ pub fn evidence(download: &Download, parsed: &Parsed, snap_len: usize) -> String
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

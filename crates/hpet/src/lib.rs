@@ -483,12 +483,15 @@ impl<M: HpetMmio> Hpet<M> {
     /// window.
     ///
     /// Computed as `nanoseconds * 10^6 / period_femtoseconds` rather than
-    /// against [`frequency_hz`](Self::frequency_hz): the period is what the
-    /// block reported and the frequency is already a truncation of it, so
-    /// dividing by the period keeps the one rounding instead of compounding
-    /// two. The numerator leaves `u64` at a span of about five hours, so it is
-    /// formed in `u128` and narrowed once, after the division — the same
-    /// widening `lfw_clock` applies to its tick conversion and for the same
+    /// against [`frequency_hz`](Self::frequency_hz): the period is the datum the
+    /// block reported and the frequency is already a truncation of it, so dividing
+    /// by the period keeps the one rounding instead of compounding two. A
+    /// preference for the reported datum and not a numerical necessity: the
+    /// truncation is a part in 10^8, orders below any overhead a caller's own
+    /// measurement carries, which is why [`frequency_hz`](Self::frequency_hz)
+    /// remains what to hand `lfw_clock::calibrate`. The numerator leaves `u64` at a span of about five
+    /// hours, so it is formed in `u128` and narrowed once, after the division — the
+    /// same widening `lfw_clock` applies to its tick conversion and for the same
     /// reason.
     ///
     /// A span shorter than one tick is zero ticks, not an error: a wait for none

@@ -84,14 +84,19 @@ pub use sample::{
     SINKS, SinkSample, TapSample, TcpSample, UartSample,
 };
 
+/// Slots left free above the largest domain's table, so a new counter is a table
+/// entry rather than a region resize — which would be a capability change. Two
+/// cache lines: room for a subsystem's counters, and the shard still one page.
+const STATS_HEADROOM: usize = 16;
+
 /// Counter slots one shard carries.
 ///
-/// Sized by the largest domain — the management endpoint, whose transport alone
-/// keeps twenty-six — with room left so a new counter is a table entry rather
-/// than a region resize, which would be a capability change. The
-/// assertions in [`sample`] hold every domain's table to it, so a table that
-/// outgrew the shard is a build error and never a silently dropped counter.
-pub const STATS_SLOTS: usize = 96;
+/// Derived rather than chosen: the largest table — the management endpoint's,
+/// whose transport alone keeps twenty-seven — plus [`STATS_HEADROOM`], rounded to
+/// a whole cache line so no shard's last slot shares one with what follows it.
+/// The assertions in [`sample`] hold every other table to the management
+/// endpoint's, so one that outgrew it is a build error and not a dropped counter.
+pub const STATS_SLOTS: usize = (sample::MANAGEMENT_SLOTS + STATS_HEADROOM).next_multiple_of(8);
 
 /// One protection domain's counters, as the shared region lays them out.
 ///

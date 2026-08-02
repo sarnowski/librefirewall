@@ -2,24 +2,18 @@
 
 These reference chapters are the **operator's interface to librefirewall**. Because the appliance
 has no shell and no CLI — a deliberate design decision (see the
-[management design](../design/management.md)) — the console, the OpenTelemetry log stream, and the
-`GET /metrics`, `GET /logs` and `GET /config` endpoints are the *only* windows into a running node —
-together they are the complete, sufficient surface for building dashboards, alerts, and analysis,
-and for debugging an incident. This chapter and its three companions —
-[Console records](console.md), [Prometheus metrics](metrics.md) and
+[management design](../design/management.md)) — the console, the OpenTelemetry log stream, the
+`GET /metrics`, `GET /logs` and `GET /config` endpoints and the two recording downloads are the
+*only* windows into a running node — together they are the complete, sufficient surface for
+building dashboards, alerts, and analysis, and for debugging an incident. This chapter and its three
+companions — [Console records](console.md), [Prometheus metrics](metrics.md) and
 [Recording downloads](recordings.md) — define what that surface contains and how to interpret it, so
 an operator can rely on it as a stable contract.
 
-> **Status.** The conventions below are settled and binding. The concrete inventories are populated
-> as each signal is implemented. The **console** inventory in [Console records](console.md) is
-> complete and is a contract as of the console-domain build, in which the serial device acquired a
-> single owning protection domain and the records other domains emit began crossing to it as
-> structured records rather than as text. The metric inventory in
-> [Prometheus metrics](metrics.md) is likewise populated and scrapable. The OpenTelemetry and
-> local-buffer inventories are still empty, and a section marked *“None implemented yet”* states
-> the current truth of the contract, not a gap in it. Nothing is named in an empty inventory ahead
-> of time: a name published before the signal it belongs to exists is a guess an operator would go
-> on to build against.
+The conventions below are settled and binding, and they bind every surface named here whether or not
+its inventory is filled. Nothing is named in an inventory ahead of the signal it belongs to: a name
+published before the record carrying it exists is a guess an operator would go on to build against,
+and this reference does not carry guesses.
 
 ## The surfaces, and the complete-state principle
 
@@ -37,13 +31,14 @@ an operator can rely on it as a stable contract.
   node is doing right now.
 - **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
   measurable moving part at bounded cardinality and no measurable dataplane cost.
-
+- **Configuration read** — the `GET /config` endpoint, returning the exact running configuration as
+  the document that produced it.
 - **Recording download** — `GET /logs.pcapng` and `GET /capture.pcapng`, the two pcapng recording
   sinks (see the [recording design](../design/recording.md)). This surface carries **evidence rather
   than state**: nothing on it is summarised, a reader is a packet analyser rather than a dashboard,
-  and it is the one surface bounded by storage rather than by memory and the only one that carries
-  the traffic itself. It is served by the same HTTP endpoint as the four above and counted by the
-  same metrics, so the families describing it are specified in
+  and it is the only one of the six that carries the traffic itself, at a volume the medium under it
+  bounds rather than memory. It is HTTP on the management port, like `GET /metrics`, `GET /logs` and
+  `GET /config`, and counted by the same metrics, so the families describing it are specified in
   [Prometheus metrics](metrics.md) — but the *format* of what it returns is pcapng, and pcapng's
   specification, not this reference, is the contract for the bytes inside the file.
 
@@ -72,7 +67,7 @@ part of that context. What it does carry, and what it does not:
 | context | on the console | what fixes it there |
 |---|---|---|
 | configuration generation | `generation=` on every `LFW-CFG` record | the datastore's counter, assigned per commit and monotonic within a boot |
-| emitting protection domain | `domain=` on every `LFW-PD` record | the domain's name in the Microkit system description, so a record and the capability topology use one identity |
+| emitting protection domain | `domain=` on every `LFW-PD` record | the domain's name in the Microkit system description, so a record and the capability topology use one identity — save that the driver's three instances share the one token `nic-driver`, which the Prometheus surface distinguishes and the console does not |
 | node identity | **absent** | there is no management plane to be provisioned with one, and no identifier to carry; one serial console is one node, and its reader already knows which |
 | software build and trust profile | **absent** | recorded in the release manifest beside the image (`trust_profile`, pinned inputs), never in a record the running system emits. `LFW-BOOT slot=` says which *slot* booted, which is not the same as which build it holds |
 
@@ -92,11 +87,14 @@ implementation and binds the two that follow.
 - **Fields** are `key=value`, space-separated, on one line, in a fixed order per record shape. An
   absent value omits its whole field rather than writing it empty, so a key that is present always
   has a value — and a record is read by looking a key up, never by counting fields.
-- **Keys and vocabulary tokens** are lower-case ASCII words joined by `-`: `prefix-length`,
-  `rx-posted`, `not-virtio-net`, `unknown-interface-reference`. Never camel case, never a Rust
-  identifier, never an internal enum name. Where a key names a configuration attribute it is spelled
-  exactly as the configuration document spells it, so a change record points at the text an operator
-  edits rather than at a field name only the source reveals.
+- **A record's keys and vocabulary tokens** are lower-case ASCII words joined by `-`:
+  `prefix-length`, `rx-posted`, `not-virtio-net`, `unknown-interface-reference`. Never camel case,
+  never a Rust identifier, never an internal enum name. Where a key names a configuration attribute
+  it is spelled exactly as the configuration document spells it, so a change record points at the
+  text an operator edits rather than at a field name only the source reveals. The Prometheus surface
+  writes the same words with `_` for `-`, so a metric name, a label name and a closed-vocabulary
+  label value are the same word a record spells with hyphens; [Prometheus metrics](metrics.md)
+  states that rule and the one class of label value it carves out of it.
 - **The vocabularies are closed.** Every `state=`, `change=`, `object=`, `field=`, `outcome=`,
   `rejected=` and `cause=` value comes from a fixed set enumerated in
   [Console records](console.md). A value outside one is a defect, not an extension, and a reader may
@@ -104,10 +102,9 @@ implementation and binds the two that follow.
 - **Numbers are decimal unless the field's own meaning is a bit pattern.** `features=` and `detail=`
   are hardware values read against a datasheet and are `0x`-prefixed lower-case hexadecimal; every
   other numeric field — generations, sequence numbers, counts, offsets, indices — is decimal.
-- The same keys and tokens are what the OTEL and Prometheus surfaces will carry when they land,
-  transliterated to each transport's own separator convention. That transliteration is a rule stated
-  here; the resulting names are fixed with those implementations and are deliberately not invented
-  in advance.
+- The same keys and tokens are what every other surface carries, transliterated to its own separator
+  convention. [Prometheus metrics](metrics.md) states that transliteration and the names it yields;
+  an OTEL attribute key is fixed with the exporter and is deliberately not invented in advance.
 - Labels and attributes are **low, bounded cardinality**: aggregate dimensions (interface, core,
   queue, subsystem, verdict class), never per-flow, per-connection, or per-packet identifiers.
 - **No signal carries packet payloads, secrets, keys, or personal data — with one named exception,
@@ -125,8 +122,8 @@ implementation and binds the two that follow.
   sink the L2–L4 headers of the packet each record is anchored to — it is why a recording is an
   authorized download rather than an open scrape, and it is why an inspected flow is meant to be
   recorded as ciphertext plus its keys rather than as plaintext at rest. Nothing else on any surface
-  moves because of it. **Today that authorization does not exist**: the management port has neither
-  TLS nor authentication, so anyone who can reach it can download every recorded packet — see
+  moves because of it. **That authorization is not in front of the port**: it carries neither TLS nor
+  client authentication, so anyone who can reach it can download every recorded packet — see
   [Recording downloads](recordings.md).
 
   One consequence worth stating where a reader will look for it: `sectors=`/`leading=` on the console
@@ -177,9 +174,15 @@ ordinary rather than a fault: a domain logs during its own `init`, several domai
 clock domain publishes, and the clock domain publishes *after* its own `ready` record — so its two
 records are unsynchronized while stating the instant it just measured. The token is deliberately not
 a zero: a record dated `1970-01-01T00:00:00.000000000Z` would be indistinguishable from one this
-node really emitted at the epoch. Within one domain the transition happens once and in one
-direction — a calibration is published once and never withdrawn — so a domain that has stamped a
-record stamps every later one.
+node really emitted at the epoch.
+
+**A domain that has stamped a record is not thereby one that stamps every later record.** Each
+domain re-reads the published calibration on every question rather than latching it, deliberately:
+a cached triple would go on converting readings with one the clock domain has withdrawn. So a
+calibration that is unpublished, torn under the read, or outside the band the reader accepts yields
+`unsynchronized` again, after a run of instants. That the transition is one-way in practice — the clock
+domain publishes once and parks — is that domain's behaviour, and a reader may not take it for a
+guarantee of the field.
 
 **Timestamps are attributable per boot and per node, and no wider.** They share the limits the
 *Identity and context* section above states: there is no node identity and no build stamp on any
@@ -187,10 +190,10 @@ record, so two nodes' instants, or one node's across a reboot, are correlated by
 operator knows from outside the contract. Two boots of one machine also anchor to two separate CMOS
 readings.
 
-**A rate is still the scraper's arithmetic.** A counter on `/metrics` carries no timestamp and the
-node contributes no time to a rate; differencing two scrapes is timed by the scraper exactly as
-before. The instant on a log record and the counters in an exposition are separate surfaces, and
-nothing correlates one to the other on the node.
+**A rate is the scraper's arithmetic.** A counter on `/metrics` carries no timestamp and the node
+contributes no time to a rate; differencing two scrapes is timed by the scraper alone. The instant
+on a log record and the counters in an exposition are separate surfaces, and nothing correlates one
+to the other on the node.
 
 A record additionally carries the **configuration `generation`** it belongs to and, where one
 generation produces several change records, a **`seq`** numbering them from 0 in emission order.
@@ -237,11 +240,10 @@ what a configuration audit needs. What is now available beside it, and what stil
 - **Two boots are still only loosely ordered.** `generation` and `seq` restart from 0 in each, and
   the instants come from two separate CMOS readings — close enough to place two boots in sequence,
   never exact enough to order two records across one.
-- **A rate is the scraper's arithmetic, not the node's.** Differencing two scrapes of a counter is
-  timed by the scraper; the node contributes no time to the result.
 
-When a *trusted* time source lands, the field's form does not change; what changes is what may be
-judged by it. Until then a record's instant is a statement and not a proof.
+A record's instant is a statement and not a proof, and what would change that is the source behind
+it rather than anything about the field: its form is fixed by this contract and does not depend on
+how far the time it carries may be trusted.
 
 ## OpenTelemetry logs
 
@@ -267,22 +269,19 @@ fixed with the implementation and documented here.
 - **Traffic** — connection- and verdict-level events from the dataplane.
 - **Subsystem** — per-component operational logs (drivers, proxies, inspection engines, HA).
 
-**Record inventory:** *None implemented yet.* No OTEL transport exists, so nothing is named here:
-an attribute key published before the record carrying it exists is a guess, and this reference does
-not carry guesses.
+**Record inventory:** no attribute key is named here, under the rule at the head of this chapter.
 
-What *is* already decided is the shape of the **System** category. Its call sites emit typed events
+What the **System** category's field set is, however, is settled: its call sites emit typed events
 — an event is a set of named fields, and the console line is one rendering of it rather than the
-thing itself — so the [console inventory](console.md) is the System category's field set, and an
-exporter adds a transport rather than a second set of call sites. The other three categories have no
-call sites at all yet.
+thing itself — so the [console inventory](console.md) is that field set, and an exporter adds a
+transport rather than a second set of call sites.
 
 ## Local log buffer
 
 **Purpose:** answer "what is this node doing *right now*" without waiting on the external log
 pipeline, and keep a node diagnosable when that pipeline is unavailable.
 
-**Endpoint:** `GET /logs` on the management interface, returning the retained records in the same
+**Endpoint:** `GET /logs` on the management port, returning the retained records in the same
 structured form as the OTEL stream.
 
 **Semantics — a debugging surface, not a log archive:**
@@ -296,13 +295,12 @@ structured form as the OTEL stream.
 - **Same content rules as every other surface.** No packet payloads, no secrets or keys, no personal
   data — being local is not a licence to retain more.
 
-**Record and retention inventory:** *None implemented yet* — the buffer size, retention bound, and
-query semantics are fixed with the implementation and documented here.
+**Record and retention inventory:** the buffer size, the retention bound and the query semantics are
+not named here, under the rule at the head of this chapter.
 
 ## Configuration read endpoint
 
 `GET /config` returns the exact running configuration (XML; see the
 [configuration design](../design/configuration.md)). It supplies the intent half of the debug dump:
 paired with a `/metrics` scrape and a `/logs` read it gives the complete picture of *what the node
-is configured to do* alongside *what it is doing* and *what it has just done*. The endpoint is not
-implemented yet (see the *Still absent* note in [Prometheus metrics](metrics.md)).
+is configured to do* alongside *what it is doing* and *what it has just done*.

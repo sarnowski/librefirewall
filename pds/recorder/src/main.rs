@@ -79,7 +79,7 @@
 //! by capability rather than by control flow, exactly as a driver's is.
 
 use lfw_blk::bringup::{self, BringUpError, Live, MappedBlkDevice};
-use lfw_blk::io::{IoRegion, IoRegionUnusable};
+use lfw_blk::io::{IoRegion, IoRegionUnusable, IoSpan};
 use lfw_blk::request::{Completed, Operation, Outcome, Requests, SLOTS, SubmitError, Token};
 use lfw_blk::smoke::{self, Report, SmokeError};
 use lfw_blk::{
@@ -89,8 +89,8 @@ use lfw_blk::{
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use lfw_recorder::deck::{
-    Area, Completion, Deck, DeckError, Ended, InterfaceNames, Job, Medium, Refused, STAGING_END,
-    Served, Transfer,
+    Area, Completion, Deck, DeckError, Ended, InterfaceNames, Job, Medium, Polled,
+    RESERVED_SECTORS, Refused, STAGING_END, Served, Transfer,
 };
 use lfw_recorder::{InterfaceName, MAX_INTERFACES};
 use pd_runtime::{BlockCounters, PdClock, attach_region, log_sample, recorder_sample};
@@ -110,6 +110,13 @@ const MANAGEMENT: Channel = Channel::new(0);
 const _: () = assert!(
     STAGING_END <= BLK_IO_REGION_SIZE,
     "the recording layout does not fit the blk_io grant"
+);
+
+// Likewise the boot proof's witness sector: it writes before any superblock has
+// been read, so the sector must be one this layout claims.
+const _: () = assert!(
+    smoke::WITNESS_SECTOR < RESERVED_SECTORS,
+    "the boot proof writes outside the front the recordings reserve"
 );
 
 /// Why this domain could not start.
@@ -245,10 +252,11 @@ fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
 
 /// The interface names a recording's prologue carries.
 ///
-/// Compiled in rather than read from `cfg`: the configuration document is
-/// mapped read-only here and reading it is a later change (see the system
-/// description beside that row). Two names, matching the build's two dataplane
-/// ports, so a reader sees the ports rather than bare indices.
+/// Compiled in rather than read from `cfg`: this domain maps no configuration
+/// region at all, because a grant it cannot reach is authority for nothing.
+/// Reading the document is a later change, and the grant returns with the code
+/// that attaches it. Two names, matching the build's two dataplane ports, so a
+/// reader sees the ports rather than bare indices.
 fn interface_names() -> (InterfaceNames, usize) {
     let mut names = [InterfaceName::new(""); MAX_INTERFACES];
     if let Some(slot) = names.get_mut(0) {
@@ -551,17 +559,20 @@ impl<'region> BlockMedium<'region> {
     }
 }
 
+/// One staging area as a bounded span of the block-I/O window. `None` is unreachable
+/// and a value rather than a panic, the layout assertions and `STAGING_END` between
+/// them putting every area on a sector inside the region.
+fn area_span(area: Area) -> Option<IoSpan> {
+    let (offset, len) = area.extent();
+    IoSpan::at_offset(offset, u32::try_from(len).ok()?)
+}
+
 impl Medium for BlockMedium<'_> {
     fn staging(&mut self, area: Area) -> &mut [u8] {
-        let (offset, len) = area.extent();
-        // The layout is `lfw_recorder`'s and the assertion above holds it
-        // inside the region, so the fallback is unreachable and is a value
-        // rather than a panic.
-        self.io
-            .staging()
-            .get_mut(offset..)
-            .and_then(|tail| tail.get_mut(..len))
-            .unwrap_or_default()
+        match area_span(area) {
+            Some(span) => self.io.staging(span),
+            None => Default::default(),
+        }
     }
 
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused> {
@@ -575,20 +586,20 @@ impl Medium for BlockMedium<'_> {
         };
         let (offset, _) = transfer.area.extent();
         let at = offset.saturating_add(transfer.at);
-        // The area's own sector, which `IoSector::new` bounds by the window: a
-        // layout that did not fit is refused here rather than handed to a
-        // device that would DMA outside the region.
-        let Some(sector) = lfw_blk::io::IoSector::new(at / SECTOR_SIZE) else {
+        let Ok(len) = u32::try_from(transfer.len) else {
             return Err(Refused);
         };
-        let Ok(len) = u32::try_from(transfer.len) else {
+        // The data segment as one `IoSpan`, the whole of what bounds its far end:
+        // `Requests::submit` weighs the sector range against the medium's capacity
+        // and the address against its alignment, knowing nothing of this region.
+        let Some(span) = IoSpan::at_offset(at, len) else {
             return Err(Refused);
         };
         let token = match self.requests.submit(
             operation,
             transfer.sector,
-            self.io.sector_paddr(sector),
-            len,
+            self.io.span_paddr(span),
+            span.bytes(),
         ) {
             Ok(token) => token,
             // Every refusal is backpressure or a range this driver will not
@@ -610,30 +621,38 @@ impl Medium for BlockMedium<'_> {
         Ok(())
     }
 
-    fn poll(&mut self) -> Option<Completion> {
+    fn poll(&mut self) -> Option<Polled> {
         let Completed {
             token,
             operation,
             outcome,
             bytes,
         } = self.requests.poll()?;
-        let entry = self
+        let Some(entry) = self
             .outstanding
             .iter_mut()
-            .find(|entry| entry.as_ref().is_some_and(|held| held.token == token))?
-            .take()?;
+            .find(|entry| entry.as_ref().is_some_and(|held| held.token == token))
+            .and_then(Option::take)
+        else {
+            // A chain this table holds no job for. Not `None`, which says the device
+            // is idle and would let a replayed entry end the pass's drain unseen.
+            return Some(Polled::Unattributed);
+        };
         if outcome == Outcome::Ok {
             self.completed.completed(entry.operation, bytes);
         }
         let _ = operation;
-        Some(Completion {
+        Some(Polled::Settled(Completion {
             job: entry.job,
             ended: if outcome == Outcome::Ok {
-                Ended::Ok
+                // The request layer's own count, clamped to what was asked for.
+                Ended::Ok {
+                    delivered: bytes as usize,
+                }
             } else {
                 Ended::Failed
             },
-        })
+        }))
     }
 }
 

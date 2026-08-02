@@ -308,17 +308,37 @@ impl PciConfig {
         (self.read16(PCI_VENDOR_ID), self.read16(PCI_DEVICE_ID))
     }
 
-    /// Enable memory-space decoding and bus-master DMA for the device.
+    /// Enable memory-space decoding, so the device's registers answer in the
+    /// window its BAR was just programmed to. This is what re-enables decoding
+    /// after [`reprogram_bar64`](Self::reprogram_bar64), which deliberately
+    /// leaves it off.
     ///
-    /// This is also what re-enables decoding after
-    /// [`reprogram_bar64`](Self::reprogram_bar64), which deliberately leaves it
-    /// off.
-    pub fn enable_memory_and_bus_master(&self) {
+    /// It grants no DMA — that is
+    /// [`enable_bus_master`](Self::enable_bus_master), separately, because a
+    /// device must be reset before it may master the bus and can only be reset
+    /// once its registers decode.
+    pub fn enable_memory(&self) {
         let command = self.read16(PCI_COMMAND);
-        self.write16(
-            PCI_COMMAND,
-            command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
-        );
+        self.write16(PCI_COMMAND, command | PCI_COMMAND_MEMORY);
+    }
+
+    /// Grant the device bus-master DMA. After this returns, every address the
+    /// device holds is one it may write, and with no IOMMU that is all of
+    /// memory — so this belongs *after* the virtio reset that clears the queue
+    /// addresses a power cycle left it with, never beside
+    /// [`enable_memory`](Self::enable_memory).
+    pub fn enable_bus_master(&self) {
+        let command = self.read16(PCI_COMMAND);
+        self.write16(PCI_COMMAND, command | PCI_COMMAND_BUS_MASTER);
+    }
+
+    /// Enable decoding and DMA together — sound only where the device has
+    /// *already* been reset. A bring-up that has not reset it yet wants
+    /// [`enable_memory`](Self::enable_memory), then the reset, then
+    /// [`enable_bus_master`](Self::enable_bus_master).
+    pub fn enable_memory_and_bus_master(&self) {
+        self.enable_memory();
+        self.enable_bus_master();
     }
 
     fn disable_memory(&self) {
@@ -583,19 +603,30 @@ const CAP_POINTER_UNIT: usize = 4;
 /// A PCI capability-list pointer, held in the four-byte units the PCI
 /// specification defines it in rather than in bytes.
 ///
-/// The representation is what bounds every access derived from it: a `u8` of
-/// units makes [`bytes`](Self::bytes) at most `u8::MAX * CAP_POINTER_UNIT` and
-/// a multiple of `CAP_POINTER_UNIT`, so [`field`](Self::field) has only the
-/// constant it adds left to judge. The device supplies the byte; nothing else
-/// about it is trusted.
+/// The representation is what bounds every access derived from it: the value is
+/// the device's byte with its two reserved low bits shifted out, so it is at most
+/// [`MAX_UNITS`](Self::MAX_UNITS) and [`bytes`](Self::bytes) at most
+/// [`MAX_BYTES`](Self::MAX_BYTES) and a multiple of `CAP_POINTER_UNIT`, leaving
+/// [`field`](Self::field) only the constant it adds to judge. The device supplies
+/// the byte; nothing else about it is trusted.
 #[derive(Clone, Copy)]
 struct CapPointer(u8);
 
 impl CapPointer {
-    /// The widest byte offset any pointer can name, from the `u8` it is held in.
-    const MAX_BYTES: usize = u8::MAX as usize * CAP_POINTER_UNIT;
+    /// The largest unit count the representation can hold. Six bits, not eight:
+    /// [`from_device_byte`](Self::from_device_byte) shifts the two reserved low
+    /// bits out, so the widest device byte becomes 63 units.
+    const MAX_UNITS: u8 = u8::MAX >> 2;
+
+    /// The widest byte offset any pointer can name.
+    const MAX_BYTES: usize = Self::MAX_UNITS as usize * CAP_POINTER_UNIT;
 
     /// Take the device's byte, dropping the two reserved low bits.
+    ///
+    /// The shift also folds every byte below 0x04 onto zero, the list
+    /// terminator. That is correct per PCI — the standard header occupies the
+    /// first 64 bytes, so no capability begins there — and it ends the walk
+    /// instead of following a pointer into the header.
     const fn from_device_byte(byte: u8) -> Self {
         Self(byte >> 2)
     }
@@ -1431,6 +1462,26 @@ mod tests {
             // accessors are bounded to, which is what `field`'s const block
             // decides for the widest pointer rather than for this one.
             assert!(pointer.field::<16, 4>().end() <= PCI_CONFIG_LEN);
+            // The bound `field` is judged against is the representation's own
+            // reach, not the byte's: no device byte can name further.
+            assert!(pointer.bytes() <= CapPointer::MAX_BYTES, "byte {byte:#x}");
+        }
+        assert_eq!(
+            CapPointer::from_device_byte(u8::MAX).bytes(),
+            CapPointer::MAX_BYTES,
+            "the widest device byte must reach exactly the declared maximum"
+        );
+        // Six bits of units, four bytes each: a quarter of what the `u8` the
+        // byte arrives in could have named, because the shift is part of the
+        // representation.
+        assert_eq!(CapPointer::MAX_BYTES, 63 * CAP_POINTER_UNIT);
+        // A pointer into the standard header cannot begin a capability, so the
+        // shift folding it onto the terminator ends the walk.
+        for byte in 0..CAP_POINTER_UNIT as u8 {
+            assert!(
+                CapPointer::from_device_byte(byte).is_end(),
+                "byte {byte:#x}"
+            );
         }
     }
 

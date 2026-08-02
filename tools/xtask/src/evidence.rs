@@ -18,14 +18,28 @@
 //! orchestrator, and `build/`, `dist/`, `target/` are generated. Inventorying
 //! any of them describes the build machine rather than the product.
 //!
-//! Two gaps remain, and a consumer must not read this document as the complete
-//! contents of the boot payload. syft's cargo cataloger reads the workspace
-//! `Cargo.lock`, which does not distinguish normal from dev dependencies, so
-//! host-only test and benchmark crates still appear. And the pinned third-party
+//! **What the exclusions do and do not reach.** They are path filters over the
+//! files syft walks, so they remove a tree's *own* manifests and lockfiles and
+//! nothing else. That is the whole of the effect for `fuzz/`, which is a
+//! separate workspace with a lockfile of its own — excluding the tree excludes
+//! its libFuzzer/ASan closure entirely. It is *not* the whole of the effect for
+//! `tools/`: syft's cargo cataloger reads the workspace `Cargo.lock` from the
+//! scan root, `xtask` is a member of that workspace, and so `xtask` and its
+//! closure are inventoried whatever this list says. Excluding `./tools` keeps
+//! the orchestrator's sources out of the file-level catalogue and leaves the
+//! package in — which is tolerable only because `xtask` depends on no
+//! third-party crate at all, so the packages it contributes are first-party
+//! crates that ship anyway. A `tools/` that grew a third-party dependency would
+//! put it in this document with nothing here to stop it.
+//!
+//! Three gaps therefore remain, and a consumer must not read this document as
+//! the complete contents of the boot payload: the orchestrator above; the
+//! workspace `Cargo.lock` not distinguishing normal from dev dependencies, so
+//! host-only test and benchmark crates still appear; and the pinned third-party
 //! components that genuinely *do* ship — the seL4 kernel from the Microkit SDK
-//! and the GRUB core image — are invisible to a source-tree scan; they are
+//! and the GRUB core image — being invisible to a source-tree scan, so they are
 //! recorded (and version-verified against their pins) as provenance in the
-//! manifest instead. Closing both needs a payload-scoped inventory that syft's
+//! manifest instead. Closing them needs a payload-scoped inventory that syft's
 //! single-source model does not offer.
 //!
 //! The SBOM is validated after generation: an unparseable or empty document is

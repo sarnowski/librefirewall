@@ -108,7 +108,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The seven `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The eight `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -117,7 +117,7 @@ const DETAIL_ESTABLISHED: u8 = 4;
 const DETAIL_RECEIVED: u8 = 5;
 const DETAIL_MEDIUM: u8 = 6;
 const DETAIL_EXTENT: u8 = 7;
-const DETAIL_COUNT: u8 = 7;
+const DETAIL_COUNT: u8 = 8;
 
 /// The nine `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;

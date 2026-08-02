@@ -28,7 +28,9 @@ make test    # fast host gate
 make ci      # the complete gate, QEMU scenarios included
 ```
 
-Requires rootless Podman and nothing else; see
+Every build and gate target requires rootless Podman and nothing else. Rendering the book with
+`make book` is the one exception: mdbook runs on the host, because the book is a reading
+convenience rather than a build input. See
 [building and testing](book/src/developers/building.md).
 
 ## License

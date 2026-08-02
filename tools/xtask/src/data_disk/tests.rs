@@ -1,5 +1,7 @@
 use std::env;
 
+use lfw_capture_ring::{Copies, Cursor, Geometry, RingState, encode_superblock};
+
 use super::*;
 
 /// A scratch directory of this test's own, removed when it drops, so two tests
@@ -155,4 +157,197 @@ fn recreating_an_image_resets_the_witness_sector() {
     disk.judge_written().expect("written");
     let again = DataDisk::create(&scratch.root, "reset").expect("recreated");
     again.judge_untouched().expect("and it is zeroes again");
+}
+
+/// Play the guest for one recording extent: a superblock stating `writer`, and
+/// `payload` laid into the extent's first payload segment.
+///
+/// The superblock is composed with the appliance's own encoder rather than by
+/// hand, so a test that passes here is a test against the bytes the recorder
+/// writes and not against this module's idea of them.
+fn guest_records(disk: &DataDisk, extent: usize, writer: Cursor, payload: &[u8]) {
+    let (start_sector, sectors) = Deck::extents()[extent];
+    let geometry = Geometry::new(
+        start_sector,
+        sectors,
+        SEGMENT_BYTES,
+        DATA_DISK_BYTES / SECTOR_SIZE as u64,
+    )
+    .expect("the deck's own extent is a ring");
+    let state = RingState::new(geometry, 7, writer, &[]).expect("a cursor inside the segment");
+    let mut region = [0u8; SUPERBLOCK_BYTES];
+    encode_superblock(&mut region, &state, Copies::Both);
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&disk.path)
+        .expect("the image is writable");
+    file.seek(SeekFrom::Start(start_sector * SECTOR_SIZE as u64))
+        .expect("seek to the superblock");
+    file.write_all(&region).expect("write the superblock");
+    let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
+    file.seek(SeekFrom::Start(
+        (start_sector + segment_sectors) * SECTOR_SIZE as u64,
+    ))
+    .expect("seek to the payload");
+    file.write_all(payload).expect("write the payload");
+    file.sync_all().expect("flush");
+}
+
+/// Both extents recorded the same way, which is what `judge_recordings` walks.
+fn both_extents_record(disk: &DataDisk, writer: Cursor, payload: &[u8]) {
+    for extent in 0..Deck::extents().len() {
+        guest_records(disk, extent, writer, payload);
+    }
+}
+
+#[test]
+fn a_recording_walked_to_the_superblocks_durable_end_passes() {
+    let scratch = Scratch::new("recordings");
+    let disk = DataDisk::create(&scratch.root, "recordings").expect("created");
+    let payload = crate::recording_contract::tests::recording(3, 64);
+    both_extents_record(
+        &disk,
+        Cursor {
+            sequence: 0,
+            offset: payload.len(),
+        },
+        &payload,
+    );
+    let verdict = disk
+        .judge_recordings()
+        .expect("both extents are recordings");
+    assert!(verdict.contains("durable end at payload byte"), "{verdict}");
+    assert!(verdict.contains("generation 7"), "{verdict}");
+}
+
+/// The defect this bound closes: one valid segment and then rubbish. The walk
+/// necessarily stops where the ring stops being walkable, so without the
+/// superblock's own cursor to reach for, the stop reads as the end of a
+/// well-formed recording.
+#[test]
+fn a_recording_the_walk_stops_short_of_the_durable_end_is_a_finding() {
+    let scratch = Scratch::new("short-walk");
+    let disk = DataDisk::create(&scratch.root, "short-walk").expect("created");
+    let good = crate::recording_contract::tests::recording(3, 64);
+    let mut payload = good.clone();
+    // What a recorder that lost its place writes: a block whose trailing length
+    // disagrees with its head, which is exactly where a reader gives up.
+    payload.extend_from_slice(&crate::recording_contract::tests::enhanced_packet(32));
+    let at = payload.len() - 4;
+    payload[at] ^= 0xFF;
+    both_extents_record(
+        &disk,
+        Cursor {
+            sequence: 0,
+            offset: payload.len(),
+        },
+        &payload,
+    );
+    let error = disk
+        .judge_recordings()
+        .expect_err("the walk stopped before the superblock's end");
+    assert!(error.contains("durable end at payload byte"), "{error}");
+    assert!(
+        error.contains("followed the extent's own lengths"),
+        "{error}"
+    );
+}
+
+/// And the other direction: bytes past the durable end are not the recording
+/// the superblock describes either.
+#[test]
+fn a_recording_the_walk_runs_past_the_durable_end_is_a_finding() {
+    let scratch = Scratch::new("long-walk");
+    let disk = DataDisk::create(&scratch.root, "long-walk").expect("created");
+    let payload = crate::recording_contract::tests::recording(3, 64);
+    let short = payload.len() - crate::recording_contract::tests::enhanced_packet(64).len();
+    both_extents_record(
+        &disk,
+        Cursor {
+            sequence: 0,
+            offset: short,
+        },
+        &payload,
+    );
+    let error = disk
+        .judge_recordings()
+        .expect_err("more is on the medium than the superblock accounts for");
+    assert!(
+        error.contains("not the recording the superblock describes"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_superblock_claiming_nothing_durable_is_a_finding() {
+    let scratch = Scratch::new("nothing-durable");
+    let disk = DataDisk::create(&scratch.root, "nothing-durable").expect("created");
+    let payload = crate::recording_contract::tests::recording(3, 64);
+    both_extents_record(
+        &disk,
+        Cursor {
+            sequence: 0,
+            offset: 0,
+        },
+        &payload,
+    );
+    let error = disk
+        .judge_recordings()
+        .expect_err("a cursor at zero says nothing reached the medium");
+    assert!(
+        error.contains("no byte of the recording is durable"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_extent_with_no_superblock_at_all_is_a_finding() {
+    let scratch = Scratch::new("no-superblock");
+    let disk = DataDisk::create(&scratch.root, "no-superblock").expect("created");
+    let error = disk
+        .judge_recordings()
+        .expect_err("a zeroed extent carries no superblock");
+    assert!(error.contains("no decodable superblock"), "{error}");
+}
+
+/// A wrapped ring is named as out of this walk's reach rather than waved
+/// through: the payload is read in device order, which stops being write order
+/// at the first wrap.
+#[test]
+fn a_wrapped_ring_is_refused_as_beyond_this_walks_reach() {
+    let (start_sector, sectors) = Deck::extents()[0];
+    let geometry = Geometry::new(
+        start_sector,
+        sectors,
+        SEGMENT_BYTES,
+        DATA_DISK_BYTES / SECTOR_SIZE as u64,
+    )
+    .expect("a ring");
+    let wrapped = RingState::new(
+        geometry,
+        1,
+        Cursor {
+            sequence: geometry.segments(),
+            offset: 0,
+        },
+        &[],
+    )
+    .expect("a legal cursor one wrap along");
+    assert_eq!(durable_payload_bytes(&wrapped), None);
+
+    let last_before_wrap = RingState::new(
+        geometry,
+        1,
+        Cursor {
+            sequence: geometry.segments() - 1,
+            offset: 64,
+        },
+        &[],
+    )
+    .expect("a legal cursor in the last segment");
+    assert_eq!(
+        durable_payload_bytes(&last_before_wrap),
+        Some((geometry.segments() as usize - 1) * SEGMENT_BYTES + 64)
+    );
 }

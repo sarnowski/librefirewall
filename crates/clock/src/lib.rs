@@ -151,6 +151,62 @@ pub const MAX_PLAUSIBLE_TSC_HZ: u64 = 100_000_000_000;
 const _: () = assert!(MIN_PLAUSIBLE_TSC_HZ > 0);
 const _: () = assert!(MIN_PLAUSIBLE_TSC_HZ < MAX_PLAUSIBLE_TSC_HZ);
 
+/// The years a boot instant may fall in, from which the band below is derived.
+///
+/// Private, because the band a caller applies is the nanosecond one: a year is
+/// what a register file reports and nanoseconds are what a [`Calibration`] holds.
+/// `lfw_rtc` states the same two years at its own granularity, and a test there
+/// holds the two statements together.
+const MIN_PLAUSIBLE_EPOCH_YEAR: u16 = 2000;
+const MAX_PLAUSIBLE_EPOCH_YEAR: u16 = 2200;
+
+/// Midnight UTC opening the first year a boot instant may fall in.
+pub const MIN_PLAUSIBLE_UNIX_NANOS: u64 = year_start_unix_nanos(MIN_PLAUSIBLE_EPOCH_YEAR);
+
+/// The last nanosecond of the final year a boot instant may fall in — the end of
+/// that year and not its start, a band closing at its midnight having refused
+/// every instant inside the year it names.
+pub const MAX_PLAUSIBLE_UNIX_NANOS: u64 = year_start_unix_nanos(MAX_PLAUSIBLE_EPOCH_YEAR + 1) - 1;
+
+/// Whether an instant is one this node will date a record with.
+///
+/// Beside [`MIN_PLAUSIBLE_TSC_HZ`]'s judgement and for its reason: both halves of
+/// a [`Calibration`] arrive from a device one indirection away, and a frequency
+/// ranged while its epoch is not leaves a reader converting readings into a year
+/// no appliance runs in. An instant outside the band states something about the
+/// *source* — a dead battery, packed decimal read as binary, a peer publishing
+/// whatever it likes — and nothing about the node's uptime.
+#[must_use]
+pub const fn epoch_is_plausible(unix_nanos: u64) -> bool {
+    unix_nanos >= MIN_PLAUSIBLE_UNIX_NANOS && unix_nanos <= MAX_PLAUSIBLE_UNIX_NANOS
+}
+
+/// Nanoseconds since the Unix epoch at midnight UTC opening `year`.
+///
+/// A refusal is a build error rather than a value, which is why the band is
+/// computed at compile time: every year passed here is a literal above the epoch,
+/// and a change that made one refusable fails the build instead of shipping zero.
+const fn year_start_unix_nanos(year: u16) -> u64 {
+    let midnight = CivilTime {
+        year,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanosecond: 0,
+    };
+    match midnight.to_unix_seconds() {
+        Ok(seconds) => seconds * NANOS_PER_SECOND,
+        Err(_) => panic!("the first of January names a Unix instant in every year after 1970"),
+    }
+}
+
+// An empty interior would refuse every instant, and a floor of zero would admit
+// the epoch itself — exactly what an unset register file reports.
+const _: () = assert!(MIN_PLAUSIBLE_UNIX_NANOS > 0);
+const _: () = assert!(MIN_PLAUSIBLE_UNIX_NANOS < MAX_PLAUSIBLE_UNIX_NANOS);
+
 /// A raw reading of the x86_64 timestamp counter.
 ///
 /// Transparent, because it is one hardware number and this crate can say
@@ -739,6 +795,75 @@ mod tests {
         let mut out = [0u8; RFC3339_LEN];
         render_rfc3339(UtcNanos(nanos), &mut out);
         String::from_utf8(out.to_vec()).expect("the renderer writes ASCII digits and separators")
+    }
+
+    /// The band's ends are the years it names, computed from the calendar here
+    /// rather than read back out of the constants under test.
+    #[test]
+    fn the_plausible_epoch_band_opens_and_closes_where_its_years_do() {
+        assert_eq!(
+            CivilTime::from_utc(UtcNanos(MIN_PLAUSIBLE_UNIX_NANOS)),
+            CivilTime {
+                year: 2000,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                nanosecond: 0,
+            }
+        );
+        assert_eq!(
+            CivilTime::from_utc(UtcNanos(MAX_PLAUSIBLE_UNIX_NANOS)),
+            CivilTime {
+                year: 2200,
+                month: 12,
+                day: 31,
+                hour: 23,
+                minute: 59,
+                second: 59,
+                nanosecond: 999_999_999,
+            }
+        );
+    }
+
+    /// The band is inclusive at both ends, and the instants just outside each are
+    /// refused: a boundary an operator's node could sit on must not be the one
+    /// value that reads as implausible.
+    #[test]
+    fn both_ends_of_the_plausible_epoch_band_are_accepted_and_neither_neighbour_is() {
+        assert!(epoch_is_plausible(MIN_PLAUSIBLE_UNIX_NANOS));
+        assert!(epoch_is_plausible(MAX_PLAUSIBLE_UNIX_NANOS));
+        assert!(!epoch_is_plausible(MIN_PLAUSIBLE_UNIX_NANOS - 1));
+        assert!(!epoch_is_plausible(MAX_PLAUSIBLE_UNIX_NANOS + 1));
+        // The two instants a register file reports when it reports nothing.
+        assert!(!epoch_is_plausible(0));
+        assert!(!epoch_is_plausible(u64::MAX));
+        // And the instant every expectation in this module is written against.
+        assert!(epoch_is_plausible(SAMPLE_UNIX_NANOS));
+    }
+
+    /// Why a calibration's anchor reading and its epoch are taken together: the
+    /// pair *is* the claim that one names the other, so a reading taken a span
+    /// before the instant it is paired with makes every later conversion read that
+    /// span late — one-signed, on every timestamp the node emits.
+    #[test]
+    fn an_anchor_taken_before_its_instant_runs_the_clock_fast_by_that_span() {
+        // A gigahertz counter, so a tick is a nanosecond and the span is readable.
+        let span_nanos = 2_300_000;
+        let together = calibration(ONE_GHZ, span_nanos, SAMPLE_UNIX_NANOS);
+        let anchored_early = calibration(ONE_GHZ, 0, SAMPLE_UNIX_NANOS);
+
+        let now = Ticks(span_nanos + NANOS_PER_SECOND);
+        assert_eq!(
+            together.utc(now).as_nanos(),
+            SAMPLE_UNIX_NANOS + NANOS_PER_SECOND
+        );
+        assert_eq!(
+            anchored_early.utc(now).as_nanos() - together.utc(now).as_nanos(),
+            span_nanos,
+            "the error is the span between the two readings, and always forward"
+        );
     }
 
     /// An independent validator, written from the calendar rules rather than

@@ -198,7 +198,10 @@ impl Datastore {
     pub fn commit(&mut self, changes: &mut [Option<Change>]) -> Result<CommitOutcome, CommitError> {
         let next = self.candidate.ok_or(CommitError::NoCandidate)?;
         let hash = content_hash(&next);
-        if hash == self.hash {
+        // The digest is a fast path and never the decision: `Unchanged` assigns
+        // no generation and publishes nothing, so a configuration reaching it
+        // wrongly is one silently suppressed.
+        if hash == self.hash && next.has_same_content(&self.model) {
             // Emptied on this path too, so a reused buffer holds this commit's
             // records whichever way it went rather than the last one's.
             for slot in changes.iter_mut() {
@@ -421,6 +424,87 @@ mod tests {
         assert_eq!(outcome.changes(), DiffSummary::NONE);
         assert_eq!(store.running(), Generation::from_bits(1));
         assert_eq!(changes.iter().flatten().count(), 0);
+    }
+
+    /// A commit is keyed by content, and the content is what decides — not the
+    /// 32-bit digest of it.
+    ///
+    /// The collision is forged rather than searched for: what matters is the
+    /// behaviour when two distinct configurations share a hash, and finding a
+    /// real FNV-1a collision would prove nothing this does not. `Unchanged`
+    /// here would leave the previous configuration in force with nothing said
+    /// about it, which is a suppression rather than a no-op.
+    #[test]
+    fn a_configuration_that_collides_with_the_running_hash_still_applies() {
+        let mut store = store();
+        commit(&mut store, &one());
+        let running = *store.running_model();
+
+        store.stage(document(1, true).as_bytes()).expect("sound");
+        let candidate = store.candidate.expect("a candidate");
+        assert!(
+            !candidate.has_same_content(&running),
+            "the two documents really are different configurations"
+        );
+        store.hash = content_hash(&candidate);
+
+        let outcome = store.commit(&mut [None; ROOMY]).expect("a candidate");
+        assert!(
+            matches!(outcome, CommitOutcome::Applied { .. }),
+            "a different configuration committed as unchanged: {outcome:?}"
+        );
+        assert_eq!(outcome.generation(), Generation::from_bits(2));
+        assert_eq!(*store.running_model(), candidate);
+    }
+
+    /// And the reverse still holds: one configuration written in another order
+    /// is the same configuration, so it assigns nothing. The equality that
+    /// decides has to be over content and not over the document's own order,
+    /// which a plain structural comparison of the model would not be.
+    #[test]
+    fn one_configuration_written_in_another_order_still_assigns_nothing() {
+        // One interface, written whole, so the two documents below differ in
+        // the order of these and in nothing else.
+        let interface = |id: &str, port: u8| {
+            format!(
+                "<interface id=\"{id}\" port=\"{port}\" enabled=\"true\" \
+                 mac=\"52:54:00:00:00:0{port}\" address=\"10.0.{port}.1\" \
+                 prefix-length=\"24\"/>"
+            )
+        };
+        let document = |first: &str, second: &str| {
+            format!(
+                "<configuration><interfaces>{first}{second}</interfaces>\
+                 <neighbours/><management enabled=\"true\" \
+                 mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" \
+                 prefix-length=\"24\"/></configuration>"
+            )
+        };
+        let (aaa, zzz) = (interface("aaa", 0), interface("zzz", 1));
+        let forwards = document(&aaa, &zzz);
+        let backwards = document(&zzz, &aaa);
+
+        let mut store = store();
+        let first = commit(&mut store, &forwards);
+        assert_eq!(first.outcome(), GenerationOutcome::Applied);
+        let model = *store.running_model();
+
+        store.stage(backwards.as_bytes()).expect("sound");
+        let reordered = store.candidate.expect("a candidate");
+        assert_ne!(
+            model, reordered,
+            "the two documents are written differently"
+        );
+        assert!(
+            model.has_same_content(&reordered),
+            "and they are the same configuration"
+        );
+        assert_eq!(
+            store.commit(&mut [None; ROOMY]).expect("a candidate"),
+            CommitOutcome::Unchanged {
+                generation: Generation::from_bits(1)
+            }
+        );
     }
 
     #[test]

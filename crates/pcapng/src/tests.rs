@@ -84,7 +84,7 @@ fn a_section_header_carries_its_four_options_in_ascending_code_order() {
         os: Some("librefirewall"),
         application: Some("lfw-pcapng"),
         schema: Some(CustomBinary {
-            pen: GROPYUS_PEN,
+            pen: UNREGISTERED_PEN,
             data: &[0x01],
         }),
     };
@@ -219,7 +219,7 @@ fn an_enhanced_packet_carries_every_option_it_was_given() {
             data: &[0xAA],
         }),
         custom: Some(CustomBinary {
-            pen: GROPYUS_PEN,
+            pen: UNREGISTERED_PEN,
             data: &[0xBB, 0xCC],
         }),
         comment: Some("hi"),
@@ -303,7 +303,7 @@ fn interface_statistics_write_their_two_timestamps_as_split_halves() {
 #[test]
 fn a_custom_block_without_data_is_sixteen_bytes() {
     let body = CustomBinary {
-        pen: GROPYUS_PEN,
+        pen: UNREGISTERED_PEN,
         data: &[],
     };
     let bytes = encoded(&body, custom_block_len, write_custom_block);
@@ -349,7 +349,7 @@ fn a_custom_block_carries_data_no_option_could_hold() {
     // is bounded by the Block Total Length alone, and this is the difference.
     let data = vec![0x5A; usize::from(u16::MAX) + 1];
     let body = CustomBinary {
-        pen: GROPYUS_PEN,
+        pen: UNREGISTERED_PEN,
         data: &data,
     };
     let bytes = encoded(&body, custom_block_len, write_custom_block);
@@ -357,7 +357,7 @@ fn a_custom_block_carries_data_no_option_could_hold() {
     let total = u32::try_from(MIN_CUSTOM_BLOCK_LEN + data.len()).expect("small enough");
     let mut expected = vec![0xAD, 0x0B, 0x00, 0x00];
     expected.extend_from_slice(&total.to_le_bytes());
-    expected.extend_from_slice(&GROPYUS_PEN.to_le_bytes());
+    expected.extend_from_slice(&UNREGISTERED_PEN.to_le_bytes());
     expected.extend_from_slice(&data);
     expected.extend_from_slice(&total.to_le_bytes());
     assert_eq!(total, 65_552);
@@ -502,7 +502,7 @@ fn a_custom_option_counts_its_enterprise_number_towards_the_length() {
     let data = vec![0x00; usize::from(u16::MAX) - PEN_LEN];
     let mut epb = bare_packet(&[]);
     epb.custom = Some(CustomBinary {
-        pen: GROPYUS_PEN,
+        pen: UNREGISTERED_PEN,
         data: &data,
     });
     assert!(
@@ -512,7 +512,7 @@ fn a_custom_option_counts_its_enterprise_number_towards_the_length() {
 
     let one_too_many = vec![0x00; usize::from(u16::MAX) - PEN_LEN + 1];
     epb.custom = Some(CustomBinary {
-        pen: GROPYUS_PEN,
+        pen: UNREGISTERED_PEN,
         data: &one_too_many,
     });
     assert_eq!(
@@ -565,7 +565,7 @@ fn every_writer_refuses_a_short_buffer_without_touching_it() {
     type BoundWriter<'a> = &'a dyn Fn(&mut [u8]) -> Result<usize, EncodeError>;
 
     let custom = CustomBinary {
-        pen: GROPYUS_PEN,
+        pen: UNREGISTERED_PEN,
         data: &[0xAB],
     };
 
@@ -593,10 +593,12 @@ fn every_writer_refuses_a_short_buffer_without_touching_it() {
     for (needed, write) in cases {
         for capacity in 0..needed {
             let mut out = scratch(capacity);
-            assert_eq!(
-                write(&mut out),
-                Err(EncodeError::OutOfSpace { needed, capacity })
-            );
+            let refused = write(&mut out);
+            // The variant matters as much as the buffer: `OutOfSpace` is the one
+            // a caller retries against, and it is only ever decided before a
+            // byte is emitted. The one outcome that can leave part of a block
+            // behind carries its own name.
+            assert_eq!(refused, Err(EncodeError::OutOfSpace { needed, capacity }));
             assert!(out.iter().all(|&byte| byte == UNTOUCHED));
         }
     }
@@ -752,6 +754,7 @@ fn every_error_renders_a_distinct_sentence() {
         EncodeError::BlockTooLong,
         EncodeError::BlockNotAligned { len: 17 },
         EncodeError::BlockTooShort { len: 12 },
+        EncodeError::MeasureDisagreed { measured: 44 },
     ]
     .map(|error| std::format!("{error}"));
 
@@ -1023,7 +1026,7 @@ fn the_test_reader_walks_past_a_padding_block_to_the_packet_behind_it() {
     assert_eq!(
         read_custom_block(blocks.first().expect("the padding")),
         Some(ReadCustom {
-            pen: GROPYUS_PEN,
+            pen: UNREGISTERED_PEN,
             data: &[0; 8],
         }),
     );
@@ -1316,7 +1319,7 @@ proptest! {
         let blocks = read_blocks(out.get(..len).expect("the block")).expect("well-framed");
         prop_assert_eq!(blocks.len(), 1);
         let custom = read_custom_block(blocks.first().expect("one block")).expect("a Custom Block");
-        prop_assert_eq!(custom.pen, GROPYUS_PEN);
+        prop_assert_eq!(custom.pen, UNREGISTERED_PEN);
         prop_assert_eq!(custom.data.len(), len - MIN_CUSTOM_BLOCK_LEN);
         prop_assert!(custom.data.iter().all(|&byte| byte == 0));
     }
@@ -1425,7 +1428,7 @@ proptest! {
         for block in &blocks {
             match read_custom_block(block) {
                 Some(custom) => {
-                    prop_assert_eq!(custom.pen, GROPYUS_PEN);
+                    prop_assert_eq!(custom.pen, UNREGISTERED_PEN);
                     prop_assert!(custom.data.iter().all(|&byte| byte == 0));
                 }
                 None => packets_read.push(

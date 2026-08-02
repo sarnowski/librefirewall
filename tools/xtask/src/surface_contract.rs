@@ -396,13 +396,13 @@ fn distinctness_differences(log: &Surface, capture: &Surface) -> Vec<String> {
 ///
 /// The count comes from the document, so an image built from the alternate
 /// document is judged against that document's port set. The *name* is the port
-/// index and not the document's interface id, because the recorder compiles its
-/// interface names in rather than reading the configuration region — see
-/// `interface_names` in `pds/recorder/src/main.rs`, which says so and says why.
-/// Until it reads the document, this assertion can hold the recording to the
-/// number of ports and to their indices and no further; the identity half of
-/// the same idea is `crate::metrics_contract`'s interface info family, which
-/// does compare against the document field by field.
+/// index and not the document's interface id, because the recorder composes its
+/// interface names itself — `interface_names` in `pds/recorder/src/main.rs` —
+/// and maps no configuration region to read them out of. Until it does, this
+/// assertion can hold the recording to the number of ports and to their indices
+/// and no further; the identity half of the same idea is
+/// `crate::metrics_contract`'s interface info family, which does compare against
+/// the document field by field.
 fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     // A section's interface table restarts at zero, so the flat list holds one
@@ -512,13 +512,19 @@ fn presence_differences(capture: &Surface, wire: &Wire) -> Result<usize, Vec<Str
 /// shorter than the frame keeps the frame's first bytes and nothing else. The
 /// original length is compared too, so a truncated block still has to claim the
 /// whole frame's length on the wire.
+///
+/// An *empty* prefix is no prefix at all, and the check says so: every slice
+/// starts with nothing, so a zero-length capture would otherwise match the first
+/// injected frame of the right claimed length and pass — a fabricated block that
+/// retained no byte being exactly the one this direction exists to catch.
 fn fabrication_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     for packet in &surface.parsed.packets {
-        let known = wire.injected.iter().any(|injected| {
-            injected.frame.starts_with(&packet.captured)
-                && injected.frame.len() == packet.original_len as usize
-        });
+        let known = !packet.captured.is_empty()
+            && wire.injected.iter().any(|injected| {
+                injected.frame.starts_with(&packet.captured)
+                    && injected.frame.len() == packet.original_len as usize
+            });
         if !known {
             found.push(format!(
                 "{}: {} carries {} captured byte(s) of a claimed {}-byte frame that is no prefix \

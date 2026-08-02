@@ -395,9 +395,9 @@ fn record_bytes(record: &LogRecord) -> [u8; RECORD_BYTES] {
 fn record_from_bytes(bytes: [u8; RECORD_BYTES]) -> LogRecord {
     // SAFETY: as `record_bytes`, in the other direction. Every field of
     // `LogRecord` is an integer or an array of integers, none of which has an
-    // invalid bit pattern, so any 192 initialised bytes are a valid value —
-    // which is precisely why a peer may write whatever it likes into a slot and
-    // the result is untrusted input rather than undefined behaviour.
+    // invalid bit pattern, so any `RECORD_BYTES` initialised bytes are a valid
+    // value — which is precisely why a peer may write whatever it likes into a
+    // slot and the result is untrusted input rather than undefined behaviour.
     unsafe { std::mem::transmute::<[u8; RECORD_BYTES], LogRecord>(bytes) }
 }
 

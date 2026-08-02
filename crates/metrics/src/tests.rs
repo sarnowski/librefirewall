@@ -241,7 +241,13 @@ fn every_name_and_token_follows_the_transliteration_rule() {
             Kind::Counter => assert!(metric.name.ends_with("_total"), "{}", metric.name),
             Kind::Gauge => assert!(!metric.name.ends_with("_total"), "{}", metric.name),
         }
-        assert!(!metric.help.is_empty() && !metric.help.contains('\n'));
+        assert!(!metric.help.is_empty(), "{}", metric.name);
+        // A HELP line is written verbatim and the exposition format escapes
+        // neither of the two bytes that would end or continue it: a newline ends
+        // the line, and a backslash begins an escape a scraper resolves against
+        // a table this renderer does not apply.
+        assert!(!metric.help.contains('\n'), "{}", metric.name);
+        assert!(!metric.help.contains('\\'), "{}", metric.name);
     }
     // A label *value* need not be an identifier — Prometheus admits any UTF-8
     // there — but the transliteration rule binds it anyway: one spelling of a
@@ -297,6 +303,53 @@ fn a_family_keeps_one_label_shape_across_every_shard() {
     }
 }
 
+/// A family several domains carry is not always a full cross product of its
+/// domains and its label values, and the difference is invisible from a name and
+/// a label set: `librefirewall_pool_returns_refused_total` declares `pool`
+/// values `receive` and `transmit`, and each domain carries exactly one of them.
+/// An alert written against a pair that does not exist never fires, so every
+/// label value that is *not* carried by every domain of its family is named in
+/// the HELP text — the one sentence a scrape itself carries.
+#[test]
+fn a_partitioned_family_names_its_partition_in_its_help() {
+    let all = declared();
+    for metric in ALL_METRICS {
+        let family: Vec<&Declared> = all
+            .iter()
+            .filter(|(name, ..)| *name == metric.name)
+            .collect();
+        let mut domains: Vec<&str> = family.iter().map(|(_, domain, _)| *domain).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        let mut pairs: Vec<(&str, &str)> = family
+            .iter()
+            .flat_map(|(_, _, labels)| labels.iter().copied())
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        for (key, value) in pairs {
+            let carried_by = domains
+                .iter()
+                .filter(|domain| {
+                    family.iter().any(|(_, series_domain, labels)| {
+                        series_domain == *domain && labels.contains(&(key, value))
+                    })
+                })
+                .count();
+            if carried_by == domains.len() {
+                continue;
+            }
+            assert!(
+                metric.help.contains(value),
+                "{} carries {key}=\"{value}\" in {carried_by} of its {} domains \
+                 and its help text does not name the partition",
+                metric.name,
+                domains.len()
+            );
+        }
+    }
+}
+
 /// The bound is exact enough to be useful and never short: a snapshot of
 /// `u64::MAX` everywhere is the worst case, and it must fit.
 #[test]
@@ -340,12 +393,12 @@ fn a_shard_round_trips_a_published_sample() {
             PipelineSample {
                 forwarded: 11,
                 route_drops: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-                stage_drops: [21, 22, 23, 24, 25, 26],
+                stage_drops: [21, 22, 23, 24, 25, 26, 27, 28, 29],
             },
             PipelineSample {
                 forwarded: 12,
                 route_drops: [31; 11],
-                stage_drops: [41; 6],
+                stage_drops: [41; 9],
             },
         ],
         generation: 1,
@@ -882,5 +935,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 39_018);
+    assert_eq!(MAX_EXPOSITION_LEN, 42_142);
 }

@@ -39,6 +39,14 @@ impl SeqNumber {
         Self(self.0.wrapping_add(count))
     }
 
+    /// `self - count`, modulo 2^32, on [`add`](Self::add)'s terms: the left
+    /// edge of a window measured back from a number is a point in the same
+    /// space and never an underflow.
+    #[must_use]
+    pub const fn sub(self, count: u32) -> Self {
+        Self(self.0.wrapping_sub(count))
+    }
+
     /// How far `self` lies ahead of `earlier`, modulo 2^32.
     ///
     /// Unsigned, so a `self` *behind* `earlier` yields the enormous complement

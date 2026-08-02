@@ -62,13 +62,13 @@ use std::{collections::VecDeque, string::String, vec, vec::Vec};
 
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_capture_ring::{
-    Append, Cursor, Fit, Geometry, Located, MAX_READERS, Placement, ReaderCursor, Ring,
+    Append, Copies, Cursor, Fit, Geometry, Located, MAX_READERS, Placement, ReaderCursor, Ring,
     SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES, SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION,
     decode_superblock, encode_superblock,
 };
 use lfw_recorder::deck::{
-    Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Refused, STAGING_END, Served,
-    TAP_BUDGET, Transfer,
+    Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Polled, Refused, STAGING_END,
+    Served, TAP_BUDGET, Transfer,
 };
 use lfw_recorder::{
     Flush, InterfaceName, Locate, MAX_INTERFACES, Recorded, Sink, SinkConfig, prologue_len,
@@ -120,6 +120,13 @@ enum Step {
     Fail { count: usize },
     /// The device answers a job nothing is waiting on.
     Forge { job: Job },
+    /// The device replays entries of its used ring, so the driver hands the
+    /// pass a completion it could attribute to no job at all.
+    Replay { count: usize },
+    /// The device answers the next `count` reads `Ok` having moved less than
+    /// they asked for, leaving the rest of the staging area holding whatever
+    /// the previous transfer left in it.
+    UnderDeliver { count: usize },
 }
 
 fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
@@ -155,11 +162,17 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             len: u32::arbitrary(unstructured).ok()?,
         },
         2 | 3 => Step::Pass,
-        4 => match u8::arbitrary(unstructured).ok()? % 3 {
+        4 => match u8::arbitrary(unstructured).ok()? % 5 {
             0 => Step::Refuse {
                 count: u8::arbitrary(unstructured).ok()? as usize,
             },
             1 => Step::Fail {
+                count: u8::arbitrary(unstructured).ok()? as usize,
+            },
+            2 => Step::Replay {
+                count: u8::arbitrary(unstructured).ok()? as usize,
+            },
+            3 => Step::UnderDeliver {
                 count: u8::arbitrary(unstructured).ok()? as usize,
             },
             _ => Step::Forge {
@@ -187,9 +200,41 @@ fn forged_job(bits: u8) -> Job {
 struct Disk {
     window: Vec<u8>,
     disk: Vec<u8>,
-    ready: VecDeque<Completion>,
+    /// Each completion and whether the transfer it answers was cut short.
+    ready: VecDeque<(Polled, bool)>,
     refuse: usize,
     fail: usize,
+    /// Reads still to be answered `Ok` for one sector less than they asked for.
+    under_deliver: usize,
+    /// Short transfers whose completion the pass has actually taken. Counted on
+    /// the way out rather than on the way in: one still sitting in the queue has
+    /// reached no counter yet, and holding the pass to it would be asserting
+    /// against a completion it was never handed.
+    short_taken: u64,
+    /// Whether the most recent read into the download area was cut short, and
+    /// so whether that area's tail still holds the previous window's bytes.
+    fetch_short: bool,
+    /// Reads into the download area published and not yet answered.
+    fetches_inflight: usize,
+    /// Whether two reads into the download area were ever outstanding at once.
+    ///
+    /// A demand for offset zero arriving while a read is in flight starts a
+    /// fresh seal and publishes a second read into the same area without
+    /// cancelling the first, and either completion then promotes whichever read
+    /// the pass currently holds. The window a download is answered from is then
+    /// not the window that read filled — a reported finding, and one no
+    /// assertion here can hold the pass to until it is decided.
+    fetch_overlap: bool,
+    /// Unattributable completions the pass has actually taken, each of which
+    /// must reach a counter rather than ending the drain.
+    replays_taken: u64,
+    /// Completions minted for a job that was never submitted. Authority a real
+    /// device does not hold — the protection domain attributes a completion
+    /// through a token table it keeps outside the DMA region, so a replayed
+    /// used-ring entry arrives as [`Polled::Unattributed`] and never as an
+    /// answer to a job. Generated all the same, and recorded so the assertions
+    /// that rest on the pass knowing what it submitted can say when they hold.
+    forged: u64,
 }
 
 impl Disk {
@@ -200,6 +245,13 @@ impl Disk {
             ready: VecDeque::new(),
             refuse: 0,
             fail: 0,
+            under_deliver: 0,
+            short_taken: 0,
+            fetch_short: false,
+            fetches_inflight: 0,
+            fetch_overlap: false,
+            replays_taken: 0,
+            forged: 0,
         }
     }
 }
@@ -245,30 +297,63 @@ impl Medium for Disk {
         }
         if self.fail > 0 {
             self.fail -= 1;
-            self.ready.push_back(Completion {
-                job,
-                ended: Ended::Failed,
-            });
+            self.ready.push_back((
+                Polled::Settled(Completion {
+                    job,
+                    ended: Ended::Failed,
+                }),
+                false,
+            ));
             return Ok(());
+        }
+        // A read cut short: the bytes past `moved` keep whatever the previous
+        // transfer through this area left there, which is precisely the content
+        // a pass must never serve as this window's.
+        let moved = if !transfer.write && self.under_deliver > 0 {
+            self.under_deliver -= 1;
+            transfer.len.saturating_sub(SECTOR_SIZE)
+        } else {
+            transfer.len
+        };
+        if !transfer.write {
+            self.fetch_short = moved < transfer.len;
+            self.fetches_inflight += 1;
+            self.fetch_overlap |= self.fetches_inflight > 1;
         }
         let offset = base + transfer.at;
         let at = transfer.sector as usize * SECTOR_SIZE;
-        for byte in 0..transfer.len {
+        for byte in 0..moved {
             if transfer.write {
                 self.disk[at + byte] = self.window[offset + byte];
             } else {
                 self.window[offset + byte] = self.disk[at + byte];
             }
         }
-        self.ready.push_back(Completion {
-            job,
-            ended: Ended::Ok,
-        });
+        self.ready.push_back((
+            Polled::Settled(Completion {
+                job,
+                ended: Ended::Ok { delivered: moved },
+            }),
+            moved < transfer.len,
+        ));
         Ok(())
     }
 
-    fn poll(&mut self) -> Option<Completion> {
-        self.ready.pop_front()
+    fn poll(&mut self) -> Option<Polled> {
+        let (polled, short) = self.ready.pop_front()?;
+        if polled == Polled::Unattributed {
+            self.replays_taken += 1;
+        }
+        if let Polled::Settled(Completion {
+            job: Job::Fetch, ..
+        }) = polled
+        {
+            self.fetches_inflight = self.fetches_inflight.saturating_sub(1);
+        }
+        if short {
+            self.short_taken += 1;
+        }
+        Some(polled)
     }
 }
 
@@ -361,13 +446,31 @@ pub fn recording_pass(data: &[u8]) {
                         <= before.tap_records + before.tap_refused + TAP_BUDGET as u64,
                     "a pass drained more than its budget"
                 );
+                // Per counter rather than against their sum: one completion can
+                // legitimately move both — a transfer the medium failed, or cut
+                // short, that also answers a job this side no longer holds is a
+                // failure *and* an unexpected completion. Each counter still
+                // rises at most once per completion, which is what makes each
+                // rise the bound on completions settled.
                 assert!(
-                    after.medium_failures + after.completions_unexpected
-                        <= before.medium_failures
-                            + before.completions_unexpected
-                            + COMPLETION_BUDGET as u64,
-                    "a pass settled more completions than its budget"
+                    after.medium_failures
+                        <= before
+                            .medium_failures
+                            .saturating_add(COMPLETION_BUDGET as u64),
+                    "a pass settled more failed completions than its budget"
                 );
+                assert!(
+                    after.completions_unexpected
+                        <= before
+                            .completions_unexpected
+                            .saturating_add(COMPLETION_BUDGET as u64),
+                    "a pass settled more unattributable completions than its budget"
+                );
+                // Read before the answer borrows the medium: the bytes handed
+                // back point into its staging window.
+                let forged = medium.forged;
+                let fetch_short = medium.fetch_short;
+                let overlap = medium.fetch_overlap;
                 if let Some(served) = deck.answer(&mut medium) {
                     answers += 1;
                     match served {
@@ -377,6 +480,27 @@ pub fn recording_pass(data: &[u8]) {
                                 "more bytes delivered than were asked for"
                             );
                             assert!(bytes.len() <= DOWNLOAD_WINDOW_LEN);
+                            // The read that filled this window moved every byte
+                            // it was asked for. Otherwise the tail of the area
+                            // still holds the previous window's content, and
+                            // delivering it puts one part of the recording
+                            // inside another's body under a correct length.
+                            //
+                            // Scoped to a run with no forged attributed
+                            // completion, for the reason `Disk::forged` records:
+                            // under one the pass is answering a fetch it
+                            // believes completed, which is authority the real
+                            // device does not have. And scoped past
+                            // `Disk::fetch_overlap`, where two reads into the
+                            // area were outstanding at once and the window a
+                            // completion promotes is not the window it filled —
+                            // a separate finding, recorded there.
+                            assert!(
+                                bytes.is_empty() || forged > 0 || overlap || !fetch_short,
+                                "{} bytes were delivered out of a window the device \
+                                 filled short",
+                                bytes.len()
+                            );
                             responder.deliver(demand, bytes, 0);
                         }
                         Served::Refuse { demand, reason, .. } => {
@@ -387,10 +511,27 @@ pub fn recording_pass(data: &[u8]) {
             }
             Step::Refuse { count } => medium.refuse = count,
             Step::Fail { count } => medium.fail = count,
-            Step::Forge { job } => medium.ready.push_back(Completion {
-                job,
-                ended: Ended::Ok,
-            }),
+            Step::UnderDeliver { count } => medium.under_deliver = count,
+            Step::Replay { count } => {
+                for _ in 0..count.min(MAX_STEPS) {
+                    medium.ready.push_back((Polled::Unattributed, false));
+                }
+            }
+            Step::Forge { job } => {
+                medium.forged += 1;
+                medium.ready.push_back((
+                    Polled::Settled(Completion {
+                        job,
+                        // More than any transfer could have moved, so what the pass
+                        // makes of a forged completion turns on the attribution and
+                        // never on the byte count.
+                        ended: Ended::Ok {
+                            delivered: usize::MAX,
+                        },
+                    }),
+                    false,
+                ));
+            }
         }
     }
 
@@ -411,6 +552,36 @@ pub fn recording_pass(data: &[u8]) {
         counters.downloads_served + counters.downloads_refused,
         answers as u64,
         "every answer is counted exactly once"
+    );
+    // A transfer the device completed `Ok` having moved less than it was given
+    // is a failure however it reports itself: the shortfall is whatever the
+    // staging area held before, and a pass that took it for a success would
+    // serve one window's bytes inside another's body.
+    //
+    // Either counter is the right home depending on whether the pass still held
+    // the transfer the completion answers: one it does hold and that came up
+    // short is a medium failure, and one it no longer holds — the requester
+    // having abandoned that window, or a forged completion having consumed the
+    // state first — is an unexpected completion. What must never happen is
+    // neither, which is a short transfer passing for a plain success.
+    assert!(
+        counters
+            .medium_failures
+            .saturating_add(counters.completions_unexpected)
+            >= medium.short_taken,
+        "{} short transfers were settled and only {} reached a fault surface",
+        medium.short_taken,
+        counters
+            .medium_failures
+            .saturating_add(counters.completions_unexpected)
+    );
+    // A completion answering no job must reach a counter rather than passing
+    // for an idle device and ending the drain.
+    assert!(
+        counters.completions_unexpected >= medium.replays_taken,
+        "{} unattributable completions were taken and only {} counted",
+        medium.replays_taken,
+        counters.completions_unexpected
     );
 }
 
@@ -484,17 +655,45 @@ fn examine_region(region: &[u8; SUPERBLOCK_BYTES], unstructured: &mut Unstructur
     // duplicated on the way through is exactly the loss this checkpoint exists
     // to prevent.
     let mut round = [0u8; SUPERBLOCK_BYTES];
-    let at = encode_superblock(&mut round, &state);
+    let written = encode_superblock(&mut round, &state, Copies::Parity);
     assert!(
-        at == 0 || at == SUPERBLOCK_COPY_BYTES,
-        "a superblock was written at {at}, which is neither copy"
+        written.at == 0 || written.at == SUPERBLOCK_COPY_BYTES,
+        "a superblock was written at {}, which is neither copy",
+        written.at
+    );
+    assert_eq!(
+        written.len, SUPERBLOCK_COPY_BYTES,
+        "a parity write is one copy and no more, or it would overwrite the copy \
+         the medium is relying on"
     );
     let again = decode_superblock(&round).expect("what this crate wrote it reads");
     assert_eq!(
         again, state,
         "a superblock did not survive being written and read back"
     );
-    assert_crc_agrees(&round, at);
+    assert_crc_agrees(&round, written.at);
+
+    // A ring with nothing of its own on the medium replaces both copies, so
+    // whatever the extent already carried — here the adversary's own bytes,
+    // which may be a valid ring of this very geometry at a far higher
+    // generation — can never be preferred over what was just written.
+    let mut occupied = *region;
+    let both = encode_superblock(&mut occupied, &state, Copies::Both);
+    assert_eq!(
+        both,
+        lfw_capture_ring::SuperblockWrite {
+            at: 0,
+            len: SUPERBLOCK_BYTES,
+        },
+        "a first checkpoint must replace the whole region"
+    );
+    assert_eq!(
+        decode_superblock(&occupied),
+        Some(state),
+        "an older ring left in the other copy outranked a fresh checkpoint"
+    );
+    assert_crc_agrees(&occupied, 0);
+    assert_crc_agrees(&occupied, SUPERBLOCK_COPY_BYTES);
 
     let stored = state.geometry();
     assert!(
@@ -709,9 +908,20 @@ fn resume_and_walk(
     // A checkpoint of whatever state the walk arrived at must round-trip, so a
     // cursor reachable by appending and rolling is one the medium can carry.
     let readers = arbitrary_readers(unstructured);
-    if let Ok(state) = ring.checkpoint(&readers) {
+    let at = if any_u32(unstructured) % 2 == 0 {
+        ring.cursor()
+    } else {
+        // A position behind the append cursor, which is what a caller holding a
+        // staging buffer checkpoints: the superblock states what the medium has,
+        // never what the writer has reached.
+        Cursor {
+            sequence: ring.cursor().sequence,
+            offset: any_u32(unstructured) as usize % (geometry.segment_bytes() + 1),
+        }
+    };
+    if let Ok(state) = ring.checkpoint(at, &readers) {
         let mut region = [0u8; SUPERBLOCK_BYTES];
-        encode_superblock(&mut region, &state);
+        encode_superblock(&mut region, &state, Copies::Parity);
         let again = decode_superblock(&region).expect("what this crate wrote it reads");
         assert_eq!(
             again, state,
@@ -1025,21 +1235,21 @@ pub fn recorder_sink(data: &[u8]) {
     let Ok(prologue) = prologue_len(&config) else {
         return;
     };
-    let Ok(mut sink) = Sink::new(config) else {
-        return;
-    };
 
     // A staging buffer between "just enough for the prologue" and "a whole
-    // segment and a sector over". The floor is not a filter: below it `open`
-    // refuses and the run ends at once, so the band is where the sink can be
-    // driven at all, and its lower end is exactly the cramped case where a
+    // segment and a sector over". The floor is not a filter: below it the sink
+    // cannot be built at all and the run ends at once, so the band is where the
+    // sink can be driven, and its lower end is exactly the cramped case where a
     // record or a pad has nowhere to go.
     let headroom = (any_u32(&mut unstructured) as usize) % (SINK_SEGMENT_BYTES + SECTOR_SIZE);
     let mut staging = Guarded::new(prologue.saturating_add(headroom));
-    if sink.open(staging.out()).is_err() {
+    // A sink that exists has its prologue staged: there is no second call to
+    // make, and so no interleaving in which a segment's records were composed
+    // over an absent one.
+    let Ok(mut sink) = Sink::new(config, staging.out()) else {
         return;
-    }
-    staging.assert_margins_intact("open");
+    };
+    staging.assert_margins_intact("new");
 
     // Everything the device has been handed, which is what a snapshot may
     // promise and no more — while the caller has kept its side of the bargain.
@@ -1167,13 +1377,32 @@ pub fn recorder_sink(data: &[u8]) {
 
     // Whatever state the run arrived at must still describe a ring the medium
     // can carry, and the counters must not have counted more than happened.
-    if let Ok(state) = sink.state() {
-        let mut region = [0u8; SUPERBLOCK_BYTES];
-        encode_superblock(&mut region, &state);
-        let again = decode_superblock(&region).expect("what this crate wrote it reads");
-        assert_eq!(
-            again, state,
-            "a sink's checkpoint did not survive the medium"
+    let mut region = [0u8; SUPERBLOCK_BYTES];
+    if let Ok(written) = sink.superblock(&mut region) {
+        assert!(
+            written.at.is_multiple_of(SUPERBLOCK_COPY_BYTES)
+                && written.len.is_multiple_of(SUPERBLOCK_COPY_BYTES)
+                && written.at + written.len <= SUPERBLOCK_BYTES,
+            "a checkpoint named {written:?}, which is not a whole copy of the region"
+        );
+        let state = decode_superblock(&region).expect("what this crate wrote it reads");
+        // A superblock states where the *medium* ends, never where the writer
+        // has reached: the two differ by everything still in the staging
+        // buffer, and a checkpoint of the append cursor would over-state the
+        // recording by that much to anything holding the disk — a resuming ring
+        // included.
+        //
+        // Scoped for the reason `assert_flush_placed` is: the staging offset
+        // tracks the segment only while `begin_segment`'s precondition holds,
+        // and a caller that reopened a segment with bytes still staged has
+        // already put the two out of step, so the append cursor is no longer a
+        // fixed distance ahead of the durable one. Every misordering is still
+        // generated and still executed.
+        assert!(
+            !contract_kept || sink.staged() == 0 || state.writer() != sink.cursor(),
+            "a checkpoint recorded the append cursor {:?} with {} bytes staged behind it",
+            sink.cursor(),
+            sink.staged()
         );
     }
     let counters = sink.counters();
@@ -1194,9 +1423,8 @@ pub fn recorder_sink(data: &[u8]) {
 /// them was padded to its end by `close_segment` and then flushed — which is
 /// the precondition `Sink::begin_segment` delegates to its caller ("call only
 /// once the closed segment's bytes are on the device"), and which
-/// `Deck::advance` (`crates/recorder/src/deck.rs:741`) is the component that
-/// enforces: it reopens a segment only while `rolling && in_flight.is_none() &&
-/// staged() == 0`. Roll a half-written segment instead and the snapshot counts
+/// `Deck::advance` is the component that enforces it: it reopens a segment only
+/// while `rolling && in_flight.is_none() && staged() == 0`. Roll a half-written segment instead and the snapshot counts
 /// the part nobody wrote, offering a download bytes the medium never received.
 ///
 /// So the bound is asserted while the caller kept that contract, and not while
@@ -1258,9 +1486,8 @@ fn assert_flush_is_whole_staged_sectors(flush: &Flush, staging: usize) {
 /// outstanding and `begin_segment` resets `staged_from` to zero under it; the
 /// later `acknowledge` then advances it by the outstanding flush's whole
 /// length, and from that point the offset no longer describes where in the
-/// segment the buffer sits. `Deck::advance`
-/// (`crates/recorder/src/deck.rs:741`) is the component that forbids it,
-/// reopening only while `rolling && in_flight.is_none() && staged() == 0`.
+/// segment the buffer sits. `Deck::advance` is the component that forbids it, reopening only while
+/// `rolling && in_flight.is_none() && staged() == 0`.
 ///
 /// So the placement is asserted while the caller kept that contract. The
 /// interleaving that breaks it is still generated and still executed — it is

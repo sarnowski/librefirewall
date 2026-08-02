@@ -28,10 +28,20 @@ fn buffer_pool_write(c: &mut Criterion) {
         let data = vec![0xABu8; size];
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, data| {
-            // SAFETY: `write`'s two clauses. `pool` is constructed in this
-            // function and handed to nothing else, so index 0 is owned here;
-            // `data` is a separate `Vec` and so cannot borrow from the pool.
-            b.iter(|| black_box(unsafe { pool.write(0, black_box(data)) }));
+            b.iter(|| {
+                // SAFETY: `write`'s two clauses. `pool` is constructed in this
+                // function and handed to nothing else, so index 0 is owned here;
+                // `data` is a separate `Vec` and so cannot borrow from the pool.
+                black_box(unsafe { pool.write(0, black_box(data)) })
+                    .expect("a representative frame fits a buffer");
+                // The destination is fenced separately, as in
+                // `buffer_pool_copy_out`: nothing here reads the written bytes
+                // back, and the buffer is reached through `UnsafeCell::get()`
+                // and `copy_nonoverlapping` — an ordinary store into memory the
+                // compiler can see is never observed, and so may delete. The
+                // copy is the whole measurement.
+                black_box(&pool);
+            });
         });
     }
     group.finish();
@@ -46,12 +56,18 @@ fn buffer_pool_write_at(c: &mut Criterion) {
         let data = vec![0xCDu8; size];
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, data| {
-            // SAFETY: `write_at`'s two clauses. `pool` is constructed in this
-            // function and handed to nothing else, so index 0 is owned here;
-            // `data` is a separate `Vec` and so cannot borrow from the pool.
-            // The span is not a soundness clause — `write_at` bounds it itself
-            // and answers in its return value.
-            b.iter(|| unsafe { pool.write_at(0, HEADER, black_box(data)) });
+            b.iter(|| {
+                // SAFETY: `write_at`'s two clauses. `pool` is constructed in
+                // this function and handed to nothing else, so index 0 is owned
+                // here; `data` is a separate `Vec` and so cannot borrow from the
+                // pool. The span is not a soundness clause — `write_at` bounds
+                // it itself and answers in its return value.
+                black_box(unsafe { pool.write_at(0, HEADER, black_box(data)) })
+                    .expect("a representative frame fits a buffer behind the header");
+                // Fenced for the reason given in `buffer_pool_write`: the
+                // outcome alone leaves the store itself eliminable.
+                black_box(&pool);
+            });
         });
     }
     group.finish();

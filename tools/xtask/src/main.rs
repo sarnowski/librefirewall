@@ -9,10 +9,35 @@
 //! first-party ones, the crates whose constants [`sysdesc`] holds the system
 //! description to.
 //!
+//! # The adversary
+//!
+//! No threat-model adversary reaches this crate: it runs on a developer's or a
+//! CI agent's machine, on the host side of an emulator, and nothing it parses
+//! arrives from a network, a device, or a peer protection domain. Being out of
+//! an adversary's reach is not a licence — only seL4, Microkit and `rust-sel4`
+//! are trusted, and nothing first-party inherits that status — and here the
+//! obligation it leaves is sharper than the exemption it does not grant.
+//!
+//! Everything this crate reads back was composed by the appliance it is
+//! judging: a serial capture, a GPT disk image and the recording extents on the
+//! data disk beside it, and pcapng bodies pulled through a real HTTP client.
+//! Those bytes are the *subject* of the assertion, so the case where they are
+//! malformed is not an unlikely one — it is the case a failing gate exists to
+//! report. A harness that indexed or unwrapped its way through them would abort
+//! on exactly the input it was built to describe, replacing a named verdict with
+//! a backtrace and losing the diagnosis with it. So every walk over guest-
+//! composed bytes follows the lengths the bytes themselves state, is bounded by
+//! a number the guest did not choose, and answers a verdict rather than
+//! panicking — the same discipline a protection domain owes untrusted input,
+//! adopted here because the alternative is a harness that cannot report the
+//! defect it found.
+//!
 //! The orchestration is split by concern, each stage in its own module:
 //!
 //! - [`sysdesc`] — the system description held to the constants the PDs map it
 //!   with.
+//! - [`reference_contract`] — the operator reference chapters held to the
+//!   catalogues they describe.
 //! - [`image`] — build the PDs and assemble the Microkit image.
 //! - [`disk`] — the signed A/B GPT disk: partition geometry and assembly.
 //! - [`signing`] — the development payload-signing trust anchor.
@@ -59,6 +84,7 @@ mod metrics_contract;
 mod pins;
 mod qemu;
 mod recording_contract;
+mod reference_contract;
 mod reproducible;
 mod signing;
 mod stamp_contract;
@@ -174,10 +200,11 @@ fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
 /// function's alone. Both of those contracts are now asserted inside `ci`,
 /// against the same release disk: the routed contract by every system and
 /// routing A/B scenario, and the `LFW-CFG` console transcript by two of the
-/// three system scenarios (`generation-swap` on the published disk and
-/// `alternate-configuration` on a second document's). Re-booting the same disk
-/// a twelfth time to re-assert a subset of what eleven boots just asserted
-/// would cost an image build and a QEMU run and establish nothing.
+/// six system scenarios (`generation-swap` on the published disk and
+/// `alternate-configuration` on a second document's). Re-booting the release
+/// disk once more here, to re-assert a subset of what the six system and eight
+/// A/B scenarios just asserted, would cost an image build and a QEMU run and
+/// establish nothing.
 ///
 /// The emptying covers the whole of [`ci`], not a boot alone: assembly
 /// populates `dist/` partway through, so a failure after that point leaves an

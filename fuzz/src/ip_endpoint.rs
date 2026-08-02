@@ -34,10 +34,22 @@
 //!   that receives one tests them.
 //! * **Nothing is carried between frames.** The same frame twice yields the same
 //!   reply byte for byte: an endpoint holds three configured values and no state
-//!   an adversary can move.
+//!   an adversary can move — for the two stateless protocols. A TCP segment is
+//!   deliberately excluded, a transport being state by definition.
+//! * **What the endpoint holds per connection is bounded and never leaked.** One
+//!   frame cannot reach that: random bytes never compose a segment whose
+//!   checksum verifies, so a single-frame harness never opens a connection and
+//!   never fills the table. A second phase therefore floods one endpoint with
+//!   *well-formed* handshakes from more sources than the table holds, injecting
+//!   the adversary's own frame between them, and holds the endpoint to the
+//!   invariant an eviction breaks: one return path per live connection, no more
+//!   and no fewer, and never a request slot the server could not find.
 
 use lfw_clock::{Calibration, Monotonic, Ticks};
-use lfw_ip_endpoint::{Endpoint, IsnSecret, Malformed, Outcome, Unhandled};
+use lfw_ip_endpoint::{
+    Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing, SeqNumber, TCP_MSS,
+    TCP_CONNECTIONS, Unhandled,
+};
 use net_headers::{
     ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Frame,
     Ipv4Packet, MIN_ECHO_REPLY_LEN, MacAddress, Protocol,
@@ -76,9 +88,16 @@ fn now() -> Monotonic {
 const REPLY_CAPACITY: usize = 2048;
 const UNTOUCHED: u8 = 0xa5;
 
+/// Hold one frame's answer, and then the endpoint's own bounded state, to
+/// everything the crate promises of them.
+pub fn ip_endpoint_harness(data: &[u8]) {
+    assert_one_frame_is_answered(data);
+    assert_state_stays_bounded_under_a_connection_flood(data);
+}
+
 /// Hand one frame to an addressed endpoint and hold both the reply and the
 /// counters to everything the crate promises of them.
-pub fn ip_endpoint_harness(data: &[u8]) {
+fn assert_one_frame_is_answered(data: &[u8]) {
     let mut endpoint = Endpoint::new(
         OUR_MAC,
         OUR_ADDRESS,
@@ -214,6 +233,127 @@ pub fn ip_endpoint_harness(data: &[u8]) {
     assert_eq!(endpoint.counters().total(), 2);
 }
 
+/// The station the flood below sends from, which is one peer: the whole point is
+/// that a single unauthenticated neighbour reaches the table's edge.
+const STATION_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0c]);
+const STATION_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
+
+/// Drive one endpoint through more connections than its table holds, injecting
+/// `frame` between them, and hold what it keeps per connection to its bound.
+///
+/// An eviction is the release nothing announces — the transport takes a slot back
+/// while answering a `SYN` and produces no timeout for it — so a return path or a
+/// request slot left behind is leaked for the life of the domain. It does not
+/// decay and nothing restarts the protection domain: the port simply stops
+/// retransmitting.
+fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
+    let mut endpoint = Endpoint::new(
+        OUR_MAC,
+        OUR_ADDRESS,
+        PREFIX_LENGTH,
+        IsnSecret::from_bytes(SECRET),
+    )
+    .expect("a unicast pair on a /24");
+    let mut out = [UNTOUCHED; REPLY_CAPACITY];
+
+    let hold = |endpoint: &Endpoint, where_: &str| {
+        assert!(
+            endpoint.connections() <= TCP_CONNECTIONS,
+            "the connection table exceeded its capacity {where_}"
+        );
+        assert_eq!(
+            endpoint.return_paths(),
+            endpoint.connections(),
+            "a return path outlived its connection {where_}"
+        );
+        assert_eq!(
+            endpoint.http_counters().slots_exhausted,
+            0,
+            "the server had no slot for a connection the transport made room for {where_}"
+        );
+    };
+
+    // Twice the table's capacity of half-open connections, so every newcomer
+    // past the first `TCP_CONNECTIONS` evicts one.
+    for index in 0..(2 * TCP_CONNECTIONS) {
+        // Lossless: the loop is bounded by twice a small table.
+        let port = 40_000u16.wrapping_add(index as u16);
+        let at = tick(index as u64);
+        let syn = syn_frame(port, 0x1000u32.wrapping_mul(index as u32).wrapping_add(1));
+        endpoint.handle(Some(at), &syn, &mut out);
+        hold(&endpoint, "while the table was filling");
+        // And the adversary's own frame between every pair, so whatever it is
+        // reaches an endpoint in every state the flood puts it through.
+        endpoint.handle(Some(at), frame, &mut out);
+        hold(&endpoint, "after the frame under test");
+    }
+
+    // Draining the timers holds it too, including past every deadline the
+    // transport keeps: that is where reapings and abandonments are answered.
+    for step in 0..4 {
+        let at = tick(1_000 + step * lfw_clock::NANOS_PER_SECOND * 400);
+        for _ in 0..(8 * TCP_CONNECTIONS) {
+            if !endpoint.poll_timeouts(at, &mut out).goes_on() {
+                break;
+            }
+            hold(&endpoint, "while the timers were draining");
+        }
+        for _ in 0..(8 * TCP_CONNECTIONS) {
+            if !endpoint.poll_output(at, &mut out).goes_on() {
+                break;
+            }
+            hold(&endpoint, "while the output was draining");
+        }
+    }
+    hold(&endpoint, "once everything had settled");
+}
+
+/// An instant `nanos` after boot.
+fn tick(nanos: u64) -> Monotonic {
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(nanos))
+}
+
+/// A well-formed `SYN` from the flooding station, in a whole Ethernet frame.
+///
+/// Composed rather than taken from the input, because a checksum a fuzzer
+/// stumbled on is a state this harness would reach once in the life of the
+/// universe — and the connection table's behaviour under pressure is what is
+/// being asserted, not the parser's.
+fn syn_frame(port: u16, iss: u32) -> Vec<u8> {
+    let mut frame = vec![0u8; 256];
+    let len = Outgoing {
+        source_port: port,
+        destination_port: MANAGEMENT_PORT,
+        sequence: SeqNumber::new(iss),
+        acknowledgement: SeqNumber::new(0),
+        flags: Flags::SYN,
+        window: 4096,
+        mss: Some(TCP_MSS),
+        window_scale: None,
+        payload: &[],
+    }
+    .write(
+        STATION_ADDRESS,
+        OUR_ADDRESS,
+        frame
+            .get_mut(Ipv4Frame::PAYLOAD_AT..)
+            .expect("room for a segment"),
+    )
+    .expect("room for a segment");
+    let total = Ipv4Frame {
+        destination_mac: OUR_MAC,
+        source_mac: STATION_MAC,
+        source: STATION_ADDRESS,
+        destination: OUR_ADDRESS,
+        protocol: Protocol::TCP,
+    }
+    .write(&mut frame, len)
+    .expect("room for a frame");
+    frame.truncate(total);
+    frame
+}
+
 /// The RFC 1071 sum over a block that carries its own checksum, folded to 16
 /// bits: all ones when the block validates. Written here rather than reached for,
 /// so the assertion is independent of the crate that produced the value.
@@ -286,11 +426,14 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
             let ethernet = Ethernet::parse(data).expect("a tagged frame has a header");
             assert_eq!(ethernet.header.ether_type, EtherType::VLAN);
         }
+        // The refusal names the value it refused; the `None` this variant also
+        // admits belongs to the counter table and never to a frame.
         Outcome::Unhandled(Unhandled::EtherType(ether_type)) => {
             let ethernet = Ethernet::parse(data).expect("an EtherType refusal has a header");
-            assert_eq!(&ethernet.header.ether_type, ether_type);
-            assert_ne!(*ether_type, EtherType::ARP);
-            assert_ne!(*ether_type, EtherType::IPV4);
+            let refused = ether_type.expect("a refused frame names the ethertype it carried");
+            assert_eq!(ethernet.header.ether_type, refused);
+            assert_ne!(refused, EtherType::ARP);
+            assert_ne!(refused, EtherType::IPV4);
         }
         // The remaining reasons are properties of an already-parsed header that
         // the counters attribute; there is nothing to re-derive from the bytes

@@ -11,6 +11,11 @@
 //! [`SECTOR_SIZE`](crate::SECTOR_SIZE), so "inside the region" is arithmetic
 //! rather than a check somebody remembered.
 //!
+//! A segment is a *span*, though, and its far end is the byte a device DMAs up
+//! to, so [`IoSpan`] is the authority for a run of them: no layer below is in a
+//! position to bound one, `Requests::submit` knowing the medium's capacity and
+//! not this region's extent.
+//!
 //! # The adversary
 //!
 //! A **hostile or malfunctioning device**, on the read path: the
@@ -81,6 +86,64 @@ impl IoSector {
     }
 }
 
+/// A run of bytes of the staging window: wholly inside the region by
+/// construction, because an [`IoSector`] bounds only its first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoSpan {
+    sector: IoSector,
+    len: u32,
+}
+
+impl IoSpan {
+    /// The `len` bytes starting at `sector`, or `None` where they do not fit the
+    /// window. Zero is refused: virtio-blk has no zero-length data segment.
+    #[must_use]
+    pub const fn new(sector: IoSector, len: u32) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        // `sector.offset() < BLK_IO_REGION_SIZE` by `IoSector`'s construction,
+        // so the sum is the only part that can leave the window — and it is
+        // computed in `usize`, which on this target holds every `u32`.
+        match sector.offset().checked_add(len as usize) {
+            Some(end) if end <= BLK_IO_REGION_SIZE => Some(Self { sector, len }),
+            _ => None,
+        }
+    }
+
+    /// The `len` bytes at byte offset `at` of the window, or `None` where `at` is
+    /// not a sector boundary or the bytes do not fit. Refused rather than
+    /// rounded down, which would hand the device a span starting before the
+    /// bytes the caller meant.
+    #[must_use]
+    pub const fn at_offset(at: usize, len: u32) -> Option<Self> {
+        if !at.is_multiple_of(SECTOR_SIZE) {
+            return None;
+        }
+        match IoSector::new(at / SECTOR_SIZE) {
+            Some(sector) => Self::new(sector, len),
+            None => None,
+        }
+    }
+
+    /// The window sector the span starts at.
+    #[must_use]
+    pub const fn sector(self) -> IoSector {
+        self.sector
+    }
+
+    /// Bytes the span covers, never zero — which is why it is not a `len`: there
+    /// is no empty form for an `is_empty` to answer.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.len
+    }
+
+    const fn offset(self) -> usize {
+        self.sector.offset()
+    }
+}
+
 /// Why a staging window could not be attached: its patched physical base is
 /// zero, not page-aligned, or so high that the region's end is not
 /// representable. `paddr` is the diagnosis, and the console is the only place
@@ -132,12 +195,22 @@ impl IoRegion<'_> {
         })
     }
 
-    /// The physical address of `sector`, for a request's data segment.
+    /// The physical address of `sector`, for a data segment of exactly one
+    /// sector — the only length the sector bound is also the span bound for.
+    /// Anything longer is an [`IoSpan`] and [`span_paddr`](Self::span_paddr).
     #[must_use]
     pub const fn sector_paddr(&self, sector: IoSector) -> u64 {
         // Cannot overflow: `attach` established that `paddr + BLK_IO_REGION_SIZE`
         // is representable, and `IoSector::offset` is below that size.
         self.paddr + sector.offset() as u64
+    }
+
+    /// The physical address a data segment covering `span` starts at — the span
+    /// rather than its first sector, so the address and the length published
+    /// beside it come from one bounded value.
+    #[must_use]
+    pub const fn span_paddr(&self, span: IoSpan) -> u64 {
+        self.paddr + span.offset() as u64
     }
 
     /// Place one sector's worth of bytes into the window, for the device to
@@ -164,20 +237,30 @@ impl IoRegion<'_> {
         }
     }
 
-    /// The whole window, for a caller composing transfers in place — a
+    /// One span of the window, for a caller composing transfers in place — a
     /// recording, which is hundreds of kilobytes and has no other home: a
-    /// protection domain's stack is tens and it has no allocator. `&mut self`
-    /// is the aliasing argument, and offsets are bounded by the slice.
-    pub fn staging(&mut self) -> &mut [u8] {
+    /// protection domain's stack is tens and it has no allocator.
+    ///
+    /// A span rather than the whole window: a borrow covering bytes the device
+    /// is filling right now is a race whatever the borrow says, and only the
+    /// caller knows which spans have a transfer against them.
+    pub fn staging(&mut self, span: IoSpan) -> &mut [u8] {
         // SAFETY: `attach`'s contract makes `base` a live `BLK_IO_REGION_SIZE`
-        // mapping held for `'region`, so the slice is in bounds for the whole
-        // borrow; `u8` needs no alignment and has no invalid bit pattern, so
-        // whatever the device left there is initialized. Exclusivity is this
+        // mapping held for `'region`, and `IoSpan` puts `offset + len` inside
+        // that size, so the slice is in bounds for the whole borrow; `u8` needs
+        // no alignment and has no invalid bit pattern, so whatever the device
+        // left there is initialized.
+        //
+        // Exclusivity has two halves. Against every other holder it is this
         // `&mut self` plus the grant: `blk_io` is mapped `rw` to the recorder
-        // alone, which `xtask::sysdesc`'s `REGIONS` rule for it enforces.
-        // The device may DMA in concurrently, so bytes read back are
-        // payload and never a value that steers an access, exactly as `take`'s.
-        unsafe { core::slice::from_raw_parts_mut(self.base, BLK_IO_REGION_SIZE) }
+        // alone, which `xtask::sysdesc`'s `REGIONS` rule enforces. Against the
+        // device it is the caller's: no transfer this driver published may still
+        // be outstanding over `span`. The enforcer is `lfw_recorder::Deck`,
+        // which partitions the window into areas no two transfers share and
+        // holds at most one against each, proved by its
+        // `only_one_flush_is_outstanding_at_a_time`. Bytes read back are the
+        // device's and are payload, never a value that steers an access.
+        unsafe { core::slice::from_raw_parts_mut(self.base.add(span.offset()), span.len as usize) }
     }
 
     /// Copy one sector's worth of bytes out of the window — whatever the device

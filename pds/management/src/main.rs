@@ -102,7 +102,7 @@
 //! nobody, and anything that can reach the management port can read every metric
 //! this node exposes. `GET /config` and `GET /logs` are absent too and answer 404
 //! rather than being stubbed. Until the required TLS termination
-//! exists the port belongs on an isolated network; the status table records it.
+//! exists the port belongs on an isolated network.
 //!
 //! # What a console record says, and why not one per frame
 //!
@@ -177,6 +177,11 @@ fn clock_refusal(refusal: CalibrationRefused) -> Refusal {
         CalibrationRefused::FrequencyImplausible { tsc_hz } => Refusal {
             cause: "clock-implausible-frequency",
             detail: RefusalDetail::One(tsc_hz),
+            signalled: false,
+        },
+        CalibrationRefused::EpochImplausible { unix_nanos } => Refusal {
+            cause: "clock-implausible-epoch",
+            detail: RefusalDetail::One(unix_nanos),
             signalled: false,
         },
     }

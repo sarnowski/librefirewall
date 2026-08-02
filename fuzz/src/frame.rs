@@ -30,13 +30,25 @@
 //! * **The rewrite leaves a valid packet.** The result re-parses — which is the
 //!   header checksum asserted the way the next hop tests it — with a TTL
 //!   exactly one lower.
+//! * **The appliance's own address is never a source.** A frame claiming to come
+//!   from an address this router holds is forged or looped, and is refused as a
+//!   martian rather than carried.
+//! * **The transport header decides nothing.** Rewriting the two bytes behind
+//!   the IPv4 header leaves both the parse and the verdict exactly as they were:
+//!   a router forwards a datagram because the datagram is well formed, and a UDP
+//!   length that contradicts it is the receiving endpoint's to refuse.
+//! * **The egress does not depend on how the table was written.** Two enabled
+//!   interfaces of equal prefix length covering the frame's own destination
+//!   resolve to the same one in either order.
+//! * **A zero prefix length is never the route.** It covers every destination,
+//!   so selecting it would be a default route; a real prefix wins instead.
 
 use std::sync::LazyLock;
 
 use net_headers::{
     ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet, MacAddress,
 };
-use routing::{Decision, Interface, Neighbour, PortId, Router};
+use routing::{Decision, DropReason, Interface, Neighbour, PortId, Router};
 
 const PORT0: PortId = PortId(0);
 const PORT1: PortId = PortId(1);
@@ -107,6 +119,124 @@ fn agree_on_the_ipv4_header(data: &[u8]) {
     }
 }
 
+/// The two bytes the UDP length field occupies in an untagged frame, which is
+/// also the fifth and sixth byte of whatever else the datagram carries there.
+const TRANSPORT_LENGTH_AT: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 4;
+
+/// Rewriting the transport header changes neither the parse nor the verdict.
+///
+/// A router carries an IPv4 datagram because the datagram is well formed; what
+/// the transport says about itself belongs to whoever receives it. Asserted by
+/// overwriting the two bytes a UDP length field sits at — which for any other
+/// protocol are ordinary payload — and demanding the same answer, so a rule that
+/// crept back into the transport parser and refused a frame on those bytes fails
+/// here rather than silently dropping traffic on the appliance.
+///
+/// Only untagged frames: an 802.1Q tag moves the transport header four bytes
+/// along, and writing at the untagged offset would land in the IPv4 header,
+/// where a changed byte legitimately changes the verdict.
+fn the_transport_header_decides_nothing(data: &[u8]) {
+    let mut original = data.to_vec();
+    let Ok(frame) = Frame::parse(&mut original) else {
+        return;
+    };
+    if frame.vlan().is_some() {
+        return;
+    }
+    let baseline = [
+        ROUTER.decide(PORT0, &frame),
+        ROUTER.decide(PORT1, &frame),
+    ];
+    if data.len() < TRANSPORT_LENGTH_AT + 2 {
+        return;
+    }
+
+    for length in [0u16, 1, 8, 0x0fff, u16::MAX] {
+        let mut mutated = data.to_vec();
+        let Some(field) = mutated.get_mut(TRANSPORT_LENGTH_AT..TRANSPORT_LENGTH_AT + 2) else {
+            return;
+        };
+        field.copy_from_slice(&length.to_be_bytes());
+        let Ok(mutated_frame) = Frame::parse(&mut mutated) else {
+            panic!("a transport length of {length} made a well-formed datagram unparsable");
+        };
+        assert_eq!(
+            [
+                ROUTER.decide(PORT0, &mutated_frame),
+                ROUTER.decide(PORT1, &mutated_frame),
+            ],
+            baseline,
+            "a transport length of {length} changed the routing verdict"
+        );
+    }
+}
+
+/// Two enabled interfaces of equal prefix length, both covering the frame's own
+/// destination, resolve to the same egress whichever order they were written in
+/// — and a third table naming a zero prefix length is refused outright.
+///
+/// The addresses come from the frame, so the adversary chooses which destination
+/// the overlap is built around. Both properties are about the table rather than
+/// the packet, which is why they are asserted through `route` and `from_slices`
+/// directly: reaching them through a verdict would need the frame to survive the
+/// link-layer checks first, leaving them reachable only by accident.
+fn the_table_answers_the_same_however_it_was_written(data: &[u8]) {
+    let mut bytes = data.to_vec();
+    let Ok(frame) = Frame::parse(&mut bytes) else {
+        return;
+    };
+    let destination = frame.ipv4().destination;
+    let [network, ..] = destination.octets();
+
+    // One /8 per port, both covering the destination, differing in everything
+    // the tie-break can see. Only the order they are written in is left.
+    let first = Interface {
+        port: PORT0,
+        mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+        address: Ipv4Address::from_octets([network, 0, 0, 1]),
+        prefix_length: 8,
+        enabled: true,
+    };
+    let second = Interface {
+        port: PORT1,
+        mac: MacAddress([0x02, 0, 0, 0, 0, 2]),
+        address: Ipv4Address::from_octets([network, 0, 0, 2]),
+        prefix_length: 8,
+        enabled: true,
+    };
+    let written = Router::<2, 0>::from_slices(&[first, second], &[]).expect("two fit in two");
+    let reversed = Router::<2, 0>::from_slices(&[second, first], &[]).expect("two fit in two");
+    assert_eq!(
+        written.route(destination),
+        reversed.route(destination),
+        "the egress for {destination} followed the table order",
+    );
+    assert!(
+        written.route(destination).is_some(),
+        "both prefixes cover {destination}, so one of them must answer",
+    );
+
+    // And a zero prefix length is never the route, however the table is written:
+    // it covers this destination and every other one, so selecting it would be a
+    // default route.
+    let default_route = Interface {
+        prefix_length: 0,
+        ..first
+    };
+    assert!(default_route.covers(destination), "a /0 covers everything");
+    for table in [
+        Router::<2, 0>::from_slices(&[default_route, second], &[]),
+        Router::<2, 0>::from_slices(&[second, default_route], &[]),
+    ] {
+        let table = table.expect("two fit in two");
+        assert_eq!(
+            table.route(destination).map(|entry| entry.prefix_length),
+            Some(second.prefix_length),
+            "a zero prefix length was selected as a connected route",
+        );
+    }
+}
+
 /// Parse one frame, decide on it as if it had arrived on each port in turn, and
 /// carry out whatever rewrite the decision authorises.
 ///
@@ -115,6 +245,8 @@ fn agree_on_the_ipv4_header(data: &[u8]) {
 /// the whole `Forward` arm reachable only by accident.
 pub fn frame_routing_harness(data: &[u8]) {
     agree_on_the_ipv4_header(data);
+    the_transport_header_decides_nothing(data);
+    the_table_answers_the_same_however_it_was_written(data);
     for ingress in [PORT0, PORT1] {
         let original = data.to_vec();
         let mut bytes = original.clone();
@@ -126,6 +258,23 @@ pub fn frame_routing_harness(data: &[u8]) {
         };
 
         let decision = ROUTER.decide(ingress, &frame);
+        // A frame claiming one of this router's own addresses as its source is
+        // forged or looped and may never be carried. Asserted for a frame that
+        // reaches the source check at all: the link-layer refusals in front of it
+        // outrank it, and a tagged or misaddressed frame is refused there first.
+        let addressed_to_us = ROUTER
+            .interface(ingress)
+            .is_some_and(|entry| entry.mac == frame.destination_mac());
+        if ROUTER.is_local_address(frame.ipv4().source)
+            && frame.vlan().is_none()
+            && addressed_to_us
+        {
+            assert_eq!(
+                decision,
+                Decision::Drop(DropReason::MartianSource),
+                "a frame sourced from an address this appliance holds was not refused",
+            );
+        }
         let Decision::Forward {
             egress,
             source,

@@ -143,6 +143,9 @@ fn write_stamp(at: Stamp, cursor: &mut Cursor<'_>) -> fmt::Result {
     }
 }
 
+/// The `cause` key, named because its width decides whether a cause was written.
+const CAUSE_KEY: &str = " cause=";
+
 /// The tail of an `LFW-PD` line, absent for the lifecycle points that carry
 /// nothing: a record ending in an empty field reads as a missing value.
 fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'_>) -> fmt::Result {
@@ -159,7 +162,9 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
         DomainDetail::Received { frames, bytes } => {
             write!(cursor, " frames={frames} bytes={bytes}")
         }
-        // Decimal against a disk's size, hexadecimal against bytes.
+        // Decimal against a disk's size, hexadecimal against bytes — and padded
+        // to all sixteen digits, so a superblock's first eight bytes line up
+        // between two records rather than shortening around a zero byte.
         DomainDetail::Medium {
             capacity_sectors,
             leading_word,
@@ -176,7 +181,17 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             detail,
             signalled,
         }) => {
-            write!(cursor, " cause={cause} signalled={signalled}")?;
+            // An absent value takes its key with it, as `None` above does: a
+            // domain may refuse without naming a cause, and a value-less key is
+            // the one shape a reader looking keys up cannot read. Written and
+            // rewound, so one `Display` call decides it.
+            let before = cursor.written;
+            cursor.write_str(CAUSE_KEY)?;
+            write!(cursor, "{cause}")?;
+            if cursor.written == before.saturating_add(CAUSE_KEY.len()) {
+                cursor.written = before;
+            }
+            write!(cursor, " signalled={signalled}")?;
             // Hexadecimal throughout: a refusal's numbers are device
             // identifiers, addresses and status bits, read against a datasheet.
             match detail {
@@ -215,7 +230,7 @@ impl fmt::Write for Cursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detail::MAX_CAUSE_LEN;
+    use crate::detail::{Cause, MAX_CAUSE_LEN};
     use crate::event::{
         ChangeKind, Domain, DomainState, Field, GenerationOutcome, ObjectKind, RejectReason, Value,
     };
@@ -248,6 +263,12 @@ mod tests {
     }
 
     fn rendered_at(at: Stamp, event: &Event) -> String {
+        rendered_cause(at, event)
+    }
+
+    /// The same, for the decoded shape whose cause is a [`Cause`] rather than a
+    /// literal — which is the only one that can carry the empty token.
+    fn rendered_cause<C: fmt::Display>(at: Stamp, event: &Event<C>) -> String {
         let mut buffer = [0u8; MAX_LINE_LEN];
         let written = render(at, event, &mut buffer).expect("MAX_LINE_LEN holds every line");
         String::from_utf8(buffer[..written].to_vec()).expect("the grammar is ASCII")
@@ -454,6 +475,46 @@ mod tests {
         assert_eq!(
             refusal(RefusalDetail::None),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=nic-driver state=refused cause=not-virtio-net signalled=false"
+        );
+    }
+
+    /// A cause that names nothing takes its key with it. The record ABI admits
+    /// the empty token deliberately, so a byzantine writing domain can publish
+    /// one — and a key with nothing after it is the one shape a reader looking a
+    /// key up cannot tell from a key whose value happens to be missing.
+    #[test]
+    fn a_refusal_naming_no_cause_omits_the_key_rather_than_writing_it_empty() {
+        let line = |cause: Cause, detail| {
+            rendered_cause(
+                AT,
+                &Event::Domain {
+                    domain: Domain::Recorder,
+                    state: DomainState::Refused,
+                    detail: DomainDetail::Refusal(Refusal {
+                        cause,
+                        detail,
+                        signalled: true,
+                    }),
+                },
+            )
+        };
+        assert_eq!(
+            line(Cause::EMPTY, RefusalDetail::None),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=refused \
+             signalled=true"
+        );
+        // The fields after it are unmoved, so omitting one does not shift a
+        // reader's handle on the rest.
+        assert_eq!(
+            line(Cause::EMPTY, RefusalDetail::Two(1, 2)),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=refused \
+             signalled=true detail=0x1,0x2"
+        );
+        let named = Cause::new(b"extent-unusable").expect("the token is in the alphabet");
+        assert_eq!(
+            line(named, RefusalDetail::None),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=refused \
+             cause=extent-unusable signalled=true"
         );
     }
 

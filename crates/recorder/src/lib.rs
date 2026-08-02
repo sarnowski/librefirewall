@@ -32,7 +32,8 @@
 #![forbid(unsafe_code)]
 
 use lfw_capture_ring::{
-    Append, Cursor, Geometry, Located, Ring, RingState, RingStateError, SECTOR_SIZE,
+    Append, Copies, Cursor, Geometry, Located, Ring, RingState, RingStateError, SECTOR_SIZE,
+    SUPERBLOCK_BYTES, SuperblockWrite, encode_superblock,
 };
 use lfw_pcapng::{
     CustomBinary, EncodeError, EnhancedPacket, InterfaceDescription, LinkType,
@@ -158,7 +159,7 @@ pub enum Recorded {
     SegmentFull,
     /// No segment could ever hold it. Counted and dropped.
     Oversized { needed: usize },
-    /// The staging buffer is full: flush and retry.
+    /// No room left in the staging buffer: flush and retry.
     StagingFull { needed: usize, free: usize },
     /// The encoder refused the record. Counted and dropped.
     Refused(EncodeError),
@@ -266,7 +267,9 @@ pub struct SinkCounters {
     pub records: u64,
     pub record_bytes: u64,
     pub dropped_oversized: u64,
-    pub dropped_staging_full: u64,
+    /// Records refused for want of staging room. **Not a drop** — the record is
+    /// still the caller's, and [`crate::deck::Deck`] re-offers it after a flush.
+    pub staging_deferrals: u64,
     pub dropped_refused: u64,
     pub segments_closed: u64,
     pub wraps: u64,
@@ -294,6 +297,12 @@ pub struct Sink {
     staged_len: usize,
     /// Everything the device has acknowledged.
     durable: Cursor,
+    /// The oldest sequence a download may claim. A resumed sink starts it at the
+    /// segment this boot opened, its predecessor having been left unsealed.
+    first_claimable: u64,
+    /// Whether the superblock region may still hold another ring's — so until a
+    /// checkpoint of this one reached the device, and never for a resumed sink.
+    superblock_stale: bool,
     /// True while a [`Flush`] is outstanding.
     flushing: bool,
     /// Tap-ring drops to attribute to the next record, so the file states its
@@ -303,13 +312,15 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// Build a sink over a fresh extent. The caller must then write the opening
-    /// prologue with [`Sink::open`].
+    /// Build a sink over a fresh extent, composing its opening prologue into
+    /// `staging` rather than leaving a call for the caller to remember: records
+    /// staged over an absent prologue put the staging offset out of step with
+    /// the ring cursor, and every later flush is addressed short of its bytes.
     ///
     /// # Errors
-    /// [`SinkError`] when the interfaces do not fit a prologue, or the prologue
-    /// does not fit a segment.
-    pub fn new(config: SinkConfig) -> Result<Self, SinkError> {
+    /// [`SinkError`] when the interfaces do not fit a prologue, it does not fit a
+    /// segment, or the staging buffer cannot hold it.
+    pub fn new(config: SinkConfig, staging: &mut [u8]) -> Result<Self, SinkError> {
         let prologue = prologue_len(&config)?;
         if !payload_fits(prologue, config.geometry.segment_bytes()) {
             return Err(SinkError::PrologueTooLong {
@@ -317,7 +328,7 @@ impl Sink {
                 segment: config.geometry.segment_bytes(),
             });
         }
-        Ok(Self {
+        let mut sink = Self {
             ring: Ring::new(config.geometry, prologue),
             snap_len: config.snap_len,
             interfaces: config.interfaces,
@@ -329,46 +340,43 @@ impl Sink {
                 sequence: 0,
                 offset: 0,
             },
+            first_claimable: 0,
+            superblock_stale: true,
             flushing: false,
             pending_drops: 0,
             counters: SinkCounters::default(),
-        })
+        };
+        sink.write_prologue(staging).map_err(SinkError::Encode)?;
+        Ok(sink)
     }
 
-    /// Resume a sink from a superblock a previous boot left.
+    /// Resume from a superblock a previous boot left, its segment's prologue
+    /// composed into `staging` as [`Sink::new`]'s is.
     ///
     /// # Errors
     /// As [`Sink::new`], plus [`SinkError::State`] when the stored state does
     /// not describe this deployment's geometry.
-    pub fn resume(config: SinkConfig, state: &RingState) -> Result<Self, SinkError> {
+    pub fn resume(
+        config: SinkConfig,
+        state: &RingState,
+        staging: &mut [u8],
+    ) -> Result<Self, SinkError> {
         let checked = state.check(&config.geometry).map_err(SinkError::State)?;
-        let mut sink = Self::new(config)?;
+        let mut sink = Self::new(config, staging)?;
         let prologue = sink.ring.prologue_len();
         sink.ring = Ring::resume(checked, prologue);
-        // A resumed ring continues in a fresh segment: the bytes the previous
-        // boot left in the open one were never sealed, so nothing claims them.
         sink.ring.roll();
         sink.staged_sequence = sink.ring.cursor().sequence;
         sink.durable = Cursor {
             sequence: sink.staged_sequence,
             offset: 0,
         };
+        sink.first_claimable = sink.staged_sequence;
+        sink.superblock_stale = false;
+        sink.staged_from = 0;
+        sink.staged_len = 0;
+        sink.write_prologue(staging).map_err(SinkError::Encode)?;
         Ok(sink)
-    }
-
-    /// Write the opening segment's prologue into the staging buffer.
-    ///
-    /// # Errors
-    /// [`EncodeError`] when the staging buffer cannot hold a prologue.
-    pub fn open(&mut self, staging: &mut [u8]) -> Result<usize, EncodeError> {
-        self.staged_sequence = self.ring.cursor().sequence;
-        self.staged_from = 0;
-        self.staged_len = 0;
-        self.durable = Cursor {
-            sequence: self.staged_sequence,
-            offset: 0,
-        };
-        self.write_prologue(staging)
     }
 
     #[must_use]
@@ -438,7 +446,7 @@ impl Sink {
                 data: &verdict_data,
             }),
             custom: Some(CustomBinary {
-                pen: lfw_pcapng::GROPYUS_PEN,
+                pen: lfw_pcapng::UNREGISTERED_PEN,
                 data: &annotation,
             }),
             comment: None,
@@ -468,8 +476,7 @@ impl Sink {
         let written = match write_enhanced_packet(out, &epb) {
             Ok(written) => written,
             Err(EncodeError::OutOfSpace { needed, capacity }) => {
-                self.counters.dropped_staging_full =
-                    self.counters.dropped_staging_full.saturating_add(1);
+                self.counters.staging_deferrals = self.counters.staging_deferrals.saturating_add(1);
                 return Recorded::StagingFull {
                     needed,
                     free: capacity,
@@ -602,24 +609,45 @@ impl Sink {
             .saturating_add((len / SECTOR_SIZE) as u64);
     }
 
-    /// The superblock this sink's state encodes to.
+    /// Compose this recording's next superblock into `image`, answering which part
+    /// of the region the caller must put on the medium.
+    ///
+    /// It records the **durable** cursor: a superblock states where the recording
+    /// ends to anything holding the disk, and the append cursor runs ahead of it
+    /// by everything still staged.
     ///
     /// # Errors
     /// [`RingStateError`] when the cursor cannot be represented.
-    pub fn state(&mut self) -> Result<RingState, RingStateError> {
-        self.ring.checkpoint(&[])
+    pub fn superblock(
+        &mut self,
+        image: &mut [u8; SUPERBLOCK_BYTES],
+    ) -> Result<SuperblockWrite, RingStateError> {
+        let state = self.ring.checkpoint(self.durable, &[])?;
+        let copies = if self.superblock_stale {
+            Copies::Both
+        } else {
+            Copies::Parity
+        };
+        Ok(encode_superblock(image, &state, copies))
+    }
+
+    pub fn acknowledge_checkpoint(&mut self) {
+        self.superblock_stale = false;
     }
 
     /// Pin what a download will deliver.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         let (oldest, _) = self.ring.readable();
-        let first = oldest;
+        let first = oldest.max(self.first_claimable);
+        // Empty rather than clamping the segment count: a clamp keeps
+        // `durable.offset` in the total and hands a reader that many bytes out of
+        // `first`, which is a different segment entirely.
+        if self.durable.sequence < first {
+            return Snapshot { first, total: 0 };
+        }
         let segment = self.ring.geometry().segment_bytes() as u64;
-        // Saturating rather than branching: a durable position older than the
-        // oldest live segment describes no readable bytes, which is what a
-        // zero span already says.
-        let segments = self.durable.sequence.saturating_sub(first);
+        let segments = self.durable.sequence - first;
         let total = segments
             .saturating_mul(segment)
             .saturating_add(self.durable.offset as u64);
@@ -703,22 +731,29 @@ impl Sink {
     }
 
     fn write_prologue(&mut self, staging: &mut [u8]) -> Result<usize, EncodeError> {
+        // From the staged tail, as `record` and `pad` do, rather than from zero,
+        // which is correct only while every caller empties the buffer first.
+        let at = self.staged_len;
         let mut written = 0usize;
         let header = SectionHeader {
             hardware: None,
             os: Some("librefirewall"),
             application: Some("librefirewall recorder"),
             schema: Some(CustomBinary {
-                pen: lfw_pcapng::GROPYUS_PEN,
+                pen: lfw_pcapng::UNREGISTERED_PEN,
                 data: &[ANNOTATION_VERSION, 0, 0, 0],
             }),
         };
-        let out: &mut [u8] = staging.get_mut(written..).unwrap_or_default();
+        let out: &mut [u8] = staging
+            .get_mut(at.saturating_add(written)..)
+            .unwrap_or_default();
         written += write_section_header(out, &header)?;
         for index in 0..self.interface_count {
             let name = self.interfaces.get(index).copied().unwrap_or(EMPTY_NAME);
             let idb = self.interface_description(&name);
-            let out: &mut [u8] = staging.get_mut(written..).unwrap_or_default();
+            let out: &mut [u8] = staging
+                .get_mut(at.saturating_add(written)..)
+                .unwrap_or_default();
             written += write_interface_description(out, &idb)?;
         }
         self.staged_len = self.staged_len.saturating_add(written);
@@ -777,7 +812,7 @@ pub fn prologue_len(config: &SinkConfig) -> Result<usize, SinkError> {
         os: Some("librefirewall"),
         application: Some("librefirewall recorder"),
         schema: Some(CustomBinary {
-            pen: lfw_pcapng::GROPYUS_PEN,
+            pen: lfw_pcapng::UNREGISTERED_PEN,
             data: &[ANNOTATION_VERSION, 0, 0, 0],
         }),
     };
@@ -805,8 +840,8 @@ pub fn prologue_len(config: &SinkConfig) -> Result<usize, SinkError> {
 pub mod deck;
 
 pub use deck::{
-    Area, COMPLETION_BUDGET, Completion, Deck, DeckError, Ended, Job, Medium, RecorderCounters,
-    Refused, Served, TAP_BUDGET, Transfer, Which,
+    Area, COMPLETION_BUDGET, Completion, Deck, DeckError, Ended, Job, Medium, Polled,
+    RecorderCounters, Refused, Served, TAP_BUDGET, Transfer, Which,
 };
 
 #[cfg(test)]

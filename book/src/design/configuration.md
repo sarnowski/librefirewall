@@ -28,8 +28,8 @@ Configuration uses a **candidate/running datastore** model with **commit-confirm
 
 ## Distributed staged rollout
 
-Across the HA pair (and later across multiple clusters via central configuration management),
-rollout is a **two-phase "stage & validate" → "commit"** process:
+Across the HA pair (and across multiple clusters via central configuration management), rollout is a
+**two-phase "stage & validate" → "commit"** process:
 
 - **Phase 1 — stage & validate:** the candidate is pushed to every participating node; each node
   independently parses, structurally and semantically validates, checks local applicability,
@@ -41,8 +41,11 @@ rollout is a **two-phase "stage & validate" → "commit"** process:
   runtime-connectivity safety.
 - Apply ordering is **staggered/canary** (standby first, verified healthy, then active), so a
   configuration that validates but fails at runtime does not take down both nodes at once.
-- Commits are **idempotent, keyed by a monotonic configuration generation-id/hash**, and the
-  staged (prepared) state has a timeout, so a coordinator failure cannot leave nodes stuck.
+- Commits are **idempotent, keyed by the monotonic configuration generation**, and the staged
+  (prepared) state has a timeout, so a coordinator failure cannot leave nodes stuck. Whether a
+  submitted configuration is the one already running is decided by comparing content, never by
+  comparing a digest of it — a digest cheap enough to carry is short enough to collide, and a
+  collision would suppress a real change.
 - Standalone changes (a direct configuration change against a single node) retain per-node
   commit-confirmed protection.
 - **Availability of configuration changes.** Unanimous agreement is required only while all
@@ -50,8 +53,6 @@ rollout is a **two-phase "stage & validate" → "commit"** process:
   configuration changes (a single-node commit), marking its configuration generation as divergent
   and reconciling with the peer when it rejoins — so a configuration change is never blocked by an
   unreachable node.
-
-**Central configuration management** for multiple clusters is developed later.
 
 ## Static hardware, dynamic configuration
 

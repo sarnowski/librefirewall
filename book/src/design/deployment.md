@@ -18,12 +18,9 @@ unit. Four roles exist:
   one or more dataplane pairs.
 - **Mirror port** — an optional, egress-only port that emits a copy of selected traffic to an
   external capture/IDS system. It is **complementary to the on-box
-  [recording sinks](recording.md), not an alternative to them**: a mirror moves traffic off the box
-  at full rate but can annotate none of it, cannot render several interfaces into one artifact, and
-  costs both a spare port and a dedicated machine able to absorb the mirrored rate; the sinks
-  record annotated, verdict-bearing evidence on the box and need neither. A deployment that wants
-  full-rate capture on dedicated hardware uses the mirror; one that wants to know why the appliance
-  did what it did uses the sinks; a deployment may want both.
+  [recording sinks](recording.md#pcapng-as-the-internal-representation), not an alternative to
+  them** — the recording design sets out what each buys and what it costs — and a deployment may
+  want both.
 
 ## NIC configurations
 

@@ -1222,9 +1222,11 @@ fn a_reply_that_does_not_fit_is_counted_as_ours() {
     // And a send into storage too small is refused the same way.
     let mut peer = Peer::new(40001, 0xd_1000);
     let id = handshake(&mut stack, at(0), &mut peer);
+    // The range was recorded and the sequence advanced before the compose, so
+    // the refusal names the bytes the caller must still hold for it.
     assert!(matches!(
         stack.send(at(1_000), id, b"payload", &mut tiny),
-        Err(SendError::Write(_))
+        Err(SendError::Write { committed: 7, .. })
     ));
     assert_eq!(stack.counters().write_refused, 2);
 }
@@ -1773,9 +1775,11 @@ fn every_composing_path_counts_storage_too_small_as_ours() {
         .connection(other)
         .and_then(Connection::oldest_range)
         .expect("one range");
+    // Nothing is committed by a retransmission: the range was already
+    // outstanding before it was asked for.
     assert!(matches!(
         stack.retransmit(at(5_000), other, sequence, b"payload", &mut tiny),
-        Err(SendError::Write(_))
+        Err(SendError::Write { committed: 0, .. })
     ));
     assert_eq!(stack.counters().write_refused, 4);
 }
@@ -1970,4 +1974,255 @@ fn the_advertised_window_is_the_callers_to_set() {
     let reset = gone.segment_at(gone.next, Flags::RST, &[]);
     stack.receive(at(4_000), STATION, &reset, &mut out);
     assert!(!stack.set_receive_window(stale, 100));
+}
+
+/// RFC 5961 section 5's left edge, which is the half RFC 793 does not state: an
+/// acknowledgement further behind `SND.UNA` than any window the peer ever
+/// offered is challenged rather than believed, so it never reaches the window
+/// update.
+#[test]
+fn an_acknowledgement_far_behind_the_send_window_is_challenged() {
+    let mut stack = stack();
+    // A peer whose `SYN` offers 4096, which is `MAX.SND.WND` from then on.
+    let mut peer = Peer::new(40000, 0x1c_0000);
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+    let una = peer.expect;
+
+    // Exactly at the left edge is inside the acceptable range, so the refusal
+    // below is a boundary rather than a blanket one.
+    peer.expect = una.sub(4_096);
+    let edge = peer.segment_at(peer.next, Flags::ACK, &[]);
+    let received = stack.receive(at(1_000), STATION, &edge, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+
+    // One byte further back is not, and the answer is a challenge rather than a
+    // reset: a blind acknowledgement must not tear a connection down.
+    peer.expect = una.sub(4_097);
+    // A window of one byte, which the challenge must keep this end from
+    // believing — reaching `update_window` is what the test is really about.
+    peer.window = 1;
+    let stale = peer.segment_at(peer.next, Flags::ACK, &[]);
+    let received = stack.receive(at(2_000), STATION, &stale, &mut out);
+    assert_eq!(
+        received.outcome,
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+    );
+    let challenge = peer.read(&out[..received.emitted]);
+    assert!(
+        !challenge.flags.contains(Flags::RST),
+        "a blind acknowledgement drew a reset"
+    );
+    assert_eq!(stack.counters().refused_unacceptable_ack, 1);
+
+    // The window it carried never reached the connection: a send still takes
+    // what the handshake's own window allows.
+    let sent = stack
+        .send(at(3_000), id, &[0u8; 64], &mut out)
+        .expect("a segment");
+    assert_eq!(
+        sent.bytes, 64,
+        "a window from a challenged acknowledgement was believed"
+    );
+}
+
+/// RFC 793 section 3.9 restarts `TIME_WAIT` on a retransmitted remote `FIN` and
+/// on nothing else: a peer that keeps acknowledging into a closed connection is
+/// answered out of the wait already running rather than holding the slot for as
+/// long as it cares to keep sending.
+#[test]
+fn a_bare_acknowledgement_in_time_wait_does_not_restart_the_wait() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1c_1000);
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+
+    let len = stack.close(at(0), id, &mut out).expect("a FIN");
+    peer.read(&out[..len]);
+    let ack = peer.ack();
+    stack.receive(at(0), STATION, &ack, &mut out);
+    let fin = peer.fin();
+    let received = stack.receive(at(0), STATION, &fin, &mut out);
+    peer.read(&out[..received.emitted]);
+    assert_eq!(
+        stack.connection(id).map(Connection::state),
+        Some(State::TimeWait)
+    );
+
+    // A bare acknowledgement most of the way through the wait: answered, and
+    // the deadline unmoved.
+    let nearly = at(TIME_WAIT_DURATION.as_nanos() - 1);
+    let probe = peer.segment_at(peer.next, Flags::ACK, &[]);
+    let received = stack.receive(nearly, STATION, &probe, &mut out);
+    assert!(
+        received.emitted > 0,
+        "a segment in TIME_WAIT went unanswered"
+    );
+    assert!(matches!(
+        stack.poll_timeouts(after(TIME_WAIT_DURATION), &mut out),
+        Some(Timeout::Reaped { .. })
+    ));
+}
+
+/// RFC 5961 section 7: the replies a peer can provoke without holding a
+/// connection are bounded per second across the whole table, and what the bound
+/// withholds is counted rather than silent.
+#[test]
+fn unsolicited_replies_are_bounded_per_second_and_the_suppression_counted() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1c_2000);
+    let mut out = [0u8; 2048];
+    // A bare acknowledgement for a 4-tuple nothing holds. RFC 793 answers every
+    // one with a reset, which is the amplifier the limit exists to close.
+    let stray = peer.ack();
+    let over = 20usize;
+    let mut answered = 0usize;
+    for _ in 0..(CHALLENGE_LIMIT as usize + over) {
+        if stack.receive(at(1_000), STATION, &stray, &mut out).emitted > 0 {
+            answered += 1;
+        }
+    }
+    assert_eq!(answered, CHALLENGE_LIMIT as usize);
+    assert_eq!(stack.counters().resets_sent, u64::from(CHALLENGE_LIMIT));
+    assert_eq!(stack.counters().challenges_suppressed, over as u64);
+    // Every one of them was still refused and counted, so the silence is not
+    // also invisible.
+    assert_eq!(
+        stack.counters().refused_no_connection,
+        CHALLENGE_LIMIT as u64 + over as u64
+    );
+
+    // The next second's allowance is fresh.
+    let later = at(1_000 + CHALLENGE_WINDOW.as_nanos());
+    assert!(stack.receive(later, STATION, &stray, &mut out).emitted > 0);
+}
+
+/// The same allowance covers a synchronized connection's challenge
+/// acknowledgements, and a reset is never withheld by it: a peer left believing
+/// in a connection this end has torn down would go on sending into it.
+#[test]
+fn a_challenge_flood_is_bounded_and_a_reset_is_not() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1c_3000);
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+
+    // An in-window `SYN`, which RFC 5961 section 4 challenges. The same segment
+    // over and over is what an off-path attacker sends.
+    let intruder = peer.segment_at(peer.next, Flags::SYN, &[]);
+    let mut answered = 0usize;
+    for _ in 0..(CHALLENGE_LIMIT as usize + 5) {
+        if stack
+            .receive(at(1_000), STATION, &intruder, &mut out)
+            .emitted
+            > 0
+        {
+            answered += 1;
+        }
+    }
+    assert_eq!(answered, CHALLENGE_LIMIT as usize);
+    assert_eq!(stack.counters().challenges_suppressed, 5);
+    assert_eq!(
+        stack.counters().challenge_acks,
+        CHALLENGE_LIMIT as u64 + 5,
+        "a challenge decision went uncounted"
+    );
+    assert_eq!(
+        stack.connection(id).map(Connection::state),
+        Some(State::Established),
+        "a challenged SYN tore the connection down"
+    );
+
+    // The budget is spent, and a `RST` at exactly the next byte expected is
+    // still accepted and still ends the connection.
+    let reset = peer.segment_at(peer.next, Flags::RST, &[]);
+    stack.receive(at(1_000), STATION, &reset, &mut out);
+    assert_eq!(stack.connection(id), None);
+    assert_eq!(stack.counters().resets_received, 1);
+}
+
+/// The round-trip sample comes from the newest range the acknowledgement
+/// covered, and "newest" is by sequence: records take whichever array slot is
+/// free, so a reused slot puts the newest range in front of an older one.
+#[test]
+fn the_round_trip_sample_comes_from_the_newest_range_by_sequence() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1c_4000);
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+
+    // Two ranges, filling the first two record slots. Neither answer is read:
+    // what this peer acknowledges is set by hand below, one range at a time.
+    stack.send(at(0), id, b"aaaa", &mut out).expect("a segment");
+    stack.send(at(0), id, b"bbbb", &mut out).expect("a segment");
+
+    // The oldest range expires, which marks it retransmitted so its
+    // acknowledgement yields no sample at all (Karn's algorithm).
+    assert!(matches!(
+        stack.poll_timeouts(after(INITIAL_RTO), &mut out),
+        Some(Timeout::Retransmit { .. })
+    ));
+    // Acknowledge only that first range, freeing the slot it held. It carries no
+    // sample of its own, having been re-sent.
+    peer.expect = peer.expect.add(4);
+    let ack = peer.ack();
+    stack.receive(after(INITIAL_RTO), STATION, &ack, &mut out);
+    assert_eq!(stack.outstanding(id), 1);
+
+    // The next range takes that freed slot, so the array now holds the newest
+    // range in front of the older one — twenty seconds older.
+    let late = at(20 * lfw_clock::NANOS_PER_SECOND);
+    stack.send(late, id, b"cccc", &mut out).expect("a segment");
+
+    // Acknowledge both a millisecond later. The sample is that millisecond, not
+    // the twenty seconds the record in the later slot has been outstanding.
+    peer.expect = peer.expect.add(8);
+    let ack = peer.ack();
+    let settled = at(20 * lfw_clock::NANOS_PER_SECOND + 1_000_000);
+    stack.receive(settled, STATION, &ack, &mut out);
+    assert_eq!(stack.outstanding(id), 0);
+    assert!(stack.connection(id).is_some_and(Connection::measured));
+    assert_eq!(
+        stack.connection(id).map(Connection::timeout),
+        Some(MIN_RTO),
+        "the sample came from the older range in the later slot"
+    );
+}
+
+/// Aborting says the message is incomplete, which a `FIN` cannot: it carries a
+/// `RST`, and the slot goes with it rather than waiting on a timer.
+#[test]
+fn aborting_resets_the_peer_and_frees_the_slot() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1c_5000);
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+    stack
+        .send(at(1_000), id, b"partial", &mut out)
+        .expect("a segment");
+
+    let len = stack.abort(id, &mut out).expect("a reset");
+    let reset = Segment::parse(APPLIANCE, STATION, &out[..len]).expect("a segment");
+    assert!(reset.flags.contains(Flags::RST));
+    assert!(
+        !reset.flags.contains(Flags::FIN),
+        "a truncated message was ended as a complete one"
+    );
+    assert_eq!(stack.connection(id), None, "the slot outlived the reset");
+    assert_eq!(stack.counters().resets_sent, 1);
+    assert_eq!(stack.counters().connections_closed, 1);
+    // A handle that names nothing any more is refused rather than resolved.
+    assert_eq!(stack.abort(id, &mut out), Err(SendError::UnknownConnection));
+
+    // Storage too small leaves the connection intact, so the next pass may try
+    // again with whatever storage it offers.
+    let mut other = Peer::new(40001, 0x1c_6000);
+    let alive = handshake(&mut stack, at(2_000), &mut other);
+    let mut tiny = [0u8; 8];
+    assert!(matches!(
+        stack.abort(alive, &mut tiny),
+        Err(SendError::Write { committed: 0, .. })
+    ));
+    assert!(stack.connection(alive).is_some());
+    assert_eq!(stack.abort(alive, &mut out).map(|len| len > 0), Ok(true));
 }

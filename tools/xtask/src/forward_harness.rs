@@ -5333,4 +5333,26 @@ mod tcp_client_tests {
         assert!(verdict.contains("both answered with"), "{verdict}");
         assert!(verdict.contains("off-path"), "{verdict}");
     }
+
+    /// A repeat between boots that are not neighbours, which is the same
+    /// injection primitive and passed a comparison of adjacent pairs alone.
+    #[test]
+    fn a_repeated_sequence_number_between_non_adjacent_boots_is_refused() {
+        let verdict = crate::qemu::judge_sequence_numbers(&[("a", 9), ("b", 4), ("c", 9)])
+            .expect_err("the first and last boots agreed");
+        assert!(verdict.contains("scenarios a and c"), "{verdict}");
+        assert!(verdict.contains('9'), "{verdict}");
+    }
+
+    /// The count reported is of *values*: naming boots under the word
+    /// "distinct" is the claim that outlived the comparison behind it.
+    #[test]
+    fn the_reported_count_is_of_distinct_values_not_of_boots() {
+        let four = crate::qemu::judge_sequence_numbers(&[("a", 1), ("b", 2), ("c", 3), ("d", 4)])
+            .expect("four distinct numbers");
+        assert!(four.contains("4 distinct"), "{four}");
+        assert!(four.contains("4 boot(s)"), "{four}");
+        let one = crate::qemu::judge_sequence_numbers(&[("a", 5)]).expect("one boot, one number");
+        assert!(one.contains("1 distinct"), "{one}");
+    }
 }

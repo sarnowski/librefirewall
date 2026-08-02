@@ -1163,6 +1163,55 @@ mod tests {
         }
     }
 
+    /// One band, stated twice at two granularities: the years this crate ranges a
+    /// register file's answer against, and the nanoseconds `lfw_clock` ranges a
+    /// published calibration's epoch against. The two are the same decision, so
+    /// this is the enforcer that keeps them one — a node whose clock domain
+    /// accepted a year its readers would refuse, or the reverse, would leave a
+    /// port unclocked with nothing naming why.
+    #[test]
+    fn the_epoch_band_a_reader_applies_is_the_year_band_this_crate_applies() {
+        let opening = CivilTime {
+            year: MIN_PLAUSIBLE_YEAR,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanosecond: 0,
+        };
+        assert_eq!(
+            lfw_clock::MIN_PLAUSIBLE_UNIX_NANOS,
+            epoch_of(opening) * lfw_clock::NANOS_PER_SECOND
+        );
+        let closing = CivilTime {
+            year: MAX_PLAUSIBLE_YEAR,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minute: 59,
+            second: 59,
+            nanosecond: 0,
+        };
+        assert_eq!(
+            lfw_clock::MAX_PLAUSIBLE_UNIX_NANOS,
+            epoch_of(closing) * lfw_clock::NANOS_PER_SECOND + lfw_clock::NANOS_PER_SECOND - 1
+        );
+        // And no year this crate refuses names an instant a reader would take.
+        for year in [MIN_PLAUSIBLE_YEAR - 1, MAX_PLAUSIBLE_YEAR + 1] {
+            let instant = CivilTime {
+                year,
+                month: 6,
+                day: 15,
+                ..CONFORMING_INSTANT
+            };
+            assert!(
+                !lfw_clock::epoch_is_plausible(epoch_of(instant) * lfw_clock::NANOS_PER_SECOND),
+                "{year}"
+            );
+        }
+    }
+
     #[test]
     fn a_date_no_calendar_has_is_refused_by_the_conversion_it_is_delegated_to() {
         // The delegation the crate header names. Whether a day exists

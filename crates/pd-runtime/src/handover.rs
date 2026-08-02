@@ -125,9 +125,13 @@ pub fn interfaces_from(checked: &CheckedConfig) -> InterfaceInventory {
 }
 
 /// Build the endpoint a checked image addresses the management port with, or
-/// `None` where it addresses none. The image's reader has already refused a
-/// prefix length and a group MAC; [`Endpoint::new`] is the third layer, taking
-/// nothing on trust from the domain that published it.
+/// `None` where it addresses none.
+///
+/// [`Endpoint::new`] takes nothing on trust from the domain that published the
+/// image, and today can refuse nothing it is handed: every pair
+/// [`EndpointError`] names is one `ConfigImage::check` has already refused. The
+/// call stays because that is a fact about the two rule sets together rather
+/// than about this function, and either may move.
 ///
 /// # Errors
 /// [`EndpointError`], for a pair no endpoint can answer under.
@@ -175,12 +179,49 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         ConfigImageError::InterfacePrefixLengthTooLong { index, .. } => {
             (RejectReason::PrefixLengthOutOfRange, index as u32)
         }
+        // A duplicated MAC shares the console's `mac-not-unicast` token, as the
+        // management/interface collision already does: an L2 address two ports
+        // answer to is not one either of them can be addressed at.
         ConfigImageError::InterfaceMacNotUnicast { index, .. }
-        | ConfigImageError::NeighbourMacNotUnicast { index, .. } => {
+        | ConfigImageError::NeighbourMacNotUnicast { index, .. }
+        | ConfigImageError::InterfaceMacDuplicated { index, .. } => {
             (RejectReason::MacNotUnicast, index as u32)
         }
+        ConfigImageError::InterfaceAddressNotUnicast { index, .. }
+        | ConfigImageError::NeighbourAddressNotUnicast { index, .. } => {
+            (RejectReason::AddressNotUnicast, index as u32)
+        }
+        ConfigImageError::InterfaceAddressNotAHostAddress { index, .. }
+        | ConfigImageError::NeighbourAddressNotAHostAddress { index, .. } => {
+            (RejectReason::AddressNotAHostAddress, index as u32)
+        }
+        ConfigImageError::InterfaceIdDuplicated { index, .. } => {
+            (RejectReason::DuplicateIdentifier, index as u32)
+        }
+        ConfigImageError::InterfacePortDuplicated { index, .. } => {
+            (RejectReason::DuplicatePort, index as u32)
+        }
+        ConfigImageError::InterfacePrefixesOverlap { index, .. } => {
+            (RejectReason::OverlappingPrefixes, index as u32)
+        }
+        // A port no interface addresses is the image's spelling of the
+        // document's dangling `interface` reference: the resolution the
+        // validator made is the port, so this is that reference not resolving.
+        ConfigImageError::NeighbourPortUnconfigured { index, .. } => {
+            (RejectReason::UnknownInterfaceReference, index as u32)
+        }
+        ConfigImageError::NeighbourOutsidePrefix { index, .. } => {
+            (RejectReason::NeighbourOutsidePrefix, index as u32)
+        }
+        ConfigImageError::NeighbourIsInterfaceAddress { index, .. } => {
+            (RejectReason::NeighbourIsInterfaceAddress, index as u32)
+        }
+        ConfigImageError::NeighbourAddressDuplicated { index, .. } => {
+            (RejectReason::DuplicateNeighbourAddress, index as u32)
+        }
         // No index: an image holds one entry, so the number that locates the
-        // fault is the value refused.
+        // fault is the value refused — except for the two collisions, which are
+        // located by the interface they collided with.
         ConfigImageError::ManagementEnabledNotBoolean { enabled } => {
             (RejectReason::MalformedValue, u32::from(enabled))
         }
@@ -191,6 +232,19 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         ConfigImageError::ManagementMacNotUnicast { mac } => {
             let [first, ..] = mac;
             (RejectReason::MacNotUnicast, u32::from(first))
+        }
+        ConfigImageError::ManagementAddressNotUnicast { address } => {
+            (RejectReason::AddressNotUnicast, u32::from_be_bytes(address))
+        }
+        ConfigImageError::ManagementAddressNotAHostAddress { address } => (
+            RejectReason::AddressNotAHostAddress,
+            u32::from_be_bytes(address),
+        ),
+        ConfigImageError::ManagementPrefixCollidesWithInterface { index } => {
+            (RejectReason::OverlappingPrefixes, index as u32)
+        }
+        ConfigImageError::ManagementMacCollidesWithInterface { index } => {
+            (RejectReason::MacNotUnicast, index as u32)
         }
     }
 }
@@ -256,6 +310,22 @@ pub struct ConfigPublisher {
     offered: u32,
 }
 
+/// Why an offer was not made: its generation was not newer than the one already
+/// on offer.
+///
+/// A type rather than prose because the consumer's half of the handshake depends
+/// on it: a consumer that has judged the number on offer does not look again, so
+/// re-offering a corrected image under a generation it has seen is invisible to
+/// it and the handshake stalls there for good. Retrying *is* bumping the
+/// generation, and this is what makes that a returned error rather than a
+/// silence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleOffer {
+    /// The generation still on offer, which the region is untouched by this.
+    pub offered: u32,
+    pub refused: u32,
+}
+
 impl ConfigPublisher {
     #[must_use]
     pub const fn new() -> Self {
@@ -272,18 +342,40 @@ impl ConfigPublisher {
     /// Returns the generation offered, which is the image's own: the offered
     /// word and the bytes are published by one call, so a generation whose
     /// bytes are not yet in the region cannot be named.
-    pub fn offer(&mut self, handover: &ConfigHandover, image: &ConfigImage) -> u32 {
+    ///
+    /// # Errors
+    /// [`StaleOffer`], leaving the region exactly as it was. Monotonicity is
+    /// what lets [`Self::take_acknowledgement`] key a commit on equality: an
+    /// offer that could move backwards would let an acknowledgement of a newer
+    /// generation release an older one.
+    pub fn offer(
+        &mut self,
+        handover: &ConfigHandover,
+        image: &ConfigImage,
+    ) -> Result<u32, StaleOffer> {
+        if image.generation <= self.offered {
+            return Err(StaleOffer {
+                offered: self.offered,
+                refused: image.generation,
+            });
+        }
         handover.publish(image);
         self.offered = image.generation;
-        self.offered
+        Ok(self.offered)
     }
 
-    /// Release the offered generation if the consumer has staged it.
+    /// Release the offered generation if the consumer has staged **that** one.
     ///
     /// Returns the generation released, once. `None` while nothing is offered,
     /// while the consumer has not staged it — which is also what a refusal
     /// looks like, the consumer never acknowledging what it will not run — or
     /// once it has already been released.
+    ///
+    /// Equality rather than "at least": an acknowledgement names the generation
+    /// the consumer staged, and staging a *different* one is not consent to
+    /// commit this one. [`Self::offer`] refusing to go backwards makes the two
+    /// spellings agree in every reachable case; the comparison holds here so
+    /// this half does not rest on the other.
     pub fn take_acknowledgement(
         &mut self,
         handover: &ConfigHandover,
@@ -292,7 +384,7 @@ impl ConfigPublisher {
         if self.offered == 0 || handover.committed_generation() >= self.offered {
             return None;
         }
-        if ack.staged_generation() < self.offered {
+        if ack.staged_generation() != self.offered {
             return None;
         }
         handover.publish_committed(self.offered);
@@ -548,6 +640,10 @@ mod tests {
 
     type Switch = ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>;
 
+    /// The interface on `port`, distinct from every other in each field a rule
+    /// compares: its own port, MAC, `/24` and id. The id carries the port
+    /// because two interfaces under one identity is a refusal rather than a
+    /// fixture.
     fn interface(port: u8, last: u8) -> InterfaceImage {
         InterfaceImage {
             port,
@@ -557,11 +653,19 @@ mod tests {
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x50 + port],
             _pad2: [0; 2],
             address: [10, 0, port, last],
-            id: IdentifierImage::from_text(if port == 0 {
-                b"dataplane-0"
-            } else {
-                b"dataplane-1"
-            }),
+            id: IdentifierImage::from_text(&[
+                b'd',
+                b'a',
+                b't',
+                b'a',
+                b'p',
+                b'l',
+                b'a',
+                b'n',
+                b'e',
+                b'-',
+                b'0' + port,
+            ]),
         }
     }
 
@@ -690,7 +794,10 @@ mod tests {
         /// the port that entry sits on.
         #[test]
         fn the_inventory_is_bounded_and_attributes_every_entry_to_its_port(
-            count in 0usize..=MAX_INTERFACES,
+            // One interface per port, so this build's two ports bound how many
+            // a *checked* image can carry however many slots the ABI holds. The
+            // exposition's own bound is asserted below and is the wider one.
+            count in 0usize..=usize::from(PORTS),
             management in any::<bool>(),
         ) {
             let mut raw = ConfigImage {
@@ -698,7 +805,7 @@ mod tests {
                 ..ConfigImage::ZERO
             };
             for (index, slot) in raw.interfaces.iter_mut().enumerate() {
-                *slot = interface((index % usize::from(PORTS)) as u8, 1);
+                *slot = interface(index as u8, 1);
             }
             if management {
                 raw.management = management_image();
@@ -788,6 +895,10 @@ mod tests {
 
         let mut second = image(2);
         second.interface_count = 1;
+        // The neighbour on port 1 goes with the interface that addressed it: a
+        // next hop on a port no interface claims is a link with no prefix to be
+        // a neighbour of, and is refused.
+        second.neighbour_count = 1;
         handover.publish(&second);
         assert_eq!(
             switch.take_offer(&handover, &ack),
@@ -1000,7 +1111,7 @@ mod tests {
         // Nothing offered yet, so there is nothing to release.
         assert_eq!(publisher.take_acknowledgement(&handover, &ack), None);
 
-        assert_eq!(publisher.offer(&handover, &image(1)), 1);
+        assert_eq!(publisher.offer(&handover, &image(1)), Ok(1));
         assert_eq!(publisher.offered(), 1);
         // Offered but unacknowledged: the consumer has not run yet.
         assert_eq!(publisher.take_acknowledgement(&handover, &ack), None);
@@ -1016,6 +1127,66 @@ mod tests {
         assert_eq!(ack.running_generation(), 1);
     }
 
+    /// An acknowledgement names the generation the consumer staged, and staging
+    /// one generation is not consent to commit another. The publisher's own
+    /// invariant, not the consumer's: the consumers survive an unstaged commit,
+    /// but a publisher that released one would have moved the configuration
+    /// forward on a generation nobody was able to run.
+    #[test]
+    fn an_acknowledgement_of_one_generation_does_not_release_another() {
+        let (handover, ack) = regions();
+        let mut publisher = ConfigPublisher::new();
+        let mut consumer = Switch::new(PORTS);
+
+        publisher.offer(&handover, &image(5)).expect("the first");
+        assert!(consumer.take_offer(&handover, &ack).is_some());
+        assert_eq!(ack.staged_generation(), 5);
+
+        // Going backwards is refused outright, so the acknowledgement of 5
+        // never gets the chance to release a 3 nobody staged.
+        assert_eq!(
+            publisher.offer(&handover, &image(3)),
+            Err(StaleOffer {
+                offered: 5,
+                refused: 3,
+            })
+        );
+        assert_eq!(publisher.offered(), 5, "the offer did not move");
+        assert_eq!(handover.offered_generation(), 5);
+        assert_eq!(handover.load_image().generation, 5, "nor did the region");
+
+        // And the acknowledgement still releases the generation it named.
+        assert_eq!(publisher.take_acknowledgement(&handover, &ack), Some(5));
+        assert_eq!(handover.committed_generation(), 5);
+    }
+
+    /// Re-offering the generation already on offer is the same refusal, which is
+    /// what makes "a publisher must bump the generation to retry" a returned
+    /// error rather than a handshake that quietly stops progressing.
+    #[test]
+    fn re_offering_the_generation_already_on_offer_is_refused() {
+        let (handover, _ack) = regions();
+        let mut publisher = ConfigPublisher::new();
+        publisher.offer(&handover, &image(1)).expect("the first");
+        assert_eq!(
+            publisher.offer(&handover, &image(1)),
+            Err(StaleOffer {
+                offered: 1,
+                refused: 1,
+            })
+        );
+        // Generation 0 is the fail-closed configuration nobody publishes, so it
+        // is refused from a fresh publisher too.
+        let mut fresh = ConfigPublisher::new();
+        assert_eq!(
+            fresh.offer(&handover, &image(0)),
+            Err(StaleOffer {
+                offered: 0,
+                refused: 0,
+            })
+        );
+    }
+
     /// A consumer that refuses an image never acknowledges it, so the publisher
     /// never releases it: the two halves fail closed together.
     #[test]
@@ -1025,7 +1196,9 @@ mod tests {
         let mut consumer = Switch::new(PORTS);
         let mut bad = image(1);
         bad.interfaces[0].mac = [0xff; 6];
-        publisher.offer(&handover, &bad);
+        publisher
+            .offer(&handover, &bad)
+            .expect("the first generation");
 
         assert!(matches!(
             consumer.take_offer(&handover, &ack),
@@ -1045,7 +1218,9 @@ mod tests {
         let mut publisher = ConfigPublisher::new();
         let mut consumer = Switch::new(PORTS);
         for generation in 1..=3 {
-            publisher.offer(&handover, &image(generation));
+            publisher
+                .offer(&handover, &image(generation))
+                .expect("each generation is newer than the last");
             assert!(consumer.take_offer(&handover, &ack).is_some());
             assert_eq!(
                 publisher.take_acknowledgement(&handover, &ack),
@@ -1163,22 +1338,35 @@ mod tests {
         );
     }
 
-    /// The third layer earns its place here: the image's own reader does not
-    /// hold the *address* to a rule, so a multicast one reaches this call and is
-    /// refused by the type that will answer under it.
+    /// Every pair a checked image can carry is one an endpoint can answer
+    /// under, so this call cannot refuse what it is handed.
+    ///
+    /// That is a property of the two rule sets rather than of this function:
+    /// [`lfw_ip_endpoint::EndpointError`] has exactly three variants — a MAC
+    /// that is not unicast, an address that is not unicast, a prefix length past
+    /// 32 — and `ConfigImage::check` refuses all three of an enabled management
+    /// entry before one gets here. The `Result` stays because the signature is
+    /// what stops this function trusting its caller, and a layer that cannot
+    /// currently refuse anything is not the same as a layer that does not check;
+    /// what has changed is that the refusal is now unreachable rather than
+    /// merely unlikely, and this is the test that says so.
     #[test]
-    fn an_address_the_image_reader_admits_and_an_endpoint_cannot_is_refused() {
-        let mut multicast = image(1);
-        multicast.management = management(1, MGMT_MAC, [224, 0, 0, 1]);
-        let checked = multicast
-            .check(PORTS)
-            .expect("the image ABI does not rule on an address");
-        assert_eq!(
-            endpoint_from(&checked, secret()).err(),
-            Some(lfw_ip_endpoint::EndpointError::AddressNotUnicast {
-                address: Ipv4Address::from_octets([224, 0, 0, 1]),
-            })
-        );
+    fn every_management_entry_a_checked_image_carries_builds_an_endpoint() {
+        for address in [[224, 0, 0, 1], [10, 0, 2, 0], [0, 0, 0, 0]] {
+            let mut raw = image(1);
+            raw.management = management(1, MGMT_MAC, address);
+            assert!(
+                raw.check(PORTS).is_err(),
+                "the image reader admitted {address:?}, which no endpoint answers under"
+            );
+        }
+
+        let mut addressed = image(1);
+        addressed.management = management(1, MGMT_MAC, MGMT_ADDRESS);
+        let checked = addressed.check(PORTS).expect("an enabled entry");
+        endpoint_from(&checked, secret())
+            .expect("a checked entry is one an endpoint answers under")
+            .expect("an enabled entry builds one");
     }
 
     /// The reader takes the *committed* word and nothing else: an offer nobody

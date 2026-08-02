@@ -229,6 +229,46 @@ fn an_oversized_window_scale_is_clamped_rather_than_refused() {
     }
 }
 
+/// A second occurrence of an option this stack reads is refused rather than
+/// quietly taking whichever came last, so a peer cannot leave this end and a
+/// middlebox on the path negotiating under different values.
+#[test]
+fn a_repeated_option_is_refused_rather_than_last_one_winning() {
+    let cases: [(u8, &[u8]); 3] = [
+        (
+            2,
+            &[
+                2, 4, 0x05, 0xb4, // MSS 1460
+                2, 4, 0x02, 0x18, // and MSS 536
+            ],
+        ),
+        (
+            3,
+            &[
+                3, 3, 2, // window scale 2
+                3, 3, 9, // and window scale 9
+                0, 0,
+            ],
+        ),
+        (
+            4,
+            &[
+                4, 2, // SACK permitted
+                4, 2, // twice
+                0, 0, 0, 0,
+            ],
+        ),
+    ];
+    for (kind, options) in cases {
+        let bytes = sealed(STATION, APPLIANCE, raw(plain(0, 0, 7, 0x02, options, &[])));
+        assert_eq!(
+            Segment::parse(STATION, APPLIANCE, &bytes),
+            Err(SegmentError::OptionRepeated { kind }),
+            "kind {kind}"
+        );
+    }
+}
+
 /// An option this stack has never heard of is stepped over rather than refused,
 /// which is the whole of forward compatibility for a receiver.
 #[test]

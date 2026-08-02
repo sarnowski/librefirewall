@@ -67,6 +67,14 @@ unsafe_op_in_unsafe_fn = "deny"
 # file's comment ratio fall and never rise, and the two `unsafe` obligations
 # that have no other carrier and so stay denied above and below:
 # `unsafe_op_in_unsafe_fn` and `undocumented_unsafe_blocks`.
+#
+# The two denials above reach every member of this workspace, as a lint table
+# here does. The ratchet does not, and the difference is worth stating where the
+# claim is made rather than leaving it to be discovered: it measures the product
+# trees, `crates/` and `pds/`, and neither `tools/` nor the separate `fuzz/`
+# workspace. Both exclusions and their reasons are recorded beside the tree list
+# it is driven from. So for `xtask` and for the fuzz harnesses, the discipline
+# above `missing_docs` is review rather than a gate.
 
 [workspace.lints.clippy]
 # Every `unsafe` block carries a truthful `// SAFETY:` comment stating the

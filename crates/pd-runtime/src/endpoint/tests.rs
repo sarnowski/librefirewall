@@ -133,7 +133,9 @@ impl Fixture {
     /// the forwarder has acknowledged it, and let the stage take it.
     fn commit(&mut self, image: ConfigImage) -> Option<ConfigRefused> {
         let mut publisher = ConfigPublisher::new();
-        let generation = publisher.offer(self.handover, &image);
+        let generation = publisher
+            .offer(self.handover, &image)
+            .expect("each image this fixture publishes carries a newer generation");
         self.handover.publish_committed(generation);
         self.stage.take_configuration(self.handover, PORTS)
     }
@@ -1000,12 +1002,13 @@ fn a_published_calibration_is_taken_and_an_implausible_one_refused() {
         Some(400_000)
     );
 
-    // A republished triple no counter has is refused, once, and the calibration
-    // in force is left exactly as it was.
+    // A republished triple no counter has is refused, once — and the calibration
+    // it replaces goes with it, because a publisher that has withdrawn a
+    // measurement leaves nothing behind worth dating a record by.
     fixture.clock.publish(&CalibrationImage {
         tsc_hz: 1,
         boot_ticks: 0,
-        boot_unix_nanos: 0,
+        boot_unix_nanos: 1_785_443_220_000_000_000,
     });
     assert_eq!(
         fixture.stage.take_clock(fixture.clock),
@@ -1019,7 +1022,7 @@ fn a_published_calibration_is_taken_and_an_implausible_one_refused() {
             .stage
             .monotonic(NOW)
             .map(lfw_clock::Monotonic::as_nanos),
-        Some(400_000)
+        None
     );
 }
 
@@ -1040,12 +1043,46 @@ fn the_frequency_band_is_the_clock_crates_own() {
         let calibration = calibration_from(CalibrationImage {
             tsc_hz,
             boot_ticks: 7,
-            boot_unix_nanos: 9,
+            boot_unix_nanos: 1_785_443_220_000_000_000,
         })
         .expect("a plausible frequency");
         assert_eq!(calibration.tsc_hz().get(), tsc_hz);
         assert_eq!(calibration.boot_ticks(), Ticks(7));
-        assert_eq!(calibration.boot_unix_nanos(), 9);
+        assert_eq!(calibration.boot_unix_nanos(), 1_785_443_220_000_000_000);
+    }
+}
+
+/// The epoch band is `lfw_clock`'s too, so both ends of the region apply one
+/// judgement: the publishing domain refuses a year outside it at the register
+/// file, and a reader refuses one that reached the region anyway.
+#[test]
+fn the_epoch_band_is_the_clock_crates_own() {
+    for unix_nanos in [
+        0,
+        lfw_clock::MIN_PLAUSIBLE_UNIX_NANOS - 1,
+        lfw_clock::MAX_PLAUSIBLE_UNIX_NANOS + 1,
+        u64::MAX,
+    ] {
+        assert_eq!(
+            calibration_from(CalibrationImage {
+                tsc_hz: TSC_HZ,
+                boot_ticks: 0,
+                boot_unix_nanos: unix_nanos,
+            }),
+            Err(CalibrationRefused::EpochImplausible { unix_nanos })
+        );
+    }
+    for unix_nanos in [
+        lfw_clock::MIN_PLAUSIBLE_UNIX_NANOS,
+        lfw_clock::MAX_PLAUSIBLE_UNIX_NANOS,
+    ] {
+        let calibration = calibration_from(CalibrationImage {
+            tsc_hz: TSC_HZ,
+            boot_ticks: 7,
+            boot_unix_nanos: unix_nanos,
+        })
+        .expect("an epoch inside the band");
+        assert_eq!(calibration.boot_unix_nanos(), unix_nanos);
     }
 }
 
@@ -1079,7 +1116,7 @@ fn a_handshake_crosses_the_pipeline_and_its_timer_re_sends() {
     fixture.clock.publish(&CalibrationImage {
         tsc_hz: TSC_HZ,
         boot_ticks: 0,
-        boot_unix_nanos: 0,
+        boot_unix_nanos: 1_785_443_220_000_000_000,
     });
     assert_eq!(fixture.stage.take_clock(fixture.clock), None);
 
@@ -1156,7 +1193,7 @@ fn a_clocked_but_unaddressed_port_drives_no_timers() {
     fixture.clock.publish(&CalibrationImage {
         tsc_hz: TSC_HZ,
         boot_ticks: 0,
-        boot_unix_nanos: 0,
+        boot_unix_nanos: 1_785_443_220_000_000_000,
     });
     assert_eq!(fixture.stage.take_clock(fixture.clock), None);
     assert!(fixture.stage.monotonic(NOW).is_some());

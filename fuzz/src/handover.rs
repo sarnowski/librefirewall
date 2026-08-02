@@ -20,8 +20,14 @@
 //! all-zero MACs, and arbitrary padding are all ordinary inputs — as is an
 //! entirely well-formed image, which the seeds carry.
 //!
-//! A purely uniform 656-byte blob would however spend almost every run in the
-//! two count refusals and rarely reach the per-entry rules behind them. The
+//! Every field means the management entry too. It is not a corner of the image:
+//! it carries the address the appliance answers management traffic at, and the
+//! two rules that keep that address and its L2 address off the dataplane are
+//! the two the capability grants cannot express — so they are exactly the two a
+//! compromised writer would have to itself if this harness did not reach them.
+//!
+//! A purely uniform region-sized blob would however spend almost every run in
+//! the two count refusals and rarely reach the per-entry rules behind them. The
 //! harness therefore checks a **second** image whose counts are folded into the
 //! band around capacity, in addition to — never instead of — the unmodified
 //! one. That widens what is reached without narrowing what is reachable —
@@ -40,7 +46,12 @@
 //!   from the code, and every outcome is compared with it. A *wrongly accepted*
 //!   image — the failure that actually reaches the dataplane — fails here as
 //!   loudly as a panic would, which a harness checking only for panics would
-//!   have passed.
+//!   have passed. The model covers every rule the reader applies, the ones
+//!   about a *pair* of entries included: one port and one MAC per interface,
+//!   disjoint prefixes, a neighbour on the link its port names, and the
+//!   management port disjoint from every dataplane one. A model that stopped at
+//!   the per-field rules would agree with a reader that had also stopped there,
+//!   and the two agreeing is the whole of what this asserts.
 //! * **Capacity, not the peer's count.** The entries handed back are bounded by
 //!   the array the image holds and never by the number the writer put in it.
 //! * **Containment of a refusal.** Every accepted entry independently satisfies
@@ -69,18 +80,35 @@ use wire::{
 /// a port so the comparison can never be what refuses an image.
 const PORT_COUNTS: [u8; 4] = [0, 1, config::PORT_COUNT, u8::MAX];
 
-/// Bytes of one interface entry in the region.
-const INTERFACE_BYTES: usize = 16;
+/// Bytes of one interface entry in the region: port, `enabled`, prefix length
+/// and a pad byte; six of MAC and two of pad; four of address; then the
+/// identifier's sixteen bytes, its length and three of pad.
+const INTERFACE_BYTES: usize = 36;
 
 /// Bytes of one neighbour entry in the region.
 const NEIGHBOUR_BYTES: usize = 16;
 
-/// Bytes of the four header words the entries follow.
+/// Bytes of the management entry, which sits between the header and the
+/// interfaces.
+const MANAGEMENT_BYTES: usize = 16;
+
+/// Bytes of the four header words the management entry follows.
 const HEADER_BYTES: usize = 16;
 
 /// The whole region image, which is what one corpus entry is.
-pub const REGION_BYTES: usize =
-    HEADER_BYTES + MAX_INTERFACES * INTERFACE_BYTES + MAX_NEIGHBOURS * NEIGHBOUR_BYTES;
+pub const REGION_BYTES: usize = HEADER_BYTES
+    + MANAGEMENT_BYTES
+    + MAX_INTERFACES * INTERFACE_BYTES
+    + MAX_NEIGHBOURS * NEIGHBOUR_BYTES;
+
+// The point of laying the input over the ABI positionally is that a corpus
+// entry *is* the region a writer left behind. That only holds while the two
+// agree byte for byte, and a seed authored against the wrong stride decodes as
+// a different image than the one it was committed for — silently, because it
+// still decodes as something. So the sum above is held to the type: a field
+// added or a pad widened in `wire` breaks this build rather than the meaning of
+// every file in the corpus.
+const _: () = assert!(REGION_BYTES == core::mem::size_of::<ConfigImage>());
 
 /// Drive the handover reader against a region a byzantine writer filled.
 pub fn handover_harness(data: &[u8]) {
@@ -267,8 +295,9 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
             count: image.neighbour_count,
         });
     }
+    let named: Vec<InterfaceImage> = image.interfaces.iter().copied().take(interfaces).collect();
 
-    for (index, entry) in image.interfaces.iter().enumerate().take(interfaces) {
+    for (index, entry) in named.iter().enumerate() {
         if entry.enabled > 1 {
             return Some(ConfigImageError::InterfaceEnabledNotBoolean {
                 index,
@@ -293,12 +322,58 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
                 mac: entry.mac,
             });
         }
+        if !is_unicast_address(entry.address) {
+            return Some(ConfigImageError::InterfaceAddressNotUnicast {
+                index,
+                address: entry.address,
+            });
+        }
+        if !is_host_address(entry.address, entry.prefix_length) {
+            return Some(ConfigImageError::InterfaceAddressNotAHostAddress {
+                index,
+                address: entry.address,
+            });
+        }
         if let Some(fault) = identifier_fault(&entry.id) {
             return Some(ConfigImageError::InterfaceIdNotAnIdentifier { index, fault });
         }
     }
 
-    for (index, entry) in image.neighbours.iter().enumerate().take(neighbours) {
+    // The rules about a pair of interfaces. A forwarding domain looks an
+    // interface up by port and a frame up by MAC, so two entries agreeing on
+    // either make the answer depend on table position.
+    for (index, entry) in named.iter().enumerate() {
+        for (other, earlier) in named.iter().enumerate().take(index) {
+            if identifier_text(&earlier.id) == identifier_text(&entry.id) {
+                return Some(ConfigImageError::InterfaceIdDuplicated { index, other });
+            }
+            if earlier.port == entry.port {
+                return Some(ConfigImageError::InterfacePortDuplicated {
+                    index,
+                    other,
+                    port: entry.port,
+                });
+            }
+            if earlier.mac == entry.mac {
+                return Some(ConfigImageError::InterfaceMacDuplicated {
+                    index,
+                    other,
+                    mac: entry.mac,
+                });
+            }
+            if prefixes_overlap(
+                earlier.address,
+                earlier.prefix_length,
+                entry.address,
+                entry.prefix_length,
+            ) {
+                return Some(ConfigImageError::InterfacePrefixesOverlap { index, other });
+            }
+        }
+    }
+
+    let hops: Vec<NeighbourImage> = image.neighbours.iter().copied().take(neighbours).collect();
+    for (index, entry) in hops.iter().enumerate() {
         if entry.port >= port_count {
             return Some(ConfigImageError::NeighbourPortUnknown {
                 index,
@@ -311,9 +386,142 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
                 mac: entry.mac,
             });
         }
+        if !is_unicast_address(entry.address) {
+            return Some(ConfigImageError::NeighbourAddressNotUnicast {
+                index,
+                address: entry.address,
+            });
+        }
+        let Some(interface) = named.iter().find(|candidate| candidate.port == entry.port) else {
+            return Some(ConfigImageError::NeighbourPortUnconfigured {
+                index,
+                port: entry.port,
+            });
+        };
+        if entry.address == interface.address {
+            return Some(ConfigImageError::NeighbourIsInterfaceAddress {
+                index,
+                address: entry.address,
+            });
+        }
+        if !inside_prefix(entry.address, interface.address, interface.prefix_length) {
+            return Some(ConfigImageError::NeighbourOutsidePrefix {
+                index,
+                address: entry.address,
+            });
+        }
+        if !is_host_address(entry.address, interface.prefix_length) {
+            return Some(ConfigImageError::NeighbourAddressNotAHostAddress {
+                index,
+                address: entry.address,
+            });
+        }
+    }
+    for (index, entry) in hops.iter().enumerate() {
+        for (other, earlier) in hops.iter().enumerate().take(index) {
+            if earlier.port == entry.port && earlier.address == entry.address {
+                return Some(ConfigImageError::NeighbourAddressDuplicated { index, other });
+            }
+        }
+    }
+
+    let management = image.management;
+    if management.enabled > 1 {
+        return Some(ConfigImageError::ManagementEnabledNotBoolean {
+            enabled: management.enabled,
+        });
+    }
+    // A disabled entry is held to nothing: the reader interprets none of its
+    // other fields, so there is no value for a rule to be about.
+    if management.enabled == 1 {
+        if management.prefix_length > MAX_PREFIX_LENGTH {
+            return Some(ConfigImageError::ManagementPrefixLengthTooLong {
+                prefix_length: management.prefix_length,
+            });
+        }
+        if !is_unicast(management.mac) {
+            return Some(ConfigImageError::ManagementMacNotUnicast {
+                mac: management.mac,
+            });
+        }
+        if !is_unicast_address(management.address) {
+            return Some(ConfigImageError::ManagementAddressNotUnicast {
+                address: management.address,
+            });
+        }
+        if !is_host_address(management.address, management.prefix_length) {
+            return Some(ConfigImageError::ManagementAddressNotAHostAddress {
+                address: management.address,
+            });
+        }
+        // The two the capability grants cannot express, and so the two a
+        // compromised writer would otherwise have had to itself.
+        for (index, interface) in named.iter().enumerate() {
+            if prefixes_overlap(
+                interface.address,
+                interface.prefix_length,
+                management.address,
+                management.prefix_length,
+            ) {
+                return Some(ConfigImageError::ManagementPrefixCollidesWithInterface { index });
+            }
+            if interface.mac == management.mac {
+                return Some(ConfigImageError::ManagementMacCollidesWithInterface { index });
+            }
+        }
     }
 
     None
+}
+
+/// The bytes an id names. Only reached once [`identifier_fault`] has admitted
+/// both sides, so the stated length is inside the storage.
+fn identifier_text(id: &wire::IdentifierImage) -> &[u8] {
+    id.bytes.get(..usize::from(id.len)).unwrap_or_default()
+}
+
+/// A unicast IPv4 address, restated from the ABI contract: neither multicast,
+/// the limited broadcast, loopback nor unspecified.
+fn is_unicast_address(address: [u8; 4]) -> bool {
+    let bits = u32::from_be_bytes(address);
+    bits & 0xf000_0000 != 0xe000_0000
+        && bits != u32::MAX
+        && bits & 0xff00_0000 != 0x7f00_0000
+        && bits != 0
+}
+
+/// The mask a prefix of `prefix_length` bits selects.
+fn prefix_mask(prefix_length: u8) -> u32 {
+    if prefix_length == 0 {
+        0
+    } else if prefix_length >= MAX_PREFIX_LENGTH {
+        u32::MAX
+    } else {
+        u32::MAX << MAX_PREFIX_LENGTH.saturating_sub(prefix_length)
+    }
+}
+
+/// An address a host may hold under `prefix_length` rather than the prefix's
+/// network or broadcast address. A `/31` and a `/32` reserve neither (RFC 3021).
+fn is_host_address(address: [u8; 4], prefix_length: u8) -> bool {
+    if prefix_length >= MAX_PREFIX_LENGTH.saturating_sub(1) {
+        return true;
+    }
+    let bits = u32::from_be_bytes(address);
+    let mask = prefix_mask(prefix_length);
+    let network = bits & mask;
+    bits != network && bits != (network | !mask)
+}
+
+/// Whether `address` falls inside the prefix `network`/`prefix_length` names.
+fn inside_prefix(address: [u8; 4], network: [u8; 4], prefix_length: u8) -> bool {
+    let mask = prefix_mask(prefix_length);
+    u32::from_be_bytes(address) & mask == u32::from_be_bytes(network) & mask
+}
+
+/// Whether two prefixes cover a common address, decided by the shorter of them.
+fn prefixes_overlap(left: [u8; 4], left_length: u8, right: [u8; 4], right_length: u8) -> bool {
+    inside_prefix(left, right, left_length.min(right_length))
 }
 
 /// A unicast MAC: the IEEE 802.3 group bit clear, and not the all-zero address.
@@ -389,6 +597,20 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
         interface_count: word(&mut unstructured),
         neighbour_count: word(&mut unstructured),
         content_hash: word(&mut unstructured),
+        // Read in the position the ABI puts it, between the header and the
+        // interfaces, and every byte of it the peer's: the management entry
+        // carries the address the appliance answers management traffic at and
+        // the two rules that keep it off the dataplane, so a harness leaving it
+        // zeroed would drive the one arm of the reader that decides those and
+        // never enter it.
+        management: wire::ManagementImage {
+            enabled: byte(&mut unstructured),
+            prefix_length: byte(&mut unstructured),
+            _pad: bytes(&mut unstructured),
+            mac: bytes(&mut unstructured),
+            _pad2: bytes(&mut unstructured),
+            address: bytes(&mut unstructured),
+        },
         ..ConfigImage::ZERO
     };
     for slot in &mut image.interfaces {

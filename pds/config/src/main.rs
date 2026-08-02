@@ -17,8 +17,11 @@
 //! No device capability, no buffer pool, no dataplane ring: the entire grant is
 //! the handover region it writes, the acknowledgement region it reads and its
 //! own log ring. A compromised reader reaches no frame and no NIC, and the
-//! worst it produces is a configuration — which the consumer re-checks field by
-//! field before running (`pd_runtime::handover`).
+//! worst it produces is a configuration — which the consumer decides for itself,
+//! `wire::ConfigImage::check` holding the image it copies out to every rule this
+//! domain's own validator applies, field by field and pair by pair. This domain
+//! is the one that parses an attacker's document, so a rule it alone enforced
+//! would be a rule a compromise of it lifts.
 //!
 //! # Nothing is published unless everything passed
 //!
@@ -88,11 +91,22 @@ fn init() -> ConfigDomain {
     // Which state each outcome is, and whether there is anything to offer, are
     // decided in `config` where they are host-tested.
     let report = config::commit_and_report(&mut store, CONFIG_XML, &mut changes, &sink);
-    if let Some(image) = report.image() {
-        publisher.offer(handover, &image);
+    // The refusal is unreachable — one offer, from a fresh publisher — and is
+    // reported rather than dropped anyway: a generation nobody was offered is
+    // one nobody runs, and the console is the only place that could say so.
+    let offered = match report.image() {
+        Some(image) => publisher.offer(handover, &image).is_ok(),
+        None => false,
+    };
+    if offered {
         CONSUMER.notify();
     }
-    announce(&sink, report.state());
+    let state = if report.image().is_some() && !offered {
+        DomainState::Refused
+    } else {
+        report.state()
+    };
+    announce(&sink, state);
 
     let domain = ConfigDomain {
         handover,
@@ -125,8 +139,9 @@ struct ConfigDomain {
     /// Kept past `init` because the counters it carries are published on every
     /// activation, not only on the first.
     sink: RingSink<'static, PdClock<'static>>,
-    /// The generation committed at boot, and the only one there will ever be
-    /// (README: no channel to submit a second document over).
+    /// The generation committed at boot, and the only one there will ever be:
+    /// the document arrives compiled in and this build has no channel to submit
+    /// a second one over.
     generation: u32,
 }
 

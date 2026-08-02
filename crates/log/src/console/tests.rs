@@ -601,3 +601,30 @@ fn every_console_counter_reaches_its_own_slot() {
     assert_eq!(values.len(), lfw_metrics::CONSOLE_SLOTS);
     assert_eq!(values.to_vec(), (1..=8).collect::<Vec<u64>>());
 }
+
+/// A console whose controller refused its register sequence has printed nothing,
+/// and the shard it publishes is what says so *and* why: the record counters are
+/// all zero while the device's refusal count is not, which is a different reading
+/// from the zeroed shard a domain that never started leaves. It is the whole
+/// content of a refusal reaching an operator, so the slot it lands in is asserted
+/// rather than assumed.
+#[test]
+fn a_refused_controller_publishes_a_shard_no_working_console_could() {
+    let refused = ConsoleCounters::default().to_sample(UartSample {
+        bytes_written: 0,
+        thre_timeouts: 0,
+        init_failures: 1,
+    });
+    assert_eq!(refused.records, [0; 5]);
+    assert_eq!(refused.uart_init_failures, 1);
+    assert_ne!(refused, lfw_metrics::ConsoleSample::default());
+
+    let slot = lfw_metrics::ConsoleSample::SERIES
+        .iter()
+        .position(|series| series.metric.name == "librefirewall_uart_init_failures_total")
+        .expect("the shard carries the family");
+    assert_eq!(refused.values()[slot], 1);
+    // Every other slot is zero, so the one number an operator reads accuses the
+    // device and nothing else.
+    assert_eq!(refused.values().iter().sum::<u64>(), 1);
+}

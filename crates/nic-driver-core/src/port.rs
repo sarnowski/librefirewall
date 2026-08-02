@@ -326,8 +326,10 @@ mod tests {
         /// virtqueue primed exactly as a driver protection domain does.
         fn new() -> Self {
             let log = Log::new();
-            let configured = Offered::new(FakeDevice::conforming(&log))
-                .acknowledge()
+            let device = FakeDevice::conforming(&log);
+            let bus = device.bus();
+            let configured = Offered::new(device)
+                .acknowledge(&bus)
                 .expect("a conforming device acknowledges")
                 .negotiate_features()
                 .expect("a conforming device offers virtio 1.0")

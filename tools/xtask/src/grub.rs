@@ -239,11 +239,15 @@ mod tests {
         let config = include_str!("../../../third-party/grub/grub.cfg");
         let window =
             parse_low_memory_window(config).expect("grub.cfg must carry a cutmem reservation");
-        // Small enough that no system image this project assembles can fit —
-        // the release image, the smallest yet built, is over half a megabyte.
+        // A ceiling, met at equality: the shipped reservation leaves exactly
+        // this much, so the window may shrink freely and may never widen. Small
+        // enough that no system image this project assembles can fit — the
+        // release image, the smallest yet built, is over half a megabyte.
+        const CEILING: u64 = 64 * 1024;
         assert!(
-            window <= 64 * 1024,
-            "grub.cfg leaves GRUB {window} bytes below 1 MiB for a boot module"
+            window <= CEILING,
+            "grub.cfg leaves GRUB {window} bytes below 1 MiB for a boot module, past the \
+             {CEILING}-byte ceiling"
         );
     }
 

@@ -165,7 +165,9 @@ pub const CONFIGURATION_GENERATION: Metric = metric(
 pub const CONFIGURATION_IMAGES: Metric = metric(
     "librefirewall_configuration_images_total",
     Kind::Counter,
-    "Configuration images this domain applied or refused.",
+    "Configuration images this domain applied or refused. Only the forwarder carries `applied`: \
+     the management endpoint reads a committed image for its own address and never applies one, \
+     so it reports `refused` alone.",
 );
 
 /// The one family whose samples come from the committed configuration rather than
@@ -188,7 +190,8 @@ pub const LOG_RECORDS_DROPPED: Metric = metric(
 pub const LOG_RECORDS_REFUSED: Metric = metric(
     "librefirewall_log_records_refused_total",
     Kind::Counter,
-    "Events this domain minted that the record ABI cannot carry; ours, expected to stay zero.",
+    "Records this domain minted and never put in its ring: an event the record ABI cannot carry, \
+     or a sink already borrowed further up the same stack. Ours either way, expected to stay zero.",
 );
 
 // ── The NIC drivers ─────────────────────────────────────────────────────────
@@ -226,19 +229,33 @@ pub const INPUT_DROPS: Metric = metric(
 pub const INVARIANT_FAULTS: Metric = metric(
     "librefirewall_invariant_faults_total",
     Kind::Counter,
-    "This driver's own broken bookkeeping; ours, never traffic, expected to stay zero.",
+    "A domain's own broken bookkeeping; ours, never traffic, expected to stay zero. Each domain \
+     raises its own faults and no other's: `rx_completion_unmapped`, `tx_completion_unmapped`, \
+     `rx_slot_occupied` and `tx_slot_occupied` are a NIC driver's, `block_completion_unmapped` \
+     the recorder's.",
 );
 
 pub const DEVICE_FAULTS: Metric = metric(
     "librefirewall_device_faults_total",
     Kind::Counter,
-    "Virtqueue completions the device got wrong about its own protocol.",
+    "Virtqueue completions the device got wrong about its own protocol. Each domain carries only \
+     the queues it has: `receive` and `transmit` on a NIC driver, `request` on the recorder's \
+     block device.",
+);
+
+pub const QUEUE_POSTED: Metric = metric(
+    "librefirewall_virtqueue_posted",
+    Kind::Gauge,
+    "Buffers posted to the device on this virtqueue and not yet completed. A device that accepts \
+     buffers and completes none leaves this pinned while every fault counter stays at zero, which \
+     is the only reading that tells a stalled port from an idle link.",
 );
 
 pub const POOL_RETURNS_REFUSED: Metric = metric(
     "librefirewall_pool_returns_refused_total",
     Kind::Counter,
-    "Buffer returns a pool owner refused: forged, out of range, duplicated or never lent.",
+    "Buffer returns a pool owner refused: forged, out of range, duplicated or never lent. Each \
+     domain owns one pool: `receive` on a NIC driver, `transmit` on the management endpoint.",
 );
 
 // ── The management endpoint ─────────────────────────────────────────────────
@@ -376,7 +393,16 @@ pub const TCP_REFUSED: Metric = metric(
 pub const TCP_CHALLENGE_ACKS: Metric = metric(
     "librefirewall_tcp_challenge_acks_total",
     Kind::Counter,
-    "RFC 5961 challenge acknowledgements sent.",
+    "Segments challenged rather than acted on under RFC 5961 — a blind in-window RST (§3.2) or a \
+     SYN on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's \
+     answer.",
+);
+
+pub const TCP_CHALLENGES_SUPPRESSED: Metric = metric(
+    "librefirewall_tcp_challenges_suppressed_total",
+    Kind::Counter,
+    "Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge \
+     acknowledgement, or the reset a segment naming no connection would have drawn.",
 );
 
 pub const TCP_RESETS: Metric = metric(
@@ -487,6 +513,13 @@ pub const RECORDING_RECORDS_DROPPED: Metric = metric(
     "Observations a sink could not encode, by why; every one is a gap the recording states.",
 );
 
+pub const RECORDING_STAGING_DEFERRALS: Metric = metric(
+    "librefirewall_recording_staging_deferrals_total",
+    Kind::Counter,
+    "Records a recording could not stage yet and re-offered. Not a loss: a deferred record is \
+     held and placed on a later pass.",
+);
+
 pub const RECORDING_SEGMENTS_CLOSED: Metric = metric(
     "librefirewall_recording_segments_closed_total",
     Kind::Counter,
@@ -589,7 +622,8 @@ pub const UART_TRANSMITTER_TIMEOUTS: Metric = metric(
 pub const UART_INIT_FAILURES: Metric = metric(
     "librefirewall_uart_init_failures_total",
     Kind::Counter,
-    "Refused initialisations of the serial controller.",
+    "Refused initialisations of the serial controller. Non-zero means this node has no console: \
+     the domain publishes its shard from the refusal path so that a scrape can say so.",
 );
 
 /// Every family, in the order the exposition emits them.
@@ -612,6 +646,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &INPUT_DROPS,
     &INVARIANT_FAULTS,
     &DEVICE_FAULTS,
+    &QUEUE_POSTED,
     &POOL_RETURNS_REFUSED,
     &ENDPOINT_FRAMES,
     &ENDPOINT_BYTES,
@@ -632,6 +667,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &TCP_CONNECTIONS,
     &TCP_REFUSED,
     &TCP_CHALLENGE_ACKS,
+    &TCP_CHALLENGES_SUPPRESSED,
     &TCP_RESETS,
     &TCP_URGENT_IGNORED,
     &TCP_WRITE_REFUSED,
@@ -649,6 +685,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &RECORDING_RECORDS,
     &RECORDING_RECORD_BYTES,
     &RECORDING_RECORDS_DROPPED,
+    &RECORDING_STAGING_DEFERRALS,
     &RECORDING_SEGMENTS_CLOSED,
     &RECORDING_WRAPS,
     &RECORDING_SECTORS_WRITTEN,

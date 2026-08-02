@@ -6,11 +6,17 @@
 //! come to depend on how the document was written rather than on what it says.
 //!
 //! Every rule refuses a configuration that is *internally* inconsistent or that
-//! this build cannot express. Two of them are wider than the documented
-//! contract states: a neighbour's address and MAC are held to the same unicast rules as
-//! an interface's, because a multicast next-hop MAC and a broadcast next-hop
-//! address are exactly as unforwardable as their interface counterparts, and
-//! the vocabulary already had the tokens for both.
+//! this build cannot express. Three of them are wider than the documented
+//! contract states: a neighbour's address and MAC are held to the same unicast
+//! and host-address rules as an interface's, because a multicast next-hop MAC
+//! and a next-hop that is a link's own broadcast address are exactly as
+//! unforwardable as their interface counterparts, and the vocabulary already
+//! had the tokens for all three.
+//!
+//! Every rule here is re-decided by [`wire::ConfigImage::check`], which is as
+//! strong on all but two of them. Not redundancy: this crate runs in the domain
+//! that parses the document, so a rule only enforced here is one a compromised
+//! parser does not enforce. Which two is stated on that function.
 
 use lfw_log::{Identifier, RejectReason};
 use net_headers::{Ipv4Address, prefix_mask};
@@ -67,6 +73,12 @@ pub enum SemanticError {
         id: Identifier,
         other: Identifier,
     },
+    /// Two dataplane ports answering to one L2 address, on the grounds
+    /// [`Self::ManagementMacCollidesWithInterface`] states.
+    DuplicateInterfaceMac {
+        id: Identifier,
+        other: Identifier,
+    },
     UnknownInterfaceReference {
         id: Identifier,
         interface: Identifier,
@@ -84,6 +96,10 @@ pub enum SemanticError {
     },
     /// A neighbour holding the appliance's own address on that link.
     NeighbourIsInterfaceAddress {
+        id: Identifier,
+    },
+    /// Forwarding to one would unicast a frame to a directed subnet broadcast.
+    NeighbourAddressNotAHostAddress {
         id: Identifier,
     },
     DuplicateNeighbourAddress {
@@ -129,6 +145,8 @@ impl SemanticError {
             | Self::NeighbourMacNotUnicast { id }
             | Self::NeighbourOutsidePrefix { id }
             | Self::NeighbourIsInterfaceAddress { id }
+            | Self::NeighbourAddressNotAHostAddress { id }
+            | Self::DuplicateInterfaceMac { id, .. }
             | Self::DuplicateNeighbourAddress { id, .. } => id,
             Self::ManagementPrefixLengthOutOfRange { .. }
             | Self::ManagementAddressNotUnicast
@@ -148,13 +166,14 @@ impl SemanticError {
             Self::DuplicatePort { .. } => RejectReason::DuplicatePort,
             Self::PortOutOfRange { .. } => RejectReason::PortOutOfRange,
             Self::PrefixLengthOutOfRange { .. } => RejectReason::PrefixLengthOutOfRange,
-            Self::InterfaceAddressNotAHostAddress { .. } => RejectReason::AddressNotAHostAddress,
+            Self::InterfaceAddressNotAHostAddress { .. }
+            | Self::NeighbourAddressNotAHostAddress { .. } => RejectReason::AddressNotAHostAddress,
             Self::InterfaceAddressNotUnicast { .. } | Self::NeighbourAddressNotUnicast { .. } => {
                 RejectReason::AddressNotUnicast
             }
-            Self::InterfaceMacNotUnicast { .. } | Self::NeighbourMacNotUnicast { .. } => {
-                RejectReason::MacNotUnicast
-            }
+            Self::InterfaceMacNotUnicast { .. }
+            | Self::NeighbourMacNotUnicast { .. }
+            | Self::DuplicateInterfaceMac { .. } => RejectReason::MacNotUnicast,
             Self::OverlappingPrefixes { .. } => RejectReason::OverlappingPrefixes,
             Self::UnknownInterfaceReference { .. } => RejectReason::UnknownInterfaceReference,
             Self::NeighbourOutsidePrefix { .. } => RejectReason::NeighbourOutsidePrefix,
@@ -281,6 +300,12 @@ fn interface_topology(model: &Model) -> Result<(), SemanticError> {
                     port: entry.port,
                 });
             }
+            if earlier.mac == entry.mac {
+                return Err(SemanticError::DuplicateInterfaceMac {
+                    id: entry.id,
+                    other: earlier.id,
+                });
+            }
             if overlaps(
                 earlier.address,
                 earlier.prefix_length,
@@ -331,6 +356,9 @@ fn neighbour_fields(model: &Model) -> Result<(), SemanticError> {
         let mask = prefix_mask(interface.prefix_length);
         if entry.address.bits() & mask != interface.address.bits() & mask {
             return Err(SemanticError::NeighbourOutsidePrefix { id });
+        }
+        if !is_host_address(entry.address, interface.prefix_length) {
+            return Err(SemanticError::NeighbourAddressNotAHostAddress { id });
         }
     }
     Ok(())
@@ -653,6 +681,73 @@ mod tests {
         );
     }
 
+    /// Two dataplane ports under one L2 address, refused on the grounds the
+    /// management/interface collision is: a frame would be taken by whichever
+    /// saw it first, and the two ports are guaranteed different by
+    /// [`SemanticError::DuplicatePort`].
+    #[test]
+    fn two_interfaces_answering_to_one_mac_are_refused_and_both_named() {
+        let mut clash = second_interface();
+        clash.mac = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]);
+        let error = refusal(&with_interface(clash));
+        assert_eq!(
+            error,
+            SemanticError::DuplicateInterfaceMac {
+                id: id("lan"),
+                other: id("wan"),
+            }
+        );
+        assert_eq!(error.id(), id("lan"));
+        assert_eq!(error.reason(), RejectReason::MacNotUnicast);
+    }
+
+    /// A neighbour at its link's network or broadcast address: `is_unicast`
+    /// admits both, and forwarding to one would unicast a frame to a directed
+    /// subnet broadcast address.
+    #[test]
+    fn a_neighbour_at_its_links_network_or_broadcast_address_is_refused() {
+        for octets in [[10, 0, 0, 255], [10, 0, 0, 0]] {
+            let mut reserved = first_neighbour();
+            reserved.address = Ipv4Address::from_octets(octets);
+            let error = refusal(&with_neighbour(reserved));
+            assert_eq!(
+                error,
+                SemanticError::NeighbourAddressNotAHostAddress {
+                    id: id("gateway-a")
+                },
+                "{octets:?}"
+            );
+            assert_eq!(error.reason(), RejectReason::AddressNotAHostAddress);
+        }
+    }
+
+    /// The same two addresses on a point-to-point link, where RFC 3021 reserves
+    /// neither: the rule is about what the prefix excludes, not about the
+    /// octets.
+    #[test]
+    fn a_neighbour_on_a_point_to_point_link_may_hold_either_address() {
+        let mut model = Model::EMPTY;
+        model
+            .push_interface(InterfaceEntry {
+                id: id("wan"),
+                port: 0,
+                enabled: true,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50]),
+                address: Ipv4Address::from_octets([10, 0, 0, 0]),
+                prefix_length: 31,
+            })
+            .expect("capacity");
+        model
+            .push_neighbour(NeighbourEntry {
+                id: id("gateway-a"),
+                interface: id("wan"),
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0a]),
+            })
+            .expect("capacity");
+        validate(&model).expect("RFC 3021 leaves both usable");
+    }
+
     #[test]
     fn a_neighbour_naming_an_unknown_interface_is_refused() {
         let mut dangling = first_neighbour();
@@ -886,6 +981,11 @@ mod tests {
             SemanticError::NeighbourMacNotUnicast { id: one },
             SemanticError::NeighbourOutsidePrefix { id: one },
             SemanticError::NeighbourIsInterfaceAddress { id: one },
+            SemanticError::NeighbourAddressNotAHostAddress { id: one },
+            SemanticError::DuplicateInterfaceMac {
+                id: one,
+                other: two,
+            },
             SemanticError::DuplicateNeighbourAddress {
                 id: one,
                 other: two,

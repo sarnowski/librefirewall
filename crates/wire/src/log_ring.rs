@@ -77,9 +77,15 @@
 //!   it. The second costs the console its own records and nobody else's, which
 //!   is the shape a consumer harming itself should have.
 //! * **A record is untrusted input.** Per-field atomics mean a write concurrent
-//!   with a read can yield a record whose fields come from different writes:
-//!   always a well-formed value, never undefined behaviour, and refused by
-//!   [`LogRecord::check`] before anything is rendered.
+//!   with a read can yield a record whose fields come from different writes. The
+//!   guarantee is exactly this and no more: every field is always a well-formed
+//!   value and never undefined behaviour. [`LogRecord::check`] refuses a *shape*
+//!   — a length, a token, a discriminant the ABI cannot carry — and provenance is
+//!   not a shape, so a record whose domain came from one write and whose state
+//!   came from the next passes and renders as a console line no domain emitted.
+//!   That is the accepted residue of a per-field publish: the alternative is a
+//!   sequence word per slot on the path of every record, against an outcome that
+//!   is a wrong line and never a fault.
 //! * **The drop count is the writer's own claim about itself** and bounds
 //!   nothing here. It restarts at zero when the writing domain does — the one
 //!   discontinuity the exposed counter semantics admit.
@@ -103,9 +109,10 @@ use crate::log_slot::LogSlot;
 /// failed bring-up are the ones refused.
 ///
 /// It is what a wider record is spent against, and it wins: the shipped
-/// document's first generation alone is 16 change records. At 232 bytes a
-/// record, 64 of them are 14 856 of the 16 384 the region already rounds to, so
-/// the growth costs neither the count nor the system description.
+/// document's first generation alone is 16 change records. At 248 bytes a
+/// record, 64 of them plus the cursor and the drop count are 15 880 of the
+/// 16 384 the region already rounds to, so the growth costs neither the count
+/// nor the system description.
 pub const LOG_RING_SLOTS: usize = 64;
 
 /// Bytes the system description reserves for one records region, derived rather
@@ -215,7 +222,6 @@ impl LogConsume {
             consume: self,
             records: PeerRecords::new(records),
             head: 0,
-            undecodable: 0,
         }
     }
 }
@@ -357,13 +363,11 @@ impl LogWriter<'_> {
     }
 }
 
-/// The draining side, holding this domain's consume position and its own tally
-/// of undecodable records in private memory.
+/// The draining side, holding this domain's consume position in private memory.
 pub struct LogReader<'ring> {
     consume: &'ring LogConsume,
     records: PeerRecords<'ring>,
     head: u32,
-    undecodable: u32,
 }
 
 impl<'ring> LogReader<'ring> {
@@ -376,9 +380,10 @@ impl<'ring> LogReader<'ring> {
     ///
     /// The outer `None` means only that nothing is queued *at this instant*,
     /// judged against the writer's published cursor; a later call may return
-    /// `Some`. The inner `Err` is a record the writer's bytes cannot be, which
-    /// is counted by [`undecodable`](Self::undecodable) and is a fact about the
-    /// peer rather than a reason to stop draining.
+    /// `Some`. The inner `Err` is a record the writer's bytes cannot be, which is
+    /// a fact about the peer rather than a reason to stop draining — and the
+    /// caller's to count, one refusal being no more this side's business than the
+    /// line it would otherwise have rendered.
     pub fn read(&mut self) -> Option<Result<CheckedRecord, LogRecordError>> {
         if self.head == self.records.tail() {
             return None;
@@ -386,11 +391,7 @@ impl<'ring> LogReader<'ring> {
         let record = self.records.record(self.head);
         self.head = self.head.wrapping_add(1) & MASK;
         self.consume.head.store(self.head, Ordering::Release);
-        let decoded = record.check();
-        if decoded.is_err() {
-            self.undecodable = self.undecodable.saturating_add(1);
-        }
-        Some(decoded)
+        Some(record.check())
     }
 
     /// Read at most `limit` records, and never more than
@@ -415,13 +416,6 @@ impl<'ring> LogReader<'ring> {
             reader: self,
             remaining,
         }
-    }
-
-    /// Records whose bytes decoded to no event, since this handle was taken.
-    /// Saturating, on [`LogRingFull::dropped`]'s terms.
-    #[must_use]
-    pub const fn undecodable(&self) -> u32 {
-        self.undecodable
     }
 
     /// What the writer says it refused for want of a slot. The writer's claim

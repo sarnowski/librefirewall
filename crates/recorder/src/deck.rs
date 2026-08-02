@@ -34,7 +34,6 @@ use lfw_clock::{Calibration, Ticks};
 
 use lfw_capture_ring::{
     Geometry, GeometryError, SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES,
-    encode_superblock,
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadRefusal, DownloadSink, TAP_SNAP_LEN,
@@ -57,17 +56,18 @@ pub const RESERVED_SECTORS: u64 = 2048;
 /// Bytes of one segment, in both recordings. A segment is what a wrap replaces
 /// whole and what a reader resynchronises on, so the number trades history
 /// granularity against per-segment prologue cost: 1 MiB gives the log ring
-/// sixteen segments and the capture ring thirty-two.
+/// fifteen payload segments and the capture ring thirty-one, one of each
+/// extent's going to the superblock.
 pub const SEGMENT_BYTES: usize = 1024 * 1024;
 
-/// Where the header recording lives: 16 MiB past the reserved front.
+/// Where the header recording lives: 16 MiB starting at the reserved front.
 pub const LOG_START_SECTOR: u64 = RESERVED_SECTORS;
 pub const LOG_SECTORS: u64 = 32768;
 /// Bytes of each frame it keeps — Ethernet, IPv4 and the transport ports, with
 /// room over.
 pub const LOG_SNAP_LEN: u32 = 128;
 
-/// Where the full-content recording lives: 32 MiB past the log's end.
+/// Where the full-content recording lives: 32 MiB starting at the log's end.
 pub const CAPTURE_START_SECTOR: u64 = LOG_START_SECTOR + LOG_SECTORS;
 pub const CAPTURE_SECTORS: u64 = 65536;
 /// Whole frames, matching `wire::TAP_SNAP_LEN`, so a capture keeps everything
@@ -232,7 +232,10 @@ pub struct Transfer {
 /// How a transfer ended, as the domain owning the device reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ended {
-    Ok,
+    /// The medium performed it and moved `delivered` data bytes — carried because
+    /// a device may complete a read `Ok` having moved less, leaving the shortfall
+    /// holding an earlier transfer's bytes.
+    Ok { delivered: usize },
     /// The medium refused it, or answered something the driver could not
     /// decode.
     Failed,
@@ -243,6 +246,17 @@ pub enum Ended {
 pub struct Completion {
     pub job: Job,
     pub ended: Ended,
+}
+
+/// What one poll of the medium produced. An unattributable completion is its own
+/// answer and never `None`, which is how a caller learns the device has nothing
+/// more to say: reporting one as the other lets a device replaying its used ring
+/// end the drain on every pass while every fault surface reads clean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Polled {
+    Settled(Completion),
+    /// Counted, and the drain goes on.
+    Unattributed,
 }
 
 /// The medium would not take a transfer now — no free slot, no room in the
@@ -268,10 +282,10 @@ pub trait Medium {
     /// [`Refused`] when the device cannot take it now; nothing is published.
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused>;
 
-    /// Take one completion, or `None`. One per call, so the caller bounds its
-    /// own drain and a device flooding its used ring cannot park the domain
-    /// inside a single call.
-    fn poll(&mut self) -> Option<Completion>;
+    /// Take one completion, or `None` once the device has nothing more. One per
+    /// call, so the caller bounds its own drain and a device flooding its used
+    /// ring cannot park the domain inside a single call.
+    fn poll(&mut self) -> Option<Polled>;
 }
 
 /// Completions one pass settles. A device answering faster than this leaves the
@@ -354,17 +368,16 @@ impl Recording {
         let geometry = which
             .geometry(capacity_sectors)
             .map_err(|error| DeckError::Extent { which, error })?;
-        let mut sink = Sink::new(SinkConfig {
-            geometry,
-            snap_len: which.snap_len(),
-            interfaces,
-            interface_count,
-        })
+        let sink = Sink::new(
+            SinkConfig {
+                geometry,
+                snap_len: which.snap_len(),
+                interfaces,
+                interface_count,
+            },
+            staging,
+        )
         .map_err(|error| DeckError::Sink { which, error })?;
-        sink.open(staging).map_err(|error| DeckError::Sink {
-            which,
-            error: SinkError::Encode(error),
-        })?;
         Ok(Self {
             which,
             sink,
@@ -548,13 +561,48 @@ impl Deck {
         self.checkpoint(medium);
     }
 
-    /// Take one completion and settle whatever it answers, reporting whether
-    /// there was one.
+    /// Bytes the transfer answering `job` asked for, or `None` holding none.
+    fn asked(&self, job: Job) -> Option<usize> {
+        match job {
+            Job::Flush(which) => self
+                .recordings
+                .get(which.index())
+                .filter(|recording| recording.submitted)
+                .and_then(|recording| recording.in_flight.as_ref())
+                .map(Flush::len),
+            // The smaller length a `SuperblockWrite` names, so both copies
+            // replaced and one moved still reads as short.
+            Job::Checkpoint(which) => {
+                (self.checkpointing == Some(which)).then_some(SUPERBLOCK_COPY_BYTES)
+            }
+            Job::Fetch => match self.download {
+                Download::Fetching {
+                    sectors,
+                    submitted: true,
+                    ..
+                } => Some((sectors as usize).saturating_mul(SECTOR_SIZE)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Take one completion and settle it, reporting whether there was one.
     fn settle(&mut self, medium: &mut impl Medium) -> bool {
-        let Some(Completion { job, ended }) = medium.poll() else {
+        let Some(polled) = medium.poll() else {
             return false;
         };
-        if ended == Ended::Failed {
+        let Polled::Settled(Completion { job, ended }) = polled else {
+            self.counters.completions_unexpected =
+                self.counters.completions_unexpected.saturating_add(1);
+            return true;
+        };
+        // Short is a failure however it reports itself.
+        let short = match ended {
+            Ended::Ok { delivered } => self.asked(job).is_some_and(|asked| delivered < asked),
+            Ended::Failed => false,
+        };
+        let failed = ended == Ended::Failed || short;
+        if failed {
             self.counters.medium_failures = self.counters.medium_failures.saturating_add(1);
         }
         match job {
@@ -573,6 +621,13 @@ impl Deck {
                     Some(flush) if recording.submitted => {
                         recording.submitted = false;
                         recording.sink.acknowledge(flush, staging);
+                        // The durable cursor just moved, and the superblock is
+                        // the medium's only statement of where it is. Rolling a
+                        // segment is far too coarse a trigger for that: it would
+                        // leave the extent claiming nothing durable for as long
+                        // as a recording stays inside its first segment, which
+                        // is the whole of a short run.
+                        recording.checkpoint_due = true;
                     }
                     // A completion for a flush that was never handed over, or
                     // for one already settled: the device's, and counted.
@@ -586,6 +641,9 @@ impl Deck {
             Job::Checkpoint(which) => {
                 if self.checkpointing == Some(which) {
                     self.checkpointing = None;
+                    if !failed && let Some(recording) = self.recordings.get_mut(which.index()) {
+                        recording.sink.acknowledge_checkpoint();
+                    }
                 } else {
                     self.counters.completions_unexpected =
                         self.counters.completions_unexpected.saturating_add(1);
@@ -600,20 +658,23 @@ impl Deck {
                     submitted: true,
                     ..
                 } => {
-                    self.download = match ended {
-                        Ended::Ok => Download::Fetched {
+                    self.download = if failed {
+                        // Answered rather than left waiting: a requester cannot
+                        // tell a refusal from a hang (`wire::download`). A short
+                        // read arrives here too, so the area's older bytes are
+                        // never handed out as this window's.
+                        Download::Answered {
+                            demand,
+                            reason: Some(DownloadRefusal::DeviceError),
+                            total_len,
+                        }
+                    } else {
+                        Download::Fetched {
                             demand,
                             total_len,
                             skip,
                             len,
-                        },
-                        // Answered rather than left waiting: a requester cannot
-                        // tell a refusal from a hang (`wire::download`).
-                        Ended::Failed => Download::Answered {
-                            demand,
-                            reason: Some(DownloadRefusal::DeviceError),
-                            total_len,
-                        },
+                        }
                     };
                 }
                 other => {
@@ -786,22 +847,14 @@ impl Deck {
         if self.checkpointing.is_some() {
             return;
         }
-        let Some(recording) = self
+        let Some((which, sector)) = self
             .recordings
-            .iter_mut()
+            .iter()
             .find(|recording| recording.checkpoint_due)
+            .map(|recording| (recording.which, recording.sink.superblock_sector()))
         else {
             return;
         };
-        let which = recording.which;
-        let Ok(state) = recording.sink.state() else {
-            // A cursor no superblock can carry: the recording keeps going and
-            // the checkpoint is simply not written, which is what an
-            // unidentified extent already looks like to a reader.
-            recording.checkpoint_due = false;
-            return;
-        };
-        let sector = recording.sink.superblock_sector();
         let staging = medium.staging(Area::Superblock);
         let Some(image) = staging.get_mut(..SUPERBLOCK_BYTES) else {
             return;
@@ -809,14 +862,21 @@ impl Deck {
         let Ok(image) = <&mut [u8; SUPERBLOCK_BYTES]>::try_from(image) else {
             return;
         };
-        // The offset of the copy it rewrote, not a length: the other copy is
-        // what a reader falls back to, so exactly one sector goes out.
-        let at = encode_superblock(image, &state);
+        let Some(recording) = self.recordings.get_mut(which.index()) else {
+            return;
+        };
+        let Ok(write) = recording.sink.superblock(image) else {
+            // A cursor no superblock can carry: the recording keeps going and
+            // the checkpoint is simply not written, which is what an
+            // unidentified extent already looks like to a reader.
+            recording.checkpoint_due = false;
+            return;
+        };
         let transfer = Transfer {
             area: Area::Superblock,
-            at,
-            sector: sector.saturating_add((at / SECTOR_SIZE) as u64),
-            len: SUPERBLOCK_COPY_BYTES,
+            at: write.at,
+            sector: sector.saturating_add((write.at / SECTOR_SIZE) as u64),
+            len: write.len,
             write: true,
         };
         match medium.submit(Job::Checkpoint(which), transfer) {
@@ -955,6 +1015,13 @@ impl Deck {
             };
             let staging = medium.staging(which.area());
             let Some(recording) = self.recordings.get_mut(which.index()) else {
+                // The demand was taken out of the state to be moved, so returning
+                // would consume it and answer nothing.
+                self.download = Download::Answered {
+                    demand,
+                    reason: Some(DownloadRefusal::NotReady),
+                    total_len: 0,
+                };
                 return;
             };
             // A seal that will not fit waits for a flush to make room; nothing

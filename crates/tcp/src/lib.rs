@@ -110,7 +110,7 @@ pub mod rto;
 pub mod segment;
 pub mod seq;
 
-use lfw_clock::Monotonic;
+use lfw_clock::{Duration, Monotonic};
 use net_headers::Ipv4Address;
 
 pub use connection::{
@@ -126,6 +126,65 @@ pub use segment::{
 pub use seq::SeqNumber;
 
 use connection::Reply;
+
+/// Unsolicited replies one stack may compose per second, shared across every
+/// connection it holds: RFC 5961 section 7's challenge-acknowledgement limit.
+///
+/// It bounds the two answers a peer can provoke without holding a connection at
+/// all — the challenge acknowledgement RFC 5961 requires in place of RFC 793's
+/// reset, and the reset a segment naming no connection draws — so a peer cannot
+/// make one port answer every segment it invents. The limit is part of the
+/// mitigation and not an optimisation: without it the challenge is itself the
+/// amplifier, one reply per forged segment.
+///
+/// A hundred a second is RFC 5961's own suggestion and is orders of magnitude
+/// above anything a legitimate exchange provokes — a real peer challenges once
+/// and then corrects itself.
+pub const CHALLENGE_LIMIT: u32 = 100;
+
+/// The span [`CHALLENGE_LIMIT`] is stated over.
+const CHALLENGE_WINDOW: Duration = Duration::from_millis(1_000);
+
+/// One second's allowance of unsolicited replies, and how much of it is gone.
+///
+/// The window is anchored on the first reply of each second rather than on a
+/// tick this crate does not have, because the caller owns the clock: a stack
+/// that is not polled has no second to spend.
+#[derive(Clone, Copy, Debug)]
+struct ChallengeBudget {
+    /// When the second in progress began, or `None` before the first reply.
+    started: Option<Monotonic>,
+    spent: u32,
+}
+
+impl ChallengeBudget {
+    const fn new() -> Self {
+        Self {
+            started: None,
+            spent: 0,
+        }
+    }
+
+    /// Take one reply's worth, answering whether there was one to take.
+    ///
+    /// A `now` behind the window's start opens a fresh one: the caller's clock
+    /// is the caller's, and a stack that treated a backwards reading as an
+    /// enormous elapsed span would hand out an allowance it had already spent.
+    fn take(&mut self, now: Monotonic) -> bool {
+        let elapsed = self
+            .started
+            .is_none_or(|started| now < started || now.since(started) >= CHALLENGE_WINDOW);
+        if elapsed {
+            self.started = Some(now);
+            self.spent = 0;
+        }
+        if self.spent >= CHALLENGE_LIMIT {
+            return false;
+        }
+        self.spent = self.spent.saturating_add(1);
+        true
+    }
+}
 
 /// Which connection a caller means.
 ///
@@ -235,7 +294,14 @@ pub enum SendError {
     /// arrived.
     WouldBlock,
     /// Storage too small, or a payload no datagram can carry.
-    Write(WriteError),
+    ///
+    /// `committed` is what the connection has already consumed sequence space
+    /// for: [`TcpStack::send`] records the range and advances before it
+    /// composes, so those payload bytes are outstanding whether or not a
+    /// segment left. A caller advances its own accounting over them and holds
+    /// them for the retransmission [`Timeout::Retransmit`] will ask for; zero
+    /// where nothing was committed.
+    Write { error: WriteError, committed: usize },
     /// The bytes offered are not the range the timeout asked for.
     WrongRange { expected: SeqNumber, len: u16 },
     /// Nothing is outstanding, so there is nothing to retransmit.
@@ -273,6 +339,9 @@ pub struct TcpStack<const CONNECTIONS: usize> {
     /// Bumped every time a slot is filled, so a handle to a closed connection
     /// cannot address the one that replaced it.
     generations: [u32; CONNECTIONS],
+    /// What is left of this second's unsolicited replies, shared across the
+    /// whole table (RFC 5961 section 7).
+    challenges: ChallengeBudget,
     counters: TcpCounters,
 }
 
@@ -298,6 +367,7 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             isn: IsnGenerator::new(secret),
             slots: [const { None }; CONNECTIONS],
             generations: [0; CONNECTIONS],
+            challenges: ChallengeBudget::new(),
             counters: TcpCounters::new(),
         }
     }
@@ -378,9 +448,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                     | SegmentError::DataOffsetTooSmall { .. }
                     | SegmentError::DataOffsetExceedsSegment { .. }
                     | SegmentError::OptionTruncated { .. }
-                    | SegmentError::OptionLengthInvalid { .. } => {
-                        &mut self.counters.refused_malformed
-                    }
+                    | SegmentError::OptionLengthInvalid { .. }
+                    | SegmentError::OptionRepeated { .. } => &mut self.counters.refused_malformed,
                 };
                 TcpCounters::bump(count);
                 return self.rejected(Rejection::Malformed(error));
@@ -408,7 +477,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
     /// until the range is acknowledged in any case, and
     /// [`poll_timeouts`](Self::poll_timeouts) will ask for them with storage the
     /// next poll offers. Losing the record instead would leave a sequence number
-    /// consumed that nothing would ever re-send.
+    /// consumed that nothing would ever re-send. The error names how many bytes
+    /// that was, so the caller can advance over exactly them.
     ///
     /// # Errors
     /// [`SendError`], for a handle that names nothing, a connection that cannot
@@ -464,7 +534,10 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             Ok(len) => len,
             Err(error) => {
                 TcpCounters::bump(&mut self.counters.write_refused);
-                return Err(SendError::Write(error));
+                return Err(SendError::Write {
+                    error,
+                    committed: allowed,
+                });
             }
         };
         TcpCounters::bump(&mut self.counters.segments_sent);
@@ -496,8 +569,53 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         let peer = connection.peer_address();
         let port = connection.peer_port();
         let window = connection.advertised_window();
+        // A `FIN` occupies a sequence number and no payload byte, so a caller
+        // holding response bytes owes nothing more for it: the transport
+        // re-composes a control segment itself.
         self.emit(peer, port, window, &reply, out)
-            .map_err(SendError::Write)
+            .map_err(|error| SendError::Write {
+                error,
+                committed: 0,
+            })
+    }
+
+    /// Tear this end of a connection down with a `RST`, and forget it.
+    ///
+    /// Distinct from [`close`](Self::close), and the difference is what a peer
+    /// and every intermediary on the path are told: a `FIN` says the message
+    /// ended where it ended, so a body cut short under an exact
+    /// `Content-Length` would read as complete. A caller that cannot produce
+    /// what it announced needs the unambiguous signal instead.
+    ///
+    /// The slot is freed here rather than left to a timer: a connection this
+    /// end has reset can neither send nor receive again.
+    ///
+    /// # Errors
+    /// [`SendError`], for a handle that names nothing or storage too small. The
+    /// connection survives a refused write, so the caller may try again with
+    /// storage the next pass offers.
+    pub fn abort(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, SendError> {
+        let Some(connection) = self.resolve_mut(id) else {
+            return Err(SendError::UnknownConnection);
+        };
+        let reply = connection.reset();
+        let peer = connection.peer_address();
+        let port = connection.peer_port();
+        let window = connection.advertised_window();
+        let len = match self.emit(peer, port, window, &reply, out) {
+            Ok(len) => len,
+            Err(error) => {
+                TcpCounters::bump(&mut self.counters.write_refused);
+                return Err(SendError::Write {
+                    error,
+                    committed: 0,
+                });
+            }
+        };
+        TcpCounters::bump(&mut self.counters.resets_sent);
+        TcpCounters::bump(&mut self.counters.connections_closed);
+        self.free(id.slot);
+        Ok(len)
     }
 
     /// Re-send the oldest unacknowledged range of a connection, with the bytes
@@ -553,7 +671,12 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             Ok(len) => len,
             Err(error) => {
                 TcpCounters::bump(&mut self.counters.write_refused);
-                return Err(SendError::Write(error));
+                // Nothing was recorded: a retransmission re-sends a range that
+                // is already outstanding.
+                return Err(SendError::Write {
+                    error,
+                    committed: 0,
+                });
             }
         };
         // Re-resolved because the write borrowed nothing of the table and the
@@ -715,7 +838,17 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                 }
             };
             TcpCounters::bump(&mut self.counters.refused_no_connection);
-            let emitted = self.send_reset(source, segment.source_port, 0, &reply, out);
+            // RFC 5961 section 7: this reset belongs to no connection and any
+            // segment provokes one, so it comes out of the second's shared
+            // allowance. A peer past it learns the same thing from its own
+            // timeout, which is what the silence for a closed port already
+            // costs.
+            let emitted = if self.challenges.take(now) {
+                self.send_reset(source, segment.source_port, 0, &reply, out)
+            } else {
+                TcpCounters::bump(&mut self.counters.challenges_suppressed);
+                0
+            };
             return Received {
                 outcome: Outcome::Rejected(Rejection::NoConnection),
                 data: &[],
@@ -833,7 +966,26 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             TcpCounters::bump(&mut self.counters.connections_closed);
         }
 
-        let emitted = match processed.reply {
+        // RFC 5961 section 7: an acknowledgement a *refusal* produced is a
+        // challenge — the answer to a blind reset, an unexpected `SYN`, an
+        // acknowledgement outside the send window, or a segment outside the
+        // receive window — and comes out of the second's shared allowance. A
+        // reset is not one and is never withheld: it ends the connection, and a
+        // peer left believing in one this end has torn down would go on sending
+        // into it.
+        let challenge = processed.refusal.is_some()
+            && processed
+                .reply
+                .is_some_and(|reply| !reply.flags.contains(Flags::RST));
+        let answer = match processed.reply {
+            Some(_) if challenge && !self.challenges.take(now) => {
+                TcpCounters::bump(&mut self.counters.challenges_suppressed);
+                None
+            }
+            other => other,
+        };
+
+        let emitted = match answer {
             Some(reply) => match self.write(source, port, window, scale, &reply, out) {
                 Ok(len) => {
                     TcpCounters::bump(&mut self.counters.segments_sent);

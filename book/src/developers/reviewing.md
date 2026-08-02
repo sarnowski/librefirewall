@@ -9,9 +9,10 @@ it cannot see. A green gate is necessary, never sufficient.
 A change is done when, from a clean checkout:
 
 1. The full gate is green through the same root commands users and CI run — formatting, Clippy, the
-   documented-`unsafe` lint, the comment and `unsafe` budget ratchets, dependency policy, unit and
-   property tests at or above the coverage floors, the fuzz targets, image assembly, and the QEMU
-   system and A/B scenarios.
+   documented-`unsafe` lint, the comment and `unsafe` budget ratchets, the system-description,
+   reference-chapter and configuration-document checks, dependency policy, unit and property tests
+   at or above the coverage floors, the fuzz targets, image assembly, and the QEMU system and A/B
+   scenarios.
 2. Documentation and tests are updated **in the same change** — crate headers, rustdoc, `SAFETY`
    comments with their named guarantors, delegated preconditions with their named enforcers, and
    every book page the change touches the truth of.
@@ -63,11 +64,16 @@ reviewers produce comparable output.
 4. **Preconditions.** For each documented precondition delegated to a caller: follow the delegation
    chain to a component that validates and has a test. A chain that cycles or ends nowhere is
    critical.
-5. **Capabilities.** Did `systems/` change? That is a security change requiring human sign-off; diff
-   the generated capability report, not only the description.
+5. **Capabilities.** Did `systems/` change? That is a security change requiring human sign-off;
+   diff the generated capability report, not only the description. The gate proves the description
+   still matches the constants the domains compile against — it cannot judge whether a grant should
+   exist at all, and that judgement is the whole of this step.
 6. **Truth.** The [status pages](../status.md) where the change alters what works; the reference
    chapters where it alters an exposed signal; any page, header, or comment the change falsified;
-   any deviation from the [design](../design/architecture.md) documented and human-approved.
+   any deviation from the [design](../design/architecture.md) documented and human-approved. The
+   gate reads the console and metrics chapters and will catch a token, family or count that moved
+   without its table; the prose around them, the label values, and which group a token was filed
+   under are unread, so those stay here.
 7. **Coverage and exclusions.** The floors hold, and any exclusion cites a reason from the
    [closed list](engineering.md#testing) — the trusted-base argument is never available.
 8. **Residue.** No compatibility path, no dead code, no `TODO`/stub/placeholder, and no correctness

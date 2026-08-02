@@ -82,7 +82,7 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use arbitrary::Unstructured;
-use net_headers::{Ipv4Address, MacAddress};
+use net_headers::{Ipv4Address, MacAddress, ParseFailure};
 use packet_buffer::CopyOutError;
 use pd_runtime::{
     BUFFER_SIZE, Configuration, DRAIN_LIMIT, Descriptor, ForwardRings, OwnedBuffer, POOL_BUFFERS,
@@ -426,7 +426,14 @@ pub fn pipeline_harness(data: &[u8]) {
         assert!(route_counters.egress_full >= previous_route.egress_full);
         assert!(route_counters.malformed_descriptor >= previous_route.malformed_descriptor);
         assert!(route_counters.snapshot_failed >= previous_route.snapshot_failed);
-        assert!(route_counters.unparsable >= previous_route.unparsable);
+        // Per class, not merely in total: a split that lost a class would keep
+        // the total rising while one label stopped moving.
+        for failure in ParseFailure::ALL {
+            assert!(
+                route_counters.unparsable.get(failure) >= previous_route.unparsable.get(failure),
+                "the {failure} count fell"
+            );
+        }
         assert!(route_counters.misrouted >= previous_route.misrouted);
         assert!(route_counters.writeback_failed >= previous_route.writeback_failed);
         assert!(route_counters.drops.total() >= previous_route.drops.total());

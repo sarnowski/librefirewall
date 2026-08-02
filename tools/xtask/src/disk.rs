@@ -43,7 +43,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 const SECTORS_PER_MIB: u64 = 2048;
 const DISK_SIZE_MIB: u64 = 128;
 
-/// The GPT layout of the deployable disk. `SLOTA` and `SLOTB` are the two
+/// The GPT layout of the deployable disk. `SLOT_A` and `SLOT_B` are the two
 /// software slots; `STATE` carries the mutable boot-selection env; `DATA` is
 /// reserved for configuration and secrets and is deliberately
 /// left as a bare GPT partition with no filesystem — no in-system component
@@ -84,14 +84,14 @@ const PARTITIONS: &[Partition] = &[
     },
     Partition {
         number: 3,
-        label: "SLOTA",
+        label: "SLOT_A",
         gpt_type: "8300",
         start_mib: 57,
         size_mib: 16,
     },
     Partition {
         number: 4,
-        label: "SLOTB",
+        label: "SLOT_B",
         gpt_type: "8300",
         start_mib: 73,
         size_mib: 16,
@@ -181,7 +181,7 @@ pub(crate) fn assemble_disk(root: &Path, build: &Path, dist: &Path) -> Result<St
     grub::seed_grubenv(&grubenv)?;
     mcopy(&state, &grubenv, "::/grubenv")?;
 
-    for label in ["SLOTA", "SLOTB"] {
+    for label in ["SLOT_A", "SLOT_B"] {
         let image = parts.join(format!("{}.img", label.to_lowercase()));
         make_fat(&image, part(label).size_mib, Some(16), label)?;
         for (source, slot_name) in SLOT_PAYLOAD {
@@ -285,7 +285,7 @@ fn write_disk(disk: &Path, parts: &Path) -> Result<(), Error> {
 ///
 /// The write is positional and does not truncate the disk, so an image larger
 /// than its partition would silently overwrite the start of the next one — for
-/// SLOTA that means corrupting the fallback slot SLOTB, destroying the very
+/// SLOT_A that means corrupting the fallback slot SLOT_B, destroying the very
 /// redundancy the A/B scheme exists for.
 fn write_partition(disk: &Path, partition: &Partition, image: &Path) -> Result<(), Error> {
     let length = image
@@ -348,11 +348,11 @@ mod tests {
 
     #[test]
     fn disk_at_renders_the_partition_byte_offset() {
-        let rendered = disk_at(Path::new("/tmp/disk.img"), "SLOTB");
+        let rendered = disk_at(Path::new("/tmp/disk.img"), "SLOT_B");
         assert_eq!(
             rendered,
             format!("/tmp/disk.img@@{}", 73 * 1024 * 1024_u64),
-            "mtools addresses SLOTB by its 1 MiB-aligned byte offset"
+            "mtools addresses SLOT_B by its 1 MiB-aligned byte offset"
         );
     }
 
@@ -386,22 +386,22 @@ mod tests {
     fn an_oversized_partition_image_is_refused() {
         let disk = scratch_disk("oversized");
         let image = disk.with_extension("part");
-        let slot_a = part("SLOTA");
+        let slot_a = part("SLOT_A");
         std::fs::write(&image, vec![0xAB_u8; (slot_a.size_bytes() + 1) as usize]).unwrap();
 
         let error = write_partition(&disk, slot_a, &image)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("SLOTA"), "got: {error}");
+        assert!(error.contains("SLOT_A"), "got: {error}");
         assert!(error.contains("overrun"), "got: {error}");
 
         // Nothing was written, so the fallback slot the whole A/B scheme rests
         // on is still intact.
         assert!(
-            window(&disk, part("SLOTB").start_bytes(), 512)
+            window(&disk, part("SLOT_B").start_bytes(), 512)
                 .iter()
                 .all(|byte| *byte == 0),
-            "a refused write must not have touched SLOTB"
+            "a refused write must not have touched SLOT_B"
         );
         cleanup(&disk, &image);
     }
@@ -410,7 +410,7 @@ mod tests {
     fn a_fitting_partition_image_lands_at_its_offset_and_leaves_neighbours_alone() {
         let disk = scratch_disk("fitting");
         let image = disk.with_extension("part");
-        let slot_a = part("SLOTA");
+        let slot_a = part("SLOT_A");
         let content = vec![0xCD_u8; 4096];
         std::fs::write(&image, &content).unwrap();
 
@@ -424,10 +424,10 @@ mod tests {
             "the write must not reach back before its partition"
         );
         assert!(
-            window(&disk, part("SLOTB").start_bytes(), 512)
+            window(&disk, part("SLOT_B").start_bytes(), 512)
                 .iter()
                 .all(|byte| *byte == 0),
-            "the write must not reach into SLOTB"
+            "the write must not reach into SLOT_B"
         );
         assert_eq!(
             disk.metadata().unwrap().len(),
@@ -452,7 +452,7 @@ mod tests {
             "the last byte of an exactly-sized image is written"
         );
         assert!(
-            window(&disk, part("SLOTA").start_bytes(), 512)
+            window(&disk, part("SLOT_A").start_bytes(), 512)
                 .iter()
                 .all(|byte| *byte == 0),
             "an exactly-sized image must stop at the partition boundary"

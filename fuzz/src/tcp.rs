@@ -48,8 +48,14 @@
 //!   never exceeds it, and the bytes past its length are never touched. This is
 //!   what the protection domain rests on: it lends that many bytes onward.
 //! * **Delivery is a subslice.** Data reported as delivered is inside the segment
-//!   handed over and never longer than the window advertised, so no byte a peer
-//!   did not send can reach a caller.
+//!   handed over and never longer than the window this end is advertising, so no
+//!   byte a peer did not send can reach a caller.
+//! * **Delivery is the stream, in order.** A peer that sends a known byte stream
+//!   has exactly a prefix of it delivered, whatever the receive window was when
+//!   each segment arrived. This is what a segment *trimmed* to the window has to
+//!   satisfy: the transport keeps the head of the accepted region, so a caller
+//!   reconstructing the delivered bytes from the wrong end would produce a
+//!   stream that is no prefix of what was sent.
 //! * **Every segment is counted, exactly once.** The counters are the only
 //!   evidence a port is doing anything, so the total is asserted to move by one
 //!   per segment.
@@ -76,6 +82,13 @@ const RECEIVE_WINDOW: u32 = 1024;
 /// inputs rather than rare ones.
 const CONNECTIONS: usize = 4;
 
+/// The initial sequence number the harness's own peer opens with, so a data
+/// segment can be composed at the byte the receiver is next expecting.
+const ESTABLISHED_IRS: u32 = 0x1000;
+
+/// The address that peer sends from.
+const ESTABLISHED_PEER: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
+
 /// Storage the caller offers, and the byte it is filled with so a segment's own
 /// bytes are distinguishable from untouched ones.
 const OUT: usize = 2048;
@@ -97,12 +110,46 @@ pub fn tcp_segments_harness(data: &[u8]) {
     // fixed here.
     let secret = IsnSecret::from_bytes(<[u8; 16]>::arbitrary(&mut unstructured).unwrap_or([0; 16]));
     let mut listening = stack(secret.clone());
-    let (mut established, opened) = established_stack(secret);
+    let (mut established, opened, acknowledgement) = established_stack(secret);
 
+    // Segments handed to the *listening* stack, which is what its own received
+    // counter is held to. Only the arm that delivers to it may move this;
+    // `operations` is what bounds the loop, so the two cannot be conflated.
     let mut segments = 0u64;
+    let mut operations = 0usize;
+    // How much of the harness's own stream the established connection has taken,
+    // and the concatenation of everything it reported delivering. The two must
+    // agree byte for byte: the transport delivers the head of what it accepted,
+    // so a caller reading the delivered bytes off the wrong end of a trimmed
+    // segment would produce a run that is no prefix of what was sent.
+    let mut delivered = 0u64;
     while let Some(op) = next_op(&mut unstructured) {
+        operations += 1;
         let now = instant(any_u32(&mut unstructured));
-        match op % 6 {
+        match op % 7 {
+            6 => {
+                // A well-formed data segment on the established connection,
+                // longer than the receive window as often as not. Nothing else
+                // in this harness reaches the synchronized data path: random
+                // bytes never carry a checksum that verifies.
+                let bytes =
+                    stream_segment(&mut unstructured, delivered, acknowledgement, ESTABLISHED_PEER);
+                let mut out = [UNTOUCHED; OUT];
+                let received = established.receive(now, ESTABLISHED_PEER, &bytes, &mut out);
+                for (index, byte) in received.data.iter().enumerate() {
+                    assert_eq!(
+                        *byte,
+                        stream_byte(delivered.saturating_add(index as u64)),
+                        "the delivered run is not the stream this peer sent"
+                    );
+                }
+                delivered = delivered.saturating_add(received.data.len() as u64);
+                assert!(received.emitted <= OUT);
+                assert!(
+                    out[received.emitted..].iter().all(|byte| *byte == UNTOUCHED),
+                    "an answer wrote past the length it reported"
+                );
+            }
             0..=2 => {
                 // A segment, from an arbitrary source, to both stacks: the same
                 // bytes reach a table that has never seen a connection and one
@@ -166,7 +213,7 @@ pub fn tcp_segments_harness(data: &[u8]) {
             );
             drain_timers(stack, now);
         }
-        if segments as usize >= MAX_OPERATIONS {
+        if operations >= MAX_OPERATIONS {
             break;
         }
     }
@@ -200,9 +247,19 @@ fn deliver<const N: usize>(
         "an answer wrote past the length it reported"
     );
     // Delivered data is a subslice of what arrived, and no longer than the window
-    // this end advertised: no byte a peer did not send can reach a caller.
+    // this end is advertising: no byte a peer did not send can reach a caller,
+    // and nothing past what this end said it could take is accepted. The window
+    // is read off the connection rather than assumed, because the harness sets
+    // it to arbitrary values of its own.
     assert!(received.data.len() <= bytes.len());
-    assert!(received.data.len() as u32 <= RECEIVE_WINDOW.max(u32::from(u16::MAX)));
+    let advertised = received
+        .connection
+        .and_then(|id| stack.connection(id))
+        .map_or(RECEIVE_WINDOW, Connection::receive_window);
+    assert!(
+        received.data.len() as u32 <= advertised,
+        "more was delivered than the window advertised"
+    );
     if !received.data.is_empty() {
         assert!(
             received.connection.is_some(),
@@ -252,29 +309,41 @@ fn stack(secret: IsnSecret) -> TcpStack<CONNECTIONS> {
 
 /// A stack with one connection already established, so the synchronized paths are
 /// reached by an input that could never compose a handshake itself.
-fn established_stack(secret: IsnSecret) -> (TcpStack<CONNECTIONS>, Option<ConnectionId>) {
+fn established_stack(secret: IsnSecret) -> (TcpStack<CONNECTIONS>, Option<ConnectionId>, u32) {
     let mut stack = stack(secret);
     let mut out = [0u8; OUT];
     let now = instant(0);
-    let peer = Ipv4Address::from_octets([10, 0, 2, 2]);
-    let syn = compose(0x1000, 0, Flags::SYN, &[], peer);
+    let peer = ESTABLISHED_PEER;
+    let syn = compose(ESTABLISHED_IRS, 0, Flags::SYN, &[], peer);
     let received = stack.receive(now, peer, &syn, &mut out);
     let Some(id) = received.connection else {
-        return (stack, None);
+        return (stack, None, 0);
     };
     // The `SYN-ACK`'s own sequence number is what the third segment must
     // acknowledge, and it is read back off the wire rather than predicted.
     let Ok(syn_ack) = lfw_tcp::Segment::parse(APPLIANCE, peer, &out[..received.emitted]) else {
-        return (stack, Some(id));
+        return (stack, Some(id), 0);
     };
-    let ack = compose(0x1001, syn_ack.sequence.add(1).raw(), Flags::ACK, &[], peer);
+    let acknowledgement = syn_ack.sequence.add(1).raw();
+    let ack = compose(
+        ESTABLISHED_IRS.wrapping_add(1),
+        acknowledgement,
+        Flags::ACK,
+        &[],
+        peer,
+    );
     stack.receive(now, peer, &ack, &mut out);
     assert_eq!(
         stack.connection(id).map(Connection::state),
         Some(lfw_tcp::State::Established),
         "the harness could not establish a connection"
     );
-    (stack, Some(id))
+    // What every later segment from this peer must acknowledge: an
+    // acknowledgement of something never sent, or one further behind
+    // `SND.UNA` than any window offered, is refused before a byte is delivered
+    // (RFC 5961 section 5), so a stream driven with a stale one would never
+    // reach the data path at all.
+    (stack, Some(id), acknowledgement)
 }
 
 /// One well-formed segment, for the handshake the harness performs itself.
@@ -285,7 +354,7 @@ fn compose(
     payload: &[u8],
     peer: Ipv4Address,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; 256];
+    let mut out = vec![0u8; payload.len() + 256];
     let len = Outgoing {
         source_port: 40000,
         destination_port: PORT,
@@ -298,7 +367,7 @@ fn compose(
         payload,
     }
     .write(peer, APPLIANCE, &mut out)
-    .expect("room for a 256-byte segment");
+    .expect("room for the payload and a header");
     out.truncate(len);
     out
 }
@@ -319,13 +388,54 @@ fn source_address(unstructured: &mut Unstructured<'_>) -> Ipv4Address {
 
 /// Bytes to be read as a segment. Taken whole and unreduced: no length prefix, no
 /// structure this harness imposes, so a corpus entry is a segment off a wire.
+///
+/// The bound is above [`RECEIVE_WINDOW`] rather than a fraction of it, because a
+/// cap below the window is a guard that deletes a path: a segment that cannot
+/// outrun the window is one whose right edge is never trimmed.
 fn segment_bytes(unstructured: &mut Unstructured<'_>) -> Vec<u8> {
-    let len = usize::from(any_u16(unstructured) % 160);
+    let len = usize::from(any_u16(unstructured) % (2 * RECEIVE_WINDOW as u16));
     let mut bytes = vec![0u8; len];
     for byte in &mut bytes {
         *byte = u8::arbitrary(unstructured).unwrap_or(0);
     }
     bytes
+}
+
+/// The byte at `offset` of the stream the harness's own peer sends: distinct per
+/// position, so a delivered run says where it came from.
+fn stream_byte(offset: u64) -> u8 {
+    // 251 is prime and coprime with every window and segment length here, so a
+    // run delivered from the wrong end of a segment is a different run rather
+    // than the same one shifted.
+    (offset % 251) as u8
+}
+
+/// One well-formed data segment on the established connection, carrying the
+/// stream from the byte the receiver is next expecting.
+///
+/// Random bytes never compose a segment whose checksum verifies, so without this
+/// the synchronized data path — and with it every trim — is unreachable however
+/// long the harness runs. The length is the adversary's and deliberately reaches
+/// past the receive window.
+fn stream_segment(
+    unstructured: &mut Unstructured<'_>,
+    delivered: u64,
+    acknowledgement: u32,
+    peer: Ipv4Address,
+) -> Vec<u8> {
+    let len = usize::from(any_u16(unstructured) % (2 * RECEIVE_WINDOW as u16));
+    let payload: Vec<u8> = (0..len as u64)
+        .map(|index| stream_byte(delivered.saturating_add(index)))
+        .collect();
+    // Lossless: the harness's own stream stays far below 2^32 bytes.
+    let sequence = ESTABLISHED_IRS.wrapping_add(1).wrapping_add(delivered as u32);
+    compose(
+        sequence,
+        acknowledgement,
+        Flags::ACK.with(Flags::PSH),
+        &payload,
+        peer,
+    )
 }
 
 /// Bytes a caller offers to send. Bounded by what a slice can be *made* to be

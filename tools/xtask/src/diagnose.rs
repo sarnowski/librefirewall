@@ -44,7 +44,7 @@
 //! or lets it decide anything; the only thing read out of a log is whether it
 //! carried any guest bytes at all, which is a size and not a contract.
 
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, io, path::Path};
 
 use crate::image;
 
@@ -108,7 +108,8 @@ pub(crate) fn after_shipping_failure(
         "\n  {label} FAILED on the release image. Re-running this one scenario on the debug \
          kernel to diagnose it — the result below is evidence, and does not change the verdict."
     );
-    let diagnosis = diagnose(diagnostic_log, rerun());
+    let cleared = clear_stale_capture(diagnostic_log);
+    let diagnosis = diagnose(diagnostic_log, cleared, rerun());
     println!("  debug re-run finished: {}\n", diagnosis.headline());
 
     format!(
@@ -136,15 +137,52 @@ enum Diagnosis {
     NotReached(String),
 }
 
+/// Remove whatever an earlier session left at the diagnostic capture's path, so
+/// that the file being there afterwards is evidence of *this* re-run.
+///
+/// Nothing clears `build/image/`: a scenario workspace is recreated beside it,
+/// and the run logs and data images accumulate on purpose because they are the
+/// evidence of the last run. So a `-debug` capture from a previous session
+/// outlives it, and a classification that reads mere existence would report "it
+/// fails on the debug kernel too" for a re-run that never booted — the one
+/// outcome that says nothing at all, dressed as the one that says the most.
+///
+/// # Errors
+/// A file that is there and could not be removed, which leaves the two outcomes
+/// indistinguishable rather than merely unknown.
+fn clear_stale_capture(diagnostic_log: &Path) -> Result<(), String> {
+    match fs::remove_file(diagnostic_log) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "removing the stale capture at {} failed: {error}",
+            diagnostic_log.display()
+        )),
+    }
+}
+
 /// Classify the re-run's outcome. A failure that left no capture behind never
 /// reached a boot: the harness writes the run log on every path out of a boot,
 /// so its absence is the mechanical difference between a scenario that failed
 /// on the debug kernel and one the debug kernel never ran.
-fn diagnose(diagnostic_log: &Path, outcome: Result<(), String>) -> Diagnosis {
-    match outcome {
-        Ok(()) => Diagnosis::PassesOnDebug,
-        Err(verdict) if diagnostic_log.is_file() => Diagnosis::FailsOnDebug(verdict),
-        Err(verdict) => Diagnosis::NotReached(verdict),
+///
+/// That difference only holds if the path started empty, which is what
+/// `cleared` reports. A path that could not be cleared is not classified from
+/// its contents at all: the file may be this run's or last week's, and saying
+/// which would be a guess.
+fn diagnose(
+    diagnostic_log: &Path,
+    cleared: Result<(), String>,
+    outcome: Result<(), String>,
+) -> Diagnosis {
+    match (outcome, cleared) {
+        (Ok(()), _) => Diagnosis::PassesOnDebug,
+        (Err(verdict), Err(problem)) => Diagnosis::NotReached(format!(
+            "{verdict}. Whether the debug kernel booted at all could not be established, because \
+             {problem}"
+        )),
+        (Err(verdict), Ok(())) if diagnostic_log.is_file() => Diagnosis::FailsOnDebug(verdict),
+        (Err(verdict), Ok(())) => Diagnosis::NotReached(verdict),
     }
 }
 
@@ -326,14 +364,19 @@ mod tests {
         let shipping = scratch("diverge-release");
         let diagnostic = scratch("diverge-debug");
         write_log(&shipping, "");
-        write_log(&diagnostic, "Bootstrapping kernel\nLFW-CFG generation=0\n");
 
         let verdict = after_shipping_failure(
             "system scenario generation-swap",
             "the fail-closed record appears 0 times",
             &shipping,
             &diagnostic,
-            || Ok(()),
+            // As a real re-run does: the harness writes the capture on every
+            // path out of a boot, and the capture's existence is what says a
+            // boot happened.
+            || {
+                write_log(&diagnostic, "Bootstrapping kernel\nLFW-CFG generation=0\n");
+                Ok(())
+            },
         );
 
         // The divergence must be the loudest thing in the message: it is the
@@ -374,14 +417,16 @@ mod tests {
         let shipping = scratch("silent-release");
         let diagnostic = scratch("silent-debug");
         write_log(&shipping, "");
-        write_log(&diagnostic, "Bootstrapping kernel\nseL4 fault: cap fault\n");
 
         let verdict = after_shipping_failure(
             "system scenario routed-forwarding",
             "timed out after 180s waiting for the routed contract",
             &shipping,
             &diagnostic,
-            || Err("timed out after 180s waiting for the routed contract".to_owned()),
+            || {
+                write_log(&diagnostic, "Bootstrapping kernel\nseL4 fault: cap fault\n");
+                Err("timed out after 180s waiting for the routed contract".to_owned())
+            },
         );
 
         assert!(verdict.contains("(EMPTY)"), "{verdict}");
@@ -450,6 +495,39 @@ mod tests {
             verdict.contains("the boot manager did not make the expected sequence"),
             "the release verdict must still be the thing to fix: {verdict}"
         );
+
+        fs::remove_file(&shipping).unwrap();
+    }
+
+    #[test]
+    fn a_debug_capture_left_by_an_earlier_session_is_not_read_as_this_runs() {
+        // Nothing clears `build/image/`, so a `-debug` log from an earlier
+        // session is exactly the file this classification would otherwise read.
+        // With it there and no boot this time, "it fails on the debug kernel
+        // too" would be manufactured out of last week's evidence.
+        let shipping = scratch("stale-release");
+        let diagnostic = scratch("stale-debug");
+        write_log(&shipping, "Bootstrapping kernel\n");
+        write_log(
+            &diagnostic,
+            "an earlier session's boot\nseL4 fault: stale\n",
+        );
+        assert!(diagnostic.is_file());
+
+        let verdict = after_shipping_failure(
+            "system scenario routed-forwarding",
+            "timed out after 180s waiting for the routed contract",
+            &shipping,
+            &diagnostic,
+            || Err("assemble the debug image: cargo exited 101".to_owned()),
+        );
+
+        assert!(verdict.contains("never reached a boot"), "{verdict}");
+        assert!(
+            !verdict.contains("seL4 fault: stale"),
+            "the earlier session's capture must not be quoted as this run's: {verdict}"
+        );
+        assert!(!diagnostic.is_file(), "the stale capture must be gone");
 
         fs::remove_file(&shipping).unwrap();
     }

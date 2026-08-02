@@ -1,11 +1,18 @@
 use super::*;
 
-use lfw_clock::{MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, NANOS_PER_SECOND, UtcNanos};
+use lfw_clock::{
+    MAX_PLAUSIBLE_TSC_HZ, MAX_PLAUSIBLE_UNIX_NANOS, MIN_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_UNIX_NANOS,
+    NANOS_PER_SECOND, UtcNanos, epoch_is_plausible,
+};
 use lfw_log::Clock as _;
 use proptest::prelude::*;
 use wire::CalibrationImage;
 
 const ONE_GHZ: u64 = 1_000_000_000;
+
+/// An epoch inside the plausible band, so a test about the *frequency* is not
+/// also a test about the epoch.
+const EPOCH: u64 = 1_785_443_220 * NANOS_PER_SECOND;
 
 fn published(image: CalibrationImage) -> ClockCalibration {
     let region = ClockCalibration::zero();
@@ -42,11 +49,51 @@ fn a_frequency_outside_the_band_yields_no_instant() {
         let region = published(CalibrationImage {
             tsc_hz,
             boot_ticks: 0,
-            boot_unix_nanos: 0,
+            boot_unix_nanos: EPOCH,
         });
         let clock = PdClock::new(&region);
         assert_eq!(clock.calibration(), None, "{tsc_hz} Hz");
         assert_eq!(clock.now(), Stamp::Unsynchronized, "{tsc_hz} Hz");
+    }
+}
+
+/// The other half of the same judgement, and the one a byzantine writing domain
+/// reaches most cheaply: a frequency ranged while its epoch is believed lets a
+/// peer date every record this domain emits anywhere `u64` nanoseconds reach. The
+/// band is the one the clock domain refuses a register file's year against, so the
+/// two ends of the region apply one judgement.
+#[test]
+fn an_epoch_outside_the_band_yields_no_instant() {
+    for boot_unix_nanos in [
+        0,
+        1,
+        MIN_PLAUSIBLE_UNIX_NANOS - 1,
+        MAX_PLAUSIBLE_UNIX_NANOS + 1,
+        u64::MAX,
+    ] {
+        let region = published(CalibrationImage {
+            tsc_hz: ONE_GHZ,
+            boot_ticks: 0,
+            boot_unix_nanos,
+        });
+        let clock = PdClock::new(&region);
+        assert_eq!(clock.calibration(), None, "{boot_unix_nanos} ns");
+        assert_eq!(clock.now(), Stamp::Unsynchronized, "{boot_unix_nanos} ns");
+    }
+}
+
+#[test]
+fn both_ends_of_the_epoch_band_are_accepted() {
+    for boot_unix_nanos in [MIN_PLAUSIBLE_UNIX_NANOS, MAX_PLAUSIBLE_UNIX_NANOS] {
+        let region = published(CalibrationImage {
+            tsc_hz: ONE_GHZ,
+            boot_ticks: 0,
+            boot_unix_nanos,
+        });
+        assert!(
+            PdClock::new(&region).calibration().is_some(),
+            "{boot_unix_nanos} ns"
+        );
     }
 }
 
@@ -56,7 +103,7 @@ fn both_ends_of_the_band_are_accepted() {
         let region = published(CalibrationImage {
             tsc_hz,
             boot_ticks: 0,
-            boot_unix_nanos: 0,
+            boot_unix_nanos: EPOCH,
         });
         assert!(PdClock::new(&region).calibration().is_some(), "{tsc_hz} Hz");
     }
@@ -67,7 +114,7 @@ fn both_ends_of_the_band_are_accepted() {
 /// number the clock domain wrote once.
 #[test]
 fn a_published_calibration_yields_an_instant_at_or_after_its_epoch() {
-    let epoch = 1_785_443_220 * NANOS_PER_SECOND;
+    let epoch = EPOCH;
     let region = published(plausible(epoch));
     let clock = PdClock::new(&region);
     let Stamp::Utc(utc) = clock.now() else {
@@ -81,7 +128,7 @@ fn a_published_calibration_yields_an_instant_at_or_after_its_epoch() {
 /// calibration is read afresh rather than cached alongside a reading.
 #[test]
 fn successive_stamps_do_not_go_backwards() {
-    let region = published(plausible(1_785_443_220 * NANOS_PER_SECOND));
+    let region = published(plausible(EPOCH));
     let clock = PdClock::new(&region);
     let mut previous = clock.now();
     for _ in 0..1_000 {
@@ -105,7 +152,7 @@ fn a_republished_calibration_is_read_on_the_next_question() {
     let region = ClockCalibration::zero();
     let clock = PdClock::new(&region);
     assert_eq!(clock.now(), Stamp::Unsynchronized);
-    region.publish(&plausible(1_785_443_220 * NANOS_PER_SECOND));
+    region.publish(&plausible(EPOCH));
     assert!(matches!(clock.now(), Stamp::Utc(_)));
     region.publish(&CalibrationImage {
         tsc_hz: 0,
@@ -127,7 +174,8 @@ proptest! {
         let region = published(CalibrationImage { tsc_hz, boot_ticks, boot_unix_nanos });
         let clock = PdClock::new(&region);
         let stamp = clock.now();
-        let inside = (MIN_PLAUSIBLE_TSC_HZ..=MAX_PLAUSIBLE_TSC_HZ).contains(&tsc_hz);
+        let inside = (MIN_PLAUSIBLE_TSC_HZ..=MAX_PLAUSIBLE_TSC_HZ).contains(&tsc_hz)
+            && epoch_is_plausible(boot_unix_nanos);
         prop_assert_eq!(matches!(stamp, Stamp::Utc(_)), inside);
         // An accepted triple never places the node before the epoch it named:
         // the conversion adds an elapsed count and saturates upward.

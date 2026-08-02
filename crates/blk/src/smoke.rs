@@ -42,12 +42,12 @@ pub const PROBE_SECTOR: u64 = 0;
 
 /// The sector the proof writes its witness pattern to.
 ///
-/// Not sector 0: the read must be able to fail independently of the write, and
-/// a proof that wrote over the sector it had just read could not tell a medium
-/// that answered reads from one that answered them out of the driver's own
-/// staging window. Far enough in that no partitioning scheme's first structures
-/// sit on it, and low enough that any medium worth calling one has it.
-pub const WITNESS_SECTOR: u64 = 64;
+/// Not sector 0: the read must be able to fail independently of the write, and a
+/// proof that wrote over the sector it had just read could not tell a medium that
+/// answered reads from one that answered them out of the driver's own staging
+/// window. The last sector of the front the recording layout reserves, so the
+/// furthest point in it from the structures that front leaves room for.
+pub const WITNESS_SECTOR: u64 = 2047;
 
 /// The smallest medium the proof will run against, in sectors: enough to hold
 /// [`WITNESS_SECTOR`] itself.

@@ -33,8 +33,16 @@ jobs:
       - script: make image
         displayName: Provision pinned builder and assemble image
 
-      - script: make ci
-        displayName: Run CI gate (offline)
+      # `release` rather than `ci`, and the difference is the half of the
+      # published contract that `ci` alone does not carry: `ci` assembles
+      # `dist/` partway through its run and leaves whatever it got there when it
+      # fails, while `release` runs the identical gate — it boots nothing of its
+      # own — and empties `dist/` when the gate did not prove what it holds. Run
+      # as `ci`, that emptying is documented behaviour that never once applies to
+      # a CI run, and the artifact's qualification rests entirely on the publish
+      # condition below.
+      - script: make release
+        displayName: Run CI gate and qualify dist/ (offline)
 
       # `cargo deny check advisories` must fetch the RustSec database, which
       # the offline gate cannot do — so vulnerability scanning lives here, and
@@ -66,6 +74,10 @@ jobs:
       # `dist/` is exactly what the gate exists to qualify. The
       # condition restates the default so that copying the neighbouring step's
       # condition is a visible change rather than an invisible one.
+      #
+      # Since the gate step runs `make release`, a red gate has already emptied
+      # `dist/` and this condition is the second of two independent reasons
+      # nothing unproven is published, rather than the only one.
       - task: PublishPipelineArtifact@1
         displayName: Publish distribution artifacts
         condition: succeeded()

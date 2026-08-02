@@ -1,6 +1,7 @@
 use lfw_http::Status;
 use lfw_metrics::{HTTP_STATUSES, PIPELINES, ROUTE_STAGE_DROP_REASONS, SHARDS, STATS_SLOTS};
 use lfw_tcp::TcpCounters;
+use net_headers::{ParseCounters, ParseError, ParseFailure};
 
 use super::*;
 
@@ -64,12 +65,31 @@ fn the_build_facts_the_catalogue_states_are_this_builds() {
 /// one, or wrote one twice, leaves a zero behind.
 #[test]
 fn every_route_counter_reaches_its_own_slot() {
+    let mut unparsable = ParseCounters::new();
+    // One more of each class than the last, so a conversion that transposed two
+    // parse slots leaves a value in the wrong one rather than an equal number.
+    for (index, error) in [
+        ParseError::FrameTooShort { needed: 14, got: 0 },
+        ParseError::StackedVlanTags,
+        ParseError::Ipv4VersionNotFour(6),
+        ParseError::Ipv4ChecksumInvalid {
+            found: 1,
+            computed: 2,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=index {
+            unparsable.record(error);
+        }
+    }
     let mut counters = RouteCounters {
         forwarded: 1,
         egress_full: 2,
         malformed_descriptor: 3,
         snapshot_failed: 4,
-        unparsable: 5,
+        unparsable,
         misrouted: 6,
         writeback_failed: 7,
         ..RouteCounters::default()
@@ -83,12 +103,33 @@ fn every_route_counter_reaches_its_own_slot() {
     assert_eq!(sample.forwarded, 1);
     assert_eq!(
         sample.stage_drops,
-        [2, 3, 4, 5, 6, 7],
+        [2, 3, 4, 1, 2, 3, 4, 6, 7],
         "the stage's own reasons are out of order"
     );
     assert_eq!(sample.stage_drops.len(), ROUTE_STAGE_DROP_REASONS.len());
     for (slot, reason) in DropReason::ALL.iter().enumerate() {
         assert_eq!(sample.route_drops[slot], *reason as u64 + 1);
+    }
+}
+
+/// The stage's parse classes are `net_headers`' own vocabulary, as the router's
+/// reasons are `routing`'s: `lfw_metrics` names them itself, so this is the
+/// enforcer that separation obliges. A class added upstream without a slot here
+/// would render under the wrong name rather than not at all.
+#[test]
+fn the_parse_failure_vocabulary_is_net_headers_own() {
+    let declared: Vec<&str> = ROUTE_STAGE_DROP_REASONS
+        .iter()
+        .copied()
+        .filter(|reason| {
+            ParseFailure::ALL
+                .iter()
+                .any(|failure| failure.name() == *reason)
+        })
+        .collect();
+    assert_eq!(declared.len(), ParseFailure::ALL.len());
+    for (token, failure) in declared.iter().zip(ParseFailure::ALL) {
+        assert_eq!(*token, failure.name(), "{failure:?}");
     }
 }
 
@@ -151,7 +192,7 @@ fn an_unaddressed_port_publishes_its_stage_and_zeroes_the_rest() {
 }
 
 /// Every field of `TcpCounters` reaches a slot of its own. The transport has
-/// twenty-six causes, and counters must attribute a refusal to what the peer
+/// twenty-seven causes, and counters must attribute a refusal to what the peer
 /// sent — kept apart from what accuses this code — so a conversion that merged
 /// two would be the one defect that attribution exists to prevent.
 #[test]
@@ -185,6 +226,7 @@ fn every_transport_counter_reaches_its_own_slot() {
         resets_received: 24,
         resets_sent: 25,
         write_refused: 26,
+        challenges_suppressed: 27,
     };
     let sample = TcpSample {
         segments_received: counters.segments_received,
@@ -210,6 +252,7 @@ fn every_transport_counter_reaches_its_own_slot() {
         refused_out_of_order: counters.refused_out_of_order,
         urgent_ignored: counters.urgent_ignored,
         challenge_acks: counters.challenge_acks,
+        challenges_suppressed: counters.challenges_suppressed,
         resets_received: counters.resets_received,
         resets_sent: counters.resets_sent,
         write_refused: counters.write_refused,
@@ -221,7 +264,7 @@ fn every_transport_counter_reaches_its_own_slot() {
     let values = management.values();
     let mut seen: Vec<u64> = values.iter().copied().filter(|value| *value != 0).collect();
     seen.sort_unstable();
-    assert_eq!(seen, (1..=26).collect::<Vec<u64>>());
+    assert_eq!(seen, (1..=27).collect::<Vec<u64>>());
 }
 
 /// A log ring's counts are `u32` on the writing side and `u64` on the wire, and

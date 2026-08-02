@@ -22,12 +22,24 @@
 //! window. Nothing here holds a second copy of the body, and nothing holds any
 //! of it between passes.
 
+use lfw_ip_endpoint::{ContentType, http::WINDOW_LEN};
 use wire::{
     DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply,
     DownloadRequest, DownloadRequester, DownloadSink, PendingDownload,
 };
 
 use crate::endpoint::EndpointStage;
+
+// The two window lengths this module sits between, tied together where both are
+// visible: the transport's sliding window is what a reply must fit into, so a
+// channel that could not carry one would answer every download past the first
+// window with a body the endpoint refuses — an exact `Content-Length` and no
+// bytes behind it. Either constant moving apart from the other fails the build
+// here rather than on an appliance.
+const _: () = {
+    assert!(WINDOW_LEN <= DOWNLOAD_WINDOW_LEN);
+    assert!(WINDOW_LEN > 0);
+};
 
 /// The streamed-response half of an HTTP endpoint, as a download needs it.
 ///
@@ -44,9 +56,11 @@ pub trait Stream {
     fn pending_stream(&self) -> Option<&'static str>;
     /// Commit to a body of `total` bytes. `false` where the endpoint would not
     /// begin one.
-    fn begin_stream(&mut self, total: u64, content_type: &str) -> bool;
-    /// The body offset the transport is waiting for.
-    fn stream_wanted(&self) -> Option<u64>;
+    fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool;
+    /// The body offset the transport is waiting for, and the most it will take
+    /// there. Fewer bytes than that are accepted and the remainder asked for
+    /// again.
+    fn stream_wanted(&self) -> Option<(u64, usize)>;
     /// Hand over the window starting at `start`. `false` where the endpoint
     /// would not take it.
     fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool;
@@ -62,12 +76,12 @@ impl Stream for EndpointStage<'_> {
         Self::pending_stream(self).map(|(_, target)| target)
     }
 
-    fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+    fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
         Self::begin_stream(self, total, content_type)
     }
 
-    fn stream_wanted(&self) -> Option<u64> {
-        Self::stream_wanted(self).map(|(_, offset)| offset)
+    fn stream_wanted(&self) -> Option<(u64, usize)> {
+        Self::stream_wanted(self).map(|(_, offset, len)| (offset, len))
     }
 
     fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
@@ -94,7 +108,7 @@ pub const CAPTURE_TARGET: &str = "/capture.pcapng";
 
 /// What a recording is served as. pcapng has no registered media type, and a
 /// browser that guessed at one would render an evidence artifact as text.
-const CONTENT_TYPE: &str = "application/octet-stream";
+const CONTENT_TYPE: ContentType = ContentType::OctetStream;
 
 /// Saturating, monotone counts for the operator-facing metrics contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -139,8 +153,10 @@ pub struct Downloads<'chan> {
     /// target was decided when the stream began.
     serving: Option<DownloadSink>,
     /// The window a reply is copied into before the transport takes it. A field
-    /// rather than a local because it is 32 KiB and a protection domain's stack
-    /// is not where that belongs.
+    /// rather than a local because it is the channel's whole window and a
+    /// protection domain's stack is not where that belongs. Sized by the channel
+    /// rather than by the transport's window, because `DownloadRequester::poll`
+    /// copies into the whole of it.
     window: [u8; DOWNLOAD_WINDOW_LEN],
     counters: DownloadCounters,
 }
@@ -266,10 +282,13 @@ impl<'chan> Downloads<'chan> {
                 return;
             };
             self.serving = Some(sink);
-            self.request(sink, 0, true);
+            // The opening request is made before the endpoint has committed to
+            // anything, so there is no window to ask against yet: a whole one,
+            // which is the most the endpoint will ever take.
+            self.request(sink, 0, WINDOW_LEN, true);
             return;
         }
-        let Some(offset) = stage.stream_wanted() else {
+        let Some((offset, len)) = stage.stream_wanted() else {
             return;
         };
         let Some(sink) = self.serving else {
@@ -278,11 +297,20 @@ impl<'chan> Downloads<'chan> {
             self.abandon(stage);
             return;
         };
-        self.request(sink, offset, false);
+        self.request(sink, offset, len, false);
     }
 
-    fn request(&mut self, sink: DownloadSink, offset: u64, opening: bool) {
-        let pending = self.requester.request(sink, offset, DOWNLOAD_WINDOW_LEN);
+    /// Ask for at most `len` bytes at `offset`.
+    ///
+    /// `len` is what the endpoint said it would take, clamped to what the
+    /// channel can carry. Asking for more than the endpoint's own window would
+    /// have the reply refused and the download abandoned; asking for more than
+    /// the channel's is clamped by the requester in any case, and the assertion
+    /// at the top of this module keeps the two from drifting apart silently.
+    fn request(&mut self, sink: DownloadSink, offset: u64, len: usize, opening: bool) {
+        let pending = self
+            .requester
+            .request(sink, offset, len.min(DOWNLOAD_WINDOW_LEN));
         self.outstanding = Some(Outstanding {
             pending,
             offset,

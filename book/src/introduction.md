@@ -21,9 +21,9 @@ security engineers — and for the people who build this one.
 
 - **[Development status](status.md)** — what works today, what does not, and where the project is
   heading. librefirewall is in early development; read this first.
-- **Reference** — the operator contract: the console records, the Prometheus metrics, and the
-  recording downloads a running node answers with. Exact and complete; this is the appliance's
-  interface definition.
+- **Reference** — the operator contract: the surfaces a running node answers through, and what its
+  console records, Prometheus metrics and recording downloads mean. Exact and complete; this is the
+  appliance's interface definition.
 - **Design** — how librefirewall is designed and why: the architecture, the threat model, and the
   decisions behind them. The design describes the settled target picture, which is deliberately
   larger than what exists today.

@@ -200,6 +200,36 @@ fn a_packet_the_harness_never_injected_is_a_finding() {
     assert!(error.contains("at offset 60"), "{error}");
 }
 
+/// A fabricated block that retained *nothing*. Every slice starts with the
+/// empty slice, so a prefix test alone accepts it against the first injected
+/// frame of the same claimed length — which is the one shape of invention a
+/// sink can produce for free.
+#[test]
+fn a_packet_block_that_retained_no_byte_is_a_finding() {
+    let mut capture = recording(CAPTURE_SNAP, SOUND);
+    capture.packets.push(Packet {
+        interface_id: 0,
+        packet_id: Some(4),
+        // The first probe's length on the wire, and not one byte of it kept.
+        original_len: 65,
+        captured: Vec::new(),
+    });
+    let mut log = recording(LOG_SNAP, SOUND);
+    log.packets.push(capture.packets[4].clone());
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 5),
+        &capture_surface(&capture, 5),
+        &wire(&probes),
+    )
+    .expect_err("an empty capture is no prefix of anything");
+    assert!(
+        error.contains("no prefix of anything the harness injected"),
+        "{error}"
+    );
+    assert!(error.contains("0 captured byte(s)"), "{error}");
+}
+
 /// A log sink that retained more than it declared. The recording is still a
 /// valid pcapng file and still pairs with the capture; what it broke is the
 /// clamping law.

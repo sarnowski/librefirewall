@@ -14,11 +14,19 @@
 //! forwarded case is swept across frame sizes because the snapshot is the one
 //! part that scales with the frame.
 //!
+//! Each measurement covers the routing pass and nothing around it. Getting a
+//! frame into the pool takes a full-frame copy the dataplane never makes — the
+//! receiving NIC DMAs it there — and at 1500 bytes that copy is about the size of
+//! the snapshot being measured, so it is performed outside the timed region.
+//! What is timed is one `poll` over a batch of already-placed frames, which is
+//! also the shape the stage runs in: a wakeup drains what has arrived.
+//!
 //! Single-core measurements. Cross-core throughput against the 10 Gbit/s target
 //! belongs to QEMU/KVM and physical hardware, not here.
 
 use std::hint::black_box;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use net_headers::{
@@ -170,9 +178,30 @@ fn publish(
         .expect("the ring is drained every iteration");
 }
 
-/// Measure one poll over a single published frame, asserting the verdict it
-/// produced: a benchmark that accepted either would silently report the cost of
-/// the cheap path under the name of the expensive one.
+/// Frames put through one timed pass.
+///
+/// A batch, not a single frame, for two reasons. The frames have to be placed
+/// into the pool before the pass and taken back out after it — neither of which
+/// a production path performs, the receiving NIC having DMA'd the frame — so the
+/// timed region is opened and closed by hand around `poll` alone, and a batch
+/// amortises the two clock reads that costs over 32 frames instead of paying
+/// them per frame. It is also the shape the stage really runs in: a wakeup
+/// drains what has arrived, rather than one frame per call.
+///
+/// Under the pool's 64 buffers and the ring's capacity with room to spare, so a
+/// batch never runs into either limit; `DRAIN_LIMIT` is above both, so one pass
+/// takes the whole batch.
+const BATCH: usize = 32;
+
+/// Measure the routing pass over [`BATCH`] published frames, asserting the
+/// verdict each produced: a benchmark that accepted either would silently report
+/// the cost of the cheap path under the name of the expensive one.
+///
+/// Only `poll` is inside the measurement. Placing the frames into the pool is a
+/// full-frame copy the dataplane never makes — at 1500 bytes it is about the size
+/// of the snapshot this exists to isolate, so timing it here would roughly halve
+/// the reported throughput and contaminate the difference between the forwarded
+/// and dropped cases, which is the number the two are read for.
 fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes: Option<u64>) {
     let regions = Regions::new();
     let mut owner = PoolOwner::attach(&regions.returns);
@@ -183,28 +212,43 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
     let mut free_in = regions.returns.free.producer();
 
     let mut group = c.benchmark_group(name);
-    if let Some(bytes) = bytes {
-        group.throughput(Throughput::Bytes(bytes));
-    }
+    match bytes {
+        Some(bytes) => group.throughput(Throughput::Bytes(bytes * BATCH as u64)),
+        // Per frame either way, so the two cases stay comparable: with a byte
+        // rate where the frame size is being swept, and with a frame rate where
+        // it is fixed and the difference between shapes is the point.
+        None => group.throughput(Throughput::Elements(BATCH as u64)),
+    };
     group.bench_with_input(
         BenchmarkId::from_parameter(frame.len()),
         frame,
         |b, frame| {
-            b.iter(|| {
-                publish(&regions.pool, &mut owner, &mut rx_in, frame);
-                assert_eq!(
-                    black_box(stage.poll(configuration, None)),
-                    1,
-                    "the frame must be handed on"
-                );
-                // Drain the far side back to the owner, so every iteration starts
-                // from the same empty rings and full pool and measures one frame.
-                let descriptor: Descriptor = tx_out.try_dequeue().expect("one frame was handed on");
-                assert_eq!(Verdict::from_bits(descriptor.verdict), Some(expected));
-                free_in
-                    .try_enqueue(descriptor)
-                    .expect("the free ring is drained every iteration");
-                assert_eq!(owner.reclaim(), 1);
+            b.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    // Untimed: the placement, which no production path performs.
+                    for _ in 0..BATCH {
+                        publish(&regions.pool, &mut owner, &mut rx_in, frame);
+                    }
+
+                    let started = Instant::now();
+                    let handed_on = black_box(stage.poll(configuration, None));
+                    elapsed += started.elapsed();
+
+                    assert_eq!(handed_on, BATCH, "every frame must be handed on");
+                    // Untimed: draining the far side back to the owner, so every
+                    // iteration starts from the same empty rings and full pool.
+                    for _ in 0..BATCH {
+                        let descriptor: Descriptor =
+                            tx_out.try_dequeue().expect("the batch was handed on");
+                        assert_eq!(Verdict::from_bits(descriptor.verdict), Some(expected));
+                        free_in
+                            .try_enqueue(descriptor)
+                            .expect("the free ring is drained every iteration");
+                    }
+                    assert_eq!(owner.reclaim(), BATCH);
+                }
+                elapsed
             });
         },
     );

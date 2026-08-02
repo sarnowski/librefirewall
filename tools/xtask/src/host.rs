@@ -30,7 +30,7 @@ use std::{
     process::Command,
 };
 
-use crate::{budgets, image, sysdesc, util::run_command};
+use crate::{budgets, image, reference_contract, sysdesc, util::run_command};
 
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target, and
@@ -185,6 +185,14 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // makes `make test` catch a divergence with no image build at all — and
     // `ci` and `release` reach it through this function anyway.
     sysdesc::check(root)?;
+    // The same argument again, aimed at the other document the code has to stay
+    // true to. The reference chapters are the operator's interface definition and
+    // nothing in the gate ever read them, so every sentence in them was an
+    // untested assertion — a refusal token or a metric family could be added to a
+    // shipping domain with the chapter that calls itself complete going stale and
+    // every stage of this gate green. It reads two Markdown files and two
+    // in-process catalogues, so it costs milliseconds here rather than a boot.
+    reference_contract::check(root)?;
     // And for the third time the same argument: the configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost
@@ -606,7 +614,6 @@ pub(crate) fn clean(root: &Path) -> Result<(), String> {
         root.join("build/image"),
         root.join("build/dev-keys"),
         root.join("dist"),
-        root.join("sdk"),
         root.join("target"),
     ] {
         if path.exists() {

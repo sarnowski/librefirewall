@@ -31,9 +31,11 @@
 //!   reference does not appear in the document as the bytes it means, so there
 //!   is nothing there to borrow. Refusing references instead would have kept
 //!   the borrow and made some legal identifiers unwritable.
-//! * **No `Display` for a rejection.** Every error names a position or an
-//!   already-parsed [`Identifier`] and never the offending attacker-chosen bytes, and
-//!   rendering one is [`lfw_log`]'s business rather than this crate's.
+//! * **No `Display` for a rejection.** Every error names a position, or an
+//!   [`Identifier`] — which is document-chosen too, and safe to render only
+//!   because its alphabet cannot carry a byte a console line or a label value
+//!   breaks on. Never a span of the document as written. Rendering one is
+//!   [`lfw_log`]'s business rather than this crate's.
 //! * **The document's own vocabulary is closed.** An element or attribute the
 //!   schema does not name is refused; nothing is skipped, and nothing is
 //!   defaulted. A misspelling an operator cannot see is the failure this is

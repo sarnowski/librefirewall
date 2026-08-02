@@ -94,6 +94,10 @@ pub mod http;
 
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
 
+/// Re-exported because a caller committing to a streamed body names one, and
+/// the bound behind it is `lfw_http`'s rather than this crate's.
+pub use lfw_http::ContentType;
+
 /// Connections one management port holds at once, and so the bound a connection
 /// flood is answered by.
 ///
@@ -149,12 +153,14 @@ impl fmt::Display for EndpointError {
 pub enum Unhandled {
     /// An 802.1Q tag, with no sub-interface to interpret it.
     VlanTagged,
-    /// Neither ARP nor IPv4.
-    EtherType(EtherType),
+    /// Neither ARP nor IPv4. The value refused, or `None` where the reason
+    /// stands for its counter slot rather than for a frame (see
+    /// [`ALL`](Self::ALL)).
+    EtherType(Option<EtherType>),
     /// An ARP reply, or an operation this endpoint does not answer.
     ArpNotARequest,
-    /// IPv4, but not ICMP.
-    Protocol(Protocol),
+    /// IPv4, but not ICMP. `None` on [`ALL`](Self::ALL)'s terms.
+    Protocol(Option<Protocol>),
     /// An ICMP message that is not an echo request.
     NotAnEchoRequest,
     /// A fragment, which no reply can be composed from.
@@ -169,13 +175,17 @@ pub enum Unhandled {
 }
 
 impl Unhandled {
-    /// Every variant, so a counter table is built by iteration rather than a list
-    /// that drifts from the enum.
+    /// One entry per counter slot, so a counter table is built by iteration
+    /// rather than from a list that drifts from the enum.
+    ///
+    /// The two reasons that carry the value they refused appear here carrying
+    /// **none**: a table entry names a slot, and an invented `EtherType(0)`
+    /// would read as a frame somebody sent.
     pub const ALL: [Self; 9] = [
         Self::VlanTagged,
-        Self::EtherType(EtherType(0)),
+        Self::EtherType(None),
         Self::ArpNotARequest,
-        Self::Protocol(Protocol(0)),
+        Self::Protocol(None),
         Self::NotAnEchoRequest,
         Self::Fragmented,
         Self::SourceNotUnicast,
@@ -220,8 +230,8 @@ impl Unhandled {
 impl fmt::Display for Unhandled {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EtherType(ether_type) => write!(f, "{} {ether_type}", self.name()),
-            Self::Protocol(protocol) => write!(f, "{} {protocol}", self.name()),
+            Self::EtherType(Some(ether_type)) => write!(f, "{} {ether_type}", self.name()),
+            Self::Protocol(Some(protocol)) => write!(f, "{} {protocol}", self.name()),
             other => f.write_str(other.name()),
         }
     }
@@ -441,13 +451,40 @@ const fn timeout_connection(timeout: Timeout) -> ConnectionId {
     }
 }
 
-/// The last `len` bytes of a segment's payload: what the transport delivered in
-/// order out of it. Taken from the frame again rather than carried across the
-/// transport's borrow of the storage it wrote into, and bounded by the payload.
-fn tcp_payload<'a>(packet: &Ipv4Packet<'a>, len: usize) -> &'a [u8] {
-    let payload = packet.payload();
-    let from = payload.len().saturating_sub(len);
-    payload.get(from..).unwrap_or_default()
+/// What one poll of a port's own work produced.
+///
+/// Three answers rather than an `Option<usize>`, because "produced no frame" and
+/// "there was nothing to do" are different facts and a caller driving a pass to
+/// exhaustion must tell them apart. A reaping produces no frame and leaves every
+/// other connection's work undone; a loop that stopped there would send one
+/// connection's segments and abandon the rest until the next wakeup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Polled {
+    /// A frame of `len` bytes is in the caller's storage. Send it and poll
+    /// again.
+    Frame { len: usize },
+    /// Work was taken and produced no frame. Nothing to send, and the pass goes
+    /// on.
+    Handled,
+    /// Nothing was due. The pass is over.
+    Idle,
+}
+
+impl Polled {
+    /// The frame to send, if any.
+    #[must_use]
+    pub const fn frame(self) -> Option<usize> {
+        match self {
+            Self::Frame { len } => Some(len),
+            Self::Handled | Self::Idle => None,
+        }
+    }
+
+    /// Whether the pass has more to do.
+    #[must_use]
+    pub const fn goes_on(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
 }
 
 impl Endpoint {
@@ -526,6 +563,18 @@ impl Endpoint {
         self.tcp.connections()
     }
 
+    /// How many connections this endpoint holds a return path for.
+    ///
+    /// Compared against [`connections`](Self::connections) by a caller checking
+    /// what this crate is holding: the table has one entry per connection, so a
+    /// path that outlived its connection is one a live connection can never
+    /// have — and a connection with no path is one nothing this end composes can
+    /// be addressed to.
+    #[must_use]
+    pub fn return_paths(&self) -> usize {
+        self.paths.iter().flatten().count()
+    }
+
     /// Decide what, if anything, to send in reply to one received frame,
     /// writing the reply into `out` and reporting its length in the outcome.
     ///
@@ -539,29 +588,39 @@ impl Endpoint {
     }
 
     /// Take whatever the transport's timers now owe, writing one segment into `out`
-    /// and answering its length.
+    /// and answering what became of it.
     ///
-    /// Called in a loop until it answers `None`: each answer either frees a
-    /// connection or moves a deadline, so the loop terminates
-    /// (`lfw_tcp::TcpStack::poll_timeouts`). A caller woken only by traffic reaps
+    /// Called in a loop until it answers [`Polled::Idle`]: each answer either
+    /// frees a connection or moves a deadline, so the loop terminates
+    /// (`lfw_tcp::TcpStack::poll_timeouts`). A timer that produced no frame —
+    /// a reaping, or a retransmission the server could not serve — is
+    /// [`Polled::Handled`] and not the end of the pass, because the timer after
+    /// it belongs to a different connection. A caller woken only by traffic reaps
     /// on the next frame rather than at the deadline.
-    pub fn poll_timeouts(&mut self, now: Monotonic, out: &mut [u8]) -> Option<usize> {
+    pub fn poll_timeouts(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
         let timeout = {
-            let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
-            self.tcp.poll_timeouts(now, segment)?
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Polled::Idle;
+            };
+            match self.tcp.poll_timeouts(now, segment) {
+                Some(timeout) => timeout,
+                None => return Polled::Idle,
+            }
         };
         let connection = timeout_connection(timeout);
         // Read before the answer, because a connection the transport abandoned or
         // reaped is already gone from its table by the time it says so.
         let path = self.path_of(connection);
-        let len = {
-            let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
-            self.http.answer(&mut self.tcp, now, timeout, segment)
-        };
-        if matches!(timeout, Timeout::Reaped { .. } | Timeout::Abandoned { .. }) {
-            self.forget(connection);
+        let len = out
+            .get_mut(Ipv4Frame::PAYLOAD_AT..)
+            .and_then(|segment| self.http.answer(&mut self.tcp, now, timeout, segment));
+        self.reconcile();
+        match (path, len) {
+            (Some(path), Some(len)) => Polled::Frame {
+                len: self.frame_around(path, len, out),
+            },
+            _ => Polled::Handled,
         }
-        Some(self.frame_around(path?, len?, out))
     }
 
     /// Whether a completed request is waiting on a body.
@@ -593,13 +652,13 @@ impl Endpoint {
     }
 
     /// Answer it with a body of `total` bytes. See [`http::Server::supply_stream`].
-    pub fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+    pub fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
         self.http.supply_stream(total, content_type)
     }
 
     /// The window a streamed response needs. See [`http::Server::window_wanted`].
     #[must_use]
-    pub fn window_wanted(&self) -> Option<(ConnectionId, u64)> {
+    pub fn window_wanted(&self) -> Option<(ConnectionId, u64, usize)> {
         self.http.window_wanted()
     }
 
@@ -614,25 +673,39 @@ impl Endpoint {
     }
 
     /// Compose the next segment any connection's response owes, writing it into
-    /// `out` and answering the frame's length.
+    /// `out` and answering what became of it.
     ///
-    /// Driven in a loop until it answers `None`, which happens as soon as every
-    /// connection is done or blocked on its peer's window; a caller woken by one
-    /// frame would otherwise send one segment per frame received. Each answer
-    /// hands one range to the transport, so the loop is bounded by the response
-    /// length and by `lfw_tcp::MAX_UNACKED`.
-    pub fn poll_output(&mut self, now: Monotonic, out: &mut [u8]) -> Option<usize> {
+    /// Driven in a loop until it answers [`Polled::Idle`], which happens as soon
+    /// as every connection is done or blocked on its peer's window; a caller
+    /// woken by one frame would otherwise send one segment per frame received.
+    /// Each answer hands one range to the transport, so the loop is bounded by
+    /// the response length and by `lfw_tcp::MAX_UNACKED`.
+    ///
+    /// A connection the server chose and could not drive ends the pass: the
+    /// server takes the connections that *can* send first, so one that produced
+    /// nothing is waiting on a window or on its peer, and neither arrives inside
+    /// a pass. Cleanup runs either way, which is why the drive's answer is not
+    /// short-circuited.
+    pub fn poll_output(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
         self.http.sweep(&self.tcp);
-        let connection = self.http.pending()?;
-        let path = self.path_of(connection);
-        let len = {
-            let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
-            self.http.drive(&mut self.tcp, now, connection, segment)?
+        let Some(connection) = self.http.pending() else {
+            return Polled::Idle;
         };
-        if self.tcp.connection(connection).is_none() {
-            self.forget(connection);
+        let path = self.path_of(connection);
+        let composed = out
+            .get_mut(Ipv4Frame::PAYLOAD_AT..)
+            .and_then(|segment| self.http.drive(&mut self.tcp, now, connection, segment));
+        self.reconcile();
+        match (path, composed) {
+            (Some(path), Some(len)) => Polled::Frame {
+                len: self.frame_around(path, len, out),
+            },
+            // A segment the transport took and this end has nowhere to send: the
+            // transport holds the range and will ask for it again, and the pass
+            // goes on rather than stopping on a connection with no return path.
+            (None, Some(_)) => Polled::Handled,
+            (_, None) => Polled::Idle,
         }
-        Some(self.frame_around(path?, len, out))
     }
 
     fn decide(&mut self, now: Option<Monotonic>, frame: &[u8], out: &mut [u8]) -> Outcome {
@@ -644,7 +717,7 @@ impl Endpoint {
             EtherType::ARP => self.arp(&ethernet, out),
             EtherType::IPV4 => self.ipv4(now, &ethernet, out),
             EtherType::VLAN => Outcome::Unhandled(Unhandled::VlanTagged),
-            other => Outcome::Unhandled(Unhandled::EtherType(other)),
+            other => Outcome::Unhandled(Unhandled::EtherType(Some(other))),
         }
     }
 
@@ -708,7 +781,7 @@ impl Endpoint {
             return self.tcp(now, ethernet.header.source, &packet, out);
         }
         if header.protocol != Protocol::ICMP {
-            return Outcome::Unhandled(Unhandled::Protocol(header.protocol));
+            return Outcome::Unhandled(Unhandled::Protocol(Some(header.protocol)));
         }
         let echo = match IcmpEcho::parse_request(packet.payload()) {
             Ok(echo) => echo,
@@ -747,38 +820,52 @@ impl Endpoint {
             return Outcome::Unclocked;
         };
         let source = packet.header().source;
-        let (outcome, connection, delivered, peer_closed, mut len) = {
+        // The delivered bytes are carried out of this block rather than
+        // re-derived from the frame: they are a subslice of the *datagram's*
+        // payload, whose borrow outlives the transport's borrow of `out`, and
+        // only the transport knows which subslice — a segment trimmed at its
+        // right edge to the receive window delivers its head, and taking the
+        // last bytes instead would hand the server a slice it never accepted.
+        let received = {
             let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
                 return Outcome::ReplyRefused(ReplyError::DoesNotFit {
                     needed: Ipv4Frame::PAYLOAD_AT,
                     capacity: out.len(),
                 });
             };
-            let received = self.tcp.receive(now, source, packet.payload(), segment);
-            (
-                received.outcome,
-                received.connection,
-                // Copied out rather than borrowed: the server takes the bytes,
-                // and the borrow of the segment they point into ends with this
-                // block.
-                received.data.len(),
-                received.peer_closed,
-                received.emitted,
-            )
+            self.tcp.receive(now, source, packet.payload(), segment)
         };
+        let outcome = received.outcome;
+        let mut len = received.emitted;
 
-        let Some(connection) = connection else {
-            return Outcome::Tcp { len, outcome };
+        // The transport frees connections on its own — an eviction under table
+        // pressure being the one no timeout announces — so what this crate holds
+        // per connection is reconciled against its table before a new one is
+        // given room in either.
+        self.reconcile();
+
+        let Some(connection) = received.connection else {
+            if len == 0 {
+                return Outcome::Tcp { len: 0, outcome };
+            }
+            // A reset for a 4-tuple this endpoint holds no connection for. There
+            // is no return path to look up and none to remember, so the pair the
+            // frame arrived from is the whole of the address — and the segment
+            // still needs its two headers, without which the length reported
+            // here would name a segment with uninitialised bytes in front of it.
+            return Outcome::Tcp {
+                len: self.frame_around((peer_mac, source), len, out),
+                outcome,
+            };
         };
         // The return path, because there is no ARP cache: a segment sent unprompted
         // can only be addressed to the pair its frames arrive from.
         self.remember(connection, peer_mac, source);
 
-        if delivered > 0 {
-            let data = tcp_payload(packet, delivered);
-            self.http.take(connection, data);
+        if !received.data.is_empty() {
+            self.http.take(connection, received.data);
         }
-        if peer_closed {
+        if received.peer_closed {
             self.http.note_peer_closed(connection);
         }
         if let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..)
@@ -788,9 +875,7 @@ impl Endpoint {
             // would have, so replacing the transport's answer loses nothing.
             len = composed;
         }
-        if self.tcp.connection(connection).is_none() {
-            self.forget(connection);
-        }
+        self.reconcile();
         self.http.sweep(&self.tcp);
         if len == 0 {
             return Outcome::Tcp { len: 0, outcome };
@@ -851,15 +936,27 @@ impl Endpoint {
             .map(|path| (path.mac, path.address))
     }
 
-    /// Release a connection's return path and its held bytes: the two are the whole
-    /// of what this crate keeps per connection.
-    fn forget(&mut self, connection: ConnectionId) {
-        for slot in &mut self.paths {
-            if slot.is_some_and(|path| path.connection == connection) {
+    /// Release everything this crate holds for connections the transport no
+    /// longer does: the return paths here, and the request and response state in
+    /// the server above.
+    ///
+    /// Reconciliation rather than a notification per release, because the
+    /// transport takes a slot back for reasons that produce no event at all —
+    /// an eviction under table pressure is a `SYN` answered, not a timeout — and
+    /// a release nobody was told about is a return path and a request slot lost
+    /// for the life of the domain. Bounded by the table, so it is a walk of
+    /// [`TCP_CONNECTIONS`] entries wherever it is called.
+    fn reconcile(&mut self) {
+        for index in 0..TCP_CONNECTIONS {
+            let held = self.paths.get(index).copied().flatten();
+            let Some(path) = held else { continue };
+            if self.tcp.connection(path.connection).is_none()
+                && let Some(slot) = self.paths.get_mut(index)
+            {
                 *slot = None;
             }
         }
-        self.http.release(connection);
+        self.http.reconcile(&self.tcp);
     }
 
     /// The two rules that decide whether a reply can be addressed at all, applied

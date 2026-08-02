@@ -109,7 +109,6 @@ fn zeroed_regions_are_an_empty_ring_holding_zeroed_records() {
     assert!(writer.is_empty());
     assert_eq!(reader.len(), 0);
     assert_eq!(writer.dropped(), 0);
-    assert_eq!(reader.undecodable(), 0);
     assert_eq!(reader.dropped_by_writer(), 0);
     assert_eq!(records.slot(0).load(), LogRecord::ZERO);
 }
@@ -312,7 +311,7 @@ fn a_drain_never_exceeds_the_capacity_const_however_large_the_limit() {
 }
 
 #[test]
-fn an_undecodable_record_is_counted_and_the_drain_carries_on() {
+fn an_undecodable_record_is_refused_and_the_drain_carries_on() {
     let ring = Ring::zero();
     let mut writer = ring.writer();
     let mut reader = ring.reader();
@@ -333,7 +332,6 @@ fn an_undecodable_record_is_counted_and_the_drain_carries_on() {
         Err(LogRecordError::KindUnknown { kind: 0xdead_beef })
     );
     assert!(is_tagged(&read[2], 2));
-    assert_eq!(reader.undecodable(), 1);
 }
 
 #[test]
@@ -498,7 +496,6 @@ fn the_reader_never_writes_the_records_region() {
         let _ = reader.len();
         let _ = reader.is_empty();
         let _ = reader.dropped_by_writer();
-        let _ = reader.undecodable();
     }
     assert_eq!(
         records_image(&ring.records),
@@ -550,7 +547,6 @@ fn a_writing_and_a_draining_thread_transfer_every_record_in_order() {
                     None => std::hint::spin_loop(),
                 }
             }
-            assert_eq!(reader.undecodable(), 0);
         });
     });
 }
@@ -725,7 +721,6 @@ proptest! {
             ring.records.slot(index as u32).store(&record_from_bytes(image));
         }
 
-        let mut total = 0usize;
         for tail in tails {
             ring.records.tail.store(tail, Ordering::Relaxed);
 
@@ -734,7 +729,6 @@ proptest! {
             prop_assert!(read.len() <= LOG_RING_SLOTS);
             prop_assert!(read.len() <= reader.capacity());
             prop_assert!(read.len() <= limit);
-            total += read.len();
 
             for decoded in read.iter().flatten() {
                 assert_yield_is_renderable(decoded)?;
@@ -747,11 +741,6 @@ proptest! {
             // whatever it says, it has bounded nothing above.
             let _ = reader.dropped_by_writer();
         }
-        prop_assert_eq!(
-            reader.undecodable() as usize <= total,
-            true,
-            "more records were refused than were read"
-        );
     }
 
     /// The same, over the consume region and independently of the first: the

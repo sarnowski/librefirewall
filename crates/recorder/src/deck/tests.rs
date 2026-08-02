@@ -30,11 +30,18 @@ const ENHANCED_PACKET_BLOCK: u32 = 0x0000_0006;
 struct Fake {
     window: Vec<u8>,
     disk: Vec<u8>,
-    ready: VecDeque<Completion>,
+    ready: VecDeque<Polled>,
     /// Submits still to be refused before one is taken.
     refuse: usize,
     /// Transfers still to be failed before one is performed.
     fail: usize,
+    /// Reads still to be answered `Ok` having moved one sector less than they
+    /// asked for. Reads only, because virtio-blk has no partial write to
+    /// acknowledge: a write's byte count is what was submitted.
+    short_reads: usize,
+    /// Completions still to be answered as attributable to no job at all — a
+    /// device replaying entries of its used ring.
+    unattributed: usize,
 }
 
 impl Fake {
@@ -45,7 +52,16 @@ impl Fake {
             ready: VecDeque::new(),
             refuse: 0,
             fail: 0,
+            short_reads: 0,
+            unattributed: 0,
         }
+    }
+
+    /// Write `bytes` onto the medium at `sector`, as an earlier deployment or a
+    /// harness seeding the disk would have left them.
+    fn seed(&mut self, sector: u64, bytes: &[u8]) {
+        let at = sector as usize * SECTOR_SIZE;
+        self.disk[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
     /// The bytes of one device extent, as a reader holding the disk would see
@@ -56,12 +72,16 @@ impl Fake {
         self.disk.get(from..to).unwrap_or_default()
     }
 
-    /// Answer a job nothing asked for.
+    /// Answer a job nothing asked for, claiming to have moved more than any
+    /// transfer could — so what the pass makes of it turns on the attribution
+    /// and never on the byte count.
     fn forge(&mut self, job: Job) {
-        self.ready.push_back(Completion {
+        self.ready.push_back(Polled::Settled(Completion {
             job,
-            ended: Ended::Ok,
-        });
+            ended: Ended::Ok {
+                delivered: usize::MAX,
+            },
+        }));
     }
 }
 
@@ -80,12 +100,22 @@ impl Medium for Fake {
         }
         if self.fail > 0 {
             self.fail -= 1;
-            self.ready.push_back(Completion {
+            self.ready.push_back(Polled::Settled(Completion {
                 job,
                 ended: Ended::Failed,
-            });
+            }));
             return Ok(());
         }
+        // A short read: one sector fewer moved than asked for, reported `Ok`
+        // exactly as a device that DMA'd less than it promised would. The tail
+        // of the area keeps whatever the previous transfer left in it, which is
+        // the whole hazard.
+        let moved = if !transfer.write && self.short_reads > 0 {
+            self.short_reads -= 1;
+            transfer.len.saturating_sub(SECTOR_SIZE)
+        } else {
+            transfer.len
+        };
         let (base, area_len) = transfer.area.extent();
         let offset = base + transfer.at;
         assert!(
@@ -105,21 +135,25 @@ impl Medium for Fake {
             at + transfer.len <= self.disk.len(),
             "a transfer stays inside the device"
         );
-        for byte in 0..transfer.len {
+        for byte in 0..moved {
             if transfer.write {
                 self.disk[at + byte] = self.window[offset + byte];
             } else {
                 self.window[offset + byte] = self.disk[at + byte];
             }
         }
-        self.ready.push_back(Completion {
+        self.ready.push_back(Polled::Settled(Completion {
             job,
-            ended: Ended::Ok,
-        });
+            ended: Ended::Ok { delivered: moved },
+        }));
         Ok(())
     }
 
-    fn poll(&mut self) -> Option<Completion> {
+    fn poll(&mut self) -> Option<Polled> {
+        if self.unattributed > 0 {
+            self.unattributed -= 1;
+            return Some(Polled::Unattributed);
+        }
         self.ready.pop_front()
     }
 }
@@ -650,6 +684,177 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
         Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::DeviceError),
         other => panic!("a failed read is answered: {other:?}"),
     }
+}
+
+#[test]
+fn a_read_the_device_under_delivers_is_refused_rather_than_served_as_content() {
+    // The staging area a download reads into is reused window after window and
+    // is never cleared, so a device that completes a read `Ok` having moved
+    // fewer bytes than it was asked for leaves the previous window's bytes in
+    // the tail. Serving them would put one part of the recording inside
+    // another's body, at full length, under a correct total.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 40, 1400, 12);
+
+    // A whole download first, so the download area holds real recording bytes
+    // for a short read to expose.
+    let honest = download(&mut deck, &mut medium, &mut reader, DownloadSink::Log);
+    assert!(!honest.is_empty(), "there is a recording to download");
+    let served = deck.counters().downloads_served;
+
+    // The recording is already sealed and drained, so the next demand locates and
+    // reads within one pass — the read this device cuts short.
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    medium.short_reads = 1;
+    deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
+    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16) {
+        Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::DeviceError),
+        other => panic!("a read the device cut short is refused, not served: {other:?}"),
+    }
+    let counters = deck.counters();
+    assert_eq!(
+        counters.downloads_served, served,
+        "not one byte was handed out for the short read"
+    );
+    assert!(
+        counters.medium_failures > 0,
+        "and the shortfall reached the fault counters rather than passing as a success"
+    );
+}
+
+#[test]
+fn a_completion_answering_no_job_is_counted_without_ending_the_drain() {
+    // A device replaying its used ring publishes completions this side holds no
+    // request for. Reporting one as "the device has nothing more" would let it
+    // throttle the recorder's completion drain on every pass while every fault
+    // surface read clean, so it is counted and drained past instead.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    // One pass, so the records are staged and their flushes submitted but no
+    // completion has been settled yet.
+    run(&mut deck, &mut medium, &ring, &mut reader, 8, 900, 1);
+    let before = deck.counters();
+    assert!(
+        before.sinks.iter().all(|sink| sink.sectors_written == 0),
+        "nothing has been acknowledged yet"
+    );
+
+    // Three completions answering nothing, queued ahead of the ones that answer
+    // the flushes.
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    medium.unattributed = 3;
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    let after = deck.counters();
+    assert_eq!(
+        after.completions_unexpected,
+        before.completions_unexpected + 3,
+        "every unattributable completion is counted"
+    );
+    assert_eq!(
+        after.medium_failures, before.medium_failures,
+        "an unattributable completion is not a transfer that failed"
+    );
+    let sectors = |counters: &RecorderCounters| -> u64 {
+        counters.sinks.iter().map(|sink| sink.sectors_written).sum()
+    };
+    assert!(
+        sectors(&after) > sectors(&before),
+        "and the pass went on to settle the flush the device really did answer"
+    );
+
+    // The recording is unharmed: everything published still reaches a segment.
+    medium.unattributed = 0;
+    for _ in 0..64 {
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    }
+    for sink in deck.counters().sinks {
+        assert_eq!(sink.records, 8);
+    }
+}
+
+#[test]
+fn a_superblock_states_a_short_runs_durable_end_without_waiting_for_a_segment_to_roll() {
+    // A segment is a megabyte and a short run never fills one, so rolling is far
+    // too coarse a trigger for the medium's only statement of where a recording
+    // ends: an extent would claim nothing durable for the whole of such a run,
+    // and anything reading the disk afterwards would conclude the appliance had
+    // composed records that never reached it.
+    let mut medium = Fake::new();
+    let (log_start, _) = Deck::extents()[0];
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 200, 8);
+
+    let image = medium.extent(log_start, (SUPERBLOCK_BYTES / SECTOR_SIZE) as u64);
+    let image: &[u8; SUPERBLOCK_BYTES] = image.try_into().expect("two sectors");
+    let found = lfw_capture_ring::decode_superblock(image).expect("a decodable superblock");
+    assert_eq!(
+        found.writer().sequence,
+        0,
+        "the run stays inside its first segment"
+    );
+    assert!(
+        found.writer().offset > 0,
+        "the superblock still says no byte is durable after a flush landed"
+    );
+}
+
+#[test]
+fn a_stale_superblock_of_an_older_ring_cannot_outrank_a_fresh_recording() {
+    // A re-initialised appliance, or a redeployment: the extent already carries
+    // a ring of exactly this geometry at a generation far above anything a
+    // fresh one reaches. Parity selection alone would leave it in the copy the
+    // fresh ring's first checkpoint does not touch, and a decode prefers the
+    // higher generation — so a later boot would resume a cursor into a
+    // recording that no longer exists.
+    let mut medium = Fake::new();
+    let (log_start, log_sectors) = Deck::extents()[0];
+    let geometry =
+        lfw_capture_ring::Geometry::new(log_start, log_sectors, SEGMENT_BYTES, CAPACITY_SECTORS)
+            .expect("the log extent");
+    let stale = lfw_capture_ring::RingState::new(
+        geometry,
+        500,
+        lfw_capture_ring::Cursor {
+            sequence: 400,
+            offset: SEGMENT_BYTES / 2,
+        },
+        &[],
+    )
+    .expect("a legal state");
+    let mut region = [0u8; SUPERBLOCK_BYTES];
+    lfw_capture_ring::encode_superblock(&mut region, &stale, lfw_capture_ring::Copies::Parity);
+    medium.seed(log_start, &region);
+    assert_eq!(
+        lfw_capture_ring::decode_superblock(&region).map(|state| state.write_generation()),
+        Some(500),
+        "the extent starts out holding the older ring"
+    );
+
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 200, 8);
+
+    let image = medium.extent(log_start, (SUPERBLOCK_BYTES / SECTOR_SIZE) as u64);
+    let image: &[u8; SUPERBLOCK_BYTES] = image.try_into().expect("two sectors");
+    let found = lfw_capture_ring::decode_superblock(image).expect("a decodable superblock");
+    assert!(
+        found.write_generation() < 500,
+        "a resuming ring would have adopted the older ring's generation {}",
+        found.write_generation()
+    );
+    assert!(
+        found.writer().sequence < 400,
+        "and its cursor, {} segments into a recording this boot never wrote",
+        found.writer().sequence
+    );
 }
 
 #[test]

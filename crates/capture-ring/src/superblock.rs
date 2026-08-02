@@ -25,6 +25,12 @@
 //! Two copies within one sector would defend against nothing: the tear this
 //! guards against is the sector, so independence requires two of them.
 //!
+//! Parity is the right rule only once *this* ring owns both copies. Before that
+//! it is a hazard: a fresh ring's first checkpoint rewrites copy 1 alone, while
+//! copy 0 may still hold a previous deployment's ring of the same geometry at a
+//! higher generation, which [`RingState::check`] accepts and
+//! [`decode_superblock`] prefers — so a checkpoint states its [`Copies`].
+//!
 //! # Canonical bytes, so a forgery has nowhere to hide
 //!
 //! Every byte of a copy is defined. The fields are little-endian at fixed
@@ -41,8 +47,8 @@ use crate::{Cursor, Geometry, SECTOR_SIZE};
 #[cfg(test)]
 mod tests;
 
-/// `LFWCAPRG` in ASCII, so the first eight bytes of the extent identify it in a
-/// hex dump without a decoder.
+/// `LFWCAPRG` in ASCII, leading every copy, so a checkpointed extent identifies
+/// itself in a hex dump without a decoder.
 pub const SUPERBLOCK_MAGIC: u64 = u64::from_le_bytes(*b"LFWCAPRG");
 
 pub const SUPERBLOCK_VERSION: u32 = 1;
@@ -324,15 +330,34 @@ impl CheckedState {
     }
 }
 
-/// Write `state` into the copy its generation's parity selects, leaving the
-/// other copy — the one the medium is currently relying on — untouched.
-///
-/// Returns the byte offset within `out` of the copy it rewrote; the copy is
-/// [`SUPERBLOCK_COPY_BYTES`] long, and that one sector is what the caller
-/// flushes. `out` is the whole region and nothing else, which is why this
-/// cannot fail: the short-buffer case is not a rejection here but a type the
-/// caller cannot construct.
-pub fn encode_superblock(out: &mut [u8; SUPERBLOCK_BYTES], state: &RingState) -> usize {
+/// Which copies of the region one checkpoint replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copies {
+    /// The one the generation's parity selects, leaving the copy the medium relies
+    /// on untouched. The steady state.
+    Parity,
+    /// Both, for a ring with nothing of its own on the medium: there is no copy
+    /// of *this* ring to preserve, and one left behind is another's.
+    Both,
+}
+
+/// Where in the region [`encode_superblock`] wrote and how much — both numbers, so
+/// a transfer follows the [`Copies`] decision rather than restating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperblockWrite {
+    /// Byte offset within the region, a multiple of [`SUPERBLOCK_COPY_BYTES`].
+    pub at: usize,
+    /// Bytes from `at`, a whole number of copies.
+    pub len: usize,
+}
+
+/// Write `state` into the copies `copies` names. `out` is the whole region and
+/// nothing else, so the short-buffer case is a type nobody can construct.
+pub fn encode_superblock(
+    out: &mut [u8; SUPERBLOCK_BYTES],
+    state: &RingState,
+    copies: Copies,
+) -> SuperblockWrite {
     let mut image = [0u8; SUPERBLOCK_COPY_BYTES];
 
     write_u64(&mut image, MAGIC_AT, SUPERBLOCK_MAGIC);
@@ -370,14 +395,31 @@ pub fn encode_superblock(out: &mut [u8; SUPERBLOCK_BYTES], state: &RingState) ->
     let crc = crc32(&image[..CRC_AT]);
     write_u32(&mut image, CRC_AT, crc);
 
-    let copy = (state.write_generation % SUPERBLOCK_COPIES as u64) as usize;
     let (first, second) = out.split_at_mut(SUPERBLOCK_COPY_BYTES);
-    if copy == 0 {
-        first.copy_from_slice(&image);
-    } else {
-        second.copy_from_slice(&image);
+    match copies {
+        // Identical rather than one blanked, so the torn-write defence holds from
+        // the first checkpoint; the tie rule makes the choice total.
+        Copies::Both => {
+            first.copy_from_slice(&image);
+            second.copy_from_slice(&image);
+            SuperblockWrite {
+                at: 0,
+                len: SUPERBLOCK_BYTES,
+            }
+        }
+        Copies::Parity => {
+            let copy = (state.write_generation % SUPERBLOCK_COPIES as u64) as usize;
+            if copy == 0 {
+                first.copy_from_slice(&image);
+            } else {
+                second.copy_from_slice(&image);
+            }
+            SuperblockWrite {
+                at: copy * SUPERBLOCK_COPY_BYTES,
+                len: SUPERBLOCK_COPY_BYTES,
+            }
+        }
     }
-    copy * SUPERBLOCK_COPY_BYTES
 }
 
 /// Decode the newer of the two valid copies.

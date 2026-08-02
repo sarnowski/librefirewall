@@ -6,12 +6,13 @@
 //! and a commit keyed on one would then re-apply a configuration that had not
 //! changed.
 //!
-//! FNV-1a because the question is whether two configurations this appliance
-//! accepted are the same one, not resistance to a chosen collision: a hash is
-//! taken of a model, and reaching a model at all means a document got through
-//! the schema and every semantic rule. What the width does bound is confidence
-//! — two distinct configurations sharing a hash would commit as unchanged — and
-//! 32 bits is what [`wire::ConfigImage`] carries.
+//! FNV-1a, and 32 bits, because nothing here decides anything: this is the label
+//! a configuration carries across the handover, never the answer to whether two
+//! configurations are the same one. That is
+//! [`Model::has_same_content`](crate::Model::has_same_content), which compares
+//! the objects. A commit keyed on a digest this short — of a document somebody
+//! else may one day choose — would let a collision suppress a configuration
+//! with no generation, no record and nothing published.
 
 use lfw_log::Identifier;
 use net_headers::{Ipv4Address, MacAddress};

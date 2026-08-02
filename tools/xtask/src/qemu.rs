@@ -35,6 +35,7 @@
 //! interface in that document claims.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -386,12 +387,16 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     ))
 }
 
-/// Hold the initial sequence numbers three boots chose to being *different*.
+/// Hold the initial sequence numbers the boots chose to being *pairwise*
+/// different.
 ///
-/// The two dataplane scenarios boot the same disk, so nothing but the per-boot
-/// `RDRAND` secret and the time component separates their numbers (RFC 6528): two
-/// equal ones mean one of the two is missing, which is the whole of what makes an
-/// initial sequence number unguessable. Every boot must have opened a connection,
+/// The scenarios that open a connection boot the same disk, so nothing but the
+/// per-boot `RDRAND` secret and the time component separates their numbers
+/// (RFC 6528): two equal ones mean one of the two is missing, which is the whole
+/// of what makes an initial sequence number unguessable. Every pair is compared
+/// rather than every adjacent pair, because a repeat is a repeat wherever it
+/// falls in the run order — comparing neighbours alone would pass a run in which
+/// the first and last boots agreed. Every boot must have opened a connection,
 /// too — a run that opened none proves nothing and must not read as a pass.
 ///
 /// # Errors
@@ -404,21 +409,27 @@ pub(crate) fn judge_sequence_numbers(observed: &[(&str, u32)]) -> Result<String,
              this means none of them reached the point where it could",
         ));
     }
-    for pair in observed.windows(2) {
-        if let [(first, earlier), (second, later)] = pair
-            && earlier == later
-        {
-            return Err(format!(
-                "scenarios {first} and {second} were both answered with initial sequence number \
-                 {earlier}. Nothing but the per-boot RDRAND secret and a monotonic time component \
-                 separates two boots of one disk (RFC 6528), so an equal pair means one of the two \
-                 is not reaching the generator — and a predictable initial sequence number lets an \
-                 off-path attacker inject into a connection it cannot see"
-            ));
+    for (index, (first, earlier)) in observed.iter().enumerate() {
+        for (second, later) in &observed[index + 1..] {
+            if earlier == later {
+                return Err(format!(
+                    "scenarios {first} and {second} were both answered with initial sequence \
+                     number {earlier}. Nothing but the per-boot RDRAND secret and a monotonic time \
+                     component separates two boots of one disk (RFC 6528), so an equal pair means \
+                     one of the two is not reaching the generator — and a predictable initial \
+                     sequence number lets an off-path attacker inject into a connection it cannot \
+                     see"
+                ));
+            }
         }
     }
+    // The count of *values*, not of boots: the two are equal only because the
+    // loop above has just proved they are, and reporting the boot count under
+    // this wording is what let the claim outlive the comparison behind it.
+    let distinct: BTreeSet<u32> = observed.iter().map(|&(_, isn)| isn).collect();
     Ok(format!(
-        "{} distinct initial sequence numbers across the boots that opened a connection",
+        "{} distinct initial sequence numbers across the {} boot(s) that opened a connection",
+        distinct.len(),
         observed.len()
     ))
 }

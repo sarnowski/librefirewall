@@ -8,14 +8,14 @@
 //! # Adversary
 //!
 //! Both of the adversaries this domain can meet. The **byzantine peer
-//! protection domain** owns the five records regions mapped here read-only:
+//! protection domain** owns the eight records regions mapped here read-only:
 //! every slot, the producer cursor and the drop count are peer-chosen, and
 //! nothing this domain does can correct one. The **hostile or malfunctioning
 //! device** is the controller, which may never report its transmitter empty.
 //! Neither is judged in this file: `wire` and `lfw_log` refuse a record and
 //! `uart_16550` bounds every wait.
 //!
-//! # Fourteen regions, not seven
+//! # Sixteen regions, not eight
 //!
 //! Each writing domain's ring is two regions carrying opposite grants. This
 //! domain maps the records read-only, so it cannot forge a line attributed to a
@@ -51,26 +51,26 @@
 //! the port window, run the register sequence — and the `state=starting`
 //! record on the next line closes it.
 //!
-//! Two different failures fall inside it, and they are no longer equally dark.
-//! A refused **capability** — the slot or the grant no longer being what
-//! [`com1`] expects — is now caught by [`Com1::claim`] and named on the debug
-//! kernel's channel, the same one the Microkit monitor reports this domain's
-//! faults on. That channel does not exist in the release image, so in release
-//! this failure rejoins the second.
+//! Two different failures fall inside it, and they are not equally dark.
 //!
-//! A refused **controller** is the second, and the accepted residue is that
-//! `uart_16550` distinguishes six ways for that to happen and this domain can
-//! carry none of them out. There is no second channel — no `GET /logs` ring
-//! yet, no metrics endpoint — and the peers' log regions are
-//! read-only here, so the refusal cannot be written into one even in principle.
-//! The consequence is a node that prints nothing, which is the diagnosis at one
-//! bit rather than six. What closes it is a reporting channel independent of
-//! the console.
+//! A refused **controller** this domain can still report. It cannot print, but
+//! its stats shard is its own to write, so `init` publishes it before parking and
+//! `librefirewall_uart_init_failures_total` moves — which is what lets a scrape
+//! tell a refused controller from a console that came up and printed nothing. The
+//! residue is granularity: `uart_16550` distinguishes six ways for the register
+//! sequence to fail and one counter carries none of them apart.
+//!
+//! A refused **capability** — the slot or the grant no longer being what [`com1`]
+//! expects — is the darker one. No controller was addressed, so no initialisation
+//! failed and there is nothing truthful to put in the shard; a zeroed shard is
+//! also what an unstarted domain leaves. The fault is named on the debug kernel's
+//! channel instead, which the release image does not have. What closes it is a
+//! reporting channel independent of the console.
 //!
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
 //! drives them; the register protocol and every bounded wait are in
-//! `uart_16550`. This file maps fourteen regions, claims one port window, and
+//! `uart_16550`. This file maps sixteen log regions, claims one port window, and
 //! calls one function in a loop.
 //!
 //! # Why the port access is here and not in `uart_16550`
@@ -96,7 +96,9 @@
 mod com1;
 
 use com1::Com1;
-use lfw_log::{Clock as _, ConsolePrinter, Domain, DomainDetail, DomainState, Event};
+use lfw_log::{
+    Clock as _, ConsoleCounters, ConsolePrinter, Domain, DomainDetail, DomainState, Event,
+};
 use lfw_metrics::{ConsoleSample, StatsShard};
 use pd_runtime::{PdClock, attach_region};
 use sel4_microkit::{ChannelSet, Handler, Infallible, debug_println, protection_domain};
@@ -178,10 +180,18 @@ fn init() -> Console {
 
     let mut uart = Uart::new(port);
     let Ok(transmitter) = uart.initialise() else {
-        // Unreportable by construction; see the crate header on the window with
-        // no observability behind it. Parking leaves the domain idle rather
-        // than retrying a controller that has already refused a sequence every
-        // step of which was confirmed by readback.
+        // No line can be printed, so the shard is the only statement left — and it
+        // is writable, the refusal being the device's and not the mapping's.
+        // Publishing here is what moves `init_failures`, so an operator who can
+        // scrape reads a refused controller rather than a shard of zeroes. Nothing
+        // was printed, so the record counters are zero and the device's three
+        // carry the whole of it. Parking leaves the domain idle rather than
+        // retrying a controller that refused a sequence confirmed at every step.
+        stats.publish(
+            &ConsoleCounters::default()
+                .to_sample(uart.stats().to_sample())
+                .values(),
+        );
         return Console;
     };
 

@@ -53,11 +53,25 @@ use std::{
 /// The recorded budgets, relative to the workspace root.
 pub(crate) const BASELINE: &str = "tools/xtask/budgets.toml";
 
-/// The trees whose files and crates are measured. `tools/` is deliberately
-/// absent: `xtask` is build orchestration that never runs on a deployed
-/// appliance, the same reason it is outside the coverage floor, and a ratchet
-/// on the orchestrator's own prose would defend nothing about
-/// the product.
+/// The trees whose files and crates are measured, and the two that are
+/// deliberately absent — recorded here rather than left silent, because an
+/// exclusion nobody wrote down is indistinguishable from an oversight and the
+/// portion of the budget it removes is free to rise unobserved.
+///
+/// `tools/` is out because `xtask` is build orchestration that never runs on a
+/// deployed appliance, the same reason it is outside the coverage floor, and a
+/// ratchet on the orchestrator's own prose would defend nothing about the
+/// product.
+///
+/// `fuzz/` is out for the reason [`HARNESS_DIRS`] already keeps `benches/` and
+/// `tests/` out of the crates that *are* measured: it is harness code, neither
+/// shipped nor part of the documentation surface a comment ratio constrains.
+/// One consequence is not covered by that argument and is named rather than
+/// implied: the `unsafe` half of this module is a count of unverifiable prose
+/// claims wherever they are written, and the fuzz harnesses hold enough of them
+/// that leaving them unrecorded is a real gap. Closing it means re-recording
+/// [`BASELINE`], which rewrites every number in it — a human-approved change of
+/// its own, not a side effect of another.
 const MEASURED_TREES: &[&str] = &["crates", "pds"];
 
 /// Path components that mark a file as harness rather than product. A criterion
@@ -160,6 +174,13 @@ impl CommentBudget {
 struct Measured {
     /// Per production file, keyed by its workspace-relative path.
     files: BTreeMap<String, CommentBudget>,
+    /// Every string literal each production file holds, keyed the same way.
+    ///
+    /// Carried here because this is the one place in the build that already
+    /// separates a literal from a sentence about one and production code from a
+    /// `#[cfg(test)]` item — see [`production_literals`], which is what reads
+    /// it. A second lexer for a second consumer is a second thing to be wrong.
+    literals: BTreeMap<String, Vec<String>>,
     /// Per crate directory, per kind. Every crate appears under every kind,
     /// including with a zero: recording an absence is what makes the *first*
     /// `unsafe` in a crate that has none fail the gate — keeping `unsafe`
@@ -172,6 +193,21 @@ struct Measured {
 struct Baseline {
     ratios: BTreeMap<String, f64>,
     unsafes: BTreeMap<(UnsafeKind, String), usize>,
+}
+
+/// Every string literal each production file under the measured trees holds,
+/// keyed by workspace-relative path.
+///
+/// Exposed because a second consumer needs exactly what the ratchets already
+/// compute and nothing more: which bytes are a literal rather than a sentence
+/// quoting one, and which of them are production rather than a `#[cfg(test)]`
+/// item. Both are decided by the scanner above, once.
+///
+/// # Errors
+/// Whatever the measurement itself refuses — a construct the scanner cannot
+/// classify, or a measured tree that is not a directory.
+pub(crate) fn production_literals(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+    Ok(measure(root)?.literals)
 }
 
 /// Enforce both ratchets against the recorded baseline.
@@ -387,6 +423,9 @@ fn measure_crate(root: &Path, krate: &Path, measured: &mut Measured) -> Result<(
             continue;
         }
         let key = relative(root, &path)?;
+        measured
+            .literals
+            .insert(key.clone(), scan.string_literals.clone());
         measured.files.insert(
             key,
             CommentBudget {
@@ -483,6 +522,9 @@ struct Scan {
     comment_lines: usize,
     production_lines: usize,
     unsafes: BTreeMap<UnsafeKind, usize>,
+    /// Every string literal outside a comment and outside a `#[cfg(test)]`
+    /// item, in source order, with its escapes exactly as written.
+    string_literals: Vec<String>,
     /// Names from `#[cfg(test)] mod NAME;`, so the sibling file they refer to
     /// can be dropped from the production set.
     test_only_modules: Vec<String>,
@@ -548,6 +590,10 @@ fn scan(source: &str) -> Result<Scan, String> {
     let mut pending_first_nonws = true;
     let mut excluded: Vec<(usize, usize)> = Vec::new();
     let mut unsafe_sites: Vec<UnsafeKind> = Vec::new();
+    // Every literal with the line it opened on, so the `#[cfg(test)]` ranges
+    // computed below can drop a test's literals exactly as they drop its lines.
+    let mut literals: Vec<(usize, String)> = Vec::new();
+    let mut literal_at: Option<(usize, usize)> = None;
     let mut test_only_modules = Vec::new();
     let mut gate: Option<Gate> = None;
     let mut attribute: Option<Attribute> = None;
@@ -597,6 +643,11 @@ fn scan(source: &str) -> Result<Scan, String> {
                     i += 2;
                 } else {
                     if byte == terminator {
+                        if state == Lex::Str
+                            && let Some((opened_on, from)) = literal_at.take()
+                        {
+                            literals.push((opened_on, source[from..i].to_owned()));
+                        }
                         state = Lex::Code;
                     }
                     i += 1;
@@ -611,6 +662,9 @@ fn scan(source: &str) -> Result<Scan, String> {
                         .count()
                         == hashes as usize
                 {
+                    if let Some((opened_on, from)) = literal_at.take() {
+                        literals.push((opened_on, source[from..i].to_owned()));
+                    }
                     state = Lex::Code;
                     i += 1 + hashes as usize;
                 } else {
@@ -632,11 +686,13 @@ fn scan(source: &str) -> Result<Scan, String> {
                 }
                 if let Some((next, hashes)) = raw_string_at(bytes, i) {
                     state = Lex::RawStr(hashes);
+                    literal_at = Some((line, next));
                     i = next;
                     continue;
                 }
                 if byte == b'"' {
                     state = Lex::Str;
+                    literal_at = Some((line, i + 1));
                     i += 1;
                     continue;
                 }
@@ -820,6 +876,15 @@ fn scan(source: &str) -> Result<Scan, String> {
     }
     for kind in unsafe_sites {
         *scan.unsafes.entry(kind).or_default() += 1;
+    }
+    for (opened_on, text) in literals {
+        if excluded
+            .iter()
+            .any(|&(start, end)| opened_on >= start && opened_on <= end)
+        {
+            continue;
+        }
+        scan.string_literals.push(text);
     }
     Ok(scan)
 }

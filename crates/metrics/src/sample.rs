@@ -31,15 +31,16 @@ use crate::catalog::{
     HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
     HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
     INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POOL_RETURNS_REFUSED,
-    RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS,
+    QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS,
     RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
-    RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS, RECORDING_STREAMS,
-    RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS,
-    ROUTE_DROPS, ROUTE_STAGE_DROPS, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES,
-    TCP_CHALLENGE_ACKS, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS,
-    TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN,
-    UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
+    RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
+    RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
+    RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, Series,
+    TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS,
+    TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS,
+    TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES,
+    UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 
 /// Dataplane pipelines the forwarder carries, one per direction. A build fact
@@ -62,13 +63,20 @@ pub const ROUTE_DROP_REASONS: [&str; 11] = [
     "no_neighbour",
 ];
 
-/// What the routing *stage* refuses around the router's decision: a descriptor
-/// or a pool operation rather than a header.
-pub const ROUTE_STAGE_DROP_REASONS: [&str; 6] = [
+/// What the routing *stage* refuses around the router's decision: a descriptor, a
+/// pool operation, or a frame no parser would read.
+///
+/// The four parse classes are `net_headers::ParseFailure::ALL`'s, name for name —
+/// which a test in `pd_runtime` holds this array to, as it does the router's own
+/// vocabulary.
+pub const ROUTE_STAGE_DROP_REASONS: [&str; 9] = [
     "egress_full",
     "malformed_descriptor",
     "snapshot_failed",
-    "unparsable",
+    "frame_too_short",
+    "ethernet_unparsable",
+    "ipv4_unparsable",
+    "ipv4_checksum_invalid",
     "misrouted",
     "writeback_failed",
 ];
@@ -109,7 +117,8 @@ pub struct TapSample {
 }
 
 /// Slots [`ForwarderSample`] occupies.
-pub const FORWARDER_SLOTS: usize = PIPELINES * (1 + ROUTE_DROP_REASONS.len() + 6) + 8;
+pub const FORWARDER_SLOTS: usize =
+    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForwarderSample {
@@ -227,7 +236,28 @@ impl ForwarderSample {
             &ROUTE_STAGE_DROPS,
             &[
                 Label::new("pipeline", "0"),
-                Label::new("reason", "unparsable"),
+                Label::new("reason", "frame_too_short"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "ethernet_unparsable"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "ipv4_unparsable"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "ipv4_checksum_invalid"),
             ],
         ),
         s(
@@ -348,7 +378,28 @@ impl ForwarderSample {
             &ROUTE_STAGE_DROPS,
             &[
                 Label::new("pipeline", "1"),
-                Label::new("reason", "unparsable"),
+                Label::new("reason", "frame_too_short"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "ethernet_unparsable"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "ipv4_unparsable"),
+            ],
+        ),
+        s(
+            &ROUTE_STAGE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "ipv4_checksum_invalid"),
             ],
         ),
         s(
@@ -402,7 +453,7 @@ impl ForwarderSample {
 }
 
 /// Slots [`DriverSample`] occupies.
-pub const DRIVER_SLOTS: usize = 25;
+pub const DRIVER_SLOTS: usize = 27;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DriverSample {
@@ -414,6 +465,7 @@ pub struct DriverSample {
     pub invariant_faults: [u64; 4],
     pub receive_device_faults: [u64; 3],
     pub transmit_device_faults: [u64; 3],
+    pub queue_posted: [u64; 2],
     pub receive_pool: PoolSample,
     pub log: LogSample,
 }
@@ -492,6 +544,8 @@ impl DriverSample {
                 Label::new("fault", "completion_length_over_reported"),
             ],
         ),
+        s(&QUEUE_POSTED, &[Label::new("queue", "receive")]),
+        s(&QUEUE_POSTED, &[Label::new("queue", "transmit")]),
         s(
             &POOL_RETURNS_REFUSED,
             &[
@@ -522,6 +576,7 @@ impl DriverSample {
         put_all(&mut values, &mut at, &self.invariant_faults);
         put_all(&mut values, &mut at, &self.receive_device_faults);
         put_all(&mut values, &mut at, &self.transmit_device_faults);
+        put_all(&mut values, &mut at, &self.queue_posted);
         put(&mut values, &mut at, self.receive_pool.not_lent);
         put(&mut values, &mut at, self.receive_pool.ledger_refused);
         put(&mut values, &mut at, self.log.dropped);
@@ -543,7 +598,7 @@ pub struct EndpointSample {
     pub unhandled: [u64; 9],
 }
 
-/// The transport's twenty-six causes, in `lfw_tcp::TcpCounters` declaration
+/// The transport's twenty-seven causes, in `lfw_tcp::TcpCounters` declaration
 /// order — which a test in `pd_runtime` holds this to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpSample {
@@ -570,6 +625,7 @@ pub struct TcpSample {
     pub refused_out_of_order: u64,
     pub urgent_ignored: u64,
     pub challenge_acks: u64,
+    pub challenges_suppressed: u64,
     pub resets_received: u64,
     pub resets_sent: u64,
     pub write_refused: u64,
@@ -589,7 +645,7 @@ pub struct HttpSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 79;
+pub const MANAGEMENT_SLOTS: usize = 80;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -723,6 +779,7 @@ impl ManagementSample {
         s(&TCP_REFUSED, &[Label::new("reason", "out_of_order")]),
         plain(&TCP_URGENT_IGNORED),
         plain(&TCP_CHALLENGE_ACKS),
+        plain(&TCP_CHALLENGES_SUPPRESSED),
         s(&TCP_RESETS, &[Label::new("direction", "received")]),
         s(&TCP_RESETS, &[Label::new("direction", "sent")]),
         plain(&TCP_WRITE_REFUSED),
@@ -800,6 +857,7 @@ impl ManagementSample {
         put(&mut values, &mut at, tcp.refused_out_of_order);
         put(&mut values, &mut at, tcp.urgent_ignored);
         put(&mut values, &mut at, tcp.challenge_acks);
+        put(&mut values, &mut at, tcp.challenges_suppressed);
         put(&mut values, &mut at, tcp.resets_received);
         put(&mut values, &mut at, tcp.resets_sent);
         put(&mut values, &mut at, tcp.write_refused);
@@ -919,7 +977,11 @@ impl ClockSample {
 pub struct SinkSample {
     pub records: u64,
     pub record_bytes: u64,
-    pub dropped: [u64; 3],
+    /// Oversized then refused, as the series name them. A deferral is not
+    /// among them: `staging_deferrals` is its own series because the record
+    /// is still the caller's and reaches the recording on a later pass.
+    pub dropped: [u64; 2],
+    pub staging_deferrals: u64,
     pub segments_closed: u64,
     pub wraps: u64,
     pub sectors_written: u64,
@@ -998,15 +1060,9 @@ impl RecorderSample {
         ),
         s(
             &RECORDING_RECORDS_DROPPED,
-            &[
-                Label::new("sink", "log"),
-                Label::new("reason", "staging_full"),
-            ],
-        ),
-        s(
-            &RECORDING_RECORDS_DROPPED,
             &[Label::new("sink", "log"), Label::new("reason", "refused")],
         ),
+        s(&RECORDING_STAGING_DEFERRALS, &[Label::new("sink", "log")]),
         s(&RECORDING_SEGMENTS_CLOSED, &[Label::new("sink", "log")]),
         s(&RECORDING_WRAPS, &[Label::new("sink", "log")]),
         s(&RECORDING_SECTORS_WRITTEN, &[Label::new("sink", "log")]),
@@ -1025,15 +1081,12 @@ impl RecorderSample {
             &RECORDING_RECORDS_DROPPED,
             &[
                 Label::new("sink", "capture"),
-                Label::new("reason", "staging_full"),
+                Label::new("reason", "refused"),
             ],
         ),
         s(
-            &RECORDING_RECORDS_DROPPED,
-            &[
-                Label::new("sink", "capture"),
-                Label::new("reason", "refused"),
-            ],
+            &RECORDING_STAGING_DEFERRALS,
+            &[Label::new("sink", "capture")],
         ),
         s(&RECORDING_SEGMENTS_CLOSED, &[Label::new("sink", "capture")]),
         s(&RECORDING_WRAPS, &[Label::new("sink", "capture")]),
@@ -1067,6 +1120,7 @@ impl RecorderSample {
             put(&mut values, &mut at, sink.records);
             put(&mut values, &mut at, sink.record_bytes);
             put_all(&mut values, &mut at, &sink.dropped);
+            put(&mut values, &mut at, sink.staging_deferrals);
             put(&mut values, &mut at, sink.segments_closed);
             put(&mut values, &mut at, sink.wraps);
             put(&mut values, &mut at, sink.sectors_written);
@@ -1110,13 +1164,15 @@ const _: () = {
     assert!(ClockSample::SERIES.len() == CLOCK_SLOTS);
     assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
 
-    // Every table fits the shard it is published into, so `StatsShard::publish`
-    // can truncate without any first-party caller ever reaching the truncation.
-    assert!(FORWARDER_SLOTS <= crate::STATS_SLOTS);
-    assert!(DRIVER_SLOTS <= crate::STATS_SLOTS);
+    // The management endpoint's table is the largest, which is the fact
+    // `crate::STATS_SLOTS` is derived from — so every table fits the shard it is
+    // published into and `StatsShard::publish` can truncate without any
+    // first-party caller ever reaching the truncation.
+    assert!(FORWARDER_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(DRIVER_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(CONSOLE_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(CONFIG_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(CLOCK_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(RECORDER_SLOTS <= MANAGEMENT_SLOTS);
     assert!(MANAGEMENT_SLOTS <= crate::STATS_SLOTS);
-    assert!(CONSOLE_SLOTS <= crate::STATS_SLOTS);
-    assert!(CONFIG_SLOTS <= crate::STATS_SLOTS);
-    assert!(CLOCK_SLOTS <= crate::STATS_SLOTS);
-    assert!(RECORDER_SLOTS <= crate::STATS_SLOTS);
 };

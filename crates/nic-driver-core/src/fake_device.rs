@@ -23,13 +23,15 @@ use std::vec::Vec;
 use virtio::pci::{NotifyError, QueueSetupError, ResetError, STATUS_FEATURES_OK};
 use virtio::queue::QueueLayout;
 
-use crate::bringup::{QueueDoorbell, VirtioDevice};
+use crate::bringup::{BusMaster, QueueDoorbell, VirtioDevice};
 
 /// One thing a driver did to the device, in the order it did it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     /// The device was reset.
     Reset,
+    /// The device was granted bus-master DMA.
+    DmaEnabled,
     /// The `device_status` byte was overwritten with this value.
     Status(u8),
     /// This feature bitmap was written as the driver's accepted set.
@@ -78,6 +80,26 @@ impl Log {
 /// a doorbell refusal can be aimed at one of them.
 const NOTIFY_BASE: u16 = 0x10;
 
+/// The DMA gate as a recorder: it appends to the same [`Log`] the device does,
+/// so *when* the driver opened it sits in one sequence with the reset it must
+/// follow. Nothing about it can refuse — a PCI command-register write cannot
+/// fail — so the only thing worth observing is the order.
+pub(crate) struct FakeBusMaster {
+    log: Log,
+}
+
+impl FakeBusMaster {
+    pub(crate) fn new(log: &Log) -> Self {
+        Self { log: log.clone() }
+    }
+}
+
+impl BusMaster for FakeBusMaster {
+    fn enable_dma(&self) {
+        self.log.record(Event::DmaEnabled);
+    }
+}
+
 /// A doorbell that records its ring instead of writing MMIO.
 pub(crate) struct FakeDoorbell {
     log: Log,
@@ -123,6 +145,13 @@ impl FakeDevice {
             refused_doorbell: None,
             status: Cell::new(0),
         }
+    }
+
+    /// The DMA gate over this device's own log, so a test can drive the
+    /// handshake and read the reset and the grant out of one sequence. Taken
+    /// before the device is moved into [`Offered`](crate::bringup::Offered).
+    pub(crate) fn bus(&self) -> FakeBusMaster {
+        FakeBusMaster::new(&self.log)
     }
 
     /// Offer this feature bitmap instead of exactly virtio 1.0.

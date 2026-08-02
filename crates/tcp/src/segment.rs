@@ -130,6 +130,11 @@ pub enum SegmentError {
     /// which no option but `END` and `NOP` can be, or wrong for a kind whose
     /// length is fixed.
     OptionLengthInvalid { kind: u8, len: u8 },
+    /// A second occurrence of an option this stack reads. RFC 793 and RFC 7323
+    /// give each of them one appearance in a header; taking the last of several
+    /// would let a peer decide which of two values a middlebox and this end
+    /// each negotiated under.
+    OptionRepeated { kind: u8 },
 }
 
 /// One received segment, every field this stack reads decoded.
@@ -513,17 +518,31 @@ fn read_options(mut area: &[u8]) -> Result<Options, SegmentError> {
                 remaining: area.len(),
             });
         };
+        // Each of the three is refused on its second appearance, so a repeat is
+        // a typed error with a counter behind it like every other refusal here,
+        // rather than the last occurrence quietly winning.
         match (*kind, option) {
             (OPTION_MSS, [_, _, high, low]) => {
+                if options.mss.is_some() {
+                    return Err(SegmentError::OptionRepeated { kind: *kind });
+                }
                 options.mss = Some(u16::from_be_bytes([*high, *low]));
             }
             (OPTION_WINDOW_SCALE, [_, _, shift]) => {
+                if options.window_scale.is_some() {
+                    return Err(SegmentError::OptionRepeated { kind: *kind });
+                }
                 // RFC 7323 section 2.3: a shift above the maximum is clamped, not
                 // refused — a peer offering one is asking for a window this end
                 // will simply not grow to.
                 options.window_scale = Some((*shift).min(MAX_WINDOW_SCALE));
             }
-            (OPTION_SACK_PERMITTED, [_, _]) => options.sack_permitted = true,
+            (OPTION_SACK_PERMITTED, [_, _]) => {
+                if options.sack_permitted {
+                    return Err(SegmentError::OptionRepeated { kind: *kind });
+                }
+                options.sack_permitted = true;
+            }
             (OPTION_MSS | OPTION_WINDOW_SCALE | OPTION_SACK_PERMITTED, _) => {
                 return Err(SegmentError::OptionLengthInvalid { kind: *kind, len });
             }

@@ -271,7 +271,257 @@ mod tests {
         text
     }
 
+    /// The model an accepted image describes, or `None` where the image says
+    /// something no model can.
+    ///
+    /// The inverse of [`image_from`], and total on an accepted image for the
+    /// reasons `ConfigImage::check` enforces: one interface per port makes
+    /// port-to-interface a function, so a neighbour's port names exactly the
+    /// interface whose id it was built from. Neighbour ids are minted here
+    /// rather than recovered, the image carrying none.
+    fn model_from(checked: &wire::CheckedConfig) -> Option<Model> {
+        let mut model = Model::EMPTY;
+        for entry in checked.interfaces() {
+            model
+                .push_interface(InterfaceEntry {
+                    id: Identifier::new(entry.id().as_bytes()).ok()?,
+                    port: entry.port(),
+                    enabled: entry.enabled(),
+                    mac: MacAddress(entry.mac()),
+                    address: Ipv4Address::from_octets(entry.address()),
+                    prefix_length: entry.prefix_length(),
+                })
+                .ok()?;
+        }
+        for (index, entry) in checked.neighbours().enumerate() {
+            let interface = checked
+                .interfaces()
+                .find(|candidate| candidate.port() == entry.port())?;
+            model
+                .push_neighbour(crate::NeighbourEntry {
+                    id: Identifier::new(format!("n{index}").as_bytes()).ok()?,
+                    interface: Identifier::new(interface.id().as_bytes()).ok()?,
+                    address: Ipv4Address::from_octets(entry.address()),
+                    mac: MacAddress(entry.mac()),
+                })
+                .ok()?;
+        }
+        if let Some(entry) = checked.management() {
+            model
+                .set_management(crate::model::ManagementEntry {
+                    enabled: true,
+                    mac: MacAddress(entry.mac()),
+                    address: Ipv4Address::from_octets(entry.address()),
+                    prefix_length: entry.prefix_length(),
+                })
+                .ok()?;
+        }
+        Some(model)
+    }
+
+    /// A consistent image: one interface per port with its own MAC, `/24` and
+    /// id, every neighbour a host address on the link its port names, and the
+    /// management port on a prefix none of them claims.
+    ///
+    /// Every rule admits it, which is the whole point: it is the base exactly
+    /// one rule is broken from below, so what an accepted image proves is that
+    /// *that* rule was the only thing wrong with it.
+    fn consistent_image(interfaces: usize, neighbours: usize, management: bool) -> ConfigImage {
+        // A neighbour with no interface on its port is not a neighbour of
+        // anything, so a configuration with no interfaces holds none.
+        let neighbours = if interfaces == 0 { 0 } else { neighbours };
+        let mut image = ConfigImage {
+            interface_count: interfaces as u32,
+            neighbour_count: neighbours as u32,
+            management: if management {
+                ManagementImage {
+                    enabled: 1,
+                    prefix_length: 24,
+                    mac: [0x52, 0x54, 0x00, 0x33, 0x00, 0x00],
+                    address: [192, 168, 42, 15],
+                    ..ManagementImage::ZERO
+                }
+            } else {
+                ManagementImage::ZERO
+            },
+            ..ConfigImage::ZERO
+        };
+        for (index, slot) in image.interfaces.iter_mut().enumerate().take(interfaces) {
+            let port = index as u8;
+            *slot = InterfaceImage {
+                port,
+                enabled: 1,
+                prefix_length: 24,
+                mac: [0x52, 0x54, 0x00, 0x11, 0x00, port],
+                address: [10, 0, port, 1],
+                id: IdentifierImage::from_text(&[b'i', b'0' + port]),
+                ..InterfaceImage::ZERO
+            };
+        }
+        for (index, slot) in image.neighbours.iter_mut().enumerate().take(neighbours) {
+            let port = (index % interfaces) as u8;
+            *slot = NeighbourImage {
+                port,
+                mac: [0x52, 0x54, 0x00, 0x22, 0x00, index as u8],
+                address: [10, 0, port, 2 + (index / interfaces) as u8],
+                ..NeighbourImage::ZERO
+            };
+        }
+        image
+    }
+
+    /// The ways a byzantine writer can break one rule about an image, applied
+    /// to a consistent one.
+    ///
+    /// One at a time, never two: an image broken twice is refused by whichever
+    /// rule runs first, which proves nothing about the second. Together they
+    /// are the reason the property below has teeth — the reverse claim is only
+    /// interesting on images that are *nearly* valid, and a strategy drawing
+    /// every field independently reaches almost none of those.
+    const MUTATIONS: [fn(&mut ConfigImage); 29] = [
+        |image| image.interfaces[1].mac = image.interfaces[0].mac,
+        |image| image.interfaces[1].id = image.interfaces[0].id,
+        |image| image.interfaces[0].mac = [0xff; 6],
+        |image| image.interfaces[0].mac = [0; 6],
+        |image| image.interfaces[0].enabled = 7,
+        |image| image.interfaces[0].id = IdentifierImage::ZERO,
+        |image| image.interfaces[0].prefix_length = 33,
+        // Moving an interface's port or its addressing moves the link every
+        // neighbour on it was placed against, so these drop the neighbours:
+        // otherwise a neighbour rule refuses the image first and the rule under
+        // test is never the one that decided.
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[1].port = image.interfaces[0].port;
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[0].port = 200;
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[1].address = [10, 0, 0, 9];
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[0].address = [224, 0, 0, 1];
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[0].address = [127, 0, 0, 1];
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[0].address = [10, 0, 0, 0];
+        },
+        |image| {
+            image.neighbour_count = 0;
+            image.interfaces[0].address = [10, 0, 0, 255];
+        },
+        // Not a fault at all: a disabled interface is held to every rule an
+        // enabled one is, so this must stay accepted on both sides.
+        |image| image.interfaces[0].enabled = 0,
+        |image| image.neighbours[0].address = [224, 0, 0, 1],
+        |image| image.neighbours[0].address = [10, 0, 0, 255],
+        |image| image.neighbours[0].address = [10, 0, 0, 1],
+        |image| image.neighbours[0].address = [10, 9, 9, 9],
+        |image| {
+            image.neighbours[1].port = image.neighbours[0].port;
+            image.neighbours[1].address = image.neighbours[0].address;
+        },
+        |image| image.neighbours[0].port = 3,
+        |image| image.neighbours[0].mac = [0x01, 0, 0, 0, 0, 1],
+        |image| image.management.address = [10, 0, 0, 9],
+        |image| image.management.mac = image.interfaces[0].mac,
+        |image| image.management.address = [224, 0, 0, 1],
+        |image| image.management.address = [192, 168, 42, 0],
+        |image| image.management.prefix_length = 33,
+        |image| {
+            image.management.prefix_length = 8;
+            image.management.address = [10, 200, 0, 1];
+        },
+        // A neighbour that is loopback rather than unicast, on a link whose
+        // prefix is short enough to cover it: the containment rule admits it,
+        // so this is the one shape in which the unicast rule is the only thing
+        // standing between the table and a next hop no frame may be sent to.
+        |image| {
+            image.interface_count = 1;
+            image.neighbour_count = 1;
+            image.interfaces[0].prefix_length = 1;
+            image.neighbours[0].address = [127, 0, 0, 1];
+        },
+    ];
+
+    /// A nearly-consistent image, holding at most as many interfaces as this
+    /// build has ports.
+    ///
+    /// At most, because one interface per port is a rule: a build with two
+    /// ports admits two interfaces however many slots the image holds, so a
+    /// wider image would be refused for the port bound and prove nothing about
+    /// any other rule.
+    fn any_image() -> impl Strategy<Value = ConfigImage> {
+        (
+            // Weighted to the full shape, because a mutation that lands on a
+            // slot the counts do not cover changes nothing and tests nothing:
+            // the smaller arms are what keep the empty and one-interface
+            // configurations reachable.
+            prop_oneof![6 => Just(usize::from(PORT_COUNT)), 1 => 0usize..=usize::from(PORT_COUNT)],
+            prop_oneof![6 => Just(4usize), 1 => 0usize..=4],
+            prop_oneof![6 => Just(true), 1 => Just(false)],
+            0usize..=MUTATIONS.len(),
+        )
+            .prop_map(|(interfaces, neighbours, management, mutation)| {
+                let mut image = consistent_image(interfaces, neighbours, management);
+                // The index past the last is "break nothing", so the unbroken
+                // image is drawn as often as any single fault.
+                if let Some(apply) = MUTATIONS.get(mutation) {
+                    apply(&mut image);
+                }
+                image
+            })
+    }
+
     proptest! {
+        /// The direction that guards the trust boundary: an image the consuming
+        /// domain accepts is one this crate's own rules would have accepted.
+        ///
+        /// The forward claim below says the validator cannot hand its consumer
+        /// an image the consumer refuses. This one says the consumer cannot be
+        /// *made* to run a configuration the validator would have refused —
+        /// which is the claim that matters, because the domain writing the
+        /// region is the domain that parses an attacker's document, and a rule
+        /// only this crate enforced would be a rule a compromised writer does
+        /// not enforce.
+        ///
+        /// Two rules are outside the claim and are the reason `model_from`
+        /// mints what it cannot recover: an image carries no neighbour id, so
+        /// two neighbours under one id are indistinguishable in it; and a
+        /// disabled management entry decodes to no entry at all rather than to
+        /// a disabled one, so the rules this crate holds a disabled entry to
+        /// have no value on the far side to be about.
+        #[test]
+        fn every_image_the_consumer_accepts_is_one_validation_would_have_accepted(
+            image in any_image(),
+        ) {
+            let Ok(checked) = image.check(PORT_COUNT) else {
+                return Ok(());
+            };
+            let model = model_from(&checked)
+                .expect("an accepted image describes a model");
+            prop_assert_eq!(
+                validate(&model),
+                Ok(()),
+                "the consuming domain accepted an image the rules refuse: {:?}",
+                validate(&model)
+            );
+            // And the round trip closes: the image that model builds is the one
+            // the consumer was handed, entry for entry.
+            let rebuilt = image_from(&model, Generation::from_bits(image.generation))
+                .expect("a validated model builds");
+            prop_assert_eq!(rebuilt.interface_count, image.interface_count);
+            prop_assert_eq!(rebuilt.neighbour_count, image.neighbour_count);
+        }
+
         /// Every configuration this crate accepts produces an image the
         /// byzantine-peer checker accepts. A validator that could hand its own
         /// consumer an image the consumer refuses would fail closed for a
@@ -328,6 +578,12 @@ mod tests {
         /// A model filled to the image's capacity still fits it: the model and
         /// the image are sized by the same two constants, so a document the
         /// reader accepted can never overrun the region it is handed over in.
+        ///
+        /// Capacity alone. Whether the consuming domain *accepts* such an image
+        /// is a narrower claim — one interface per port bounds a two-port build
+        /// to two interfaces however many slots the image holds — and it is
+        /// `every_validated_model_produces_an_image_its_own_reader_accepts` and
+        /// its reverse that make it, over models validation admits.
         #[test]
         fn a_model_at_capacity_fills_the_image(interfaces in 0usize..=MAX_INTERFACES) {
             let mut model = Model::EMPTY;
@@ -364,7 +620,6 @@ mod tests {
                 usize::try_from(image.neighbour_count),
                 Ok(model.neighbour_count())
             );
-            prop_assert!(image.check(PORT_COUNT).is_ok());
         }
     }
 }

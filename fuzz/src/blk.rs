@@ -31,6 +31,9 @@
 //! * **Any status byte**, including the 253 the specification does not define.
 //! * **Any capacity**, taken once at attach, including zero and `u64::MAX` —
 //!   the number every sector range a caller names is judged against.
+//! * **Any (sector, length) pair as a staging span**, so a data segment whose
+//!   *end* would leave the DMA-visible window is an ordinary input rather than a
+//!   shape the harness declines to build.
 //!
 //! The *caller* is not an adversary — it is the protection domain — but its
 //! requests are generated just as freely, because the range it names is checked
@@ -59,12 +62,19 @@
 //! * **Fault counters only rise**, so a device flooding the queue with rubbish
 //!   remains visible to an operator differencing two scrapes rather than
 //!   wrapping to a small number.
+//! * **No span outside the staging window can be named at all.** With no IOMMU
+//!   in front of the device, the far end of a data segment is an address it may
+//!   write, so `IoSpan` exists only where the whole run lies inside the region —
+//!   checked against a model that recomputes the bound in a width that cannot
+//!   wrap.
 
 use arbitrary::Unstructured;
-use lfw_blk::io::{IoRegion, IoSector};
+use lfw_blk::io::{IoRegion, IoSector, IoSpan};
 use lfw_blk::request::SLOTS;
 use lfw_blk::request::{Completed, Operation, Outcome, RequestFaults, Requests, SubmitError};
-use lfw_blk::{BlkVirtqueue, DMA_REGION_SIZE, QUEUE_SIZE, SECTOR_SIZE, io::IO_SECTORS};
+use lfw_blk::{
+    BLK_IO_REGION_SIZE, BlkVirtqueue, DMA_REGION_SIZE, QUEUE_SIZE, SECTOR_SIZE, io::IO_SECTORS,
+};
 
 use crate::region::{BlkIoRegion, DmaRegion};
 
@@ -163,6 +173,16 @@ fn any_u64(unstructured: &mut Unstructured<'_>) -> u64 {
 /// asserting it agrees with itself.
 const fn has_data(operation: Operation) -> bool {
     matches!(operation, Operation::Read | Operation::Write)
+}
+
+/// Whether `len` bytes from staging sector `index` lie inside the window,
+/// computed independently and in a width that cannot wrap.
+fn span_is_inside(index: usize, len: u32) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let start = index as u128 * SECTOR_SIZE as u128;
+    start + u128::from(len) <= BLK_IO_REGION_SIZE as u128
 }
 
 /// Whether the range `sector..sector + len/SECTOR_SIZE` is one the driver may
@@ -265,15 +285,52 @@ pub fn blk_requests_harness(data: &[u8]) {
                 };
                 let sector = any_u64(&mut unstructured);
                 let len = any_u32(&mut unstructured);
-                // Half the time the data address is a real staging sector and
-                // half the time it is whatever the fuzzer says, so both the
-                // accepted and the refused shapes are reachable.
-                let data_paddr = if any_u8(&mut unstructured) % 2 == 0 {
-                    let sector = IoSector::new(any_u32(&mut unstructured) as usize % IO_SECTORS)
-                        .expect("reduced into range");
-                    io.sector_paddr(sector)
-                } else {
-                    any_u64(&mut unstructured)
+                // A third of the time the address is a bounded span of the
+                // staging window — the only shape the protection domain ever
+                // publishes — a third a bare sector, and a third whatever the
+                // fuzzer says, so the accepted and the refused shapes are both
+                // reachable. A span the window cannot hold is refused here,
+                // which is the layer that knows the region: `submit` weighs the
+                // sector range against the medium's capacity and the address
+                // against its alignment, and knows nothing of the window.
+                let data_paddr = match any_u8(&mut unstructured) % 3 {
+                    0 => {
+                        let index = any_u32(&mut unstructured) as usize % IO_SECTORS;
+                        let sector = IoSector::new(index).expect("reduced into range");
+                        match IoSpan::new(sector, len) {
+                            Some(span) => {
+                                assert!(
+                                    span_is_inside(index, len),
+                                    "a span of {len} bytes at sector {index} was built \
+                                     although it leaves the window"
+                                );
+                                assert_eq!(span.bytes(), len);
+                                assert_eq!(span.sector(), sector);
+                                io.span_paddr(span)
+                            }
+                            None => {
+                                assert!(
+                                    !span_is_inside(index, len),
+                                    "a span of {len} bytes at sector {index} was refused \
+                                     although it fits the window"
+                                );
+                                // The span the domain would have published does
+                                // not exist, so the request goes out under the
+                                // bare sector address instead: the submit is
+                                // still driven, and what it makes of a length
+                                // the window could not have held is the
+                                // request layer's own business.
+                                io.sector_paddr(sector)
+                            }
+                        }
+                    }
+                    1 => {
+                        let sector =
+                            IoSector::new(any_u32(&mut unstructured) as usize % IO_SECTORS)
+                                .expect("reduced into range");
+                        io.sector_paddr(sector)
+                    }
+                    _ => any_u64(&mut unstructured),
                 };
                 let before = requests.in_flight();
                 match requests.submit(operation, sector, data_paddr, len) {
@@ -362,6 +419,37 @@ pub fn blk_requests_harness(data: &[u8]) {
                         requests.in_flight(),
                         before,
                         "a poll that answered nothing freed a slot"
+                    );
+                }
+            }
+            // Name a staging span from whatever the fuzzer chose, at a byte
+            // offset as often as at a sector, and hold both constructors to the
+            // model.
+            4 if any_u8(&mut unstructured) % 2 == 0 => {
+                let index = any_u32(&mut unstructured) as usize;
+                let len = any_u32(&mut unstructured);
+                match IoSector::new(index) {
+                    Some(sector) => assert_eq!(
+                        IoSpan::new(sector, len).is_some(),
+                        span_is_inside(index, len),
+                        "sector {index}, len {len}"
+                    ),
+                    None => assert!(index >= IO_SECTORS),
+                }
+                let at = any_u32(&mut unstructured) as usize;
+                let by_offset = IoSpan::at_offset(at, len);
+                assert_eq!(
+                    by_offset.is_some(),
+                    at.is_multiple_of(SECTOR_SIZE)
+                        && at / SECTOR_SIZE < IO_SECTORS
+                        && span_is_inside(at / SECTOR_SIZE, len),
+                    "offset {at}, len {len}"
+                );
+                if let Some(span) = by_offset {
+                    assert_eq!(
+                        io.span_paddr(span),
+                        io.sector_paddr(span.sector()),
+                        "a span addresses its own first sector"
                     );
                 }
             }

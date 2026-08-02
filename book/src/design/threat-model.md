@@ -22,8 +22,9 @@ TLS material on the proxy path); and the **packet buffers** in flight.
 - **A byzantine neighbour PD.** Every PD treats the queues and messages from adjacent PDs as
   untrusted: malformed descriptors, stale or forged ownership, and backpressure are rejected
   safely, never allowed to corrupt state or crash a well-behaved PD.
-- **A management-plane attacker** reaching the API, and a **connection-flood / state-exhaustion
-  attacker** targeting the proxy (see [Isolation model](#isolation-model)).
+- **A management-plane attacker** reaching the API.
+- **A connection-flood / state-exhaustion attacker** targeting the proxy (see
+  [Isolation model](#isolation-model)).
 
 **Trust boundaries.** The **seL4 kernel and its boot/loader chain are the trusted computing base**;
 runtime capability isolation is enforced by the kernel and is relied upon. The **`rust-sel4` /

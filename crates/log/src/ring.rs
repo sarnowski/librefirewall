@@ -15,10 +15,14 @@
 //! # Two counters, because they accuse different parties
 //!
 //! [`RingSink::dropped`] is a flood or a console that is not draining;
-//! [`RingSink::refused`] is this domain's own defect, an event it minted that
-//! the ABI cannot carry. One number would leave an operator unable to tell "we
-//! log faster than the console reads" from "this build emits records nothing
-//! can read": a counter accuses one party, never several.
+//! [`RingSink::refused`] is this domain's own defect. One number would leave an
+//! operator unable to tell "we log faster than the console reads" from "this
+//! build emits records nothing can read": a counter accuses one party, never
+//! several.
+//!
+//! It covers two of them under one number — an event the ABI cannot carry, and a
+//! sink already borrowed further up the same stack — because both accuse *this
+//! build*. The series that carries it therefore names both.
 
 use core::cell::{Cell, RefCell};
 
@@ -62,7 +66,7 @@ impl<'ring, C: Clock> RingSink<'ring, C> {
     }
 
     /// Records that never reached the ring at all: an event this build cannot
-    /// encode, or a sink already in use further up the same stack. Saturating,
+    /// encode, or a sink already borrowed further up the same stack. Saturating,
     /// because a wrap would read a sustained defect back as a small number.
     #[must_use]
     pub fn refused(&self) -> u32 {

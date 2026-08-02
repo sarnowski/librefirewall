@@ -135,6 +135,11 @@
 //!   doorbell rung before `DRIVER_OK`. The typestate exists to get this right
 //!   and the ordering is not observable through a passive window, so it is
 //!   asserted where a device can misbehave at every step.
+//! * **DMA is granted once, and only after the reset.** With no IOMMU, bus
+//!   mastering is the whole of the authority the other steps merely sequence: a
+//!   device granted it while still holding the queue addresses it was left with
+//!   may write them. So the grant sits immediately behind the reset, happens
+//!   exactly once, and never happens at all for a device that refused its reset.
 //! * **`STATUS_FAILED` is what a refusal leaves behind.** Every rejection from
 //!   `Offered` onward claims `signalled_to_device()`, and the device's own
 //!   record must show that write — the claim checked against what was actually
@@ -187,8 +192,8 @@ use std::rc::Rc;
 
 use arbitrary::Unstructured;
 use nic_driver_core::bringup::{
-    ACCEPTED_FEATURES, BAR_WINDOW_SIZE, BringUpError, DriverVirtqueue, Offered, QueueDoorbell,
-    RX_QUEUE, TX_QUEUE, VirtioDevice, identify,
+    ACCEPTED_FEATURES, BAR_WINDOW_SIZE, BringUpError, BusMaster, DriverVirtqueue, Offered,
+    QueueDoorbell, RX_QUEUE, TX_QUEUE, VirtioDevice, identify,
 };
 use virtio::net::features;
 use virtio::pci::{
@@ -473,7 +478,11 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
     // device's own offsets: `identify` bounded them, which was asserted above.
     let offered = unsafe { placed.map(window_base) };
 
-    let Ok(acknowledged) = offered.acknowledge() else {
+    // The real `PciConfig` is the bus-master gate on this path, so the
+    // command-register write the grant performs is the one a driver PD makes.
+    // Its *value* is not asserted here: every byte of this ECAM page comes from
+    // the input, so the register's initial state is the adversary's too.
+    let Ok(acknowledged) = offered.acknowledge(&config) else {
         return observed;
     };
     let Ok(negotiated) = acknowledged.negotiate_features() else {
@@ -522,6 +531,8 @@ fn take_run<'data>(unstructured: &mut Unstructured<'data>, requested: u32) -> &'
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceEvent {
     Reset,
+    /// The driver granted the device bus-master DMA.
+    DmaEnabled,
     Status(u8),
     DriverFeatures(u64),
     /// The virtqueue the driver programmed, by the index it named.
@@ -557,6 +568,23 @@ struct DeviceRecord {
     doorbell_answers: Vec<Result<u16, NotifyError>>,
     /// Whether the device refused its reset.
     reset_refused: bool,
+}
+
+/// The bus-master gate, recording into the same [`DeviceRecord`] the device
+/// does.
+///
+/// A PCI command-register write cannot fail and answers nothing, so there is
+/// nothing for the input to choose here: the only thing worth observing is
+/// *when* the driver opened the gate, and it lands in one sequence with the
+/// reset it must follow.
+struct ScriptedBus {
+    record: Rc<RefCell<DeviceRecord>>,
+}
+
+impl BusMaster for ScriptedBus {
+    fn enable_dma(&self) {
+        self.record.borrow_mut().events.push(DeviceEvent::DmaEnabled);
+    }
 }
 
 /// A virtio device that answers each access from its own run of the fuzzer's
@@ -743,7 +771,10 @@ fn drive_handshake(script: &[u8]) -> SeamObserved {
         record: Rc::clone(&record),
     };
 
-    let outcome = match run_handshake(Offered::new(device)) {
+    let bus = ScriptedBus {
+        record: Rc::clone(&record),
+    };
+    let outcome = match run_handshake(Offered::new(device), &bus) {
         Ok(()) => SeamOutcome::Live,
         Err(error) => SeamOutcome::Refused(error),
     };
@@ -761,8 +792,11 @@ fn drive_handshake(script: &[u8]) -> SeamObserved {
 }
 
 /// `Offered` through to `DRIVER_OK`, ringing both doorbells once live.
-fn run_handshake<D: VirtioDevice>(offered: Offered<D>) -> Result<(), BringUpError> {
-    let negotiated = offered.acknowledge()?.negotiate_features()?;
+fn run_handshake<D: VirtioDevice>(
+    offered: Offered<D>,
+    bus: &impl BusMaster,
+) -> Result<(), BringUpError> {
+    let negotiated = offered.acknowledge(bus)?.negotiate_features()?;
     assert_eq!(
         negotiated.features() & !ACCEPTED_FEATURES,
         0,
@@ -791,6 +825,32 @@ fn assert_ordering(record: &DeviceRecord) {
     let driver_ok = position(DeviceEvent::Status(
         STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
     ));
+    // DMA is the authority everything else here is only a protocol step beside:
+    // with no IOMMU, a device that may master the bus may write anywhere. So it
+    // is granted exactly once, immediately after the reset that cleared whatever
+    // queue addresses the device was holding — and a device that refused its
+    // reset is never granted it at all.
+    match position(DeviceEvent::DmaEnabled) {
+        Some(at) => {
+            assert_eq!(at, 1, "DMA was not granted right after the reset: {events:?}");
+            assert!(
+                !record.reset_refused,
+                "a device that refused its reset was granted DMA: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == DeviceEvent::DmaEnabled)
+                    .count(),
+                1,
+                "DMA was granted more than once: {events:?}"
+            );
+        }
+        None => assert!(
+            record.reset_refused,
+            "the handshake ran without ever granting DMA: {events:?}"
+        ),
+    }
     if let Some(at) = position(DeviceEvent::Status(STATUS_ACKNOWLEDGE)) {
         assert!(
             position(DeviceEvent::Status(STATUS_ACKNOWLEDGE | STATUS_DRIVER))
@@ -817,7 +877,7 @@ fn assert_ordering(record: &DeviceRecord) {
                 driver_ok.is_some_and(|at| index > at),
                 "a doorbell was rung before DRIVER_OK: {events:?}"
             ),
-            DeviceEvent::Reset | DeviceEvent::Status(_) => {}
+            DeviceEvent::Reset | DeviceEvent::DmaEnabled | DeviceEvent::Status(_) => {}
         }
     }
 }

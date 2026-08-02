@@ -171,6 +171,19 @@ impl Model {
     pub(crate) fn management_slot(&self) -> [Option<ManagementEntry>; 1] {
         [self.management]
     }
+
+    /// Whether two configurations *are* the same one, whichever order each was
+    /// written in — which is what "unchanged" means, and is exact.
+    ///
+    /// `PartialEq` is deliberately not this: it compares the arrays as written,
+    /// answering the different question of whether two documents *said* the
+    /// same thing.
+    #[must_use]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        self.interfaces_by_id() == other.interfaces_by_id()
+            && self.neighbours_by_id() == other.neighbours_by_id()
+            && self.management == other.management
+    }
 }
 
 /// `entries` in key order with the empty slots behind them: a selection sort

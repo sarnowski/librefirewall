@@ -20,7 +20,8 @@
 //!
 //! Both published cursors and the drop count take a full, unreduced `u32` —
 //! rewound, advanced past the ring, `u32::MAX`, anything. Any slot may be
-//! overwritten whole with 192 unreduced bytes, **or one atomic at a time**,
+//! overwritten whole with [`crate::log_record::RECORD_BYTES`] unreduced bytes, **or
+//! one atomic at a time**,
 //! which is the peer's real granularity and the only way a torn record is
 //! expressible (see [`crate::log_ring_abi`]). The record a writing domain
 //! publishes through `LogWriter::write` is equally unreduced — the whole
@@ -156,9 +157,8 @@ struct Model {
     /// The writer's private position and its own drop count.
     writer_tail: u32,
     writer_dropped: u32,
-    /// The reader's private position and its own tally of refused records.
+    /// The reader's private position.
     reader_head: u32,
-    reader_undecodable: u32,
 }
 
 impl Model {
@@ -172,7 +172,6 @@ impl Model {
             writer_tail: 0,
             writer_dropped: 0,
             reader_head: 0,
-            reader_undecodable: 0,
         }
     }
 
@@ -291,9 +290,6 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
                         &mut handed_out,
                         &mut observed,
                     );
-                    if held.check().is_err() {
-                        model.reader_undecodable = model.reader_undecodable.saturating_add(1);
-                    }
                 }
             }
             2 => {
@@ -346,9 +342,6 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
                         &mut handed_out,
                         &mut observed,
                     );
-                    if record.check().is_err() {
-                        model.reader_undecodable = model.reader_undecodable.saturating_add(1);
-                    }
                 }
             }
             3 => {
@@ -431,11 +424,6 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
             writer.dropped(),
             model.writer_dropped,
             "the writer's own drop count diverged from its refusals"
-        );
-        assert_eq!(
-            reader.undecodable(),
-            model.reader_undecodable,
-            "the reader's own tally diverged from the records the check refused"
         );
         assert_eq!(
             reader.dropped_by_writer(),
@@ -556,9 +544,6 @@ fn drain_while_the_cursor_moves(
                     );
                     model.reader_head = position.wrapping_add(1) & MASK;
                     model.published_head = model.reader_head;
-                    if held.check().is_err() {
-                        model.reader_undecodable = model.reader_undecodable.saturating_add(1);
-                    }
                     taken.push((position as usize, held));
                 }
             }

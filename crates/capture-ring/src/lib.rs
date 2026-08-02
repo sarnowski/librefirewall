@@ -108,9 +108,9 @@ mod superblock;
 mod tests;
 
 pub use superblock::{
-    CheckedState, MAX_READERS, ReaderCursor, RingState, RingStateError, SUPERBLOCK_BYTES,
+    CheckedState, Copies, MAX_READERS, ReaderCursor, RingState, RingStateError, SUPERBLOCK_BYTES,
     SUPERBLOCK_COPIES, SUPERBLOCK_COPY_BYTES, SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION,
-    decode_superblock, encode_superblock,
+    SuperblockWrite, decode_superblock, encode_superblock,
 };
 
 /// The unit a block device addresses and the granularity at which it promises
@@ -754,20 +754,26 @@ impl Ring {
         })
     }
 
-    /// The next superblock: this ring's geometry and cursor plus the reader
-    /// positions the caller collected, under a generation one past the last.
+    /// The next superblock: this ring's geometry, the write position `at`, and the
+    /// readers the caller collected, under a generation one past the last. `at` is
+    /// the caller's rather than the append cursor, which runs ahead by everything
+    /// appended and not yet handed over: a superblock states where the recording
+    /// *ends on the medium*. A caller holding no such buffer passes
+    /// [`Ring::cursor`].
     ///
-    /// The bump is what selects the copy [`encode_superblock`] rewrites, so a
-    /// checkpoint that is never written leaves a generation unused rather than
-    /// rewriting the copy the medium is currently relying on.
+    /// The generation bump selects the copy [`encode_superblock`] rewrites under
+    /// [`Copies::Parity`], so one never written leaves a generation unused rather
+    /// than rewriting the copy in use.
     ///
     /// # Errors
-    /// [`RingStateError`] for a reader set this ring cannot describe — too
-    /// many, a repeated identifier, or a position outside the extent. The ring
-    /// is left untouched, generation included.
-    pub fn checkpoint(&mut self, readers: &[ReaderCursor]) -> Result<RingState, RingStateError> {
+    /// [`RingStateError`] for a position or reader set this ring cannot describe.
+    pub fn checkpoint(
+        &mut self,
+        at: Cursor,
+        readers: &[ReaderCursor],
+    ) -> Result<RingState, RingStateError> {
         let generation = self.write_generation.saturating_add(1);
-        let state = RingState::new(self.geometry, generation, self.cursor, readers)?;
+        let state = RingState::new(self.geometry, generation, at, readers)?;
         self.write_generation = generation;
         Ok(state)
     }

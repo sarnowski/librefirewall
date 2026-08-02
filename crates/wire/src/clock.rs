@@ -6,9 +6,9 @@
 //! writes this region measured its numbers against a device (`pds/clock`), so
 //! what arrives here is a hostile or malfunctioning device's answer one
 //! indirection away — and the writing domain itself is a peer whose behaviour a
-//! reader may not assume. Nothing here judges the values: whether a frequency is
-//! plausible is `lfw_clock`'s question, and this crate cannot ask it without
-//! depending on the crate that reads the region.
+//! reader may not assume. Nothing here judges the values: whether a frequency or
+//! an epoch is plausible is `lfw_clock`'s question, and this crate cannot ask it
+//! without depending on the crate that reads the region.
 //!
 //! # Why a seqlock rather than the handover's generation word
 //!
@@ -49,8 +49,9 @@ use crate::MAPPING_ALIGN;
 /// Four rather than one, because a single retry would fail whenever a read
 /// happened to land inside a publish — and rather than many, because a writer
 /// that is still mid-publish after four attempts is not one more attempts will
-/// help. A publish is three stores, so a reader losing four races to it has met
-/// something other than ordinary interleaving.
+/// help. A publish is five stores — the counter odd, the three words, the counter
+/// even — so a reader losing four races to it has met something other than
+/// ordinary interleaving.
 pub const LOAD_ATTEMPTS: usize = 4;
 
 /// A calibration as three raw words: what the writer measured, before anybody
@@ -102,7 +103,11 @@ impl ClockCalibration {
         }
     }
 
-    /// Publish one triple, leaving the counter even and two higher than it was.
+    /// Publish one triple, leaving the counter even and higher than it was.
+    ///
+    /// Two higher from an even counter and one from an odd one, which is the point
+    /// of the `| 1` below: the protocol needs the counter to end even and differ
+    /// from what a reader could have taken, not to advance by a fixed step.
     ///
     /// The counter goes odd first, the words move under it, and it goes even
     /// last — so a reader that catches any part of this sees an odd counter or a
@@ -161,6 +166,11 @@ impl ClockCalibration {
             // region nobody has published into. Both leave the loop to try again
             // and its bound to end it, so "no calibration" is one answer with one
             // meaning rather than two the caller must tell apart.
+            //
+            // A known bound: the counter is a `u32` that wraps, so a writer
+            // publishing 2^31 times lands it on zero and this reader calls a
+            // published triple unpublished. Fail-safe, and no denial a byzantine
+            // writer lacks already by simply not publishing.
             if self.generation.load(Ordering::Relaxed) == before && before != 0 {
                 return Some(image);
             }

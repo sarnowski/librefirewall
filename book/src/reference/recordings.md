@@ -4,18 +4,17 @@
 tools already open. This is the evidence half of the debug dump, and the one surface that carries the
 traffic itself.
 
-**Endpoints:** `GET /logs.pcapng` and `GET /capture.pcapng` on the management interface. Each returns
-one of the two recording sinks (see the [recording design](../design/recording.md)) — the same
-encoder, the same ring machinery, the same download path, differing today only in extent and snap
-length.
+**Endpoints:** `GET /logs.pcapng` and `GET /capture.pcapng` on the management port. Each returns one
+of the two recording sinks (see the [recording design](../design/recording.md)) — the same encoder,
+the same ring machinery, the same download path, differing in two things only: the extent each
+occupies on the medium, and the snap length.
 
 > **These bodies carry packet payloads.** They are the single named exception to the no-payload rule
 > stated under the conventions in [Observability surfaces](observability.md), and nothing else on
 > any surface carries a byte of traffic.
-> **Today they are unauthenticated**: the port has neither TLS nor client authentication, so anyone
-> who can reach it can download every packet the appliance recorded. The design requires the
-> exception to be gated by an authorization decision; that gate does not exist yet. Treat reachability
-> of the management port as equivalent to handing over the recordings.
+> **They are unauthenticated**: the port has neither TLS nor client authentication, so anyone who
+> can reach it can download every packet the appliance recorded. Treat reachability of the
+> management port as equivalent to handing over the recordings.
 
 ## What a response is
 
@@ -36,10 +35,16 @@ snapshot even though the recording keeps growing underneath it. A recording whos
 stated is never begun rather than begun and truncated, and one longer than 2 GiB is refused outright
 rather than served wrong.
 
-**A body is assembled a window at a time and never held whole.** The recorder answers 32 KiB per
-round trip out of its staging window, the endpoint copies each into a 16 KiB sliding transport window
-sized above the retransmit span, and no domain holds a second copy of a megabyte. Nothing between the
-medium and the wire parses the recording.
+**A body is assembled a window at a time and never held whole.** The recorder answers up to 32 KiB
+per round trip out of its staging window, the endpoint copies each into a 16 KiB sliding transport
+window twice the span it may be asked to retransmit out of, and no domain holds a second copy of a
+megabyte. Nothing between the medium and the wire parses the recording.
+
+**A window is a bound, not a demand.** The endpoint names both where the next bytes begin and the
+most it will take, and a supplier handing over fewer than that **advances** the response in place:
+the next window is asked for at the byte after what arrived, and the span behind it is never given
+up. A reader of a segmented ring runs short at every extent boundary, so a short window is the
+ordinary case rather than a failure, and it is neither an early end to the body nor a shorter one.
 
 ## When it goes wrong
 
@@ -48,16 +53,18 @@ There is no error body, and **where the failure falls decides what a client sees
 - **Before the head is written** — nothing is on the wire yet, so the request is answered
   `503 Service Unavailable` with no body. A recorder that has nothing to serve, and a recording whose
   length exceeds the 2 GiB a windowed response can address, both land here.
-- **After the head** — `Content-Length` has already been committed, so the connection simply closes
-  short of it. **A client sees a truncated body, never a wrong one**, and a truncated body is
-  detectable by anything that counts what it received; `curl` reports it.
+- **After the head** — `Content-Length` has already been committed, so the connection is **reset**
+  short of it, rather than finished. A `FIN` under an exact `Content-Length` presents a truncated
+  message to an intermediary as a complete one, and a reset cannot be read that way. **A client sees
+  a truncated body, never a wrong one**, and a truncated body is detectable by anything that counts
+  what it received; `curl` reports it.
 
 The ways a download ends early, wherever it falls:
 
 | condition | what it means | counted as |
 |---|---|---|
 | `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-download | `librefirewall_recording_download_overruns_total{sink}` and `librefirewall_recording_streams_total{outcome="abandoned"}` |
-| `DeviceError` | the block device refused the read | `librefirewall_recording_streams_total{outcome="abandoned"}` |
+| `DeviceError` | the block device refused the read, or completed it having moved fewer bytes than were asked for — a short read is an error here and never bytes to serve | `librefirewall_recording_streams_total{outcome="abandoned"}` |
 | `NotReady` / `OutOfRange` / `NoSuchSink` | the recorder has nothing to serve for that request | `librefirewall_recording_streams_total{outcome="abandoned"}` |
 | the transport and the recorder disagree about the range in flight | ours, and expected never to happen | `librefirewall_recording_streams_total{outcome="abandoned"}` |
 
@@ -93,42 +100,42 @@ below that it does not know.
 
   | option | what it holds |
   |---|---|
-  | `epb_flags` | direction. Only *inbound* is emitted today — see below |
-  | `epb_dropcount` | tap-ring observations lost before this record. **Always `0` today** — the field is emitted and nothing feeds it, so a recording does *not* yet state its own gaps in-band (the [recording design](../design/recording.md) requires that it does). Reconcile against `/metrics` instead |
+  | `epb_flags` | direction; every record reads *inbound* — see below |
+  | `epb_dropcount` | tap-ring observations lost before this record, and any `u64`. The recorder differences the forwarder's own tap-drop count on every pass and holds the rise as a debt until there is a record to carry it, so the number belongs to the gap before this block and not to the packet in it. It accounts for the tap ring **and nothing else**: what a sink could not encode, or could not write, is on `/metrics` and not in the file |
   | `epb_packetid` | the appliance-wide packet identity |
   | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped |
   | custom option, PEN-tagged | 16 bytes: layout version, verdict, drop reason, interface id, direction, and the **configuration generation** the decision was made under |
 
-- **A Custom Block of padding** closes a sealed segment, so every write to the device is a whole
-  sector. It is skipped by any reader that does not know the PEN, and by `tcpdump`.
-- **The PEN is `0xFFFFFFFF`, a placeholder.** GROPYUS holds no registered Private Enterprise Number.
-  The value is IANA-reserved so it can never collide with a real assignment, but it is not ours, and
-  a reader must not treat a PEN-tagged option in these files as a stable identifier until a
-  registered number replaces it.
-- **No Interface Statistics Block is emitted yet**, and no Decryption Secrets Block. Between that and
-  the unfed `epb_dropcount`, **a recording reports none of its own loss in-band**: a file that a burst
-  outran looks exactly like one that lost nothing. Until both land, the loss families under
-  [the two recordings, and the downloads served out of
-  them](metrics.md#the-two-recordings-and-the-downloads-served-out-of-them) are the only account of
-  it, and a recording must be read beside a scrape rather than alone.
+- **A Custom Block of padding** fills whatever the encoder must leave empty to keep every write to
+  the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
+  sector before every download. A downloaded file therefore carries padding in its interior and not
+  only at a segment's end. It is skipped by any reader that does not know the PEN, and by `tcpdump`.
+- **The PEN is `0xFFFFFFFF`, and it is nobody's.** No registered Private Enterprise Number stands
+  behind these annotations. The value is IANA-reserved so it can never collide with a real
+  assignment, but it identifies no one, and a reader must not treat a PEN-tagged option in these
+  files as a stable identifier until a registered number replaces it.
+- **Neither an Interface Statistics Block nor a Decryption Secrets Block appears.** `epb_dropcount`
+  is therefore the whole of what a file says about its own loss, and it says one thing: what the tap
+  ring dropped. A recording the encoder or the medium lost records from reads exactly like one that
+  lost none, so the loss families under [the two recordings, and the downloads served out of
+  them](metrics.md#the-two-recordings-and-the-downloads-served-out-of-them) are the other half of
+  the account, and a recording is read beside a scrape rather than alone.
 
-## What the two recordings currently differ by
+## What the two recordings hold
 
-**Only the snap length.** The [recording design](../design/recording.md) defines the log sink as
-connection lifecycle and policy events anchored to their causing packet, and the capture sink as
-filtered full content. Neither is what exists: there is no connection tracking and no filtering, so
-**both recordings hold every dataplane observation**, one keeping the first 128 bytes and the other
-up to 2048. An operator should read `/logs.pcapng` today as "the capture, truncated to headers", not
-as an event log. The annotation carries a version byte precisely so the record can grow when the
-events land.
+**The same observations.** Neither sink selects: **both hold every dataplane observation**, one
+keeping the first 128 bytes of each frame and the other up to 2048. That is the whole of the
+difference in their contents, and it is why `/logs.pcapng` reads as the capture truncated to headers
+rather than as an event log — it is not one, and nothing in it is a connection event. The annotation
+carries a version byte, which is what a reader keys on rather than the layout it happens to see.
 
 Three further limits an operator will otherwise infer wrongly:
 
 - **Only the dataplane is recorded.** The management port is not tapped, so nothing on it — including
   the download itself — appears in either file.
-- **One observation per frame.** The design's paired ingress and egress observation of a forwarded
-  frame is not made; `epb_packetid` is minted and monotone, but there is only ever one record to
-  relate. Every `epb_flags` therefore reads inbound.
+- **One observation per frame.** A forwarded frame is recorded once and not once per direction, so
+  every `epb_flags` reads inbound. `epb_packetid` is minted and monotone, and there is never a
+  second record to relate one to.
 - **Some frames are counted and deliberately absent.** A frame no routing decision was reached about,
   one routed out of a port the stage is not wired to, and one recorded as forwarded that a later
   refusal lost are all counted on the dataplane families and encoded in no recording, because the tap

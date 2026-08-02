@@ -65,13 +65,15 @@ pub const BYTE_ORDER_MAGIC: u32 = 0x1A2B_3C4D;
 /// The IANA Private Enterprise Number tagging every custom option this crate
 /// writes.
 ///
-/// **Placeholder.** GROPYUS holds no registered PEN, and this must be replaced
-/// by one before any capture leaves a customer's premises. 4294967295 is the
-/// value chosen to hold the place because IANA reserves it and can therefore
-/// never assign it: a file that escapes with this number cannot be mistaken for
-/// another organisation's annotations, and a reader that validates PENs rejects
-/// the option outright rather than decoding our layout as someone else's.
-pub const GROPYUS_PEN: u32 = 0xFFFF_FFFF;
+/// **Nobody's.** No registered PEN stands behind these annotations, and one must
+/// replace this before any capture leaves a customer's premises. 4294967295 is
+/// the value chosen to hold the place because IANA reserves it and can
+/// therefore never assign it: a file that escapes with this number cannot be
+/// mistaken for another organisation's annotations, and a reader that validates
+/// PENs rejects the option outright rather than decoding our layout as someone
+/// else's. The name says the same thing the value does, so a caller cannot read
+/// ownership into a number that has none.
+pub const UNREGISTERED_PEN: u32 = 0xFFFF_FFFF;
 
 /// Block Type, Block Total Length, and the repeated Block Total Length: the
 /// bytes every block spends on framing itself.
@@ -185,9 +187,9 @@ const _: () = {
 
 /// Why a block could not be encoded.
 ///
-/// Every variant is a refusal, never a partial result: the caller's buffer is
-/// untouched and the same input will be refused the same way, so a retry is
-/// only worth making against [`EncodeError::OutOfSpace`].
+/// Every variant but [`EncodeError::MeasureDisagreed`] is decided before a byte is
+/// written, so the buffer is untouched and only [`OutOfSpace`](Self::OutOfSpace) is
+/// worth a retry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EncodeError {
@@ -214,6 +216,10 @@ pub enum EncodeError {
     /// A padding block below [`MIN_CUSTOM_BLOCK_LEN`], which cannot frame
     /// itself at all.
     BlockTooShort { len: usize },
+    /// The two walks disagreed about a block's length, so the reservation ran out
+    /// under the writer — a defect in this crate, both being one emitter, and its
+    /// own variant because it leaves bytes a retry would double.
+    MeasureDisagreed { measured: usize },
 }
 
 impl fmt::Display for EncodeError {
@@ -249,6 +255,12 @@ impl fmt::Display for EncodeError {
                 f,
                 "a {len}-byte block is below the {MIN_CUSTOM_BLOCK_LEN} its framing needs"
             ),
+            Self::MeasureDisagreed { measured } => {
+                write!(
+                    f,
+                    "a block did not fit the {measured} bytes measured for it"
+                )
+            }
         }
     }
 }
@@ -556,7 +568,7 @@ pub fn write_custom_block(out: &mut [u8], body: &CustomBinary<'_>) -> Result<usi
 /// A recording reaches the medium in whole sectors, and the slack behind the
 /// last block of one has to be bytes every reader steps over rather than a
 /// short read truncating the file. [`CUSTOM_BLOCK_COPYABLE`] is a type libpcap
-/// itself knows to skip, and [`GROPYUS_PEN`] tags data no other tool claims.
+/// itself knows to skip, and [`UNREGISTERED_PEN`] tags data no other tool claims.
 ///
 /// # Errors
 /// [`EncodeError::BlockNotAligned`] or [`EncodeError::BlockTooShort`] for a
@@ -568,7 +580,7 @@ pub fn write_padding_block(out: &mut [u8], len: usize) -> Result<usize, EncodeEr
     let zeros = len
         .checked_sub(MIN_CUSTOM_BLOCK_LEN)
         .ok_or(EncodeError::BlockTooShort { len })?;
-    let pen = GROPYUS_PEN.to_le_bytes();
+    let pen = UNREGISTERED_PEN.to_le_bytes();
     write_block(out, CUSTOM_BLOCK_COPYABLE, Body::zeroed(&pen, zeros), &[])
 }
 
@@ -876,7 +888,10 @@ fn write_block(
     // would have to unwind before retrying into a fresh buffer.
     let block = out.get_mut(..measured.bytes).ok_or(out_of_space)?;
     let mut filler = Filler { out: block, at: 0 };
-    emit(&mut filler, block_type, measured.field, body, options).map_err(|Full| out_of_space)?;
+    let disagreed = EncodeError::MeasureDisagreed {
+        measured: measured.bytes,
+    };
+    emit(&mut filler, block_type, measured.field, body, options).map_err(|Full| disagreed)?;
     Ok(measured.bytes)
 }
 

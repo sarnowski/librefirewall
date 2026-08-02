@@ -20,6 +20,16 @@
 //! because refusing them would make some legal identifier unwritable, and their
 //! expansion is fixed rather than document-supplied — the property the whole
 //! rest of the list lacks.
+//!
+//! # Where this reader is not XML
+//!
+//! Two knowing deviations, both narrowing. **Attribute values are not
+//! normalized**: XML turns a tab, line feed or carriage return in a value into a
+//! space, and this delivers the bytes — every value the schema admits has a
+//! grammar that refuses whitespace, so this changes which refusal a document
+//! gets and never whether it gets one. And **a name may not be
+//! namespace-qualified**: `:` is outside the name set, so a qualified name ends
+//! at the colon and the tag then fails to parse.
 
 use lfw_log::RejectReason;
 
@@ -45,8 +55,11 @@ pub const MAX_NAME_LEN: usize = 32;
 /// the widest value the schema admits, is seventeen bytes.
 pub const MAX_ATTRIBUTE_VALUE_LEN: usize = 32;
 
-/// Longest reference the reader will scan for a `;` before giving up:
-/// `&#x10FFFF;` is the widest one that can be valid.
+/// Longest reference the reader will scan for a `;`: `&#x10FFFF;` is the widest
+/// one that can be valid, so anything longer is padding around a value that
+/// would have fitted — `&#000000000065;` is a legal-if-padded `A`. Refused as
+/// over-long rather than as unterminated, the `;` being further off rather than
+/// absent.
 const MAX_REFERENCE_LEN: usize = 12;
 
 /// What was wrong with the document, at the granularity a developer and a test
@@ -65,6 +78,8 @@ pub enum DocumentFault {
     CharacterData,
     /// `<!--` with no `-->`.
     UnterminatedComment,
+    /// `--` inside a comment, which XML forbids.
+    DoubleHyphenInComment,
     /// `<?` with no `?>`.
     UnterminatedProcessingInstruction,
     /// A processing instruction other than an XML declaration at offset zero.
@@ -107,14 +122,20 @@ pub enum DocumentFault {
     TooManyAttributes,
     /// One element carrying the same attribute name twice.
     DuplicateAttribute,
-    /// A `&` with no `;` within [`MAX_REFERENCE_LEN`].
+    /// A `&` with no `;` before the document ends.
     UnterminatedReference,
+    /// A reference whose `;` is further away than [`MAX_REFERENCE_LEN`].
+    ReferenceTooLong,
     /// A named reference outside the five predefined entities.
     UnknownEntityReference,
     /// A numeric reference that is not a character XML admits.
     InvalidCharacterReference,
     /// An element the schema does not admit at this point.
     UnknownElement,
+    /// A second `<interfaces>`, `<neighbours>` or `<management>`. Distinct from
+    /// [`Self::UnknownElement`]: the element is one the schema names, and what
+    /// is wrong is that it is the second.
+    DuplicateElement,
     /// An attribute the schema does not admit on this element.
     UnknownAttribute,
     /// An element or attribute the schema requires and the document omits.
@@ -165,6 +186,12 @@ impl DocumentFault {
             | Self::MismatchedEndTag
             | Self::UnexpectedEndTag
             | Self::UnclosedElement
+            | Self::DoubleHyphenInComment
+            | Self::ReferenceTooLong
+            // The operator vocabulary has no duplicate-element token, and a
+            // second `<interfaces>` is a structural fault like the rest of this
+            // group; which element it was is the offset beside it.
+            | Self::DuplicateElement
             | Self::UnterminatedReference => RejectReason::Malformed,
         }
     }
@@ -308,12 +335,23 @@ pub enum Event<'a> {
 pub struct Reader<'a> {
     document: &'a [u8],
     at: usize,
+    /// Where the content starts: past a byte order mark, or zero. The
+    /// declaration is admitted here rather than at offset zero, a mark being
+    /// part of the encoding and not part of the document.
+    prologue: usize,
     open: [Option<(&'a [u8], usize)>; MAX_DEPTH],
     depth: usize,
     pending_close: Option<(&'a [u8], usize)>,
     seen_root: bool,
     finished: bool,
 }
+
+/// The UTF-8 byte order mark, which XML admits before the declaration. Skipped
+/// rather than refused: it says the encoding is the one this reader already
+/// requires, and faulting a document for three bytes an operator cannot see and
+/// did not type helps nobody. Offsets stay absolute, so a refusal after one
+/// still points at a real byte.
+const BYTE_ORDER_MARK: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 impl<'a> Reader<'a> {
     /// # Errors
@@ -326,9 +364,11 @@ impl<'a> Reader<'a> {
                 MAX_DOCUMENT_BYTES,
             ));
         }
+        let prologue = usize::from(document.starts_with(&BYTE_ORDER_MARK)) * BYTE_ORDER_MARK.len();
         Ok(Self {
             document,
-            at: 0,
+            at: prologue,
+            prologue,
             open: [None; MAX_DEPTH],
             depth: 0,
             pending_close: None,
@@ -427,21 +467,35 @@ impl<'a> Reader<'a> {
         Ok(None)
     }
 
+    /// A comment, ending at the first `--` — which XML requires to be the one
+    /// that closes it. Scanning for `-->` instead would take
+    /// `<!-- a -- b -->` for a comment, and read as markup the text a writer
+    /// believed was commented out.
     fn skip_comment(&self, at: usize) -> Result<usize, DocumentError> {
         let body = at.saturating_add(4);
-        match find(self.document, body, b"-->") {
-            Some(end) => Ok(end.saturating_add(3)),
-            None => Err(DocumentError::at(DocumentFault::UnterminatedComment, at)),
+        let Some(hyphens) = find(self.document, body, b"--") else {
+            return Err(DocumentError::at(DocumentFault::UnterminatedComment, at));
+        };
+        let after = hyphens.saturating_add(2);
+        if self.document.get(after) == Some(&b'>') {
+            return Ok(after.saturating_add(1));
         }
+        Err(DocumentError::at(
+            DocumentFault::DoubleHyphenInComment,
+            hyphens,
+        ))
     }
 
     /// The XML declaration, and only at offset zero. Everything else spelled
     /// `<?` is a processing instruction, which is an instruction to a consumer
     /// this document has no business addressing.
     fn skip_declaration(&self, at: usize) -> Result<usize, DocumentError> {
-        let is_declaration = at == 0
+        let is_declaration = at == self.prologue
             && starts_with(self.document, at, b"<?xml")
-            && self.document.get(5).is_some_and(u8::is_ascii_whitespace);
+            && self
+                .document
+                .get(at.saturating_add(5))
+                .is_some_and(u8::is_ascii_whitespace);
         if !is_declaration {
             return Err(DocumentError::at(DocumentFault::ProcessingInstruction, at));
         }
@@ -634,7 +688,15 @@ impl<'a> Reader<'a> {
             .or_else(|| self.document.get(body_at..))
             .unwrap_or_default();
         let Some(length) = window.iter().position(|byte| *byte == b';') else {
-            return Err(DocumentError::at(DocumentFault::UnterminatedReference, at));
+            // Which of the two turns on why the window ended: the bound, or the
+            // document.
+            let bounded = body_at.saturating_add(MAX_REFERENCE_LEN) <= self.document.len();
+            let fault = if bounded {
+                DocumentFault::ReferenceTooLong
+            } else {
+                DocumentFault::UnterminatedReference
+            };
+            return Err(DocumentError::at(fault, at));
         };
         let body = window.get(..length).unwrap_or_default();
         let next = body_at.saturating_add(length).saturating_add(1);
@@ -894,13 +956,88 @@ mod tests {
     }
 
     #[test]
+    /// The scan for a `;` is bounded, so what a reference is refused for turns
+    /// on why the window ran out: the document ended, or the bound did.
     fn a_reference_that_never_terminates_is_refused_within_a_bounded_window() {
+        // The bound ran out. No `;` was seen within the longest reference that
+        // can be valid, so the reference is too long to be one — whether a `;`
+        // sits further along is a question the reader deliberately does not scan
+        // far enough to answer, and does not need to.
         assert_refused(
             b"<a x=\"&aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/>",
-            DocumentFault::UnterminatedReference,
+            DocumentFault::ReferenceTooLong,
             6,
         );
+        // A valid character reference padded past the bound: `&#65;` is `A`, and
+        // this is the same character written with nine leading zeroes. Refused,
+        // and refused as over-long rather than as missing the `;` it has.
+        assert_refused(
+            b"<a x=\"&#000000000065;\"/>",
+            DocumentFault::ReferenceTooLong,
+            6,
+        );
+        // Exactly at the bound, from both sides: `&#x10FFFF;` is the widest
+        // reference that can be valid and is not refused for its length.
+        assert_eq!(
+            read(b"<a x=\"&#x10FFFF;\"/>").map(|events| events.len()),
+            Ok(2)
+        );
+
+        // The document ended. Nothing further could have terminated it.
         assert_refused(b"<a x=\"&\"/>", DocumentFault::UnterminatedReference, 6);
+        assert_refused(b"<a x=\"&amp", DocumentFault::UnterminatedReference, 6);
+    }
+
+    /// XML forbids `--` inside a comment, and the reason is not pedantry: a
+    /// writer who wrote `<!-- a -- b -->` believed everything up to the last
+    /// `>` was commented out, and a reader scanning for `-->` would agree with
+    /// them. A reader that instead ended the comment at the inner `--` would
+    /// read `b` as markup. Refused, so neither reading is taken.
+    #[test]
+    fn a_double_hyphen_inside_a_comment_is_refused() {
+        assert_refused(
+            b"<!-- a -- b --><configuration/>",
+            DocumentFault::DoubleHyphenInComment,
+            7,
+        );
+        // `<!--->` is not an empty comment either: its single body hyphen
+        // leaves no `--` to close on, so the comment simply never ends.
+        assert_refused(b"<!---><a/>", DocumentFault::UnterminatedComment, 0);
+        // The empty comment, which is well formed, and one whose body merely
+        // contains single hyphens.
+        assert_eq!(read(b"<!----><a/>").map(|events| events.len()), Ok(2));
+        assert_eq!(
+            read(b"<!-- a-b -c --><a/>").map(|events| events.len()),
+            Ok(2)
+        );
+        assert_refused(b"<!-- unclosed", DocumentFault::UnterminatedComment, 0);
+    }
+
+    /// A UTF-8 byte order mark is legal before the declaration and says the
+    /// encoding is the one this reader requires, so it is skipped rather than
+    /// read as character data. Offsets stay absolute, so a refusal after one
+    /// still points at the byte it was decided at.
+    #[test]
+    fn a_leading_byte_order_mark_is_part_of_the_encoding_and_not_of_the_document() {
+        let mut marked = vec![0xEF, 0xBB, 0xBF];
+        marked.extend_from_slice(b"<?xml version=\"1.0\"?><a/>");
+        assert_eq!(
+            names(&read(&marked).expect("a marked document")),
+            [&b"a"[..], b"a"]
+        );
+
+        // Without a declaration too, and the offset of a later fault is counted
+        // from the start of the file rather than from the start of the content.
+        let mut plain = vec![0xEF, 0xBB, 0xBF];
+        plain.extend_from_slice(b"<a>x</a>");
+        assert_refused(&plain, DocumentFault::CharacterData, 6);
+
+        // Only at the very start: three bytes anywhere else are character data,
+        // and a partial mark is not one.
+        let mut trailing = Vec::from(&b"<a/>"[..]);
+        trailing.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        assert_refused(&trailing, DocumentFault::CharacterData, 4);
+        assert_refused(&[0xEF, 0xBB], DocumentFault::CharacterData, 0);
     }
 
     #[test]

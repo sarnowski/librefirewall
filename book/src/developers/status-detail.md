@@ -5,21 +5,30 @@ specifically remains to finish it — so the work can be picked up without re-de
 code. The [Engineering foundations](#engineering-foundations) section at the end covers the
 machinery every capability lands through.
 
+Every section states what exists and then what is missing. None of them says *done*, and that is
+not modesty: the word belongs to the status tables, it is earned by an empty *Missing* here, and no
+capability below has one yet.
+
+**Test counts are deliberately not written down here.** A number nobody re-runs is a claim with a
+delayed fuse, and this page carried several of them wrong at once. The suite states its own count
+whenever it runs and `make coverage` states the current coverage; what a section says instead is
+*what* holds a claim up — which tests, which fuzz target, which scenario.
+
 ## Routed IPv4 forwarding
 
-**Done.** Two host-tested `no_std` crates carry the whole decision. `crates/net-headers` parses
-Ethernet, one optional 802.1Q tag, IPv4 and UDP, and applies the four edits a hop requires — both
-MACs, the TTL decrement, and the header checksum — as one operation that cannot be performed in
-part. `crates/routing` turns a parsed frame and its ingress port into a verdict: forward out of a
-named port under a named MAC pair, or one of eleven named drop reasons, each with its own counter.
-`pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of the pool, decide,
-rewrite, and write back the 34 header bytes — and marks every frame it refuses `Verdict::Discard`
-so the transmitting driver returns the buffer instead of transmitting it. The table it decides
-against is data rather than code: the const parameters are capacities, the lengths are runtime
-values, and the domain is handed one table and later handed another (see
+**What exists.** Two host-tested `no_std` crates carry the whole decision. `crates/net-headers`
+parses Ethernet, one optional 802.1Q tag, IPv4 and UDP, and applies the four edits a hop requires
+— both MACs, the TTL decrement, and the header checksum — as one operation that cannot be
+performed in part. `crates/routing` turns a parsed frame and its ingress port into a verdict:
+forward out of a named port under a named MAC pair, or one of eleven named drop reasons, each with
+its own counter. `pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of
+the pool, decide, rewrite, and write back the 34 header bytes — and marks every frame it refuses
+`Verdict::Discard` so the transmitting driver returns the buffer instead of transmitting it. The
+table it decides against is data rather than code: the const parameters are capacities, the lengths
+are runtime values, and the domain is handed one table and later handed another (see
 *[Configuration management](#configuration-management)*).
 
-Held by 47 unit and property tests across the two crates, by the stage's own tests in
+Held by unit and property tests across the two crates, by the stage's own tests in
 `crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
 and garbage traffic through it and asserts the pool comes back whole — and by a persistent fuzz
 target (`route_frame`) whose input is the frame itself.
@@ -28,13 +37,13 @@ target (`route_frame`) whose input is the frame itself.
 
 - **No ARP and no ICMP on the dataplane.** Both now exist — `crates/net-headers` parses and builds
   them and `crates/ip-endpoint` answers them — but only for a port that answers *for itself*: the
-  management endpoint (see *[Full port role model](#full-port-role-model)*). On a dataplane port
+  management port (see *[Full port role model](#full-port-role-model)*). On a dataplane port
   neighbours are still a static table and a drop is still silent, because a dataplane frame can only
   leave the port opposite the one it arrived on: the pools are owned by the receiving drivers, so no
   domain on that path can originate a frame at all. Giving a dataplane port an ARP cache and an ICMP
   responder means giving the forwarder a pool it owns, which is a capability change and not a code
   one.
-- **Interfaces, neighbours and the management interface are all that is configurable.** They come from
+- **Interfaces, neighbours and the management port are all that is configurable.** They come from
   `systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
   now the single source of the appliance's addressing: the MAC QEMU gives each guest NIC and the
   endpoints the system test states its contract between are both read out of it
@@ -42,7 +51,10 @@ target (`route_frame`) whose input is the frame itself.
   nothing compared — are one literal and two derivations. Everything else a hop depends on is still
   compiled in: which ports exist, which pipeline joins which pair, and the pool and ring extents.
 - **Connected routes only.** A destination is routable exactly when an interface prefix covers it;
-  no route table, no default route, no gateway indirection.
+  no route table and no gateway indirection. There is no default route and there cannot be one: an
+  interface whose prefix length is 0 is never selected as an egress, so a document cannot express
+  one by writing `/0` — the address is still one the appliance holds and the port is still a usable
+  ingress, and traffic that would have needed the default route is `no_route`.
 - **IPv4 only, and no options**: `IHL != 5` is refused rather than skipped, IPv6 is absent, and a
   VLAN tag is parsed but never acted on — a tagged frame is dropped for want of a sub-interface.
 - **No fragment reassembly.** A non-initial fragment is forwarded without a transport header being
@@ -50,12 +62,13 @@ target (`route_frame`) whose input is the frame itself.
 
 ## Zero-copy dataplane
 
-**Done.** The substrate exists as four host-tested `no_std` crates: `crates/queue` (the lock-free
-SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership ledger), `crates/wire`
-(the descriptor ABI shared across domains, pinned by static layout assertion) and `crates/pd-runtime`
-(the pipeline, pool owner and routing stage the protection domains are assembled from).
+**What exists.** The substrate exists as four host-tested `no_std` crates: `crates/queue` (the
+lock-free SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership ledger),
+`crates/wire` (the descriptor ABI shared across domains, pinned by static layout assertion) and
+`crates/pd-runtime` (the pipeline, pool owner and routing stage the protection domains are
+assembled from).
 
-Correctness is held by 360 unit and property tests across those four crates — including hostile-peer
+Correctness is held by unit and property tests across those four crates — including hostile-peer
 cases for forged and duplicate returns, forged cursors, exhausted rings and bounded drains — plus a
 500,000-frame three-thread pipeline test that cycles every buffer through `rx → route → tx → free`
 far more times than the pool holds, exchanging the forwarding table at poll boundaries as it goes.
@@ -89,31 +102,35 @@ passes no tap, so what it measures is the path with recording off.
 
 ## virtio-net driver
 
-**Done.** A from-scratch modern virtio 1.0 PCI transport in `crates/virtio` — capability-list walk,
-BAR relocation, feature negotiation, queue programming, doorbells, and a split-virtqueue driver half
-— covered by 67 unit and property tests and one compile-fail doctest. Every transport entry point
-the device drives returns a typed error (`BarError`, `ResetError`, `QueueSetupError`, `NotifyError`,
-`CapError`) instead of panicking.
+**What exists.** A from-scratch modern virtio 1.0 PCI transport in `crates/virtio` —
+capability-list walk, BAR relocation, feature negotiation, queue programming, doorbells, and a
+split-virtqueue driver half — held by unit and property tests and one compile-fail doctest. Every
+transport entry point the device drives returns a typed error (`BarError`, `ResetError`,
+`QueueSetupError`, `NotifyError`, `CapError`) instead of panicking.
 
-`crates/nic-driver-core` holds bring-up and the steady-state poll pass, covered by 69 further tests.
-Rx and Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate
-every peer transmit descriptor.
+`crates/nic-driver-core` holds bring-up and the steady-state poll pass, tested the same way. Rx and
+Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate every
+peer transmit descriptor.
 
 Twelve persistent fuzz targets cover this surface, the peer-facing one, the network-facing parser,
-the addressed management endpoint, the configuration document and the handover image, and the log
+the addressed management port, the configuration document and the handover image, and the log
 record and its ring (see *[Engineering foundations](#engineering-foundations)*).
 
 **Missing.**
 
 - **Interrupts.** Busy-poll only — no MSI-X, no INTx (deliberate for this milestone). The ISR
   capability's presence is still required of the device, but its offset is not retained and the
-  status register is never read. This burns a core per port, and both driver instances run at the
-  same priority and never yield, so their mutual progress rests on seL4's round-robin scheduling
-  alone.
+  status register is never read. This burns a core per port, and the three driver instances run at
+  the same priority and never yield, so their mutual progress rests on seL4's round-robin
+  scheduling alone.
 - **Real hardware.** No PCI enumeration: the BDF and the BAR physical address are pinned in the
   system description, so the driver cannot bind a device it was not built for.
-- **DMA confinement.** Bus-master DMA is enabled unconditionally against fixed physical addresses;
-  no VT-d.
+- **DMA confinement.** Bus-master DMA is granted against fixed physical addresses with no VT-d, so
+  nothing bounds where the device writes. What the grant *is* ordered against is now right: the NIC
+  driver enables bus mastering only after the device has acknowledged its reset (virtio 1.0
+  §3.1.1's first step), so a device that will not reset never reaches bus-master authority at all.
+  The block driver still takes it at BAR placement, before the handshake — an open defect, recorded
+  under *[virtio-blk driver](#virtio-blk-driver)*.
 - **Offloads.** No checksum offload, TSO/GSO, or mergeable receive buffers — prerequisites for
   10 Gbit/s. No feature but virtio 1.0 is accepted, precisely because accepting one would licence
   buffer shapes no code handles.
@@ -127,9 +144,10 @@ record and its ring (see *[Engineering foundations](#engineering-foundations)*).
 
 ## virtio-blk driver
 
-A seventh protection domain, `recorder`, owns a virtio-blk device at the pinned PCI function
-00:05.0 and is the only domain in the system that can put a byte on persistent storage. The device
-class is `crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
+**What exists.** A ninth protection domain, `recorder` — the seventh binary, the driver's three
+instances being one binary — owns a virtio-blk device at the pinned PCI function 00:05.0 and is the
+only domain in the system that can put a byte on persistent storage. The device class is
+`crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
 state machine over one virtqueue (`request`), and the sector-addressed staging window every data
 segment names (`io`). The split is `nic-driver-core`'s — every decision is in the library where a
 host test can drive it against a stand-in device, and the protection domain is a thin adapter,
@@ -138,11 +156,14 @@ because correctness logic belongs in a host-testable crate rather than in a prot
 **What it proves today** is that the path reaches a real medium, and it proves it as a
 machine-observable contract rather than as a console line — the end-to-end tests assert observable
 contracts, never timing-sensitive log text. `lfw_blk::smoke` reads sector 0, then writes a 512-byte
-pattern that names its own target sector to sector 64, waiting for each completion before starting
-the next. The QEMU harness creates a 64 MiB raw image per run, seeds a different recognisable
-pattern into sector 0 before boot, and afterwards reads sector 64 back and compares it against
-`lfw_blk::smoke::witness_pattern` — the appliance's own definition, called rather than copied. Every
-scenario that boots the appliance must show the pattern, and the two A/B halt scenarios, where no
+pattern that names its own target sector to sector 2047, waiting for each completion before
+starting the next. That sector is the last of the 1 MiB front the recording layout already reserves
+for neither recording, and a build-time assertion ties the two together so the proof cannot come to
+overwrite a recording. The QEMU harness creates a 64 MiB raw image per run, seeds a different
+recognisable pattern into sector 0 before boot, and afterwards reads sector 2047 back and compares
+it against `lfw_blk::smoke::witness_pattern` — the appliance's own definition, called rather than
+copied. Every scenario that boots the appliance must show the pattern, and the two A/B halt
+scenarios, where no
 slot is bootable and no domain runs, must show the sector still zeroed. That pair is what makes
 either verdict evidence.
 
@@ -158,7 +179,7 @@ LFW-PD time=… domain=recorder state=ready sectors=131072 leading=0x444545532d5
 returned — here the harness's `LFW-SEED` marker, little-endian, which is a second, independent sign
 that the *read* crossed to the medium and not merely to the driver's own staging window.
 
-**Missing:**
+**Missing.**
 
 - **No flush, no ordering guarantee, and no retry.** `lfw_blk` observes `VIRTIO_BLK_F_FLUSH` and
   reports whether the device offered it, deliberately without accepting it, and issues no
@@ -169,32 +190,41 @@ that the *read* crossed to the medium and not merely to the driver's own staging
 - **A failed transfer reaches no surface.** That loss is counted inside the recorder as
   `medium_failures`, and that counter is published nowhere — no metric family carries it, no console
   record states it, and the recording itself says nothing about the sectors it lost, because
-  `epb_dropcount` reports observations the *sink* dropped and not bytes the *device* refused. A
-  medium quietly failing every write is, today, indistinguishable from one that is merely idle.
+  `epb_dropcount` accounts for what the tap ring lost and for nothing the *device* refused. A
+  medium quietly failing every write is indistinguishable from one that is merely idle.
 - **One device, one extent, no partition.** `systems/qemu-x86_64` declares a single block device and
   the driver addresses the whole of it. The per-deployment device count and named-extent binding the
   [recording design](../design/recording.md) intends are untouched.
 - **Nothing is measured.** The staging window is 256 KiB because that is a plausible amount to have
   in flight, not because a benchmark said so, and there is no Criterion bench on the block path.
+- **Bus mastering is granted too early, and this is an open defect.** `Identified::place_bar`
+  enables memory decoding and bus mastering together, so the device holds DMA authority from BAR
+  placement — before the reset, the feature negotiation and the capacity check that follow. The NIC
+  driver was moved to virtio 1.0 §3.1.1's order, where the grant comes after the device
+  acknowledges its reset; the block driver was not, so a device that refuses its reset here has
+  already been made a bus master. Nothing in the appliance depends on the early grant.
 
 ## Recording and download
 
-**Partial.** Every frame the router decides on is observed, both recordings are written to the
+**What exists.** Every frame the router decides on is observed, both recordings are written to the
 medium as pcapng, and either can be downloaded whole over HTTP.
 
 The forwarder taps its own routing stage. `RouteStage` already snapshots each frame into private
 scratch before deciding, so an observation costs one copy into a shared ring and no second read of
-the pool. What is recorded is the frame **as it arrived** — the tap is taken between the router's
-decision and the forwarding rewrite, which costs a second header parse on the forwarding path and
-buys the property that makes a recording usable as evidence: what reaches the medium is what the
-wire carried. Three classes of frame are counted and deliberately absent from a recording, because
-`wire::TapDropReason` mirrors `routing::DropReason` exactly and there is no honest encoding for
-them: a frame no routing decision was reached about (a malformed descriptor, a refused snapshot,
-bytes that are not IPv4 over Ethernet), a frame routed out of a port the stage is not wired to, and
+the pool. The copy is lifted after the verdict and before the hop's rewrite, which is the ordering
+that makes a recording evidence about the wire rather than about this appliance's own output, and
+the price of it is a second header parse on the forwarding path: the rewrite re-parses what the
+decision already parsed. Three classes of frame are counted and deliberately absent from a
+recording, because `wire::TapDropReason` mirrors `routing::DropReason` exactly and there is no
+honest encoding for them: a frame no routing decision was reached about (a malformed descriptor, a
+refused snapshot, bytes that are not IPv4 over Ethernet), a frame routed out of a port the stage is
+not wired to, and
 a frame recorded as forwarded that a later refusal still lost. **The tap never backpressures
-forwarding**: a full ring costs the newest observation and is counted — on both sides of the ring and
-on `/metrics` — because a tap that could stall the dataplane would make an observability feature a
-remote outage.
+forwarding**: a full ring costs the newest observation and is counted — on both sides of the ring
+and on `/metrics` — because a tap that could stall the dataplane would make an observability
+feature a remote outage. That loss is also the one thing a recording states about itself: the
+recorder differences the writer's drop count on every pass and carries the rise onto the next
+record it places, so `epb_dropcount` is fed rather than written as a zero.
 
 The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` over
 `lfw_capture_ring`, differing only in extent and snap length:
@@ -205,10 +235,14 @@ The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` o
 | capture (`/capture.pcapng`) | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
 
 Sectors 0–2047 are reserved and belong to neither, which is where the harness's seed and the smoke
-proof's witness pattern live. Within each extent the **first segment holds the superblock**, doubled
-and CRC32'd, its two 512-byte copies alternating by generation parity so a torn write never leaves
-the ring without a good one; payload therefore starts one segment in, giving the log recording 15
-payload segments and the capture recording 31. The 256 KiB `blk_io` staging window is carved into a
+proof's witness pattern live. Within each extent the **first segment holds the superblock** — the
+ring's geometry and the cursor it has been written up to, doubled and CRC32'd, its two 512-byte
+copies alternating by generation parity so a torn write never leaves the ring without a good one.
+The cursor it records is the **durable** one and not the append one, so a resume cannot claim bytes
+the medium never took; and a fresh ring's first checkpoint writes *both* copies, parity applying
+only from the second, because otherwise a stale copy left by an older ring on the same medium could
+outrank the new one. Payload therefore starts one segment in, giving the log recording 15 payload
+segments and the capture recording 31. The 256 KiB `blk_io` staging window is carved into a
 64 KiB log buffer, a 128 KiB capture buffer, a 32.5 KiB download read buffer (a 32 KiB window plus
 one sector, so a window can start mid-sector) and a 1 KiB superblock buffer, each sector-aligned, and
 every DMA address is `io_paddr` plus one of those offsets.
@@ -225,26 +259,29 @@ A download pins a snapshot: offset zero seals the named recording, flushes it, a
 length the response commits to; later offsets are located against that same snapshot, read back off
 the medium, and delivered a window at a time. A ring that wrapped past a reader answers `Overrun`, a
 medium that refused answers `DeviceError`, and either ends the response rather than truncating it
-silently. The management domain drives that from `EndpointStage`'s windowed body, so nothing holds a
-second copy of a megabyte: the recorder answers 32 KiB per round trip, the endpoint copies each into
-a 16 KiB sliding window sized above the transport's retransmit span, and a client that stops reading
-abandons the stream. Serving a body larger than the response staging buffer is what the windowed body
-exists for — a scrape of `/metrics` fits in staging, a 12 KiB recording would too, and a 16 MiB one
-never will.
+silently. The management domain drives that from `EndpointStage`'s windowed body, so nothing holds
+a second copy of a megabyte: the recorder answers up to 32 KiB per round trip, the endpoint copies
+each into a 16 KiB sliding window sized above the transport's retransmit span, and a client that
+stops reading abandons the stream. **The window the endpoint names is a bound and not a demand**,
+which is the shape the segmented ring forces: a reader runs short at every 1 MiB extent boundary,
+so a supplier handing back fewer bytes advances the response from where the bytes ended instead of
+ending it. Two compile-time assertions tie the recorder's window and the endpoint's to each other.
+Serving a body larger than the response staging buffer is what the windowed body exists for — a
+scrape of `/metrics` fits in staging, a 12 KiB recording would too, and a 16 MiB one never will.
 
 **What a recording contains.** Each segment opens with a Section Header Block naming
 `librefirewall`, then one Interface Description Block per interface — Ethernet, microsecond
 timestamps, `if_snaplen` the sink's own. Every observation is an Enhanced Packet Block carrying
-`epb_flags` (direction), `epb_dropcount` (the field the [recording design](../design/recording.md)
-wants the sink's own loss stated in — emitted, and always zero, because nothing feeds it),
+`epb_flags` (direction), `epb_dropcount` (the tap-ring observations lost ahead of this record),
 `epb_packetid`, `epb_verdict`, and a PEN-tagged custom option holding a layout version, the
 verdict, the drop reason, the interface, the direction and the **configuration generation the
 decision was made under**. A sealed segment is padded to a sector boundary with a Custom Block that
 any reader skips. The [recording download endpoints reference](../reference/recordings.md) is the
 operator-facing statement of all of it.
 
-The console names both extents at bring-up, which is the only way an operator learns where a
-recording is — there is no shell and no CLI:
+The console names both extents at bring-up. Nothing else states them: they are compiled in rather
+than configured, `/metrics` says how much a recording has written and never where it sits, and
+there is no shell to ask — so these two records are what an operator has:
 
 ```
 LFW-PD time=… domain=recorder state=ready sectors=131072 leading=0x444545532d57464c
@@ -289,7 +326,7 @@ and wall-clock times. An independent parse of the two files established:
 - reading the two extents straight off the data-disk image after shutdown yields **exactly the bytes
   the downloads returned**, so the medium is proved independently of the download path.
 
-**Missing:**
+**Missing.**
 
 - **No connection tracking, so no connection logs — the sinks differ only in snap length.**
   The log sink of the [recording design](../design/recording.md) records connection lifecycle and
@@ -319,21 +356,29 @@ and wall-clock times. An independent parse of the two files established:
   was reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
   that a later refusal still lost. An operator reconciling a recording against `/metrics` subtracts
   those; the [recordings reference](../reference/recordings.md) states the reconciliation.
-- **A recording states none of its own loss.** The [recording design](../design/recording.md) makes
-  `epb_dropcount` and an Interface Statistics Block the in-band report of what a sink did not
-  record, and neither carries anything: `Sink::note_drops` exists, is host-tested and fuzzed, and is
-  called by no protection domain, so every `epb_dropcount` written to the medium is `0`; no ISB is
-  emitted at all. A file a burst outran is indistinguishable from one that lost nothing, which is
-  precisely the property the format was chosen for. The loss *is* counted, on `/metrics`, so the
-  numbers exist — they are just not in the artifact that travels.
-- **The PEN is a placeholder.** Annotations are tagged `0xFFFF_FFFF`, IANA-reserved so it can never
-  collide with a real assignment — but it is not GROPYUS's, and a registered Private Enterprise Number
-  is needed before a recording leaves a customer's premises.
+- **A recording states one of its three kinds of loss.** The
+  [recording design](../design/recording.md) makes `epb_dropcount` and an Interface Statistics
+  Block the in-band report of everything a sink did not record. `epb_dropcount` now carries the
+  first of the three: the recorder reads the forwarder's tap-drop counter each pass, differences it,
+  and holds the rise as a debt on both recordings until a record is placed to carry it — so the
+  number belongs to the gap ahead of its block rather than to the packet in it, and it is cleared
+  only by a successful placement. The other two are still out of band: a record the encoder refused
+  and a write the medium lost are counted on `/metrics` and stated nowhere in the file, and no ISB
+  is emitted at all. A file whose *sink* fell behind therefore still reads like one that lost
+  nothing.
+- **The PEN is a placeholder, and whose it will be is undecided.** Annotations are tagged
+  `0xFFFF_FFFF`, IANA-reserved so it can never collide with a real assignment, and a registered
+  Private Enterprise Number is needed before a recording leaves a customer's premises. The constant
+  holding the placeholder is `lfw_pcapng::UNREGISTERED_PEN`, named for what the value is rather than
+  for an owner, because who would register a number is itself unsettled — the question is not the
+  code's to answer, and a constant that named a party would have answered it by implication.
 - **The Interface Description Blocks name the port, not the interface.** They carry the literals
-  `port0` and `port1` rather than the configured id `dataplane-0`. The recorder maps the `cfg` region
-  read-only and could use the real names; it does not, and that row is the one `<map>` in the whole
-  system description still carrying no `setvar_vaddr`, because Microkit refuses a symbol no ELF
-  defines.
+  `port0` and `port1` rather than the configured id `dataplane-0`, and closing that now costs a
+  capability rather than a rename: the recorder's read-only mapping of the `cfg` region has been
+  **withdrawn**. It was the one grant in the system no symbol addressed, which is authority no code
+  in the domain could name, and `xtask::sysdesc` now fails the build on any mapping in that state —
+  so giving the recorder the configured names means granting the region back and addressing it,
+  deliberately, rather than finding it already there.
 - **The extents are compiled in.** `lfw_recorder::deck` fixes both, and the device is the whole of one
   disk. The per-deployment device count and named-extent binding the
   [recording design](../design/recording.md) intends are untouched, and no configuration item names
@@ -342,15 +387,19 @@ and wall-clock times. An independent parse of the two files established:
   [recording design](../design/recording.md) requires a time bound as well; there is none, so how
   long a node holds traffic is whatever its ring yields at the offered rate. Nothing is erased when
   recording stops, and nothing erases an extent on decommission.
-- **Nothing resumes, and nothing rotates or checkpoints on a schedule.** A superblock is written when
-  the recorder decides to — at bring-up and after a segment closes — never on a clock; and no boot
-  reads one back. `Sink::resume` exists and is host-tested and nothing calls it, so a restart begins a
-  fresh ring over the old bytes rather than continuing the segment it left open.
+- **Nothing resumes, and nothing rotates or checkpoints on a schedule.** A superblock is written
+  when the recorder decides to — at bring-up and after a segment closes — never on a clock; and no
+  boot reads one back. `Sink::resume` is host-tested and correct as far as it can be shown to be —
+  a resumed recording's download starts at the segment *this* boot opened rather than the previous
+  boot's unsealed one, and there is no separate `open` for it to be called out of order with — but
+  it is called by no protection domain, so a restart begins a fresh ring over the old bytes.
 - **One reader, and no live event stream.** The superblock carries four reader-cursor slots and
   nothing registers one. The [management](../design/management.md) and
   [recording](../design/recording.md) designs make the OTEL exporter, a syslog exporter and an
   operator console's live event stream readers of this ring; the ring's only reader is the download
-  path.
+  path. That unregistered cursor is why no series says how much history a recording still holds: a
+  wrap count states that a segment was evicted, and there is no cursor for it to have been evicted
+  past.
 - **A download is the whole recording.** No `Range`, no `If-Match`, no `ETag`, and no way to ask for
   one segment or a time range — the [management design](../design/management.md) asks for a *time
   range* of a sink. A body over 2 GiB is refused outright rather than served wrong.
@@ -362,8 +411,9 @@ and wall-clock times. An independent parse of the two files established:
 
 ## Configuration management
 
-**Done.** One schema-validated XML document, `systems/qemu-x86_64/configuration.xml`, is the whole
-of the appliance's addressing, and it reaches the dataplane through four stages that never mix.
+**What exists.** One schema-validated XML document, `systems/qemu-x86_64/configuration.xml`, is
+the whole of the appliance's addressing, and it reaches the dataplane through four stages that
+never mix.
 
 `crates/config` reads it. The reader is `no_std`, allocator-free and hardened against a
 management-plane adversary rather than against a typo: `<!DOCTYPE`, entity declarations, CDATA,
@@ -374,13 +424,14 @@ values. The schema is closed: an unknown element or attribute is a refusal, not 
 because a misspelling nobody can see is the failure an appliance with no shell cannot afford.
 Parsing and semantic validation are separate passes over separate inputs — bytes, then a
 model — so a syntax rule cannot come to depend on an address and a topology rule cannot come to
-depend on where in the file something was written. Twenty-one semantic rules then run over the model:
-a duplicate interface id, neighbour id or port; a port the build does not have; a prefix length past
-32; an interface address that is its own prefix's network or broadcast address; a non-unicast
-address or MAC on either object; overlapping prefixes; a neighbour naming an unknown interface, or
-sitting outside its interface's prefix, or equal to the interface's own address; a duplicate
-neighbour address on one interface; and six over the `<management>` element, which is held to the
-same field rules as an interface *and* to colliding with no dataplane prefix and no dataplane MAC —
+depend on where in the file something was written. Twenty-three semantic rules then run over the
+model: a duplicate interface id, neighbour id, port or interface MAC; a port the build does not
+have; a prefix length past 32; an address that is its own prefix's network or broadcast address, on
+an interface or on a neighbour; a non-unicast address or MAC on either object; overlapping
+prefixes; a neighbour naming an unknown interface, or sitting outside its interface's prefix, or
+equal to the interface's own address; a duplicate neighbour address on one interface; and six over
+the `<management>` element, which is held to the same field rules as an interface *and* to
+colliding with no dataplane prefix and no dataplane MAC —
 because one address reachable both by routing and by local termination is not something the grant set
 can express. A document naming more objects than the handover ABI can carry is refused by the reader
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
@@ -389,21 +440,27 @@ bytes, so attacker-supplied content never reaches an observability surface.
 `config::Datastore` versions what passed. A candidate is staged without touching what is running,
 `validate_document` takes `&self` so "an operation that changes nothing" is carried by the signature
 rather than by discipline, and a commit assigns the next monotonic generation and returns the diff —
-or assigns no generation at all and reports `unchanged`, a content hash held beside the generation
-being what recognises a commit of the content already in force. The diff is keyed by the document's
-`id`, so reordering the document produces **zero** change records — a property test, not an
-intention — and a modified object produces one record per changed field and nothing for the rest.
+or assigns no generation at all and reports `unchanged`. What recognises a commit of the content
+already in force is a **comparison of the content**, object by object; the 32-bit hash held beside
+the generation is a fast path in front of it and can only ever agree, because a digest short enough
+to carry across the handover is short enough to collide, and a collision here would suppress a real
+configuration with no generation, no record and nothing published. The diff is keyed by the
+document's `id`, so reordering the document produces **zero** change records — a property test, not
+an intention — and a modified object produces one record per changed field and nothing for the
+rest.
 
 `pds/config` is a protection domain of its own holding no device capability, no buffer pool and no
 dataplane ring, so the domain that parses attacker-supplied XML cannot reach a frame, a NIC, or the
 memory either travels through. It writes a fixed-layout POD image of the already-validated model
 into a shared region — the forwarder never parses XML, which is the entire point of the split — and
-publishes it under a two-phase protocol: offer, the consumer re-checks and acknowledges, then
-commit. The two regions are separate and mirrored (`cfg` read-write here and read-only there,
-`cfgack` the reverse) so neither domain can forge the other's half.
+publishes it under an **offer/acknowledge handover**: offer, the consumer re-checks and
+acknowledges, then commit. (It is a handover between two domains of one node and not a two-phase
+commit: nothing is prepared that a later message could abort, and there is no coordinator.) The two
+regions are separate and mirrored (`cfg` read-write here and read-only there, `cfgack` the reverse)
+so neither domain can forge the other's half.
 
 The image has **two readers with different authority**, which is the shape a second consumer takes
-here. The forwarder is the *consumer* of the two-phase commit — it reads the offered generation,
+here. The forwarder is the *consumer* of that handover — it reads the offered generation,
 stages a table and acknowledges, and a commit waits for that. The management domain reads the
 **committed** generation alone (`pd_runtime::CommittedReader`) to learn its own addressing: it maps
 `cfg` read-only, maps `cfgack` not at all, and therefore cannot delay a commit, refuse one on
@@ -411,25 +468,42 @@ anybody's behalf, or forge the acknowledgement that releases one.
 
 `pd_runtime::ConfigurationSwitch` is the consumer. It treats the region as a byzantine peer's
 claim — copies the image out before deciding on it, exactly as `RouteStage` snapshots a frame, and
-re-checks every field: a count past capacity, an `enabled` byte that is neither 0 nor 1, a port with
-no driver, a prefix length past 32, a non-unicast MAC — the management entry included, whose fields
-are left uninterpreted altogether when it is disabled, so an unaddressed port has one representation
-and a zeroed region is still the valid fail-closed image. A refused image leaves the running
-configuration exactly as it was and is never acknowledged, so the publisher never commits it. The
-switch happens **between two polls** and is provable rather than claimed: a Microkit domain runs one
-entrypoint to completion, so a frame is decided entirely under one generation with no lock involved.
+then re-decides the rules itself, in `wire::ConfigImage::check`. **It now re-decides all 23**, at
+the validating domain's own strength on all but the two named below, and in a stated order so an
+image breaking several is attributed to the first: the two counts against capacity; then per
+interface the `enabled` byte, a port this build has, a prefix length past 32, a unicast MAC, a
+unicast address and one that is not its prefix's network or broadcast address; then between
+interfaces one port each, one MAC each, and disjoint prefixes; then per neighbour a unicast MAC
+and address, on the link its port names, not the interface's own address and not that link's
+network or broadcast address; then one neighbour per port and address; and finally the management
+entry under an interface's own field rules, plus the two that hold it apart from the dataplane — a
+prefix disjoint from every interface prefix and a MAC distinct from every interface MAC. Those last
+two matter most: they are what makes the isolation the design calls structurally unreachable
+enforced on the *untrusted* path rather than only in the domain that parses the document.
+
+**Two deviations, both deliberate and both about values the image does not carry.** A neighbour's
+`id` is not in the image at all, so two neighbours sharing one is unrepresentable here — and
+nothing downstream of the image consumes such an id. And a *disabled* management entry leaves every
+other field of it uninterpreted, so there is no value for a rule to be about; that is also what
+gives an unaddressed port one representation and makes a zeroed region the valid fail-closed image.
+Both are stated on the function and held by tests of their own.
+
+A refused image leaves the running configuration exactly as it was and is never acknowledged, so
+the publisher never commits it. The switch happens **between two polls** and is provable rather
+than claimed: a Microkit domain runs one entrypoint to completion, so a frame is decided entirely
+under one generation with no lock involved.
 
 Because the forwarder boots fail-closed on generation 0 and the document the image carries commits
 as generation 1, **every boot performs a live configuration swap on a running forwarder**, and every
 changed value reaches the console as a structured `LFW-CFG` record (see the
 [console reference](../reference/console.md)).
 
-Held by 182 tests in `crates/config` and 99 in `crates/log`, by the handover's own tests in
+Held by the tests in `crates/config` and `crates/log`, by the handover's own tests in
 `crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the five QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the six QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -449,9 +523,9 @@ document that shares no address and no MAC with the first.
   so there is no version history to roll back *to*; with no persisted configuration and no channel
   to submit a second document over there could not be one worth holding, every generation but the
   single one each boot commits being unreachable by construction. What is implemented of the
-  design's versioning is the part that is reachable: monotonic generations, and a content hash
-  beside them that makes re-committing what is already running an `unchanged` outcome rather than a
-  new version.
+  design's versioning is the part that is reachable: monotonic generations, and the content
+  comparison beside them that makes re-committing what is already running an `unchanged` outcome
+  rather than a new version.
 - **No commit-confirm.** The candidate/commit half of the
   [configuration design](../design/configuration.md)'s transaction model exists; the confirm half
   does not, and it cannot be built here: an automatic revert needs a deadline, and there is no
@@ -468,7 +542,7 @@ document that shares no address and no MAC with the first.
   [configuration design](../design/configuration.md) intends needs a pair; the handover protocol is
   written for exactly one consumer, and "every consumer has staged" is one comparison rather than a
   conjunction.
-- **Only interfaces, neighbours and the management interface are configurable.** No routes, no policy,
+- **Only interfaces, neighbours and the management port are configurable.** No routes, no policy,
   no zones, no NAT — none of which exist to configure. Queue depths, pool sizes and buffer extents
   are deliberately *not* runtime configuration: they are memory-region extents fixed in the system
   description, which is where the [configuration design](../design/configuration.md) draws the line
@@ -479,10 +553,10 @@ document that shares no address and no MAC with the first.
 
 ## Console device and log transport
 
-**Done.** The console is a device with exactly one owner. `pds/console` holds the only I/O-port
-capability that reaches it — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible COM1
-window — and is the sole writer of the line; every other domain publishes a typed record into a
-single-producer ring of its own and that domain drains, renders and transmits it. A record is
+**What exists.** The console is a device with exactly one owner. `pds/console` holds the only
+I/O-port capability that reaches it — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible
+COM1 window — and is the sole writer of the line; every other domain publishes a typed record into
+a single-producer ring of its own and that domain drains, renders and transmits it. A record is
 therefore whole or absent rather than spliced with another domain's, which is a property of the
 capability grant rather than of scheduling.
 
@@ -508,18 +582,19 @@ same reason. `Com1::claim` then reads every register the driver can address befo
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`crates/wire` carries the transport: a 232-byte fixed-layout `LogRecord` whose every offset is a
+`crates/wire` carries the transport: a 248-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
 record grew by the eight bytes of its instant and one discriminant byte taken out of existing
 padding, and the slot count did not move: the ring is sized for a boot transcript whose first
-generation alone is 16 change records, and 64 records of 232 bytes still fit the 16 KiB the region
+generation alone is 20 change records, and 64 records of 248 bytes still fit the 16 KiB the region
 already rounded to. The records region (slots, producer cursor, the writer's drop count) is
 read-write to the writing domain and read-only to the console, so the console cannot forge a line
 attributed to a domain that never emitted one — it is the domain whose output is read as testimony
 about the others. The consume region (the console's cursor, one word) is read-write to the console
 and read-only to the writer, so a writer cannot forge how much of its own ring has been read and
-quietly reuse slots the console never rendered. Fourteen regions, 140 KiB, one pair per writing
-domain; no writer maps another writer's.
+quietly reuse slots the console never rendered. Sixteen regions, 160 KiB, one pair for each of the
+eight writing domains; no writer maps another writer's, and the console — which writes no ring of
+its own — maps every records half read-only and every consume half read-write.
 
 The console busy-polls and never leaves `init`, exactly as the NIC drivers do — Microkit has no
 periodic wakeup, so a `notified`-driven console would stall a boot transcript longer than the
@@ -586,12 +661,15 @@ indifferent to whether anything is printed.
   debug boot (a diagnostic re-run's `build/image/*-debug.log`, or `make run`) and in none of the
   captures the gate writes, those being release boots. That is accepted, the kernel printing on boot
   and on faults rather than per record, and it is why the claim is stated of the shipped profile.
-- **The console cannot report its own failure to start.** From entry into `init` until the register
-  sequence returns, the reporting mechanism is what is being started. A refused *capability* is named
-  on the debug kernel's channel, which does not exist in a release image; a refused *controller* — one
-  of six distinct errors the driver distinguishes — reaches nothing at all, and the node prints
-  nothing. Diagnosing that is one bit where the driver has six. Closing it needs a reporting channel
-  independent of the console.
+- **The console cannot report its own failure to start *on the line*, and reports one bit of it
+  elsewhere.** From entry into `init` until the register sequence returns, the reporting mechanism
+  is what is being started, so nothing about the failure reaches the serial port. What it does reach
+  is the metrics shard: the domain publishes from its refusal path, so a scrape that answers with
+  `librefirewall_uart_init_failures_total` at 1 names a refused controller — where the counter was
+  structurally always zero before. That is one bit against the six distinct errors the driver
+  distinguishes, and it says nothing about a refused I/O-port *capability*, which is named only on
+  the debug kernel's channel and so never in a release image. Closing the rest needs a reporting
+  channel independent of the console.
 - **Every counter here is now published rather than only tallied.** The UART's bytes written, THRE
   timeouts and init failures; the renderer's printed, malformed, unknown, unrenderable and
   write-failed; each writer's dropped and refused. All of them are now published and scrapable (see
@@ -605,11 +683,11 @@ indifferent to whether anything is printed.
 
 ## Console system-state events
 
-**Done.** The five ad-hoc bring-up markers are gone. Call sites in all seven protection-domain
-binaries emit **typed events** — a closed set of named fields — and rendering happens once, in the
-console domain, so the attribute structure an OpenTelemetry record needs is produced at the call
-site rather than thrown away in a format string, and the structure is what crosses between domains
-rather than the text. Two channels of closed vocabulary reach the line,
+**What exists.** The five ad-hoc bring-up markers are gone. Call sites in all seven
+protection-domain binaries emit **typed events** — a closed set of named fields — and rendering
+happens once, in the console domain, so the attribute structure an OpenTelemetry record needs is
+produced at the call site rather than thrown away in a format string, and the structure is what
+crosses between domains rather than the text. Two channels of closed vocabulary reach the line,
 `LFW-PD time=… domain=… state=…` for a domain's lifecycle and `LFW-CFG time=… generation=… …` for
 configuration, both specified field for field in the [console reference](../reference/console.md)
 and matching the existing `LFW-BOOT` convention, so a reader keys on the `LFW-` prefix alone. The
@@ -657,19 +735,22 @@ judges over every channel at once.
 - **No fault or restart events**, because there is no fault handler and no PD restart to report.
 - **A record that cannot be rendered or encoded is counted and lost**, where it used to be written
   out in a debug form. See *[Console device and log transport](#console-device-and-log-transport)*.
-- **Nothing beyond the console.** These are the OTEL log stream's System category by construction,
-  but no transport exists (see the [status table](../status.md)), so the records reach an operator
-  only over a serial line, on a node they are already attached to.
+- **Nothing beyond the console.** These are the OTEL log stream's **System** category by
+  construction, and they are the only category with call sites at all — Audit, Traffic and Subsystem
+  have none, so three of the design's four categories are empty at the source and not merely at the
+  transport. No transport, exporter or receiver exists either (see the
+  [status table](../status.md)), so the records reach an operator only over a serial line, on a node
+  they are already attached to.
 
 ## Full port role model
 
-**Done.** One of the four port roles the [architecture design](../design/architecture.md) names
-exists, and it is an **addressed IPv4 endpoint that terminates TCP connections**: a **dedicated
-management port** that answers for itself, carries no forwarded traffic, and is isolated from the
-dataplane by a grant set. It is a third `virtio-net-pci` device at 00:04.0, driven by a third
-instance of the same `nic-driver.elf` the two dataplane ports use — the binary turned out to be
-port-agnostic already, so the third port cost it no code change — and its frames end at a
-`management` protection domain.
+**What exists.** One of the four port roles the
+[deployment design](../design/deployment.md#port-roles) names exists, and it is an **addressed IPv4
+endpoint that terminates TCP connections**: a **dedicated management port** that answers for
+itself, carries no forwarded traffic, and is isolated from the dataplane by a grant set. It is a
+third `virtio-net-pci` device at 00:04.0, driven by a third instance of the same `nic-driver.elf`
+the two dataplane ports use — the binary turned out to be port-agnostic already, so the third port
+cost it no code change — and its frames end at a `management` protection domain.
 
 That domain answers three protocols and counts everything: an **ARP request** for its own address is
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
@@ -709,8 +790,8 @@ The domain reads the **committed** generation only (`pd_runtime::CommittedReader
 configuration region read-only, the calibration region read-only, and the acknowledgement region
 **not at all**, and so cannot delay a commit, refuse one on anybody's behalf, or forge the
 acknowledgement that releases one. That is strictly weaker than the forwarder's role, which is the
-consumer of the two-phase commit. What it costs is stated where it lives: with no channel to the
-configuration domain, the port picks up its address on the next frame that wakes it.
+consumer of the offer/acknowledge handover. What it costs is stated where it lives: with no channel
+to the configuration domain, the port picks up its address on the next frame that wakes it.
 
 The isolation is a grant set, not a rule anybody has to remember. The management domain holds **no**
 dataplane region, no device capability and no I/O port; the forwarder holds no management region; the
@@ -749,7 +830,7 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the five scenarios additionally hold the console's own record to the frames and the bytes
+Two of the six scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the three boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -759,9 +840,12 @@ not satisfy it.
 
 - **No TLS.** HTTP answers `GET /metrics` ([detail](#prometheus-metrics)) and both recordings
   ([detail](#recording-and-download)), but in the clear: the
-  [management design](../design/management.md) requires mutual TLS on the management interface and
+  [management design](../design/management.md) requires mutual TLS on the management port and
   there is none, so anyone who can reach the port can scrape it — and now download every packet the
-  appliance recorded. `/config` and `/logs` do not exist.
+  appliance recorded. `/config` and `/logs` do not exist, so of the debug dump the
+  [observability reference](../reference/observability.md) describes, the state half and the two
+  recordings are what a node can be asked for and the running document and the retained records
+  cannot be.
 - **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
   there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
@@ -773,17 +857,27 @@ not satisfy it.
   `frames=`/`bytes=` pair, but every outcome the endpoint distinguishes — and every reply it could
   not send — is published as the `librefirewall_endpoint_*` families and scrapable; see
   [Prometheus metrics](../reference/metrics.md).
-- **A change to the management interface is audited like any other**, but only because the change
+- **A change to the `management` object is audited like any other**, but only because the change
   records are keyed by a synthetic identifier: the element has no `id` of its own, so every record
   about it reads `object=management key=management`.
+- **Nothing bounds the rate of requests to this port.** The
+  [management design](../design/management.md) asks the surface to bound it; nothing does. The only
+  rate bound anywhere in the appliance is RFC 5961 §7's per-second budget on *unsolicited replies*,
+  shared across the connection table — which caps what this node emits at a peer and caps nothing a
+  peer sends at it. What does exist against a flood is bounded state rather than a bounded rate: a
+  fixed connection table, reaped by timeout and under pressure ([detail](#proxy-tcp-stack)), and one
+  response staged at a time.
 - **No other role.** Session-replication, mirror and multiple port pairs are open, and so are the
-  3/4/6/7-NIC hardware image variants: there is one system description with three ports in it.
+  3/4/6/7-NIC hardware image variants: there is one system description with three ports in it. The
+  `role` label on `librefirewall_interface_info` is closed at the two roles that have ports —
+  `dataplane` and `management` — and gains a token when a port in another role exists, never
+  before it.
 
 ## Proxy TCP stack
 
-**Done.** `crates/tcp` is a first-party TCP implementation that completes a real handshake with a
-real client, carries a byte stream, and closes cleanly — proven on the booting **release** image by
-the gate performing a whole TCP exchange against the management port. It is not a
+**What exists.** `crates/tcp` is a first-party TCP implementation that completes a real handshake
+with a real client, carries a byte stream, and closes cleanly — proven on the booting **release**
+image by the gate performing a whole TCP exchange against the management port. It is not a
 management-endpoint toy: it is the stack the dataplane proxy will run on, and every constraint below
 comes from that.
 
@@ -812,9 +906,14 @@ What the passive-open path implements, completely:
 - **Sequence-number validation.** RFC 793 p.69's four-case acceptability test; an out-of-window
   segment is answered with an acknowledgement naming what was expected and never accepted, and a
   retransmission overlapping the window's left edge is trimmed rather than refused.
-- **RFC 5961 validation**, applied in *every* state rather than only the synchronized ones: a `RST`
+- **RFC 5961 in full**, applied in *every* state rather than only the synchronized ones. §3's `RST`
   is obeyed only at the exact next byte expected, and an in-window one that is not — like an
-  in-window `SYN` — gets a challenge acknowledgement.
+  in-window `SYN` — draws a challenge acknowledgement. §5's left-edge test
+  (`SEG.ACK >= SND.UNA - MAX.SND.WND`) refuses an acknowledgement from too far behind. §7's
+  **per-second challenge budget, shared across the whole table**, bounds every unsolicited reply the
+  stack would emit — a challenge acknowledgement, and the reset a segment naming no connection would
+  draw — so the node cannot be made an amplifier by a spoofed source. A `RST` that ends a connection
+  is never withheld by it, and a suppression is counted rather than silent.
 - **RFC 6298 retransmission**: SRTT and RTTVAR with the RFC's own α and β, the RFC's one-second
   floor, a 60-second ceiling, exponential backoff, and Karn's algorithm — a range that has been
   re-sent yields no round-trip sample. The `SYN-ACK` and the `FIN` the stack composes itself; data
@@ -828,7 +927,11 @@ What the passive-open path implements, completely:
 - **Bounded state under a flood.** A fixed table, reaped by timeout *and* by capacity pressure —
   the oldest reapable entry gives way, and a table of *established* connections refuses a new one
   rather than letting a peer that completes handshakes evict everybody else. Every connection
-  becomes reapable in finite time, which is a property test rather than a claim.
+  becomes reapable in finite time, which is a property test rather than a claim. An eviction is
+  reported to the layers above so they reconcile against the transport, a peer that closes without
+  sending a byte is closed on rather than left holding a slot, and `TIME_WAIT` restarts only on a
+  retransmitted remote `FIN` (RFC 793 §3.9) — three ways a slot used to be pinned by a peer's
+  choice.
 - **MSS clamping** (the peer's offer against this end's own limit, with RFC 1122's default and
   floor), **window scaling** (RFC 7323, negotiated at the `SYN` and clamped to shift 14), and
   correct pseudo-header checksums both ways.
@@ -836,17 +939,17 @@ What the passive-open path implements, completely:
   server keeps it equal to the room it has left, so a peer is never told it may send more than the
   endpoint can take.
 
-Every outcome is counted, one field per cause — twenty-five of them — under the
+Every outcome is counted, one field per cause — twenty-seven of them — under the
 [metrics reference](../reference/metrics.md)'s attribution rule: what a peer sent that was refused,
 and separately the one count that accuses this code (`write_refused`, storage too small, expected to
 read zero forever). There is no device class here, because nothing in the crate reads a register.
 
 Zero `unsafe` (`forbid(unsafe_code)`), zero panicking constructs on any path a segment reaches, and
 sequence arithmetic that is modulo-2^32 by construction: `SeqNumber` exposes no `Add`, `Sub` or
-`Ord`, because the derivable ones are all wrong across the wrap. 99.7% line coverage over 126 unit
-and property tests, plus a persistent fuzz target that drives arbitrary segments at arbitrary
-instants — including a clock that moves backwards — against a listening stack and an established
-one.
+`Ord`, because the derivable ones are all wrong across the wrap. Held by unit and property tests
+over every state the machine has, plus a persistent fuzz target that drives arbitrary segments at
+arbitrary instants — including a clock that moves backwards — against a listening stack and an
+established one.
 
 **Missing.**
 
@@ -862,7 +965,7 @@ one.
 - **No congestion control**, no delayed acknowledgement, no Nagle. The structural place for the
   first is `Connection::sendable`; the other two need a timer this stack is not driven by.
 - **The urgent pointer is ignored.** `URG` data is delivered in band and counted.
-- **No dataplane consumer.** The only caller is the management endpoint. Nothing proxies, nothing
+- **No dataplane consumer.** The only caller is the management domain. Nothing proxies, nothing
   terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
   is untouched (see the [status table](../status.md)).
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
@@ -873,16 +976,19 @@ one.
 - **Timers advance when the caller polls them.** The management domain is woken by a frame, so a
   `TIME_WAIT` on an otherwise silent port is reaped on the next frame rather than at its deadline.
   Bounded rather than unbounded — the table is also reaped under pressure — but not prompt.
-- **The counters now reach a surface.** All twenty-five are published as
+- **The counters now reach a surface.** All twenty-seven are published as
   `librefirewall_tcp_*` and scrapable; see *[Prometheus metrics](#prometheus-metrics)* and the
   [metrics reference](../reference/metrics.md).
 
 ## Prometheus metrics
 
-**Partial.** `GET /metrics` on the management port answers a real Prometheus exposition — 74 metric
-families, 253 series, about 32 KiB — covering every one of the nine protection domains, and the
-end-to-end gate scrapes it with `curl` off a booted release image and cross-checks a number in it
-against traffic the harness watched cross the wire itself.
+**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 77
+metric families and 263 counter and gauge series, plus one info series per configured interface —
+covering every one of the nine protection domains. Its worst case is computed from the catalogue at
+build time (`MAX_EXPOSITION_LEN`, 42 142 bytes), which is what the response staging buffer behind
+the endpoint is sized from, so a scrape can never be short. The end-to-end gate scrapes it with
+`curl` off a booted release image and cross-checks a number in it against traffic the harness
+watched cross the wire itself.
 
 **A per-NIC series is joinable to the interface a configuration document names.** Every counter
 family carries `domain`, the protection domain that produced it, and `domain="nic_driver0"` is a name
@@ -916,29 +1022,35 @@ last wrote; that is stated as a freshness boundary in the
 The exposition is rendered by `crates/metrics` (`no_std`, panic-free, with a computed
 `MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `crates/http`
 (`no_std`, a bounded server-side HTTP/1.1 head parser that returns a typed error mapping onto one of
-eight statuses). Both are fuzzed. The management domain publishes its own shard *before* rendering,
-so a scrape always reports the request that asked for it.
+eight statuses). Both are fuzzed. The management domain's own shard is stored before the exposition
+is composed rather than after, which is why a scrape is never one request behind its own surface —
+stated as a freshness property in the [metrics reference](../reference/metrics.md).
 
 **Missing.**
 
-- **No mutual TLS — the endpoint is plain HTTP with no client authentication.** The
-  [management design](../design/management.md) requires mTLS on the management interface. Anyone who
-  can reach the port can scrape it, and the exposition names every domain, drop reason and fault
-  class in the node. This is a **deviation from the design**, recorded here and in
-  `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network the management
-  interface is not already isolated on.
+- **No mutual TLS — the endpoint is plain HTTP with no client authentication, and no bound on how
+  often it may be asked.** The [management design](../design/management.md) requires mTLS on the
+  management port and asks it to bound the request rate; neither exists. Anyone who can reach the
+  port can scrape it as fast as they like, and the exposition names every domain, drop reason and
+  fault class in the node. This is a **deviation from the design**, recorded here and in
+  `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network the management port is
+  not already isolated on.
 - **One response is staged at a time.** A scrape arriving while another is still going out is
   answered `503` and counted. A finished-but-not-yet-reaped connection's buffer is reclaimed rather
   than waited out, so a periodic scraper is never refused for the previous scrape — but two
   *concurrent* scrapers can refuse each other.
-- **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, queue
-  and ring occupancy and flow-table numbers await the stateful dataplane, and log-buffer occupancy
-  awaits the buffer. None of them are absent by oversight.
-- **No `/config` and no `/logs`**, so the debug dump has only its state half.
+- **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, the
+  flow table awaits the stateful one, and log-buffer occupancy awaits the buffer. Occupancy is the
+  one that is now half here: `librefirewall_virtqueue_posted` publishes how many buffers each port
+  has posted to its device and not yet had completed, which is the only reading that tells a
+  stalled port from an idle link, while the dataplane's own queues and rings still publish none.
+  None of the absences are oversights.
+- **No `/config` and no `/logs`**, so of the debug dump only the state half and the two recordings
+  can be asked for ([detail](#full-port-role-model)).
 
 ## Trusted time source
 
-**Done.** A node establishes a wall-clock time at boot, and the whole chain that does it is
+**What exists.** A node establishes a wall-clock time at boot, and the whole chain that does it is
 host-tested library code driven by a thin domain. `crates/clock` is the arithmetic — a tick delta
 and a reference interval to a counter frequency, a counter reading to nanoseconds since boot or
 since the epoch, an instant to a civil date and to an RFC 3339 line — with Hinnant's era
@@ -954,9 +1066,11 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the five QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the six QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
-accepts, and that its year is inside the band the RTC reader accepts.
+accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
+wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
+published clock does not run ahead by the cost of reading the part.
 
 **Every domain consumes it, and every structured record carries an instant.** The calibration goes
 into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
@@ -971,7 +1085,10 @@ accident. That is most of a boot transcript, the clock domain's own two records 
 publishes *after* the record that states what it measured. The same two scenarios assert the whole
 of this against the release image: that every record carries the field in one of its two forms, that
 every instant is inside the RTC reader's year band, that no domain goes back to `unsynchronized`
-after stamping, and that no domain's instants go backwards.
+after stamping, and that no domain's instants go backwards. The one-way transition is a fact about
+*this* clock domain — it publishes once and parks — and not a property of the field: a reader
+re-reads the region on every question by design, and answers `unsynchronized` again for a
+calibration that is torn under the read or outside the band it accepts, having refused it.
 
 **Missing** — and it is everything the word *trusted* covers:
 
@@ -989,7 +1106,7 @@ after stamping, and that no domain's instants go backwards.
   against an external log to about a second, and is evidence of nothing.
 - **No metric says which domain has taken the calibration up.** It is readable per record on the log
   stream (`time=unsynchronized` against an instant) and `/metrics` carries the gauge for the
-  management domain alone; the other six writing domains publish no such series (see the
+  management domain alone; the other seven writing domains publish no such series (see the
   [metrics reference](../reference/metrics.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
   never corrected; there is no timer, no interrupt, and no second reading to drift against.
@@ -1002,23 +1119,26 @@ after stamping, and that no domain's instants go backwards.
 
 ## Protection-domain decomposition
 
-**Done.** Nine protection domains from seven binaries (one forwarder, one configuration domain, one
-console, one clock, one management endpoint, one recorder, three driver instances of one driver
-binary) with real, verifiable least privilege: the forwarder holds no device capability at all and
-neither dataplane pipeline's `free` ring — so it cannot hand a live DMA target back to be issued a
-second time — and each driver sees only its own ECAM page, BAR, virtqueue region, and its two
-pipelines. Each pipeline is three memory regions rather than one precisely so that those grants can
-differ; the forwarder maps the buffer pools, because a domain that rewrites a header must reach the
-bytes. The recorder is the mirror of that argument in the other direction: it is the only domain
-that reaches the block device — its ECAM page, BAR, DMA region and staging window are mapped by
-nothing else — and it maps no pool, no ring, no NIC region and no port, so the domain that owns the
-disk reaches no frame and the domains that move frames reach no medium. What crosses between them is
-a tap ring carrying annotations rather than packets, mirrored in perms so neither end can forge the
-other's half. The configuration domain's entire grant is two 4 KiB regions: no device, no pool, no
-ring, so the domain that parses attacker-supplied XML cannot reach a frame or a NIC. Those two
-regions are one per direction, and their perms are the argument — the forwarder maps the handover
-**read-only**, so it cannot rewrite the configuration it is about to be judged by, and the publisher
-maps the acknowledgement read-only, so it cannot forge the consent that releases its own generation.
+**What exists.** Nine protection domains from seven binaries (one forwarder, one configuration
+domain, one console, one clock, one management domain, one recorder, three driver instances of
+one driver binary) with real, verifiable least privilege: the forwarder holds no device capability
+at all and neither dataplane pipeline's `free` ring — so it cannot hand a live DMA target back to
+be issued a second time — and each driver sees only its own ECAM page, BAR, virtqueue region, and
+its two pipelines. Each pipeline is three memory regions rather than one precisely so that those
+grants can differ; the forwarder maps the buffer pools, because a domain that rewrites a header
+must reach the bytes. The recorder is the mirror of that argument in the other direction: it is
+the only domain that reaches the block device — its ECAM page, BAR, DMA region and staging window
+are mapped by nothing else — and it maps no pool, no ring, no NIC region and no port, so the
+domain that owns the disk reaches no frame and the domains that move frames reach no medium. What
+crosses between them is a tap ring carrying annotations rather than packets, mirrored in perms so
+neither end can forge the other's half. The configuration domain's entire grant is six mappings —
+`cfg` read-write, `cfgack` read-only, the calibration read-only, its own log ring's two halves and
+its counter shard — and the negative half is what matters: no device, no pool, no ring, so the
+domain that parses attacker-supplied XML cannot reach a frame or a NIC. The two handover regions
+are one per direction and their perms are the argument — the forwarder maps the handover
+**read-only**, so it cannot rewrite the configuration it is about to be judged by, and the
+publisher maps the acknowledgement read-only, so it cannot forge the consent that releases its own
+generation.
 
 Five notification channels. The three driver channels are granted in **one direction only** — a driver
 may signal its consumer, and that consumer's send capability on the driver does not exist rather
@@ -1027,8 +1147,8 @@ too, and in the opposite sense: the recorder may announce a download window, and
 domain may not signal back, because the recorder busy-polls its request region and a send capability
 it does not need is one it must not hold. The fifth, between the configuration domain and the
 forwarder, is the one granted in **both**, and stated as a decision at both ends rather than
-inherited from Microkit's default: applying a configuration is a two-phase commit and each phase is
-a signal the other end cannot infer. The forwarder therefore holds exactly one send capability in
+inherited from Microkit's default: the offer/acknowledge handover has a step in each direction and
+neither end can infer the other's. The forwarder therefore holds exactly one send capability in
 the whole system, on the configuration domain alone, and the management domain holds none at all.
 The console holds none in either direction — it never reaches the event loop, so a notification on
 it would be authority granted for nothing. Zero IRQs. The capability grant is machine-checkable in
@@ -1069,13 +1189,15 @@ on the console's first boot and `pds/clock/src/cmos.rs` is written from it. Both
 capability answers before relying on it, so a slot the Microkit tool moved is a named refusal rather
 than a fault mid-sequence.
 
-**Missing.** Two of the fourteen component classes the
-[architecture design](../design/architecture.md) enumerates exist: the NIC driver PDs and the
-configuration validator PD. The console, clock and management domains are three further domains and
-*not* three further classes — the design enumerates neither, describing the console as a surface and
-leaving the trusted-time mechanism open — so they add domains to the decomposition without closing
-any of the gap below — the management domain is the endpoint of a port, not the management API PD,
-which needs the TLS and HTTP that do not exist above the ARP, IP and TCP that now do. Absent: Rx/Tx
+**Missing.** Two of the component classes the [architecture design](../design/architecture.md)
+offers as representative exist: the NIC driver PDs and the configuration validator PD. (That list
+is explicitly representative rather than closed, so it is not a denominator and no count against it
+is stated here.) The console, clock and
+management domains are three further domains and *not* three further classes — the design names
+neither, describing the console as a surface and leaving the trusted-time mechanism open — so they
+add domains to the decomposition without closing any of the gap below; the management domain is
+the endpoint of a port, not the management API PD, which needs the TLS and HTTP that do not exist
+above the ARP, IP and TCP that now do. Absent: Rx/Tx
 virtualisers, classifier, filter/connection-tracking, routing/ARP/ICMP, TLS-proxy, per-protocol L7
 parsers, DPI engine, content scanner, CA signing PD, management API PD, HA state-sync PD, and the
 update/health PD. The routing/ARP/ICMP class is the one that is neither: routing exists as a *stage
@@ -1086,16 +1208,16 @@ One grant is also wider than the code needs, and it is not closed:
 
 - **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what keeps the virtqueue
   and pipeline regions inside RAM while leaving the BAR window above RAM in the q35 PCI hole. The
-  window either side is narrow, and the management port's two pipelines have just **narrowed it
-  further**: RAM must now reach past 784.55 MiB rather than 784.27 MiB, and every port added narrows
-  it again; at 1280 MiB or more RAM swallows the BAR window. The reasoning is recorded in the system
-  description; no code enforces it.
+  window either side is narrow, and each region added narrows it further: the recorder's 256 KiB
+  staging window was the last to do so, and RAM must now reach past 784.80 MiB where the three
+  ports alone needed 784.55 MiB. At 1280 MiB or more RAM swallows the BAR window instead. The
+  reasoning is recorded in the system description; no code enforces either end of it.
 
 ## Untrusted-device hardening
 
-**Done.** Every byte the device writes — configuration-space ids, the capability chain, BAR type
-bits, structure offsets, the feature bitmap, the `device_status` readback, the queue count, each
-queue's `queue_notify_off`, and every used-ring completion — is treated as hostile input and
+**What exists.** Every byte the device writes — configuration-space ids, the capability chain, BAR
+type bits, structure offsets, the feature bitmap, the `device_status` readback, the queue count,
+each queue's `queue_notify_off`, and every used-ring completion — is treated as hostile input and
 **rejected with a typed error or a counted drop, never by panicking**.
 
 What remains of `assert!` and `expect` on these paths is a different thing and stays deliberately:
@@ -1128,10 +1250,10 @@ and a write each terminate within their advertised bound for *any* sequence of d
 
 ## Untrusted-peer containment
 
-**Done.** Buffer ownership is accounted **by identity**, not by count: `packet_buffer::FreeList`
-refuses to reclaim an index that is out of range or not outstanding, and `pd_runtime::PoolOwner`
-refuses one this domain never lent. A *local* double return is not representable, `pop` minting a
-non-`Copy`, non-`Clone` `OwnedBuffer` token.
+**What exists.** Buffer ownership is accounted **by identity**, not by count:
+`packet_buffer::FreeList` refuses to reclaim an index that is out of range or not outstanding, and
+`pd_runtime::PoolOwner` refuses one this domain never lent. A *local* double return is not
+representable, `pop` minting a non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
 Every rejection is a **counted drop**, never a fault: `PoolCounters` and `RouteCounters` record
 them, the latter attributing every refused frame to one of eleven named routing reasons or to the
@@ -1139,12 +1261,21 @@ stage check that caught it. `ConfigCounters` does the same for the handover, so 
 images this domain will not run is distinguishable from one that has stopped offering any.
 Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit header-room
 check) and checked against the driver's in-flight set before any span is touched. Every peer-fed
-loop is bounded by `DRAIN_LIMIT`.
+loop is bounded by `DRAIN_LIMIT`, which is a bound of this build and not of anything the peer
+publishes. The two loops fed by a *device* rather than a peer — the receive drain and the transmit
+reap — take the virtqueue size `Q` instead, for the same reason in the other direction: a
+conformant device never has more than `Q` buffers outstanding, so the cap costs nothing, and one
+that floods its used ring cannot park the domain in the loop.
 
 The configuration handover is the same treatment applied to a second peer: the region is mapped
-read-only, its image is copied out before anything is decided on it, and every field of the copy —
-counts, the `enabled` byte, ports, prefix lengths, MACs — is re-checked in the consumer, which is
-the domain that has to live with the result. A refused image is counted, leaves the running
+read-only, its image is copied out before anything is decided on it, and the consumer — the domain
+that has to live with the result — then re-decides the rules rather than re-reading the fields. All
+23 of them: the counts, the `enabled` byte, ports, prefix lengths, unicast and host addresses and
+MACs on all three object kinds, one port and one MAC per interface, disjoint interface prefixes, a
+neighbour on the link its port names and a host on that link, one neighbour per port and address,
+and the management entry's prefix and MAC disjoint from every interface's
+([detail](#configuration-management), where the two rules the image cannot represent are named).
+A refused image is counted, leaves the running
 configuration exactly as it was, and is never acknowledged, so the publisher cannot commit it.
 
 The log ring is the same treatment applied to a third peer, and to a peer on **both** sides at once.
@@ -1179,9 +1310,12 @@ rubbish are the *other* domains'.
 
 ## A/B image update
 
-**Done.** A GPT disk with ESP, STATE, SLOT_A, SLOT_B and DATA partitions; both slots carry a signed
-kernel and system image. GRUB is built from pinned source as a standalone EFI binary with an
-embedded public key, so it *enforces* detached-signature verification on everything it loads.
+**What exists.** A GPT disk with ESP, STATE, SLOT_A, SLOT_B and DATA partitions; both slots carry
+a signed kernel and system image. GRUB is built from pinned source as a standalone EFI binary with
+an embedded public key, so it *enforces* detached-signature verification on everything it loads.
+Its module set is a curated allowlist (`third-party/grub/modules.txt`) rather than a default build:
+every module in the core image is code inside the signed binary, so the list is the verified-boot
+base's attack surface and each entry states which line of `grub.cfg` needs it.
 
 The `OK`/`TRY`/`ORDER` selection scheme is implemented and covered by **eight** QEMU scenarios:
 confirmed-A, try-pending-B, fallback-from-broken-B, skip-exhausted-B, confirmed-B, an `ORDER` naming
@@ -1210,10 +1344,11 @@ forwarded and GRUB's halt record on the channel.
 
 ## Signed boot chain
 
-**Done.** OVMF → GRUB → Multiboot2 → seL4/Microkit with enforced payload signature verification;
-the corrupt-signature fallback and the both-slots-broken halt are proven by test. A throwaway
-development key is generated per checkout and never committed, and the release manifest records
-`trust_profile: development` with the key fingerprint so a development-signed image cannot be
+**What exists.** OVMF → GRUB → Multiboot2 → seL4/Microkit with enforced payload signature
+verification; the corrupt-signature fallback and the both-slots-broken halt are proven by test. A
+throwaway development key is generated per checkout and never committed, and the release manifest
+records `trust_profile: development` with the key fingerprint so a development-signed image cannot
+be
 mistaken for a production one.
 
 Signing is key-explicit and self-checked: each signature names the exact fingerprint embedded into
@@ -1245,9 +1380,9 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `crates/` and `pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-two library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (six system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the three scenarios that reach the management endpoint judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (six system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the three scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
@@ -1264,9 +1399,9 @@ and their trees — appear in the inventory. And the third-party components that
 inside the disk — the seL4 kernel from the Microkit SDK and the GRUB core image — are absent; they
 are recorded as version-verified provenance in the release manifest instead.
 
-**The two configuration harnesses assert semantics, not survival.** A target whose body is a bare
-parse call proves only that the parser did not crash on that input, which for a validator is the
-least interesting outcome: the failure that reaches a dataplane is an image *wrongly accepted*.
+**The two configuration harnesses assert semantics, not survival.** Absence of a panic is the
+least interesting thing a validator can be shown to have, because the failure that reaches a
+dataplane is an image *wrongly accepted* rather than one that crashed the reader.
 `fuzz/src/handover.rs` therefore carries its own statement of the handover ABI's rules and of the
 order they are applied in, taken from the contract rather than read out of `wire`, and compares it
 with `ConfigImage::check` on every input — so an image the reader admits and the contract refuses

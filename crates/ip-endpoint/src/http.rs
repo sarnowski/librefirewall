@@ -48,16 +48,26 @@
 //! That paragraph is also why a recording off a block device *cannot* be composed
 //! whole. A second shape shares the one array — [`Body`] keeps the two exclusive
 //! — stating its length up front ([`Server::supply_stream`] writes an exact
-//! `Content-Length`; nothing here is chunked) and taking the body [`WINDOW_LEN`]
-//! bytes at a time ([`Server::supply_window`]). A window is not simply the next
-//! bytes to send, because a range the transport re-asks for must still be in the
-//! array: it begins [`RETRANSMIT_SPAN`] *behind* that byte, with [`WINDOW_LEN`]
-//! twice that span to leave room in front, under a `const` assertion so a wider
-//! transport window moves this in a diff. Not holding one is an answer rather
-//! than a stall: **nothing** goes out that pass, [`Server::window_wanted`] names
-//! what is needed, and [`Server::pending`] prefers a connection that can send.
-//! Where a window cannot be produced at all, [`Server::abandon_stream`] closes
-//! short of the announced length — invented bytes being worse than truncation.
+//! `Content-Length`; nothing here is chunked) and taking the body at most
+//! [`WINDOW_LEN`] bytes at a time ([`Server::supply_window`]). A window is not
+//! simply the next bytes to send, because a range the transport re-asks for must
+//! still be in the array: it begins [`RETRANSMIT_SPAN`] *behind* that byte, with
+//! [`WINDOW_LEN`] twice that span to leave room in front, under a `const`
+//! assertion so a wider transport window moves this in a diff.
+//!
+//! [`Server::window_wanted`] names both where the next bytes begin and **how
+//! many** the array will take, and a supplier that hands over fewer than that
+//! advances the stream rather than ending it: the next call asks for the
+//! remainder at the byte after what arrived, so the window is completed in place
+//! and the span behind it is never given up. A supplier reading a segmented ring
+//! legitimately runs short at every segment boundary, so a short window is
+//! ordinary rather than exceptional. Not holding one at all is an answer rather
+//! than a stall: **nothing** goes out that pass, and [`Server::pending`] prefers
+//! a connection that can send. Where a window cannot be produced at all,
+//! [`Server::abandon_stream`] gives up short of the announced length — invented
+//! bytes being worse than truncation — and the connection is **reset** rather
+//! than closed, because a `FIN` under an exact `Content-Length` presents a
+//! truncated message to an intermediary as a complete one.
 //!
 //! # The body is asked for, not fetched
 //!
@@ -88,10 +98,8 @@
 //! case, so no legitimate request loses a byte.
 
 use lfw_clock::Monotonic;
-use lfw_http::{
-    MAX_HEAD_LEN, MAX_REQUEST_BYTES, METRICS_CONTENT_TYPE, Parsed, Status, parse, write_head,
-};
-use lfw_tcp::{Connection, ConnectionId, MAX_UNACKED, SeqNumber, TcpStack, Timeout};
+use lfw_http::{ContentType, MAX_HEAD_LEN, MAX_REQUEST_BYTES, Parsed, Status, parse, write_head};
+use lfw_tcp::{Connection, ConnectionId, MAX_UNACKED, SendError, SeqNumber, TcpStack, Timeout};
 
 use crate::TCP_MSS;
 
@@ -116,8 +124,14 @@ pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_
 /// would refuse the retransmission and stall the transfer.
 pub const RETRANSMIT_SPAN: usize = MAX_UNACKED * TCP_MSS as usize;
 
-/// Bytes of body the sliding window holds, and so the size of every window
-/// [`Server::supply_window`] is handed.
+/// Bytes of body the sliding window holds, and so the most
+/// [`Server::supply_window`] will take at once.
+///
+/// A supplier crossing a protection-domain boundary has a reply region of its
+/// own, and the two numbers must agree: this is the smaller of the pair, so the
+/// domain that fetches a window clamps its request to it under a compile-time
+/// assertion of its own rather than discovering the mismatch as a download that
+/// answers `200` and an empty body.
 pub const WINDOW_LEN: usize = 16 * 1024;
 
 /// The longest body this server will stream. A range is found by its offset from
@@ -139,8 +153,8 @@ const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 39_018);
-    assert!(RESPONSE_CAPACITY == 39_179);
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 42_142);
+    assert!(RESPONSE_CAPACITY == 42_303);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own
@@ -184,8 +198,10 @@ pub struct HttpCounters {
     /// Passes that sent nothing for want of the window: how often a download
     /// stalls on its supplier, and **ours**.
     pub window_misses: u64,
-    /// Windows offered at another `start` or length: a caller and this server
-    /// disagreeing about a body's place, which is **ours**.
+    /// Windows offered at another `start`, carrying nothing, or longer than the
+    /// length asked for: a caller and this server disagreeing about a body's
+    /// place, which is **ours**. A window merely *shorter* than what was asked
+    /// for is not one of these — it is taken and the remainder asked for again.
     pub windows_refused: u64,
     /// Windowed responses given up on: a supplier that cannot keep up.
     pub streams_abandoned: u64,
@@ -216,6 +232,21 @@ enum Phase {
     Closed,
 }
 
+/// What the array needs next: where in the body those bytes begin, how many it
+/// will take, and how much of the window they follow.
+///
+/// `behind` is what distinguishes completing the window held from replacing it.
+/// Zero means the window slides and the array is filled from its front; anything
+/// else means the bytes land behind what is already there, which is how a short
+/// supply is finished without giving up the span the transport may still re-ask
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Need {
+    start: u64,
+    len: usize,
+    behind: usize,
+}
+
 /// Where a windowed response has got to, and which slice of its body the array
 /// holds. Offsets are of the *response*: what a retransmission asks by.
 #[derive(Clone, Copy, Debug)]
@@ -224,7 +255,8 @@ struct Window {
     /// fewer bytes abandons rather than revising it.
     total: u64,
     at: u64,
-    /// Bytes of the window supplied; short of [`WINDOW_LEN`] on the last one.
+    /// Bytes of the window supplied; below [`WINDOW_LEN`] where the body ended
+    /// first or a supplier ran short of it.
     filled: usize,
     /// Response bytes handed to the transport, the head included.
     sent: u64,
@@ -256,24 +288,33 @@ impl Window {
         (lo, lo.saturating_add(filled), MAX_HEAD_LEN)
     }
 
-    /// The body byte a window must begin at, or `None` where the one held will do
-    /// or the body is out. A *start*, not the byte to send: see the header.
-    fn wanted(&self, head: usize) -> Option<u64> {
+    /// The body bytes the array needs next, or `None` where the window it holds
+    /// can still be sent from or the body is out.
+    ///
+    /// A *start*, not the byte to send: see the module header. Where the window
+    /// is not yet full the need is the byte after what it holds, so a supplier
+    /// that ran short completes it and the span behind the send point stays
+    /// servable; where it is full and spent, the window slides and the span is
+    /// re-fetched with it.
+    fn wanted(&self, head: usize) -> Option<Need> {
         let body = self.sent_body(head);
         if body >= self.total {
             return None;
         }
         // Lossless: `filled` is at most `WINDOW_LEN`.
-        if body < self.at.saturating_add(self.filled as u64) {
+        let held_end = self.at.saturating_add(self.filled as u64);
+        if body < held_end {
             return None;
         }
-        Some(body.saturating_sub(RETRANSMIT_SPAN as u64))
-    }
-
-    /// Bytes the window at `start` owes: a whole [`WINDOW_LEN`], or the rest.
-    fn expected(&self, start: u64) -> u64 {
-        // Lossless: `WINDOW_LEN` is a compile-time constant well under 2^32.
-        self.total.saturating_sub(start).min(WINDOW_LEN as u64)
+        let (start, behind) = if self.filled < WINDOW_LEN {
+            (held_end, self.filled)
+        } else {
+            (body.saturating_sub(RETRANSMIT_SPAN as u64), 0)
+        };
+        let room = WINDOW_LEN.saturating_sub(behind);
+        // Lossless: bounded by `room`, itself at most `WINDOW_LEN`.
+        let len = self.total.saturating_sub(start).min(room as u64) as usize;
+        (len > 0).then_some(Need { start, len, behind })
     }
 }
 
@@ -289,7 +330,8 @@ enum Body {
     Staged,
     /// A head in the staging array, and a sliding window of the body behind it.
     Windowed(Window),
-    /// Given up on: nothing more goes out and no range serves again.
+    /// Given up on: nothing more goes out, no range serves again, and the next
+    /// drive resets the connection rather than closing it.
     Abandoned,
 }
 
@@ -336,7 +378,7 @@ impl Slot {
 
     /// Whether the transport has yet to be handed everything. An abandoned
     /// response owes nothing whatever it announced, which turns the next drive
-    /// into the close.
+    /// into the reset that says so.
     fn owes(&self, head: usize) -> bool {
         match self.body {
             Body::Own | Body::Staged => self.sent < self.len,
@@ -667,7 +709,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 // Lossless: an exposition is at most `MAX_EXPOSITION_LEN` bytes.
                 let len = write_head(
                     Status::Ok,
-                    Some(METRICS_CONTENT_TYPE),
+                    Some(ContentType::Metrics),
                     body as u64,
                     &mut head,
                 )
@@ -702,7 +744,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// that cannot then produce exactly that many has no way back but
     /// [`abandon_stream`](Self::abandon_stream) — which is also what it owes the
     /// request where this answers `false`, changing nothing.
-    pub fn supply_stream(&mut self, total: u64, content_type: &str) -> bool {
+    pub fn supply_stream(&mut self, total: u64, content_type: ContentType) -> bool {
         let Some((connection, _)) = self.pending_stream() else {
             return false;
         };
@@ -735,8 +777,13 @@ impl<const SLOTS: usize> Server<SLOTS> {
     }
 
     /// Write the head backwards from [`MAX_HEAD_LEN`], so a window filled from
-    /// there begins where it ends. `None` for a content type past that bound.
-    fn write_stream_head(&mut self, total: u64, content_type: &str) -> Option<()> {
+    /// there begins where it ends.
+    ///
+    /// `None` only where the length will not fit, which
+    /// [`supply_stream`](Self::supply_stream) has already refused: the content
+    /// type is one [`MAX_HEAD_LEN`] was derived from, so no value of it can
+    /// overrun the reservation.
+    fn write_stream_head(&mut self, total: u64, content_type: ContentType) -> Option<()> {
         let mut head = [0u8; MAX_HEAD_LEN];
         let len = write_head(Status::Ok, Some(content_type), total, &mut head).ok()?;
         let start = MAX_HEAD_LEN.checked_sub(len)?;
@@ -748,20 +795,26 @@ impl<const SLOTS: usize> Server<SLOTS> {
         Some(())
     }
 
-    /// The body byte a window must begin at, and the connection waiting on it: a
-    /// window *start*, not the next byte to send (see [`Window::wanted`]).
+    /// The body byte the next window bytes begin at, how many of them the array
+    /// will take, and the connection waiting on them.
+    ///
+    /// A window *start*, not the next byte to send (see [`Window::wanted`]). The
+    /// length is the bound a supplier is held to and never a demand: fewer bytes
+    /// are taken and the remainder asked for again, which is what a supplier
+    /// reading a segmented medium hands over at every boundary.
     #[must_use]
-    pub fn window_wanted(&self) -> Option<(ConnectionId, u64)> {
+    pub fn window_wanted(&self) -> Option<(ConnectionId, u64, usize)> {
         let head = self.shared.head_len();
-        self.slots
-            .iter()
-            .find_map(|slot| Some((slot.connection?, slot.window()?.wanted(head)?)))
+        self.slots.iter().find_map(|slot| {
+            let need = slot.window()?.wanted(head)?;
+            Some((slot.connection?, need.start, need.len))
+        })
     }
 
     /// Hand the server the window beginning at body byte `start`: the `start`
-    /// [`window_wanted`](Self::window_wanted) named, and a whole [`WINDOW_LEN`]
-    /// unless the body ends first. Anything else is refused and counted — it would
-    /// put a recording's bytes where no client could tell they did not belong.
+    /// [`window_wanted`](Self::window_wanted) named, and between one byte and the
+    /// length it named. Anything else is refused and counted — it would put a
+    /// recording's bytes where no client could tell they did not belong.
     pub fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
         if self.take_window(start, bytes) {
             bump(&mut self.counters.windows_supplied);
@@ -781,18 +834,22 @@ impl<const SLOTS: usize> Server<SLOTS> {
         let Some((index, window)) = found else {
             return false;
         };
-        // Lossless: a slice length is a `usize`.
-        if window.wanted(head) != Some(start) || bytes.len() as u64 != window.expected(start) {
+        let Some(need) = window.wanted(head) else {
+            return false;
+        };
+        if start != need.start || bytes.is_empty() || bytes.len() > need.len {
             return false;
         }
-        // `bytes` is at most `WINDOW_LEN`, which the module's assertion holds to
-        // fit behind the head, so the zip copies all of it. An iteration rather
-        // than a slice leaves no bound to refuse at runtime.
+        // The window begins at `MAX_HEAD_LEN` and these bytes land behind
+        // whatever of it is already there. `behind + need.len` is at most
+        // `WINDOW_LEN`, which the module's assertion holds to fit behind the
+        // head, so the zip copies all of `bytes`. An iteration rather than a
+        // slice leaves no bound to refuse at runtime.
         for (target, byte) in self
             .shared
             .bytes
             .iter_mut()
-            .skip(MAX_HEAD_LEN)
+            .skip(MAX_HEAD_LEN.saturating_add(need.behind))
             .zip(bytes.iter())
         {
             *target = *byte;
@@ -800,8 +857,9 @@ impl<const SLOTS: usize> Server<SLOTS> {
         if let Some(slot) = self.slots.get_mut(index)
             && let Body::Windowed(window) = &mut slot.body
         {
-            window.at = start;
-            window.filled = bytes.len();
+            // Lossless: `behind` is at most `WINDOW_LEN`.
+            window.at = need.start.saturating_sub(need.behind as u64);
+            window.filled = need.behind.saturating_add(bytes.len());
         }
         true
     }
@@ -809,7 +867,8 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// Give up on the windowed response, wherever it has got to. Before the head
     /// is written nothing is on the wire, so the request is answered `503`: the
     /// owner registered the target and could not produce it. After it, the
-    /// connection closes short of the announced length.
+    /// connection is **reset** short of the announced length, which is the one
+    /// unambiguous way to say a message is incomplete.
     pub fn abandon_stream(&mut self) {
         if let Some((connection, _)) = self.pending_stream()
             && let Some(index) = self.index_of(connection)
@@ -857,8 +916,16 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// the slot until an idle timer reaps it. A connection already being answered
     /// is unaffected: a half-close is the client saying it has finished asking,
     /// not that it has stopped listening.
+    ///
+    /// A slot is *taken* for a connection that never had one — one that delivered
+    /// no byte at all, which is a bare `SYN` followed by a `FIN` — because it is
+    /// the close this end owes that needs recording. Without it nothing ever
+    /// asks the transport to close, and the connection sits in `CLOSE_WAIT`,
+    /// which the transport deliberately will not evict, for the whole idle
+    /// timeout: a handful of packets would then deny the port.
     pub fn note_peer_closed(&mut self, connection: ConnectionId) {
-        let Some(index) = self.index_of(connection) else {
+        let Some(index) = self.slot_for(connection) else {
+            bump(&mut self.counters.slots_exhausted);
             return;
         };
         if let Some(slot) = self.slots.get_mut(index)
@@ -922,7 +989,15 @@ impl<const SLOTS: usize> Server<SLOTS> {
         if self.slots.get(index)?.owes(head) {
             return self.send_next(stack, now, connection, index, out);
         }
-        match stack.close(now, connection, out) {
+        // A response given up on part way is short of the length its head
+        // announced, so it ends with a `RST`: a `FIN` would say the message
+        // ended where it ended, and every intermediary on the path would read a
+        // truncated recording as a complete one.
+        let ended = match self.slots.get(index)?.body {
+            Body::Abandoned => stack.abort(connection, out),
+            Body::Own | Body::Staged | Body::Windowed(_) => stack.close(now, connection, out),
+        };
+        match ended {
             Ok(written) => {
                 let slot = self.slots.get_mut(index)?;
                 slot.phase = Phase::Closed;
@@ -952,7 +1027,17 @@ impl<const SLOTS: usize> Server<SLOTS> {
             Chunk::Own { start, end } => self.slots.get(index)?.head.get(start..end)?,
             Chunk::Staged { start, end } => self.shared.bytes.get(start..end)?,
         };
-        let written = stack.send(now, connection, payload, out).ok()?;
+        // The transport records the range and advances its sequence *before* it
+        // composes, so a refused write leaves those bytes outstanding and asks
+        // for them again on the retransmission timer. This end therefore
+        // advances over exactly what it committed either way: not doing so
+        // leaves a range `range` can never find, and every retransmission of it
+        // counted as unavailable for the life of the connection.
+        let (bytes, len) = match stack.send(now, connection, payload, out) {
+            Ok(written) => (written.bytes, Some(written.len)),
+            Err(SendError::Write { committed, .. }) => (committed, None),
+            Err(_) => return None,
+        };
         let base = stack
             .connection(connection)
             .and_then(Connection::oldest_range)
@@ -965,15 +1050,12 @@ impl<const SLOTS: usize> Server<SLOTS> {
         }
         if let Body::Windowed(window) = &mut slot.body {
             // Lossless: a count of bytes taken out of one segment.
-            window.sent = window.sent.saturating_add(written.bytes as u64);
+            window.sent = window.sent.saturating_add(bytes as u64);
         } else {
-            slot.sent = slot.sent.saturating_add(written.bytes);
+            slot.sent = slot.sent.saturating_add(bytes);
         }
-        self.counters.response_bytes = self
-            .counters
-            .response_bytes
-            .saturating_add(written.bytes as u64);
-        Some(written.len)
+        self.counters.response_bytes = self.counters.response_bytes.saturating_add(bytes as u64);
+        len
     }
 
     /// Where the next unsent bytes are, or `None` where the response owes none.
@@ -1140,6 +1222,25 @@ impl<const SLOTS: usize> Server<SLOTS> {
             // Nothing may be served out of it, and nothing will ask.
             slot.body = Body::Own;
             slot.base = None;
+        }
+    }
+
+    /// Give back every slot whose connection the transport no longer holds.
+    ///
+    /// The transport frees a connection on its own — evicting one under table
+    /// pressure, taking a reset, finishing a close — and the only thing it says
+    /// about it is that the handle stops resolving. Reconciling against that
+    /// covers every such release at once, including the ones a future
+    /// transport adds; a notification per release would be one more thing a
+    /// caller must not forget, and a slot forgotten here is a slot no
+    /// connection can ever have again.
+    pub fn reconcile<const CONNECTIONS: usize>(&mut self, stack: &TcpStack<CONNECTIONS>) {
+        for index in 0..SLOTS {
+            let held = self.slots.get(index).and_then(|slot| slot.connection);
+            let Some(connection) = held else { continue };
+            if stack.connection(connection).is_none() {
+                self.release(connection);
+            }
         }
     }
 

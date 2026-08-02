@@ -11,7 +11,9 @@ From a clean checkout:
 
 ```sh
 make image          # build the OCI builder, then assemble the release A/B disk + bundle
-make test           # fast host gate: format, clippy, unit/property tests, coverage, lint, deps
+make test           # fast host gate: format, clippy, unit/property tests, coverage, the budget
+                    #   ratchets, the system-description, reference-chapter and configuration
+                    #   checks, and dependency policy
 make test-system    # boot the QEMU system scenarios; the ones with a reachable endpoint judge
                     #   metrics, logs and captures against each other and against the wire
 make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
@@ -23,7 +25,9 @@ The full command surface:
 make image                # build the OCI builder, then `xtask image` — the RELEASE configuration
 make image-debug          # assemble the debug kernel instead; an opt-in no gate reaches
 make run                  # boot the image interactively in QEMU (debug kernel, for its diagnostics)
-make test                 # fast host gate (format, clippy, tests, coverage floor, lint, dependency policy)
+make test                 # fast host gate (format, clippy, tests, coverage floor, budgets, the
+                          #   contract checks over systems/, the book and the config document,
+                          #   dependency policy)
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
@@ -56,17 +60,22 @@ cannot pass for an accelerated run.
 ## Landing changes
 
 Commits go straight to `trunk`; there are no long-lived branches, no remote feature branches, and
-no pull requests. Install the git hooks once per checkout with `make hooks`:
+no pull requests. Install the git hooks once per worktree with `make hooks` — it points
+`core.hooksPath` at `.githooks`, which git resolves relative to each worktree:
 
 - **pre-commit** runs `make test` — the fast host gate. It does not boot QEMU, so it stays fast.
 - **pre-push** runs `make ci` — the complete gate.
 
-Every commit that reaches `trunk` has therefore passed formatting, lints, tests, coverage,
-dependency policy, the fuzz targets, release image assembly, and the QEMU system and A/B gates on
-the release image — so `git bisect` is always meaningful. Do not bypass the hooks; a finding is
-fixed, not skipped. Commit subjects follow Conventional Commits (`type(scope): description`), and
-the message explains the intent, constraints, and semantic consequences of the change — the *why*
-— not a narration of the file edits, which the diff already shows.
+The two hooks do not cover the same commits, and the difference is worth knowing before trusting a
+bisect. Every commit reaching `trunk` has passed the fast host gate — formatting, lints, the host
+tests and their coverage floors, the budget ratchets, the system-description, reference-chapter and
+configuration-document checks, and dependency policy — while the full gate runs once per push,
+against the tip. A push carrying several commits therefore leaves the intermediate ones qualified
+by pre-commit alone, so a bisect may land on a commit that was never booted. Do not bypass the
+hooks; a finding is fixed, not skipped. Commit subjects follow Conventional Commits
+(`type(scope): description`), and the message explains the intent, constraints, and semantic
+consequences of the change — the *why* — not a narration of the file edits, which the diff already
+shows.
 
 The gate verifies what a machine can check, and that is less than the practice the project holds
 itself to: a green gate is necessary, never sufficient. What it checks mechanically:
@@ -76,19 +85,49 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | Formatting | `cargo fmt --all --check` |
 | Lints, warnings denied — every host crate, and the protection domains for seL4 in **both** kernel configurations | `cargo clippy` over an explicit `-p` list, in `xtask test` |
 | A `SAFETY` comment *present* on every `unsafe` block | `undocumented_unsafe_blocks = "deny"` |
-| Per-file comment ratio and per-crate `unsafe` count never rise | `xtask test` (the budget ratchets) |
+| Per-file comment ratio and per-crate `unsafe` count never rise, across `crates/` and `pds/` | `xtask test` (the budget ratchets) |
 | Coverage floors (94% combined, 90% per library crate) | `cargo llvm-cov` in `xtask test` |
 | Dependency, license and source policy | `cargo deny check bans licenses sources` |
+| The system description agrees with the constants the domains compile against: every region's extent, cacheability and per-grant permissions, the **exact** set of domains that map it, both I/O-port windows against the constants the drivers form addresses from, every channel end's notify direction, the port→driver attribution, and that each of the 110 mappings is named by a `setvar_vaddr` | `xtask test` (`sysdesc::check`) |
+| The shipped configuration document is one the appliance would accept: it goes through the same `config::load` the configuration domain runs at boot | `xtask test` (`image::check_configuration`) |
+| The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves | `xtask test` (`reference_contract`) |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
 | Boot, forwarding and A/B contracts | `xtask test-system`, `xtask test-ab` |
 
-Two things that table must not be read as saying. The lint command is **not** a bare
-`cargo clippy -- -D warnings`: `default-members = ["tools/xtask"]` makes that select `xtask` alone
-and report clean without looking at a single library crate, which is why `xtask` names its packages
-explicitly and fails the build when the list is incomplete. And the local gate runs offline, so
-`cargo deny check advisories` is not in it — vulnerability scanning is a separate networked CI
-stage (`azure-pipelines.yml`), so a local green is a dependency-policy pass and not an advisory
-scan.
+`sysdesc::check` is the **only** machine check of the capability topology. Because it names each
+region's mapper set exactly, a grant that widens and a grant that vanishes are both findings there
+and nowhere else — including the one shape the rest of it cannot see, a mapping no `setvar_vaddr`
+names, which is authority granted to a domain with no line of code in it able to say where.
+
+`reference_contract` is why the book's *content* is now gated without the book becoming a build
+input: rendering is still a reading convenience, mdbook is still not pinned into the builder, and
+no gate calls `make book` — but two chapters are read as data and held to the code, so the
+operator's interface definition can no longer go stale with every stage green.
+
+Four things that table must not be read as saying.
+
+The lint command is **not** a bare `cargo clippy -- -D warnings`:
+`default-members = ["tools/xtask"]` makes that select `xtask` alone and report clean without
+looking at a single library crate, which is why `xtask` names its packages explicitly and fails the
+build when the list is incomplete.
+
+The local gate runs offline, so `cargo deny check advisories` is not in it — vulnerability scanning
+is a separate networked CI stage (`azure-pipelines.yml`), so a local green is a dependency-policy
+pass and not an advisory scan.
+
+The two ratchets do not reach as far as the two `unsafe` lint denials do. `unsafe_op_in_unsafe_fn`
+and `undocumented_unsafe_blocks` are workspace lints and bind every member; the comment and
+`unsafe` budgets measure the product trees, `crates/` and `pds/`, and neither `tools/` nor the
+separate `fuzz/` workspace. For `xtask` and the fuzz harnesses the discipline is review, not a
+gate.
+
+And `reference_contract` sees less of its two chapters than the row above may suggest. It compares
+the parsed tables and the counts the chapters state about themselves — and deliberately not: prose
+of any kind, a family's `HELP` text included; label *values*, because a shard's series carry what a
+running node happens to publish rather than a closed set; `librefirewall_interface_info`'s label
+names, which are byte literals in the exposition writer rather than a table; and which group a
+token sits in, since a domain's tables are compared as one set per domain. A check whose reach is
+unstated invites confidence it has not earned, so those four gaps stay the reader's to close.
 
 ## Build profiles
 
@@ -134,7 +173,10 @@ assembles the release configuration into `dist/` and already holds that disk to 
 booted appliance owes. What `make release` adds: if the gate did not prove the artifact, `dist/` is
 emptied rather than left holding an unproven image that looks finished. That covers a failure
 anywhere in the run, not a failed boot alone, because assembly populates `dist/` partway through
-and an incomplete release is no more publishable than an unproven one.
+and an incomplete release is no more publishable than an unproven one. CI runs `make release`
+rather than `make ci` (`azure-pipelines.yml`), so that emptying is what actually happens on a red
+CI run rather than documented behaviour no CI run ever reaches; the publish step's `succeeded()`
+condition is then the second of two independent reasons nothing unproven leaves the pipeline.
 
 The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
 through OVMF and GRUB. Alongside it, `dist/` carries five product-prefixed pieces of release

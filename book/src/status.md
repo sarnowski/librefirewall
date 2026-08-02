@@ -12,15 +12,22 @@ The current deployable system is a two-dataplane-port routed IPv4 slice: one dri
 domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4 capabilities
 alone, and an isolated forwarder protection domain routes frames between the two ports — parsing
 each one, deciding on it against the configuration in force, and rewriting its Ethernet and IPv4
-headers in place, so the payload is never copied.
+headers in place. A frame is never moved **between** buffers: one pool buffer carries it from one
+NIC's DMA to the other's, and only the 34 rewritten header bytes travel back into it. The decision
+itself is taken on a private copy, because a verdict reached on bytes a peer may rewrite underneath
+it is no verdict — so a hop costs one copy of the payload, and a second when the recording tap is
+attached.
 
 That configuration is a schema-validated XML document, read and committed by a protection domain
 of its own that holds no device and no dataplane memory, and handed to the forwarder through a
 shared region under an offer/acknowledge protocol. The forwarder boots **fail-closed** — an empty
-table, forwarding nothing — and switches to a configuration only after re-checking every field of
-it itself, so every boot performs a live configuration swap on a running dataplane. There is still
-no way to *submit* a document to a running node: the configuration is embedded into the image at
-build time, so a configuration change requires a new image and a reboot.
+table, forwarding nothing — and switches to a configuration only after re-deciding, itself, every
+one of the 23 rules the validating domain applied — at that domain's own strength on all but two,
+both named and both about values the image does not carry — so a compromised parser cannot hand it
+a table those rules refuse. Every boot therefore performs a live
+configuration swap on a running dataplane. There is still no way to *submit* a document to a
+running node: the configuration is embedded into the image at build time, so a configuration change
+requires a new image and a reboot.
 
 A **dedicated management port** is the third NIC, and it is an addressed IPv4 endpoint that
 answers for itself and forwards nothing. It answers ARP requests for its own address, ICMP echo
@@ -69,16 +76,20 @@ A recorder domain owns the appliance's **block device** and turns the traffic in
 record. It brings a virtio-blk device up, proves the path to the medium by reading a sector and
 writing a recognisable one back, and then writes **two pcapng recordings** onto that device: a
 *log* recording snapped to 128 bytes per frame and a *capture* recording snapped to 2048. What it
-records is what the forwarder taps: every frame the router reached a decision about, copied out at
-the decision point *before* the forwarding rewrite, so what reaches the medium is what the wire
-carried. Either recording is downloadable whole over the management port — `GET /logs.pcapng`,
-`GET /capture.pcapng` — and `tcpdump -r` opens both natively. The recorder is the only domain in
-the system that can put a byte on persistent storage, and the only path between it and the
-dataplane is a one-way tap that can never backpressure forwarding.
+records is what the forwarder taps: one observation of every frame the router reached a decision
+about, lifted while the frame is still the one that arrived rather than the one this appliance will
+send on — which is what makes a recording evidence about the wire and not about the appliance's own
+output. Either recording is downloadable whole over the management port — `GET /logs.pcapng`,
+`GET /capture.pcapng` — and `tcpdump -r` opens both natively. Each recording is a ring across a
+fixed extent of the disk, and the first sectors of that extent are its **superblock**: a doubled,
+checksummed record of the ring's geometry and of how far it has been durably written, so the extent
+can be read back from the medium alone with nothing else to consult. The recorder is the only
+domain in the system that can put a byte on persistent storage, and the only path between it and
+the dataplane is a one-way tap that can never backpressure forwarding.
 
 Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
 forwarded because it is routable, never because a policy allowed it. There is no connection
-tracking and no NAT, and the ARP and ICMP that exist belong to the management endpoint alone — the
+tracking and no NAT, and the ARP and ICMP that exist belong to the management port alone — the
 dataplane resolves a next hop from a static neighbour table and answers nothing for itself. What
 exists is a router on a firewall's substrate, not yet a firewall.
 
@@ -95,13 +106,13 @@ headers rather than an event log.
 | Capability | Status | Notes |
 |---|---|---|
 | Stateful L2–L4 filtering and connection tracking | **open** | |
-| Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management endpoint only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
+| Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |
 | Flow classifier (cut-through vs. proxy path) | **open** | |
-| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — [detail](developers/status-detail.md#prometheus-metrics) |
+| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — described with the [`/metrics` endpoint](developers/status-detail.md#prometheus-metrics) |
 | OT/industrial protocol inspection | **open** | |
-| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
+| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | this row is about the dataplane and the proxy, where nothing exists. **Nothing bounds the rate of requests to the management port either** — the [management design](design/management.md) asks it to, and the only rate bound anywhere in the appliance is RFC 5961 §7's per-second challenge budget, which caps unsolicited TCP replies and not requests. What does exist is bounded *state*: the transport's connection table is fixed and reaped under pressure — [detail](developers/status-detail.md#proxy-tcp-stack) |
 | Mirror port | **open** | the [recording design](design/recording.md) holds the recording sinks and a mirror to be complementary rather than alternatives; the sinks exist, the mirror does not |
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
@@ -120,7 +131,7 @@ headers rather than an event log.
 | Multicore dataplane, RSS, per-core flow shards | **open** | single vCPU today |
 | Proxy TCP stack | **partial** | a first-party passive-open stack carries a real connection on the management port, and it is the stack the dataplane proxy will run on; no active open, no SACK, no congestion control, and no dataplane consumer — [detail](developers/status-detail.md#proxy-tcp-stack) |
 | 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
-| IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
+| IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is unconfined. seL4 leaves the IOMMU *enabled* — Microkit's x86 default, recorded in the [update design](design/updates.md) — which is not the same thing: a device's writes are bounded only once that device is placed in an IOMMU domain, and none is |
 | Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists, is addressed, answers ARP, ICMP echo and TCP, and is isolated from the dataplane; no other role does — [detail](developers/status-detail.md#full-port-role-model) |
 | Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
 | ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
@@ -132,18 +143,18 @@ headers rather than an event log.
 | Capability | Status | Notes |
 |---|---|---|
 | First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
-| pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — [detail](developers/status-detail.md#recording-and-download) |
+| pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — described with the [recordings](developers/status-detail.md#recording-and-download) |
 | Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no filtering, so the capture sink is unfiltered and on by default — [detail](developers/status-detail.md#recording-and-download) |
-| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
-| A recording that states its own loss in-band | **open** | `epb_dropcount` is written on every record and is always `0` because nothing feeds it, and no Interface Statistics Block is emitted; loss reaches `/metrics` and never the file — see the [recording design](design/recording.md) |
+| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for the *time range* the [management design](design/management.md) does ask for, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
+| A recording that states its own loss in-band | **partial** | `epb_dropcount` is fed: the recorder differences the forwarder's tap-drop counter on every pass and carries the rise as a debt onto the next record placed, so a file does state the observations the tap ring lost ahead of each block. It states **only** those — what a sink could not encode and what the medium refused reach `/metrics` and never the file, and no Interface Statistics Block is emitted — see the [recording design](design/recording.md) |
 | Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
 | Recording the management port | **open** | only the dataplane is tapped, so nothing on the management port — including a download — is recorded |
 | Retention bound and zeroization | **open** | the only bound is the ring's size; there is no time bound and nothing is erased on stop — see the [recording design](design/recording.md) |
 | Rotation and checkpointing on a schedule | **open** | a superblock is written when the recorder decides to, never on a clock |
 | Resuming a recording across a boot | **open** | `Sink::resume` exists and is host-tested; nothing calls it, so a reboot starts a fresh ring over the old bytes |
-| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path — see the [recording design](design/recording.md) |
+| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path. That is a named deviation from the [recording design](design/recording.md), and it is why no series says how much history a recording still holds: a wrap count says a segment was evicted and there is no cursor for it to have been evicted past |
 | Live event stream, OTEL and syslog exporters as ring readers | **open** | see the [management](design/management.md) and [recording](design/recording.md) designs |
-| Registered Private Enterprise Number | **open** | the annotations are tagged `0xFFFFFFFF`, IANA-reserved so it cannot collide, but not ours — a recording must not leave a customer's premises under it |
+| Registered Private Enterprise Number | **open** | the annotations are tagged `0xFFFFFFFF`, IANA-reserved so it cannot collide, but registered to nobody — a recording must not leave a customer's premises under it. Which party would hold one is itself unsettled — [detail](developers/status-detail.md#recording-and-download) |
 | Storage binding from the configuration document | **open** | the extents are compiled into `lfw_recorder::deck` and the device is the whole of one disk; nothing resolves a partition and no configuration item names one — see the [configuration](design/configuration.md) and [recording](design/recording.md) designs |
 | Decryption Secrets Block (inspected flow as ciphertext plus keys) | **open** | nothing is inspected, so there is no key material — see the [recording design](design/recording.md) |
 
@@ -165,9 +176,9 @@ headers rather than an event log.
 | Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](developers/status-detail.md#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
-| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
-| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](developers/status-detail.md#prometheus-metrics) |
-| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium |
+| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the design's **System** category alone — Audit, Traffic and Subsystem have none. No transport, exporter or receiver exists, so the OpenTelemetry inventory in the [observability reference](reference/observability.md) is empty, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane and the flow table awaits the stateful one; occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
+| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. `GET /config` does not exist either, so of the debug dump the [observability reference](reference/observability.md) describes, the state half and the recordings are what a node can be asked for; the retained records and the running document cannot be, and the reference's local-buffer inventory is empty |
 
 ## Lifecycle, boot and trust
 

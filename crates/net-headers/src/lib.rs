@@ -33,6 +33,10 @@
 //! * **Only the first fragment carries a transport header.** A non-initial
 //!   fragment reports [`Transport::NonInitialFragment`] rather than reading
 //!   payload bytes as though they were a UDP header.
+//! * **A transport header is annotation, never a verdict.** [`Transport`] is
+//!   total: nothing behind the IPv4 header can make a frame unparsable. A router
+//!   carries a datagram because the datagram is well formed, and what the
+//!   transport says about itself is the receiving endpoint's to check.
 //! * **IPv6 is absent**: of the two L3 protocols the design names, only
 //!   IPv4 is handled.
 //! * **ARP is IPv4-over-Ethernet or nothing.** Any other hardware type,
@@ -301,15 +305,27 @@ impl Ipv4Header {
 pub struct UdpHeader {
     pub source_port: u16,
     pub destination_port: u16,
-    /// Header plus payload, as it is on the wire; at least [`UDP_HEADER_LEN`].
+    /// Header plus payload, exactly as it is on the wire and checked against
+    /// nothing: a value below [`UDP_HEADER_LEN`] or above what the datagram
+    /// carries reaches a reader unaltered.
     pub length: u16,
     pub checksum: u16,
 }
 
 /// What sits behind the IPv4 header.
+///
+/// Every variant is an *annotation*: nothing here can make a frame unroutable.
+/// A UDP length contradicting the IP total length is surfaced as it stands, and
+/// a header the datagram is too short for is
+/// [`TruncatedUdp`](Self::TruncatedUdp) rather than an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     Udp(UdpHeader),
+    /// A datagram claiming UDP with fewer than [`UDP_HEADER_LEN`] bytes behind
+    /// its IPv4 header, so no port could be read. Carries what there was.
+    TruncatedUdp {
+        available: usize,
+    },
     /// A fragment carrying no transport header at its offset, so none was read.
     NonInitialFragment,
     /// A protocol this crate does not parse. Carried rather than rejected: a
@@ -723,6 +739,10 @@ impl Checksum {
         Self(accumulate(self.0, bytes))
     }
 
+    /// Add one 16-bit word. Saturating on the same argument
+    /// [`add_bytes`](Self::add_bytes) makes: a `u32` holds every pair of a 64 KiB
+    /// datagram — the largest an IPv4 total length names — with orders of
+    /// magnitude to spare, so the bound is unreachable rather than lossy.
     #[must_use]
     pub const fn add_u16(self, value: u16) -> Self {
         Self(self.0.saturating_add(value as u32))
@@ -885,9 +905,8 @@ impl EchoReply<'_> {
     ///
     /// # Errors
     /// [`ReplyError`], for storage that cannot hold the frame or an echo payload
-    /// no datagram can name. Bytes of `out` may have been written on the
-    /// [`ReplyError::DoesNotFit`] path only up to the length that did fit, which
-    /// the caller discards along with the outcome.
+    /// no datagram can name. Both rejections precede every write, so `out` is
+    /// byte-for-byte untouched on either.
     pub fn write(&self, out: &mut [u8]) -> Result<usize, ReplyError> {
         let payload = self.echo.payload;
         let Some(total_length) = (IPV4_HEADER_LEN + ICMP_ECHO_HEADER_LEN)
@@ -1030,19 +1049,124 @@ pub enum ParseError {
         found: u16,
         computed: u16,
     },
-    /// The datagram claims UDP but leaves no room for a UDP header.
-    UdpHeaderTruncated {
-        available: usize,
-    },
-    /// A UDP length below its own header, which would make the payload length
-    /// negative.
-    UdpLengthBelowHeader {
-        length: u16,
-    },
-    UdpLengthExceedsDatagram {
-        length: u16,
-        available: usize,
-    },
+}
+
+impl ParseError {
+    /// Which class of malformation this is, and so which counter the frame it
+    /// refused belongs to.
+    #[must_use]
+    pub const fn failure(self) -> ParseFailure {
+        match self {
+            Self::FrameTooShort { .. } => ParseFailure::FrameTooShort,
+            Self::UnsupportedEtherType(_) | Self::StackedVlanTags => ParseFailure::Ethernet,
+            Self::Ipv4VersionNotFour(_)
+            | Self::Ipv4OptionsUnsupported { .. }
+            | Self::Ipv4TotalLengthBelowHeader { .. }
+            | Self::Ipv4TotalLengthExceedsFrame { .. } => ParseFailure::Ipv4,
+            Self::Ipv4ChecksumInvalid { .. } => ParseFailure::Ipv4Checksum,
+        }
+    }
+}
+
+/// The class of malformation a [`ParseError`] reports: what a counter of refused
+/// frames is kept per, and so the vocabulary an operator reads.
+///
+/// Coarser than [`ParseError`] deliberately, because these four are four
+/// different things to do about them: a frame too short for its own headers
+/// points at a link or a driver, an Ethernet refusal at what is being sent onto
+/// the segment, a malformed IPv4 header at a sender or an attack, and a checksum
+/// failure at corruption on the path. A series per error variant would be eight
+/// numbers nobody can act on differently, and the values that make a rejection
+/// diagnosable are carried by the error itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ParseFailure {
+    /// The frame did not carry the headers it would take to be routed at all.
+    FrameTooShort,
+    /// The Ethernet layer: an EtherType this appliance does not route, or
+    /// stacked 802.1Q tags.
+    Ethernet,
+    /// The IPv4 header's own fields: version, options, or a total length that
+    /// contradicts either the header or the frame.
+    Ipv4,
+    /// The IPv4 header checksum, which means something different from a
+    /// malformed header: every field was readable and the sum over them does
+    /// not match.
+    Ipv4Checksum,
+}
+
+impl ParseFailure {
+    /// Every variant, so a counter table can be built by iteration rather than
+    /// by a list that drifts from the enum.
+    pub const ALL: [Self; 4] = [
+        Self::FrameTooShort,
+        Self::Ethernet,
+        Self::Ipv4,
+        Self::Ipv4Checksum,
+    ];
+
+    /// A stable short name, for a metric label or a report line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::FrameTooShort => "frame_too_short",
+            Self::Ethernet => "ethernet_unparsable",
+            Self::Ipv4 => "ipv4_unparsable",
+            Self::Ipv4Checksum => "ipv4_checksum_invalid",
+        }
+    }
+
+    /// The index this class occupies in [`ParseCounters`], and so in `ALL`.
+    #[must_use]
+    const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+impl fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// One counter per [`ParseFailure`], indexed by the class itself so a new
+/// variant cannot be added without a slot to record it.
+///
+/// Saturating and never reset: the rate is attacker-controlled, and a scrape
+/// differences successive reads, so a wrap would forge a negative rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseCounters {
+    counts: [u64; ParseFailure::ALL.len()],
+}
+
+impl ParseCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counts: [0; ParseFailure::ALL.len()],
+        }
+    }
+
+    /// Count one refused frame under the class its error names.
+    pub fn record(&mut self, error: ParseError) {
+        if let Some(count) = self.counts.get_mut(error.failure().slot()) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, failure: ParseFailure) -> u64 {
+        match self.counts.get(failure.slot()) {
+            Some(count) => *count,
+            None => 0,
+        }
+    }
+
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.counts
+            .iter()
+            .fold(0u64, |sum, count| sum.saturating_add(*count))
+    }
 }
 
 impl fmt::Display for ParseError {
@@ -1076,18 +1200,6 @@ impl fmt::Display for ParseError {
             Self::Ipv4ChecksumInvalid { found, computed } => write!(
                 f,
                 "header checksum 0x{found:04x} does not match the computed 0x{computed:04x}"
-            ),
-            Self::UdpHeaderTruncated { available } => write!(
-                f,
-                "{available} bytes leave no room for a {UDP_HEADER_LEN}-byte UDP header"
-            ),
-            Self::UdpLengthBelowHeader { length } => write!(
-                f,
-                "UDP length {length} is below the {UDP_HEADER_LEN}-byte header"
-            ),
-            Self::UdpLengthExceedsDatagram { length, available } => write!(
-                f,
-                "UDP length {length} exceeds the {available} bytes the datagram carries"
             ),
         }
     }
@@ -1132,6 +1244,10 @@ impl<'a> Frame<'a> {
     /// is modified on any error path.
     pub fn parse(bytes: &'a mut [u8]) -> Result<Self, ParseError> {
         let frame_len = bytes.len();
+        // `needed` is one quantity throughout: the length this whole frame would
+        // have to be for the header that was cut short to fit behind as much of
+        // L2 as has been recognised — an Ethernet and an IPv4 header before the
+        // EtherType is readable, plus the 802.1Q tag past the dispatch.
         let too_short = |needed: usize| ParseError::FrameTooShort {
             needed,
             got: frame_len,
@@ -1170,7 +1286,11 @@ impl<'a> Frame<'a> {
 
         let available_for_ip = after_l2.len();
         let Some((ipv4, payload)) = after_l2.split_first_chunk_mut::<IPV4_HEADER_LEN>() else {
-            return Err(too_short(frame_len + (IPV4_HEADER_LEN - available_for_ip)));
+            // The L2 headers the dispatch consumed plus an IPv4 header — the
+            // same quantity, exact now that the tag is known. No underflow: the
+            // split failed, so `available_for_ip` is below `IPV4_HEADER_LEN`.
+            let l2_len = frame_len - available_for_ip;
+            return Err(too_short(l2_len + IPV4_HEADER_LEN));
         };
 
         let (header, datagram_payload_len) = validate_ipv4(ipv4, payload.len(), available_for_ip)?;
@@ -1183,7 +1303,7 @@ impl<'a> Frame<'a> {
             });
         };
 
-        let transport = parse_transport(&header, datagram_payload)?;
+        let transport = parse_transport(&header, datagram_payload);
 
         Ok(Self {
             macs,
@@ -1307,17 +1427,24 @@ fn validate_ipv4(
     Ok((header, datagram_payload_len))
 }
 
-fn parse_transport(header: &Ipv4Header, payload: &[u8]) -> Result<Transport, ParseError> {
+/// Read what sits behind the IPv4 header, without judging it.
+///
+/// Total, and that is the point: a transport header cannot make a datagram
+/// unroutable, so there is no error to return. Whether the UDP length agrees
+/// with the IP total length is the receiving endpoint's question, and dropping
+/// the packet here would perform its check for it. The fields are read for
+/// annotation and handed on as they were found.
+fn parse_transport(header: &Ipv4Header, payload: &[u8]) -> Transport {
     if header.fragment_offset != 0 {
-        return Ok(Transport::NonInitialFragment);
+        return Transport::NonInitialFragment;
     }
     if header.protocol != Protocol::UDP {
-        return Ok(Transport::Unparsed(header.protocol));
+        return Transport::Unparsed(header.protocol);
     }
     let Some((udp, _)) = payload.split_first_chunk::<UDP_HEADER_LEN>() else {
-        return Err(ParseError::UdpHeaderTruncated {
+        return Transport::TruncatedUdp {
             available: payload.len(),
-        });
+        };
     };
     let [
         sp_high,
@@ -1329,24 +1456,12 @@ fn parse_transport(header: &Ipv4Header, payload: &[u8]) -> Result<Transport, Par
         ck_high,
         ck_low,
     ] = *udp;
-    let length = u16::from_be_bytes([len_high, len_low]);
-    let Some(udp_payload_len) = usize::from(length).checked_sub(UDP_HEADER_LEN) else {
-        return Err(ParseError::UdpLengthBelowHeader { length });
-    };
-    // A fragmented first piece legitimately carries less than the UDP length
-    // announces, the rest being in the following fragments.
-    if !header.more_fragments && udp_payload_len > payload.len() - UDP_HEADER_LEN {
-        return Err(ParseError::UdpLengthExceedsDatagram {
-            length,
-            available: payload.len(),
-        });
-    }
-    Ok(Transport::Udp(UdpHeader {
+    Transport::Udp(UdpHeader {
         source_port: u16::from_be_bytes([sp_high, sp_low]),
         destination_port: u16::from_be_bytes([dp_high, dp_low]),
-        length,
+        length: u16::from_be_bytes([len_high, len_low]),
         checksum: u16::from_be_bytes([ck_high, ck_low]),
-    }))
+    })
 }
 
 const fn version_of(header: &[u8; IPV4_HEADER_LEN]) -> u8 {
@@ -1670,15 +1785,37 @@ mod tests {
         );
     }
 
+    /// A UDP length field that contradicts the datagram is carried, not
+    /// refused: it is not a routability property, and dropping the packet here
+    /// would make this appliance perform the receiving endpoint's check.
     #[test]
-    fn a_udp_length_below_its_own_header_is_refused() {
-        let mut bytes = udp_frame(64, b"abcd");
+    fn a_udp_length_that_disagrees_with_the_datagram_still_parses() {
         let udp_start = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
-        bytes[udp_start + 4..udp_start + 6].copy_from_slice(&4u16.to_be_bytes());
-        assert_eq!(
-            Frame::parse(&mut bytes).unwrap_err(),
-            ParseError::UdpLengthBelowHeader { length: 4 }
-        );
+        for length in [0u16, 4, 1000, u16::MAX] {
+            let mut bytes = udp_frame(64, b"abcd");
+            bytes[udp_start + 4..udp_start + 6].copy_from_slice(&length.to_be_bytes());
+            let frame = Frame::parse(&mut bytes).expect("the datagram is still routable");
+            match frame.transport() {
+                Transport::Udp(udp) => assert_eq!(
+                    udp.length, length,
+                    "the length field reached the caller altered"
+                ),
+                other => panic!("expected the UDP header as it stands, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same for a datagram with no room for the UDP header it claims: the
+    /// ports cannot be read, so none are reported, and the frame stays routable.
+    #[test]
+    fn a_datagram_too_short_for_the_udp_header_it_claims_still_parses() {
+        let mut bytes = udp_frame(64, b"xy");
+        let total_length = (IPV4_HEADER_LEN + 4) as u16;
+        bytes[ETHERNET_HEADER_LEN + 2..ETHERNET_HEADER_LEN + 4]
+            .copy_from_slice(&total_length.to_be_bytes());
+        reseal(&mut bytes);
+        let frame = Frame::parse(&mut bytes).expect("the datagram is still routable");
+        assert_eq!(frame.transport(), Transport::TruncatedUdp { available: 4 });
     }
 
     #[test]
@@ -1726,29 +1863,6 @@ mod tests {
             ParseError::Ipv4TotalLengthBelowHeader { total_length: 8 }
         );
 
-        // A datagram whose total length leaves no room for the UDP header it
-        // claims to carry.
-        let mut truncated_udp = udp_frame(64, b"xy");
-        let total_length = (IPV4_HEADER_LEN + 4) as u16;
-        truncated_udp[ETHERNET_HEADER_LEN + 2..ETHERNET_HEADER_LEN + 4]
-            .copy_from_slice(&total_length.to_be_bytes());
-        reseal(&mut truncated_udp);
-        assert_eq!(
-            Frame::parse(&mut truncated_udp).unwrap_err(),
-            ParseError::UdpHeaderTruncated { available: 4 }
-        );
-
-        let mut long_udp = udp_frame(64, b"xy");
-        let udp_at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
-        long_udp[udp_at + 4..udp_at + 6].copy_from_slice(&1000u16.to_be_bytes());
-        assert_eq!(
-            Frame::parse(&mut long_udp).unwrap_err(),
-            ParseError::UdpLengthExceedsDatagram {
-                length: 1000,
-                available: UDP_HEADER_LEN + 2,
-            }
-        );
-
         // Four bytes are not an 802.1Q tag and an inner EtherType.
         let mut stub = udp_frame(64, b"xy");
         stub[MAC_PAIR_LEN..ETHERNET_HEADER_LEN].copy_from_slice(&EtherType::VLAN.0.to_be_bytes());
@@ -1776,12 +1890,70 @@ mod tests {
         }
     }
 
+    /// Every error classifies, the four classes are distinct, and each has its
+    /// own counter slot: what makes the metric label set closed.
+    #[test]
+    fn every_parse_error_falls_into_exactly_one_counted_class() {
+        let errors = [
+            ParseError::FrameTooShort { needed: 34, got: 9 },
+            ParseError::UnsupportedEtherType(EtherType::IPV6),
+            ParseError::StackedVlanTags,
+            ParseError::Ipv4VersionNotFour(6),
+            ParseError::Ipv4OptionsUnsupported { ihl: 6 },
+            ParseError::Ipv4TotalLengthBelowHeader { total_length: 8 },
+            ParseError::Ipv4TotalLengthExceedsFrame {
+                total_length: 9000,
+                available: 60,
+            },
+            ParseError::Ipv4ChecksumInvalid {
+                found: 1,
+                computed: 2,
+            },
+        ];
+        let mut counters = ParseCounters::new();
+        for error in errors {
+            assert!(
+                ParseFailure::ALL.contains(&error.failure()),
+                "{error} classifies outside the counted set"
+            );
+            counters.record(error);
+        }
+        assert_eq!(counters.total(), errors.len() as u64);
+        // The eight errors above are the whole enum, so the per-class counts are
+        // the whole partition: two Ethernet, four IPv4, one each of the others.
+        assert_eq!(counters.get(ParseFailure::FrameTooShort), 1);
+        assert_eq!(counters.get(ParseFailure::Ethernet), 2);
+        assert_eq!(counters.get(ParseFailure::Ipv4), 4);
+        assert_eq!(counters.get(ParseFailure::Ipv4Checksum), 1);
+
+        let mut names: Vec<&str> = ParseFailure::ALL.iter().map(|kind| kind.name()).collect();
+        for (kind, name) in ParseFailure::ALL.into_iter().zip(&names) {
+            assert_eq!(&format!("{kind}"), name);
+        }
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "two classes share a metric name");
+    }
+
+    #[test]
+    fn a_parse_counter_saturates_rather_than_wrapping() {
+        let mut counters = ParseCounters::new();
+        counters.counts[ParseFailure::Ipv4Checksum.slot()] = u64::MAX;
+        counters.record(ParseError::Ipv4ChecksumInvalid {
+            found: 1,
+            computed: 2,
+        });
+        assert_eq!(counters.get(ParseFailure::Ipv4Checksum), u64::MAX);
+        assert_eq!(counters.total(), u64::MAX);
+    }
+
     #[test]
     fn every_rejection_renders_as_the_values_that_caused_it() {
-        // A drop is currently unobservable on any operator surface: these
-        // renderings are what a rejection will read as once it is, so a `{}`
-        // that printed the variant name and none of its values would be
-        // discovered on the one path where nothing else is available.
+        // The metric surface counts a refused frame by its `ParseFailure`
+        // class; these renderings are the values behind that number, and a `{}`
+        // that printed the variant name and none of them would leave a console
+        // record or a report line with nothing to diagnose from.
         let renderings = [
             format!("{}", ParseError::FrameTooShort { needed: 34, got: 9 }),
             format!("{}", ParseError::UnsupportedEtherType(EtherType::ARP)),
@@ -1804,15 +1976,6 @@ mod tests {
                 ParseError::Ipv4ChecksumInvalid {
                     found: 0x1234,
                     computed: 0x5678,
-                }
-            ),
-            format!("{}", ParseError::UdpHeaderTruncated { available: 4 }),
-            format!("{}", ParseError::UdpLengthBelowHeader { length: 4 }),
-            format!(
-                "{}",
-                ParseError::UdpLengthExceedsDatagram {
-                    length: 1000,
-                    available: 10,
                 }
             ),
         ];

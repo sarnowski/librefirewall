@@ -327,6 +327,28 @@ impl QueueDoorbell for Doorbell {
 /// `CommonCfg` mapped over plain host memory reads back exactly what was
 /// written. Without the seam those branches would be reachable only under QEMU,
 /// whose virtio-net conforms and so never takes them.
+/// The transport's gate on DMA: whether the device may master the bus at all.
+///
+/// Separate from [`VirtioDevice`] because it is a bit in the *host's* PCI
+/// command register rather than anything the device answers, and separate so the
+/// order lives in one place. [`Offered::acknowledge`] resets the device and only
+/// then opens the gate: virtio 1.0 section 3.1.1 makes the reset step one, and a
+/// device granted DMA before it still holds the queue addresses firmware or a
+/// warm reboot left it — with no IOMMU, addresses it may write.
+///
+/// `virtio::pci::PciConfig` implements it; a host test passes a stand-in that
+/// records when the gate opened, which is how the ordering is asserted.
+pub trait BusMaster {
+    /// Grant the device bus-master DMA. Called once, after the reset.
+    fn enable_dma(&self);
+}
+
+impl BusMaster for PciConfig {
+    fn enable_dma(&self) {
+        self.enable_bus_master();
+    }
+}
+
 pub trait VirtioDevice {
     type Doorbell: QueueDoorbell;
 
@@ -467,8 +489,12 @@ impl Identified {
         self.caps
     }
 
-    /// Relocate the device's BAR to `bar_paddr` and re-enable memory decoding
-    /// and bus mastering. Nothing is written to the device on rejection.
+    /// Relocate the device's BAR to `bar_paddr` and re-enable memory decoding.
+    /// Nothing is written to the device on rejection.
+    ///
+    /// Decoding and nothing else: the device answers in the window the driver
+    /// mapped, which the reset in [`Offered::acknowledge`] needs, and is granted
+    /// no DMA until that reset has happened. See [`BusMaster`].
     ///
     /// `bar_paddr` is build data — the `bar_paddr` setvar the Microkit tool
     /// patches from the system description — and is validated rather than
@@ -493,7 +519,7 @@ impl Identified {
         config
             .reprogram_bar64(self.caps.bar, address)
             .map_err(BringUpError::BarIndexRefused)?;
-        config.enable_memory_and_bus_master();
+        config.enable_memory();
         Ok(PlacedBar { caps: self.caps })
     }
 }
@@ -561,18 +587,23 @@ impl<D: VirtioDevice> Offered<D> {
         Self { device }
     }
 
-    /// Reset the device, then tell it the driver has noticed it and knows how
-    /// to drive it (`ACKNOWLEDGE`, then `ACKNOWLEDGE | DRIVER`).
+    /// Reset the device, grant it DMA, then tell it the driver has noticed it
+    /// and knows how to drive it (`ACKNOWLEDGE`, then `ACKNOWLEDGE | DRIVER`).
     ///
-    /// Both writes are cumulative ORs of the bits set so far, as virtio 1.0
-    /// section 3.1.1 requires: the device latches the status byte as written, so
-    /// setting `DRIVER` alone would retract `ACKNOWLEDGE`. A refused reset
-    /// writes `STATUS_FAILED` before returning.
-    pub fn acknowledge(self) -> Result<Acknowledged<D>, BringUpError> {
+    /// The reset is first because virtio 1.0 section 3.1.1 makes it step one,
+    /// and `bus` is opened immediately after it and nowhere else; a refused reset
+    /// therefore never reaches the grant, leaving a device that cannot master the
+    /// bus at all. Both status writes are cumulative ORs of the bits set so far,
+    /// as the same section requires: the device latches the byte as written, so
+    /// setting `DRIVER` alone would retract `ACKNOWLEDGE`.
+    pub fn acknowledge(self, bus: &impl BusMaster) -> Result<Acknowledged<D>, BringUpError> {
         if let Err(error) = self.device.reset() {
             self.device.set_status(STATUS_FAILED);
             return Err(BringUpError::ResetRefused(error));
         }
+        // Reset state, so it holds no queue address: the one instant at which
+        // granting DMA gives the device nothing to write.
+        bus.enable_dma();
         self.device.set_status(STATUS_ACKNOWLEDGE);
         self.device.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
         Ok(Acknowledged {
@@ -752,7 +783,7 @@ impl<D: VirtioDevice> Live<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_device::{Event, FakeDevice, Log};
+    use crate::fake_device::{Event, FakeBusMaster, FakeDevice, Log};
     use proptest::prelude::*;
     use std::boxed::Box;
     use std::vec;
@@ -924,8 +955,9 @@ mod tests {
 
     /// Run the whole handshake against `device`, from [`Offered`] to [`Live`].
     fn bring_up(device: FakeDevice) -> Result<Live<FakeDevice>, BringUpError> {
+        let bus = device.bus();
         Ok(Offered::new(device)
-            .acknowledge()?
+            .acknowledge(&bus)?
             .negotiate_features()?
             .configure_queues(0x3000_0000)?
             .go_live())
@@ -942,10 +974,61 @@ mod tests {
             .place_bar(&fake.config(), 0x5000_0000)
             .expect("an aligned 32-bit target");
         // The low half carries the address, the high half is cleared, and
-        // decoding is on again: bit 1 (memory) and bit 2 (bus master).
+        // decoding is on again — bit 1 (memory) — while bus mastering, bit 2,
+        // is still off: the device has not been reset yet, so it holds whatever
+        // queue addresses it was left with and may not be allowed to write.
         assert_eq!(fake.r32(CFG_BAR0 + 4 * 4), 0x5000_0000);
         assert_eq!(fake.r32(CFG_BAR0 + 5 * 4), 0);
-        assert_eq!(fake.r16(0x04) & 0b110, 0b110);
+        assert_eq!(fake.r16(0x04) & 0b010, 0b010, "memory decoding is off");
+        assert_eq!(
+            fake.r16(0x04) & 0b100,
+            0,
+            "bus mastering was granted before the device was reset"
+        );
+    }
+
+    /// The device is reset before it may master the bus, and the two are one
+    /// step so no path can reach the grant without the reset.
+    #[test]
+    fn dma_is_granted_only_after_the_reset() {
+        let log = Log::new();
+        let device = FakeDevice::conforming(&log);
+        let bus = device.bus();
+        Offered::new(device)
+            .acknowledge(&bus)
+            .expect("a conforming device acknowledges its reset");
+        let events = log.events();
+        assert_eq!(
+            events.first(),
+            Some(&Event::Reset),
+            "something reached the device before its reset"
+        );
+        assert_eq!(
+            events.get(1),
+            Some(&Event::DmaEnabled),
+            "DMA was granted somewhere other than immediately after the reset"
+        );
+        // And before the status writes, so nothing the driver tells the device
+        // sits between the reset and the grant.
+        assert_eq!(events.get(2), Some(&Event::Status(STATUS_ACKNOWLEDGE)));
+    }
+
+    /// A device that never acknowledges its reset is never granted DMA: the
+    /// refusal is what keeps a misbehaving device off the bus entirely.
+    #[test]
+    fn a_device_that_refuses_its_reset_is_never_granted_dma() {
+        let log = Log::new();
+        let device = FakeDevice::conforming(&log).refusing_reset(STATUS_DRIVER_OK);
+        let bus = device.bus();
+        assert!(matches!(
+            Offered::new(device).acknowledge(&bus),
+            Err(BringUpError::ResetRefused(_))
+        ));
+        assert!(
+            !log.events().contains(&Event::DmaEnabled),
+            "a device that refused its reset was granted DMA anyway"
+        );
+        assert_eq!(log.events().last(), Some(&Event::Status(STATUS_FAILED)));
     }
 
     #[test]
@@ -1138,6 +1221,10 @@ mod tests {
             log.events(),
             vec![
                 Event::Reset,
+                // The DMA grant sits behind the reset and in front of every
+                // status write: a device reaches bus-master authority only once
+                // it has been put back to a known state.
+                Event::DmaEnabled,
                 Event::Status(STATUS_ACKNOWLEDGE),
                 Event::Status(STATUS_ACKNOWLEDGE | STATUS_DRIVER),
                 Event::DriverFeatures(ACCEPTED_FEATURES),
@@ -1151,7 +1238,7 @@ mod tests {
                 ),
                 Event::Rang(RX_QUEUE),
             ],
-            "reset, acknowledge, driver, features, queues, DRIVER_OK, then the doorbell"
+            "reset, DMA, acknowledge, driver, features, queues, DRIVER_OK, then the doorbell"
         );
     }
 
@@ -1264,8 +1351,9 @@ mod tests {
         for paddr in [0u64, 0x3000_0800, u64::MAX] {
             let log = Log::new();
             let device = FakeDevice::conforming(&log);
+            let bus = device.bus();
             let negotiated = Offered::new(device)
-                .acknowledge()
+                .acknowledge(&bus)
                 .unwrap()
                 .negotiate_features()
                 .unwrap();
@@ -1395,7 +1483,7 @@ mod tests {
         };
         let live = bar
             .map(caps)
-            .acknowledge()
+            .acknowledge(&FakeBusMaster::new(&Log::new()))
             .expect("a zeroed status register reads back as an acknowledged reset")
             .negotiate_features()
             .expect("virtio 1.0 is offered and two queues are reported");

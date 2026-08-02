@@ -245,7 +245,7 @@ fn init() -> NicDriver {
                 // Compared rather than stored unconditionally: this is a busy
                 // loop with no wakeup, so an unconditional publish would dirty
                 // the shard's cache line millions of times a second on an idle
-                // port for nothing. The comparison is twenty-five words
+                // port for nothing. The comparison is a shard's worth of words
                 // in this domain's own memory; the store crosses to another
                 // domain's view.
                 if sample != published {
@@ -324,8 +324,11 @@ fn bring_up(sink: &dyn Sink) -> Result<(Live<MappedDevice>, NicPort<'static>), S
     // PD's whole life, at the physical address `place_bar` just programmed —
     // `PlacedBar::map`'s contract. Nothing is required of the device's own
     // offsets: `identify` bounded them against the same constant.
+    // The configuration space is also the bus-master gate: `acknowledge` resets
+    // the device and grants it DMA in that order, which is why the gate is
+    // handed in rather than opened when the BAR was placed.
     let negotiated = unsafe { placed.map(bar) }
-        .acknowledge()?
+        .acknowledge(&config)?
         .negotiate_features()?;
     announce(
         sink,

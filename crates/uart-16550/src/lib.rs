@@ -12,7 +12,8 @@
 //! slot Microkit assigns the domain — never `in`/`out`, which the kernel's TSS
 //! bitmap faults regardless of the grant. No portable crate can hold that
 //! authority, so the only real [`PortIo`] is `pds/console/src/com1.rs`, which
-//! argues it in full; here there is no `unsafe` and no seL4 dependency.
+//! argues it in full. This crate has no seL4 dependency at all, and the
+//! `forbid` below is what keeps the port access out of it.
 //!
 //! # The adversary
 //!
@@ -66,6 +67,7 @@
 //!   reporting exactly when the node is in trouble.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 use lfw_metrics::UartSample;
 

@@ -30,13 +30,18 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ cause=<token> signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
 **`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`**, **`recorder`** — the
-domain names in the Microkit system description. `state=` is one of **`starting`**,
-**`negotiated`**, **`ready`**, **`refused`**.
+domain names in the Microkit system description, seven tokens against nine domains because the
+driver runs as three instances that share one token. **A `nic-driver` record therefore does not say
+which port it is about**, and nothing on this surface does: three instances publish into three rings
+the console interleaves, so the driver's records are not one port's transcript. `/metrics` is where
+the instances are separate, as `domain="nic_driver0"`, `1` and `2` (see
+[Prometheus metrics](metrics.md)). `state=` is one of **`starting`**, **`negotiated`**, **`ready`**,
+**`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
 written waits forever:
@@ -61,16 +66,27 @@ apologetic**: no `LFW-PD domain=console` record, and no other record either, bec
 the rings the other domains are publishing into.
 
 An entirely empty serial line after the boot manager's `LFW-BOOT` record is therefore ambiguous, and
-an earlier version of this contract told an operator to read it as a refused console first. That was
-wrong, and was found to be wrong the first time a release image was booted: the same silence is what
-a node that never reached userspace at all looks like, because on the release kernel nothing between
-GRUB and the console domain can print. The two are not distinguishable **on this surface**. A
-[`/metrics`](metrics.md) scrape that answers proves userspace came up and narrows the silence to
-the console itself; an unanswered scrape leaves both possibilities open, and there is no `GET
-/logs` yet. Distinguishing them for certain is an external act — attaching a debugger, or booting the debug profile,
-whose kernel narrates its own start-up. In the QEMU gate that act is automated: a scenario that
-fails on the release image is re-run once on the debug kernel by `xtask`'s diagnostic re-run, which
-reports the empty release capture as the expected silence of a kernel built without
+not in the way it first reads: the same silence is what a node that never reached userspace at all
+looks like, because on the release kernel nothing between GRUB and the console domain can print. The
+two are not distinguishable **on this surface**. A [`/metrics`](metrics.md) scrape is what separates
+them, and it separates three cases rather than two:
+
+- **It answers, and `librefirewall_uart_init_failures_total` is non-zero.** The controller refused
+  its initialisation. The domain got far enough to say so — its shard is its own to write even when
+  the line is not — so a refused console is a reading rather than a silence. What it does not say is
+  *which* refusal: the driver distinguishes six ways for the register sequence to fail and the one
+  counter holds none of them apart.
+- **It answers, and the whole console shard is zero.** Nothing was refused and nothing was printed.
+  Two states look like that and the shard cannot part them: an I/O-port capability that was not what
+  the domain expected, where no controller was addressed and so nothing truthful can be written, and
+  a domain that never ran at all.
+- **It does not answer.** Userspace is not up, or the management port is not, and every possibility
+  above is still open.
+
+Parting the states a zero shard cannot part is an external act — attaching a debugger, or booting the
+debug profile, whose kernel narrates its own start-up. In the QEMU gate that act is automated: a
+scenario that fails on the release image is re-run once on the debug kernel by `xtask`'s diagnostic
+re-run, which reports the empty release capture as the expected silence of a kernel built without
 `CONFIG_PRINTING` rather than as a second fault, and surfaces the debug boot's serial output beside
 it. That is a harness convenience for the project's own test scenarios, not a channel on a deployed
 node: an operator holding a silent appliance still has only the external act.
@@ -153,12 +169,16 @@ node: an operator holding a silent appliance still has only the external act.
   The key is `sectors=` on both records and it means two different things — a capacity on the first,
   an extent length on the rest — which is exactly why the pairing rule at the top of this section
   matters: read `sectors=` with the key beside it, `leading=` or `start=`, never alone.
-- `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. `signalled` says whether the
-  device was told to stop (`STATUS_FAILED` written) or was left decoding nothing, which depends on
-  whether its BAR had been placed when the rejection happened. `detail=` carries up to two numbers,
-  hexadecimal, in the order the token names them, and is omitted where the token is the whole of the
-  fault. Two is the line's budget rather than an arbitrary cut: a refusal with more to say keeps the
-  pair that identifies it, and what it left out is recorded at the code that dropped it.
+- `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
+  domain may refuse without naming a token, and an empty token takes its whole key with it rather
+  than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
+  cannot read. `signalled=` is always written, so the refusal group is recognised by that key and
+  never by `cause=`. `signalled` says whether the device was told to stop (`STATUS_FAILED` written)
+  or was left decoding nothing, which depends on whether its BAR had been placed when the rejection
+  happened. `detail=` carries up to two numbers, hexadecimal, in the order the token names them, and
+  is omitted where the token is the whole of the fault. Two is the line's budget rather than an
+  arbitrary cut: a refusal with more to say keeps the pair that identifies it, and what it left out
+  is recorded at the code that dropped it.
 - `config state=refused` means **nothing is in force from this document** — it was either held to be
   wrong, or the datastore would not make the commit — and it carries no tail saying which. The
   `LFW-CFG` record emitted immediately before it does: `rejected=<reason>` for a document the reader
@@ -177,19 +197,25 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the four tables together are the complete set: 23 the
-`nic-driver` domain raises, 25 the `clock` domain raises, 5 the `management` domain raises, and 37
+`nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, and 39
 the `recorder` domain raises. A token outside all four is a defect, not an extension. The
 `forwarder` and `console` domains raise none, having no `refused` record.
 
 **`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
 are virtio 1.0 PCI device classes and both run the same handshake in the same order, so a
 capability chain that is malformed, a BAR that is not 64-bit, a reset that is not acknowledged and
-a doorbell outside the window are literally the same fault twice — described by two independent
-crates (`nic_driver_core::bringup` and `lfw_blk::bringup`, which share no code) that arrived at the
-same names because the names are the specification's. Renaming one side to make the sets disjoint
-would make a reader learn two vocabularies for one fault. **Read the token with the domain**, never
+a doorbell outside the window are the same fault twice — described by two independent crates
+(`nic_driver_core::bringup` and `lfw_blk::bringup`, which share no code) that arrived at the same
+names because the names are the specification's. Renaming one side to make the sets disjoint would
+make a reader learn two vocabularies for one fault. **Read the token with the domain**, never
 alone: `not-virtio-net` and `not-virtio-blk` are the two that already differ, and they differ
 because the *identity* being checked differs.
+
+A shared token is the same fault, and **`detail=` under it need not be the same pair**: the operands
+are each domain's own, listed against the token in that domain's table. `queue-absent` is the one to
+watch — the index of the missing queue on `nic-driver`, the offered and required queue counts on
+`recorder` — so read the numbers against the table for the domain the record names, never against
+the other one.
 
 **`nic-driver`.** The first two are the domain's own, raised before the device is touched at all;
 the rest are the driver's bring-up tree.
@@ -248,20 +274,24 @@ anything.
 | group | tokens |
 |---|---|
 | the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the two 64-bit draws failed) |
-| the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused) |
+| the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused), `clock-implausible-epoch` (the nanoseconds refused) |
 | the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
 
-**`recorder`.** Its first token is the domain's own, raised before the device is touched at all;
-the middle group is `lfw_blk`'s bring-up tree, which is `nic-driver`'s with three differences —
-`not-virtio-blk` for the identity, `device-read-only` and `capacity-zero` for two facts only a block
-device has, no transmit queue, and `device-cfg-` tokens for the structure `capacity` is read from;
-and the last group is the boot-time proof of the path to the medium, which has no counterpart on any
-other domain.
+**`recorder`.** Its first token is the domain's own, raised before the device is touched at all. The
+four groups after it are `lfw_blk`'s bring-up tree, which is `nic-driver`'s with the differences a
+block device makes: `not-virtio-blk` for the identity, `device-read-only` and `capacity-zero` for
+two facts only a block device has, the `device-cfg-` tokens for the structure `capacity` is read
+from, `queue-size-zero` where a NIC names an absent queue by index, and no transmit queue at all.
+Then comes the boot-time proof of the path to the medium, which has no counterpart on any other
+domain; and last the two recordings, refused after the device is up and running.
 
-`signalled=` is `true` only where the bring-up tree wrote `STATUS_FAILED`, exactly as on
-`nic-driver`. Every token in the proof group carries `signalled=false`: the device is past
-`DRIVER_OK` by then and is deliberately left running, so a later milestone can retry it without a
-reset.
+`signalled=` is `true` where the bring-up tree wrote `STATUS_FAILED`, exactly as on `nic-driver`.
+Every token in the proof group carries `signalled=false`: the device is past `DRIVER_OK` by then and
+is deliberately left running, so a later milestone can retry it without a reset. **The two recording
+tokens are the exception to read carefully** — they carry `signalled=true` while leaving the device
+running exactly as the proof group does, so on those two the flag is not a statement about the
+controller's status byte and there is nothing in it for an operator to act on. The token is the
+whole of the refusal there.
 
 | group | tokens |
 |---|---|
@@ -271,6 +301,7 @@ reset.
 | handshake | `reset-not-acknowledged` (status), `no-virtio-1` (offered features), `device-read-only` (offered features), `features-rejected` (status), `capacity-zero` |
 | the queue and its doorbell | `dma-region-unusable` (paddr), `queue-absent` (offered, required), `queue-size-zero` (index), `queue-too-small` (device maximum, required), `doorbell-outside-bar` (slot end, BAR size — or BAR size alone where the offset overflowed), `doorbell-misaligned` (offset) |
 | the proof of the medium (`signalled=false` throughout; `detail=` numbers are hexadecimal like every other refusal's, so a byte count reads as `0x200`) | `block-device-too-small` (capacity, sectors needed), `block-probe-refused` / `block-witness-refused` (which submit refusal, as a small code), `block-probe-silent` / `block-witness-silent` (the poll budget spent), `block-probe-misattributed` / `block-witness-misattributed` (no `detail=`), `block-probe-failed` / `block-witness-failed` (the outcome, `0x1` device error, `0x2` unsupported, `0x1nn` an undefined status byte `nn`), `block-probe-short` / `block-witness-short` (bytes moved, bytes asked for) |
+| the recordings on it (`signalled=true` throughout, and see above for what that does not mean) | `recording-extent-unusable` (the numbers the geometry rule that refused names: the extent's first sector and the device's capacity, or one count of sectors, bytes or segments), `recording-sink-unusable` (no `detail=`) |
 
 ## `LFW-CFG` — configuration
 
@@ -300,7 +331,7 @@ the volume of a commit is the size of its diff.
   `modified` record carries both.
 - Values render by their type: `port` and `prefix-length` decimal, `enabled` `true|false`, `mac` as
   `52:54:00:12:34:50` (lower case), `address` as a dotted quad, `interface` as the referenced id.
-- Records are ordered interfaces first, then neighbours, then the management interface, by id within
+- Records are ordered interfaces first, then neighbours, then the `management` object, by id within
   each, then by the field order listed above. Two runs over one pair of configurations produce
   byte-identical output.
 
@@ -316,10 +347,14 @@ bytes. `rejected=` is one of 30 reasons:
 
 | group | reasons |
 |---|---|
-| document syntax and hardening bounds (18) | `malformed`, `doctype`, `entity-declaration`, `unknown-entity-reference`, `invalid-character-reference`, `document-too-large`, `depth-exceeded`, `too-many-attributes`, `name-too-long`, `value-too-long`, `unexpected-character-data`, `duplicate-attribute`, `unknown-element`, `unknown-attribute`, `missing-element`, `missing-attribute`, `malformed-value`, `capacity-exceeded` |
-| semantic validation over the parsed model (12) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address` |
+| document syntax and hardening bounds (17) | `malformed`, `doctype`, `entity-declaration`, `unknown-entity-reference`, `invalid-character-reference`, `document-too-large`, `depth-exceeded`, `too-many-attributes`, `name-too-long`, `value-too-long`, `unexpected-character-data`, `duplicate-attribute`, `unknown-element`, `unknown-attribute`, `missing-element`, `missing-attribute`, `malformed-value` |
+| semantic validation over the parsed model (13) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `capacity-exceeded` |
 
-The vocabulary is deliberately coarser than the reader's own fault tree: fifteen distinct
+`capacity-exceeded` sits in the second group and not the first, which is where a reader expects a
+bound to be: a document naming more interfaces or neighbours than the handover image holds passed
+every bound its *bytes* are held to, and does not fit the model they parse into.
+
+The vocabulary is deliberately coarser than the reader's own fault tree: eighteen distinct
 unterminated, mismatched or misplaced constructs all read as `malformed`, because each is one edit
 to the same place and a finer token would name an internal parser state rather than something an
 operator can go and fix.
@@ -346,8 +381,9 @@ generation was committed and never reached the dataplane, which is a fault; seei
 healthy boot. The forwarding domain additionally reports `generation=0 outcome=applied changes=0`
 from its own start-up, and that is not a third copy of anything — it is the node stating that it is
 running the fail-closed empty table and forwarding nothing until a generation arrives. On the
-shipped document the whole sequence is 16 change records,
-`generation=1 outcome=applied changes=16`, the fail-closed `generation=0 outcome=applied changes=0`,
+shipped document the whole sequence is 20 change records — two interfaces of five fields, two
+neighbours of three, and the management object's four —
+`generation=1 outcome=applied changes=20`, the fail-closed `generation=0 outcome=applied changes=0`,
 and `generation=1 outcome=applied changes=0`.
 
 **`offset=` is not always a byte offset.** It is the one number the reason names, and which number
@@ -407,18 +443,19 @@ names who misbehaved, and the three classes never merge. **Every one of them is 
 writer-side pair as `librefirewall_log_records_dropped_total` and
 `librefirewall_log_records_refused_total`, the console's outcomes as
 `librefirewall_console_records_total{outcome=…}`, and the UART's as the `librefirewall_uart_*`
-families.
+families. None of them appears on the console itself, so the short names below are the metric side's
+— underscored, as everything on `/metrics` is, and not tokens of the hyphenated console vocabulary.
 
 | counter | kept by | accuses | what it means |
 |---|---|---|---|
 | `dropped` | each writing domain | itself, or the console | the ring had no slot, so the **newest** record was refused. A flood, or a console that is not draining |
-| `refused` | each writing domain | *our own* invariant | an event this build minted that the record ABI cannot carry. Expected to read zero forever |
+| `refused` | each writing domain | *our own* invariant | a record this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Expected to read zero forever |
 | `malformed` | the console | the **peer that sent it** | the bytes in the slot are no record at all — the writing domain published something the ABI cannot carry, or wrote a slot it had not been given |
 | `unknown` | the console | the **peer that sent it** | the record decoded, but its vocabulary token names no variant this build has: the two halves of the ABI have parted, which means the two domains are different builds |
 | `unrenderable` | the console | *our own* invariant | the event decoded and would not fit the 228-byte line. No peer can cause this; it is a defect in this build's renderer, and it is an alert rather than a statistic |
 | `write_failed` | the console | the **device** | the controller would not take the line. Console output has been lost, and this is the one counter with nowhere to be reported *to* — the console is the reporting mechanism |
 | `printed` | the console | — | lines rendered and handed to the device in full |
-| `bytes_written`, `thre_timeouts`, `init_failures` | the UART driver | the **device** | bytes handed to the transmitter; bytes dropped because it never reported itself empty; refused initialisations |
+| `bytes_written`, `transmitter_timeouts`, `init_failures` | the UART driver | the **device** | bytes handed to the transmitter; bytes dropped because it never reported itself empty; refused initialisations. A non-zero `init_failures` is the one reading a node with no console can still produce — see the silence procedure above |
 
 Two properties of a full ring are worth stating because they are the opposite of what a log buffer
 usually does:

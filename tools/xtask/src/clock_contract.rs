@@ -61,7 +61,7 @@ pub(crate) fn judge(serial: &[u8], log: &Path) -> Result<String, String> {
             "the clock domain refused to establish a time: {record:?}. The cause token names \
              which of the three stages refused — `hpet-` the timer block, `tsc-` the \
              measurement, `rtc-` the real-time clock, `cmos-ioport-` the port capability \
-             itself — and the book's reference section lists what each one's operands are.\n  full run log: {}",
+             itself — and the record carries that stage's own operands beside it.\n  full run log: {}",
             log.display()
         ));
     }

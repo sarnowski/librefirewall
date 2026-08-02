@@ -322,9 +322,19 @@ fn assert_model_fits_the_handover_image(model: &Model) {
     );
 }
 
-/// The cross-crate claim: what this crate accepts, the domain that consumes its
-/// output accepts. A validator able to produce an image its own reader refuses
-/// would fail the appliance closed for a reason nobody could act on.
+/// The cross-crate claim in one direction: what this crate accepts, the domain
+/// that consumes its output accepts. A validator able to produce an image its
+/// own reader refused would fail the appliance closed for a reason nobody could
+/// act on.
+///
+/// Only that direction, and the other one matters more: an image the consumer
+/// accepts must be one the rules would have accepted, because the domain writing
+/// that region is the one parsing the bytes below and a rule only this crate
+/// enforced would not survive a compromise of it. A document is the wrong input
+/// to assert it from — it reaches the region only through a validator that has
+/// already refused everything — so it is asserted over arbitrary *images*
+/// instead, by `config`'s own
+/// `every_image_the_consumer_accepts_is_one_validation_would_have_accepted`.
 fn assert_artifacts_agree(model: &Model, hash: u32) {
     for generation in GENERATIONS {
         let image = image_from(model, Generation::from_bits(generation))

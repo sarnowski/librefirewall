@@ -26,4 +26,5 @@
         <neighbour id="peer-south" interface="downlink"
                    address="172.20.6.9" mac="52:54:00:be:ef:09"/>
     </neighbours>
+<management mac="52:54:00:ab:cd:e2" address="172.20.7.20" prefix-length="25" enabled="true"/>
 </configuration>

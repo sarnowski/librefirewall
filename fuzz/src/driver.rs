@@ -46,7 +46,8 @@
 //! already in flight; arbitrary returns on the receive pipeline's `free` ring;
 //! and forged cursors on every ring.
 //!
-//! Two limits are deliberate, and neither removes an adversary capability:
+//! Two limits on *assertions* are deliberate, and neither removes an adversary
+//! capability:
 //!
 //! * **The `rx` ring's published `tail` is not forged.** Its producer is
 //!   `RxPath` itself and its consumer is this harness's own forwarder stand-in,
@@ -59,33 +60,37 @@
 //!   bytes the device just overwrote; its premise is gone, not its subject. The
 //!   audit still runs over every input prefix before the first scribble, and
 //!   every other assertion holds for the whole input.
-//! * **The double-lend check is suspended for a buffer whose return the peer
-//!   has put beyond this harness's knowledge**, for the same reason and with
-//!   the same shape. The receive pipeline's `free` ring is the return path, so
-//!   a return the peer queues on it is a *real* return and the pool owner is
-//!   right to reclaim and re-issue the buffer — the peer is then harming
-//!   itself, not being double-lent to. The peer reaches that ring two ways, and
-//!   both disclaim: queueing a descriptor of its choosing (op 9) disclaims that
-//!   index, and rewriting the ring's slots and cursors outright disclaims every
-//!   index, because a forged `tail` republishes whatever bytes already sat in
-//!   the slots and names nothing this harness can attribute.
+//! # The double-lend check, and why it is a count rather than a flag
 //!
-//!   This narrows an *assertion*, never the input: every adversary action stays
-//!   expressible, and the check runs at full strength on every buffer whose
-//!   ownership the peer has not deliberately confused. It is needed because
-//!   this harness plays both the honest far driver and the byzantine peer on
-//!   one ring while only the first updates its record of what is outstanding —
-//!   holding the driver to that record made correct behaviour look like a
-//!   duplicate, and a harness assertion that fires on correct behaviour is
-//!   worse than none. Restoring full strength needs `PoolOwner::reclaim` to
-//!   report *which* indices it accepted rather than how many, a change in
-//!   `crates/pd-runtime` that this workspace does not own.
+//! One pool buffer with two owners is the failure the whole ownership chain
+//! exists to prevent, so the harness holds the driver to it for every buffer,
+//! under every adversary action, with nothing suspended. What it counts is what
+//! makes that possible: **the forwarder can never take more descriptors naming a
+//! buffer than the pool owner lent out.** Both halves are observed rather than
+//! predicted — a lend is a `PoolOwner::lent` flag this harness watched go up,
+//! and a take is a descriptor it pulled off the `rx` ring.
 //!
-//!   Both mechanisms are pinned as committed seeds —
-//!   `peer_returns_a_lent_buffer_out_of_band` and
-//!   `peer_forges_the_free_ring_image` — so the seed smoke tests replay them on
-//!   every gate run and a model that starts firing falsely again fails in
-//!   milliseconds rather than after a long fuzz run.
+//! A per-buffer boolean cannot express it. The peer may queue a return for a
+//! buffer it does not own, and that return is *real*: the pool owner is right to
+//! reclaim and re-issue the buffer, and the peer is harming itself rather than
+//! being double-lent to. The buffer is then legitimately published a second time
+//! while the peer's first descriptor is still in the ring, so "seen twice" is
+//! correct behaviour and only "seen more often than it was lent" is a defect.
+//! That is why the lent set is read as a pair of counts across every operation
+//! instead of a claim this harness keeps on its own.
+//!
+//! It survives every forgery below for one reason: the pool owner's lent set is
+//! private to it and its consumer position is private to it, so a peer that
+//! rewrites the `free` ring's slots and cursors can *cause* reclaims but cannot
+//! hide them — each one still clears a flag this harness sees — and a peer that
+//! forges the `rx` ring's `head` can make the driver overwrite an unpublished
+//! slot, which loses a descriptor rather than delivering one twice.
+//!
+//! Both peer paths are pinned as committed seeds —
+//! `peer_returns_a_lent_buffer_out_of_band` and
+//! `peer_forges_the_free_ring_image` — so the seed smoke tests replay them on
+//! every gate run and a model that starts firing falsely fails in milliseconds
+//! rather than after a long fuzz run.
 
 use arbitrary::Unstructured;
 use nic_driver_core::bringup::QUEUE_SIZE;
@@ -363,14 +368,16 @@ pub fn driver_paths_harness(data: &[u8]) {
     let tx_pool_base = TX_POOL_PADDR;
     let tx_pool_end = tx_pool_base + (POOL_BUFFERS * BUFFER_SIZE) as u64;
 
-    // Which receive-pool buffers this driver has handed to the forwarder and
-    // not yet had returned. A second appearance of one is a buffer with two
-    // owners, which is the failure the whole ownership chain exists to prevent.
-    let mut lent_to_forwarder = [false; POOL_BUFFERS];
-    // Buffers whose ownership the peer has deliberately confused by queueing a
-    // return for them out of band (op 9). See `lent_to_forwarder`'s check in
-    // op 8 for why the claim above cannot survive that.
-    let mut disclaimed = [false; POOL_BUFFERS];
+    // The two halves of the double-lend invariant, per receive-pool buffer: how
+    // often the pool owner has lent the index out, and how often the forwarder
+    // has taken a descriptor naming it off the `rx` ring. Takes may never exceed
+    // lends; see the module header for why a boolean cannot say this.
+    let mut lent_by_owner = [0u32; POOL_BUFFERS];
+    let mut taken_from_ring = [0u32; POOL_BUFFERS];
+    // The owner's lent set as it stood at the end of the previous operation, so
+    // each lend is counted from the transition that made it rather than
+    // predicted from what this harness expected the driver to do.
+    let mut previous_lent = pool.lent();
     // Frames the forwarder has taken and the far tx driver has not returned.
     let mut parked: Vec<Descriptor> = Vec::new();
     let mut previous_input = counters.input;
@@ -493,22 +500,20 @@ pub fn driver_paths_harness(data: &[u8]) {
                          is traffic dropped on a decision no domain made"
                     );
                     let buffer = descriptor.buffer as usize;
-                    // Only for a buffer whose ownership the peer has not
-                    // deliberately confused. Once op 9 has queued a return
-                    // naming this buffer, the pool owner is *right* to reclaim
-                    // and re-issue it — the free ring is the return path, and a
-                    // peer that gives a buffer back while still using its own
-                    // copy is harming itself, not being double-lent to. This
-                    // harness plays both the honest far driver and the
-                    // byzantine peer on that one ring, so without this it
-                    // asserts a duplicate against its own incomplete record of
-                    // what was returned, and fires on correct driver behaviour.
+                    // The whole of the double-lend invariant, at full strength
+                    // for every buffer: the forwarder cannot hold more
+                    // descriptors naming one buffer than the owner ever lent it
+                    // out. Both numbers are observed — the lend from the owner's
+                    // own lent set, the take from this ring — so no peer action
+                    // can put them out of step without a defect behind it.
+                    taken_from_ring[buffer] += 1;
                     assert!(
-                        !lent_to_forwarder[buffer] || disclaimed[buffer],
-                        "buffer {buffer} was handed to the forwarder twice without a return — \
-                         one pool buffer with two owners"
+                        taken_from_ring[buffer] <= lent_by_owner[buffer],
+                        "buffer {buffer} reached the forwarder {} times against {} lends — \
+                         one pool buffer with two owners",
+                        taken_from_ring[buffer],
+                        lent_by_owner[buffer]
                     );
-                    lent_to_forwarder[buffer] = true;
                     parked.push(descriptor);
                 }
             }
@@ -520,20 +525,12 @@ pub fn driver_paths_harness(data: &[u8]) {
                 if any_u32(&mut unstructured) & 1 == 0 {
                     descriptor.buffer %= POOL_BUFFERS as u32 + 1;
                 }
-                if far_driver_returns.try_enqueue(descriptor).is_ok() {
-                    // A queued return IS a return, whoever queued it and
-                    // whatever they keep doing with their copy. Give up this
-                    // harness's claim on the buffer rather than let op 8 hold
-                    // the driver to a record that no longer describes who owns
-                    // it. The adversary loses nothing — the descriptor above is
-                    // still wholly its choice, forged indices included.
-                    let buffer = descriptor.buffer as usize;
-                    if buffer < POOL_BUFFERS {
-                        lent_to_forwarder[buffer] = false;
-                        disclaimed[buffer] = true;
-                        parked.retain(|parked| parked.buffer != descriptor.buffer);
-                    }
-                }
+                // Whether the owner accepts it is the owner's business, and this
+                // harness reads the answer out of its lent set rather than
+                // predicting it. The buffer stays parked, so the far driver may
+                // return it a second time — a duplicate return, which is one
+                // more thing the owner has to refuse.
+                let _full = far_driver_returns.try_enqueue(descriptor);
             }
             10 => {
                 // The transmit pipeline's pool owner collecting its returns.
@@ -549,9 +546,7 @@ pub fn driver_paths_harness(data: &[u8]) {
                 let count = any_u32(&mut unstructured) as usize % (parked.len() + 1);
                 for _ in 0..count {
                     let descriptor = parked.remove(any_index(&mut unstructured, parked.len()));
-                    if far_driver_returns.try_enqueue(descriptor).is_ok() {
-                        lent_to_forwarder[descriptor.buffer as usize] = false;
-                    } else {
+                    if far_driver_returns.try_enqueue(descriptor).is_err() {
                         parked.push(descriptor);
                         break;
                     }
@@ -574,14 +569,13 @@ pub fn driver_paths_harness(data: &[u8]) {
                         rx_free_view.set_tail(tail);
                         rx_free_view.store_slot(slot, descriptor);
                         // Rewriting the return ring's contents and cursors
-                        // injects returns naming buffers of the peer's
-                        // choosing, and unlike op 9 it leaves no trace this
-                        // harness can attribute to an index: a forged `tail`
-                        // alone republishes whatever bytes already sat in the
-                        // slots. After this the harness knows nothing about
-                        // which buffers are still outstanding, so it keeps no
-                        // claim about any of them.
-                        disclaimed = [true; POOL_BUFFERS];
+                        // injects returns naming buffers of the peer's choosing,
+                        // and unlike op 9 it leaves nothing this harness could
+                        // attribute to an index: a forged `tail` alone
+                        // republishes whatever bytes already sat in the slots.
+                        // Nothing here needs attributing, though — the owner's
+                        // lent set records whichever of them it accepted, and the
+                        // counts below are read from that.
                     }
                     _ => {
                         tx_ring_view.set_head(head);
@@ -591,6 +585,26 @@ pub fn driver_paths_harness(data: &[u8]) {
                 }
             }
         }
+
+        // Count the lends and the reclaims this operation really performed, from
+        // the owner's own record. A lend needs the flag down and puts it up; a
+        // reclaim needs it up and puts it down, so the two alternate and every
+        // lend is one rising edge. No operation both lends and reclaims the same
+        // index — `drain` only lends, `reclaim` only reclaims — so sampling once
+        // per operation misses none.
+        let lent_now = pool.lent();
+        for index in 0..POOL_BUFFERS {
+            if !previous_lent[index] && lent_now[index] {
+                lent_by_owner[index] += 1;
+            }
+            assert!(
+                taken_from_ring[index] <= lent_by_owner[index],
+                "buffer {index} was taken {} times against {} lends",
+                taken_from_ring[index],
+                lent_by_owner[index]
+            );
+        }
+        previous_lent = lent_now;
 
         // The headline: neither adversary may make this driver look like it has
         // a bug. Every `InvariantFaults` field is documented as unreachable

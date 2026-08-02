@@ -162,7 +162,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
         Scenario {
             name: "fallback-from-broken-B",
             grubenv: GrubenvSeed::Entries(&["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
-            corrupt_slots: &["SLOTB"],
+            corrupt_slots: &["SLOT_B"],
             records: &[
                 "LFW-BOOT slot=B state=trying",
                 "LFW-BOOT slot=B state=rejected",
@@ -214,7 +214,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
         Scenario {
             name: "halt-when-both-slots-are-broken",
             grubenv: GrubenvSeed::Entries(&["ORDER=A B", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
-            corrupt_slots: &["SLOTA", "SLOTB"],
+            corrupt_slots: &["SLOT_A", "SLOT_B"],
             records: &[
                 "LFW-BOOT slot=A state=confirmed",
                 "LFW-BOOT slot=A state=rejected",

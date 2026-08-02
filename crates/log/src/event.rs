@@ -114,10 +114,13 @@ closed_vocabulary! {
     /// Why a configuration document was refused, at the granularity an operator
     /// acts on: each token names one thing to go and fix.
     ///
-    /// The first group is the document's syntax and the hardening bounds a
-    /// hostile document is held to; the second is semantic validation over the
-    /// parsed model. A reason never carries the offending bytes — the record
-    /// pairs it with a byte offset instead.
+    /// The first group is the document's syntax and the hardening bounds its
+    /// *bytes* are held to; the second is semantic validation over the parsed
+    /// model, where `capacity-exceeded` belongs — a document naming more
+    /// interfaces than the handover image holds passed every byte bound and does
+    /// not fit. A reason never carries the offending bytes; the record pairs it
+    /// with a byte offset. The order is the wire encoding, so a reason is
+    /// appended and never inserted.
     RejectReason {
         Malformed => "malformed",
         Doctype => "doctype",

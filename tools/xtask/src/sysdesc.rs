@@ -253,7 +253,7 @@ const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It ha
      domain that rewrites a header must reach the bytes";
 
 /// As [`POOL_WITHHELD`], for the log transport — the exclusion that holds
-/// between the five writing domains, and the one thing about a log region that
+/// between the eight writing domains, and the one thing about a log region that
 /// is a mapping rather than an authority.
 ///
 /// What each pair's *perms* withhold is a different argument and is not stated
@@ -686,6 +686,14 @@ const REGIONS: &[RegionRule] = &[
     // grant to it is the edit CONFIG_ACK_WITHHELD refuses. On `cfg` itself no
     // exclusion is claimed — a driver has no more use for a configuration image
     // than for a parser — so the perms carry the argument there.
+    //
+    // The recorder is not a reader, and the row is the reason it cannot become
+    // one by accident: it held this grant while attaching the region nowhere and
+    // compiling its interface names in, so the authority existed and no code
+    // consumed it. A grant ahead of its consumer is a grant nothing reviews
+    // against a use, and this table is where the two are made one statement — so
+    // the change that starts reading the document adds the grant back in the
+    // same breath as the code that needs it.
     RegionRule {
         name: "cfg",
         size: ExpectedSize {
@@ -697,7 +705,6 @@ const REGIONS: &[RegionRule] = &[
             read_write("config"),
             read_only("forwarder"),
             read_only("management"),
-            read_only("recorder"),
         ],
         withheld: None,
     },
@@ -1461,7 +1468,38 @@ fn findings(elements: &[Element]) -> Vec<String> {
     check_io_ports(elements, domains_agree, &mut findings);
     check_channel_ends(elements, &mut findings);
     check_port_drivers(elements, &mut findings);
+    check_every_map_is_addressable(elements, &mut findings);
     findings
+}
+
+/// Every `<map>` names the symbol the mapping domain reaches it through.
+///
+/// A `setvar_vaddr` is the whole of what turns a grant into something code can
+/// address: without it, the region is mapped into the domain's address space and
+/// no line in that domain can name where. Such a mapping is authority with no
+/// consumer, and the rest of this module cannot see it — the mapper set, the
+/// perms and the extent are all exactly right, and the grant simply does nothing
+/// but widen what a compromised domain reaches.
+///
+/// The recorder held one: `cfg` read-only, attached nowhere, while the domain
+/// composed its interface names itself. It was withdrawn, and this is what stops
+/// the shape returning quietly. A region a domain must map at an address the code
+/// hardcodes would fail here, which is the right outcome: it is a claim worth
+/// making deliberately rather than by omission.
+fn check_every_map_is_addressable(elements: &[Element], findings: &mut Vec<String>) {
+    for element in elements.iter().filter(|element| element.tag == "map") {
+        if element.attribute("setvar_vaddr").is_some() {
+            continue;
+        }
+        findings.push(format!(
+            "<map mr={:?}> into {:?} names no setvar_vaddr, so the region is mapped into that \
+             domain and no code in it can address the mapping. That is authority with no \
+             consumer: withdraw the grant, or — if a symbol genuinely cannot carry it — say so \
+             where the grant is made",
+            element.attribute("mr").unwrap_or("?"),
+            element.owner()
+        ));
+    }
 }
 
 /// Which domain drives which port, against `lfw_metrics::PORT_DOMAINS`.
@@ -2630,6 +2668,22 @@ mod tests {
             );
             assert!(finding.contains("capability change"), "{region}: {finding}");
         }
+    }
+
+    /// A grant that exists and that no code can reach: the shape the recorder's
+    /// withdrawn `cfg` mapping had, and the one every other check in this module
+    /// passes clean.
+    #[test]
+    fn a_mapping_no_symbol_addresses_is_reported() {
+        let findings = findings_after(
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />",
+            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" />",
+        );
+        let finding = only_finding(&findings);
+        assert!(finding.contains("names no setvar_vaddr"), "{finding}");
+        assert!(finding.contains("authority with no consumer"), "{finding}");
+        assert!(finding.contains("\"clock\""), "{finding}");
     }
 
     /// The console's `<ioport>` as the description writes it, and the anchor

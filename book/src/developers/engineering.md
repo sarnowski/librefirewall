@@ -19,11 +19,17 @@ later" indirection for another architecture.
 
 ## Name the adversary
 
-The [threat model](../design/threat-model.md) assumes five adversaries: untrusted network traffic,
-a hostile or malfunctioning device, a compromised parser domain, a byzantine neighbour protection
-domain, and a management-plane attacker. A crate or module that handles external input states in
-its header, in plain words, which of them it faces. That statement is what makes "reachable from
-external input" reviewable rather than a judgement call: the code says whose input it is.
+The [threat model](../design/threat-model.md) assumes six adversaries: untrusted network traffic, a
+hostile or malfunctioning NIC device, a compromised parser or inspection domain, a byzantine
+neighbour protection domain, a management-plane attacker, and a connection-flood or
+state-exhaustion attacker against the terminating proxy. The last is not a mode of the first: its
+every frame is well-formed and its weapon is how much per-connection state each one commits, which
+is why the isolation model carries a denial-of-service item at all.
+
+A crate or module that handles external input states in its header, in plain words, which of them
+it faces. That statement is what makes "reachable from external input" reviewable rather than a
+judgement call: the code says whose input it is — and an adversary this list omits is one no header
+can name.
 
 ## Handling untrusted input
 
@@ -83,7 +89,10 @@ rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-
   boundary has no other carrier.
 - **The `unsafe` budget only shrinks.** Every `unsafe` block obliges a prose claim the compiler
   cannot check, so the per-crate block count is the leading indicator of unverified prose. The
-  count is recorded (`tools/xtask/budgets.toml`) and never rises without explicit human approval.
+  count is recorded (`tools/xtask/budgets.toml`) for every crate under `crates/` and `pds/`, and
+  never rises without explicit human approval. The two `unsafe` lint denials reach further than the
+  ratchet does: they bind every workspace member, while the recorded counts stop at those two
+  trees. In `tools/` and the separate `fuzz/` workspace the rule holds by review, not by a gate.
 
 **A delegated precondition names its enforcer.** A precondition delegated layer by layer can
 complete a circle — the driver defers to the runtime, the runtime to the queue, the queue back to
@@ -125,8 +134,10 @@ The rules for the prose that remains:
   enum is the error documentation; a consumed `self` is the lifecycle documentation. `missing_docs`
   is deliberately not enforced: forcing a comment onto every public item manufactures contentless
   prose.
-- **The comment budget only shrinks.** Per production file, the comment-line ratio is recorded and
-  never rises without explicit human approval and a recorded reason.
+- **The comment budget only shrinks.** Per production file under `crates/` and `pds/`, the
+  comment-line ratio is recorded and never rises without explicit human approval and a recorded
+  reason. Benchmarks, test binaries and the build tooling are outside the measurement; the rule
+  holds there by review.
 - **Code never references documentation.** No comment, string, or error message names a
   documentation file, a book page, or a section number — such references are brittle and rot
   silently. A comment stands alone in plain language; where it must name who guarantees something,
@@ -137,11 +148,12 @@ Where documentation lives, each place with exactly one mandate:
 
 - **This book** — everything: the operator contract (reference), the design and its rationale
   (design), the development practice (this part), and the [development status](../status.md) with
-  its [detail](status-detail.md). The book never references the project's internal working rules —
-  it is written for its readers, who cannot be expected to hold a rulebook in their heads.
+  its [detail](status-detail.md). The book never carries the content of the project's internal
+  working rules — it is written for its readers, who cannot be expected to hold a rulebook in their
+  heads. Naming where a rule lives, as this list does, is not carrying it.
 - **README.md** — a short introduction and pointers here. Nothing else.
-- **AGENTS.md** — the working agreement for agents: workflow, what to read, and how decisions
-  evolve. Only agents read it, so nothing a human developer needs lives only there.
+- **AGENTS.md** — the working agreement for agents. Only agents read it, so nothing a human
+  developer needs lives only there.
 - **The source** — local intent, inline with the code, under the rules above.
 
 Documentation is part of the change: if a change makes any page, header, or comment wrong, the same
@@ -247,16 +259,17 @@ The decisions that constrain all observability code:
   absolutely); a recording is authorized, never merely scraped; an inspected flow is recorded as
   ciphertext plus its keys, never as decrypted plaintext at rest; and neither sink is a licence for
   a third — widening the exception is a design change, not a commit.
-- `/metrics`, `/config`, `/logs`, the two recording downloads (`/logs.pcapng`, `/capture.pcapng`)
-  and the console are the **complete** debug surface. Adding another introspection mechanism — a
-  debug endpoint, a side channel, a diagnostic dump — changes the product's attack surface and is a
+- Six surfaces are the **complete** debug surface: the console, the OpenTelemetry log stream,
+  `GET /metrics`, `GET /logs`, `GET /config`, and the recording download — one surface carrying two
+  files, `/logs.pcapng` and `/capture.pcapng`. Adding another introspection mechanism — a debug
+  endpoint, a side channel, a diagnostic dump — changes the product's attack surface and is a
   design change, not a commit.
 
 ## Verifying on a running appliance
 
-A booted node has no shell, no CLI and no debugger. Everything you can learn about one, it tells
-you through four surfaces, and they are the instrument — reason about a running system through
-them rather than about it from the source:
+A booted node has no shell, no CLI and no debugger. It answers only through the six surfaces above,
+and four of them are the instrument you reach for while developing — reason about a running system
+through them rather than about it from the source:
 
 | Surface | Answers | Reach it with |
 |---|---|---|
@@ -272,7 +285,8 @@ the recording and look at the packets. Every QEMU scenario leaves its downloads 
 `make test-system` run the evidence is already on disk. Use the surfaces while developing, not only
 at the end.
 
-The three HTTP surfaces are also cross-checkable, and that is where they earn the most: the
+The three HTTP surfaces in that table are also cross-checkable, and that is where they earn the
+most: the
 recorder's own record counts, the packet blocks in each recording, and the frames the harness put
 on the wire all describe one traffic stream from three independent vantage points, so a fault that
 hides inside any one of them shows up as a disagreement between two. `xtask::surface_contract`

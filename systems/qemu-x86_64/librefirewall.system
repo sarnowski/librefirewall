@@ -732,12 +732,15 @@
     </protection_domain>
 
     <!-- The configuration domain: it reads the document compiled into it,
-         refuses or commits it, and publishes the result. Its whole grant is the
-         two regions above, mirrored — `cfg` read-write because it is the writer
-         of the configuration, `cfgack` read-only because the acknowledgement is
-         the consumer's statement and a publisher that could forge one would
-         release a generation nobody had staged, which is the entire point of
-         there being two phases.
+         refuses or commits it, and publishes the result. Its whole grant is six
+         mappings and nothing else: the handover pair above, mirrored — `cfg`
+         read-write because it is the writer of the configuration, `cfgack`
+         read-only because the acknowledgement is the consumer's statement and a
+         publisher that could forge one would release a generation nobody had
+         staged, which is the entire point of there being two phases — plus the
+         four every domain here holds: `clock` read-only to stamp what it says,
+         its own `log_config` ring read-write with `log_config_consume`
+         read-only, and its own `stats_config` page read-write.
 
          It holds NO device capability, NO buffer pool and NO dataplane ring, so
          the domain that parses attacker-supplied XML cannot reach a frame, a
@@ -847,10 +850,14 @@
          It maps NO pool, NO dataplane ring, NO configuration region, NO ECAM
          page and NO BAR window, so a compromised clock reaches no frame, no NIC
          and no configuration — the shape of isolation the configuration and
-         console domains already have, in a third direction. What it DOES map, and
-         the only region it shares with anybody, is `clock` (read-write): the
-         calibration it publishes, read by the management domain alone. See the
-         note beside that region. -->
+         console domains already have, in a third direction. The one region it
+         maps that nothing else in the system does is `hpet`. Everything else it
+         maps is shared, and by design: `clock` (read-write) is the calibration
+         it publishes, and it is the sole writer of a region eight other domains
+         map read-only — see the note beside that region — while `log_clock`,
+         `log_clock_consume` and `stats_clock` are its own record ring and
+         counter page, paired with the console and the management domain exactly
+         as every other domain's are. -->
     <protection_domain name="clock" priority="3" stack_size="0x4000">
         <program_image path="clock.elf" />
         <ioport id="0" addr="0x70" size="2" />
@@ -1145,10 +1152,6 @@
            * dl_request (READ-ONLY) / dl_reply (rw) — the download handover,
              mirrored against the management domain's grant. It reads what was
              asked for and writes the answer.
-           * cfg (READ-ONLY) — which interfaces exist and what they are called,
-             for the pcapng interface descriptions a recording has to name.
-             Read-only for the reason every consumer's is: a domain that could
-             write it would rewrite the configuration it is about to be judged by.
            * clock (READ-ONLY) — what a counter reading means, for the instant
              every log record and every recorded observation is dated with.
            * log_recorder (rw) / log_recorder_consume (READ-ONLY) — its own
@@ -1244,7 +1247,6 @@
         <map mr="tap_consume" vaddr="0x2_500_000" perms="rw" cached="true" setvar_vaddr="tap_consume_vaddr" />
         <map mr="dl_request" vaddr="0x2_600_000" perms="r" cached="true" setvar_vaddr="dl_request_vaddr" />
         <map mr="dl_reply" vaddr="0x2_700_000" perms="rw" cached="true" setvar_vaddr="dl_reply_vaddr" />
-        <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" />
         <map mr="clock" vaddr="0x3_002_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_recorder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_recorder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
@@ -1461,12 +1463,12 @@
          ABSENCE IS A DECISION.
 
          A DOMAIN THAT NEVER BLOCKS NEEDS NO WAKEUP. The console busy-polls the
-         five rings and never leaves `init`, for the reason set out above it, so
+         eight rings and never leaves `init`, for the reason set out above it, so
          it never reaches the Microkit event loop and could not observe a
          notification if one were sent. It discovers work the only way a polling
          domain can: by reading the cursor each writing domain publishes, which
          it does on every pass regardless. A send capability on this domain
-         would therefore be authority granted for nothing — a widening of five
+         would therefore be authority granted for nothing — a widening of eight
          writers' reach with no path that consumes it — so no channel is
          declared, and the machinery that fed one is gone rather than left
          dormant.

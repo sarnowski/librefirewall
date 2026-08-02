@@ -31,6 +31,9 @@ Read the rest on demand:
   worktree and delete the branch.
 - Install the hooks once per worktree (`make hooks`) and never bypass them — `--no-verify` to land
   work is a violation; fix the finding instead.
+- Changing an exposed signal means changing its reference chapter in the same change: the console
+  and metrics chapters are held to the code by the fast gate, so a chapter that drifts fails
+  `make test` rather than going stale unnoticed.
 - Run the reviewer checklist against your own change before declaring it done. A green gate is
   necessary, never sufficient.
 - A change with security consequence — the capability topology in `systems/`, a trust boundary,
@@ -54,8 +57,11 @@ are deliberately changed — and the user owns them.
 
 Two boundaries hold whatever else changes, because they keep the documentation readable and honest:
 
-- **The book and README never reference this file, internal rules, or each other's sections by
-  number.** They are written for their readers in self-contained plain language.
+- **The book and README never carry the content of this file or of any internal working rule, and
+  never cross-reference a section by number.** They are written for their readers in self-contained
+  plain language, and a reader must never need a rulebook to follow them. A bare routing pointer —
+  naming this file so an agent can find it, or listing it among the places documentation lives —
+  carries no rule content and is permitted.
 - **Code never references documentation** — no file names, page names, or section numbers in
   comments, strings, or error messages. A comment stands alone; a guarantor is named as a code
   artifact.

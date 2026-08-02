@@ -44,8 +44,7 @@
 //! instant this domain cannot tell from a correct one (`lfw_rtc`'s header
 //! records the UTC assumption and what it costs). What is established here is a
 //! *measured* counter rate and a *stated* epoch — enough to timestamp, and not
-//! enough to judge a certificate by. README's status table says so in the row
-//! this domain fills in.
+//! enough to judge a certificate by.
 //!
 //! # Records go to a ring, not to `debug_println!`
 //!
@@ -96,8 +95,8 @@ const CALIBRATION_WINDOW: Duration = Duration::from_millis(1);
 
 // The window has to be one the reference timer can actually serve on the least
 // favourable block its specification admits, and that bound is `lfw_hpet`'s to
-// state rather than this domain's to assume. An order of magnitude of
-// headroom, asserted rather than argued.
+// state rather than this domain's to assume. Two orders of magnitude of
+// headroom — a millisecond against a hundred — asserted rather than argued.
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() <= WORST_CASE_SERVICEABLE_WAIT.as_nanos());
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() > 0);
 
@@ -413,13 +412,24 @@ fn establish() -> Result<Calibration, StartupError> {
     // top of `u64` between them. A delta this produces that is *implausible*
     // rather than merely large is what `calibrate` refuses.
     let elapsed = after.0.wrapping_sub(before.0);
+    // Against the block's truncated frequency rather than its period, which is
+    // consistent with `ticks_for` dividing by the period and not at odds with it:
+    // the truncation is a part in 10^8, three orders below the two-read overhead
+    // above, and a rate is the form `calibrate` takes.
     let tsc_hz = calibrate(elapsed, end.wrapping_sub(start), hpet.frequency_hz())?;
 
     let unix_seconds = Rtc::new(port).read_unix_seconds()?;
+    // After the register file and not before it: a `Calibration`'s reading and its
+    // instant claim to name the *same* moment, and the read above spends port
+    // operations of its own — bounded by `lfw_rtc::READ_PORT_OPS_MAX`, ordinarily
+    // a handful plus a wait on the update in progress bit. Anchoring on the
+    // calibration window's last reading would date the node that span early and
+    // run every timestamp it later emits fast by it.
+    let anchor = read_timestamp_counter();
     let boot_unix_nanos = unix_seconds
         .checked_mul(NANOS_PER_SECOND)
         .ok_or(StartupError::EpochOutOfRange { unix_seconds })?;
-    Ok(Calibration::new(tsc_hz, after, boot_unix_nanos))
+    Ok(Calibration::new(tsc_hz, anchor, boot_unix_nanos))
 }
 
 /// Returned by `init` in every case: this domain runs once and then parks in

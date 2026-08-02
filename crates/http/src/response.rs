@@ -23,17 +23,46 @@ pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8
 /// Opaque bytes: this crate parses no format and would be claiming to know one.
 pub const OCTET_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 
-/// Every type this crate names, so a third moves [`MAX_HEAD_LEN`] in one diff.
-const CONTENT_TYPES: [&str; 2] = [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE];
+/// A content type this crate can promise a head for.
+///
+/// A closed set rather than a `&str`, and that is the whole point of the type:
+/// [`MAX_HEAD_LEN`] is derived from exactly these, so a caller that reserves
+/// that much room in front of its body can never be refused a head. A `&str`
+/// parameter would let a caller name a longer type and be handed a bound that
+/// does not hold for it — which is a response that fails to begin rather than
+/// one that fails to fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentType {
+    /// [`METRICS_CONTENT_TYPE`]: the classic Prometheus text exposition.
+    Metrics,
+    /// [`OCTET_STREAM_CONTENT_TYPE`]: bytes this crate claims to know nothing
+    /// about.
+    OctetStream,
+}
+
+impl ContentType {
+    /// Every variant, so [`MAX_HEAD_LEN`] is derived by iteration rather than
+    /// from a list that drifts from the enum.
+    pub const ALL: [Self; 2] = [Self::Metrics, Self::OctetStream];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metrics => METRICS_CONTENT_TYPE,
+            Self::OctetStream => OCTET_STREAM_CONTENT_TYPE,
+        }
+    }
+}
 
 /// Digits a `u64` content length can take.
 const MAX_LENGTH_DIGITS: usize = 20;
 
 /// Bytes the longest head this crate can write occupies, derived from the status
-/// table and [`CONTENT_TYPES`] rather than measured.
+/// table and [`ContentType::ALL`] rather than measured.
 ///
 /// A caller reserves this much in front of its body and can then never be
-/// refused a head, for a content type this crate names.
+/// refused a head: [`ContentType`] admits no type longer than this was derived
+/// from.
 pub const MAX_HEAD_LEN: usize = head_bound();
 
 pub(crate) const fn head_bound() -> usize {
@@ -49,8 +78,8 @@ pub(crate) const fn head_bound() -> usize {
     }
     let mut longest_type = 0;
     let mut index = 0;
-    while index < CONTENT_TYPES.len() {
-        let content_type = CONTENT_TYPES[index].len();
+    while index < ContentType::ALL.len() {
+        let content_type = ContentType::ALL[index].as_str().len();
         if content_type > longest_type {
             longest_type = content_type;
         }
@@ -82,11 +111,10 @@ pub struct HeadDoesNotFit {
 ///
 /// # Errors
 /// [`HeadDoesNotFit`] when `out` is shorter than the head. A slice of
-/// [`MAX_HEAD_LEN`] bytes can never provoke it, for a content type this crate
-/// names.
+/// [`MAX_HEAD_LEN`] bytes can never provoke it.
 pub fn write_head(
     status: Status,
-    content_type: Option<&str>,
+    content_type: Option<ContentType>,
     content_length: u64,
     out: &mut [u8],
 ) -> Result<usize, HeadDoesNotFit> {
@@ -100,7 +128,7 @@ pub fn write_head(
         writer.bytes(b"\r\n")?;
         if let Some(content_type) = content_type {
             writer.bytes(b"Content-Type: ")?;
-            writer.bytes(content_type.as_bytes())?;
+            writer.bytes(content_type.as_str().as_bytes())?;
             writer.bytes(b"\r\n")?;
         }
         writer.bytes(b"Content-Length: ")?;

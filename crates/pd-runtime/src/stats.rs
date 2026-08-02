@@ -25,6 +25,7 @@ use lfw_metrics::{
     Snapshot, StatsShard, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
+use net_headers::ParseFailure;
 use routing::DropReason;
 
 use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, TapCounters};
@@ -79,6 +80,7 @@ pub fn pipeline_sample(counters: &RouteCounters) -> PipelineSample {
             *count = counters.drops.get(*reason);
         }
     }
+    let parse = &counters.unparsable;
     PipelineSample {
         forwarded: counters.forwarded,
         route_drops,
@@ -86,7 +88,10 @@ pub fn pipeline_sample(counters: &RouteCounters) -> PipelineSample {
             counters.egress_full,
             counters.malformed_descriptor,
             counters.snapshot_failed,
-            counters.unparsable,
+            parse.get(ParseFailure::FrameTooShort),
+            parse.get(ParseFailure::Ethernet),
+            parse.get(ParseFailure::Ipv4),
+            parse.get(ParseFailure::Ipv4Checksum),
             counters.misrouted,
             counters.writeback_failed,
         ],
@@ -171,6 +176,7 @@ pub fn management_sample(
                     refused_out_of_order: tcp.refused_out_of_order,
                     urgent_ignored: tcp.urgent_ignored,
                     challenge_acks: tcp.challenge_acks,
+                    challenges_suppressed: tcp.challenges_suppressed,
                     resets_received: tcp.resets_received,
                     resets_sent: tcp.resets_sent,
                     write_refused: tcp.write_refused,
@@ -284,11 +290,8 @@ pub fn recorder_sample(
         *slot = SinkSample {
             records: counters.records,
             record_bytes: counters.record_bytes,
-            dropped: [
-                counters.dropped_oversized,
-                counters.dropped_staging_full,
-                counters.dropped_refused,
-            ],
+            dropped: [counters.dropped_oversized, counters.dropped_refused],
+            staging_deferrals: counters.staging_deferrals,
             segments_closed: counters.segments_closed,
             wraps: counters.wraps,
             sectors_written: counters.sectors_written,

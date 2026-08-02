@@ -73,10 +73,17 @@ fn a_copy_is_written_field_by_field_where_the_layout_says() {
             },
             &[reader(9, 4, 7)],
         ),
+        Copies::Parity,
     );
 
     // Generation 7 is odd, so the second copy is the one rewritten.
-    assert_eq!(written, SUPERBLOCK_COPY_BYTES);
+    assert_eq!(
+        written,
+        SuperblockWrite {
+            at: SUPERBLOCK_COPY_BYTES,
+            len: SUPERBLOCK_COPY_BYTES,
+        }
+    );
     assert!(copy_of(&region, 0).iter().all(|byte| *byte == 0));
 
     let copy = copy_of(&region, 1);
@@ -109,17 +116,81 @@ fn an_encode_rewrites_one_copy_and_leaves_the_other_alone() {
     // not be the one under the write head.
     let mut region = [0xAAu8; SUPERBLOCK_BYTES];
     assert_eq!(
-        encode_superblock(&mut region, &state(2, Cursor::default(), &[])),
-        0
+        encode_superblock(
+            &mut region,
+            &state(2, Cursor::default(), &[]),
+            Copies::Parity
+        ),
+        SuperblockWrite {
+            at: 0,
+            len: SUPERBLOCK_COPY_BYTES,
+        }
     );
     assert!(copy_of(&region, 1).iter().all(|byte| *byte == 0xAA));
 
     let mut region = [0xAAu8; SUPERBLOCK_BYTES];
     assert_eq!(
-        encode_superblock(&mut region, &state(3, Cursor::default(), &[])),
-        SUPERBLOCK_COPY_BYTES
+        encode_superblock(
+            &mut region,
+            &state(3, Cursor::default(), &[]),
+            Copies::Parity
+        ),
+        SuperblockWrite {
+            at: SUPERBLOCK_COPY_BYTES,
+            len: SUPERBLOCK_COPY_BYTES,
+        }
     );
     assert!(copy_of(&region, 0).iter().all(|byte| *byte == 0xAA));
+}
+
+#[test]
+fn a_first_checkpoint_replaces_both_copies_so_no_older_ring_outranks_it() {
+    // The extent already carries a previous deployment's ring of the very same
+    // geometry, at a generation far above anything a fresh ring reaches. Parity
+    // selection alone would leave it in copy 0 and a decode would prefer it, so
+    // a resuming ring would adopt a cursor into a recording that no longer
+    // exists.
+    let stale = state(
+        500,
+        Cursor {
+            sequence: 400,
+            offset: 64,
+        },
+        &[],
+    );
+    let mut region = [0u8; SUPERBLOCK_BYTES];
+    encode_superblock(&mut region, &stale, Copies::Parity);
+    assert_eq!(
+        decode_superblock(&region),
+        Some(stale),
+        "the extent starts out holding somebody else's ring"
+    );
+
+    let fresh = state(
+        1,
+        Cursor {
+            sequence: 0,
+            offset: 8,
+        },
+        &[],
+    );
+    let written = encode_superblock(&mut region, &fresh, Copies::Both);
+    assert_eq!(
+        written,
+        SuperblockWrite {
+            at: 0,
+            len: SUPERBLOCK_BYTES,
+        },
+        "a ring with no history writes the whole region"
+    );
+    assert_eq!(
+        decode_superblock(&region),
+        Some(fresh),
+        "and nothing of the older ring is left to be preferred"
+    );
+    // Both copies are the fresh ring's and are identical, so the torn-write
+    // defence holds from the first checkpoint rather than from the second.
+    assert_eq!(copy_of(&region, 0), copy_of(&region, 1));
 }
 
 #[test]
@@ -133,7 +204,7 @@ fn a_state_survives_the_medium_unchanged() {
         &[reader(1, 9, 0), reader(2, 11, 40), reader(300, 0, SEGMENT)],
     );
     let mut region = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut region, &original);
+    encode_superblock(&mut region, &original, Copies::Parity);
     assert_eq!(decode_superblock(&region), Some(original));
 }
 
@@ -164,8 +235,8 @@ fn the_newer_generation_wins_whichever_copy_holds_it() {
     );
     // Parity puts the odd generation in copy 1 and the even one in copy 0, so
     // this exercises the newer copy being the *first* one.
-    encode_superblock(&mut region, &older);
-    encode_superblock(&mut region, &newer);
+    encode_superblock(&mut region, &older, Copies::Parity);
+    encode_superblock(&mut region, &newer, Copies::Parity);
     assert_eq!(decode_superblock(&region), Some(newer));
 
     // And the other way round, so neither ordering is being read as "later in
@@ -187,8 +258,8 @@ fn the_newer_generation_wins_whichever_copy_holds_it() {
         },
         &[],
     );
-    encode_superblock(&mut region, &older);
-    encode_superblock(&mut region, &newer);
+    encode_superblock(&mut region, &older, Copies::Parity);
+    encode_superblock(&mut region, &newer, Copies::Parity);
     assert_eq!(decode_superblock(&region), Some(newer));
 }
 
@@ -211,8 +282,8 @@ fn a_torn_copy_costs_its_own_generation_and_no_more() {
         &[],
     );
     let mut written = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut written, &older);
-    encode_superblock(&mut written, &newer);
+    encode_superblock(&mut written, &older, Copies::Parity);
+    encode_superblock(&mut written, &newer, Copies::Parity);
 
     // The newer copy is torn: the ring resumes one generation behind rather
     // than starting over, which is the whole return on writing two.
@@ -254,10 +325,10 @@ fn two_valid_copies_at_one_generation_resolve_to_the_first() {
         &[],
     );
     let mut region = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut region, &first);
+    encode_superblock(&mut region, &first, Copies::Parity);
 
     let mut forged = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut forged, &second);
+    encode_superblock(&mut forged, &second, Copies::Parity);
     let (_, target) = region.split_at_mut(SUPERBLOCK_COPY_BYTES);
     target.copy_from_slice(copy_of(&forged, 0));
 
@@ -275,7 +346,7 @@ fn a_copy_that_is_not_this_writers_is_refused_however_it_differs() {
         &[reader(3, 1, 4)],
     );
     let mut written = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut written, &good);
+    encode_superblock(&mut written, &good, Copies::Parity);
 
     // Each mutation is repaired with a fresh CRC, so what is under test is the
     // field rule and not the checksum catching the edit.
@@ -305,7 +376,7 @@ fn a_byte_in_the_span_the_layout_does_not_name_refuses_the_copy() {
     // interpreted later.
     let good = state(2, Cursor::default(), &[reader(1, 0, 0)]);
     let mut written = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut written, &good);
+    encode_superblock(&mut written, &good, Copies::Parity);
 
     for at in [READERS_AT + READER_BYTES, CRC_AT - 1] {
         let mut region = written;
@@ -322,7 +393,11 @@ fn a_stored_extent_that_overflows_the_device_it_claims_is_refused() {
     // `stored_geometry` checks the extent against itself, so the only way past
     // that is an extent whose own end does not exist.
     let mut region = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut region, &state(2, Cursor::default(), &[]));
+    encode_superblock(
+        &mut region,
+        &state(2, Cursor::default(), &[]),
+        Copies::Parity,
+    );
     let copy = &mut region[..SUPERBLOCK_COPY_BYTES];
     copy[START_SECTOR_AT..START_SECTOR_AT + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     let crc = crc32(&copy[..CRC_AT]);
@@ -539,9 +614,15 @@ proptest! {
         let original = RingState::new(geometry(64), generation, Cursor { sequence, offset }, &readers)
             .expect("every generated field is within its rule");
         let mut region = [0u8; SUPERBLOCK_BYTES];
-        let written = encode_superblock(&mut region, &original);
+        let written = encode_superblock(&mut region, &original, Copies::Parity);
 
-        prop_assert_eq!(written, (generation % 2) as usize * SUPERBLOCK_COPY_BYTES);
+        prop_assert_eq!(
+            written,
+            SuperblockWrite {
+                at: (generation % 2) as usize * SUPERBLOCK_COPY_BYTES,
+                len: SUPERBLOCK_COPY_BYTES,
+            }
+        );
         prop_assert_eq!(decode_superblock(&region), Some(original));
     }
 
@@ -567,7 +648,7 @@ proptest! {
                 .collect();
             let state = RingState::new(geometry(64), generation, writer, &readers)
                 .expect("every seeded field is within its rule");
-            encode_superblock(&mut region, &state);
+            encode_superblock(&mut region, &state, Copies::Parity);
         }
         for (at, byte) in corrupt {
             region[at] = byte;

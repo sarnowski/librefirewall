@@ -3,20 +3,31 @@ use super::*;
 use std::boxed::Box;
 use std::{vec, vec::Vec};
 
+use lfw_ip_endpoint::http::WINDOW_LEN;
 use wire::{DownloadReply, DownloadRequest, DownloadResponder};
 
 /// The endpoint as a download sees it, with every state a real transport can
 /// present and two a hostile or broken one can.
+///
+/// It **enforces the endpoint's own window contract** rather than taking whatever
+/// it is handed: a window at another offset, or longer than the length it asked
+/// for, is refused exactly as `lfw_ip_endpoint::http::Server::supply_window`
+/// refuses one. A fake that accepted any window is what let this module ask for
+/// bytes the endpoint would never take, and made every recording past the first
+/// window a `200` with an empty body.
 #[derive(Default)]
 struct FakeStream {
     pending: Option<&'static str>,
-    wanted: Option<u64>,
-    begun: Option<(u64, Vec<u8>)>,
+    /// What the transport is waiting on: the body offset and the most the array
+    /// will take there.
+    wanted: Option<(u64, usize)>,
+    begun: Option<(u64, ContentType)>,
     supplied: Vec<(u64, Vec<u8>)>,
     abandoned: usize,
     /// Refuse the next `begin_stream`.
     refuse_begin: bool,
-    /// Refuse the next `supply_window`.
+    /// Refuse the next `supply_window`, as an endpoint whose place this module
+    /// has lost track of does.
     refuse_window: bool,
     /// The counters the last pass handed over for the domain's shard.
     noted: Option<DownloadCounters>,
@@ -27,23 +38,34 @@ impl Stream for FakeStream {
         self.pending
     }
 
-    fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+    fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
         if self.refuse_begin {
             self.refuse_begin = false;
             return false;
         }
         self.pending = None;
-        self.begun = Some((total, content_type.as_bytes().to_vec()));
+        self.begun = Some((total, content_type));
+        // A committed response wants its first window at once, which is what the
+        // real endpoint answers as soon as the head is written.
+        self.wanted = (total > 0).then_some((0, WINDOW_LEN));
         true
     }
 
-    fn stream_wanted(&self) -> Option<u64> {
+    fn stream_wanted(&self) -> Option<(u64, usize)> {
         self.wanted
     }
 
     fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
         if self.refuse_window {
             self.refuse_window = false;
+            return false;
+        }
+        // The real endpoint's contract: the offset it asked for, at least one
+        // byte, and no more than it said it would take.
+        let Some((wanted, len)) = self.wanted else {
+            return false;
+        };
+        if start != wanted || bytes.is_empty() || bytes.len() > len {
             return false;
         }
         self.wanted = None;
@@ -127,7 +149,8 @@ fn a_get_of_a_recording_asks_the_recorder_for_its_first_window() {
 
     assert_eq!(
         asked(&channel),
-        Some((DownloadSink::Capture, 0, DOWNLOAD_WINDOW_LEN))
+        Some((DownloadSink::Capture, 0, WINDOW_LEN)),
+        "the opening request must fit the transport's own window, not the channel's"
     );
     assert!(stream.begun.is_none(), "nothing is committed to yet");
 }
@@ -146,9 +169,9 @@ fn the_first_reply_begins_the_stream_at_the_length_the_recorder_stated() {
     answer(&channel, &body, 4096);
     downloads.poll(&mut stream);
 
-    let (total, content_type) = stream.begun.clone().expect("the stream was begun");
+    let (total, content_type) = stream.begun.expect("the stream was begun");
     assert_eq!(total, 4096);
-    assert_eq!(content_type, b"application/octet-stream");
+    assert_eq!(content_type, ContentType::OctetStream);
     assert_eq!(stream.supplied, vec![(0, body)]);
     assert_eq!(downloads.counters().started, 1);
     assert_eq!(downloads.counters().windows, 1);
@@ -173,12 +196,37 @@ fn a_later_window_is_asked_for_at_the_offset_the_transport_named() {
     answer(&channel, &[1u8; 64], 4096);
     downloads.poll(&mut stream);
 
-    stream.wanted = Some(64);
+    stream.wanted = Some((64, WINDOW_LEN));
     downloads.poll(&mut stream);
     assert_eq!(
         asked(&channel),
-        Some((DownloadSink::Log, 64, DOWNLOAD_WINDOW_LEN)),
+        Some((DownloadSink::Log, 64, WINDOW_LEN)),
         "the same recording, at the offset the transport is waiting on"
+    );
+}
+
+/// A transport that will take less than a whole window — one completing a window
+/// an earlier short supply left unfinished — is asked for exactly that much and
+/// no more. Asking for a whole window there would have the reply refused and the
+/// download given up on.
+#[test]
+fn a_partly_filled_window_is_asked_for_at_the_length_it_can_still_take() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(LOG_TARGET),
+        ..FakeStream::default()
+    };
+    downloads.poll(&mut stream);
+    answer(&channel, &[1u8; 64], 4_096);
+    downloads.poll(&mut stream);
+
+    stream.wanted = Some((64, 300));
+    downloads.poll(&mut stream);
+    assert_eq!(
+        asked(&channel),
+        Some((DownloadSink::Log, 64, 300)),
+        "the recorder was asked for more than the transport would take"
     );
 }
 
@@ -267,7 +315,7 @@ fn a_window_wanted_for_a_stream_this_domain_never_began_is_ended() {
     let channel = Channel::new();
     let mut downloads = channel.downloads();
     let mut stream = FakeStream {
-        wanted: Some(512),
+        wanted: Some((512, WINDOW_LEN)),
         ..FakeStream::default()
     };
     downloads.poll(&mut stream);
@@ -319,5 +367,92 @@ fn only_one_request_is_ever_outstanding() {
     assert!(
         responder.take().is_none(),
         "and nothing more is asked until the transport wants a window"
+    );
+}
+
+/// A recording several windows long arrives whole, through the channel and the
+/// endpoint's own window contract.
+///
+/// The recorder here reads a ring of extents and can never answer past the extent
+/// an offset falls in, so **every** window it serves is short — which is the
+/// ordinary case for a recording longer than one extent, not an exceptional one.
+/// A short window must advance the response: the transport then asks for the
+/// remainder, and what the client reads is the body its head announced.
+#[test]
+fn a_recording_several_windows_long_is_delivered_whole() {
+    const TOTAL: u64 = 3 * WINDOW_LEN as u64 + 777;
+    /// Shorter than a window, so no reply ever fills one.
+    const EXTENT: u64 = 5_000;
+
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(CAPTURE_TARGET),
+        ..FakeStream::default()
+    };
+
+    let mut delivered = 0u64;
+    for _ in 0..4096 {
+        downloads.poll(&mut stream);
+        // The recorder answers whatever is outstanding, stopping at the extent
+        // boundary and at the end of the snapshot.
+        {
+            let mut responder = channel.responder();
+            if let Some(demand) = responder.take() {
+                let offset = demand.offset();
+                let reach = (EXTENT - offset % EXTENT).min(TOTAL.saturating_sub(offset));
+                // Lossless: bounded by the demand, itself bounded by the window.
+                let len = (demand.len() as u64).min(reach) as usize;
+                let bytes: Vec<u8> = (offset..offset.saturating_add(len as u64))
+                    .map(|at| (at % 251) as u8)
+                    .collect();
+                responder.deliver(demand, &bytes, TOTAL);
+            }
+        }
+        downloads.poll(&mut stream);
+        // The transport sends what arrived and asks for the rest, which is what
+        // the peer's acknowledgement makes it do.
+        let taken: u64 = stream
+            .supplied
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
+        if taken > delivered {
+            delivered = taken;
+            stream.wanted = (delivered < TOTAL).then_some((delivered, WINDOW_LEN));
+        }
+        if delivered >= TOTAL {
+            break;
+        }
+    }
+
+    assert_eq!(stream.begun.map(|(total, _)| total), Some(TOTAL));
+    assert_eq!(
+        delivered, TOTAL,
+        "the body was short of the length its head announced"
+    );
+    assert_eq!(stream.abandoned, 0, "a short window ended the download");
+    assert_eq!(downloads.counters().bytes, TOTAL);
+    assert_eq!(downloads.counters().started, 1);
+
+    // Every window arrived at the offset the transport asked for and carried the
+    // bytes that belong there: a window taken at the wrong offset would put a
+    // recording's bytes where no client could tell they did not belong.
+    let mut at = 0u64;
+    for (start, bytes) in &stream.supplied {
+        assert_eq!(*start, at, "a window arrived out of order");
+        assert!(!bytes.is_empty(), "an empty window was taken");
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(
+                u64::from(*byte),
+                at.saturating_add(index as u64) % 251,
+                "the window at {at} carried another offset's bytes"
+            );
+        }
+        at = at.saturating_add(bytes.len() as u64);
+    }
+    assert!(
+        stream.supplied.len() as u64 > TOTAL / WINDOW_LEN as u64,
+        "every window was served whole, so no short one was exercised"
     );
 }

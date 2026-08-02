@@ -62,7 +62,7 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
             Some(Event::Start(section)) => {
                 if section.name == b"management" {
                     if management_read {
-                        return Err(unknown_element(&section));
+                        return Err(duplicate_element(&section));
                     }
                     management_read = true;
                     let entry = management_from(&section)?;
@@ -74,10 +74,19 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
                     continue;
                 }
                 reject_attributes(&section)?;
-                if section.name == b"interfaces" && !interfaces_read {
+                // Which of the three faults it is, kept apart: an element the
+                // schema does not name at all, and a second one it does, are
+                // different things to go and do about the document.
+                if section.name == b"interfaces" {
+                    if interfaces_read {
+                        return Err(duplicate_element(&section));
+                    }
                     interfaces_read = true;
                     read_interfaces(&mut reader, &mut model)?;
-                } else if section.name == b"neighbours" && !neighbours_read {
+                } else if section.name == b"neighbours" {
+                    if neighbours_read {
+                        return Err(duplicate_element(&section));
+                    }
                     neighbours_read = true;
                     read_neighbours(&mut reader, &mut model)?;
                 } else {
@@ -268,6 +277,15 @@ fn unknown_element(element: &Element<'_>) -> DocumentError {
     }
 }
 
+/// A section the schema names, appearing a second time. Reported at the second
+/// one, which is the one to delete.
+fn duplicate_element(element: &Element<'_>) -> DocumentError {
+    DocumentError {
+        fault: DocumentFault::DuplicateElement,
+        offset: element.offset,
+    }
+}
+
 fn unknown_attribute(attribute: &Attribute<'_>) -> DocumentError {
     DocumentError {
         fault: DocumentFault::UnknownAttribute,
@@ -417,9 +435,18 @@ mod tests {
             "<neighbours/><interfaces/></configuration>"
         );
         assert!(parse(swapped.as_bytes()).is_ok());
+        // A second section is refused for *being* a second one. It is not an
+        // unknown element — the schema names all three — and telling an
+        // operator that `<interfaces>` is unknown when their document has two
+        // of them sends them to the wrong edit.
         for twice in [
             concat!(
                 "<configuration><interfaces/><interfaces/><neighbours/>",
+                management!(),
+                "</configuration>"
+            ),
+            concat!(
+                "<configuration><interfaces/><neighbours/><neighbours/>",
                 management!(),
                 "</configuration>"
             ),
@@ -432,7 +459,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse(twice.as_bytes()).expect_err("one each").fault,
-                DocumentFault::UnknownElement,
+                DocumentFault::DuplicateElement,
                 "{twice}"
             );
         }

@@ -104,10 +104,18 @@ pub struct TcpCounters {
     /// silent.
     pub urgent_ignored: u64,
 
-    /// Acknowledgements sent to challenge a segment rather than to acknowledge
-    /// data: RFC 5961's answer to a blind in-window `RST` or a `SYN` on a
-    /// synchronized connection.
+    /// Segments challenged rather than acted on: RFC 5961's answer to a blind
+    /// in-window `RST` (section 3.2) or a `SYN` on a synchronized connection
+    /// (section 4). It counts the *decision* to challenge; whether the
+    /// acknowledgement left is the per-second budget's answer, and what that
+    /// withheld is `challenges_suppressed`.
     pub challenge_acks: u64,
+    /// Unsolicited replies withheld by RFC 5961 section 7's per-second budget,
+    /// whichever kind: a challenge acknowledgement — including the ones RFC 793
+    /// owes an out-of-window segment or an unacceptable acknowledgement — or the
+    /// reset a segment naming no connection would have drawn. A number that moves
+    /// at all is a peer provoking replies faster than any exchange needs to.
+    pub challenges_suppressed: u64,
     /// `RST`s accepted, each of which destroyed a connection.
     pub resets_received: u64,
     /// `RST`s sent, for any of the reasons RFC 793 section 3.4 lists.
@@ -146,6 +154,7 @@ impl TcpCounters {
             refused_out_of_order: 0,
             urgent_ignored: 0,
             challenge_acks: 0,
+            challenges_suppressed: 0,
             resets_received: 0,
             resets_sent: 0,
             write_refused: 0,

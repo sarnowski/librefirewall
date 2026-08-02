@@ -125,8 +125,11 @@ pub enum RequestError {
     ObsoleteLineFolding,
     /// A request announcing a body. See the crate header.
     BodyNotAccepted,
-    /// The bytes are not UTF-8, and so not the ASCII a head is made of.
-    NotAscii,
+    /// The bytes are not UTF-8, which is what is checked: a head is ASCII, and
+    /// every ASCII string is UTF-8, so this refuses the bytes no `&str` can
+    /// hold rather than every byte above 0x7F. The fields that must be ASCII
+    /// say so themselves — a token, a target, a field value.
+    NotUtf8,
 }
 
 impl RequestError {
@@ -151,7 +154,7 @@ impl RequestError {
             | Self::MalformedVersion
             | Self::ObsoleteLineFolding
             | Self::BodyNotAccepted
-            | Self::NotAscii => Status::BadRequest,
+            | Self::NotUtf8 => Status::BadRequest,
         }
     }
 }
@@ -181,7 +184,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
     };
     let head = bytes.get(..end).unwrap_or_default();
     let consumed = end.saturating_add(HEAD_TERMINATOR.len());
-    let head = core::str::from_utf8(head).map_err(|_| RequestError::NotAscii)?;
+    let head = core::str::from_utf8(head).map_err(|_| RequestError::NotUtf8)?;
 
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -190,11 +193,14 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
     let mut headers = [None; MAX_HEADERS];
     let mut count = 0usize;
     for line in lines {
-        let header = parse_header(line)?;
+        // Counted before it is read, so a field past the bound is refused for
+        // being one field too many — a 431 — whatever its syntax. Parsing first
+        // would answer 400 for the same request and hide the bound behind
+        // whichever rule the extra field happened to break.
         let Some(slot) = headers.get_mut(count) else {
             return Err(RequestError::TooManyHeaders);
         };
-        *slot = Some(header);
+        *slot = Some(parse_header(line)?);
         count = count.saturating_add(1);
     }
 
@@ -213,12 +219,11 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
 /// first half of a terminator whose second half is still on the wire.
 fn check_line_endings(bytes: &[u8]) -> Result<(), RequestError> {
     let mut previous: Option<u8> = None;
-    for (index, byte) in bytes.iter().enumerate() {
-        match *byte {
-            b'\n' if previous != Some(b'\r') => return Err(RequestError::BareLineFeed),
-            _ => {}
+    for byte in bytes {
+        if *byte == b'\n' && previous != Some(b'\r') {
+            return Err(RequestError::BareLineFeed);
         }
-        if previous == Some(b'\r') && *byte != b'\n' && index > 0 {
+        if previous == Some(b'\r') && *byte != b'\n' {
             return Err(RequestError::StrayCarriageReturn);
         }
         previous = Some(*byte);

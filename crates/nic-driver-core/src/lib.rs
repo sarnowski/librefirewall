@@ -189,6 +189,18 @@ pub struct DriverStats {
     pub counters: Counters,
     pub rx_device: DeviceFaults,
     pub tx_device: DeviceFaults,
+    /// Buffers posted to the device on the receive queue and not yet completed.
+    ///
+    /// An occupancy rather than a count of events, and the only thing that
+    /// separates a stalled device from an idle link: a device may accept a buffer
+    /// and never complete it, which no fault counter sees — the driver did
+    /// nothing wrong. Under traffic this rises and falls; a device that has
+    /// stopped completing leaves it pinned at the queue's size.
+    pub rx_posted: usize,
+    /// The transmit mirror of [`rx_posted`](Self::rx_posted): pinned here means
+    /// frames handed to the device and never sent, each a pool buffer the far
+    /// owner is still waiting for.
+    pub tx_posted: usize,
 }
 
 impl DriverStats {
@@ -225,6 +237,9 @@ impl DriverStats {
             ],
             receive_device_faults: device_faults(self.rx_device),
             transmit_device_faults: device_faults(self.tx_device),
+            // A gauge among counters, and the only number here that may fall.
+            // Lossless: a `usize` occupancy is bounded by the queue size.
+            queue_posted: [self.rx_posted as u64, self.tx_posted as u64],
             receive_pool: PoolSample {
                 not_lent: receive_pool.reclaim_not_lent,
                 ledger_refused: receive_pool.reclaim_refused,
@@ -243,6 +258,8 @@ impl DriverStats {
             counters: *counters,
             rx_device: rx.device_faults(),
             tx_device: tx.device_faults(),
+            rx_posted: rx.posted_count(),
+            tx_posted: tx.posted_count(),
         }
     }
 }
@@ -1036,22 +1053,24 @@ mod tests {
                 completion_not_posted: 20,
                 completion_length_over_reported: 21,
             },
+            rx_posted: 22,
+            tx_posted: 23,
         };
         let sample = stats.to_sample(
             PoolCounters {
-                reclaim_not_lent: 22,
-                reclaim_refused: 23,
+                reclaim_not_lent: 24,
+                reclaim_refused: 25,
             },
             LogSample {
-                dropped: 24,
-                refused: 25,
+                dropped: 26,
+                refused: 27,
             },
         );
         let values = sample.values();
         assert_eq!(values.len(), lfw_metrics::DRIVER_SLOTS);
         let mut seen: Vec<u64> = values.to_vec();
         seen.sort_unstable();
-        assert_eq!(seen, (1..=25).collect::<Vec<u64>>());
+        assert_eq!(seen, (1..=27).collect::<Vec<u64>>());
     }
 
     /// One transmit virtqueue over a fresh region, plus the device on its far
@@ -1968,6 +1987,41 @@ mod tests {
         assert_eq!(stats.tx_device.completion_not_posted, 1);
         assert_eq!(stats.counters.input.tx_duplicate, 7);
         assert_eq!(stats.counters.invariant, InvariantFaults::default());
+    }
+
+    /// A device that accepts buffers and never completes one is a stall, and
+    /// occupancy is the only thing that shows it: every fault counter stays at
+    /// zero — the driver did nothing wrong and the device broke no protocol
+    /// rule — while the receive queue stays pinned full. Without this reaching
+    /// the sample, a stalled port and a quiet link are the same reading.
+    #[test]
+    fn a_device_that_completes_nothing_shows_up_as_pinned_queue_occupancy() {
+        let mut rx = RxFixture::new();
+        let tx = TxFixture::new();
+        rx.refill();
+
+        let stalled = DriverStats::sample(&rx.counters, &rx.vq, &tx.vq);
+        assert_eq!(
+            stalled.rx_posted, Q,
+            "a primed receive queue has every descriptor outstanding"
+        );
+        assert_eq!(stalled.counters, Counters::default(), "nothing is faulty");
+        assert_eq!(stalled.rx_device, DeviceFaults::default());
+
+        // Draining while the device has completed nothing changes nothing: the
+        // occupancy is what did not move, which is the observation.
+        rx.drain();
+        let still = DriverStats::sample(&rx.counters, &rx.vq, &tx.vq);
+        assert_eq!(still.rx_posted, Q);
+
+        // And it falls the moment the device completes one, so the number is a
+        // live occupancy rather than a high-water mark.
+        rx.device.complete(0, (VirtioNetHdr::LEN + 64) as u32);
+        rx.drain();
+        assert_eq!(
+            DriverStats::sample(&rx.counters, &rx.vq, &tx.vq).rx_posted,
+            Q - 1
+        );
     }
 
     /// One whole transmit pipeline with the buffer cycle closed: the

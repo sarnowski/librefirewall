@@ -23,20 +23,19 @@ system image as a Multiboot2 module — both must be present and version-matched
 
 **This table describes the boot medium, not the whole of a node's storage.** Configuration and
 identity are written in bytes per day and belong here, so that a node carries everything it needs to
-come up as itself. The [recording rings](recording.md) do not: a capture ring rewrites its medium
-continuously, its write-endurance profile is not comparable to configuration's, and a single
-sequential writer per device is what obtains a device's bandwidth. Rings are therefore bound to
-their own devices or partitions, resolved at boot (see
-[Storage devices and binding](recording.md#storage-devices-and-binding)), and how many devices a
-build drives is part of its static topology — so a deployment target's storage is this layout plus
+come up as itself. The [recording rings](recording.md) do not: their rate and endurance class is a
+different one, so they are bound to their own devices or partitions, resolved at boot (see
+[Storage devices and binding](recording.md#storage-devices-and-binding)). How many devices a build
+drives is part of its static topology — so a deployment target's storage is this layout plus
 whatever that variant grants it to record onto.
 
 ## Boot manager and slot selection
 
-The boot manager is **GRUB** (built from pinned source as a minimal standalone `x86_64-efi`
-image with an embedded, immutable configuration and a curated module allowlist). GRUB is chosen
-because it is the one common bootloader that natively speaks the x86 Multiboot2 contract seL4
-requires, while also supporting UEFI, signature verification, and a persistent environment.
+The boot manager is **GRUB**, reduced to the modules it needs and carrying an embedded, immutable
+configuration — so the selection logic is part of the verified boot base rather than something read
+from writable media. GRUB is chosen because it is the one common bootloader that natively speaks the
+x86 Multiboot2 contract seL4 requires, while also supporting UEFI, signature verification, and a
+persistent environment.
 
 Selection uses the proven `OK`/`TRY`/`ORDER` scheme (as in RAUC's GRUB integration), which is what
 stock GRUB scripting can express without arithmetic: a confirmed slot (`*_OK`) boots immediately; an
@@ -57,9 +56,10 @@ in its core image and **enforces detached-signature verification** on every file
 authenticates the payload independently of the medium it sits on. The boot-selection state is
 loaded unverified (it only *chooses among* already-signed slots and can never inject code).
 
-Development builds generate a local, throwaway signing key (never committed); the release manifest
-records `trust_profile: development` and the key fingerprint so a development-signed image can never
-be mistaken for a production one.
+A release records the trust profile it was signed under, so a development-signed image can never be
+mistaken for a production one. Signature verification authenticates a release but does not order
+releases, so downgrade to a known-vulnerable signed release is prevented separately, by a monotonic
+security epoch held in a TPM.
 
 ## Firmware and the seL4 hand-off contract
 
@@ -68,23 +68,25 @@ UEFI+GRUB imposes hand-off constraints that shape the boot chain:
 
 - seL4's x86 Multiboot2 path takes the **ACPI RSDP from the Multiboot2 ACPI tag** GRUB provides, so
   ACPI works under UEFI without the legacy BIOS memory scan.
-- The seL4 boot module (the Microkit system image) must load **above** the kernel image; GRUB's
-  relocator satisfies this, but it remains a real constraint on memory-constrained targets.
+- The seL4 boot module (the Microkit system image) must load **above** the kernel image. seL4 places
+  the userland image at the end of the last boot module and never checks that against where its own
+  kernel sits, so a module loaded below the kernel makes seL4 write the userland image over the
+  kernel it is running on, before any protection domain starts. **GRUB does not honour this
+  contract**: its relocator takes the lowest free range that fits, and on `x86_64-efi` the
+  conventional memory below 1 MiB is free. What holds the property is therefore the embedded
+  configuration reserving that memory away from GRUB, together with a build-time check refusing a
+  system image small enough to fit whatever the reservation leaves. Neither is redundant, and the
+  failure they prevent is silent.
 - **The debug kernel takes its serial console from the kernel command line**, so the kernel must be
-  given its `console_port`/`debug_port` on the Multiboot2 command line or it boots silently. The
-  **IOMMU is left enabled** (Microkit's x86 default); on a platform without VT-d seL4 reports zero
-  IOMMUs.
+  given its `console_port`/`debug_port` on the Multiboot2 command line or it boots silently.
+- The **IOMMU is left enabled** (Microkit's x86 default), and on a platform without VT-d seL4
+  reports zero IOMMUs. Enabling it is not confinement: a device's DMA is bounded only once that
+  device is placed in an IOMMU domain, which is what the
+  [threat model's DMA isolation](threat-model.md#isolation-model) requires and what the hand-off
+  contract alone does not provide.
 
-## Deliberately deferred
+## Scope of the slot mechanism
 
-- **UEFI Secure Boot** and its key hierarchy (enrolling a librefirewall platform key; signing the
-  EFI binary). The payload-signing and A/B mechanics above are independent of, and ready for, it.
-- **TPM-backed anti-rollback** (a monotonic security epoch preventing downgrade to a known-vulnerable
-  signed release).
-- **The in-system update/health PD** and the staged, transactional, multi-cluster rollout that
-  builds on the [configuration-management workflow](configuration.md).
-- **Redundant, crash-safe boot state.** Stock `grubenv` is a single in-place block; torn-write-safe
-  redundant state is part of the update-PD work, not the bootloader.
-- **Virtualised/cloud targets** (Proxmox, Azure) are expected to use image/generation replacement at
-  the hypervisor or load-balancer level rather than guest-managed A/B, reusing the same signed
-  release and compatibility contract.
+**Virtualised and cloud targets do not use guest-managed A/B.** On Proxmox and Azure an update is
+image or generation replacement at the hypervisor or load-balancer level, reusing the same signed
+release and compatibility contract rather than the slot mechanics above.

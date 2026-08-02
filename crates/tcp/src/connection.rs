@@ -212,6 +212,10 @@ pub struct Connection {
     snd_nxt: SeqNumber,
     /// The peer's advertised window, already scaled.
     snd_wnd: u32,
+    /// RFC 5961 section 5's `MAX.SND.WND`: the largest window this end has ever
+    /// been offered, which is how far behind [`snd_una`](Self::snd_una) an
+    /// acknowledgement may legitimately lag.
+    snd_wnd_max: u32,
     /// RFC 793 p.72's `SND.WL1`/`SND.WL2`: which segment last moved the window,
     /// so an old segment arriving late cannot shrink it back.
     snd_wl1: SeqNumber,
@@ -272,6 +276,7 @@ impl Connection {
             // The `SYN` this connection is about to send occupies one number.
             snd_nxt: iss.add(1),
             snd_wnd: scaled_window(segment.window, 0),
+            snd_wnd_max: scaled_window(segment.window, 0),
             snd_wl1: segment.sequence,
             snd_wl2: iss,
             irs,
@@ -674,8 +679,15 @@ impl Connection {
         // TIME_WAIT holds no stream: a segment reaching it is a retransmission
         // to be acknowledged, and the wait restarts so the acknowledgement has
         // its own lifetime to be delivered in.
+        //
+        // RFC 793 section 3.9 restarts it on a retransmitted remote `FIN` and
+        // on nothing else: any other acceptable segment is answered out of the
+        // wait already running, so a peer cannot hold a slot indefinitely by
+        // sending into a connection that is over.
         if self.state == State::TimeWait {
-            self.start_time_wait(now);
+            if segment.flags.contains(Flags::FIN) {
+                self.start_time_wait(now);
+            }
             return Processed {
                 data: &[],
                 reply: Some(self.acknowledgement()),
@@ -767,10 +779,14 @@ impl Connection {
             }
             self.state = State::Established;
             established = true;
-        } else if ack.follows(self.snd_nxt) {
-            // An acknowledgement of something never sent. RFC 793 answers with
-            // an acknowledgement of what really was, which is also RFC 5961
-            // section 5's challenge.
+        } else if ack.follows(self.snd_nxt) || ack.precedes(self.snd_una.sub(self.snd_wnd_max)) {
+            // RFC 5961 section 5's acceptable range, both edges. Ahead of
+            // `SND.NXT` is an acknowledgement of something never sent; further
+            // than `MAX.SND.WND` behind `SND.UNA` is one no delayed duplicate
+            // of a real segment can be, and taking it would let an off-path
+            // attacker reach `update_window` with a window of its own choosing.
+            // Both are answered with an acknowledgement of what really was,
+            // which is RFC 793's answer and RFC 5961's challenge alike.
             return Err(self.refuse(Refusal::UnacceptableAck, Some(self.acknowledgement())));
         }
 
@@ -786,18 +802,23 @@ impl Connection {
     /// Retire every range the acknowledgement covers, taking a round-trip
     /// sample from the newest that was not retransmitted (Karn's algorithm).
     fn retire(&mut self, now: Monotonic, ack: SeqNumber) {
-        let mut sample = None;
+        // The newest is the one furthest along the sequence space, not the one
+        // in the last array slot: records are placed in whichever slot is free,
+        // so slot order says nothing about send order.
+        let mut newest: Option<(SeqNumber, Duration)> = None;
         for slot in &mut self.unacked {
             let Some(record) = slot else { continue };
             if record.end().follows(ack) {
                 continue;
             }
-            if !record.retransmitted {
-                sample = Some(now.since(record.sent_at));
+            if !record.retransmitted
+                && newest.is_none_or(|(sequence, _)| sequence.precedes(record.sequence))
+            {
+                newest = Some((record.sequence, now.since(record.sent_at)));
             }
             *slot = None;
         }
-        if let Some(sample) = sample {
+        if let Some((_, sample)) = newest {
             self.timer.measure(sample);
         }
         self.arm(now);
@@ -813,6 +834,7 @@ impl Connection {
                 && segment.acknowledgement.follows_or_equals(self.snd_wl2));
         if newer {
             self.snd_wnd = scaled_window(segment.window, self.snd_scale);
+            self.snd_wnd_max = self.snd_wnd_max.max(self.snd_wnd);
             self.snd_wl1 = segment.sequence;
             self.snd_wl2 = segment.acknowledgement;
         }

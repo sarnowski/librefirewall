@@ -92,7 +92,9 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
-use net_headers::{ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, MacAddress, TtlExpired};
+use net_headers::{
+    ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, MacAddress, ParseCounters, TtlExpired,
+};
 use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError, WriteOutsideBuffer};
 use queue::SpscRing;
 use routing::{Decision, DropCounters, DropReason, PortId, Router};
@@ -401,7 +403,7 @@ pub use endpoint::{
 };
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
-    endpoint_from, interfaces_from, router_from,
+    StaleOffer, endpoint_from, interfaces_from, router_from,
 };
 pub use lfw_ip_endpoint::IsnSecret;
 pub use stats::{
@@ -533,6 +535,10 @@ impl<'ring> PoolOwner<'ring> {
     /// accepts it. A rejected return changes nothing and is counted in
     /// [`counters`](Self::counters), so the buffer it named keeps whatever
     /// state it really had and its rightful holder can still return it.
+    ///
+    /// The count is what a driver acts on; *which* indices were accepted is
+    /// [`lent`](Self::lent) differenced across the call, an accepted return being
+    /// exactly a lent flag this cleared and nothing here setting one.
     pub fn reclaim(&mut self) -> usize {
         let Self {
             ledger,
@@ -566,6 +572,19 @@ impl<'ring> PoolOwner<'ring> {
     #[must_use]
     pub fn owned(&self) -> usize {
         self.ledger.len()
+    }
+
+    /// Which indices this domain currently counts as lent to a peer, one flag
+    /// per pool index.
+    ///
+    /// The record [`reclaim`](Self::reclaim) decides against, exposed because its
+    /// count cannot say *which* returns it accepted: differencing this across a
+    /// `reclaim` names exactly the indices that came back. A caller tracking
+    /// ownership of its own cannot reconstruct that from a number, and it is also
+    /// what tells a return the peer routed out of band from a forged one.
+    #[must_use]
+    pub fn lent(&self) -> [bool; POOL_BUFFERS] {
+        self.lent
     }
 
     #[must_use]
@@ -612,11 +631,12 @@ pub struct RouteCounters {
     pub malformed_descriptor: u64,
     /// Spans the pool refused to snapshot, leaving nothing to route on.
     pub snapshot_failed: u64,
-    /// Frames that are not the IPv4-over-Ethernet packet they would have to be
-    /// to be routed. One counter for every [`net_headers::ParseError`]: this
-    /// domain has no exposed surface to report which — a drop is
-    /// currently unobservable — so a finer split would be numbers nobody reads.
-    pub unparsable: u64,
+    /// Frames that are not the IPv4-over-Ethernet packet they would have to be to
+    /// be routed, one counter per [`net_headers::ParseFailure`]: four classes,
+    /// because each is a different thing for an operator to do about it, and four
+    /// rather than one per error variant because the values that make a rejection
+    /// diagnosable belong in a record rather than in a label.
+    pub unparsable: ParseCounters,
     /// Frames the router would forward out of a port this stage is not wired
     /// to. A stage is a fixed cross-connect between one ingress and one egress
     /// port, so such a decision cannot be carried out here at all.
@@ -728,6 +748,17 @@ impl<'ring> RouteStage<'ring> {
     /// stop draining rather than fault, the descriptor being peer input.
     /// Stopping on the first refusal is deliberate: every further dequeue into
     /// a full destination would lose another buffer.
+    ///
+    /// The descriptors the refusal leaves behind stay on the source ring, owned
+    /// by whoever lent them, so the stop costs the one already dequeued and
+    /// leaks nothing. There is no self-wakeup — this call cannot schedule
+    /// another — so the bound on when they are looked at again is the next
+    /// notification the domain receives. Two things make that a real bound: a
+    /// driver polls in a busy loop rather than waiting to be asked, so a
+    /// momentarily full destination drains within one of its passes; and every
+    /// frame either driver receives afterwards wakes this domain, which
+    /// re-drains the backlog ahead of it. Only a total traffic stop is unbounded,
+    /// and then the backlog is stationary rather than growing.
     pub fn poll<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
         &mut self,
         configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
@@ -822,7 +853,7 @@ impl<'ring> RouteStage<'ring> {
     }
 
     /// The same, borrowed: what a caller assembling a shard out of both stages
-    /// needs, and a copy of a struct holding eleven more would be one per
+    /// needs, and copying a struct of this many counters would be one copy per
     /// wakeup for nothing.
     #[must_use]
     pub const fn counters_ref(&self) -> &RouteCounters {
@@ -918,8 +949,8 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
 ) -> Routed {
     let frame = match Frame::parse(frame_bytes) {
         Ok(frame) => frame,
-        Err(_) => {
-            bump(&mut counters.unparsable);
+        Err(error) => {
+            counters.unparsable.record(error);
             return Routed::Discarded;
         }
     };
@@ -962,8 +993,8 @@ fn forward(
     let frame_bytes: &mut [u8] = scratch.get_mut(..frame_len).unwrap_or_default();
     let mut frame = match Frame::parse(frame_bytes) {
         Ok(frame) => frame,
-        Err(_) => {
-            bump(&mut counters.unparsable);
+        Err(error) => {
+            counters.unparsable.record(error);
             return Verdict::Discard;
         }
     };
@@ -1034,7 +1065,9 @@ fn write_back(
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
-    use net_headers::{EtherType, Ipv4Address, MacAddress, Protocol, Transport, UDP_HEADER_LEN};
+    use net_headers::{
+        EtherType, Ipv4Address, MacAddress, ParseFailure, Protocol, Transport, UDP_HEADER_LEN,
+    };
     use proptest::prelude::*;
     use routing::{Interface, Neighbour};
     use std::boxed::Box;
@@ -1950,7 +1983,16 @@ mod tests {
         }
 
         assert_eq!(stage.poll(running(), None), unroutable.len());
-        assert_eq!(stage.counters().unparsable, unroutable.len() as u64);
+        let unparsable = stage.counters().unparsable;
+        assert_eq!(unparsable.total(), unroutable.len() as u64);
+        // And each under the class an operator would act on: a frame of
+        // arbitrary bytes is an EtherType this appliance does not route, a ten-byte
+        // frame carries no headers at all, four bytes past L2 carry no IPv4
+        // header, and a flipped checksum byte is corruption on the path.
+        assert_eq!(unparsable.get(ParseFailure::Ethernet), 1);
+        assert_eq!(unparsable.get(ParseFailure::FrameTooShort), 2);
+        assert_eq!(unparsable.get(ParseFailure::Ipv4Checksum), 1);
+        assert_eq!(unparsable.get(ParseFailure::Ipv4), 0);
         assert_eq!(
             stage.counters().drops.total(),
             0,
@@ -2095,7 +2137,7 @@ mod tests {
             .expect("a full pool has buffers");
         assert_eq!(stage.poll(running(), Some(&mut tap)), 1);
 
-        assert_eq!(stage.counters().unparsable, 1);
+        assert_eq!(stage.counters().unparsable.total(), 1);
         assert_eq!(tap.counters().observed, 0);
         assert!(ring.drain().is_empty());
     }
@@ -2244,6 +2286,63 @@ mod tests {
         assert_eq!(owner.reclaim(), 2);
         assert_eq!(owner.owned(), POOL_BUFFERS);
         assert_eq!(owner.counters(), PoolCounters::default());
+    }
+
+    /// The lent set names which buffers are out, and differencing it across a
+    /// `reclaim` names which returns that call accepted — the question its count
+    /// cannot answer. A caller keeping its own record of ownership needs exactly
+    /// this: with only a number, a legitimate return it did not queue itself is
+    /// indistinguishable from a forged one.
+    #[test]
+    fn the_lent_set_names_which_returns_a_reclaim_accepted() {
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut free_in = r.returns.free.producer();
+
+        assert_eq!(owner.lent(), [false; POOL_BUFFERS], "nothing starts lent");
+
+        let mut lent = Vec::new();
+        for _ in 0..3 {
+            let buffer = owner.alloc().expect("a full pool has buffers");
+            let index = buffer.index();
+            owner
+                .lend(&mut rx_in, buffer, 0, 64, Verdict::Transmit)
+                .expect("the ring is empty");
+            lent.push(index);
+        }
+        for index in &lent {
+            assert!(owner.lent()[*index as usize], "index {index} is out");
+        }
+
+        // Return the middle one, plus a forged index and a replay of a buffer
+        // that is not out: only the real return may move a flag.
+        let real = lent[1];
+        for descriptor in [real, POOL_BUFFERS as u32, lent[0].wrapping_add(32)] {
+            free_in
+                .try_enqueue(Descriptor::new(descriptor, 0, 0, Verdict::Transmit))
+                .expect("the free ring has room");
+        }
+        let before = owner.lent();
+        assert_eq!(owner.reclaim(), 1, "one of the three returns is legitimate");
+        let after = owner.lent();
+
+        let accepted: Vec<u32> = (0..POOL_BUFFERS as u32)
+            .filter(|index| before[*index as usize] && !after[*index as usize])
+            .collect();
+        assert_eq!(
+            accepted,
+            std::vec![real],
+            "the difference must name exactly the return that was accepted"
+        );
+        // And nothing is ever added by a reclaim, which is what makes the
+        // difference a complete answer rather than half of one.
+        for index in 0..POOL_BUFFERS {
+            assert!(
+                before[index] || !after[index],
+                "a reclaim lent a buffer out"
+            );
+        }
     }
 
     #[test]
@@ -2977,7 +3076,7 @@ mod tests {
             // Every verdict is one of the two, and the tallies account for
             // every frame exactly once.
             let discarded = counters.drops.total()
-                + counters.unparsable
+                + counters.unparsable.total()
                 + counters.misrouted
                 + counters.snapshot_failed
                 + counters.writeback_failed;

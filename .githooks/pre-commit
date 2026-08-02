@@ -1,6 +1,14 @@
 #!/bin/sh
-# Fast host gate. Runs before every commit so what lands on trunk is green and
-# bisectable at the cheapest moment.
+# Fast host gate. Runs before every commit, so the fast gate is what every
+# single commit on trunk has passed — formatting, lints, the host tests and
+# their coverage floors, the budget ratchets, the system-description,
+# reference-chapter and configuration-document checks, and dependency policy.
+#
+# It is not the whole gate, and the difference is worth knowing before trusting
+# a bisect: the full gate runs once per push, against the tip. A push carrying
+# several commits therefore leaves the intermediate ones qualified by this hook
+# alone, so a bisect that lands on one has not landed on a commit the QEMU
+# scenarios ever booted.
 set -e
 echo "pre-commit: running 'make test' (fast host gate)"
 exec make test

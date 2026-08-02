@@ -17,7 +17,7 @@
 - **Security:** the API provides encryption, authentication, and read/write authorization using an
   **mTLS certificate pair issued during onboarding** (the design of the onboarding process is
   still open — see [development status](../status.md)). The management API runs in an isolated PD,
-  on a dedicated management interface, and is rate-limited.
+  on a dedicated management interface, and bounds the rate of requests it accepts.
 - **Metrics:** exposed in **Prometheus exposition format** via `GET /metrics` — the *only* metrics
   interface — with disciplined, bounded cardinality (aggregate metrics, never per-flow labels).
   Every moving part (queues, buffer pools, per-NIC and per-core counters) is observable there
@@ -39,10 +39,8 @@
 - **Recording:** the two pcapng sinks (see
   [Recording and persistent storage](recording.md)) are retrieved through the management API as
   pcapng files, over the same mTLS-authenticated, authorized and rate-limited surface as everything
-  else, and a **live event stream** for an operator console — another
-  [reader of the log ring](recording.md#one-writer-many-readers) — is developed later. This is the
-  one surface bounded by storage rather than by memory, and the only one that carries the traffic
-  itself.
+  else, as is a **live event stream** for an operator console — another
+  [reader of the log ring](recording.md#one-writer-many-readers).
 - **The recording sinks are a deliberate exception to the no-payload rule, not an oversight in
   it.** Every other surface named here is barred from carrying packet payloads, and that bar
   stands unchanged: metrics, logs, the local log buffer, and the console carry none. The capture
@@ -67,4 +65,4 @@
   debug it. The externalized logs and metrics are therefore a first-class operator contract,
   specified in the [reference part](../reference/observability.md) of this book.
 - **Management application:** configuration management, log analysis, and metric analysis are
-  handled by a separate management application, developed later.
+  handled by a separate management application.

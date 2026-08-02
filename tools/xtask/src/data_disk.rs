@@ -29,9 +29,14 @@
 //! # No adversary
 //!
 //! This is build orchestration on the host side of an emulator; no threat-model
-//! adversary is named for it. The guest can write the file — that is the
-//! point — but nothing here parses what it wrote: the whole judgement is a
-//! comparison of 512 bytes against a constant.
+//! adversary is named for it. The guest composes every byte read back here —
+//! that is the point — and two of the three judgements do parse what it wrote:
+//! a superblock through the appliance's own decoder, and the payload as pcapng
+//! by the lengths the payload itself states. So they are written the way a
+//! reader of hostile bytes would write them, and for the reason stated for this
+//! crate as a whole: a malformed extent is the case a failing gate exists to
+//! report, and a harness that aborted on it would lose the report. The witness
+//! sector alone is the comparison of 512 bytes against a constant.
 
 use std::{
     fs::{File, OpenOptions},
@@ -217,8 +222,10 @@ impl DataDisk {
     /// guest wrote.
     ///
     /// # Errors
-    /// A superblock that does not decode, or an extent whose payload segments
-    /// hold no walkable pcapng.
+    /// A superblock that does not decode, one that claims nothing durable, an
+    /// extent whose payload segments hold no walkable pcapng, or one the walk
+    /// did not follow to exactly the byte the superblock's durable cursor
+    /// names.
     pub(crate) fn judge_recordings(&self) -> Result<String, String> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -246,6 +253,32 @@ impl DataDisk {
                     state.geometry().start_sector()
                 ));
             }
+            // How far the walk must reach, off the disk rather than assumed.
+            // The superblock records the *durable* cursor — where the recording
+            // ends to anything holding the medium — so the payload's written
+            // prefix is that cursor's segments plus its offset, exactly. Without
+            // this bound the walk stops wherever the ring becomes unwritten and
+            // reports a pass, so a recorder that wrote one valid segment and
+            // then garbage would satisfy every other assertion here.
+            let durable = durable_payload_bytes(&state).ok_or_else(|| {
+                format!(
+                    "the superblock at sector {start_sector} places its durable cursor at \
+                     segment {} of {}, past the first wrap. This walk reads the payload in \
+                     device order, which is write order only until the ring wraps, so it cannot \
+                     state where the recording ends — extend it before a run gets this far\n  \
+                     image: {}",
+                    state.writer().sequence,
+                    state.geometry().segments(),
+                    self.path.display()
+                )
+            })?;
+            if durable == 0 {
+                return Err(format!(
+                    "the superblock at sector {start_sector} says no byte of the recording is \
+                     durable, so nothing the appliance composed reached the medium\n  image: {}",
+                    self.path.display()
+                ));
+            }
             // Past segment 0, which holds the superblock and no record.
             let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
             let payload_sectors = sectors.saturating_sub(segment_sectors);
@@ -263,6 +296,16 @@ impl DataDisk {
                     self.path.display()
                 )
             })?;
+            if parsed.consumed != durable {
+                return Err(format!(
+                    "the superblock at sector {start_sector} places the recording's durable end \
+                     at payload byte {durable} and the block walk followed the extent's own \
+                     lengths to byte {}, so what is on the medium is not the recording the \
+                     superblock describes\n  image: {}",
+                    parsed.consumed,
+                    self.path.display()
+                ));
+            }
             if parsed.packets.is_empty() {
                 return Err(format!(
                     "the extent at sector {start_sector} parses and holds no packet block, so \
@@ -272,7 +315,7 @@ impl DataDisk {
             }
             lines.push(format!(
                 "  sector {start_sector}: superblock generation {}, {} section header(s), {} \
-                 packet block(s) on the medium",
+                 packet block(s) walked to the durable end at payload byte {durable}",
                 state.write_generation(),
                 parsed.sections,
                 parsed.packets.len()
@@ -283,6 +326,28 @@ impl DataDisk {
             lines.join("\n")
         ))
     }
+}
+
+/// How many bytes of the payload area the superblock's durable cursor accounts
+/// for, or `None` where the ring has wrapped and the answer is not a prefix.
+///
+/// The payload area is read as one contiguous run of segments in device order,
+/// and payload segment `sequence % segments` is where sequence `sequence` sits —
+/// so until the first wrap the durable bytes are the prefix
+/// `sequence * segment_bytes + offset`, and after it they are not a prefix of
+/// anything: the segments ahead of the open one still hold the previous wrap.
+/// `None` rather than a weaker bound, because a bound that admits stale bytes is
+/// the hole this function exists to close.
+fn durable_payload_bytes(state: &lfw_capture_ring::RingState) -> Option<usize> {
+    let geometry = state.geometry();
+    let cursor = state.writer();
+    if cursor.sequence >= geometry.segments() {
+        return None;
+    }
+    let segments = usize::try_from(cursor.sequence).ok()?;
+    segments
+        .checked_mul(geometry.segment_bytes())?
+        .checked_add(cursor.offset)
 }
 
 /// Read exactly `into.len()` bytes at `offset`.

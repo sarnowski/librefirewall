@@ -1,7 +1,11 @@
 use super::*;
 
 /// Compose one pcapng block: type, total length, body, total length again.
-fn block(kind: u32, body: &[u8]) -> Vec<u8> {
+///
+/// Reachable beyond this module because [`crate::data_disk`] composes the same
+/// bytes onto a synthetic disk image, and two composers would be two statements
+/// of one format.
+pub(crate) fn block(kind: u32, body: &[u8]) -> Vec<u8> {
     let len = BLOCK_FRAMING_LEN + body.len();
     let mut out = Vec::new();
     out.extend_from_slice(&kind.to_le_bytes());
@@ -11,7 +15,7 @@ fn block(kind: u32, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn section_header() -> Vec<u8> {
+pub(crate) fn section_header() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&BYTE_ORDER_MAGIC.to_le_bytes());
     body.extend_from_slice(&1u16.to_le_bytes());
@@ -20,7 +24,7 @@ fn section_header() -> Vec<u8> {
     block(SECTION_HEADER_BLOCK, &body)
 }
 
-fn interface_description() -> Vec<u8> {
+pub(crate) fn interface_description() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1u16.to_le_bytes());
     body.extend_from_slice(&0u16.to_le_bytes());
@@ -28,7 +32,7 @@ fn interface_description() -> Vec<u8> {
     block(INTERFACE_DESCRIPTION_BLOCK, &body)
 }
 
-fn enhanced_packet(captured: usize) -> Vec<u8> {
+pub(crate) fn enhanced_packet(captured: usize) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
@@ -39,7 +43,7 @@ fn enhanced_packet(captured: usize) -> Vec<u8> {
     block(ENHANCED_PACKET_BLOCK, &body)
 }
 
-fn recording(packets: usize, captured: usize) -> Vec<u8> {
+pub(crate) fn recording(packets: usize, captured: usize) -> Vec<u8> {
     let mut bytes = section_header();
     bytes.extend_from_slice(&interface_description());
     for _ in 0..packets {
@@ -125,6 +129,18 @@ fn a_declared_length_that_disagrees_with_the_body_is_a_finding() {
     download.headers = vec![String::from("Content-Length: 7")];
     let error = judge(&download, &expectation()).expect_err("a short body is a truncated download");
     assert!(error.contains("Content-Length"), "{error}");
+}
+
+#[test]
+fn a_response_that_declares_no_length_is_a_finding() {
+    // The absent header is the case a conditional check waves through: `curl`
+    // reads to close, the body still parses, and the endpoint's stated
+    // contract — an exact length — has quietly stopped being kept.
+    let mut download = answered(recording(4, 64));
+    download.headers = vec![String::from("Content-Type: application/octet-stream")];
+    let error =
+        judge(&download, &expectation()).expect_err("a recording without a length is a finding");
+    assert!(error.contains("no Content-Length"), "{error}");
 }
 
 #[test]

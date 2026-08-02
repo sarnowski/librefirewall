@@ -66,7 +66,7 @@ use core::num::NonZeroU64;
 
 use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
 use lfw_ip_endpoint::{
-    ConnectionId, Endpoint, IsnSecret,
+    ConnectionId, ContentType, Endpoint, IsnSecret,
     http::{MAX_STREAM_TARGETS, METRICS_TARGET},
 };
 use lfw_log::RejectReason;
@@ -122,6 +122,11 @@ pub enum CalibrationRefused {
     /// A frequency no x86_64 timestamp counter has. The band is `lfw_clock`'s, so
     /// this domain applies that crate's judgement rather than a second copy of it.
     FrequencyImplausible { tsc_hz: u64 },
+    /// An epoch outside the band `lfw_clock::epoch_is_plausible` admits. The
+    /// publishing domain refuses the same band at the register file, so this is
+    /// that judgement applied at the reading end of the region rather than a
+    /// second one: a peer that reached past its own check is not believed here.
+    EpochImplausible { unix_nanos: u64 },
 }
 
 /// Turn a published triple into a calibration, or refuse it.
@@ -135,6 +140,11 @@ pub fn calibration_from(image: CalibrationImage) -> Result<Calibration, Calibrat
     if tsc_hz.get() < MIN_PLAUSIBLE_TSC_HZ || tsc_hz.get() > MAX_PLAUSIBLE_TSC_HZ {
         return Err(CalibrationRefused::FrequencyImplausible {
             tsc_hz: tsc_hz.get(),
+        });
+    }
+    if !lfw_clock::epoch_is_plausible(image.boot_unix_nanos) {
+        return Err(CalibrationRefused::EpochImplausible {
+            unix_nanos: image.boot_unix_nanos,
         });
     }
     Ok(Calibration::new(
@@ -420,6 +430,13 @@ impl<'ring> EndpointStage<'ring> {
                 // Remembered, so a clock domain publishing an implausible triple
                 // is refused once rather than on every frame that arrives.
                 self.clock_generation = generation;
+                // And the one it replaces is dropped with it. A superseded
+                // calibration dates every later segment by a measurement the
+                // publisher has itself withdrawn, which is the plausible-looking
+                // wrong time this module refuses to produce; answering
+                // `unsynchronized` instead costs a peer no denial it lacks,
+                // since it could withhold the region's first publish anyway.
+                self.calibration = None;
                 bump(&mut self.counters.clocks_refused);
                 Some(refusal)
             }
@@ -480,21 +497,23 @@ impl<'ring> EndpointStage<'ring> {
     /// Answer that target with a body of `total` bytes, delivered window by
     /// window. `false` leaves the request unanswered, and this domain then owes
     /// it an [`abandon_stream`](Self::abandon_stream).
-    pub fn begin_stream(&mut self, total: u64, content_type: &str) -> bool {
+    pub fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
         self.endpoint
             .as_mut()
             .is_some_and(|endpoint| endpoint.begin_stream(total, content_type))
     }
 
     /// The body byte a window must begin at before the streamed response can go
-    /// on, and the connection waiting on it.
+    /// on, the most the endpoint will take there, and the connection waiting on
+    /// it.
     ///
     /// It is a window **start** and not the next byte to send: it lies a
     /// retransmit span behind, because the transport owns no copy of a range it
-    /// may re-ask for. Fetch exactly that window and hand it to
-    /// [`supply_window`](Self::supply_window).
+    /// may re-ask for. The length is a bound rather than a demand — fewer bytes
+    /// advance the response and the remainder is asked for again — which is what
+    /// lets a supplier reading a segmented medium answer at all.
     #[must_use]
-    pub fn stream_wanted(&self) -> Option<(ConnectionId, u64)> {
+    pub fn stream_wanted(&self) -> Option<(ConnectionId, u64, usize)> {
         self.endpoint.as_ref()?.window_wanted()
     }
 
@@ -626,10 +645,17 @@ impl<'ring> EndpointStage<'ring> {
             let Some(endpoint) = endpoint.as_mut() else {
                 return;
             };
-            let Some(len) = endpoint.poll_output(now, reply) else {
+            // A pass that produced no frame is not a pass with nothing left to
+            // do: cleanup after a connection the transport freed produces
+            // nothing, and stopping there would leave every other connection's
+            // segments until the next wakeup.
+            let polled = endpoint.poll_output(now, reply);
+            if !polled.goes_on() {
                 return;
-            };
-            self.send(len);
+            }
+            if let Some(len) = polled.frame() {
+                self.send(len);
+            }
         }
     }
 
@@ -666,11 +692,17 @@ impl<'ring> EndpointStage<'ring> {
             let Some(endpoint) = endpoint.as_mut() else {
                 return;
             };
-            let Some(len) = endpoint.poll_timeouts(now, reply) else {
+            // A reaping produces no frame and the timer after it belongs to a
+            // different connection, so the pass goes on: `Polled::Idle` is the
+            // only end of it.
+            let polled = endpoint.poll_timeouts(now, reply);
+            if !polled.goes_on() {
                 return;
-            };
-            bump(&mut self.counters.timer_segments);
-            self.send(len);
+            }
+            if let Some(len) = polled.frame() {
+                bump(&mut self.counters.timer_segments);
+                self.send(len);
+            }
         }
     }
 

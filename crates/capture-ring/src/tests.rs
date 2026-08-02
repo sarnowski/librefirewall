@@ -647,7 +647,9 @@ fn a_checkpoint_takes_the_next_generation_and_a_refusal_takes_none() {
     let mut ring = ring(3);
     commit(&mut ring, 64).expect("a fresh segment holds it");
 
-    let first = ring.checkpoint(&[]).expect("no readers is a legal set");
+    let first = ring
+        .checkpoint(ring.cursor(), &[])
+        .expect("no readers is a legal set");
     assert_eq!(first.write_generation(), 1);
     assert_eq!(first.writer(), ring.cursor());
     assert_eq!(first.geometry(), ring.geometry());
@@ -666,13 +668,13 @@ fn a_checkpoint_takes_the_next_generation_and_a_refusal_takes_none() {
         },
     ];
     assert_eq!(
-        ring.checkpoint(&duplicates),
+        ring.checkpoint(ring.cursor(), &duplicates),
         Err(RingStateError::DuplicateReaderId { id: 4 })
     );
     assert_eq!(ring.write_generation(), 1);
 
     let second = ring
-        .checkpoint(&duplicates[..1])
+        .checkpoint(ring.cursor(), &duplicates[..1])
         .expect("one reader is legal");
     assert_eq!(second.write_generation(), 2);
     assert_eq!(ring.write_generation(), 2);
@@ -691,10 +693,12 @@ fn a_checkpoint_round_trips_the_ring_through_the_medium() {
             offset: PROLOGUE,
         },
     }];
-    let state = ring.checkpoint(&readers).expect("a legal reader set");
+    let state = ring
+        .checkpoint(ring.cursor(), &readers)
+        .expect("a legal reader set");
 
     let mut region = [0u8; SUPERBLOCK_BYTES];
-    encode_superblock(&mut region, &state);
+    encode_superblock(&mut region, &state, Copies::Parity);
     let recovered = decode_superblock(&region).expect("the copy just written");
     let resumed = Ring::resume(
         recovered.check(&ring.geometry()).expect("the same ring"),

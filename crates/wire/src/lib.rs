@@ -29,6 +29,13 @@
 //! and bounds both arrays by the capacities below rather than by the count the
 //! writer put in the region.
 //!
+//! It holds the image to the *whole* rule set rather than to its fields alone,
+//! because the domain that writes the region is the one that parses an
+//! attacker's document: a rule the writer alone enforced is a rule a compromised
+//! writer does not enforce. One call sees every entry at once, so the rules
+//! about a *pair* of them are decidable here — and what is not is named on the
+//! function.
+//!
 //! The domain that writes the handover only ever holds a shared reference to
 //! the region, because no attach path mints a `&mut` to memory a second domain
 //! maps. So the image in it is expressed as atomics rather than plain fields:
@@ -316,9 +323,32 @@ impl ConfigImage {
     /// Decodes every field the counts cover, refusing the image on the first
     /// value that cannot be one.
     ///
+    /// Decodes every field the counts cover and holds the whole image to every
+    /// rule about it, refusing on the first one broken.
+    ///
     /// `port_count` is how many dataplane ports this build has; it comes from
     /// the calling domain, never from the region, so it is the bound the writer
     /// cannot move.
+    ///
+    /// The order is part of the contract rather than an accident of the loops:
+    /// the two counts, then each interface's own fields in index order, then the
+    /// rules between two interfaces, then each neighbour against the interface
+    /// its port names, then the rules between two neighbours, then the
+    /// management entry and finally the two that hold it apart from the
+    /// dataplane. An image breaking several rules is attributed to the first,
+    /// so a refusal sends its reader to one place.
+    ///
+    /// # Two rules this cannot re-decide
+    ///
+    /// A neighbour's *identity* is absent from the image — a
+    /// [`NeighbourImage`] carries a port, a MAC and an address — so two
+    /// neighbours under one id are indistinguishable here. Nothing downstream
+    /// of the image consumes such an id, so nothing downstream can be misled by
+    /// one; it is a handle for editing the document.
+    ///
+    /// A *disabled* management entry is refused for nothing: `enabled == 0`
+    /// leaves every other field of it uninterpreted, so there is no value for a
+    /// rule to be about. [`check_management`] is where that is decided.
     ///
     /// # Errors
     /// [`ConfigImageError`], naming the field and the value that refused it.
@@ -338,16 +368,18 @@ impl ConfigImage {
         for ((index, raw), slot) in raw_interfaces.iter().enumerate().zip(interfaces.iter_mut()) {
             *slot = Some(check_interface(raw, index, port_count)?);
         }
+        check_interface_topology(&interfaces)?;
 
         let mut neighbours = [None; MAX_NEIGHBOURS];
         for ((index, raw), slot) in raw_neighbours.iter().enumerate().zip(neighbours.iter_mut()) {
-            *slot = Some(check_neighbour(raw, index, port_count)?);
+            *slot = Some(check_neighbour(raw, index, port_count, &interfaces)?);
         }
+        check_neighbour_topology(&neighbours)?;
 
         Ok(CheckedConfig {
             generation: self.generation,
             content_hash: self.content_hash,
-            management: check_management(&self.management)?,
+            management: check_management(&self.management, &interfaces)?,
             interfaces,
             neighbours,
         })
@@ -520,8 +552,19 @@ impl ManagementSlot {
 
 /// The shared-memory image of a [`ConfigImage`], readable and writable through
 /// a shared reference — the only kind of reference a mapped region is reached
-/// by. Accesses are `Relaxed`: all the ordering the region needs is the
-/// release/acquire pair on the generation that publishes it.
+/// by.
+///
+/// Accesses are `Relaxed`, and the property that buys is narrow: the
+/// release/acquire pair on the generation orders the writes of *one*
+/// publication against a reader that then sees that generation. It orders
+/// nothing against a publisher that writes again, which is the publisher this
+/// side is written against — so a reader copying the region out can observe a
+/// blend of two images, one field from each. That is not made safe by ordering
+/// and is not claimed to be: [`ConfigImage::check`] rules on the copy as one
+/// value, and a blend is admitted only if every rule holds of the blend. What
+/// each access is, therefore, is a read that cannot tear *within a field* —
+/// which is what keeps a MAC from being half of one address and half of another
+/// — and nothing more.
 #[repr(C)]
 struct ConfigSlot {
     generation: AtomicU32,
@@ -735,9 +778,72 @@ pub enum ConfigImageError {
         index: usize,
         fault: TextFault,
     },
-    /// The management entry's own three rules. They carry no index: the image
-    /// holds exactly one management interface, so the value refused is the whole
-    /// of what locates the fault.
+    InterfaceAddressNotUnicast {
+        index: usize,
+        address: [u8; 4],
+    },
+    /// The prefix's own network or broadcast address.
+    InterfaceAddressNotAHostAddress {
+        index: usize,
+        address: [u8; 4],
+    },
+    InterfaceIdDuplicated {
+        index: usize,
+        other: usize,
+    },
+    /// The ingress that port names would be ambiguous, and the two lookups a
+    /// forwarding decision makes could answer with different entries.
+    InterfacePortDuplicated {
+        index: usize,
+        other: usize,
+        port: u8,
+    },
+    /// Two ports answering to one L2 address: a frame would be taken by
+    /// whichever saw it first.
+    InterfaceMacDuplicated {
+        index: usize,
+        other: usize,
+        mac: [u8; 6],
+    },
+    /// Two interfaces covering one address, which makes its egress ambiguous.
+    InterfacePrefixesOverlap {
+        index: usize,
+        other: usize,
+    },
+    NeighbourAddressNotUnicast {
+        index: usize,
+        address: [u8; 4],
+    },
+    /// A routed frame would be unicast to a directed subnet broadcast address.
+    NeighbourAddressNotAHostAddress {
+        index: usize,
+        address: [u8; 4],
+    },
+    /// A port the build has and no interface addresses, so the link the
+    /// neighbour sits on has no prefix for it to be inside.
+    NeighbourPortUnconfigured {
+        index: usize,
+        port: u8,
+    },
+    /// Outside its own link's prefix, which is not a neighbour of it.
+    NeighbourOutsidePrefix {
+        index: usize,
+        address: [u8; 4],
+    },
+    /// Holding the appliance's own address on that link.
+    NeighbourIsInterfaceAddress {
+        index: usize,
+        address: [u8; 4],
+    },
+    /// Two at one address on one port, which makes resolution ambiguous.
+    NeighbourAddressDuplicated {
+        index: usize,
+        other: usize,
+    },
+    /// The management entry's own rules. They carry no index of their own: the
+    /// image holds exactly one management interface, so the value refused is the
+    /// whole of what locates the fault. The last two name the interface they
+    /// collide with instead.
     ManagementEnabledNotBoolean {
         enabled: u8,
     },
@@ -746,6 +852,22 @@ pub enum ConfigImageError {
     },
     ManagementMacNotUnicast {
         mac: [u8; 6],
+    },
+    ManagementAddressNotUnicast {
+        address: [u8; 4],
+    },
+    ManagementAddressNotAHostAddress {
+        address: [u8; 4],
+    },
+    /// One address reachable two ways: routed out of the named interface's
+    /// port, and terminated off the dataplane.
+    ManagementPrefixCollidesWithInterface {
+        index: usize,
+    },
+    /// As [`Self::InterfaceMacDuplicated`], across the boundary the management
+    /// port sits on the far side of.
+    ManagementMacCollidesWithInterface {
+        index: usize,
     },
 }
 
@@ -795,6 +917,60 @@ impl fmt::Display for ConfigImageError {
             Self::InterfaceIdNotAnIdentifier { index, fault } => {
                 write!(f, "interface {index} id {fault}")
             }
+            Self::InterfaceAddressNotUnicast { index, address } => {
+                write!(f, "interface {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is not unicast")
+            }
+            Self::InterfaceAddressNotAHostAddress { index, address } => {
+                write!(f, "interface {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is its prefix's network or broadcast address")
+            }
+            Self::InterfaceIdDuplicated { index, other } => {
+                write!(f, "interface {index} repeats interface {other}'s id")
+            }
+            Self::InterfacePortDuplicated { index, other, port } => write!(
+                f,
+                "interface {index} shares port {port} with interface {other}"
+            ),
+            Self::InterfaceMacDuplicated { index, other, mac } => {
+                write!(f, "interface {index} shares MAC ")?;
+                write_mac(f, *mac)?;
+                write!(f, " with interface {other}")
+            }
+            Self::InterfacePrefixesOverlap { index, other } => write!(
+                f,
+                "interface {index} covers an address interface {other} also covers"
+            ),
+            Self::NeighbourAddressNotUnicast { index, address } => {
+                write!(f, "neighbour {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is not unicast")
+            }
+            Self::NeighbourAddressNotAHostAddress { index, address } => {
+                write!(f, "neighbour {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is its link's network or broadcast address")
+            }
+            Self::NeighbourPortUnconfigured { index, port } => write!(
+                f,
+                "neighbour {index} names port {port}, which no interface addresses"
+            ),
+            Self::NeighbourOutsidePrefix { index, address } => {
+                write!(f, "neighbour {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is outside its link's prefix")
+            }
+            Self::NeighbourIsInterfaceAddress { index, address } => {
+                write!(f, "neighbour {index} address ")?;
+                write_address(f, *address)?;
+                write!(f, " is the interface's own")
+            }
+            Self::NeighbourAddressDuplicated { index, other } => write!(
+                f,
+                "neighbour {index} repeats neighbour {other}'s address on one port"
+            ),
             Self::ManagementEnabledNotBoolean { enabled } => {
                 write!(f, "management enabled byte {enabled} is not 0 or 1")
             }
@@ -807,6 +983,23 @@ impl fmt::Display for ConfigImageError {
                 write_mac(f, *mac)?;
                 write!(f, " is not unicast")
             }
+            Self::ManagementAddressNotUnicast { address } => {
+                write!(f, "management address ")?;
+                write_address(f, *address)?;
+                write!(f, " is not unicast")
+            }
+            Self::ManagementAddressNotAHostAddress { address } => {
+                write!(f, "management address ")?;
+                write_address(f, *address)?;
+                write!(f, " is its prefix's network or broadcast address")
+            }
+            Self::ManagementPrefixCollidesWithInterface { index } => write!(
+                f,
+                "management shares a prefix with interface {index}, which routes it"
+            ),
+            Self::ManagementMacCollidesWithInterface { index } => {
+                write!(f, "management shares its MAC with interface {index}")
+            }
         }
     }
 }
@@ -816,11 +1009,77 @@ fn write_mac(f: &mut fmt::Formatter<'_>, mac: [u8; 6]) -> fmt::Result {
     write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
 }
 
+fn write_address(f: &mut fmt::Formatter<'_>, address: [u8; 4]) -> fmt::Result {
+    let [a, b, c, d] = address;
+    write!(f, "{a}.{b}.{c}.{d}")
+}
+
 /// A unicast MAC: the group bit (IEEE 802.3 3.2.3) clear, and not the all-zero
 /// address, which names nothing.
 fn is_unicast(mac: [u8; 6]) -> bool {
     let [first, ..] = mac;
     first & 0x01 == 0 && mac != [0; 6]
+}
+
+/// The image carries an address in network order, as a header does.
+const fn address_bits(address: [u8; 4]) -> u32 {
+    u32::from_be_bytes(address)
+}
+
+/// Saturating at both ends, so no length this ABI admits shifts by the width.
+const fn prefix_mask(prefix_length: u8) -> u32 {
+    if prefix_length == 0 {
+        0
+    } else if prefix_length >= MAX_PREFIX_LENGTH {
+        u32::MAX
+    } else {
+        u32::MAX << MAX_PREFIX_LENGTH.saturating_sub(prefix_length)
+    }
+}
+
+/// Neither multicast (224.0.0.0/4), the limited broadcast, loopback
+/// (127.0.0.0/8) nor unspecified — none of which the appliance can answer under
+/// or unicast a routed frame to.
+const fn is_unicast_address(address: [u8; 4]) -> bool {
+    let bits = address_bits(address);
+    bits & 0xf000_0000 != 0xe000_0000
+        && bits != u32::MAX
+        && bits & 0xff00_0000 != 0x7f00_0000
+        && bits != 0
+}
+
+/// A `/31` is a two-address point-to-point link and a `/32` is a host route, so
+/// neither reserves a network or broadcast address to exclude (RFC 3021).
+const fn is_host_address(address: [u8; 4], prefix_length: u8) -> bool {
+    if prefix_length >= MAX_PREFIX_LENGTH.saturating_sub(1) {
+        return true;
+    }
+    let bits = address_bits(address);
+    let mask = prefix_mask(prefix_length);
+    let network = bits & mask;
+    bits != network && bits != (network | !mask)
+}
+
+const fn inside_prefix(address: [u8; 4], network: [u8; 4], prefix_length: u8) -> bool {
+    let mask = prefix_mask(prefix_length);
+    address_bits(address) & mask == address_bits(network) & mask
+}
+
+/// Whether two prefixes cover a common address, which is decided entirely by
+/// the shorter of the two: if the longer prefix's network falls inside the
+/// shorter one, every address the longer covers the shorter covers too.
+const fn prefixes_overlap(
+    left: [u8; 4],
+    left_length: u8,
+    right: [u8; 4],
+    right_length: u8,
+) -> bool {
+    let shorter = if left_length < right_length {
+        left_length
+    } else {
+        right_length
+    };
+    inside_prefix(left, right, shorter)
 }
 
 /// Reads each field exactly once, by copying the whole entry out first: the
@@ -863,6 +1122,12 @@ fn check_interface(
     if !is_unicast(mac) {
         return Err(ConfigImageError::InterfaceMacNotUnicast { index, mac });
     }
+    if !is_unicast_address(address) {
+        return Err(ConfigImageError::InterfaceAddressNotUnicast { index, address });
+    }
+    if !is_host_address(address, prefix_length) {
+        return Err(ConfigImageError::InterfaceAddressNotAHostAddress { index, address });
+    }
     let id = check_bounded_text(&id, false)
         .map_err(|fault| ConfigImageError::InterfaceIdNotAnIdentifier { index, fault })?;
 
@@ -876,12 +1141,54 @@ fn check_interface(
     })
 }
 
-/// As [`check_interface`], for an entry with neither an enable flag nor a
-/// prefix to refuse.
+/// The rules about a *pair* of interfaces. Iteration is over the entries the
+/// array holds rather than the count the region claimed, and the earlier of a
+/// pair is named as `other`, so a refusal always names the later entry and reads
+/// in document order.
+fn check_interface_topology(
+    interfaces: &[Option<CheckedInterface>; MAX_INTERFACES],
+) -> Result<(), ConfigImageError> {
+    for (index, entry) in interfaces.iter().flatten().enumerate() {
+        for (other, earlier) in interfaces.iter().flatten().take(index).enumerate() {
+            if earlier.id == entry.id {
+                return Err(ConfigImageError::InterfaceIdDuplicated { index, other });
+            }
+            if earlier.port == entry.port {
+                return Err(ConfigImageError::InterfacePortDuplicated {
+                    index,
+                    other,
+                    port: entry.port,
+                });
+            }
+            if earlier.mac == entry.mac {
+                return Err(ConfigImageError::InterfaceMacDuplicated {
+                    index,
+                    other,
+                    mac: entry.mac,
+                });
+            }
+            if prefixes_overlap(
+                earlier.address,
+                earlier.prefix_length,
+                entry.address,
+                entry.prefix_length,
+            ) {
+                return Err(ConfigImageError::InterfacePrefixesOverlap { index, other });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// As [`check_interface`], for an entry with neither an enable flag nor a prefix
+/// of its own — then against the interface whose port it names, which is what
+/// makes it a neighbour of anything. That interface is a value rather than a
+/// choice: [`check_interface_topology`] has already refused two on one port.
 fn check_neighbour(
     raw: &NeighbourImage,
     index: usize,
     port_count: u8,
+    interfaces: &[Option<CheckedInterface>; MAX_INTERFACES],
 ) -> Result<CheckedNeighbour, ConfigImageError> {
     let NeighbourImage {
         port, mac, address, ..
@@ -893,18 +1200,55 @@ fn check_neighbour(
     if !is_unicast(mac) {
         return Err(ConfigImageError::NeighbourMacNotUnicast { index, mac });
     }
+    if !is_unicast_address(address) {
+        return Err(ConfigImageError::NeighbourAddressNotUnicast { index, address });
+    }
+    let Some(interface) = interfaces.iter().flatten().find(|entry| entry.port == port) else {
+        return Err(ConfigImageError::NeighbourPortUnconfigured { index, port });
+    };
+    if address == interface.address {
+        return Err(ConfigImageError::NeighbourIsInterfaceAddress { index, address });
+    }
+    if !inside_prefix(address, interface.address, interface.prefix_length) {
+        return Err(ConfigImageError::NeighbourOutsidePrefix { index, address });
+    }
+    if !is_host_address(address, interface.prefix_length) {
+        return Err(ConfigImageError::NeighbourAddressNotAHostAddress { index, address });
+    }
 
     Ok(CheckedNeighbour { port, mac, address })
 }
 
-/// The management entry, or `None` where the image carries none.
+/// Resolution is by port and address, so two entries agreeing on both would
+/// answer with whichever came first.
+fn check_neighbour_topology(
+    neighbours: &[Option<CheckedNeighbour>; MAX_NEIGHBOURS],
+) -> Result<(), ConfigImageError> {
+    for (index, entry) in neighbours.iter().flatten().enumerate() {
+        for (other, earlier) in neighbours.iter().flatten().take(index).enumerate() {
+            if earlier.port == entry.port && earlier.address == entry.address {
+                return Err(ConfigImageError::NeighbourAddressDuplicated { index, other });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The management entry, or `None` where the image carries none — then the two
+/// rules that hold it apart from the dataplane, neither of which the capability
+/// grants can express: an address reachable both by routing and by local
+/// termination, and one L2 address on two ports.
 ///
 /// A disabled entry is `None` rather than a [`CheckedManagement`] with a flag:
 /// the fields of a disabled interface are not interpreted at all, so an
 /// unaddressed port has one representation here and it is the one a zeroed
 /// region produces. That is what keeps [`ConfigImage::ZERO`] — the fail-closed
-/// generation every domain starts under — a valid image.
-fn check_management(raw: &ManagementImage) -> Result<Option<CheckedManagement>, ConfigImageError> {
+/// generation every domain starts under — a valid image, and it is why a
+/// disabled entry is held to no rule: there is no value left to hold.
+fn check_management(
+    raw: &ManagementImage,
+    interfaces: &[Option<CheckedInterface>; MAX_INTERFACES],
+) -> Result<Option<CheckedManagement>, ConfigImageError> {
     let ManagementImage {
         enabled,
         prefix_length,
@@ -923,6 +1267,25 @@ fn check_management(raw: &ManagementImage) -> Result<Option<CheckedManagement>, 
     }
     if !is_unicast(mac) {
         return Err(ConfigImageError::ManagementMacNotUnicast { mac });
+    }
+    if !is_unicast_address(address) {
+        return Err(ConfigImageError::ManagementAddressNotUnicast { address });
+    }
+    if !is_host_address(address, prefix_length) {
+        return Err(ConfigImageError::ManagementAddressNotAHostAddress { address });
+    }
+    for (index, interface) in interfaces.iter().flatten().enumerate() {
+        if prefixes_overlap(
+            interface.address,
+            interface.prefix_length,
+            address,
+            prefix_length,
+        ) {
+            return Err(ConfigImageError::ManagementPrefixCollidesWithInterface { index });
+        }
+        if interface.mac == mac {
+            return Err(ConfigImageError::ManagementMacCollidesWithInterface { index });
+        }
     }
     Ok(Some(CheckedManagement {
         prefix_length,
@@ -1277,26 +1640,38 @@ mod tests {
     /// Ports this build has, in the tests. Two, as the appliance has.
     const PORTS: u8 = 2;
 
+    /// A build with one port per interface slot the image holds. One port per
+    /// interface is a rule, so the ABI's own interface capacity is only
+    /// reachable on a build with that many ports — the appliance's two bound it
+    /// to two, and a test about the capacity has to say which it is testing.
+    const WIDE: u8 = MAX_INTERFACES as u8;
+
     /// A locally administered unicast address, so nothing about it is refusable.
     const UNICAST: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x50];
 
+    /// One interface per port, each distinct in every field a rule compares:
+    /// its own port, its own MAC, its own `/24` and its own id.
     fn interface(port: u8) -> InterfaceImage {
         InterfaceImage {
             port,
             enabled: 1,
             prefix_length: 24,
-            mac: UNICAST,
-            address: [10, 0, 0, 1],
-            id: IdentifierImage::from_text(b"dataplane-0"),
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x50 + port],
+            address: [10, 0, port, 1],
+            id: IdentifierImage::from_text(&[b'd', b'p', b'0' + port]),
             ..InterfaceImage::ZERO
         }
     }
 
-    fn neighbour(port: u8) -> NeighbourImage {
+    /// The `index`th neighbour: on the port `index` cycles onto, at a host
+    /// address inside that port's `/24` and distinct from every other
+    /// neighbour's on it.
+    fn neighbour(index: usize) -> NeighbourImage {
+        let port = (index % usize::from(PORTS)) as u8;
         NeighbourImage {
             port,
             mac: UNICAST,
-            address: [10, 0, 0, 2],
+            address: [10, 0, port, 2 + (index / usize::from(PORTS)) as u8],
             ..NeighbourImage::ZERO
         }
     }
@@ -1310,10 +1685,10 @@ mod tests {
         image.interface_count = interfaces as u32;
         image.neighbour_count = neighbours as u32;
         for (index, slot) in image.interfaces.iter_mut().enumerate() {
-            *slot = interface((index % usize::from(PORTS)) as u8);
+            *slot = interface(index as u8);
         }
         for (index, slot) in image.neighbours.iter_mut().enumerate() {
-            *slot = neighbour((index % usize::from(PORTS)) as u8);
+            *slot = neighbour(index);
         }
         image
     }
@@ -1373,8 +1748,18 @@ mod tests {
 
     #[test]
     fn an_interface_count_at_capacity_is_accepted() {
-        let checked = image(MAX_INTERFACES, 0).check(PORTS).expect("valid");
+        let checked = image(MAX_INTERFACES, 0).check(WIDE).expect("valid");
         assert_eq!(checked.interface_count(), MAX_INTERFACES);
+    }
+
+    /// One port per interface, so a build with fewer ports than the image has
+    /// slots cannot run a full one — and says which entry it refused.
+    #[test]
+    fn more_interfaces_than_the_build_has_ports_is_refused() {
+        assert_eq!(
+            image(MAX_INTERFACES, 0).check(PORTS),
+            Err(ConfigImageError::InterfacePortUnknown { index: 2, port: 2 })
+        );
     }
 
     #[test]
@@ -1399,7 +1784,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_count_at_capacity_is_accepted() {
-        let checked = image(0, MAX_NEIGHBOURS).check(PORTS).expect("valid");
+        let checked = image(2, MAX_NEIGHBOURS).check(PORTS).expect("valid");
         assert_eq!(checked.neighbour_count(), MAX_NEIGHBOURS);
     }
 
@@ -1453,7 +1838,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_naming_a_port_the_build_does_not_have_is_refused() {
-        let mut raw = image(0, 2);
+        let mut raw = image(2, 2);
         raw.neighbours[1].port = 200;
         assert_eq!(
             raw.check(PORTS),
@@ -1517,13 +1902,166 @@ mod tests {
     #[test]
     fn a_neighbour_mac_that_is_not_unicast_is_refused() {
         for mac in [[0x01, 0, 0, 0, 0, 0], [0xff; 6], [0; 6]] {
-            let mut raw = image(0, 1);
+            let mut raw = image(2, 1);
             raw.neighbours[0].mac = mac;
             assert_eq!(
                 raw.check(PORTS),
                 Err(ConfigImageError::NeighbourMacNotUnicast { index: 0, mac })
             );
         }
+    }
+
+    #[test]
+    fn an_interface_address_no_host_may_hold_is_refused() {
+        for address in [[224, 0, 0, 1], [127, 0, 0, 1], [0, 0, 0, 0], [255; 4]] {
+            let mut raw = image(1, 0);
+            raw.interfaces[0].address = address;
+            assert_eq!(
+                raw.check(PORTS),
+                Err(ConfigImageError::InterfaceAddressNotUnicast { index: 0, address }),
+                "{address:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interface_at_its_own_network_or_broadcast_address_is_refused() {
+        for address in [[10, 0, 0, 0], [10, 0, 0, 255]] {
+            let mut raw = image(1, 0);
+            raw.interfaces[0].address = address;
+            assert_eq!(
+                raw.check(PORTS),
+                Err(ConfigImageError::InterfaceAddressNotAHostAddress { index: 0, address }),
+                "{address:?}"
+            );
+        }
+        // RFC 3021 leaves both usable on a point-to-point link and a host route.
+        for (prefix_length, address) in [(31u8, [10, 0, 0, 0]), (32, [10, 0, 0, 255])] {
+            let mut raw = image(1, 0);
+            raw.interfaces[0].prefix_length = prefix_length;
+            raw.interfaces[0].address = address;
+            raw.check(PORTS).expect("neither reserves an address");
+        }
+    }
+
+    /// The four rules about a *pair* of interfaces, each broken on its own so
+    /// what a test proves is that *that* pair is caught.
+    #[test]
+    fn two_interfaces_a_forwarding_domain_could_not_tell_apart_are_refused() {
+        let clash = |change: fn(&mut InterfaceImage)| {
+            let mut raw = image(2, 0);
+            change(&mut raw.interfaces[1]);
+            raw.check(PORTS)
+        };
+
+        assert_eq!(
+            clash(|entry| entry.id = IdentifierImage::from_text(b"dp0")),
+            Err(ConfigImageError::InterfaceIdDuplicated { index: 1, other: 0 })
+        );
+        assert_eq!(
+            clash(|entry| entry.port = 0),
+            Err(ConfigImageError::InterfacePortDuplicated {
+                index: 1,
+                other: 0,
+                port: 0,
+            })
+        );
+        assert_eq!(
+            clash(|entry| entry.mac = UNICAST),
+            Err(ConfigImageError::InterfaceMacDuplicated {
+                index: 1,
+                other: 0,
+                mac: UNICAST,
+            })
+        );
+        assert_eq!(
+            clash(|entry| entry.address = [10, 0, 0, 9]),
+            Err(ConfigImageError::InterfacePrefixesOverlap { index: 1, other: 0 })
+        );
+        // The containment case: a shorter prefix swallowing a longer one is an
+        // overlap even though neither address is in the other's block.
+        assert_eq!(
+            clash(|entry| {
+                entry.address = [10, 128, 0, 1];
+                entry.prefix_length = 8;
+            }),
+            Err(ConfigImageError::InterfacePrefixesOverlap { index: 1, other: 0 })
+        );
+    }
+
+    /// Every rule that holds a neighbour to the link it claims to be on.
+    #[test]
+    fn a_neighbour_that_is_not_one_of_its_links_hosts_is_refused() {
+        let with = |change: fn(&mut NeighbourImage)| {
+            let mut raw = image(2, 1);
+            change(&mut raw.neighbours[0]);
+            raw.check(PORTS)
+        };
+
+        for address in [[224, 0, 0, 1], [0, 0, 0, 0], [255; 4]] {
+            let mut raw = image(2, 1);
+            raw.neighbours[0].address = address;
+            assert_eq!(
+                raw.check(PORTS),
+                Err(ConfigImageError::NeighbourAddressNotUnicast { index: 0, address }),
+                "{address:?}"
+            );
+        }
+        assert_eq!(
+            with(|entry| entry.address = [10, 0, 0, 1]),
+            Err(ConfigImageError::NeighbourIsInterfaceAddress {
+                index: 0,
+                address: [10, 0, 0, 1],
+            })
+        );
+        assert_eq!(
+            with(|entry| entry.address = [10, 9, 9, 9]),
+            Err(ConfigImageError::NeighbourOutsidePrefix {
+                index: 0,
+                address: [10, 9, 9, 9],
+            })
+        );
+        // The directed subnet broadcast of its own link, which a routed frame
+        // would otherwise be unicast to.
+        for address in [[10, 0, 0, 255], [10, 0, 0, 0]] {
+            let mut raw = image(2, 1);
+            raw.neighbours[0].address = address;
+            assert_eq!(
+                raw.check(PORTS),
+                Err(ConfigImageError::NeighbourAddressNotAHostAddress { index: 0, address }),
+                "{address:?}"
+            );
+        }
+    }
+
+    /// A port the build has but this configuration does not address: the
+    /// neighbour names a link with no prefix to be inside of.
+    #[test]
+    fn a_neighbour_on_a_port_no_interface_addresses_is_refused() {
+        let mut raw = image(1, 2);
+        raw.neighbours[0].port = 0;
+        raw.neighbours[1].port = 1;
+        assert_eq!(
+            raw.check(PORTS),
+            Err(ConfigImageError::NeighbourPortUnconfigured { index: 1, port: 1 })
+        );
+    }
+
+    #[test]
+    fn two_neighbours_at_one_address_on_one_port_are_refused() {
+        let mut raw = image(2, 3);
+        raw.neighbours[2] = raw.neighbours[0];
+        assert_eq!(
+            raw.check(PORTS),
+            Err(ConfigImageError::NeighbourAddressDuplicated { index: 2, other: 0 })
+        );
+
+        // The rule is per port: one host number on two separate links is two
+        // hosts, and only the prefixes overlapping would make it one.
+        let mut apart = image(2, 2);
+        apart.neighbours[1].port = 1;
+        apart.neighbours[1].address = [10, 0, 1, 2];
+        apart.check(PORTS).expect("two links, two hosts");
     }
 
     /// An enabled management entry decodes to its three values; a disabled one
@@ -1601,6 +2139,68 @@ mod tests {
                 Err(ConfigImageError::ManagementMacNotUnicast { mac })
             );
         }
+        for address in [[224, 0, 0, 1], [127, 0, 0, 1], [0; 4], [255; 4]] {
+            assert_eq!(
+                with(ManagementImage { address, ..enabled }),
+                Err(ConfigImageError::ManagementAddressNotUnicast { address }),
+                "{address:?}"
+            );
+        }
+        for address in [[10, 0, 2, 0], [10, 0, 2, 255]] {
+            assert_eq!(
+                with(ManagementImage { address, ..enabled }),
+                Err(ConfigImageError::ManagementAddressNotAHostAddress { address }),
+                "{address:?}"
+            );
+        }
+    }
+
+    /// The two rules the capability grants cannot express, and so the two a
+    /// compromised writer would otherwise have had entirely to itself: one
+    /// address the appliance would both route towards and terminate on, and one
+    /// L2 address on a dataplane port and the management port at once.
+    #[test]
+    fn a_management_entry_the_dataplane_would_answer_for_too_is_refused() {
+        let with = |management: ManagementImage| {
+            let mut raw = image(2, 1);
+            raw.management = management;
+            raw.check(PORTS)
+        };
+        let enabled = ManagementImage {
+            enabled: 1,
+            prefix_length: 24,
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            address: [10, 0, 2, 15],
+            ..ManagementImage::ZERO
+        };
+        with(enabled).expect("the fixture keeps them apart");
+
+        // Inside the second interface's prefix rather than the first, so the
+        // refusal names which interface it collided with.
+        assert_eq!(
+            with(ManagementImage {
+                address: [10, 0, 1, 9],
+                ..enabled
+            }),
+            Err(ConfigImageError::ManagementPrefixCollidesWithInterface { index: 1 })
+        );
+        assert_eq!(
+            with(ManagementImage {
+                mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x51],
+                ..enabled
+            }),
+            Err(ConfigImageError::ManagementMacCollidesWithInterface { index: 1 })
+        );
+        // A prefix short enough to swallow both dataplane prefixes collides
+        // with the first of them.
+        assert_eq!(
+            with(ManagementImage {
+                prefix_length: 8,
+                address: [10, 200, 0, 1],
+                ..enabled
+            }),
+            Err(ConfigImageError::ManagementPrefixCollidesWithInterface { index: 0 })
+        );
     }
 
     #[test]
@@ -1808,11 +2408,66 @@ mod tests {
                 index: 7,
                 fault: TextFault::NotInAlphabet { offset: 3 },
             },
+            ConfigImageError::InterfaceAddressNotUnicast {
+                index: 8,
+                address: [224, 0, 0, 1],
+            },
+            ConfigImageError::InterfaceAddressNotAHostAddress {
+                index: 9,
+                address: [10, 0, 0, 255],
+            },
+            ConfigImageError::InterfaceIdDuplicated {
+                index: 10,
+                other: 0,
+            },
+            ConfigImageError::InterfacePortDuplicated {
+                index: 11,
+                other: 1,
+                port: 3,
+            },
+            ConfigImageError::InterfaceMacDuplicated {
+                index: 12,
+                other: 2,
+                mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x50],
+            },
+            ConfigImageError::InterfacePrefixesOverlap {
+                index: 13,
+                other: 3,
+            },
+            ConfigImageError::NeighbourAddressNotUnicast {
+                index: 14,
+                address: [255, 255, 255, 255],
+            },
+            ConfigImageError::NeighbourAddressNotAHostAddress {
+                index: 15,
+                address: [10, 0, 0, 255],
+            },
+            ConfigImageError::NeighbourPortUnconfigured { index: 16, port: 1 },
+            ConfigImageError::NeighbourOutsidePrefix {
+                index: 17,
+                address: [10, 9, 9, 9],
+            },
+            ConfigImageError::NeighbourIsInterfaceAddress {
+                index: 18,
+                address: [10, 0, 0, 1],
+            },
+            ConfigImageError::NeighbourAddressDuplicated {
+                index: 19,
+                other: 4,
+            },
             ConfigImageError::ManagementEnabledNotBoolean { enabled: 9 },
             ConfigImageError::ManagementPrefixLengthTooLong { prefix_length: 99 },
             ConfigImageError::ManagementMacNotUnicast {
                 mac: [0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa],
             },
+            ConfigImageError::ManagementAddressNotUnicast {
+                address: [127, 0, 0, 1],
+            },
+            ConfigImageError::ManagementAddressNotAHostAddress {
+                address: [192, 168, 42, 0],
+            },
+            ConfigImageError::ManagementPrefixCollidesWithInterface { index: 5 },
+            ConfigImageError::ManagementMacCollidesWithInterface { index: 6 },
         ]
         .iter()
         .map(|error| format!("{error}"))
@@ -1830,9 +2485,25 @@ mod tests {
                 "interface 5 MAC 01:02:03:04:05:06 is not unicast",
                 "neighbour 6 MAC 00:00:00:00:00:00 is not unicast",
                 "interface 7 id byte 3 is outside [a-z0-9-]",
+                "interface 8 address 224.0.0.1 is not unicast",
+                "interface 9 address 10.0.0.255 is its prefix's network or broadcast address",
+                "interface 10 repeats interface 0's id",
+                "interface 11 shares port 3 with interface 1",
+                "interface 12 shares MAC 52:54:00:12:34:50 with interface 2",
+                "interface 13 covers an address interface 3 also covers",
+                "neighbour 14 address 255.255.255.255 is not unicast",
+                "neighbour 15 address 10.0.0.255 is its link's network or broadcast address",
+                "neighbour 16 names port 1, which no interface addresses",
+                "neighbour 17 address 10.9.9.9 is outside its link's prefix",
+                "neighbour 18 address 10.0.0.1 is the interface's own",
+                "neighbour 19 repeats neighbour 4's address on one port",
                 "management enabled byte 9 is not 0 or 1",
                 "management prefix length 99 exceeds 32",
                 "management MAC ff:ee:dd:cc:bb:aa is not unicast",
+                "management address 127.0.0.1 is not unicast",
+                "management address 192.168.42.0 is its prefix's network or broadcast address",
+                "management shares a prefix with interface 5, which routes it",
+                "management shares its MAC with interface 6",
             ]
         );
     }
@@ -1986,7 +2657,10 @@ mod tests {
             prop_oneof![9 => 0u8..=1, 1 => any::<u8>()],
             prop_oneof![9 => 0u8..=MAX_PREFIX_LENGTH, 1 => any::<u8>()],
             plausible_mac(),
-            any::<[u8; 4]>(),
+            // Usually a host address on a prefix no interface here claims, so
+            // the two rules that hold the management port apart from the
+            // dataplane admit it as often as they refuse it.
+            prop_oneof![7 => Just([192, 168, 42, 15]), 3 => any::<[u8; 4]>()],
         )
             .prop_map(|(enabled, prefix_length, mac, address)| ManagementImage {
                 enabled,
@@ -2135,6 +2809,48 @@ mod tests {
             )
     }
 
+    /// As [`config_image`], with the entries usually made mutually consistent —
+    /// one port, one MAC, one prefix and one id apiece, derived from the slot
+    /// index — and sometimes left exactly as drawn.
+    ///
+    /// The first arm is why the accepted path is reachable at all for an image
+    /// of more than one entry: the rules between two entries refuse almost
+    /// every independently drawn pair, so without it the assertions about what
+    /// an *accepted* multi-entry image yields would never run. The second arm
+    /// is why that costs nothing: every image the unspread strategies can
+    /// produce is still produced, so no rule becomes unreachable.
+    fn consistent_config_image() -> impl Strategy<Value = ConfigImage> {
+        (
+            config_image(
+                plausible_interface_image(),
+                plausible_neighbour_image(),
+                plausible_management_image(),
+            ),
+            prop_oneof![6 => Just(true), 4 => Just(false)],
+        )
+            .prop_map(|(image, spread)| if spread { spread_entries(image) } else { image })
+    }
+
+    /// Give every slot its own port, MAC, prefix and id, and put every
+    /// neighbour at a host address inside the prefix of the interface its port
+    /// names. What the entry strategies drew is kept wherever a rule does not
+    /// compare two entries — `enabled`, the prefix length, the padding.
+    fn spread_entries(mut image: ConfigImage) -> ConfigImage {
+        for (index, slot) in image.interfaces.iter_mut().enumerate() {
+            let port = index as u8;
+            slot.port = port;
+            slot.mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x50 + port];
+            slot.address = [10, 0, port, 1];
+            slot.id = IdentifierImage::from_text(&[b'd', b'p', b'0' + port]);
+        }
+        for (index, slot) in image.neighbours.iter_mut().enumerate() {
+            let port = (index % MAX_INTERFACES) as u8;
+            slot.port = port;
+            slot.address = [10, 0, port, 2 + (index / MAX_INTERFACES) as u8];
+        }
+        image
+    }
+
     /// Counts weighted low, then to the capacity boundary, then anywhere at
     /// all. A count drawn uniformly over `u32` exceeds capacity in every
     /// practical case, so on its own it would prove only that the reader
@@ -2152,22 +2868,24 @@ mod tests {
     /// applies them, so the property below pins totality and not merely
     /// agreement about which inputs are bad.
     fn expected_refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
-        if image.interface_count as usize > MAX_INTERFACES {
+        let interface_count = image.interface_count as usize;
+        if interface_count > MAX_INTERFACES {
             return Some(ConfigImageError::InterfaceCountExceedsCapacity {
                 count: image.interface_count,
             });
         }
-        if image.neighbour_count as usize > MAX_NEIGHBOURS {
+        let neighbour_count = image.neighbour_count as usize;
+        if neighbour_count > MAX_NEIGHBOURS {
             return Some(ConfigImageError::NeighbourCountExceedsCapacity {
                 count: image.neighbour_count,
             });
         }
-        for (index, raw) in image
-            .interfaces
-            .iter()
-            .enumerate()
-            .take(image.interface_count as usize)
-        {
+        let named = |slice: &[InterfaceImage]| -> Vec<InterfaceImage> {
+            slice.iter().copied().take(interface_count).collect()
+        };
+        let interfaces = named(&image.interfaces);
+
+        for (index, raw) in interfaces.iter().enumerate() {
             if raw.enabled > 1 {
                 return Some(ConfigImageError::InterfaceEnabledNotBoolean {
                     index,
@@ -2192,16 +2910,60 @@ mod tests {
                     mac: raw.mac,
                 });
             }
+            if !is_unicast_address(raw.address) {
+                return Some(ConfigImageError::InterfaceAddressNotUnicast {
+                    index,
+                    address: raw.address,
+                });
+            }
+            if !is_host_address(raw.address, raw.prefix_length) {
+                return Some(ConfigImageError::InterfaceAddressNotAHostAddress {
+                    index,
+                    address: raw.address,
+                });
+            }
             if let Some(fault) = identifier_fault(&raw.id) {
                 return Some(ConfigImageError::InterfaceIdNotAnIdentifier { index, fault });
             }
         }
-        for (index, raw) in image
+
+        for (index, raw) in interfaces.iter().enumerate() {
+            for (other, earlier) in interfaces.iter().enumerate().take(index) {
+                if identifier_text(&earlier.id) == identifier_text(&raw.id) {
+                    return Some(ConfigImageError::InterfaceIdDuplicated { index, other });
+                }
+                if earlier.port == raw.port {
+                    return Some(ConfigImageError::InterfacePortDuplicated {
+                        index,
+                        other,
+                        port: raw.port,
+                    });
+                }
+                if earlier.mac == raw.mac {
+                    return Some(ConfigImageError::InterfaceMacDuplicated {
+                        index,
+                        other,
+                        mac: raw.mac,
+                    });
+                }
+                if prefixes_overlap(
+                    earlier.address,
+                    earlier.prefix_length,
+                    raw.address,
+                    raw.prefix_length,
+                ) {
+                    return Some(ConfigImageError::InterfacePrefixesOverlap { index, other });
+                }
+            }
+        }
+
+        let neighbours: Vec<NeighbourImage> = image
             .neighbours
             .iter()
-            .enumerate()
-            .take(image.neighbour_count as usize)
-        {
+            .copied()
+            .take(neighbour_count)
+            .collect();
+        for (index, raw) in neighbours.iter().enumerate() {
             if raw.port >= port_count {
                 return Some(ConfigImageError::NeighbourPortUnknown {
                     index,
@@ -2214,7 +2976,45 @@ mod tests {
                     mac: raw.mac,
                 });
             }
+            if !is_unicast_address(raw.address) {
+                return Some(ConfigImageError::NeighbourAddressNotUnicast {
+                    index,
+                    address: raw.address,
+                });
+            }
+            let Some(interface) = interfaces.iter().find(|entry| entry.port == raw.port) else {
+                return Some(ConfigImageError::NeighbourPortUnconfigured {
+                    index,
+                    port: raw.port,
+                });
+            };
+            if raw.address == interface.address {
+                return Some(ConfigImageError::NeighbourIsInterfaceAddress {
+                    index,
+                    address: raw.address,
+                });
+            }
+            if !inside_prefix(raw.address, interface.address, interface.prefix_length) {
+                return Some(ConfigImageError::NeighbourOutsidePrefix {
+                    index,
+                    address: raw.address,
+                });
+            }
+            if !is_host_address(raw.address, interface.prefix_length) {
+                return Some(ConfigImageError::NeighbourAddressNotAHostAddress {
+                    index,
+                    address: raw.address,
+                });
+            }
         }
+        for (index, raw) in neighbours.iter().enumerate() {
+            for (other, earlier) in neighbours.iter().enumerate().take(index) {
+                if earlier.port == raw.port && earlier.address == raw.address {
+                    return Some(ConfigImageError::NeighbourAddressDuplicated { index, other });
+                }
+            }
+        }
+
         let management = image.management;
         if management.enabled > 1 {
             return Some(ConfigImageError::ManagementEnabledNotBoolean {
@@ -2232,8 +3032,38 @@ mod tests {
                     mac: management.mac,
                 });
             }
+            if !is_unicast_address(management.address) {
+                return Some(ConfigImageError::ManagementAddressNotUnicast {
+                    address: management.address,
+                });
+            }
+            if !is_host_address(management.address, management.prefix_length) {
+                return Some(ConfigImageError::ManagementAddressNotAHostAddress {
+                    address: management.address,
+                });
+            }
+            for (index, interface) in interfaces.iter().enumerate() {
+                if prefixes_overlap(
+                    interface.address,
+                    interface.prefix_length,
+                    management.address,
+                    management.prefix_length,
+                ) {
+                    return Some(ConfigImageError::ManagementPrefixCollidesWithInterface { index });
+                }
+                if interface.mac == management.mac {
+                    return Some(ConfigImageError::ManagementMacCollidesWithInterface { index });
+                }
+            }
         }
         None
+    }
+
+    /// The bytes an id names, for the oracle's own duplicate comparison. Only
+    /// reached once [`identifier_fault`] has admitted both, so the stated length
+    /// is inside the storage.
+    fn identifier_text(raw: &IdentifierImage) -> &[u8] {
+        raw.bytes.get(..usize::from(raw.len)).unwrap_or_default()
     }
 
     proptest! {
@@ -2290,11 +3120,7 @@ mod tests {
         /// refusal is attributed to the wrong field.
         #[test]
         fn an_arbitrary_region_is_read_totally_and_yields_only_valid_entries(
-            mut image in config_image(
-                plausible_interface_image(),
-                plausible_neighbour_image(),
-                plausible_management_image(),
-            ),
+            mut image in consistent_config_image(),
             interface_count in any_plausible_count(),
             neighbour_count in any_plausible_count(),
             port_count in 1u8..=4,
@@ -2328,16 +3154,67 @@ mod tests {
                         .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
                 );
             }
-            for entry in checked.neighbours() {
+            // Every rule between two interfaces holds of what came out, which
+            // is the claim the forwarding domain's own lookups rest on.
+            for (index, entry) in checked.interfaces().enumerate() {
+                prop_assert!(is_unicast_address(entry.address()));
+                prop_assert!(is_host_address(entry.address(), entry.prefix_length()));
+                for earlier in checked.interfaces().take(index) {
+                    prop_assert_ne!(earlier.port(), entry.port());
+                    prop_assert_ne!(earlier.mac(), entry.mac());
+                    prop_assert_ne!(earlier.id(), entry.id());
+                    prop_assert!(!prefixes_overlap(
+                        earlier.address(),
+                        earlier.prefix_length(),
+                        entry.address(),
+                        entry.prefix_length(),
+                    ));
+                }
+            }
+            for (index, entry) in checked.neighbours().enumerate() {
                 prop_assert!(entry.port() < port_count);
                 prop_assert!(is_unicast(entry.mac()));
+                prop_assert!(is_unicast_address(entry.address()));
+                // On a link this configuration addresses, and a host on it.
+                let interface = checked
+                    .interfaces()
+                    .find(|candidate| candidate.port() == entry.port())
+                    .expect("an accepted neighbour sits on a configured port");
+                prop_assert_ne!(entry.address(), interface.address());
+                prop_assert!(inside_prefix(
+                    entry.address(),
+                    interface.address(),
+                    interface.prefix_length(),
+                ));
+                prop_assert!(is_host_address(entry.address(), interface.prefix_length()));
+                for earlier in checked.neighbours().take(index) {
+                    prop_assert!(
+                        earlier.port() != entry.port() || earlier.address() != entry.address()
+                    );
+                }
             }
             match checked.management() {
                 Some(management) => {
                     prop_assert_eq!(image.management.enabled, 1);
                     prop_assert!(management.prefix_length() <= MAX_PREFIX_LENGTH);
                     prop_assert!(is_unicast(management.mac()));
+                    prop_assert!(is_unicast_address(management.address()));
+                    prop_assert!(is_host_address(
+                        management.address(),
+                        management.prefix_length()
+                    ));
                     prop_assert_eq!(management.address(), image.management.address);
+                    // Neither reachable by routing nor answering under a
+                    // dataplane port's L2 address.
+                    for entry in checked.interfaces() {
+                        prop_assert!(!prefixes_overlap(
+                            entry.address(),
+                            entry.prefix_length(),
+                            management.address(),
+                            management.prefix_length(),
+                        ));
+                        prop_assert_ne!(entry.mac(), management.mac());
+                    }
                 }
                 None => prop_assert_eq!(image.management.enabled, 0),
             }

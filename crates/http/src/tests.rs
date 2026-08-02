@@ -218,6 +218,19 @@ fn each_bound_is_enforced_exactly_at_its_edge() {
         Err(RequestError::TooManyHeaders)
     );
 
+    // The field past the bound is counted before it is read, so the answer is
+    // the bound's — 431 — whatever is wrong with it. A parser that read it first
+    // would answer 400 and tell a client to fix a syntax error when what it must
+    // do is send fewer fields.
+    let mut over = headers(MAX_HEADERS);
+    over.truncate(over.len() - 2);
+    over.extend_from_slice(b"not a header at all\r\n\r\n");
+    assert_eq!(parse(&over), Err(RequestError::TooManyHeaders));
+    assert_eq!(
+        RequestError::TooManyHeaders.status(),
+        Status::HeadersTooLarge
+    );
+
     let name = |len: usize| {
         let mut head = b"GET / HTTP/1.1\r\n".to_vec();
         head.extend(core::iter::repeat_n(b'x', len));
@@ -268,7 +281,7 @@ fn a_head_is_read_as_ascii_and_arbitrary_bytes_are_refused() {
 
 // ── Responses ───────────────────────────────────────────────────────────────
 
-fn head_to_string(status: Status, content_type: Option<&str>, length: u64) -> String {
+fn head_to_string(status: Status, content_type: Option<ContentType>, length: u64) -> String {
     let mut out = [0u8; MAX_HEAD_LEN];
     let len = write_head(status, content_type, length, &mut out).expect("the declared bound fits");
     String::from_utf8(out[..len].to_vec()).expect("ASCII")
@@ -276,7 +289,7 @@ fn head_to_string(status: Status, content_type: Option<&str>, length: u64) -> St
 
 #[test]
 fn a_metrics_head_carries_the_type_the_length_and_the_close() {
-    let head = head_to_string(Status::Ok, Some(METRICS_CONTENT_TYPE), 20_480);
+    let head = head_to_string(Status::Ok, Some(ContentType::Metrics), 20_480);
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\n\
@@ -296,12 +309,12 @@ fn a_head_with_no_body_type_still_carries_a_length() {
 }
 
 /// The bound is what lets a caller reserve room in front of a body and never be
-/// refused: every status, with every content type this crate names and the
+/// refused: every status, with every content type the type admits and the
 /// longest length, must fit it.
 #[test]
 fn the_declared_head_bound_holds_every_status() {
     for status in Status::ALL {
-        for content_type in [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE] {
+        for content_type in ContentType::ALL {
             let mut out = [0u8; MAX_HEAD_LEN];
             let len = write_head(status, Some(content_type), u64::MAX, &mut out)
                 .expect("the bound holds every status");
@@ -310,13 +323,13 @@ fn the_declared_head_bound_holds_every_status() {
             assert!(text.starts_with(&format!("HTTP/1.1 {} {}", status.code(), status.reason())));
             assert!(text.ends_with("\r\n\r\n"));
             assert!(text.contains(&format!("Content-Length: {}\r\n", u64::MAX)));
-            assert!(text.contains(&format!("Content-Type: {content_type}\r\n")));
+            assert!(text.contains(&format!("Content-Type: {}\r\n", content_type.as_str())));
         }
     }
 }
 
-/// The bound is derived from the status table and the content types this crate
-/// names, so it is held to the longest head those actually produce rather than
+/// The bound is derived from `Status::ALL` and the content types `ContentType`
+/// admits, so it is held to the longest head those actually produce rather than
 /// only to fitting one: a bound computed from a *different* string would agree
 /// by luck.
 #[test]
@@ -324,7 +337,7 @@ fn the_head_bound_is_the_longest_head_it_bounds() {
     let longest = Status::ALL
         .iter()
         .flat_map(|status| {
-            [METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE]
+            ContentType::ALL
                 .map(|content_type| head_to_string(*status, Some(content_type), u64::MAX).len())
         })
         .max()
@@ -446,7 +459,7 @@ proptest! {
     #[test]
     fn a_head_states_the_length_it_was_given(length in any::<u64>()) {
         for status in Status::ALL {
-            let head = head_to_string(status, Some(METRICS_CONTENT_TYPE), length);
+            let head = head_to_string(status, Some(ContentType::Metrics), length);
             let stated = format!("Content-Length: {length}\r\n");
             prop_assert!(head.contains(&stated));
             prop_assert!(head.contains("Connection: close\r\n"));
