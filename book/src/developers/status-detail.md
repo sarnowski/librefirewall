@@ -17,9 +17,9 @@ whenever it runs and `make coverage` states the current coverage; what a section
 ## Routed IPv4 forwarding
 
 **What exists.** Two host-tested `no_std` crates carry the whole decision. `crates/net-headers`
-parses Ethernet, one optional 802.1Q tag, IPv4 and UDP, and applies the four edits a hop requires
-— both MACs, the TTL decrement, and the header checksum — as one operation that cannot be
-performed in part. `crates/routing` turns a parsed frame and its ingress port into a verdict:
+parses Ethernet, one optional 802.1Q tag, IPv4, and the UDP, TCP or ICMP header behind it, and
+applies the four edits a hop requires — both MACs, the TTL decrement, and the header checksum —
+as one operation that cannot be performed in part. `crates/routing` turns a parsed frame and its ingress port into a verdict:
 forward out of a named port under a named MAC pair, or one of eleven named drop reasons, each with
 its own counter. `pd_runtime::RouteStage` joins them to the dataplane — snapshot the frame out of
 the pool, decide, rewrite, and write back the 34 header bytes — and marks every frame it refuses
@@ -57,6 +57,15 @@ target (`route_frame`) whose input is the frame itself.
   ingress, and traffic that would have needed the default route is `no_route`.
 - **IPv4 only, and no options**: `IHL != 5` is refused rather than skipped, IPv6 is absent, and a
   VLAN tag is parsed but never acted on — a tagged frame is dropped for want of a sub-interface.
+- **The L4 header is annotation, and nothing reads it yet.** The UDP, TCP and ICMP headers behind
+  IPv4 are parsed — ports, TCP flags, sequence and data offset, ICMP type and code — and every
+  field reaches a caller exactly as it was sent. Nothing is validated: a TCP data offset below five
+  or naming more than the segment carries, a UDP length contradicting the datagram, an ICMP
+  checksum that does not verify are all surfaced rather than refused, and a datagram too short for
+  the header it claims reports how few bytes there were. None of them can make a frame unroutable,
+  because judging them would perform the receiving endpoint's check for it — and because there is
+  no filtering stage to consume them: they exist so that one can be written, and today the fields
+  are read and dropped.
 - **No fragment reassembly.** A non-initial fragment is forwarded without a transport header being
   read, which is correct for routing and insufficient for anything that must see the whole datagram.
 

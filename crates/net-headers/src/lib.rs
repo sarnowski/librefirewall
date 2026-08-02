@@ -1,4 +1,4 @@
-//! Ethernet, IPv4, UDP, ARP and ICMP-echo header parsing, the four in-place
+//! Ethernet, IPv4, UDP, TCP, ICMP and ARP header parsing, the four in-place
 //! edits routing a frame requires, and the two replies an addressed endpoint
 //! sends.
 //!
@@ -43,12 +43,18 @@
 //!   protocol type or address length is an [`ArpError`] rather than a packet
 //!   with fields nobody checked, and the only operations that decode are request
 //!   and reply.
-//! * **ICMP is echo or nothing.** [`IcmpEcho::parse_request`] is the whole of
-//!   what this crate reads of ICMP; every other type and code is refused, so no
-//!   error message, redirect or timestamp is parsed here.
-//! * **TCP is not parsed here.** A segment's header is inseparable from the state
-//!   machine that judges it, so `lfw_tcp` owns that parser and reaches this crate's
+//! * **ICMP is read as a header, and answered only as an echo.** [`IcmpHeader`]
+//!   carries type, code and the four bytes behind them whatever the type;
+//!   [`IcmpEcho::parse_request`] is a separate, checksum-verifying read that
+//!   composes a reply and still refuses anything but an echo request.
+//! * **A TCP header is read here; a TCP segment is not.** [`TcpHeader`] is the
+//!   fixed twenty bytes as annotation. Options, the pseudo-header checksum and
+//!   the state machine judging them are `lfw_tcp`'s, which reaches this crate's
 //!   arithmetic through [`Checksum`]; [`Ipv4Frame`] is the datagram around one.
+//!   Its flags type is not reused here, and the two are deliberately separate:
+//!   an endpoint's is the control bits it dispatches on, normalised for a state
+//!   machine, while [`TcpFlags`] is the whole flags byte as it arrived, ECN
+//!   included — a filter matches what was sent, not what an endpoint implements.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -76,6 +82,10 @@ pub const MAX_PREFIX_LENGTH: u8 = 32;
 
 pub const UDP_HEADER_LEN: usize = 8;
 
+/// A TCP header with no options, which is all [`TcpHeader`] reads: the data
+/// offset may name more, and what it names is the option area `lfw_tcp` walks.
+pub const TCP_HEADER_LEN: usize = 20;
+
 /// The smallest frame that can carry anything this crate parses.
 pub const MIN_ROUTABLE_FRAME_LEN: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
 
@@ -86,11 +96,12 @@ pub const ARP_PAYLOAD_LEN: usize = 28;
 /// The whole of an ARP frame, and so the whole of an ARP reply.
 pub const ARP_FRAME_LEN: usize = ETHERNET_HEADER_LEN + ARP_PAYLOAD_LEN;
 
-/// Type, code, checksum, identifier, sequence.
-pub const ICMP_ECHO_HEADER_LEN: usize = 8;
+/// Type, code, checksum, and the four bytes an echo spends on identifier and
+/// sequence — one length, because every ICMP message begins the same way.
+pub const ICMP_HEADER_LEN: usize = 8;
 
 /// The frame an [`EchoReply`] with no payload occupies.
-pub const MIN_ECHO_REPLY_LEN: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + ICMP_ECHO_HEADER_LEN;
+pub const MIN_ECHO_REPLY_LEN: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + ICMP_HEADER_LEN;
 
 const ARP_HARDWARE_ETHERNET: u16 = 1;
 const ARP_HARDWARE_LEN: u8 = 6;
@@ -98,8 +109,6 @@ const ARP_PROTOCOL_LEN: u8 = 4;
 const ARP_REQUEST: u16 = 1;
 const ARP_REPLY: u16 = 2;
 
-const ICMP_ECHO_REQUEST_TYPE: u8 = 8;
-const ICMP_ECHO_REPLY_TYPE: u8 = 0;
 const ICMP_ECHO_CODE: u8 = 0;
 
 /// Where a checksum field sits inside the block it covers, and so the two bytes
@@ -312,6 +321,98 @@ pub struct UdpHeader {
     pub checksum: u16,
 }
 
+/// The whole TCP flags byte, one accessor per bit and nothing masked away.
+///
+/// A newtype rather than a `u8` because these bits are what a filtering rule
+/// matches on, and a rule written against a raw byte carries its own mask to
+/// every match site — where a wrong one is a rule that silently matches the
+/// wrong traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TcpFlags(pub u8);
+
+impl TcpFlags {
+    #[must_use]
+    pub const fn fin(self) -> bool {
+        self.0 & 0x01 != 0
+    }
+
+    #[must_use]
+    pub const fn syn(self) -> bool {
+        self.0 & 0x02 != 0
+    }
+
+    #[must_use]
+    pub const fn rst(self) -> bool {
+        self.0 & 0x04 != 0
+    }
+
+    #[must_use]
+    pub const fn psh(self) -> bool {
+        self.0 & 0x08 != 0
+    }
+
+    #[must_use]
+    pub const fn ack(self) -> bool {
+        self.0 & 0x10 != 0
+    }
+
+    #[must_use]
+    pub const fn urg(self) -> bool {
+        self.0 & 0x20 != 0
+    }
+
+    #[must_use]
+    pub const fn ece(self) -> bool {
+        self.0 & 0x40 != 0
+    }
+
+    #[must_use]
+    pub const fn cwr(self) -> bool {
+        self.0 & 0x80 != 0
+    }
+}
+
+/// The fixed twenty bytes of a TCP header, read and judged against nothing —
+/// the same stance [`UdpHeader`] takes on its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpHeader {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub sequence: u32,
+    pub acknowledgement: u32,
+    /// The header's length in 32-bit words, exactly as it is on the wire: a
+    /// value below five, or one naming more than the segment carries, reaches a
+    /// reader unaltered rather than refusing the frame.
+    pub data_offset: u8,
+    pub flags: TcpFlags,
+    pub window: u16,
+    pub checksum: u16,
+    pub urgent_pointer: u16,
+}
+
+/// The eight bytes every ICMP message begins with, read and judged against
+/// nothing: neither the checksum nor the type is verified here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IcmpHeader {
+    pub message_type: u8,
+    pub code: u8,
+    pub checksum: u16,
+    /// The four bytes whose meaning is the type's — an echo's identifier and
+    /// sequence, an unreachable's next-hop MTU — carried raw, because reading
+    /// them would mean deciding which type this is.
+    pub rest_of_header: [u8; 4],
+}
+
+impl IcmpHeader {
+    /// The RFC 792 types, as the values a rule names them by.
+    pub const ECHO_REPLY: u8 = 0;
+    pub const DESTINATION_UNREACHABLE: u8 = 3;
+    pub const REDIRECT: u8 = 5;
+    pub const ECHO_REQUEST: u8 = 8;
+    pub const TIME_EXCEEDED: u8 = 11;
+    pub const PARAMETER_PROBLEM: u8 = 12;
+}
+
 /// What sits behind the IPv4 header.
 ///
 /// Every variant is an *annotation*: nothing here can make a frame unroutable.
@@ -324,6 +425,18 @@ pub enum Transport {
     /// A datagram claiming UDP with fewer than [`UDP_HEADER_LEN`] bytes behind
     /// its IPv4 header, so no port could be read. Carries what there was.
     TruncatedUdp {
+        available: usize,
+    },
+    Tcp(TcpHeader),
+    /// The same for TCP: fewer than [`TCP_HEADER_LEN`] bytes, so no port, flag
+    /// or sequence number could be read.
+    TruncatedTcp {
+        available: usize,
+    },
+    Icmp(IcmpHeader),
+    /// The same for ICMP: fewer than [`ICMP_HEADER_LEN`] bytes, so not even a
+    /// type could be read.
+    TruncatedIcmp {
         available: usize,
     },
     /// A fragment carrying no transport header at its offset, so none was read.
@@ -579,7 +692,7 @@ impl<'a> IcmpEcho<'a> {
     /// verified, so a corrupt error message is refused as the wrong type rather
     /// than as a bad sum.
     pub fn parse_request(message: &'a [u8]) -> Result<Self, IcmpError> {
-        let Some((header, payload)) = message.split_first_chunk::<ICMP_ECHO_HEADER_LEN>() else {
+        let Some((header, payload)) = message.split_first_chunk::<ICMP_HEADER_LEN>() else {
             return Err(IcmpError::HeaderTruncated { got: message.len() });
         };
         let [
@@ -592,7 +705,7 @@ impl<'a> IcmpEcho<'a> {
             seq_high,
             seq_low,
         ] = *header;
-        if message_type != ICMP_ECHO_REQUEST_TYPE || code != ICMP_ECHO_CODE {
+        if message_type != IcmpHeader::ECHO_REQUEST || code != ICMP_ECHO_CODE {
             return Err(IcmpError::NotAnEchoRequest { message_type, code });
         }
         if fold(accumulate(0, message)) != u16::MAX {
@@ -909,7 +1022,7 @@ impl EchoReply<'_> {
     /// byte-for-byte untouched on either.
     pub fn write(&self, out: &mut [u8]) -> Result<usize, ReplyError> {
         let payload = self.echo.payload;
-        let Some(total_length) = (IPV4_HEADER_LEN + ICMP_ECHO_HEADER_LEN)
+        let Some(total_length) = (IPV4_HEADER_LEN + ICMP_HEADER_LEN)
             .checked_add(payload.len())
             .and_then(|total| u16::try_from(total).ok())
         else {
@@ -965,7 +1078,7 @@ impl EchoReply<'_> {
         ipv4[IPV4_CHECKSUM_AT + 1] = ipv4_ck_low;
 
         let mut icmp = [
-            ICMP_ECHO_REPLY_TYPE,
+            IcmpHeader::ECHO_REPLY,
             ICMP_ECHO_CODE,
             0,
             0,
@@ -1430,17 +1543,23 @@ fn validate_ipv4(
 /// Read what sits behind the IPv4 header, without judging it.
 ///
 /// Total, and that is the point: a transport header cannot make a datagram
-/// unroutable, so there is no error to return. Whether the UDP length agrees
-/// with the IP total length is the receiving endpoint's question, and dropping
-/// the packet here would perform its check for it. The fields are read for
-/// annotation and handed on as they were found.
+/// unroutable, so there is no error to return. Whether a UDP length or a TCP
+/// data offset agrees with the datagram is the receiving endpoint's question,
+/// and dropping the packet here would perform its check for it. The fields are
+/// read for annotation and handed on as they were found.
 fn parse_transport(header: &Ipv4Header, payload: &[u8]) -> Transport {
     if header.fragment_offset != 0 {
         return Transport::NonInitialFragment;
     }
-    if header.protocol != Protocol::UDP {
-        return Transport::Unparsed(header.protocol);
+    match header.protocol {
+        Protocol::UDP => read_udp(payload),
+        Protocol::TCP => read_tcp(payload),
+        Protocol::ICMP => read_icmp(payload),
+        other => Transport::Unparsed(other),
     }
+}
+
+fn read_udp(payload: &[u8]) -> Transport {
     let Some((udp, _)) = payload.split_first_chunk::<UDP_HEADER_LEN>() else {
         return Transport::TruncatedUdp {
             available: payload.len(),
@@ -1461,6 +1580,73 @@ fn parse_transport(header: &Ipv4Header, payload: &[u8]) -> Transport {
         destination_port: u16::from_be_bytes([dp_high, dp_low]),
         length: u16::from_be_bytes([len_high, len_low]),
         checksum: u16::from_be_bytes([ck_high, ck_low]),
+    })
+}
+
+fn read_tcp(payload: &[u8]) -> Transport {
+    let Some((tcp, _)) = payload.split_first_chunk::<TCP_HEADER_LEN>() else {
+        return Transport::TruncatedTcp {
+            available: payload.len(),
+        };
+    };
+    let [
+        sp_high,
+        sp_low,
+        dp_high,
+        dp_low,
+        seq0,
+        seq1,
+        seq2,
+        seq3,
+        ack0,
+        ack1,
+        ack2,
+        ack3,
+        offset_reserved,
+        flags,
+        win_high,
+        win_low,
+        ck_high,
+        ck_low,
+        urg_high,
+        urg_low,
+    ] = *tcp;
+    Transport::Tcp(TcpHeader {
+        source_port: u16::from_be_bytes([sp_high, sp_low]),
+        destination_port: u16::from_be_bytes([dp_high, dp_low]),
+        sequence: u32::from_be_bytes([seq0, seq1, seq2, seq3]),
+        acknowledgement: u32::from_be_bytes([ack0, ack1, ack2, ack3]),
+        // The low nibble is the reserved field, which this crate neither reads
+        // nor reports: it is not a value to act on.
+        data_offset: offset_reserved >> 4,
+        flags: TcpFlags(flags),
+        window: u16::from_be_bytes([win_high, win_low]),
+        checksum: u16::from_be_bytes([ck_high, ck_low]),
+        urgent_pointer: u16::from_be_bytes([urg_high, urg_low]),
+    })
+}
+
+fn read_icmp(payload: &[u8]) -> Transport {
+    let Some((icmp, _)) = payload.split_first_chunk::<ICMP_HEADER_LEN>() else {
+        return Transport::TruncatedIcmp {
+            available: payload.len(),
+        };
+    };
+    let [
+        message_type,
+        code,
+        ck_high,
+        ck_low,
+        rest0,
+        rest1,
+        rest2,
+        rest3,
+    ] = *icmp;
+    Transport::Icmp(IcmpHeader {
+        message_type,
+        code,
+        checksum: u16::from_be_bytes([ck_high, ck_low]),
+        rest_of_header: [rest0, rest1, rest2, rest3],
     })
 }
 
@@ -1818,6 +2004,259 @@ mod tests {
         assert_eq!(frame.transport(), Transport::TruncatedUdp { available: 4 });
     }
 
+    /// An IPv4 frame whose whole transport is `payload`, so a header this crate
+    /// annotates can be laid out byte by byte rather than through a builder that
+    /// would decide the very fields under test.
+    fn ipv4_frame(protocol: Protocol, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]);
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]);
+        frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
+
+        let total_length = (IPV4_HEADER_LEN + payload.len()) as u16;
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&total_length.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = protocol.0;
+        ip[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        ip[16..20].copy_from_slice(&[10, 0, 1, 2]);
+        let checksum = recomputed_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// The twenty header bytes of a TCP segment, every field placed by hand.
+    fn tcp_header_bytes(
+        source_port: u16,
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        offset_reserved: u8,
+        flags: u8,
+    ) -> [u8; TCP_HEADER_LEN] {
+        let [sp_high, sp_low] = source_port.to_be_bytes();
+        let [dp_high, dp_low] = destination_port.to_be_bytes();
+        let [s0, s1, s2, s3] = sequence.to_be_bytes();
+        let [a0, a1, a2, a3] = acknowledgement.to_be_bytes();
+        [
+            sp_high,
+            sp_low,
+            dp_high,
+            dp_low,
+            s0,
+            s1,
+            s2,
+            s3,
+            a0,
+            a1,
+            a2,
+            a3,
+            offset_reserved,
+            flags,
+            0x40,
+            0x00,
+            0xbe,
+            0xef,
+            0x00,
+            0x11,
+        ]
+    }
+
+    /// The bytes a [`TcpHeader`] came from, rebuilt out of its fields alone: a
+    /// field read at the wrong offset, or dropped, cannot survive the trip.
+    fn encode_tcp(header: TcpHeader) -> [u8; TCP_HEADER_LEN] {
+        let [sp_high, sp_low] = header.source_port.to_be_bytes();
+        let [dp_high, dp_low] = header.destination_port.to_be_bytes();
+        let [s0, s1, s2, s3] = header.sequence.to_be_bytes();
+        let [a0, a1, a2, a3] = header.acknowledgement.to_be_bytes();
+        let [w_high, w_low] = header.window.to_be_bytes();
+        let [ck_high, ck_low] = header.checksum.to_be_bytes();
+        let [u_high, u_low] = header.urgent_pointer.to_be_bytes();
+        [
+            sp_high,
+            sp_low,
+            dp_high,
+            dp_low,
+            s0,
+            s1,
+            s2,
+            s3,
+            a0,
+            a1,
+            a2,
+            a3,
+            header.data_offset << 4,
+            header.flags.0,
+            w_high,
+            w_low,
+            ck_high,
+            ck_low,
+            u_high,
+            u_low,
+        ]
+    }
+
+    fn transport_of(bytes: &mut [u8]) -> Transport {
+        Frame::parse(bytes)
+            .expect("the IPv4 header is well formed")
+            .transport()
+    }
+
+    #[test]
+    fn a_well_formed_tcp_frame_parses_to_its_fields() {
+        let header = tcp_header_bytes(4444, 80, 0x1122_3344, 0x5566_7788, 0x50, 0x12);
+        let mut bytes = ipv4_frame(Protocol::TCP, &header);
+        match transport_of(&mut bytes) {
+            Transport::Tcp(tcp) => {
+                assert_eq!(tcp.source_port, 4444);
+                assert_eq!(tcp.destination_port, 80);
+                assert_eq!(tcp.sequence, 0x1122_3344);
+                assert_eq!(tcp.acknowledgement, 0x5566_7788);
+                assert_eq!(tcp.data_offset, 5);
+                assert_eq!(tcp.window, 0x4000);
+                assert_eq!(tcp.checksum, 0xbeef);
+                assert_eq!(tcp.urgent_pointer, 0x0011);
+                assert!(tcp.flags.syn() && tcp.flags.ack());
+                assert!(!tcp.flags.fin() && !tcp.flags.rst());
+            }
+            other => panic!("expected a TCP header, got {other:?}"),
+        }
+    }
+
+    /// Each of the eight bits is named by exactly one accessor, so no rule
+    /// matching one of them can be reading another.
+    #[test]
+    fn every_tcp_flag_bit_is_named_by_exactly_one_accessor() {
+        type Accessor = (&'static str, fn(TcpFlags) -> bool);
+        let accessors: [Accessor; 8] = [
+            ("fin", TcpFlags::fin),
+            ("syn", TcpFlags::syn),
+            ("rst", TcpFlags::rst),
+            ("psh", TcpFlags::psh),
+            ("ack", TcpFlags::ack),
+            ("urg", TcpFlags::urg),
+            ("ece", TcpFlags::ece),
+            ("cwr", TcpFlags::cwr),
+        ];
+        for (index, (name, _)) in accessors.iter().enumerate() {
+            let flags = TcpFlags(1 << index);
+            let set: Vec<&str> = accessors
+                .iter()
+                .filter(|(_, read)| read(flags))
+                .map(|(named, _)| *named)
+                .collect();
+            assert_eq!(set, vec![*name], "bit {index} is named by {set:?}");
+        }
+        assert_eq!(TcpFlags::default(), TcpFlags(0));
+        let none = TcpFlags(0);
+        assert!(accessors.iter().all(|(_, read)| !read(none)));
+        let all = TcpFlags(u8::MAX);
+        assert!(accessors.iter().all(|(_, read)| read(all)));
+    }
+
+    /// A data offset is read and judged against nothing, exactly as a UDP
+    /// length is: below the five words a header occupies, or naming a header
+    /// longer than the segment, it reaches the caller as it was sent.
+    #[test]
+    fn a_tcp_data_offset_the_segment_contradicts_is_carried_rather_than_refused() {
+        for data_offset in [0u8, 1, 4, 5, 6, 15] {
+            let header = tcp_header_bytes(1, 2, 0, 0, data_offset << 4, 0);
+            let mut bytes = ipv4_frame(Protocol::TCP, &header);
+            match transport_of(&mut bytes) {
+                Transport::Tcp(tcp) => assert_eq!(
+                    tcp.data_offset, data_offset,
+                    "the data offset reached the caller altered"
+                ),
+                other => panic!("expected the TCP header as it stands, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_datagram_too_short_for_the_tcp_header_it_claims_still_parses() {
+        for available in 0..TCP_HEADER_LEN {
+            let header = tcp_header_bytes(1, 2, 3, 4, 0x50, 0x02);
+            let mut bytes = ipv4_frame(Protocol::TCP, &header[..available]);
+            assert_eq!(
+                transport_of(&mut bytes),
+                Transport::TruncatedTcp { available }
+            );
+        }
+    }
+
+    /// Every ICMP type is an annotation, not a verdict: the echo parser refuses
+    /// what is not an echo, and this one refuses nothing at all.
+    #[test]
+    fn an_icmp_message_of_any_type_parses_to_its_header() {
+        for message_type in [
+            IcmpHeader::ECHO_REPLY,
+            IcmpHeader::DESTINATION_UNREACHABLE,
+            IcmpHeader::REDIRECT,
+            IcmpHeader::ECHO_REQUEST,
+            IcmpHeader::TIME_EXCEEDED,
+            IcmpHeader::PARAMETER_PROBLEM,
+            200,
+            u8::MAX,
+        ] {
+            let message = [message_type, 4, 0xab, 0xcd, 1, 2, 3, 4];
+            let mut bytes = ipv4_frame(Protocol::ICMP, &message);
+            assert_eq!(
+                transport_of(&mut bytes),
+                Transport::Icmp(IcmpHeader {
+                    message_type,
+                    code: 4,
+                    checksum: 0xabcd,
+                    rest_of_header: [1, 2, 3, 4],
+                })
+            );
+        }
+    }
+
+    /// A checksum this crate does not verify here: the ICMP annotation carries
+    /// the field, and only `IcmpEcho::parse_request` judges it.
+    #[test]
+    fn an_icmp_checksum_that_does_not_verify_is_carried_rather_than_refused() {
+        let message = [IcmpHeader::ECHO_REQUEST, 0, 0, 0, 0, 1, 0, 1];
+        let mut bytes = ipv4_frame(Protocol::ICMP, &message);
+        match transport_of(&mut bytes) {
+            Transport::Icmp(icmp) => assert_eq!(icmp.checksum, 0),
+            other => panic!("expected the ICMP header as it stands, got {other:?}"),
+        }
+        let icmp_at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        assert!(matches!(
+            IcmpEcho::parse_request(&bytes[icmp_at..]),
+            Err(IcmpError::ChecksumInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn a_datagram_too_short_for_the_icmp_header_it_claims_still_parses() {
+        for available in 0..ICMP_HEADER_LEN {
+            let message = [IcmpHeader::ECHO_REQUEST, 0, 0, 0, 0, 1, 0, 1];
+            let mut bytes = ipv4_frame(Protocol::ICMP, &message[..available]);
+            assert_eq!(
+                transport_of(&mut bytes),
+                Transport::TruncatedIcmp { available }
+            );
+        }
+    }
+
+    /// The fragment test precedes the protocol dispatch, so a TCP or ICMP
+    /// fragment reports no header rather than reading payload as one.
+    #[test]
+    fn a_non_initial_fragment_reads_no_transport_header_whatever_the_protocol() {
+        for protocol in [Protocol::TCP, Protocol::ICMP, Protocol::UDP] {
+            let mut bytes = ipv4_frame(protocol, &[0xff; TCP_HEADER_LEN]);
+            bytes[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+                .copy_from_slice(&0x0001u16.to_be_bytes());
+            reseal(&mut bytes);
+            assert_eq!(transport_of(&mut bytes), Transport::NonInitialFragment);
+        }
+    }
+
     #[test]
     fn non_ipv4_ethertypes_are_named_in_the_rejection() {
         for ether_type in [EtherType::ARP, EtherType::IPV6, EtherType(0x88b5)] {
@@ -1878,10 +2317,10 @@ mod tests {
 
     #[test]
     fn a_protocol_this_crate_does_not_parse_is_carried_rather_than_refused() {
-        // A router forwards TCP and ICMP; only a filtering decision needs them
-        // broken down, so the protocol number is surfaced and the packet stays
-        // routable.
-        for protocol in [Protocol::TCP, Protocol::ICMP, Protocol(253)] {
+        // A router forwards a protocol it cannot break down, so the number is
+        // surfaced and the packet stays routable. GRE, IGMP and an unassigned
+        // number stand for every protocol behind the three that are read.
+        for protocol in [Protocol(2), Protocol(47), Protocol(253)] {
             let mut bytes = udp_frame(64, b"payload!");
             bytes[ETHERNET_HEADER_LEN + 9] = protocol.0;
             reseal(&mut bytes);
@@ -2093,6 +2532,91 @@ mod tests {
         fn ipv4_addresses_round_trip_through_their_octets(octets in any::<[u8; 4]>()) {
             prop_assert_eq!(Ipv4Address::from_octets(octets).octets(), octets);
         }
+
+        /// The whole of what this landing promises, as one property: whatever
+        /// protocol number a datagram carries and however few bytes follow its
+        /// IPv4 header, the frame stays routable and the transport is annotated
+        /// rather than judged.
+        #[test]
+        fn no_transport_header_can_make_a_well_formed_datagram_unroutable(
+            protocol in any::<u8>(),
+            payload in prop::collection::vec(any::<u8>(), 0..80),
+        ) {
+            let protocol = Protocol(protocol);
+            let mut bytes = ipv4_frame(protocol, &payload);
+            let frame = Frame::parse(&mut bytes).expect("the IPv4 header is well formed");
+            let available = payload.len();
+            let expected_truncation = match protocol {
+                Protocol::UDP => available < UDP_HEADER_LEN,
+                Protocol::TCP => available < TCP_HEADER_LEN,
+                Protocol::ICMP => available < ICMP_HEADER_LEN,
+                _ => false,
+            };
+            match frame.transport() {
+                Transport::Udp(_) | Transport::Tcp(_) | Transport::Icmp(_) => {
+                    prop_assert!(!expected_truncation);
+                }
+                Transport::TruncatedUdp { available: got }
+                | Transport::TruncatedTcp { available: got }
+                | Transport::TruncatedIcmp { available: got } => {
+                    prop_assert!(expected_truncation);
+                    prop_assert_eq!(got, available);
+                }
+                Transport::Unparsed(carried) => prop_assert_eq!(carried, protocol),
+                Transport::NonInitialFragment => prop_assert!(false, "nothing was fragmented"),
+            }
+        }
+
+        /// Every TCP field is read from the offset it occupies, and the only
+        /// bits dropped are the reserved nibble the parser documents dropping.
+        #[test]
+        fn a_tcp_header_round_trips_every_byte_but_the_reserved_nibble(
+            mut header in prop::array::uniform20(any::<u8>()),
+        ) {
+            header[12] &= 0xf0;
+            let mut bytes = ipv4_frame(Protocol::TCP, &header);
+            match transport_of(&mut bytes) {
+                Transport::Tcp(tcp) => prop_assert_eq!(encode_tcp(tcp), header),
+                other => prop_assert!(false, "{other:?}"),
+            }
+        }
+
+        /// The same for ICMP, where nothing at all is dropped: all eight bytes
+        /// come back, because the four behind the checksum are carried raw.
+        #[test]
+        fn an_icmp_header_round_trips_every_byte(
+            message in prop::array::uniform8(any::<u8>()),
+        ) {
+            let mut bytes = ipv4_frame(Protocol::ICMP, &message);
+            match transport_of(&mut bytes) {
+                Transport::Icmp(icmp) => {
+                    let [ck_high, ck_low] = icmp.checksum.to_be_bytes();
+                    let [r0, r1, r2, r3] = icmp.rest_of_header;
+                    prop_assert_eq!(
+                        [icmp.message_type, icmp.code, ck_high, ck_low, r0, r1, r2, r3],
+                        message
+                    );
+                }
+                other => prop_assert!(false, "{other:?}"),
+            }
+        }
+
+        /// A transport header decides nothing about forwarding: whatever the
+        /// bytes behind the IPv4 header say, a rewrite still leaves a frame the
+        /// next hop accepts, with the transport annotation unchanged by it.
+        #[test]
+        fn rewriting_for_forwarding_leaves_the_transport_annotation_alone(
+            protocol in prop::sample::select(vec![Protocol::TCP, Protocol::ICMP, Protocol::UDP]),
+            payload in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut bytes = ipv4_frame(protocol, &payload);
+            let mut frame = Frame::parse(&mut bytes).expect("constructed well-formed");
+            let before = frame.transport();
+            frame.rewrite_for_forwarding(MacAddress([1; 6]), MacAddress([2; 6]))
+                .expect("a TTL of 64 survives a hop");
+            let reparsed = Frame::parse(&mut bytes).expect("a rewrite keeps the frame well-formed");
+            prop_assert_eq!(reparsed.transport(), before);
+        }
     }
 
     const OUR_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
@@ -2128,7 +2652,7 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let mut icmp = Vec::new();
-        icmp.push(ICMP_ECHO_REQUEST_TYPE);
+        icmp.push(IcmpHeader::ECHO_REQUEST);
         icmp.push(ICMP_ECHO_CODE);
         icmp.extend_from_slice(&[0, 0]);
         icmp.extend_from_slice(&identifier.to_be_bytes());
@@ -2401,7 +2925,7 @@ mod tests {
         let frame = echo_request(OUR_ADDRESS, 1, 1, b"payload!");
         let icmp_at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
 
-        for len in 0..ICMP_ECHO_HEADER_LEN {
+        for len in 0..ICMP_HEADER_LEN {
             assert_eq!(
                 IcmpEcho::parse_request(&frame[icmp_at..icmp_at + len]).unwrap_err(),
                 IcmpError::HeaderTruncated { got: len }
@@ -2457,12 +2981,12 @@ mod tests {
         assert!(!reply_packet.header().is_fragment());
 
         let message = reply_packet.payload();
-        assert_eq!(message[0], ICMP_ECHO_REPLY_TYPE);
+        assert_eq!(message[0], IcmpHeader::ECHO_REPLY);
         assert_eq!(message[1], ICMP_ECHO_CODE);
         assert_eq!(naive_checksum(message), 0, "the reply's own sum validates");
         assert_eq!(u16::from_be_bytes([message[4], message[5]]), 0xbeef);
         assert_eq!(u16::from_be_bytes([message[6], message[7]]), 3);
-        assert_eq!(&message[ICMP_ECHO_HEADER_LEN..], b"0123456789abcdef");
+        assert_eq!(&message[ICMP_HEADER_LEN..], b"0123456789abcdef");
         assert!(out[len..].iter().all(|byte| *byte == 0));
     }
 
@@ -2587,7 +3111,7 @@ mod tests {
                     let packet = Ipv4Packet::parse(ethernet.payload).expect("a datagram");
                     let message = packet.payload();
                     prop_assert_eq!(naive_checksum(message), 0);
-                    prop_assert_eq!(&message[ICMP_ECHO_HEADER_LEN..], &payload[..]);
+                    prop_assert_eq!(&message[ICMP_HEADER_LEN..], &payload[..]);
                 }
                 Err(ReplyError::DoesNotFit { needed, .. }) => {
                     prop_assert!(needed > capacity);

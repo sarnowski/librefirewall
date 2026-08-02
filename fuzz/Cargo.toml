@@ -27,7 +27,7 @@ cargo-fuzz = true
 #                   through this one and needs no target of its own
 #   config          the configuration document, whose every byte is the
 #                   management-plane attacker's, and the model read out of it
-#   net-headers     the Ethernet/IPv4/UDP/ARP/ICMP headers a wire carries
+#   net-headers     the Ethernet/IPv4/UDP/TCP/ICMP/ARP headers a wire carries
 #   lfw-ip-endpoint the terminal endpoint that answers ARP, ICMP echo and TCP for
 #                   the management port, and so the first surface here that
 #                   composes a reply out of an adversary's own bytes

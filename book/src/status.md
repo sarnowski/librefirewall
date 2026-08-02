@@ -87,11 +87,13 @@ can be read back from the medium alone with nothing else to consult. The recorde
 domain in the system that can put a byte on persistent storage, and the only path between it and
 the dataplane is a one-way tap that can never backpressure forwarding.
 
-Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
-forwarded because it is routable, never because a policy allowed it. There is no connection
-tracking and no NAT, and the ARP and ICMP that exist belong to the management port alone — the
-dataplane resolves a next hop from a static neighbour table and answers nothing for itself. What
-exists is a router on a firewall's substrate, not yet a firewall.
+Parsing reaches the L4 header — UDP, TCP and ICMP — but **no filtering decision of any kind is
+made**: a packet is forwarded because it is routable, never because a policy allowed it. The
+ports, flags and types a rule would match on are read and handed on as annotation, and nothing
+consumes them yet. There is no connection tracking and no NAT, and the ARP and ICMP that exist
+belong to the management port alone — the dataplane resolves a next hop from a static neighbour
+table and answers nothing for itself. What exists is a router on a firewall's substrate, not yet
+a firewall.
 
 That absence reaches the recordings, and is the largest gap in them. The
 [recording design](design/recording.md) splits the two sinks by *what* they record — the log sink

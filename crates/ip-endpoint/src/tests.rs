@@ -5,7 +5,7 @@ use crate::http::{
     RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
 };
 use net_headers::{
-    ARP_FRAME_LEN, ARP_PAYLOAD_LEN, ETHERNET_HEADER_LEN, ICMP_ECHO_HEADER_LEN, IPV4_HEADER_LEN,
+    ARP_FRAME_LEN, ARP_PAYLOAD_LEN, ETHERNET_HEADER_LEN, ICMP_HEADER_LEN, IPV4_HEADER_LEN,
     MAC_PAIR_LEN, MIN_ECHO_REPLY_LEN,
 };
 use proptest::prelude::*;
@@ -492,7 +492,7 @@ fn an_echo_request_for_our_address_is_answered_with_the_same_echo() {
     assert_eq!(message[0], 0, "an echo reply is type 0");
     assert_eq!(u16::from_be_bytes([message[4], message[5]]), 0x1234);
     assert_eq!(u16::from_be_bytes([message[6], message[7]]), 9);
-    assert_eq!(&message[ICMP_ECHO_HEADER_LEN..], &request.payload[..]);
+    assert_eq!(&message[ICMP_HEADER_LEN..], &request.payload[..]);
 }
 
 #[test]

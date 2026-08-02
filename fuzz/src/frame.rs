@@ -37,6 +37,11 @@
 //!   the IPv4 header leaves both the parse and the verdict exactly as they were:
 //!   a router forwards a datagram because the datagram is well formed, and a UDP
 //!   length that contradicts it is the receiving endpoint's to refuse.
+//! * **The transport annotation says what the datagram says.** Which variant is
+//!   reported follows from the protocol number and the bytes the IPv4 total
+//!   length leaves behind the header, and from nothing else. A variant that
+//!   disagreed with either would be a filtering stage handed a header the
+//!   datagram does not carry.
 //! * **The egress does not depend on how the table was written.** Two enabled
 //!   interfaces of equal prefix length covering the frame's own destination
 //!   resolve to the same one in either order.
@@ -46,7 +51,8 @@
 use std::sync::LazyLock;
 
 use net_headers::{
-    ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet, MacAddress,
+    ETHERNET_HEADER_LEN, Frame, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet,
+    MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
 use routing::{Decision, DropReason, Interface, Neighbour, PortId, Router};
 
@@ -127,10 +133,11 @@ const TRANSPORT_LENGTH_AT: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 4;
 ///
 /// A router carries an IPv4 datagram because the datagram is well formed; what
 /// the transport says about itself belongs to whoever receives it. Asserted by
-/// overwriting the two bytes a UDP length field sits at — which for any other
-/// protocol are ordinary payload — and demanding the same answer, so a rule that
-/// crept back into the transport parser and refused a frame on those bytes fails
-/// here rather than silently dropping traffic on the appliance.
+/// overwriting the two bytes a UDP length field sits at — a TCP sequence
+/// number's high half, an ICMP identifier, or ordinary payload, depending on
+/// what the datagram claims to be — and demanding the same answer, so a rule
+/// that crept back into the transport parser and refused a frame on those bytes
+/// fails here rather than silently dropping traffic on the appliance.
 ///
 /// Only untagged frames: an 802.1Q tag moves the transport header four bytes
 /// along, and writing at the untagged offset would land in the IPv4 header,
@@ -168,6 +175,68 @@ fn the_transport_header_decides_nothing(data: &[u8]) {
             baseline,
             "a transport length of {length} changed the routing verdict"
         );
+    }
+}
+
+/// The transport annotation follows from the protocol number and the length the
+/// IPv4 total length leaves, and from nothing else.
+///
+/// This is the reachability half of the property above it: that one proves a
+/// transport field cannot change the verdict, and this proves the field was read
+/// at all — that a datagram claiming TCP with room for a header reports one, and
+/// that a datagram without the room reports exactly how few bytes there were.
+/// Without it a parser answering `Unparsed` to everything would satisfy every
+/// other assertion here.
+fn the_transport_annotation_matches_the_datagram(data: &[u8]) {
+    let mut bytes = data.to_vec();
+    let Ok(frame) = Frame::parse(&mut bytes) else {
+        return;
+    };
+    let header = frame.ipv4();
+    // `Frame::parse` refuses a total length below its own header, so this is
+    // that guarantee asserted rather than assumed.
+    let available = usize::from(header.total_length)
+        .checked_sub(IPV4_HEADER_LEN)
+        .expect("an accepted datagram is at least as long as its header");
+
+    if header.fragment_offset != 0 {
+        assert_eq!(
+            frame.transport(),
+            Transport::NonInitialFragment,
+            "a fragment at a non-zero offset had its payload read as a header"
+        );
+        return;
+    }
+
+    let fixed_header_len = match header.protocol {
+        Protocol::UDP => UDP_HEADER_LEN,
+        Protocol::TCP => TCP_HEADER_LEN,
+        Protocol::ICMP => ICMP_HEADER_LEN,
+        other => {
+            assert_eq!(
+                frame.transport(),
+                Transport::Unparsed(other),
+                "a protocol this crate does not read was broken down anyway"
+            );
+            return;
+        }
+    };
+
+    match frame.transport() {
+        Transport::Udp(_) | Transport::Tcp(_) | Transport::Icmp(_) => assert!(
+            available >= fixed_header_len,
+            "a header was read out of {available} bytes",
+        ),
+        Transport::TruncatedUdp { available: got }
+        | Transport::TruncatedTcp { available: got }
+        | Transport::TruncatedIcmp { available: got } => {
+            assert!(
+                available < fixed_header_len,
+                "{available} bytes were reported truncated",
+            );
+            assert_eq!(got, available, "the reported shortfall is not the real one");
+        }
+        other => panic!("protocol {} was annotated {other:?}", header.protocol),
     }
 }
 
@@ -246,6 +315,7 @@ fn the_table_answers_the_same_however_it_was_written(data: &[u8]) {
 pub fn frame_routing_harness(data: &[u8]) {
     agree_on_the_ipv4_header(data);
     the_transport_header_decides_nothing(data);
+    the_transport_annotation_matches_the_datagram(data);
     the_table_answers_the_same_however_it_was_written(data);
     for ingress in [PORT0, PORT1] {
         let original = data.to_vec();
