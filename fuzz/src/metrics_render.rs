@@ -3,7 +3,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **byzantine neighbour protection domain**, and through the
+//! A **byzantine neighbour protection domain**, and through the
 //! endpoint that serves the bytes, its **management-plane attacker**. Every
 //! `u64` a shard holds was stored by another domain, so the whole snapshot is a
 //! peer's choice; the output length is the endpoint's, and the harness varies it
@@ -17,7 +17,7 @@
 //!   beyond it are.
 //! * **Refusal, never truncation.** A buffer under the declared bound either
 //!   answers a whole exposition or refuses; there is no third answer, and an
-//!   `Ok` is always a complete document (ENG-12).
+//!   `Ok` is always a complete document.
 //! * **The declared bound holds.** Any snapshot at all fits
 //!   [`MAX_EXPOSITION_LEN`], including the all-`u64::MAX` worst case the
 //!   arbitrary values reach and a full inventory of configured interfaces.
@@ -264,7 +264,14 @@ fn check(rendered: &[u8], interfaces: &InterfaceInventory) {
         if is_info {
             assert_eq!(
                 keys,
-                ["domain", "interface", "role", "address", "prefix_length", "mac"],
+                [
+                    "domain",
+                    "interface",
+                    "role",
+                    "address",
+                    "prefix_length",
+                    "mac"
+                ],
                 "the info family's label set is fixed: {line}"
             );
         }

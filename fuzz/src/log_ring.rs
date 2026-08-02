@@ -2,8 +2,8 @@
 //!
 //! # The adversary and the surface
 //!
-//! The ring is laid across two regions with opposite permissions (CONCEPT
-//! §7.1): a writing domain maps the records region read-write and the consume
+//! The ring is laid across two regions with opposite
+//! permissions: a writing domain maps the records region read-write and the consume
 //! region read-only, and the console domain maps them the other way round. So
 //! there are two adversaries here, not one, and the code under test is *both*
 //! halves — `LogWriter`, which a writing domain drives against a console that
@@ -61,7 +61,7 @@
 //!   never more than [`LOG_RING_SLOTS`] — asserted after the peer has set the
 //!   records cursor to an arbitrary value, and with `usize::MAX` as the limit,
 //!   which is the case where the only thing left standing between the console
-//!   and a non-terminating drain is the crate's own clamp (ENG-4).
+//!   and a non-terminating drain is the crate's own clamp.
 //! * **The two estimates never contradict.** `len()` never exceeds
 //!   `capacity()` and `is_empty()` agrees with it, on both handles after every
 //!   operation — the property a caller sizing a batch from a peer-influenced
@@ -115,7 +115,7 @@ enum Wrote {
 ///
 /// Returned so the tests below can *demonstrate* that a shape is generable — a
 /// claim that an adversary capability is reachable is worth nothing without an
-/// input that reaches it (TEST-8). Every invariant resting on these counters is
+/// input that reaches it. Every invariant resting on these counters is
 /// asserted inside [`observe`] as it runs, not here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Observed {
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     /// A cursor the peer keeps advancing does not extend a drain: the clamp is
-    /// the crate's own capacity and never the published cursor (ENG-4).
+    /// the crate's own capacity and never the published cursor.
     #[test]
     fn a_cursor_that_keeps_moving_does_not_extend_a_drain() {
         let observed = observe(&cursor_advances_mid_drain());

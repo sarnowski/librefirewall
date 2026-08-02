@@ -59,19 +59,19 @@ criterion = "0.7.0"
 # lints that already pass everywhere belong here; the gate denies all warnings.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# `missing_docs` is deliberately absent (AGENTS.md DOC-4). Forcing a comment
-# onto every public item manufactures contentless prose — a lint that makes
-# documentation *exist* without making it *true* buys nothing, and every
-# sentence it compels is an untested assertion that nothing fails when it goes
-# stale. What replaces it is the DOC-11 ratchet in `tools/xtask/src/budgets.rs`,
-# which lets a file's comment ratio fall and never rise, and the two `unsafe`
-# obligations that have no other carrier and so stay denied above and below:
+# `missing_docs` is deliberately absent. Forcing a comment onto every public
+# item manufactures contentless prose — a lint that makes documentation *exist*
+# without making it *true* buys nothing, and every sentence it compels is an
+# untested assertion that nothing fails when it goes stale. What replaces it is
+# the comment-budget ratchet in `tools/xtask/src/budgets.rs`, which lets a
+# file's comment ratio fall and never rise, and the two `unsafe` obligations
+# that have no other carrier and so stay denied above and below:
 # `unsafe_op_in_unsafe_fn` and `undocumented_unsafe_blocks`.
 
 [workspace.lints.clippy]
 # Every `unsafe` block carries a truthful `// SAFETY:` comment stating the
-# invariant that makes it sound (AGENTS.md rule). Denied here so a bare block
-# fails the build instead of relying on review to catch it.
+# invariant that makes it sound. Denied here so a bare block fails the build
+# instead of relying on review to catch it.
 undocumented_unsafe_blocks = "deny"
 
 # The one profile the protection domains are ever compiled with: `xtask image`
@@ -81,8 +81,8 @@ undocumented_unsafe_blocks = "deny"
 # consequence worth stating where it would otherwise be rediscovered the hard
 # way: `debug-assertions` is off here, so a `debug_assert!` anywhere in the
 # workspace is absent from every image that ever boots, including the one the
-# QEMU system tests exercise. No check may therefore be conditional on it
-# (AGENTS.md ENG-10); the shipped profile is the tested profile (BLD-3).
+# QEMU system tests exercise. No check on an externally driven value may
+# therefore be conditional on it; the shipped profile is the tested profile.
 #
 # `panic = "abort"` is load-bearing rather than a size tweak: the PDs are
 # `no_std` binaries and there is no unwinder under seL4.
@@ -94,8 +94,8 @@ panic = "abort"
 # tests assert "arbitrary input never panics" while running with overflow
 # checking; leaving it off here shipped a binary that wraps silently instead,
 # and a wrap on a dataplane index is precisely the reachable-from-input
-# arithmetic ENG-5 forbids. The arithmetic on those paths is bounded by
+# arithmetic this project forbids. The arithmetic on those paths is bounded by
 # construction, so this is expected to change no behaviour — and where that
 # expectation is ever wrong, a `panic = "abort"` PD faulting loudly is the
-# outcome ENG-12 asks for over a silently wrapped index.
+# right outcome: a visible fault over a silently wrapped index.
 overflow-checks = true

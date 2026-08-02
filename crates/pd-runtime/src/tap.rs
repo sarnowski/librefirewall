@@ -3,7 +3,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **byzantine neighbour protection domain**, on the far side of
+//! A **byzantine neighbour protection domain**, on the far side of
 //! the ring, and **untrusted network traffic** in the payload this side copies
 //! in. Neither can reach anything here: the ring refuses rather than waits, the
 //! payload is bytes and never a value that steers an access, and the recorder's
@@ -52,7 +52,7 @@ pub const fn tap_drop_reason(reason: DropReason) -> TapDropReason {
     }
 }
 
-/// Saturating, monotone counts for MONITORING.md.
+/// Saturating, monotone counts for the operator-facing metrics contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TapCounters {
     /// Observations published to the recorder.
@@ -107,7 +107,7 @@ impl<'ring> Tap<'ring> {
 
     /// Publish one observation, and never fail: a refusal is counted and the
     /// caller carries on. That is the whole of the no-backpressure rule as a
-    /// signature (DOC-9) — there is no error for a forwarding path to handle,
+    /// signature — there is no error for a forwarding path to handle,
     /// so none can be handled wrongly.
     pub fn observe(&mut self, observation: Observation<'_>) {
         let Observation {
@@ -118,14 +118,14 @@ impl<'ring> Tap<'ring> {
             generation,
             frame,
         } = observation;
-        // Saturating: a `u64` of packets at CONCEPT §4's line rate outlives the
+        // Saturating: a `u64` of packets at the 10 Gbit/s target line rate outlives the
         // appliance by geological margins, and a wrap would make two frames
         // share an identity a reader relates them by.
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
         // Clamped rather than refused: the length is this domain's own
         // snapshot, bounded by `BUFFER_SIZE`, so the clamp is unreachable and
-        // is written as a value so no path here can panic (ENG-5).
+        // is written as a value so no path here can panic.
         let original_len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
         let annotation = TapAnnotation::new(
             packet_id,

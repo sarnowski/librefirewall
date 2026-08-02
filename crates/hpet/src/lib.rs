@@ -7,20 +7,20 @@
 //! as its reference arguments. What earns it that role over every other timer
 //! on the part is that its rate is *self-describing*: the capabilities register
 //! states its own tick period in femtoseconds, so no frequency is configured
-//! here and none is assumed. CONCEPT §13.1 leaves the trusted-time mechanism
+//! here and none is assumed. The design leaves the trusted-time mechanism
 //! open; this crate is the measurement half of what would settle it, and it
 //! exposes no signal of its own.
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**. Every number this crate
+//! A **hostile or malfunctioning device**. Every number this crate
 //! sees is one the block chose: its revision, the period it claims, the width
 //! it claims for its counter, whether the configuration register keeps the bit
 //! that starts the counter, and every counter reading. A block that answers
 //! nothing — an unclaimed window reads all-ones — is indistinguishable from one
 //! that answers wrongly, and both are met the same way: nothing is believed
 //! without being ranged, every wait is bounded by a named constant of this
-//! crate's own rather than by anything the device reports (ENG-4), and every
+//! crate's own rather than by anything the device reports, and every
 //! refusal is its own [`HpetError`]. A timer that never ticks must cost a
 //! calibration, not the domain that attempted it.
 //!
@@ -38,7 +38,7 @@
 //! # Why there is nothing to configure
 //!
 //! [`MMIO_BASE`] and [`MMIO_LENGTH`] are constants rather than parameters
-//! because they are hardware topology, and CONCEPT §12.3 fixes hardware in the
+//! because they are hardware topology, and hardware is fixed in the
 //! system description at build time: the region this crate may touch is granted
 //! by a `<memory_region>` element, so a runtime base would be a value the
 //! capability could not follow. The build-time constant and the grant are one
@@ -57,7 +57,7 @@
 //!   the brand string. Neither is universally populated, a hypervisor is free to
 //!   report a nominal value it does not deliver, and a wrong frequency is not a
 //!   refusal but a clock that drifts — the failure mode that reaches TLS
-//!   validation (CONCEPT §7.2) as an expiry judged against the wrong instant. A
+//!   validation as an expiry judged against the wrong instant. A
 //!   measured interval against a self-describing reference is checkable;
 //!   an assumed constant is not.
 //! * **The 8254 PIT.** It is reachable at legacy I/O ports, which would mean a
@@ -72,7 +72,7 @@
 //! * **Programming any comparator at all.** Only the main counter is read, so
 //!   the timer block's comparators, their routing, and `NUM_TIM_CAP` are never
 //!   touched and nothing here reports them: an accessor for a field no caller
-//!   acts on would be surface without a purpose (ENG-7).
+//!   acts on would be surface without a purpose.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -140,7 +140,7 @@ const _: () = assert!(MIN_FREQUENCY_HZ < MAX_FREQUENCY_HZ);
 /// read — which makes this bound a span as well as a count, and
 /// [`WORST_CASE_SERVICEABLE_WAIT`] states that span. It is a constant of this
 /// crate rather than anything derived from the device, which is what makes the
-/// loop bounded by a value the adversary does not choose (ENG-4).
+/// loop bounded by a value the adversary does not choose.
 pub const COUNTER_POLL_LIMIT: u32 = 1_000_000;
 
 /// The most main-counter reads one [`Hpet::wait_ticks`] can make, whatever the
@@ -265,9 +265,9 @@ pub trait HpetMmio {
 /// completed.
 ///
 /// Every variant carries what the device answered, because an operator with no
-/// shell (CONCEPT §11) separates an absent block — every read answering
+/// shell separates an absent block — every read answering
 /// all-ones — from one that claims an impossible period, and a dead counter
-/// from a slow one, only if the cases produce different console lines (ENG-12).
+/// from a slow one, only if the cases produce different console lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HpetError {
     /// `REV_ID` is zero, which the specification forbids a present block from
@@ -305,8 +305,7 @@ pub enum HpetError {
     /// The span names more ticks of this counter than `u64` can count.
     /// Reachable only for spans of hours against the fastest period the band
     /// admits, and refused rather than truncated because a silently shortened
-    /// calibration window is one whose result is wrong without saying so
-    /// (ENG-12).
+    /// calibration window is one whose result is wrong without saying so.
     DurationTooLong { nanoseconds: u64 },
 }
 
@@ -315,7 +314,7 @@ pub enum HpetError {
 ///
 /// The two travel together in one value produced by one constructor, so they
 /// cannot disagree and no caller can compose a frequency from a period the band
-/// refused (DOC-9). It is also what makes [`Hpet::frequency_hz`] a
+/// refused. It is also what makes [`Hpet::frequency_hz`] a
 /// [`NonZeroU64`] with no failure path: the type is the one
 /// `lfw_clock::calibrate` takes for its reference rate, so a caller reaches
 /// that function with nothing left to check.
@@ -351,7 +350,7 @@ impl ClockPeriod {
 ///
 /// Only [`probe`](Self::probe) produces one, so reading a counter that was
 /// never started, or scaling a span by a period the band refused, cannot be
-/// written rather than being a rule to remember (DOC-9).
+/// written rather than being a rule to remember.
 pub struct Hpet<M: HpetMmio> {
     mmio: M,
     period: ClockPeriod,
@@ -435,7 +434,7 @@ impl<M: HpetMmio> Hpet<M> {
     /// *backwards* — a different reading of a 32-bit part, a restored virtual
     /// machine — produces a wrapping difference near `u64::MAX`, which satisfies
     /// any `ticks` at once, and no timer on the part could tell the two apart.
-    /// **The implausibility is judged downstream (DOC-7):** the pair reaches
+    /// **The implausibility is judged downstream:** the pair reaches
     /// `lfw_clock::calibrate` as its `reference_elapsed`, where a difference
     /// that large derives a frequency below `lfw_clock::MIN_PLAUSIBLE_TSC_HZ`
     /// and is refused as `CalibrationError::ImplausiblySlow`; the refusal is
@@ -741,7 +740,7 @@ mod tests {
 
     #[test]
     fn each_way_a_block_can_be_unusable_reaches_an_operator_as_its_own_error() {
-        // ENG-12: six ways for a block or its counter to be unusable must not
+        // Six ways for a block or its counter to be unusable must not
         // collapse into one console line. Each is driven to its own variant,
         // and no two are equal.
         let refusals = [
@@ -909,7 +908,7 @@ mod tests {
 
     #[test]
     fn a_counter_that_moved_backwards_is_refused_by_the_calibration_it_feeds() {
-        // The delegation `wait_ticks` names (DOC-7). A backwards reading is a
+        // The delegation `wait_ticks` names. A backwards reading is a
         // wrapping difference near `u64::MAX`, which satisfies any wait at
         // once — and no timer on the part could contradict it. The refusal is
         // `lfw_clock::calibrate`'s: a reference interval that large derives a

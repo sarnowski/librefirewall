@@ -13,7 +13,7 @@
      A guest NIC therefore cannot be given a MAC no interface here claims, and
      the contract cannot expect a station this file has not attached to a port.
 
-     Hardware topology is not configurable here (CONCEPT.md §12.3): which ports
+     Hardware topology is not configurable here: which ports
      exist, and the protection domains and memory regions behind them, are fixed
      in librefirewall.system at build time. What a port *is* — its addressing
      and whether it is used at all — is this file. -->

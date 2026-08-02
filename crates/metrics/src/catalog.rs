@@ -3,9 +3,9 @@
 //!
 //! # The transliteration rule
 //!
-//! MONITORING.md fixes one naming scheme across every surface and says the
-//! Prometheus surface carries the console's own keys and tokens "transliterated
-//! to each transport's own separator convention". This is that transliteration,
+//! One naming scheme is fixed across every surface: the Prometheus surface
+//! carries the console's own keys and tokens transliterated
+//! to each transport's own separator convention. This is that transliteration,
 //! and it is one rule with no exceptions:
 //!
 //! > A metric name, a label name and a label value is the console key or
@@ -24,7 +24,7 @@
 //!
 //! # Attribution is structural
 //!
-//! MONITORING.md's binding attribution rule keeps three classes apart, and they
+//! The binding attribution rule keeps three classes apart, and they
 //! are three different metric families here rather than three values of one
 //! label: what a **device** got wrong about its own protocol
 //! ([`DEVICE_FAULTS`]), what a **device or peer sent** that a layer refused
@@ -41,7 +41,7 @@ use crate::sample::{
 
 /// Whether a series is a monotonic total or a value that may move in either
 /// direction. Prometheus needs it on the `# TYPE` line; this crate needs it
-/// because a gauge is the one shape MONITORING.md's counter semantics — never
+/// because a gauge is the one shape the exposed counter semantics — never
 /// reset, saturating — deliberately do not apply to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -169,7 +169,7 @@ pub const CONFIGURATION_IMAGES: Metric = metric(
 );
 
 /// The one family whose samples come from the committed configuration rather than
-/// from a shard. A gauge because none of MONITORING.md's counter semantics applies
+/// from a shard. A gauge because no exposed counter semantics applies
 /// to a constant: the value is always `1` and a query joins its labels on `domain`.
 pub const INTERFACE_INFO: Metric = metric(
     "librefirewall_interface_info",

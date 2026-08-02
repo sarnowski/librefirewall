@@ -7,7 +7,7 @@
 //!
 //! # Adversary
 //!
-//! Both of the ones this domain can meet (CONCEPT §7.1). The **byzantine peer
+//! Both of the adversaries this domain can meet. The **byzantine peer
 //! protection domain** owns the five records regions mapped here read-only:
 //! every slot, the producer cursor and the drop count are peer-chosen, and
 //! nothing this domain does can correct one. The **hostile or malfunctioning
@@ -40,7 +40,7 @@
 //! # One mechanism, and the window where there is none
 //!
 //! This domain's own `LFW-PD domain=console state=…` records go through
-//! [`ConsolePrinter::print`], the call a peer's decoded record takes (ENG-7);
+//! [`ConsolePrinter::print`], the call a peer's decoded record takes;
 //! there is no second path for its own output.
 //!
 //! Its first write is nevertheless the only event in this system with no
@@ -60,8 +60,8 @@
 //!
 //! A refused **controller** is the second, and the accepted residue is that
 //! `uart_16550` distinguishes six ways for that to happen and this domain can
-//! carry none of them out. There is no second channel — no `GET /logs` ring yet
-//! (MONITORING.md), no metrics endpoint — and the peers' log regions are
+//! carry none of them out. There is no second channel — no `GET /logs` ring
+//! yet, no metrics endpoint — and the peers' log regions are
 //! read-only here, so the refusal cannot be written into one even in principle.
 //! The consequence is a node that prints nothing, which is the diagnosis at one
 //! bit rather than six. What closes it is a reporting channel independent of
@@ -69,7 +69,7 @@
 //!
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
-//! drives them (LAY-2); the register protocol and every bounded wait are in
+//! drives them; the register protocol and every bounded wait are in
 //! `uart_16550`. This file maps fourteen regions, claims one port window, and
 //! calls one function in a loop.
 //!
@@ -79,7 +79,7 @@
 //! capability, at a CNode slot Microkit assigns to the domain — so the code
 //! that performs it is authority-bound to the protection domain and cannot be
 //! written, or host-tested, in a portable crate. It lives in [`com1`], which is
-//! the adapter LAY-2 asks a PD to be: no decision, no bound, no protocol. What
+//! the thin adapter a PD should be: no decision, no bound, no protocol. What
 //! `uart_16550` keeps is everything a host test can judge, including the
 //! address arithmetic that keeps every invocation inside the granted window.
 //!
@@ -106,7 +106,7 @@ use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
 /// The log rings this domain drains, and so the length of the round-robin: one
 /// per writing domain, matching the eight pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
-/// fixed by the system description (CONCEPT §12.3), so this is a build fact.
+/// fixed by the system description, so this is a build fact.
 const RINGS: usize = 8;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
@@ -209,7 +209,7 @@ fn init() -> Console {
     // that is up, and thereafter only when something moved. Compared rather than
     // stored unconditionally for `pds/nic-driver`'s reason: this is a busy loop,
     // and an unconditional publish would dirty the shard's cache line millions
-    // of times a second for nothing (OBS-3).
+    // of times a second for nothing.
     let mut published = sample(&printer);
     stats.publish(&published.values());
     loop {
@@ -227,7 +227,7 @@ fn init() -> Console {
 /// lays them out.
 ///
 /// Assembled in `lfw_log`, where a test holds the metric surface's vocabulary to
-/// the fields it names (LAY-2); this file supplies the one thing only it has,
+/// the fields it names; this file supplies the one thing only it has,
 /// which is both halves at once.
 fn sample(printer: &ConsolePrinter<SerialLine<'_>>) -> ConsoleSample {
     printer

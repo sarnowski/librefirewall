@@ -12,7 +12,7 @@
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**. Every byte this crate
+//! A **hostile or malfunctioning device**. Every byte this crate
 //! reads is the device's: the configuration-space ids, the capability chain,
 //! the feature bitmap, the `device_status` readback, the queue count, the
 //! `capacity` in its device-configuration structure, the used-ring completions,
@@ -54,12 +54,12 @@ pub const BLK_QUEUE: u16 = 0;
 
 /// Descriptors in that virtqueue: a driver constant rather than the
 /// device-reported maximum, so a loop bounded by it is bounded by a value the
-/// adversary does not choose (ENG-4). QEMU's virtio-blk reports 256 and this
+/// adversary does not choose. QEMU's virtio-blk reports 256 and this
 /// programs 16, which is what [`virtio::pci::CommonCfg::setup_queue`] checks
 /// against.
 pub const QUEUE_SIZE: usize = 16;
 
-/// A block, in bytes. Fixed by virtio 1.0 §5.2 for every virtio-blk device
+/// A block, in bytes. Fixed by virtio 1.0 section 5.2 for every virtio-blk device
 /// regardless of the `blk_size` it may report, which describes its preferred
 /// I/O granularity and not the unit `sector` counts in.
 pub const SECTOR_SIZE: usize = 512;
@@ -72,7 +72,7 @@ pub type BlkVirtqueue = SplitVirtqueue<QUEUE_SIZE>;
 /// relocated to — so the mapped window and the decoded window describe the same
 /// bytes.
 ///
-/// **Cross-artifact (DOC-7):** it must equal the `size` attribute of `bar3` in
+/// **A cross-artifact contract:** it must equal the `size` attribute of `bar3` in
 /// `systems/qemu-x86_64/librefirewall.system`, whose enforcer is
 /// `xtask::sysdesc` — it reads the description back and holds it to this
 /// constant, as it already does for `nic_driver_core`'s `BAR_WINDOW_SIZE`.
@@ -100,7 +100,7 @@ const STATUS_AREA_OFFSET: usize = 0x280;
 /// The assertions below are what hold that arithmetic rather than this
 /// sentence.
 ///
-/// **Cross-artifact (DOC-7):** as [`BAR_WINDOW_SIZE`], for `blk_dma`.
+/// **A cross-artifact contract:** as [`BAR_WINDOW_SIZE`], for `blk_dma`.
 pub const DMA_REGION_SIZE: usize = 0x1000;
 
 /// Size of the DMA-visible staging region the recorder protection domain reads
@@ -113,7 +113,7 @@ pub const DMA_REGION_SIZE: usize = 0x1000;
 /// moving an offset the request protocol is stated in. 256 KiB, which is
 /// [`io::IO_SECTORS`] sectors.
 ///
-/// **Cross-artifact (DOC-7):** as [`BAR_WINDOW_SIZE`], for `blk_io`.
+/// **A cross-artifact contract:** as [`BAR_WINDOW_SIZE`], for `blk_io`.
 pub const BLK_IO_REGION_SIZE: usize = 0x40000;
 
 // The region layout, decided when the program is compiled rather than argued

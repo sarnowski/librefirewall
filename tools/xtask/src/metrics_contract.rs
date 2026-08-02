@@ -4,7 +4,7 @@
 //! `curl` opens a TCP connection to the management endpoint through QEMU's own
 //! user-mode stack, and what comes back is judged here: the status line, the
 //! headers, and a body this module **parses** as Prometheus exposition rather
-//! than searching for substrings in (TEST-13).
+//! than searching for substrings in.
 //!
 //! # Two scrapes, not one
 //!
@@ -37,8 +37,8 @@
 //!
 //! # Summing is the reader's job, and this is a reader
 //!
-//! The appliance exposes one series per `pipeline` and computes no total, for
-//! the reason MONITORING.md records: a summed total is corrupted by a domain
+//! The appliance exposes one series per `pipeline` and computes no total,
+//! because a summed total is corrupted by a domain
 //! restart. A scraper aggregates instead, and so does this — the sum below is
 //! performed *here*, over the labelled series, which is exactly what a
 //! Prometheus query would do.
@@ -406,7 +406,7 @@ fn judge_one_interface<'a>(
         }
     }
     // Exactly these labels and no others: an extra one would be an unbounded
-    // dimension nothing in MONITORING.md's inventory names (OBS-3).
+    // dimension nothing in the metric inventory names.
     let mut names: Vec<&str> = sample.labels.keys().map(String::as_str).collect();
     names.sort_unstable();
     let mut wanted: Vec<&str> = expected.iter().map(|(label, _)| *label).collect();
@@ -576,8 +576,8 @@ fn judge_one(
     if per_pipeline.len() != 2 {
         return Err(format!(
             "the exposition carries {} forwarded-frame series and the appliance has two \
-             pipelines; a node that summed them itself would carry one, which is what \
-             MONITORING.md's no-total rule forbids",
+             pipelines; a node that summed them itself would carry one, which the no-total rule \
+             forbids: a domain restart would corrupt a summed total",
             per_pipeline.len()
         ));
     }

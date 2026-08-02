@@ -3,7 +3,7 @@
 //!
 //! # Which adversary each harness models
 //!
-//! CONCEPT §7.1 enumerates the adversaries; three of them reach code in this
+//! Of the appliance's adversaries, three reach code in this
 //! workspace, and every module below states which one it drives:
 //!
 //! | module | surface under test | adversary |
@@ -27,14 +27,14 @@
 //! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
 //!
 //! Every crate in the workspace that interprets bytes it did not write appears
-//! in that table, which is the reviewable form of AGENTS.md TEST-7: the
+//! in that table, which is the reviewable form of that obligation: the
 //! dependency list in `fuzz/Cargo.toml` is the workspace's crate list, and each
 //! dependency has a target.
 //!
 //! # What a harness here asserts
 //!
-//! A target whose body is a bare call proves only that one input did not crash
-//! (TEST-9). Each harness below therefore carries a **model** of the surface it
+//! A target whose body is a bare call proves only that one input did not
+//! crash. Each harness below therefore carries a **model** of the surface it
 //! drives and asserts the code against it after every operation. Three kinds of
 //! claim recur, and they are the claims the dataplane's safety rests on:
 //!
@@ -61,7 +61,7 @@
 //!
 //! # Modelling authority, not politeness
 //!
-//! TEST-8 is the rule these harnesses are shaped by: a guard that keeps a
+//! One rule shapes every harness here: a guard that keeps a
 //! harness "sane" deletes precisely the region where the bug lives. The
 //! adversary's *authority* is therefore reproduced in full — duplicate and
 //! out-of-range indices, returns of buffers never lent, completions for
@@ -157,7 +157,7 @@ use arbitrary::{Arbitrary, Unstructured};
 ///
 /// A libFuzzer *time* budget, not a bound on what any operation may express: a
 /// single operation still carries a fully arbitrary index, cursor, or byte, so
-/// no adversarial shape is unreachable (TEST-8). It exists because an input can
+/// no adversarial shape is unreachable. It exists because an input can
 /// otherwise encode an arbitrarily long op stream and spend the whole run in
 /// one execution, which starves coverage rather than finding anything.
 ///

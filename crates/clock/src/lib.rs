@@ -7,19 +7,19 @@
 //! the TSC is one instruction whose result is a hardware fact, and calibrating
 //! it against a reference timer is a capability a protection domain must be
 //! granted; the conversion arithmetic is neither, and it is the part that can be
-//! driven exhaustively by a host test. MONITORING.md's *Ordering and time*
-//! records the system it lands in as one where no record is timestamped and no
-//! time source is trusted, a record being ordered by `(generation, seq)` within
-//! a boot — this crate is the arithmetic half of the source that would change
-//! that, and it changes no exposed signal on its own.
+//! driven exhaustively by a host test. The system this lands in is one where
+//! no record is timestamped and no time source is trusted, a record being
+//! ordered by `(generation, seq)` within a boot — this crate is the arithmetic
+//! half of the source that would change that, and it changes no exposed signal
+//! on its own.
 //!
 //! # The adversary
 //!
-//! None of CONCEPT §7.1's five reaches this crate directly: there is no device
+//! No adversary reaches this crate directly: there is no device
 //! register, no shared region and no network byte in it, and every argument is
 //! an integer a first-party caller computed. Being out of an adversary's reach
-//! is not a licence — CON-3 grants trusted status to seL4, Microkit and
-//! `rust-sel4` and to nothing first-party — so the obligation carried here is
+//! is not a licence — only seL4, Microkit and `rust-sel4` are trusted, and
+//! nothing first-party inherits that status — so the obligation carried here is
 //! the one an input path would carry: every function is total over the whole of
 //! its argument domain, every product that could leave `u64` is widened rather
 //! than wrapped, and a value that cannot be interpreted comes back as a typed
@@ -27,7 +27,7 @@
 //!
 //! That is not defensive habit. The numbers a caller will supply are
 //! first-party only in the last step: a calibration interval is measured
-//! against a hardware timer, so §7.1's **hostile or malfunctioning device**
+//! against a hardware timer, so a **hostile or malfunctioning device**
 //! stands one indirection behind [`calibrate`]'s arguments, and a crate that
 //! assumed its caller had already judged them would put that judgement nowhere.
 //! [`calibrate`] therefore decides plausibility itself, against
@@ -71,8 +71,8 @@
 //!
 //! # Rejected: a calendar dependency
 //!
-//! `chrono` and `time` would satisfy DEP-4 — both are pure Rust — and neither
-//! is in the pinned input set (DEP-1), both carry a `std`-leaning surface far
+//! `chrono` and `time` are pure Rust, as first-party userspace must stay, but
+//! neither is a pinned input, both carry a `std`-leaning surface far
 //! larger than the two dozen lines of integer arithmetic actually wanted, and
 //! neither could be held to the coverage floor as first-party code is. The
 //! algorithm is public and short enough to test exhaustively, which is the
@@ -258,9 +258,9 @@ impl Duration {
 /// Why a measured interval did not yield a usable counter frequency.
 ///
 /// One variant per cause, and each carries what was derived, because an
-/// operator with no shell (CONCEPT §11) separates a reference timer that
+/// operator with no shell separates a reference timer that
 /// reported nothing from one that reported an interval it did not measure only
-/// if the two produce different lines (ENG-12).
+/// if the two produce different lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibrationError {
     /// The counter did not advance across the interval. Nothing can be derived
@@ -495,7 +495,7 @@ impl CivilTime {
     /// The exact inverse of [`from_utc`](Self::from_utc) at second resolution.
     /// The `nanosecond` field is validated and then does not contribute, which
     /// is deliberate: silently accepting an out-of-range remainder while
-    /// dropping it would tell a caller its value was understood (ENG-12).
+    /// dropping it would tell a caller its value was understood when it was not.
     ///
     /// Fields are checked most-significant first, so the error names the first
     /// thing actually wrong rather than whichever check ran last.
@@ -584,7 +584,7 @@ const fn civil_from_days(days: u64) -> (u64, u64, u64) {
 /// The day count since the Unix epoch of a civil date — the exact inverse of
 /// [`civil_from_days`].
 ///
-/// **Precondition, delegated (DOC-7):** `year >= UNIX_EPOCH_YEAR` and `month`
+/// **Precondition, delegated to the caller:** `year >= UNIX_EPOCH_YEAR` and `month`
 /// in `1..=12`, without which the two subtractions below underflow. Enforced by
 /// [`CivilTime::to_unix_seconds`], which is the only caller and refuses both
 /// before reaching here; proven by the property
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn each_way_a_calibration_can_fail_reaches_an_operator_as_its_own_error() {
-        // ENG-12: four causes must not collapse into one line.
+        // Four distinct causes must not collapse into one line.
         let hz = NonZeroU64::new(1).expect("a literal above zero");
         let refusals = [
             calibrate(0, 1, hz),

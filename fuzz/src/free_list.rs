@@ -2,8 +2,8 @@
 //!
 //! # The adversary and the surface
 //!
-//! `FreeList::reclaim` is the crate's own stated trust boundary (CONCEPT §7.1,
-//! byzantine neighbour PD): an index handed to a peer leaves as a plain number
+//! `FreeList::reclaim` is the crate's own stated trust boundary against a
+//! byzantine neighbour PD: an index handed to a peer leaves as a plain number
 //! on a shared ring and comes back as one *of the peer's choosing*. The peer
 //! may return an index it was never given, return the same index twice, return
 //! one the domain still holds, or invent one outside the pool entirely. Each

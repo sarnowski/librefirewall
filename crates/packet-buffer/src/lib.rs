@@ -1,8 +1,8 @@
 //! The shared packet buffers and the owning domain's ownership ledger.
 //!
 //! [`BufferPool`] is the fixed-size backing store descriptors index, in memory
-//! shared with a byzantine peer protection domain and written by a NIC's DMA
-//! engine (CONCEPT §7.1). [`FreeList`] is its complement: domain-private
+//! shared with a byzantine neighbour protection domain and written by a NIC's
+//! DMA engine — a hostile device. [`FreeList`] is its complement: domain-private
 //! memory, never shared, recording which buffers this domain may hand out.
 //!
 //! # Ownership is an identity, not a count
@@ -127,7 +127,7 @@ impl<const N: usize> BufferPool<N> {
     /// when `offset + len` lies within that buffer, `None` otherwise. Being the
     /// single enforcer is what lets a reader check the bound once instead of
     /// per accessor, and it runs in every build profile — a check absent from
-    /// the shipped image is not a check (ENG-10).
+    /// the shipped image is not a check.
     fn span(&self, index: usize, offset: usize, len: usize) -> Option<*mut u8> {
         let cell = self.buffers.get(index)?;
         span_fits(offset, len).then(|| cell.get().cast::<u8>())
@@ -571,7 +571,7 @@ mod tests {
         unsafe { pool.write(0, &[0x5Au8; BUFFER_SIZE]) }.expect("a whole buffer fits");
         // Past the end, an offset whose `offset + len` sum wraps, and an index
         // outside the pool: each a shape a peer descriptor can carry, each a
-        // typed rejection rather than the fault this used to be (ENG-5).
+        // typed rejection rather than the fault this used to be.
         for (index, offset, len) in [
             (0, BUFFER_SIZE - 1, 2),
             (0, usize::MAX, 2),
@@ -857,7 +857,7 @@ mod tests {
     /// cases are actually reached, with arbitrary ones mixed in so the forged
     /// and overflowing shapes are too. Modelling the *authority* a peer has —
     /// any `usize`, any `u32` — rather than the values a correct peer would
-    /// send is what keeps the adversarial region in the strategy (TEST-8).
+    /// send is what keeps the adversarial region in the strategy.
     fn any_span() -> impl Strategy<Value = (usize, usize, u32, usize)> {
         let index = prop_oneof![3 => 0usize..8, 1 => any::<usize>()];
         let offset = prop_oneof![3 => 0usize..=BUFFER_SIZE, 1 => any::<usize>()];

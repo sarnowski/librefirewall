@@ -162,7 +162,7 @@ fn a_fresh_printer_has_printed_nothing_and_starts_at_the_first_ring() {
 #[test]
 fn an_event_the_domain_mints_itself_reaches_the_device_as_its_console_line() {
     // The console's own lifecycle record, through the same call a peer's
-    // decoded record takes (ENG-7).
+    // decoded record takes: there is one printing mechanism, not two.
     let mut printer = ConsolePrinter::new(FakeSink::new());
     let event = domain_event(Domain::Console, DomainState::Ready);
     assert!(printer.print(Stamp::Unsynchronized, &event));
@@ -434,7 +434,7 @@ fn the_counters_saturate_rather_than_wrapping_at_the_top() {
 fn a_refusal_cause_survives_the_crossing_into_the_line_it_is_read_as() {
     // The one event whose text a peer chooses. It crosses as bounded bytes and
     // must reach the console as the same token, since a bring-up failure's
-    // cause is the whole of what an operator gets (CONCEPT §11).
+    // cause is the whole of what an operator gets, there being no shell.
     let ring = ring();
     let refusal = Event::Domain {
         domain: Domain::NicDriver,
@@ -491,7 +491,7 @@ proptest! {
     /// bytes at all, in any slot — a pass returns, and it consumes at most
     /// `rings * BURST_PER_RING` records. A peer that could make it spin would
     /// hang this test rather than fail it, which is the failure mode being
-    /// excluded (ENG-4).
+    /// excluded.
     #[test]
     fn a_pass_is_bounded_by_this_domains_own_constants_whatever_a_peer_wrote(
         words in prop::collection::vec(any::<u64>(), 1..64),
@@ -536,7 +536,7 @@ proptest! {
 
     /// Nothing a peer writes goes unaccounted: every record a pass consumed is
     /// in exactly one counter. A record that vanished without a number behind
-    /// it is the silent loss ENG-12 forbids.
+    /// it is a silent loss, which no path here may make.
     #[test]
     fn every_record_a_pass_consumes_lands_in_exactly_one_counter(
         kinds in prop::collection::vec(any::<u8>(), 0..BURST_PER_RING),
@@ -582,7 +582,7 @@ proptest! {
 /// Every counter this path keeps reaches a slot of the shard the console domain
 /// publishes, and none reaches two. `lfw_metrics` names the vocabulary and
 /// depends on neither this crate nor `uart_16550`, so this is the enforcer that
-/// separation obliges (DOC-7).
+/// separation obliges.
 #[test]
 fn every_console_counter_reaches_its_own_slot() {
     let counters = ConsoleCounters {

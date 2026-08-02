@@ -7,7 +7,7 @@
 //! Every byte read here — the configuration-space ids, the capability chain,
 //! the BAR type bits, the feature bitmap, the `device_status` readback, the
 //! queue count, the `capacity` in the device-configuration structure, the
-//! `queue_notify_off` — is written by CONCEPT §7.1's **hostile or
+//! `queue_notify_off` — is written by a **hostile or
 //! malfunctioning device**. A merely broken device produces the same bytes as a
 //! malicious one, so both are answered the same way: a typed [`BringUpError`]
 //! naming the cause. A driver protection domain that cannot bring its device up
@@ -15,7 +15,7 @@
 //!
 //! # Why the sequence is a typestate
 //!
-//! virtio 1.0 §3.1.1 fixes the initialization order, and getting it wrong is
+//! virtio 1.0 section 3.1.1 fixes the initialization order, and getting it wrong is
 //! silent: a device whose features are written before `DRIVER` is set, or which
 //! is told `DRIVER_OK` before its virtqueue carries addresses, misbehaves as a
 //! dead disk rather than as an error. The order is therefore carried by types
@@ -64,7 +64,7 @@ pub const ACCEPTED_FEATURES: u64 = features::VIRTIO_F_VERSION_1;
 
 /// Byte offset of `capacity` within the virtio-blk device-configuration
 /// structure, and the extent and alignment reading it needs. Fixed by virtio
-/// 1.0 §5.2.4; the value is in 512-byte sectors whatever `blk_size` says.
+/// 1.0 section 5.2.4; the value is in 512-byte sectors whatever `blk_size` says.
 const CAPACITY_OFFSET: usize = 0;
 const CAPACITY_LEN: usize = size_of::<u64>();
 const CAPACITY_ALIGN: usize = align_of::<u64>();
@@ -72,9 +72,9 @@ const CAPACITY_ALIGN: usize = align_of::<u64>();
 /// Why bring-up refused to continue.
 ///
 /// Each variant carries the value that caused the rejection: an operator with
-/// no shell (CONCEPT §11) can only tell a device that exposes no capability
+/// no shell can only tell a device that exposes no capability
 /// list from one whose chain loops if the two produce different console lines,
-/// and a single "bring-up failed" is the collapse ENG-12 names.
+/// and a single "bring-up failed" would collapse the causes into one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BringUpError {
     NotVirtioBlk {
@@ -131,7 +131,7 @@ pub enum BringUpError {
     DeviceReadOnly {
         offered: u64,
     },
-    /// The device cleared `FEATURES_OK` on readback; virtio 1.0 §3.1.1 requires
+    /// The device cleared `FEATURES_OK` on readback; virtio 1.0 section 3.1.1 requires
     /// initialization to stop here.
     FeaturesRejected {
         status: u8,
@@ -161,7 +161,7 @@ pub enum BringUpError {
 impl BringUpError {
     /// Whether `STATUS_FAILED` was written to the device before this error was
     /// returned — which of two states the device was left in, for the console
-    /// line an operator reads (MONITORING.md).
+    /// line an operator reads.
     ///
     /// False for every rejection raised before [`PlacedBar::map`]: the status
     /// register lives in a BAR that has not been placed, so there is nothing to
@@ -442,7 +442,7 @@ impl BlkDevice for MappedBlkDevice {
 /// Identify the device at the pinned function and validate everything about it
 /// that can be checked before its BAR is placed.
 ///
-/// **This function is the enforcer the rest of the chain names (DOC-7).** All
+/// **This function is the enforcer the rest of the chain names.** All
 /// four device-offset checks are made here — extent and alignment for the
 /// common-configuration structure, and again for the device-configuration
 /// structure at the extent `capacity` is read to — and every later state is
@@ -560,7 +560,7 @@ impl PlacedBar {
     /// Nothing is required of the caller about the *device's* offsets:
     /// [`identify`] is their enforcer, proved by
     /// `a_structure_outside_the_mapped_window_is_refused_before_any_dereference`
-    /// and its three siblings (DOC-7).
+    /// and its three siblings.
     #[must_use]
     pub unsafe fn map(self, bar_base: *mut u8) -> Offered<MappedBlkDevice> {
         // SAFETY: `CommonCfg::new` requires `COMMON_CFG_MIN_LEN` readable and
@@ -601,7 +601,7 @@ impl<D: BlkDevice> Offered<D> {
     /// Reset the device, then tell it the driver has noticed it and knows how
     /// to drive it (`ACKNOWLEDGE`, then `ACKNOWLEDGE | DRIVER`).
     ///
-    /// Both writes are cumulative ORs, as virtio 1.0 §3.1.1 requires: the
+    /// Both writes are cumulative ORs, as virtio 1.0 section 3.1.1 requires: the
     /// device latches the status byte as written, so setting `DRIVER` alone
     /// would retract `ACKNOWLEDGE`.
     ///
@@ -716,8 +716,8 @@ impl<D: BlkDevice> Negotiated<D> {
     /// it is handed to a device that will DMA to it, so a zero, misaligned or
     /// wrapping value must fail visibly rather than point the hardware at
     /// whatever lies there. **This check is the enforcer
-    /// [`crate::request::Requests::attach`] names for the same address
-    /// (DOC-7)**, proved by `an_unusable_dma_region_address_is_refused`.
+    /// [`crate::request::Requests::attach`] names for the same address**,
+    /// proved by `an_unusable_dma_region_address_is_refused`.
     ///
     /// The doorbell is placed here rather than returned as an offset, so a
     /// `queue_notify_off` never leaves as a bare number: it is either bounded
@@ -865,7 +865,7 @@ mod tests {
     /// It models the *authority a device has* — any feature bitmap, any queue
     /// count, any capacity, any `queue_notify_off`, a reset it may simply not
     /// acknowledge — and constrains none of it to what a conforming device
-    /// would do (TEST-8). [`FakeBlkDevice::conforming`] is the well-behaved
+    /// would do. [`FakeBlkDevice::conforming`] is the well-behaved
     /// baseline; every builder method takes one capability away from it.
     struct FakeBlkDevice {
         log: Log,
@@ -1020,9 +1020,8 @@ mod tests {
     /// through the raw pointer, and such a write invalidates any reference
     /// derived from the same allocation, so a fixture that read a register back
     /// through one would itself be undefined behaviour while claiming to prove
-    /// the driver's conduct against a hostile device (TEST-6). Exposing no
-    /// reference makes that unrepresentable rather than a rule to remember
-    /// (DOC-9).
+    /// the driver's conduct against a hostile device. Exposing no
+    /// reference makes that unrepresentable rather than a rule to remember.
     struct MappedRegion<const N: usize> {
         page: *mut Page<N>,
     }
@@ -1524,7 +1523,7 @@ mod tests {
 
     #[test]
     fn an_unusable_dma_region_address_is_refused() {
-        // The enforcer `Requests::attach` names for the same address (DOC-7):
+        // The enforcer `Requests::attach` names for the same address:
         // zero, not page-aligned, and a base whose region would wrap.
         for paddr in [0u64, 0x3000_0800, u64::MAX, u64::MAX - 0x800] {
             let log = Log::new();

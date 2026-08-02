@@ -174,7 +174,7 @@ impl DocumentFault {
 ///
 /// The offset is the whole of what is reported about the position, and there is
 /// no field for the bytes: an operator gets somewhere to look and a console
-/// gets nothing an attacker chose (OBS-5).
+/// gets nothing an attacker chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocumentError {
     pub fault: DocumentFault,
@@ -218,7 +218,7 @@ impl AttributeValue {
     /// The fallback is unreachable — `len` only ever advances through `push`,
     /// which refuses to move it past the array — and an empty slice rather than
     /// a panic because a branch safe Rust cannot delete is not a failure to
-    /// surface (ENG-12).
+    /// surface.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.get(..self.len).unwrap_or_default()

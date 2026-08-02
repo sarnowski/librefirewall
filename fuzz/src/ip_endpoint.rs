@@ -4,7 +4,7 @@
 //! # The adversary and the surface
 //!
 //! Whatever is attached to the management port chooses every byte of a frame
-//! (CONCEPT §7.1: untrusted network traffic **and** the management-plane
+//! (untrusted network traffic **and** the management-plane
 //! attacker), so the input here *is* the frame: no length prefix, no operation
 //! selector, no structure this harness imposes. A corpus entry is a packet, which
 //! is what makes a capture off a real wire a usable seed.

@@ -4,8 +4,8 @@
 //!
 //! The device can write **every byte of the virtqueue region** — not only the
 //! used ring it owns by protocol, but the descriptor table and the available
-//! ring as well (CONCEPT §7.1, and the module header of
-//! `crates/virtio/src/queue.rs` states exactly this). The crate's governing rule
+//! ring as well; the module header of
+//! `crates/virtio/src/queue.rs` states exactly this. The crate's governing rule
 //! is correspondingly strong: *no value read back from the region is ever used
 //! to index it*. The descriptor lifecycle, the free list's successor links and
 //! the length each descriptor was posted with all live in driver-private memory
@@ -44,7 +44,7 @@
 //! for. They are now compile errors: a `Completion` **is** the exclusive borrow
 //! of the queue that produced it, and `recycle` takes no queue argument, so
 //! there is no expression that hands one to another queue or uses it twice.
-//! That capability was never the *device's*, which is what TEST-8 governs; it
+//! That capability was never the *device's*, so no adversarial reach is lost; it
 //! was the driver's own bookkeeping, and the queue's API no longer admits it.
 //! Everything the device can express — every byte of the region, any
 //! completion, any used index — is untouched below.

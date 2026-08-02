@@ -5,18 +5,18 @@
 //! and by nothing else, so every fact a crate compiles against it — a region's
 //! extent, its cacheability, the perms it is granted under, *which domains map
 //! it at all*, the direction a notification channel is granted in — was a
-//! precondition delegated to a file no build step ever read (DOC-7). A
+//! precondition delegated to a file no build step ever read. A
 //! disagreement surfaced as a truncated mapping, a device register written
 //! through a cached mapping, a domain reaching bytes it was meant never to
 //! reach, or a missing signal — at boot, on the one path with no shell and no
-//! operator (CONCEPT §11). This module is the enforcer those preconditions
+//! operator to notice. This module is the enforcer those preconditions
 //! name.
 //!
 //! # No adversary, and that is the point
 //!
 //! Nothing here reads hostile input: the file is source-controlled and is
 //! edited by the same people who edit the constants it must agree with, so
-//! CON-2 names no CONCEPT §7.1 adversary for this path. What it defends against
+//! no threat-model adversary is named for this path. What it defends against
 //! is the ordinary edit that moves one side and not the other — which is why
 //! [`REGIONS`], [`IO_PORTS`], [`DOMAINS`], [`CHANNEL_ENDS`] and
 //! [`MODELLED_TAGS`] are *exhaustive* rather than best-effort. A region, an
@@ -59,8 +59,8 @@
 //!   a `cached="true"` — because that is how you explain it. Anything inside
 //!   `<!-- -->` is markup to a substring search and to nothing else.
 //!
-//! Everything the scanner cannot classify stops the gate and names itself
-//! (ENG-12): an unterminated comment, an unterminated attribute value, an
+//! Everything the scanner cannot classify stops the gate and names
+//! itself: an unterminated comment, an unterminated attribute value, an
 //! unterminated element, character data outside markup, an element type this
 //! module does not model. A cross-check that passes on a file it did not
 //! understand is worse than no cross-check, because it reports the agreement it
@@ -159,7 +159,7 @@ struct Grant {
     /// authority: this is where a widened grant — an executable buffer pool, a
     /// writable ECAM page, a forwarder that can rewrite the configuration it is
     /// about to be judged by — becomes a build failure instead of a diff nobody
-    /// read (ENG-1).
+    /// read.
     perms: &'static str,
 }
 
@@ -242,7 +242,7 @@ impl RegionRule {
 /// The forwarder is deliberately **not** among the domains this withholds a
 /// pool from, and has not been since routing landed: `RouteStage` rewrites a
 /// frame's Ethernet and IPv4 headers in the buffer they arrived in, which is a
-/// grant that was decided and approved rather than acquired (ENG-1, SCM-6).
+/// grant that was decided and human-approved rather than acquired.
 /// What the region split still establishes is [`RETURN_WITHHELD`], and that is
 /// the load-bearing one.
 const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It hands that pool's \
@@ -266,11 +266,11 @@ const LOG_WITHHELD: &str = "no writing domain maps another writing domain's ring
      (systems/qemu-x86_64/librefirewall.system, beside the log regions)";
 
 /// What the management port's regions withhold, and it is the isolation
-/// CONCEPT §9.1 requires of a port that carries no forwarded traffic: the
+/// required of a port that carries no forwarded traffic: the
 /// mutual exclusion between that port and the dataplane. Quoted into the
 /// finding on either half being widened, because either half alone would leave
 /// the property untrue.
-const MANAGEMENT_WITHHELD: &str = "the forwarder maps no management region and the management      domain maps no dataplane one. CONCEPT §9.1 isolates the management port from the dataplane      and gives it no forwarded traffic, and that isolation is exactly this mutual exclusion — a      frame cannot cross between the two because no domain is granted a region on both sides of      it. A dataplane grant appearing on the management domain would put the domain that will one      day terminate an operator's session on the path of every frame in flight; a management grant      appearing on the forwarder would let the routing stage reach a port that is meant to be      unreachable from it";
+const MANAGEMENT_WITHHELD: &str = "the forwarder maps no management region and the management      domain maps no dataplane one. The design isolates the management port from the dataplane      and gives it no forwarded traffic, and that isolation is exactly this mutual exclusion — a      frame cannot cross between the two because no domain is granted a region on both sides of      it. A dataplane grant appearing on the management domain would put the domain that will one      day terminate an operator's session on the path of every frame in flight; a management grant      appearing on the forwarder would let the routing stage reach a port that is meant to be      unreachable from it";
 
 /// As [`MANAGEMENT_WITHHELD`], for the management port's transmit pipeline — the
 /// three regions a reply travels out on, and what keeps the dataplane off them.
@@ -279,9 +279,9 @@ const MANAGEMENT_TRANSMIT_WITHHELD: &str = "the forwarder maps no part of the ma
      that map any of it. The two sit at opposite ends of it: the management domain OWNS this pool \
      — it allocates a buffer, writes a reply into it, lends it, and consumes the returns — and the \
      driver maps the pool to write the virtio-net header in front of the frame and produces those \
-     returns. A grant to the forwarder would put a dataplane domain on a port CONCEPT §9.1 makes \
+     returns. A grant to the forwarder would put a dataplane domain on a port the design makes \
      unreachable from it, and a grant to any third domain would be a second writer of a pool that \
-     has one owner (ENG-1)";
+     has one owner";
 
 /// As [`POOL_WITHHELD`], for the management port's receive pool: the one pool in
 /// this description whose mapper holds it READ-ONLY.
@@ -292,7 +292,7 @@ const MANAGEMENT_RECEIVE_POOL_WITHHELD: &str = "the driver that receives into th
      domain maps it READ-ONLY, because a frame this appliance was sent is parsed and never \
      altered: a reply is composed in storage of that domain's own and copied into a buffer of the \
      *transmit* pool. Read-write here would be authority to rewrite a frame under the decision \
-     that inspected it, for a use no code has (ENG-1)";
+     that inspected it, for a use no code has";
 
 /// As [`POOL_WITHHELD`], for the return rings — the exclusion the forwarder's
 /// isolation now rests on entirely.
@@ -319,7 +319,7 @@ const RECORDER_DEVICE_WITHHELD: &str = "the recorder is the only domain that map
      that owns the disk reaches no network device by doing so. The staging window in particular \
      is withheld from the management domain deliberately rather than by omission: a download is \
      answered out of `dl_reply`, a bounded copy the recorder composed, because a read grant here \
-     would expose whatever that domain happened to be staging at the time (ENG-1, SCM-6)";
+     would expose whatever that domain happened to be staging at the time";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -353,8 +353,7 @@ const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `c
      (`pd_runtime::CommittedReader`), so it cannot delay a commit, cannot refuse one on anybody's \
      behalf, and holds no region an acknowledgement could be forged in. A `cfgack` grant here \
      would make 'every consumer has staged' a conjunction over two domains and hand the domain \
-     that answers the management-plane attacker the word that releases a generation (ENG-1, \
-     SCM-6)";
+     that answers the management-plane attacker the word that releases a generation";
 
 /// Every memory region the description may declare, and what each one owes the
 /// code. A region absent from this table fails the gate; so does a rule here
@@ -1059,7 +1058,7 @@ const STATS_WITHHELD: &str = "one writer and one reader per shard, and every oth
      a `/metrics` surface it could edit would let a compromise of it hide the compromise. The \
      console in particular maps no shard but its own, which is the same exclusion the log rings \
      already make one step further: there it cannot forge a record, here it cannot forge a \
-     number (ENG-1, SCM-6)";
+     number";
 
 /// What an I/O-port grant withholds, quoted into the finding that reports one
 /// being widened, moved, or handed to a second domain.
@@ -1068,7 +1067,7 @@ const STATS_WITHHELD: &str = "one writer and one reader per shard, and every oth
 /// space in which every other port is refused, so a rule that withheld nothing
 /// would be a rule granting the whole space. There is no shape of this table
 /// that has nothing to say here, and making it unrepresentable is cheaper than
-/// a test asserting it (DOC-9).
+/// a test asserting it.
 const COM1_WITHHELD: &str = "every other port in the 65536-port space stays refused to this \
      domain: no PCI configuration address/data pair at 0xCF8/0xCFC — a second path to every \
      device's configuration space, beside the ECAM mappings the drivers hold — no PS/2 \
@@ -1102,7 +1101,7 @@ const CMOS_WITHHELD: &str = "every other port in the 65536-port space stays refu
 /// window as the premise its addressing rests on — "every address as
 /// `COM1_BASE | offset` with the base's alignment to an eight-port window
 /// asserted at build time, so no address it can form leaves this row". This is
-/// where that delegated precondition is enforced (DOC-7).
+/// where that delegated precondition is enforced.
 struct ExpectedPort {
     /// Carried beside the value so a disagreement names both sides rather than
     /// printing two numbers.
@@ -1117,7 +1116,7 @@ struct ExpectedPort {
 /// `out` are privileged and seL4 gates them per port, so a window handed to a
 /// domain is that domain's licence to drive whatever decodes it — and a window
 /// that widened, moved, or turned up in a second domain is a capability change
-/// on the same footing as a widened memory grant (ENG-1, SCM-6).
+/// on the same footing as a widened memory grant, human-reviewed the same way.
 struct IoPortRule {
     domain: &'static str,
     /// The `id` attribute — the grant's identifier *within* the domain, and the
@@ -1137,8 +1136,8 @@ struct IoPortRule {
 /// Every I/O-port grant the description may declare. Two rows, on two domains,
 /// each holding one window — and the count is the property rather than an
 /// accident of how little the system does: a third row is a third domain able
-/// to reach a device by port invocation, and adding one is the review ENG-1
-/// requires. What the table states beyond the windows themselves is that they
+/// to reach a device by port invocation, and adding one is a capability change
+/// to review. What the table states beyond the windows themselves is that they
 /// are disjoint and that neither domain holds the other's.
 const IO_PORTS: &[IoPortRule] = &[
     IoPortRule {
@@ -1223,7 +1222,7 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
      notify=\"false\". A driver never leaves `init` and so never reaches the Microkit event loop, \
      so a forwarder able to signal one would hold authority over a domain that cannot answer, and \
      the claim that entrypoint rests on would stop being true. The configuration channel is the \
-     one end this domain may send on, and it was granted deliberately (ENG-1, SCM-6); these two \
+     one end this domain may send on, and it was granted deliberately and reviewed; these two \
      were not";
 
 /// As [`DRIVER_CHANNEL_ONE_WAY`], for the management port's channel. A claim of
@@ -1231,7 +1230,7 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
 /// the same thing: the forwarder's two ends are about a domain that holds one
 /// send capability and must hold no more, and this end is about a domain that
 /// holds none at all.
-const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds NO send capability on      anything, in this system or on this channel, and this is the end that says so. It is a      notified-driven consumer: it is woken, it drains, it returns. A send capability here would be      one on a driver that never leaves `init` and so could never observe it — authority for      nothing (ENG-1) — and it would make pds/nic-driver's claim that its `notified` entrypoint is      unreachable by *capability* false for the third instance while staying true for the other two";
+const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds NO send capability on      anything, in this system or on this channel, and this is the end that says so. It is a      notified-driven consumer: it is woken, it drains, it returns. A send capability here would be      one on a driver that never leaves `init` and so could never observe it — authority for      nothing — and it would make pds/nic-driver's claim that its `notified` entrypoint is      unreachable by *capability* false for the third instance while staying true for the other two";
 
 /// Every `<end>` the description may declare, and the direction that one
 /// channel is granted in. An end absent from this table fails the gate, and so
@@ -1318,7 +1317,7 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
 /// One port's driver: the receive-pipeline region that port's frames arrive on,
 /// and the protection domain the metric surface attributes them to.
 ///
-/// This is the enforcer `lfw_metrics::PORT_DOMAINS`' DOC-7 precondition names.
+/// This is the enforcer `lfw_metrics::PORT_DOMAINS`' precondition names.
 /// That table is the join key of the interface info family — a scraper matches
 /// `domain="nic_driver0"` on a counter series against the info series for the
 /// interface the document put on port 0 — and *which domain drives which port* is
@@ -1357,7 +1356,7 @@ fn port_drivers() -> Vec<PortDriverRule> {
                 1 => "port 1",
                 // Unreachable while the build has two dataplane ports, and a
                 // name rather than a panic so a third port fails as an
-                // unnamed rule instead of stopping the checker (ENG-5).
+                // unnamed rule instead of stopping the checker.
                 _ => "a dataplane port this checker cannot name",
             },
             receive_region: match port {
@@ -1384,7 +1383,7 @@ const RECEIVE_PIPELINE_SYMBOL: &str = "rx_fwd_vaddr";
 /// Every element type this module knows how to judge. An element outside it
 /// stops the gate rather than being skipped: `<irq>`, `<virtual_machine>` and
 /// `<vcpu>` are all authority grants, and one arriving unnoticed is precisely
-/// the capability change ENG-1 says must be looked at.
+/// a capability change that must be looked at.
 ///
 /// `ioport` was the case that proved the point: it entered the description as a
 /// new capability class and stopped the gate here, unmodelled, rather than
@@ -1572,8 +1571,8 @@ fn check_modelled_tags(elements: &[Element], findings: &mut Vec<String>) {
             findings.push(format!(
                 "line {}: <{}> is an element type this cross-check does not model, so whatever \
                  it grants is neither compared nor reported. Teach sysdesc.rs to judge it \
-                 (MODELLED_TAGS), and treat the grant itself as the security change it is \
-                 (ENG-1, SCM-6)",
+                 (MODELLED_TAGS), and treat the grant itself as the security change it is, \
+                 human-reviewed rather than merged",
                 element.line, element.tag
             ));
         }
@@ -1743,7 +1742,7 @@ fn check_region_mappers(rule: &RegionRule, granted: &[(&str, String)], findings:
             let mut finding = format!(
                 "{domain:?} maps <memory_region name={:?}>, which sysdesc.rs grants to \
                  {granted_to} and to nothing else. A domain reaching a region it was withheld \
-                 is a capability change, reviewed and approved rather than merged (ENG-1, SCM-6)",
+                 is a capability change, reviewed and approved rather than merged",
                 rule.name
             );
             if let Some(claim) = rule.withheld {
@@ -1792,7 +1791,7 @@ fn check_map_perms(
     findings.push(format!(
         "{site} grants perms={perms:?} where sysdesc.rs grants {domain:?} {:?} on this region. A \
          change to what a domain may do to a region is a capability change, and it is reviewed \
-         and approved rather than merged (ENG-1, SCM-6); record the new grant here once it is",
+         and approved rather than merged; record the new grant here once it is",
         grant.perms
     ));
 }
@@ -1849,8 +1848,8 @@ fn check_io_ports(elements: &[Element], domains_agree: bool, findings: &mut Vec<
                 "{site} is an I/O-port grant no rule in sysdesc.rs names, so the window it hands \
                  this domain is compared against nothing. `in` and `out` are privileged and seL4 \
                  gates them per port, so this is a domain newly able to drive whatever decodes \
-                 that window — a capability change, reviewed and approved rather than merged \
-                 (ENG-1, SCM-6). Record it in IO_PORTS once it is"
+                 that window — a capability change, reviewed and approved rather than merged. \
+                 Record it in IO_PORTS once it is"
             ));
             continue;
         };
@@ -1906,7 +1905,7 @@ fn check_port_window(site: &str, rule: &IoPortRule, element: &Element, findings:
              driver state one window between them — the driver forms every address inside the \
              one it compiled against — so a window this file moved or widened is authority \
              nobody reviewed, and it is a capability change reviewed and approved rather than \
-             merged (ENG-1, SCM-6). What the grant as approved withholds: {}",
+             merged. What the grant as approved withholds: {}",
             expected.rust_name, expected.value, rule.withheld
         ));
     }
@@ -1936,7 +1935,7 @@ fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
         };
         seen.push((domain, id));
 
-        // Microkit 2.3.0 §7.6: `notify` "indicates that the protection domain
+        // Microkit 2.3.0 manual, section 7.6: `notify` "indicates that the protection domain
         // for this end can send a notification to the other end; defaults to
         // true". An absent attribute is therefore a granted send capability.
         let notify = element.attribute("notify").unwrap_or("true");
@@ -2629,7 +2628,7 @@ mod tests {
                 finding.contains(&format!("{domain:?}")) && finding.contains("\"rw\""),
                 "{region}: {finding}"
             );
-            assert!(finding.contains("ENG-1"), "{region}: {finding}");
+            assert!(finding.contains("capability change"), "{region}: {finding}");
         }
     }
 
@@ -2662,7 +2661,7 @@ mod tests {
         let finding = only_finding(&findings);
         assert!(finding.contains("nic_driver0"), "{finding}");
         assert!(finding.contains("no rule in sysdesc.rs names"), "{finding}");
-        assert!(finding.contains("ENG-1"), "{finding}");
+        assert!(finding.contains("capability change"), "{finding}");
     }
 
     #[test]
@@ -2685,7 +2684,10 @@ mod tests {
             );
             let finding = only_finding(&findings);
             assert!(finding.contains(constant), "{attribute}: {finding}");
-            assert!(finding.contains("ENG-1"), "{attribute}: {finding}");
+            assert!(
+                finding.contains("capability change"),
+                "{attribute}: {finding}"
+            );
             // And it says what the approved grant withholds, rather than only
             // which number to type back.
             assert!(
@@ -2778,7 +2780,7 @@ mod tests {
                 finding.contains("\"console\"") && finding.contains("\"rw\""),
                 "{region}: {finding}"
             );
-            assert!(finding.contains("ENG-1"), "{region}: {finding}");
+            assert!(finding.contains("capability change"), "{region}: {finding}");
         }
     }
 
@@ -2893,7 +2895,7 @@ mod tests {
         );
         let finding = only_finding(&findings);
         assert!(
-            finding.contains("\"rwx\"") && finding.contains("ENG-1"),
+            finding.contains("\"rwx\"") && finding.contains("capability change"),
             "{finding}"
         );
     }
@@ -2923,7 +2925,7 @@ mod tests {
                 finding.contains("\"forwarder\"") && finding.contains(ring),
                 "{finding}"
             );
-            assert!(finding.contains("ENG-1"), "{finding}");
+            assert!(finding.contains("capability change"), "{finding}");
             // And it says what the withholding is worth, not merely that the
             // table disagrees.
             assert!(
@@ -3141,7 +3143,7 @@ mod tests {
         assert!(finding.contains("nothing with a CPU"), "{finding}");
     }
 
-    /// The mutual exclusion CONCEPT §9.1 asks for, in the direction that would
+    /// The management/dataplane mutual exclusion, in the direction that would
     /// put the routing stage on the management port.
     #[test]
     fn the_forwarder_reaching_a_management_region_is_reported() {
@@ -3153,7 +3155,10 @@ mod tests {
         );
         let joined = findings.join("\n");
         assert!(joined.contains("\"forwarder\" maps"), "{joined}");
-        assert!(joined.contains("CONCEPT §9.1"), "{joined}");
+        assert!(
+            joined.contains("isolates the management port from the dataplane"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -3273,7 +3278,7 @@ mod tests {
         );
         let finding = only_finding(&findings);
         assert!(
-            finding.contains("<irq>") && finding.contains("ENG-1"),
+            finding.contains("<irq>") && finding.contains("security change"),
             "{finding}"
         );
     }
@@ -3472,7 +3477,7 @@ mod tests {
 
     /// The committed file, through this check alone: every port is driven by the
     /// domain `lfw_metrics` attributes it to, so the join key is one word on both
-    /// sides. This is the positive half of the DOC-7 enforcer.
+    /// sides. This is the positive half of the enforcer.
     #[test]
     fn every_port_is_driven_by_the_domain_the_metric_surface_attributes_it_to() {
         let elements = scan(committed().as_bytes()).expect("the description scans");

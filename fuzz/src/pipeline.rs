@@ -3,7 +3,7 @@
 //! # The adversary and the surface
 //!
 //! `pd_runtime` is the inter-PD protocol itself, so this is where "what one
-//! protection domain must withstand from another" is defined (CONCEPT §7.1).
+//! protection domain must withstand from another" is defined.
 //! The peer this harness plays is the transmitting driver, which maps every
 //! region under test read-write — both cursors of all three rings, every slot,
 //! and the pool bytes — and the two mechanisms that stop that from becoming a
@@ -15,7 +15,7 @@
 //! property of the system description, not of `pd_runtime`, so this harness
 //! keeps modelling the *widest* peer any region has — narrowing it to what one
 //! domain happens to map would delete adversary authority the protocol must
-//! still withstand (TEST-8).
+//! still withstand.
 //!
 //! The worst outcome this guards is not a crash. It is a forged index reaching
 //! the free stack, being handed back out by `alloc`, and turned into a physical
@@ -69,7 +69,7 @@
 //!   publishes.
 //! * **The delegated precondition terminates, and its two ends agree.**
 //!   `descriptor_in_bounds` is the component `packet_buffer`'s accessors name
-//!   as the enforcer for a peer-supplied span (AGENTS.md DOC-7), and
+//!   as the enforcer for a peer-supplied span, and
 //!   `copy_out` re-checks that span itself. Every descriptor reaching the tx
 //!   side is put to *both*, and their verdicts asserted equal — in both
 //!   directions, which is why the copy is attempted even for a span the
@@ -313,7 +313,7 @@ pub fn pipeline_harness(data: &[u8]) {
                 for descriptor in drained {
                     taken += 1;
                     // `descriptor_in_bounds` is the enforcer `packet_buffer`
-                    // names for a peer-supplied span (AGENTS.md DOC-7), and
+                    // names for a peer-supplied span, and
                     // `copy_out` re-checks that same span unconditionally. Both
                     // rule on the identical question over the identical pool —
                     // `Pool` is `BufferPool<POOL_BUFFERS>`, the very bound the

@@ -276,7 +276,7 @@ impl Topology {
     }
 
     /// The management port, which is not one of [`Topology::endpoints`] and never
-    /// will be: CONCEPT §9.1 keeps it out of the dataplane, so no probe crosses
+    /// will be: the design keeps it out of the dataplane, so no probe crosses
     /// it and no routed contract is stated between it and anything.
     pub(crate) fn management(&self) -> ManagementPort {
         self.management

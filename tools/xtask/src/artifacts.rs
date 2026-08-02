@@ -6,8 +6,8 @@
 //! are both derived from it, so the two can never drift from each other or from
 //! what is actually written.
 //!
-//! `dist/` holds only deployable outputs and the evidence that describes them
-//! (AGENTS.md, *Build interface*). Build-internal products — the Microkit
+//! `dist/` holds only deployable outputs and the evidence that describes
+//! them. Build-internal products — the Microkit
 //! capability/memory report, the intermediate partition images, the development
 //! keyring — stay under `build/`: the report in particular is a full disclosure
 //! of the capability and memory topology and is debugging evidence, not

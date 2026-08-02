@@ -1,7 +1,7 @@
 //! The host-side commands: the fast gate, coverage, benchmarks, fuzzing, clean.
 //!
 //! These run without booting seL4. [`test_host`] is the fast gate the pre-commit
-//! hook and CI share (format, the DOC-11/ENG-13 budgets, the system-description
+//! hook and CI share (format, the comment and `unsafe` budgets, the system-description
 //! cross-check, host tests, Clippy with warnings denied over *every* workspace
 //! member, the `cargo-deny` dependency/license/source policy, and the library
 //! coverage floor). [`fuzz`] additionally runs in the full `ci` gate (build
@@ -65,7 +65,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
 /// the firewall is built from.
 ///
 /// Its exact complement over the workspace is `tests::COVERAGE_EXCLUSIONS`,
-/// which records for every remaining member the AGENTS.md TEST-3 reason that
+/// which records for every remaining member the coverage-exemption reason that
 /// admits leaving it out — and, where that reason does not cover the whole of
 /// the member, the part it does not. A test in that module holds the two to
 /// partitioning the workspace, so a member in neither fails the build rather
@@ -130,7 +130,7 @@ const BENCH_PACKAGES: &[&str] = &["queue", "packet-buffer", "virtio", "pd-runtim
 /// # This is now the only thing keeping the `debug` configuration buildable
 ///
 /// Every gate boots the release image: [`crate::ci`] assembles that
-/// configuration and the QEMU system and A/B scenarios boot it (BLD-3). The
+/// configuration and the QEMU system and A/B scenarios boot it. The
 /// debug kernel survives in exactly three places — this lint, the `image-debug`
 /// opt-in, and `run` — and of the three only this one runs in a gate. So a PD
 /// change that compiles under the release headers and not under the debug ones
@@ -262,7 +262,7 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
 ///   `target/<config>`, which for `debug` is also where the host dev profile
 ///   writes; keeping this step in its own tree means it can neither perturb
 ///   nor be perturbed by an artifact the image build or the coverage run
-///   depends on (BLD-4).
+///   depends on — a cache may accelerate a build, never decide one.
 ///
 /// Everything else mirrors `image`'s PD build exactly — the same `--release`
 /// profile (so `debug_assertions` is off here as it is in every booted image),
@@ -277,7 +277,7 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
         // Fail by name rather than as a bindgen error a thousand lines deep:
         // the one way to reach this step without the headers is running xtask
         // outside the pinned builder, and that is what the operator must be
-        // told (ENG-12).
+        // told.
         if !include_dir.is_dir() {
             return Err(format!(
                 "cannot lint the protection domains: the pinned Microkit SDK's {config} headers \
@@ -322,7 +322,7 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Enforce the DOC-11 comment budget and the ENG-13 `unsafe` budget against
+/// Enforce the comment budget and the `unsafe` budget against
 /// the recorded baseline in [`budgets::BASELINE`].
 ///
 /// Both are ratchets rather than thresholds: a number may fall and may never
@@ -624,17 +624,17 @@ mod tests {
     /// Why a workspace member is outside the [`LIBRARY_PACKAGES`] coverage
     /// floor.
     ///
-    /// AGENTS.md TEST-3 closes the set of admissible reasons, so the reason is
+    /// The set of admissible reasons is closed — only-observable-under-seL4,
+    /// build orchestration, or a test-or-benchmark harness — so the reason is
     /// this enum rather than free prose: an exclusion that cannot name one of
     /// these variants is not an exclusion, and the check below refuses it.
-    /// Only the two reasons this workspace uses are declared — TEST-3's third
-    /// (a test or benchmark harness) owns no member of its own here, because
-    /// the criterion benches live inside crates that are themselves floored.
+    /// Only the two reasons this workspace uses are declared — the third owns
+    /// no member here; the criterion benches live inside floored crates.
     enum CoverageExclusion {
-        /// TEST-3 reason (1): a protection-domain adapter, which no host
-        /// command can measure because it does not build for the host.
+        /// Only observable under seL4: a protection-domain adapter, which no
+        /// host command can measure because it does not build for the host.
         ///
-        /// Reason (1) holds only when the exclusion "names the QEMU test that
+        /// This reason holds only when the exclusion "names the QEMU test that
         /// covers it instead", so that clause is a field and not a sentence
         /// someone may forget to write. `qemu_evidence` names the covering
         /// command and what it asserts; `residue` names the adapter code that
@@ -644,19 +644,19 @@ mod tests {
             qemu_evidence: &'static str,
             residue: Option<&'static str>,
         },
-        /// TEST-3 reason (2): build orchestration. None of it runs on a
+        /// Build orchestration. None of it runs on a
         /// deployed appliance, so it is host-tested to keep the build honest
         /// rather than held to a number defending the product.
         BuildOrchestration,
     }
 
-    /// The xtask commands a reason (1) exclusion may cite: the only two that
+    /// The xtask commands an only-under-seL4 exclusion may cite: the two that
     /// boot a real image and judge it by a machine-observable contract.
     /// Requiring the evidence to name one is what separates it from "the QEMU
     /// gate covers it", which names nothing and can be written about anything.
     const QEMU_TESTS: &[&str] = &["test-system", "test-ab"];
 
-    /// Every workspace member outside the coverage floor, with the TEST-3
+    /// Every workspace member outside the coverage floor, with the recorded
     /// reason admitting it — the exact complement of [`LIBRARY_PACKAGES`].
     ///
     /// The pair is what makes "excluded" a decision someone recorded rather
@@ -678,7 +678,7 @@ mod tests {
                     "`PoolDmaBase::new`'s rejecting branches and the `StartupError` console \
                      path are reached by no QEMU test: every scenario boots the one correct \
                      system description, so the patched `rx_pool_paddr`/`tx_pool_paddr` are \
-                     always valid and only the accepting branch runs. That is the LAY-2 \
+                     always valid and only the accepting branch runs. That is the \
                      layering defect the crate header already records — first-party decision \
                      logic sitting in a PD, where neither the host floor nor the QEMU gate can \
                      reach it — and not a covered path. Closing it means moving the newtype \
@@ -717,7 +717,8 @@ mod tests {
                      nobody checked is the fail-closed property itself; the decision behind it is \
                      floored in `pd_runtime`, but this domain's reaction to it is first-party \
                      logic sitting in a PD where neither the host floor nor the QEMU gate reaches \
-                     it — the layering defect LAY-2 names. Closing it means moving that reaction \
+                     it — a layering defect, since first-party logic belongs in a host-testable \
+                     crate. Closing it means moving that reaction \
                      beside `take_offer`: one call taking this domain's `Sink`, emitting whatever \
                      the offer has to say, and returning whether the publisher must be signalled, \
                      which leaves the domain a call and a `notify` and puts the arm under the \
@@ -745,7 +746,7 @@ mod tests {
                      branch ever runs. Choosing to publish nothing rather than something weaker \
                      is the fail-closed property itself, and it is first-party decision logic \
                      sitting in a PD where neither the host floor nor the QEMU gate reaches it — \
-                     the layering defect LAY-2 names. Closing it means moving the \
+                     a layering defect. Closing it means moving the \
                      commit-or-refuse decision into `crates/config` beside \
                      `commit_and_report`, returning whether anything was offered and leaving the \
                      domain with the publish call alone, which puts the branch under the host \
@@ -785,10 +786,10 @@ mod tests {
                      through the `debug_println!` the release build compiles away. What to do \
                      about a refused device is first-party \
                      decision logic sitting in a PD, where neither the host floor nor the QEMU \
-                     gate reaches it — the layering defect LAY-2 names — and not a covered \
+                     gate reaches it — a layering defect — and not a covered \
                      path. Closing it needs both halves: a reporting channel that does not \
-                     depend on the console (the `GET /logs` ring MONITORING.md specifies, or \
-                     the metrics endpoint of CONCEPT §11), and the park-or-retry decision moved \
+                     depend on the console (the specified `GET /logs` ring, or \
+                     the management-plane metrics endpoint), and the park-or-retry decision moved \
                      beside `Uart::initialise` so a host test can drive it. The same second \
                      channel is what would expose `ConsolePrinter`'s malformed, unknown, \
                      unrenderable and write_failed counters, which are floored in `crates/log` \
@@ -825,7 +826,7 @@ mod tests {
                      is unreached is this domain's translation of them into console tokens, and \
                      `EpochOutOfRange`, which no reading `lfw_rtc` admits can produce. That is \
                      first-party logic sitting in a PD where neither the host floor nor the QEMU \
-                     gate can measure it — the layering defect LAY-2 names — and not a covered \
+                     gate can measure it — a layering defect — and not a covered \
                      path. Closing it means the same move the other three PDs' residues \
                      describe: a refusal type owning its own console mapping, which cannot live \
                      in `lfw-clock` (the dependency would cycle through `lfw-log`) and so needs \
@@ -856,15 +857,15 @@ mod tests {
                      whole batch, so a second signal for the same frames may or may not arrive — \
                      which is precisely a decision that cannot be asserted from outside. It is \
                      first-party logic sitting in a PD, where neither the host floor nor the QEMU \
-                     gate reaches it, and that is the layering defect LAY-2 names rather than a \
+                     gate reaches it, and that is a layering defect rather than a \
                      covered path. Closing it means moving the report-or-stay-silent decision \
                      beside `TerminalStage::poll`, answering the totals to report or nothing, \
                      which leaves the domain a call and an `announce` and puts the branch under \
                      the host coverage floor. What no arrangement of this domain closes is \
                      `TerminalCounters::malformed_descriptor` and `return_ring_full`: no scenario \
                      has a byzantine driver to raise either and no surface exposes them \
-                     (MONITORING.md — the counts reach the console only as the frames/bytes \
-                     pair), which needs the metrics endpoint of CONCEPT §11.",
+                     (the counts reach the console only as the frames/bytes \
+                     pair), which needs the management-plane metrics endpoint.",
                 ),
             },
         ),
@@ -895,7 +896,7 @@ mod tests {
                      are exercised exhaustively against hostile stand-in devices under the host \
                      floor — so what stays uncovered here is the adapter's own wiring: which \
                      region is attached to which symbol, and the conversion of a `lfw_blk::Refusal` \
-                     into the console's. That conversion is the LAY-2 residue this entry records: \
+                     into the console's. That conversion is the layering defect this entry records: \
                      it is first-party logic in a PD, and closing it means moving the \
                      `lfw_blk::Refusal`-to-`lfw_log::Refusal` conversion into `pd_runtime`, beside \
                      the `log_sample` that already lives there, which would put it under the host \
@@ -1000,8 +1001,8 @@ mod tests {
 
     #[test]
     fn every_member_is_coverage_floored_or_excluded_for_a_stated_reason() {
-        // What this closes: TEST-3 admits an exclusion only for a reason on
-        // its closed list, so every member is either inside the floor or named
+        // What this closes: an exclusion is admitted only for a reason on
+        // the closed list, so every member is either inside the floor or named
         // by an exclusion carrying one.
         //
         // Both questions are answered from the lists and never from the
@@ -1025,9 +1026,9 @@ mod tests {
                     "{directory} ({package}) is a workspace member no coverage decision names: \
                      absent from LIBRARY_PACKAGES, and absent from COVERAGE_EXCLUSIONS. It is \
                      therefore built and linted while no coverage floor defends it and no \
-                     reason is recorded for that — exactly the unstated exclusion TEST-3 \
-                     forbids. Either add it to LIBRARY_PACKAGES, or give it a \
-                     COVERAGE_EXCLUSIONS entry naming its reason from TEST-3's closed list."
+                     reason is recorded for that — exactly the unstated exclusion the coverage \
+                     policy forbids. Either add it to LIBRARY_PACKAGES, or give it a \
+                     COVERAGE_EXCLUSIONS entry naming its reason from the closed list."
                 ),
                 (true, Some(_)) => panic!(
                     "{directory} ({package}) is in LIBRARY_PACKAGES and is also excluded by \
@@ -1039,7 +1040,7 @@ mod tests {
     }
 
     /// Hold a recorded exclusion to actually stating its reason, rather than
-    /// merely selecting a variant. TEST-3's reason (1) is only satisfied when
+    /// merely selecting a variant. The only-under-seL4 reason is satisfied when
     /// the exclusion names the QEMU test covering the member instead, so an
     /// evidence string that names neither QEMU command is the same defect as
     /// no evidence at all.
@@ -1049,22 +1050,22 @@ mod tests {
             residue,
         } = reason
         else {
-            // Reason (2) is complete in the variant: nothing runs on a
+            // Build orchestration is complete in the variant: nothing runs on a
             // deployed appliance, so there is no covering test to name.
             return;
         };
         assert!(
             QEMU_TESTS.iter().any(|test| qemu_evidence.contains(test)),
-            "{package} is excluded under TEST-3 reason (1), which holds only when the exclusion \
+            "{package} is excluded as only observable under seL4, which holds only when the exclusion \
              names the QEMU test that covers it instead, but its evidence names none of \
              {QEMU_TESTS:?}: {qemu_evidence:?}"
         );
         if let Some(residue) = residue {
             assert!(
-                residue.contains("LAY-2"),
+                residue.contains("layering defect"),
                 "{package} admits adapter code its QEMU evidence does not reach. That is \
                  first-party logic in a PD that neither the host floor nor the QEMU gate can \
-                 measure — the layering defect LAY-2 names — and the admission must say so \
+                 measure — a layering defect — and the admission must say so \
                  rather than read as an accepted exclusion: {residue:?}"
             );
         }
@@ -1074,7 +1075,7 @@ mod tests {
     fn a_crate_with_benchmarks_is_benched_and_a_benched_crate_has_them() {
         // BENCH_PACKAGES was the one package list nothing validated: a crate
         // that grew a `benches/` and was left off it is never benched, and the
-        // measurement TEST-11 asks for silently does not happen. Both
+        // expected performance measurement silently does not happen. Both
         // directions are one comparison, because the directory on disk is the
         // whole truth about whether a crate has benchmarks.
         let root = crate::util::workspace_root().expect("the workspace root");
@@ -1088,7 +1089,7 @@ mod tests {
                 (true, false) => panic!(
                     "{directory} has a benches/ directory but {package} is not in \
                      BENCH_PACKAGES, so `xtask bench` never runs those benchmarks and a \
-                     regression in them is invisible (TEST-11). Add it, or delete the \
+                     regression in them is invisible. Add it, or delete the \
                      benchmarks nothing runs."
                 ),
                 (false, true) => panic!(

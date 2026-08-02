@@ -3,10 +3,10 @@
 //!
 //! # Adversary
 //!
-//! The byzantine peer protection domain (CONCEPT §7.1). The calibration comes
+//! A byzantine neighbour protection domain. The calibration comes
 //! out of a region the clock domain writes, so the frequency, the anchor
 //! reading and the epoch are all a peer's numbers — and behind that peer sits
-//! §7.1's hostile or malfunctioning device, whose timer and register file they
+//! a hostile or malfunctioning device, whose timer and register file they
 //! were measured from. Nothing here trusts them: an unpublished, torn or
 //! implausible triple yields no instant rather than a wrong one, because a
 //! record carrying a wrong time is worse than one carrying none — an operator
@@ -16,8 +16,8 @@
 //!
 //! `RDTSC` is the one instruction in this workspace every domain that stamps a
 //! record has to execute, and each copy of it would be a separate `unsafe`
-//! block obliging a separate DOC-6 claim that no compiler checks (ENG-11,
-//! ENG-13). This crate is where the claim is made once: every protection domain
+//! block obliging a separate safety claim that no compiler checks — a budget
+//! kept minimal. This crate is where the claim is made once: every protection domain
 //! already depends on it, and it is where `attach_region!` states the other
 //! invariant they all share.
 //!
@@ -47,7 +47,7 @@ pub fn read_timestamp_counter() -> Ticks {
     // facts neither this crate nor any first-party one provides. The target is
     // the guarantor of the first — `RDTSC` has been architectural on x86_64
     // since the ISA existed, and `support/targets/x86_64-sel4-minimal.json`
-    // targets nothing else (CON-4). The seL4 kernel is the guarantor of the
+    // targets nothing else. The seL4 kernel is the guarantor of the
     // second: it leaves `CR4.TSD` clear, which is what makes the instruction
     // unprivileged in a protection domain. That is third-party runtime
     // behaviour, recorded rather than asserted — and it is the one step of this

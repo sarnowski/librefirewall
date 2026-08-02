@@ -14,19 +14,19 @@
 //! Every decision the proof makes — which sectors, what the pattern is, how
 //! long the device may take, what counts as a completion for the request that
 //! was submitted, and what each failure is called — is first-party logic, and
-//! logic welded to a Microkit entrypoint is logic no host test can reach
-//! (LAY-2). The domain supplies the mapped regions and the doorbell; this
+//! logic welded to a Microkit entrypoint is logic no host test can reach.
+//! The domain supplies the mapped regions and the doorbell; this
 //! module supplies every judgement made through them.
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**. The proof believes
+//! A **hostile or malfunctioning device**. The proof believes
 //! nothing it is told: the capacity is checked before a sector is named, a
 //! completion is matched against the token the submit minted rather than taken
 //! as an answer to the outstanding request, a short or failed transfer is a
 //! typed error rather than a success, and the wait for each completion is
 //! bounded by [`POLL_BUDGET`] — a driver constant, so a device that simply
-//! never answers parks this proof instead of this domain (ENG-4). The bytes it
+//! never answers parks this proof instead of this domain. The bytes it
 //! reads back are never interpreted: [`Report::probe_word`] is carried to the
 //! console as a number and steers nothing.
 
@@ -56,7 +56,7 @@ pub const MINIMUM_CAPACITY_SECTORS: u64 = WITNESS_SECTOR + 1;
 /// The first eight bytes of the witness pattern — the token an outside observer
 /// searches the medium for.
 ///
-/// **Cross-artifact (DOC-7):** the enforcer is `xtask`'s QEMU harness, which
+/// **A cross-artifact contract:** the enforcer is `xtask`'s QEMU harness, which
 /// reads [`WITNESS_SECTOR`] out of the data disk after the run and compares it
 /// against [`witness_pattern`] byte for byte. It calls these definitions rather
 /// than restating them, so the two sides cannot drift.
@@ -69,7 +69,7 @@ const WITNESS_HEADER_LEN: usize = WITNESS_MAGIC.len() + size_of::<u64>();
 /// silent.
 ///
 /// A driver constant rather than anything the device influences, which is what
-/// makes the wait bounded (ENG-4). Large enough that a device merely slow under
+/// makes the wait bounded. Large enough that a device merely slow under
 /// an emulated CPU finishes inside it, and small enough that a device which
 /// never answers gives the domain back to the scheduler in seconds rather than
 /// holding a priority-1 timeslice for the life of the appliance.
@@ -293,8 +293,8 @@ const fn outcome_code(outcome: Outcome) -> u64 {
 ///
 /// Numbers only. [`probe_word`](Self::probe_word) is the first eight bytes of
 /// what the device returned, which is device input and is carried as an
-/// integer for an operator to look at — it steers nothing here and reaches no
-/// surface but the console, so OBS-5 is satisfied by there being no payload in
+/// integer for an operator to look at — it steers nothing here, and the rule
+/// that no packet payload reaches an operator surface holds: nothing is in
 /// it beyond eight bytes of a sector the appliance itself put nothing in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
@@ -348,7 +348,7 @@ pub fn prove(
 /// Total over the array: a sector is longer than eight bytes by
 /// `crate::SECTOR_SIZE`'s definition, and the copy is bounded by the
 /// destination rather than by the source, so there is no length to get wrong
-/// and no index to leave the buffer (ENG-5).
+/// and no index to leave the buffer.
 fn leading_word(sector: &[u8; SECTOR_SIZE]) -> u64 {
     let mut leading = [0u8; size_of::<u64>()];
     for (byte, value) in leading.iter_mut().zip(sector) {

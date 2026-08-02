@@ -8,7 +8,7 @@
 //!
 //! # Why the checksum is verified before any field is used
 //!
-//! The pseudo-header (RFC 793 §3.1) covers the two addresses and the segment
+//! The pseudo-header (RFC 793 section 3.1) covers the two addresses and the segment
 //! length, which is what makes a segment's checksum a statement about *which
 //! connection it belongs to*. Verifying it first is therefore not defensive
 //! ordering: a segment whose checksum fails may have had its ports or its
@@ -19,7 +19,7 @@
 //! # The option framework, and what it is a framework for
 //!
 //! Three options are read: maximum segment size (RFC 793), window scale
-//! (RFC 7323 §2) and SACK-permitted (RFC 2018). The first two are negotiated;
+//! (RFC 7323 section 2) and SACK-permitted (RFC 2018). The first two are negotiated;
 //! the third is recorded and acted on by nothing, because selective
 //! acknowledgement needs a reassembly queue this stack deliberately does not
 //! have (see the crate header). Recording it is what makes adding SACK a change
@@ -57,7 +57,7 @@ const OPTION_SACK_PERMITTED: u8 = 4;
 const OPTION_MSS_LEN: u8 = 4;
 const OPTION_WINDOW_SCALE_LEN: u8 = 3;
 
-/// The largest shift RFC 7323 §2.2 permits a window scale to carry. A peer
+/// The largest shift RFC 7323 section 2.2 permits a window scale to carry. A peer
 /// naming more is clamped to it rather than refused, which is what that section
 /// requires of a receiver.
 pub const MAX_WINDOW_SCALE: u8 = 14;
@@ -65,7 +65,7 @@ pub const MAX_WINDOW_SCALE: u8 = 14;
 /// The control bits, as one value rather than eight booleans.
 ///
 /// A newtype rather than a `bool` per flag because the combination is what
-/// decides: RFC 793 §3.9 dispatches on `SYN` with and without `ACK`, on `RST`
+/// decides: RFC 793 section 3.9 dispatches on `SYN` with and without `ACK`, on `RST`
 /// alone, and on `FIN` beside data, and a struct of booleans makes each of those
 /// a conjunction spelled out at every call site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,13 +98,13 @@ impl Flags {
 
 /// The options a segment carried that this stack reads.
 ///
-/// Absent rather than defaulted: RFC 7323 §2.2 makes window scaling apply only
+/// Absent rather than defaulted: RFC 7323 section 2.2 makes window scaling apply only
 /// when *both* ends offered it, so "no option" and "a scale of zero" are
 /// different facts and an `Option` is what keeps them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub mss: Option<u16>,
-    /// Already clamped to [`MAX_WINDOW_SCALE`], per RFC 7323 §2.3.
+    /// Already clamped to [`MAX_WINDOW_SCALE`], per RFC 7323 section 2.3.
     pub window_scale: Option<u8>,
     /// Read and recorded; nothing negotiates it. See the module header.
     pub sack_permitted: bool,
@@ -113,7 +113,7 @@ pub struct Options {
 /// Why a segment is not one this stack will read.
 ///
 /// Every variant carries the value that refused it, so a refusal is attributable
-/// to a byte rather than to a category (MONITORING.md's attribution rule).
+/// to a byte the peer sent rather than to a category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentError {
     /// Fewer bytes than a header with no options.
@@ -150,7 +150,7 @@ pub struct Segment<'a> {
 
 impl<'a> Segment<'a> {
     /// The sequence space this segment occupies: its payload plus the phantom
-    /// byte each of `SYN` and `FIN` takes (RFC 793 §3.3).
+    /// byte each of `SYN` and `FIN` takes (RFC 793 section 3.3).
     ///
     /// `u32` rather than `usize` because it is added to a sequence number, and
     /// the widening is exact: a payload is bounded by an IPv4 datagram.
@@ -267,7 +267,7 @@ pub struct Outgoing<'a> {
     /// Already scaled down by the shift this end advertised.
     pub window: u16,
     /// Written only on a segment carrying `SYN`, which is the only segment
-    /// RFC 793 and RFC 7323 §2.2 permit them on.
+    /// RFC 793 and RFC 7323 section 2.2 permit them on.
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
     pub payload: &'a [u8],
@@ -395,7 +395,7 @@ impl Outgoing<'_> {
     ///
     /// Built by value, one arm per combination, so the layout is readable as a
     /// table and no index into it is computed at run time. Empty on every segment
-    /// carrying no `SYN`, which is the only one RFC 793 and RFC 7323 §2.2 permit
+    /// carrying no `SYN`, which is the only one RFC 793 and RFC 7323 section 2.2 permit
     /// these options on.
     fn option_area(&self) -> ([u8; MAX_OPTION_LEN], usize) {
         if !self.flags.contains(Flags::SYN) {
@@ -451,7 +451,7 @@ fn needed_len(needed: usize) -> u16 {
     u16::try_from(needed).unwrap_or(u16::MAX)
 }
 
-/// The RFC 793 §3.1 pseudo-header as a running sum: the two addresses, a zero
+/// The RFC 793 section 3.1 pseudo-header as a running sum: the two addresses, a zero
 /// byte and the protocol number as one word, and the segment's own length.
 fn pseudo_header(source: Ipv4Address, destination: Ipv4Address, length: u16) -> Checksum {
     Checksum::new()
@@ -483,8 +483,7 @@ fn recomputed(source: Ipv4Address, destination: Ipv4Address, bytes: &[u8]) -> u1
 ///
 /// The loop is bounded by the area, which the data offset bounds to
 /// [`MAX_TCP_HEADER_LEN`]: every iteration consumes at least one byte, so no
-/// option a peer can compose makes it run longer than the header it is in
-/// (ENG-4).
+/// option a peer can compose makes it run longer than the header it is in.
 fn read_options(mut area: &[u8]) -> Result<Options, SegmentError> {
     let mut options = Options::default();
     while let Some((kind, rest)) = area.split_first() {
@@ -519,7 +518,7 @@ fn read_options(mut area: &[u8]) -> Result<Options, SegmentError> {
                 options.mss = Some(u16::from_be_bytes([*high, *low]));
             }
             (OPTION_WINDOW_SCALE, [_, _, shift]) => {
-                // RFC 7323 §2.3: a shift above the maximum is clamped, not
+                // RFC 7323 section 2.3: a shift above the maximum is clamped, not
                 // refused — a peer offering one is asking for a window this end
                 // will simply not grow to.
                 options.window_scale = Some((*shift).min(MAX_WINDOW_SCALE));

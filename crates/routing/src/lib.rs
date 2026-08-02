@@ -2,7 +2,7 @@
 //! parsed headers, whether to forward it, out of which port, and under which
 //! pair of MAC addresses.
 //!
-//! Faces untrusted network traffic (CONCEPT §7.1). Every field it reads was
+//! Faces untrusted network traffic. Every field it reads was
 //! chosen by whatever is attached to a dataplane port, so a decision is total:
 //! [`Router::decide`] returns a verdict for every possible header, and the
 //! verdict for anything it does not recognise is a named [`DropReason`] rather
@@ -19,7 +19,7 @@
 //! Neighbours are configured, never learned: this crate carries no discovery
 //! state. Resolution stays a table because the forwarder cannot *originate* a
 //! frame — it owns no buffer pool, and a frame leaves only the port opposite the
-//! one it arrived on (CONCEPT §6.3's Routing/ARP/ICMP component).
+//! one it arrived on; answering is the routing/ARP/ICMP component's job.
 //!
 //! A drop is counted, never answered. An ICMP error — time exceeded,
 //! destination unreachable — needs that same origination.

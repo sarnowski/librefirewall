@@ -1,0 +1,247 @@
+# Development status
+
+Statuses are **done**, **partial**, or **open**. Every *partial* capability is broken down
+further — what exists and what specifically remains — in the developer chapter,
+[Implementation status in detail](developers/status-detail.md), so the work can be picked up
+without re-deriving it from the code. This page is the evaluator's view: what the appliance does
+today, what it does not, and where the project is heading.
+
+## The current deployable system
+
+The current deployable system is a two-dataplane-port routed IPv4 slice: one driver protection
+domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4 capabilities
+alone, and an isolated forwarder protection domain routes frames between the two ports — parsing
+each one, deciding on it against the configuration in force, and rewriting its Ethernet and IPv4
+headers in place, so the payload is never copied.
+
+That configuration is a schema-validated XML document, read and committed by a protection domain
+of its own that holds no device and no dataplane memory, and handed to the forwarder through a
+shared region under an offer/acknowledge protocol. The forwarder boots **fail-closed** — an empty
+table, forwarding nothing — and switches to a configuration only after re-checking every field of
+it itself, so every boot performs a live configuration swap on a running dataplane. There is still
+no way to *submit* a document to a running node: the configuration is embedded into the image at
+build time, so a configuration change requires a new image and a reboot.
+
+A **dedicated management port** is the third NIC, and it is an addressed IPv4 endpoint that
+answers for itself and forwards nothing. It answers ARP requests for its own address, ICMP echo
+requests to it, and HTTP over a first-party TCP stack: `GET /metrics` returns a Prometheus
+exposition, and `GET /logs.pcapng` and `GET /capture.pcapng` return the two traffic recordings
+whole. All of it is plain HTTP — **there is no TLS and no authentication in front of any of it
+yet**, so anyone who can reach the port can scrape the metrics and download every packet the
+appliance recorded. The port's MAC, address and prefix come from the configuration document like
+every other address on the appliance, so the port is configured rather than compiled in.
+
+The isolation between management and dataplane is a property of what each domain is granted, not a
+rule anybody has to remember: the management domain holds no dataplane memory and the forwarder
+holds no management memory, and the end-to-end gate asserts the same exclusion on the wire, in
+both directions, on the release image — no frame injected on the management port ever appears on a
+dataplane port, and no dataplane probe ever appears on the management one.
+
+Another protection domain owns the serial console — the PC-compatible COM1 port — and is the only
+writer of the line; every other domain reaches an operator by publishing a typed record, which the
+console domain renders and puts on the line. It replaced a kernel debug facility the release
+kernel is not built with: until this landed, a **release image printed nothing at all**, so a node
+that parked on a refused NIC or came up fail-closed on a refused document said so only in the
+profile nobody ships.
+
+Booting that release image for the first time found a second, deeper defect underneath the first,
+which had been latent since the boot chain was written: the bootloader was free to place the
+system image in the 640 KiB below 1 MiB, from where seL4's x86 boot would load the userland image
+over its own running kernel — a triple fault before any protection domain executed. Whether it
+happened was decided by whether the system image happened to fit down there, so **the debug
+profile was green by luck**. The GRUB configuration now denies the bootloader that memory and the
+build refuses an image small enough to fit what remains; see
+[Signed boot chain](developers/status-detail.md#signed-boot-chain).
+
+Both defects were reachable only in the configuration no gate booted, and both are the reason the
+gate now boots the shipped one: every QEMU scenario in `make ci` runs the release image, and the
+only debug kernel any gate boots is the one re-run to diagnose a scenario that has already failed.
+
+A clock domain establishes what time it is. It calibrates the timestamp counter against the HPET —
+a timer whose rate is self-describing — reads the real-time clock once for an epoch to anchor that
+counter to, and publishes the calibration to every other domain. **Every structured record
+therefore carries the UTC instant it was emitted at**, rendered as RFC 3339 — and the records
+emitted before the calibration exists carry the token `unsynchronized` rather than a fake 1970. It
+is **not** a trusted time source — see the status table below and its
+[detail](developers/status-detail.md#trusted-time-source).
+
+A recorder domain owns the appliance's **block device** and turns the traffic into a durable
+record. It brings a virtio-blk device up, proves the path to the medium by reading a sector and
+writing a recognisable one back, and then writes **two pcapng recordings** onto that device: a
+*log* recording snapped to 128 bytes per frame and a *capture* recording snapped to 2048. What it
+records is what the forwarder taps: every frame the router reached a decision about, copied out at
+the decision point *before* the forwarding rewrite, so what reaches the medium is what the wire
+carried. Either recording is downloadable whole over the management port — `GET /logs.pcapng`,
+`GET /capture.pcapng` — and `tcpdump -r` opens both natively. The recorder is the only domain in
+the system that can put a byte on persistent storage, and the only path between it and the
+dataplane is a one-way tap that can never backpressure forwarding.
+
+Parsing stops at IPv4 and UDP, and **no filtering decision of any kind is made**: a packet is
+forwarded because it is routable, never because a policy allowed it. There is no connection
+tracking and no NAT, and the ARP and ICMP that exist belong to the management endpoint alone — the
+dataplane resolves a next hop from a static neighbour table and answers nothing for itself. What
+exists is a router on a firewall's substrate, not yet a firewall.
+
+That absence reaches the recordings, and is the largest gap in them. The
+[recording design](design/recording.md) splits the two sinks by *what* they record — the log sink
+connection lifecycle and policy events anchored to their causing packet, the capture sink filtered
+full content. Neither exists: with no connection tracking there are no connection events to
+record, and with no filtering the capture sink is unfiltered and on by default. **Today the two
+recordings differ only in their snap length**, and `/logs.pcapng` is the capture truncated to
+headers rather than an event log.
+
+## Traffic inspection and enforcement
+
+| Capability | Status | Notes |
+|---|---|---|
+| Stateful L2–L4 filtering and connection tracking | **open** | |
+| Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management endpoint only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
+| Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
+| NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |
+| Flow classifier (cut-through vs. proxy path) | **open** | |
+| L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — [detail](developers/status-detail.md#prometheus-metrics) |
+| OT/industrial protocol inspection | **open** | |
+| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | |
+| Mirror port | **open** | the [recording design](design/recording.md) holds the recording sinks and a mirror to be complementary rather than alternatives; the sinks exist, the mirror does not |
+| TLS termination and re-origination | **open** | |
+| QUIC / HTTP-3 termination | **open** | |
+| Isolated sign-only CA protection domain | **open** | |
+| Trusted time source | **partial** | a protection domain establishes real time at boot and publishes it to every other domain, so every structured record carries the instant it was emitted at; nothing about it is *trusted* — [detail](developers/status-detail.md#trusted-time-source) |
+| Streaming DPI / signature matching | **open** | |
+| Full-object content scanning (YARA-X) | **open** | |
+| Web filtering | **open** | |
+
+## Dataplane, platform and hardware
+
+| Capability | Status | Notes |
+|---|---|---|
+| Zero-copy shared-memory dataplane | **partial** | [detail](developers/status-detail.md#zero-copy-dataplane) |
+| First-party virtio-net driver | **partial** | [detail](developers/status-detail.md#virtio-net-driver) |
+| Multicore dataplane, RSS, per-core flow shards | **open** | single vCPU today |
+| Proxy TCP stack | **partial** | a first-party passive-open stack carries a real connection on the management port, and it is the stack the dataplane proxy will run on; no active open, no SACK, no congestion control, and no dataplane consumer — [detail](developers/status-detail.md#proxy-tcp-stack) |
+| 10 Gbit/s per dataplane port pair | **open** | nothing has been measured against the target |
+| IOMMU (VT-d) DMA confinement | **open** | bus-master DMA is currently unconfined |
+| Full port role model (management, session-replication, mirror, multiple pairs) | **partial** | a dedicated management port exists, is addressed, answers ARP, ICMP echo and TCP, and is isolated from the dataplane; no other role does — [detail](developers/status-detail.md#full-port-role-model) |
+| Hardware image variants (3/4/6/7-NIC) | **open** | one system description, `systems/qemu-x86_64` |
+| ixgbe (SFP+ 10 Gbit/s) driver | **open** | |
+| Azure netvsc / MANA drivers, Azure NVA (GWLB, VXLAN) | **open** | |
+| Proxmox and bare-metal targets | **open** | QEMU only |
+
+## Recording and persistent storage
+
+| Capability | Status | Notes |
+|---|---|---|
+| First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
+| pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — [detail](developers/status-detail.md#recording-and-download) |
+| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no filtering, so the capture sink is unfiltered and on by default — [detail](developers/status-detail.md#recording-and-download) |
+| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
+| A recording that states its own loss in-band | **open** | `epb_dropcount` is written on every record and is always `0` because nothing feeds it, and no Interface Statistics Block is emitted; loss reaches `/metrics` and never the file — see the [recording design](design/recording.md) |
+| Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
+| Recording the management port | **open** | only the dataplane is tapped, so nothing on the management port — including a download — is recorded |
+| Retention bound and zeroization | **open** | the only bound is the ring's size; there is no time bound and nothing is erased on stop — see the [recording design](design/recording.md) |
+| Rotation and checkpointing on a schedule | **open** | a superblock is written when the recorder decides to, never on a clock |
+| Resuming a recording across a boot | **open** | `Sink::resume` exists and is host-tested; nothing calls it, so a reboot starts a fresh ring over the old bytes |
+| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path — see the [recording design](design/recording.md) |
+| Live event stream, OTEL and syslog exporters as ring readers | **open** | see the [management](design/management.md) and [recording](design/recording.md) designs |
+| Registered Private Enterprise Number | **open** | the annotations are tagged `0xFFFFFFFF`, IANA-reserved so it cannot collide, but not ours — a recording must not leave a customer's premises under it |
+| Storage binding from the configuration document | **open** | the extents are compiled into `lfw_recorder::deck` and the device is the whole of one disk; nothing resolves a partition and no configuration item names one — see the [configuration](design/configuration.md) and [recording](design/recording.md) designs |
+| Decryption Secrets Block (inspected flow as ciphertext plus keys) | **open** | nothing is inspected, so there is no key material — see the [recording design](design/recording.md) |
+
+## High availability
+
+| Capability | Status | Notes |
+|---|---|---|
+| Active/passive pair, failover | **open** | per-environment mechanisms settled in the [deployment design](design/deployment.md) |
+| Batched session-state replication | **open** | |
+| Isolated HA state-sync protection domain | **open** | |
+
+## Management, configuration and observability
+
+| Capability | Status | Notes |
+|---|---|---|
+| Management HTTP API over mTLS | **open** | |
+| Schema-validated XML configuration, hardened validator PD | **partial** | [detail](developers/status-detail.md#configuration-management) |
+| Candidate/commit-confirm transactions, versioning, rollback | **partial** | the candidate/running split and monotonic generations exist; neither rollback nor commit-confirm does — [detail](developers/status-detail.md#configuration-management) |
+| Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
+| Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](developers/status-detail.md#console-device-and-log-transport) |
+| Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
+| OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. No transport, exporter or receiver exists, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS**, and per-core, queue-occupancy and flow-table coverage awaits the subsystems themselves — [detail](developers/status-detail.md#prometheus-metrics) |
+| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium |
+
+## Lifecycle, boot and trust
+
+| Capability | Status | Notes |
+|---|---|---|
+| Signed A/B disk image and slot selection | **partial** | [detail](developers/status-detail.md#ab-image-update) |
+| Signature-enforced boot chain (OVMF → GRUB → Multiboot2 → seL4) | **partial** | [detail](developers/status-detail.md#signed-boot-chain) |
+| In-system update/health protection domain | **open** | nothing inside seL4 holds a capability on the **boot** disk, so nothing can write boot state. The recorder's block device is a second, data-only disk and reaches no partition of the boot one — [detail](developers/status-detail.md#ab-image-update) |
+| Configuration, identity or secrets on persistent storage | **open** | one domain now holds a disk capability, but it writes recordings and nothing else; the DATA partition is still an empty unformatted GPT entry with no consumer and no encryption — [detail](developers/status-detail.md#configuration-management) |
+| UEFI Secure Boot enrolment | **open** | manifest records `secure_boot: false` |
+| TPM-backed anti-rollback | **open** | no TPM anywhere, including the QEMU harness |
+
+## Architecture and assurance
+
+| Capability | Status | Notes |
+|---|---|---|
+| Pure-Rust userspace | **done** | the only C is the seL4 kernel and its boot chain |
+| Least-privilege PD decomposition | **partial** | [detail](developers/status-detail.md#protection-domain-decomposition) |
+| Untrusted-device hardening | **partial** | [detail](developers/status-detail.md#untrusted-device-hardening) |
+| Untrusted-peer (byzantine neighbour) containment | **partial** | [detail](developers/status-detail.md#untrusted-peer-containment) |
+| PD fault handling and restart | **open** | a rejected bring-up parks its domain; nothing restarts it, and there is no fault handler |
+
+## Open decisions and known risks
+
+The design chapters record the settled target picture. The following are, respectively, decisions
+not yet made and known risks. They are recorded here so they are not mistaken for oversights.
+
+### Open decisions
+
+- **Onboarding process** for issuing the management mTLS certificate pair — required; its design is
+  open.
+- **TLS crypto provider** for rustls (pure-Rust vs. an external provider), to be resolved by
+  benchmarking.
+- **CA signing-trust sharing across HA nodes** — required; the form (e.g. per-node intermediate CAs
+  under a common trusted root) is open.
+- **HA-link split-brain arbitration** — witness, quorum, or fencing.
+- **Trusted time source mechanism.**
+- **Proxy vs. cut-through throughput split** — the proportion of traffic on the terminating proxy
+  path, which drives core sizing.
+- **Central configuration management application** (multi-cluster) — built later.
+
+### Known risks
+
+- **x86_64 seL4/Microkit maturity.** x86_64 on Microkit is recent (added in 2.1.0, November 2025)
+  and exposes only generic/QEMU platforms (no dedicated x86 hardware board); x86_64 with
+  SMP is the least-exercised seL4 configuration.
+- **No existing 10 Gbit/s or x86 NIC driver.** The public sDDF tree contains only virtio and
+  Arm-SoC drivers; all NIC drivers (virtio, SFP+ 10G, netvsc, MANA) are implemented from scratch in
+  Rust.
+- **TCP stack effort.** Building a first-party proxy TCP stack is a substantial effort, and it
+  is larger than the one an adopted stack would have left: the correctness of a transport under
+  hostile input, and the years of exposure that establishes it, are what adopting one buys and
+  writing one forgoes. SACK, congestion control, and scaling to many concurrent proxied connections
+  at 10 Gbit/s are each ahead. The trade is deliberate — that effort against a copy per segment —
+  and naming it does not reduce it.
+- **Pure-Rust signature matching at line rate.** Whether the pure-Rust `aho-corasick` /
+  `regex-automata` engines sustain line rate with a realistic ruleset is unproven and needs an
+  early benchmark (as does the crypto provider).
+- **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
+  Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
+  effort, not a single NIC driver.
+- **FPU/SIMD in protection domains.** Dataplane PDs run without FPU/SSE state. Sustaining
+  checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU context for the
+  relevant PDs or staying scalar — a design constraint to resolve when performance work begins.
+- **Full-rate capture of everything is not reachable, and the filter is the sizing control.** A
+  capture sink recording all traffic at the target rate (see the
+  [recording design](design/recording.md)) would have to sustain writes at the dataplane's own
+  rate, which no practical device does and which would consume the medium's write endurance in
+  short order. The sink is therefore sized by its filter rather than by the link, and a filter
+  drawn too broadly yields loss. The loss is reported in-band and is measurable rather than silent,
+  which is the mitigation available — but it remains loss, and choosing filters narrow enough is an
+  operational discipline the appliance can measure and cannot impose.
+- **The throughput target and the recording sinks compete for one memory-bandwidth budget.**
+  Copying frames into a ring and writing them out draws on the same bandwidth the inspection path
+  is already sized to consume. How much recording the target rate can carry is unmeasured, and
+  it is the class of cost that does not appear until both run at once — so it belongs to the same
+  early benchmarking as the crypto provider and the signature engines.

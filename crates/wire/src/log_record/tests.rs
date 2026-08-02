@@ -490,7 +490,7 @@ fn a_field_the_kind_does_not_name_is_read_by_nothing() {
 
 /// The stamp is the one field every shape carries, and its zero must be the
 /// *absence* of a time: a zeroed slot that decoded to the epoch would date every
-/// untouched record 1970-01-01 (ENG-12).
+/// untouched record 1970-01-01, a silently wrong value.
 #[test]
 fn a_zeroed_stamp_is_no_time_rather_than_the_epoch() {
     assert_eq!(
@@ -775,7 +775,7 @@ fn a_prefix_length_word_that_does_not_fit_a_byte_is_refused_rather_than_truncate
     );
 }
 
-/// The OBS-5 boundary: text a hostile writer put in the region reaches an
+/// The console-safety boundary: text a hostile writer put in the region reaches an
 /// operator's terminal unless this decode refuses it, so the alphabet is held
 /// on every text field a record has.
 #[test]

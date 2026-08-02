@@ -182,7 +182,7 @@ fn an_unencodable_event_is_refused_without_touching_the_ring() {
 
 /// A sink already in use further up the same stack refuses rather than
 /// panicking: a protection domain has no unwinder, so a `borrow_mut` that could
-/// fault would trade a log line for the domain (ENG-5).
+/// fault would trade a log line for the domain.
 #[test]
 fn a_sink_already_in_use_refuses_rather_than_faulting() {
     let ring = ring();
@@ -257,7 +257,7 @@ fn a_record_carries_the_instant_the_sinks_clock_gave_it() {
 }
 
 /// A domain emitting before this node has established a time produces the
-/// absence rather than the epoch, which is most of a boot transcript (ENG-12).
+/// absence rather than the epoch, which is most of a boot transcript.
 #[test]
 fn a_domain_with_no_clock_yet_emits_the_absence_and_not_nineteen_seventy() {
     let ring = ring();
@@ -273,7 +273,7 @@ fn a_domain_with_no_clock_yet_emits_the_absence_and_not_nineteen_seventy() {
 proptest! {
     /// However many records a domain offers, the sink accounts for every one of
     /// them: what the reader sees plus what was counted is what was emitted.
-    /// Bounded work and no loss that is not counted (ENG-4, ENG-12).
+    /// Bounded work and no loss that is not counted.
     #[test]
     fn every_emitted_record_is_either_readable_or_counted(count in 0usize..200) {
         let ring = ring();

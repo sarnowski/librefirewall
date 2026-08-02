@@ -7,7 +7,7 @@
 //!
 //! # Adversary
 //!
-//! The management-plane attacker (CONCEPT §7.1). The document is compiled in
+//! The management-plane attacker. The document is compiled in
 //! today, which makes the threat theoretical; the reader is written against a
 //! fully attacker-controlled byte string anyway, because the document will one
 //! day arrive over a network and a parser hardened afterwards is a rewrite.
@@ -25,7 +25,7 @@
 //! A document this domain will not accept leaves the handover region untouched,
 //! so the consumer stays on generation 0 and the appliance comes up forwarding
 //! nothing, visibly. There is deliberately no default configuration behind the
-//! document (ENG-12): a fallback would make a typo indistinguishable from a
+//! document: a fallback would make a typo indistinguishable from a
 //! working appliance until traffic went somewhere nobody intended.
 //!
 //! # The document arrives at build time, or the build fails
@@ -86,7 +86,7 @@ fn init() -> ConfigDomain {
     let mut publisher = ConfigPublisher::new();
 
     // Which state each outcome is, and whether there is anything to offer, are
-    // decided in `config` where they are host-tested (LAY-2).
+    // decided in `config` where they are host-tested.
     let report = config::commit_and_report(&mut store, CONFIG_XML, &mut changes, &sink);
     if let Some(image) = report.image() {
         publisher.offer(handover, &image);

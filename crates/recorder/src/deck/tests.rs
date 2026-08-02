@@ -26,7 +26,7 @@ const ENHANCED_PACKET_BLOCK: u32 = 0x0000_0006;
 /// It is the hostile side of every test here: it refuses submits, fails
 /// transfers and answers jobs nothing is waiting on, which is what makes a
 /// byzantine device something the pass is proved against rather than something
-/// it is assumed away from (TEST-6).
+/// it is assumed away from.
 struct Fake {
     window: Vec<u8>,
     disk: Vec<u8>,
@@ -736,7 +736,7 @@ fn an_unclocked_recorder_states_no_instant_rather_than_a_counter_reading() {
 fn a_segment_reopens_only_once_its_predecessor_is_durable() {
     // `Sink::begin_segment` delegates "call only once the closed segment's
     // bytes are on the device" to its caller and names this pass as the
-    // enforcer (DOC-7). This is that proof: with a medium that refuses every
+    // enforcer. This is that proof: with a medium that refuses every
     // submit, no recording may roll, because a roll would readdress the staging
     // buffer against the next segment while the closed one is still in it.
     let mut medium = Fake::new();
@@ -767,7 +767,7 @@ fn a_segment_reopens_only_once_its_predecessor_is_durable() {
 
 #[test]
 fn a_records_drop_count_states_what_the_tap_ring_lost_before_it() {
-    // The loss a recording states in its own bytes (CONCEPT §15.2). The tap
+    // A recording is meant to state its own loss in-band. The tap
     // ring is deliberately lossy, and a reader learns how much only because the
     // rise in the writer's drop count is carried into the next record's
     // `epb_dropcount` rather than left to a metric taken somewhere else.

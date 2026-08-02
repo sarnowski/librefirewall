@@ -8,13 +8,13 @@
 //!
 //! # Adversary
 //!
-//! Three of CONCEPT §7.1's. A hostile or malfunctioning **block device**: this
+//! Three adversaries. A hostile or malfunctioning **block device**: this
 //! domain maps the device's configuration space, the MMIO window its BAR is
 //! relocated to, the DMA region holding the request virtqueue, and the staging
 //! window payload crosses in, so the capacity it claims, the completions it
 //! publishes, the status bytes it DMAs and the sector contents it answers a
-//! read with are all untrusted. DMA is unconfined — no IOMMU on this platform
-//! (CONCEPT §7.2) — so an address handed to the device is an address it may
+//! read with are all untrusted. DMA is unconfined — this platform has no
+//! IOMMU — so an address handed to the device is an address it may
 //! write. A **byzantine neighbour** on both handovers: the forwarder writes the
 //! tap ring's annotations, and the management domain writes the download
 //! request's sink, offset and length. And **untrusted network traffic**, one
@@ -23,7 +23,7 @@
 //!
 //! # What is decided elsewhere
 //!
-//! Nearly all of it (LAY-2). Which devices are acceptable and how the handshake
+//! Nearly all of it, in host-testable crates. Which devices are acceptable and how the handshake
 //! runs live in `lfw_blk::bringup`; which byte of the staging window a request
 //! may name lives in `lfw_blk::io`; the boot-time proof that the path reaches a
 //! medium lives in `lfw_blk::smoke`; and the whole recording pass — where each
@@ -31,11 +31,11 @@
 //! answered — lives in `lfw_recorder::deck`, against a fake medium that
 //! refuses, fails and forges. What is left here is the [`Medium`]
 //! implementation: it moves bytes and attributes completions, and it is the
-//! LAY-2 residue this package's coverage exclusion records.
+//! layering residue this package's coverage exclusion records.
 //!
 //! # Everything this domain touches is patched in at build time
 //!
-//! Hardware topology is static (CONCEPT §12.3), so this driver performs no PCI
+//! Hardware topology is static, fixed at build time, so this driver performs no PCI
 //! enumeration: it holds capabilities for exactly one function's ECAM page.
 //! Each symbol comes from `systems/qemu-x86_64/librefirewall.system`:
 //!
@@ -61,7 +61,7 @@
 //! NIC drivers and the console, so mutual progress rests on seL4's round-robin
 //! between equal-priority threads. That is why no wait here may be unbounded —
 //! every step of a pass is bounded by a constant of `lfw_recorder`'s or
-//! `lfw_blk`'s and never by anything a peer or the device controls (ENG-4).
+//! `lfw_blk`'s and never by anything a peer or the device controls.
 //!
 //! # The console is a domain, not a print statement
 //!
@@ -106,7 +106,7 @@ const MANAGEMENT: Channel = Channel::new(0);
 
 // The staging layout is `lfw_recorder`'s and the region is `lfw_blk`'s, so this
 // is the one place both are visible and the only place the two can be held to
-// each other (DOC-7).
+// each other.
 const _: () = assert!(
     STAGING_END <= BLK_IO_REGION_SIZE,
     "the recording layout does not fit the blk_io grant"
@@ -295,8 +295,8 @@ fn init() -> Recorder {
                         },
                     );
                     // Where each recording is, so an operator with the disk can
-                    // find it. There is no other way to learn it: no shell, no
-                    // CLI (CONCEPT §11).
+                    // find it. There is no other way to learn it: the node
+                    // has no shell and no CLI.
                     for (start_sector, sectors) in Deck::extents() {
                         announce(
                             &sink,
@@ -327,7 +327,7 @@ fn init() -> Recorder {
     }
 }
 
-/// Record the whole reason and park. With no shell and no CLI (CONCEPT §11)
+/// Record the whole reason and park. With no shell and no CLI on the node
 /// this record is all an operator gets.
 fn refuse(sink: &dyn Sink, error: StartupError) -> Recorder {
     announce(
@@ -473,7 +473,7 @@ fn bring_up(sink: &dyn Sink) -> Result<Started<'static>, StartupError> {
     let queue = unsafe { BlkVirtqueue::new(dma) };
     // SAFETY: the same region and the address `configure_queue` just programmed
     // the device with — and refused had it been zero, misaligned or wrapping,
-    // which is the enforcer `Requests::attach` names for it (DOC-7). The queue
+    // which is the enforcer `Requests::attach` names for it. The queue
     // passed in was built over this very pointer one statement ago, and
     // `xtask::sysdesc` holds the region's `size` equal to `DMA_REGION_SIZE`.
     let mut requests = unsafe { Requests::attach(dma, dma_paddr, queue, capacity_sectors) };
@@ -556,7 +556,7 @@ impl Medium for BlockMedium<'_> {
         let (offset, len) = area.extent();
         // The layout is `lfw_recorder`'s and the assertion above holds it
         // inside the region, so the fallback is unreachable and is a value
-        // rather than a panic (ENG-5).
+        // rather than a panic.
         self.io
             .staging()
             .get_mut(offset..)

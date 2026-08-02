@@ -9,7 +9,7 @@
 //!
 //! # Adversary
 //!
-//! Untrusted network traffic **and** a byzantine neighbour PD (CONCEPT §7.1).
+//! Untrusted network traffic **and** a byzantine neighbour PD.
 //! Every descriptor read here, every byte parsed, and the configuration decided
 //! under were written by another domain or by whatever is attached to a
 //! dataplane port. All three are rejected by a counted drop rather than a fault,
@@ -34,7 +34,7 @@
 //! The forwarding table arrives at run time, and generation 0 — no interfaces,
 //! nothing forwarded — is what this domain runs under until one does: the
 //! absence of policy rather than a default. What is compiled in is the
-//! *wiring* (CONCEPT §12.3).
+//! *wiring*, which the system description fixes at build time.
 //!
 //! Records go to a ring, not `debug_println!` — no `seL4_DebugPutChar` in the
 //! release kernel.
@@ -50,7 +50,7 @@
 //!
 //! Every drop this domain counts reaches one region it is the sole writer of,
 //! which the management domain maps read-only and renders into `GET /metrics`.
-//! The write is at the end of a wakeup and not per frame (OBS-3).
+//! The write is at the end of a wakeup and not per frame, off the hot path.
 
 use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
 use lfw_metrics::StatsShard;
@@ -138,7 +138,7 @@ struct Forwarder {
 impl Forwarder {
     /// Write everything this domain counts into its shard. Assembled in
     /// `pd_runtime::stats`, where a test holds the metric surface's vocabulary
-    /// to the enums it names (LAY-2); this file supplies the log ring's own drop
+    /// to the enums it names; this file supplies the log ring's own drop
     /// counts and the region.
     fn publish(&self) {
         let sample = forwarder_sample(

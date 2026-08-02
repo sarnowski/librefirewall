@@ -11,7 +11,7 @@
 //!
 //! It models the *authority a device has* — any byte, at any register, on any
 //! read, changing between two reads of the same register — and constrains none
-//! of it to what a conforming part would do (TEST-8).
+//! of it to what a conforming part would do.
 //! [`FakePort::conforming`] is the well-behaved baseline; every builder method
 //! takes one capability away from it.
 

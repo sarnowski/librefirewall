@@ -31,7 +31,7 @@
 //!
 //! The kernel configuration is the caller's, and the gate's callers all pass
 //! `release`: that is the image a release publishes, so that is the image every
-//! end-to-end scenario boots (BLD-3). `debug` reaches this module from the
+//! end-to-end scenario boots. `debug` reaches this module from the
 //! `image-debug` opt-in, from `run`, and from a diagnostic re-run.
 
 use std::{
@@ -77,7 +77,7 @@ pub(crate) const CONFIGURATION_DOCUMENT: &str = "systems/qemu-x86_64/configurati
 /// Set at every site that compiles a protection domain, and never given a
 /// default anywhere: `include_bytes!(env!(…))` fails the compilation when it is
 /// absent, which is what keeps "which document did this image ship" a question
-/// with one answer rather than a fallback nobody chose (ENG-12).
+/// with one answer rather than a fallback nobody chose.
 pub(crate) const CONFIG_PATH_VAR: &str = "LIBREFIREWALL_CONFIG_PATH";
 /// Protection-domain binaries the system image is assembled from.
 ///

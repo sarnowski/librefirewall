@@ -1,0 +1,8 @@
+[book]
+title = "librefirewall"
+authors = ["Tobias Sarnowski"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"

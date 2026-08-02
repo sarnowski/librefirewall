@@ -1,6 +1,6 @@
 //! The signed GRUB boot base.
 //!
-//! GRUB is the boot manager (CONCEPT §14.2): a minimal standalone `x86_64-efi`
+//! GRUB is the boot manager: a minimal standalone `x86_64-efi`
 //! core image built with a curated module allowlist
 //! (`third-party/grub/modules.txt`), an immutable embedded configuration
 //! (`third-party/grub/grub.cfg`), and the librefirewall public key baked in —
@@ -105,7 +105,7 @@ fn judge_boot_module_size(system_image: &Path, size: u64, window: u64) -> Result
 ///
 /// Read out of the configuration rather than restated here, so the bound this
 /// build is checked against is the bound the shipped boot manager applies
-/// (DOC-9): one fact, stated once, in the file that acts on it.
+/// — one fact, stated once, in the file that acts on it.
 ///
 /// # Errors
 /// [`Error::Invalid`] when the configuration carries no `cutmem` reservation at

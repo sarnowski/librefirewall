@@ -4,8 +4,8 @@
 //! # The adversary and the surface
 //!
 //! A writing domain owns the records region and the console domain maps it
-//! read-only, so every byte of every slot was chosen by another domain
-//! (CONCEPT §7.1). [`LogRecord::check`] is the console's whole defence against
+//! read-only, so every byte of every slot was chosen by another domain —
+//! a byzantine neighbour. [`LogRecord::check`] is the console's whole defence against
 //! the *shape* of those bytes, [`lfw_log::Event::decode`] its defence against
 //! the vocabulary tokens inside them, and [`lfw_log::render`] is what turns
 //! what survives into bytes on an operator's terminal. All three are driven
@@ -19,7 +19,7 @@
 //! to the whole [`RECORD_BYTES`] — so the fuzzer's bytes *are* the region.
 //! [`record_from_region`] lays the input over the ABI field for field and
 //! zeroes what the input does not reach, which is what a partially written
-//! region holds. Nothing is reduced into a plausible range on the way (TEST-8):
+//! region holds. Nothing is reduced into a plausible range on the way:
 //! record kinds that name no event, vocabulary tokens past their cardinality,
 //! value-type tags that name no value, text lengths past the storage the record
 //! carries, text bytes that are ESC, newline or anything else outside
@@ -40,8 +40,8 @@
 //! alphabet as well, which is what makes an *accepted* record — and so the
 //! render path below — common rather than astronomically rare.
 //!
-//! This widens what is reached without narrowing what is reachable, which is
-//! the distinction TEST-8 turns on: the first check still carries the
+//! This widens what is reached without narrowing what is reachable — the
+//! distinction that matters: the first check still carries the
 //! adversary's full authority on every input, and the committed seeds carry the
 //! ESC, the newline and the over-long text explicitly so those shapes do not
 //! depend on the fuzzer rediscovering them.
@@ -62,7 +62,7 @@
 //!   not name — the count is a bound, not a hint.
 //! * **Every accepted text is within its bound and its alphabet**, which is the
 //!   property the next one rests on.
-//! * **The console line is printable (OBS-5).** The accepted body is decoded
+//! * **The console line is printable.** The accepted body is decoded
 //!   and rendered exactly as `ConsolePrinter` does it, and every byte of the
 //!   line is asserted to be printable ASCII: no control character, no ESC, no
 //!   CR and no LF. This is what stops a hostile writing domain painting
@@ -216,8 +216,8 @@ const ALPHABET: &[u8; 37] = b"abcdefghijklmnopqrstuvwxyz0123456789-";
 /// records still carry arbitrary text bytes on every input, and the committed
 /// seeds carry an ESC sequence and a newline explicitly. What this buys is that
 /// an *accepted* record — the only kind that reaches `decode` and `render` —
-/// stops being astronomically rare, so the OBS-5 property is exercised rather
-/// than merely present.
+/// stops being astronomically rare, so the printable-line property is
+/// exercised rather than merely present.
 fn into_alphabet<const N: usize>(text: &TextImage<N>) -> TextImage<N> {
     let mut folded = *text;
     for byte in &mut folded.bytes {
@@ -272,7 +272,10 @@ fn check_one(record: &LogRecord) {
     );
     let (re_at, re_decoded) =
         Event::<Cause>::decode(&checked).expect("the same record decoded once already");
-    assert_eq!(event, re_decoded, "decoding one record twice gave two events");
+    assert_eq!(
+        event, re_decoded,
+        "decoding one record twice gave two events"
+    );
     assert_eq!(at, re_at, "decoding one record twice gave two instants");
     assert_eq!(
         line,
@@ -284,7 +287,7 @@ fn check_one(record: &LogRecord) {
 /// Render an event the way `ConsolePrinter::print` does and assert every byte
 /// of the resulting console line is one a terminal prints rather than obeys.
 ///
-/// This is the OBS-5 property, and it is the reason this harness chains three
+/// This is the printable-line property, and it is the reason this harness chains three
 /// crates instead of stopping at the check: the bytes came out of a region a
 /// hostile domain owns, and between that region and the UART there is nothing
 /// but the alphabet check in `wire` and the one in `lfw_log`. A byte that
@@ -780,7 +783,7 @@ fn narrowing_refusal(number: u32, which: LogText) -> Option<LogRecordError> {
 /// the slot a writing domain left behind, so a seed can be authored and read as
 /// one; and the mapping stays fixed whatever `arbitrary` does internally, so a
 /// curated regression seed keeps meaning the record it was committed for.
-/// Little-endian because the target is x86_64 and nothing else (CON-4).
+/// Little-endian because the target is x86_64 and nothing else.
 #[must_use]
 pub fn record_from_region(data: &[u8]) -> LogRecord {
     let mut unstructured = Unstructured::new(data);
@@ -1303,7 +1306,7 @@ mod tests {
 
     /// As above, for the newline that would forge a second console line out of
     /// one record. The refusal names the position of the newline within the
-    /// cause and never the byte (OBS-5).
+    /// cause and never the byte, which must not reach a console.
     #[test]
     fn a_newline_in_a_cause_is_refused_at_its_own_offset() {
         let record = record_from_region(&seed("cause_holds_a_newline"));
@@ -1376,7 +1379,7 @@ mod tests {
     /// The derivations are additive: whatever else one input is checked as, the
     /// unmodified region is always among them, so the adversary's full
     /// authority is exercised on every input rather than only on the ones the
-    /// narrowing happens to leave alone (TEST-8).
+    /// narrowing happens to leave alone.
     #[test]
     fn the_unmodified_region_is_always_among_the_records_checked() {
         for (name, bytes) in demonstrations() {
@@ -1393,7 +1396,7 @@ mod tests {
     /// seeds and a sweep of synthetic regions, every one of the four record
     /// kinds is checked and at least one record is accepted. A fold that
     /// produced only refusals would leave the decode and render path — where
-    /// the OBS-5 property lives — permanently unreached, and nothing else here
+    /// the printable-line property lives — permanently unreached, and nothing else here
     /// would say so.
     #[test]
     fn the_narrowing_reaches_every_kind_and_accepts_some_of_them() {

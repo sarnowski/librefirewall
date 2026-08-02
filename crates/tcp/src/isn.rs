@@ -5,9 +5,9 @@
 //!
 //! An off-path attacker who can predict the sequence number a listener will
 //! choose can inject data into a connection it cannot see, and can complete a
-//! handshake as an address it does not hold. Against CONCEPT §7.1's
+//! handshake as an address it does not hold. Against the
 //! **management-plane attacker** that is the difference between needing to be on
-//! the path and not needing to be. RFC 6528 §3's construction is what removes
+//! the path and not needing to be. RFC 6528 section 3's construction is what removes
 //! it: the time component keeps sequence numbers from repeating across
 //! connections on one 4-tuple, and the keyed hash makes the offset between two
 //! *different* 4-tuples unguessable without the key — so observing one
@@ -45,7 +45,7 @@ use net_headers::Ipv4Address;
 
 use crate::seq::SeqNumber;
 
-/// Nanoseconds per tick of RFC 6528 §3's timer, which that section fixes at
+/// Nanoseconds per tick of RFC 6528 section 3's timer, which that section fixes at
 /// 4 microseconds.
 const TIMER_TICK_NANOS: u64 = 4_000;
 
@@ -63,7 +63,7 @@ impl IsnSecret {
     }
 }
 
-/// RFC 6528 §3's `M + F(...)`, over one boot's secret.
+/// RFC 6528 section 3's `M + F(...)`, over one boot's secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IsnGenerator {
     secret: IsnSecret,

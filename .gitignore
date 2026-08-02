@@ -3,6 +3,7 @@
 !/build/container/**
 /dist/
 /target/
+/book/book/
 
 # Key material must never reach a commit, whatever path it is dropped at: the
 # development signing keys under build/dev-keys, and any TLS-inspection CA or

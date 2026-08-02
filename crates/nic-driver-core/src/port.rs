@@ -29,7 +29,7 @@
 //! # Adversaries
 //!
 //! This module adds no distrust boundary of its own; it composes two that
-//! already exist. The **hostile or malfunctioning device** (CONCEPT §7.1) is
+//! already exist. The **hostile or malfunctioning device** is
 //! answered by `virtio::queue` and [`RxPath`], the **byzantine neighbour PD**
 //! (the peer) by [`TxPath`] and `pd_runtime::PoolOwner`. What this module
 //! must not do is reintroduce an unbounded loop between them.
@@ -118,7 +118,7 @@ pub struct NicPort<'ring> {
 impl<'ring> NicPort<'ring> {
     /// Take every handle this port needs and move both virtqueues in.
     ///
-    /// **Unenforced precondition (DOC-7):** call once per protection domain.
+    /// **Unenforced precondition:** call once per protection domain.
     /// Every handle taken here is this domain's own position in a ring, so a
     /// second port over the same pipelines restarts at slot zero and re-walks
     /// slots already used. No type refuses the second call; `queue`'s crate
@@ -202,7 +202,7 @@ impl<'ring> NicPort<'ring> {
         }
     }
 
-    /// Sample this port in the shape the metrics endpoint (CONCEPT §11)
+    /// Sample this port in the shape the appliance's metrics endpoint
     /// scrapes.
     #[must_use]
     pub fn stats(&self) -> DriverStats {
@@ -259,10 +259,10 @@ mod tests {
     /// emits a `Unique` retag over the allocation, which pops the tag the
     /// virtqueue was built from and makes every later driver access undefined
     /// behaviour — while the fixture goes on claiming to prove the driver's
-    /// conduct against a hostile device (TEST-6). Owning the allocation as a
+    /// conduct against a hostile device. Owning the allocation as a
     /// raw pointer leaves no `Box` to move and so no ordering to get wrong,
-    /// which is what makes that unrepresentable rather than a rule to remember
-    /// (DOC-9).
+    /// which is what makes that unrepresentable rather than a rule to
+    /// remember.
     struct VqRegion {
         page: *mut VqPage,
     }

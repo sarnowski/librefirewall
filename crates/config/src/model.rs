@@ -44,7 +44,7 @@ pub struct NeighbourEntry {
 }
 
 /// The `<management>` element: the appliance's own presence on the port
-/// CONCEPT §9.1 keeps out of the dataplane. It carries no `id` and no `port` —
+/// the design keeps out of the dataplane. It carries no `id` and no `port` —
 /// one such port, not in the router's set, so neither has anything to select.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagementEntry {

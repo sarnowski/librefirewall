@@ -2,7 +2,7 @@
 //! through the shared reference a mapped region is the only kind of reference
 //! to.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1). A peer can write
+//! Faces the byzantine neighbour protection domain. A peer can write
 //! any slot at any moment, and a non-atomic access racing with that write is
 //! undefined behaviour — which would let the compiler assume the memory cannot
 //! change underneath it. Atomic accesses cannot race by definition, so the
@@ -17,7 +17,7 @@
 //!
 //! Nothing here is public. A caller that could reach a field could choose its
 //! own `Ordering`, and which ordering each word carries is a property of the
-//! transport rather than a convention its users are asked to keep (DOC-9) —
+//! transport rather than a convention its users are asked to keep —
 //! so the region is reached through [`crate::LogRecords`]'s handles alone.
 //!
 //! Accesses are `Relaxed`: all the ordering a record needs is the

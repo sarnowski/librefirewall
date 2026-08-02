@@ -99,7 +99,7 @@ mod tests {
     use std::{format, string::String};
     use wire::{MAX_INTERFACES, MAX_NEIGHBOURS};
 
-    /// The document from CONTRACTS.md §4b plus a second interface, so both
+    /// The canonical contract configuration document plus a second interface, so both
     /// ports this build has are named and a neighbour resolves onto one of
     /// them rather than onto the only interface there is.
     const TWO_PORTS: &str = concat!(

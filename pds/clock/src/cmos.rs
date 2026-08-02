@@ -3,7 +3,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device** — the part, which may
+//! The **hostile or malfunctioning device** — the part, which may
 //! answer anything or never settle. Nothing here judges it: every byte goes
 //! straight to `lfw_rtc`, which bounds each wait, ranges each field, and takes
 //! two agreeing snapshots before decoding anything. No peer domain and no
@@ -27,7 +27,7 @@
 //! can be granted except this one — `channel.rs` declares
 //! `BASE_OUTPUT_NOTIFICATION_SLOT`, `BASE_ENDPOINT_SLOT`, `BASE_IRQ_SLOT` and
 //! `BASE_TCB_SLOT` and no ioport base, and the one ioport symbol it reads is
-//! `pub(crate)` and `dead_code`. ENG-8 says prefer the framework; there is
+//! `pub(crate)` and `dead_code`. The framework is to be preferred; there is
 //! nothing to prefer, so the slot is stated below and [`Cmos::claim`] proves it.
 //!
 //! **The number is this domain's own, and it must be read as this domain's even
@@ -44,13 +44,13 @@ use sel4::sys::{seL4_CPtr, seL4_Error};
 
 /// Microkit's CNode slot for this domain's first I/O-port capability.
 ///
-/// **Cross-artifact (DOC-7).** Nothing here can check this at build time: the
+/// **Cross-artifact fact.** Nothing here can check this at build time: the
 /// Microkit tool chooses it and emits no header for it. Two things enforce it,
 /// exactly as they do for the console's own slot.
 ///
 /// *Detection* is the pinned SDK. `MICROKIT_VERSION=2.3.0` in
-/// `third-party/sources.lock` is checksum-verified on every build (DEP-1) and
-/// moves only through a change that runs the whole gate (DEP-3); `xtask image`
+/// `third-party/sources.lock` is checksum-verified on every build and
+/// moves only through a change that runs the whole gate; `xtask image`
 /// then writes the slot that SDK actually assigned into
 /// `build/image/<config>/report.txt`, under `cnode_clock`, where
 /// `ioports_0x70_clock` stands at slot 394 — which is where this number came
@@ -89,7 +89,7 @@ pub struct PortFault {
 /// capability.
 ///
 /// It carries neither port number nor capability pointer: both are fixed by the
-/// system description (CONCEPT §12.3), so a field would be a second, unchecked
+/// system description, fixed at build time, so a field would be a second, unchecked
 /// statement of [`CMOS_IOPORT`] and of `lfw_rtc`'s own port constants. The
 /// private unit field makes [`claim`](Self::claim) — and so the probe — the
 /// only way to obtain one.
@@ -99,7 +99,7 @@ impl Cmos {
     /// Prove the capability answers for both ports the driver can address, and
     /// take it.
     ///
-    /// This is the check that replaces a #GP with a verdict (ENG-12), and the
+    /// This is the check that replaces a #GP with a verdict, and the
     /// window is the whole of `lfw_rtc`'s demand: [`INDEX_PORT`] and
     /// [`DATA_PORT`] are the only two addresses that crate forms, and its
     /// `PORT_COUNT` const-assertion holds them adjacent and the pair aligned.
@@ -156,7 +156,7 @@ impl CmosPortIo for Cmos {
 /// Invoke `seL4_X86_IOPort_In8` and turn the kernel's verdict into a `Result`.
 ///
 /// The verdict stays a raw code rather than becoming `sel4::Error`, which would
-/// otherwise be the framework's type to prefer (ENG-8): `sel4::Error::from_sys`
+/// otherwise be the framework's type to prefer: `sel4::Error::from_sys`
 /// panics on a code outside the ten it knows, and a diagnosis that faults on an
 /// unfamiliar answer is the failure mode this file replaces.
 fn in8(port: u16) -> Result<u8, seL4_Error::Type> {

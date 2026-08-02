@@ -1,15 +1,15 @@
 //! The geometry and on-disk metadata of a segmented recording ring on a block
-//! device (CONCEPT §15.4): where a record's bytes belong on the medium, and
+//! device: where a record's bytes belong on the medium, and
 //! what the superblock beside them says about the ring's identity and every
 //! cursor into it.
 //!
 //! Faces a hostile or malfunctioning device and the byzantine peer protection
-//! domain (CONCEPT §7.1). Two of the inputs are adversarial and neither looks
+//! domain. Two of the inputs are adversarial and neither looks
 //! it. A record length is a captured frame's own size, so whoever sent the
 //! frame chose it, and it reaches the segment arithmetic, the wrap decision and
 //! the caller's write bound at once. A superblock is whatever bytes the medium
 //! hands back — a device returning a neighbouring sector, a slot the other
-//! image wrote (CONCEPT §14.2), or an extent composed offline by someone who
+//! A/B image wrote, or an extent composed offline by someone who
 //! had the disk. Nothing here panics, indexes past a bound or wraps an
 //! arithmetic operation on either, and a superblock that does not describe
 //! *this* ring is refused by name rather than adopted.
@@ -26,7 +26,7 @@
 //!
 //! [`Ring::append`] hands back a [`Reservation`] borrowing the ring mutably,
 //! and publishes the record only when [`Reservation::commit`] consumes it.
-//! Three mistakes are unrepresentable rather than checked (DOC-9): committing
+//! Three mistakes are unrepresentable rather than checked: committing
 //! twice, because `commit` takes `self`; committing a placement the ring has
 //! since moved past, because the reservation's `&mut Ring` is the only handle
 //! to the ring while it lives, so nothing can append or roll underneath it; and
@@ -43,7 +43,7 @@
 //! `append` and trusting the caller to write afterwards — publishes bytes the
 //! medium may never receive, and a reader is then handed that hole as live
 //! history. A capture that silently omits is worse than one that states what it
-//! omitted (CONCEPT §15.2); this is the same choice one layer down.
+//! omitted, as the recording design holds; this is the same choice one layer down.
 //!
 //! # One decision, reached two ways
 //!
@@ -72,13 +72,13 @@
 //! Every rejection here names what was refused and why: a [`GeometryError`]
 //! per rule, a [`Fit::Oversized`] carrying both the record and the segment
 //! payload it could not fit, a [`Located::Overrun`] carrying the number of
-//! segments a reader was overtaken by — the gap CONCEPT §15.4 wants as a number
+//! segments a reader was overtaken by — the gap that must be a measured number
 //! rather than a suspicion — and a [`RingStateError`] per superblock field. No
 //! path clamps a cursor into range, substitutes a default geometry or silently
-//! restarts a ring whose superblock it could not use (ENG-12).
+//! restarts a ring whose superblock it could not use.
 //!
 //! The one saturation is [`Cursor::sequence`], and it is not a fallback: at one
-//! [`MIN_SEGMENT_BYTES`] segment per roll and the 10 Gbit/s of CONCEPT §4, a
+//! [`MIN_SEGMENT_BYTES`] segment per roll and the targeted 10 Gbit/s, a
 //! `u64` runs out after some ten million years, and saturating rather than
 //! wrapping is chosen so that the unreachable case stalls visibly — a
 //! [`RingCounters::segments_rolled`] still climbing against a frozen sequence —
@@ -96,7 +96,7 @@
 //! * **The medium's format is not this crate's.** A segment begins with a
 //!   caller-supplied prologue of a known length and continues with appendable
 //!   payload; that the prologue is a pcapng Section Header Block and its
-//!   interface set (CONCEPT §15.2) is the encoder's business and is nowhere
+//!   interface set is the encoder's business and is nowhere
 //!   assumed here.
 
 #![cfg_attr(not(test), no_std)]
@@ -136,9 +136,9 @@ pub const MIN_PAYLOAD_SEGMENTS: u64 = 2;
 
 // The conversions between `u64` and `usize` in this crate are written as `as`
 // rather than a fallible `try_from` whose error arm no target could reach.
-// x86_64 is the only target (CONCEPT §3, CON-4), and this is the check that
-// makes the casts lossless in both directions rather than a comment claiming
-// they are (DOC-9).
+// x86_64 is the only target this project accommodates, and this is the check
+// that makes the casts lossless in both directions rather than a comment
+// claiming they are.
 const _: () = assert!(usize::BITS == 64);
 
 /// A ring's fixed geometry over a contiguous extent of one block device,
@@ -470,7 +470,7 @@ pub enum Located {
     Live(Placement),
     /// Overtaken. The writer has wrapped past this sequence, `gap` segments
     /// ago, and `oldest` is the first sequence still on the medium — the
-    /// resynchronisation point, and the measured loss CONCEPT §15.4 asks for.
+    /// resynchronisation point, and the measured loss a reader is owed.
     Overrun { gap: u64, oldest: u64 },
     /// A position this ring has not written: ahead of the write cursor, or past
     /// the end of a segment. Not loss — a cursor no writer here produced, which
@@ -478,7 +478,7 @@ pub enum Located {
     Unwritten,
 }
 
-/// Saturating, monotone counts for the metrics of MONITORING.md.
+/// Saturating, monotone counts backing the exposed ring metrics.
 ///
 /// One [`Ring`] is one party's view of an extent, so a writer's ring leaves
 /// [`Self::reader_overruns`] at zero and a reader's leaves the append counts
@@ -522,7 +522,7 @@ impl Ring {
     /// refused, because it needs no fallible constructor to be visible: every
     /// non-empty append then returns [`Fit::Oversized`] carrying
     /// `segment_payload: 0`, which names the misconfiguration at the point it
-    /// bites and counts it (ENG-12).
+    /// bites and counts it.
     #[must_use]
     pub const fn new(geometry: Geometry, prologue_len: usize) -> Self {
         Self {
@@ -548,7 +548,7 @@ impl Ring {
     ///
     /// Takes a [`CheckedState`] rather than a [`RingState`], so a superblock
     /// that was never checked against this deployment's geometry cannot reach a
-    /// ring at all (DOC-9): [`RingState::check`] is the only way to obtain one.
+    /// ring at all: [`RingState::check`] is the only way to obtain one.
     ///
     /// A stored cursor sitting below `prologue_len` — a ring resumed under a
     /// longer prologue than it was written with — leaves the open segment more
@@ -723,7 +723,7 @@ impl Ring {
     /// the medium, and no later caller can recover it from an
     /// [`Located::Overrun`] it forgot to count. Leaving the count to the caller
     /// would make measured loss depend on the caller remembering, which is the
-    /// silent omission CONCEPT §15.2 rules out.
+    /// silent omission a recording must never make.
     pub fn locate(&mut self, sequence: u64, offset: usize) -> Located {
         let (oldest, newest) = self.readable();
         if sequence < oldest {

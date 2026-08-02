@@ -250,7 +250,7 @@ fn every_domain_detail_shape_survives_the_crossing() {
 
 /// A `CheckedBody` is a public value with public fields, so a token past this
 /// build's variants is reachable however tightly `wire` bounds its own. Every
-/// one is a named refusal rather than an index into the array (ENG-5).
+/// one is a named refusal rather than an index into the array.
 #[test]
 fn a_token_past_the_last_variant_is_a_typed_refusal() {
     let detail = CheckedDetail::None;
@@ -821,7 +821,7 @@ proptest! {
 
     /// Arbitrary region bytes: whatever a byzantine writer puts in a record,
     /// the pair of checks is a decoded event or a typed refusal, and never a
-    /// panic (ENG-5).
+    /// panic.
     #[test]
     fn arbitrary_record_bytes_decode_or_refuse(
         features in any::<u64>(),

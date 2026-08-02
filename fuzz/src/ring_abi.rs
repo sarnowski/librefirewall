@@ -5,11 +5,11 @@
 //! `SpscRing`'s two cursors and its slot array are **private fields**, and that
 //! is correct: no first-party code should reach them. A peer protection domain
 //! is under no such constraint. It maps the very same region read-write
-//! (CONCEPT §7.1, and `pd_runtime`'s `attach_region!` states the aliasing set
+//! (`pd_runtime`'s `attach_region!` states the aliasing set
 //! explicitly), so every one of those words is a plain address it can store to
 //! at any moment. A harness that could not write them would be modelling a
-//! *polite* peer and would exclude the entire adversarial region — the TEST-8
-//! failure this workspace exists to correct.
+//! *polite* peer and would exclude the entire adversarial region — the
+//! harness failure mode this workspace exists to correct.
 //!
 //! So the peer is reproduced the way the peer really works: through the
 //! ring's `#[repr(C)]` ABI, with atomic stores, exactly as `pd_runtime`'s and
@@ -43,8 +43,8 @@
 //! word**, not one descriptor. That distinction is the whole of the torn-read
 //! hazard the `queue` crate names ("a concurrent peer write can yield a
 //! descriptor whose four fields come from different writes"), and a view that
-//! could only store whole descriptors would have excluded it — TEST-8, because
-//! a *conforming* peer publishes whole descriptors and only a byzantine one
+//! could only store whole descriptors would have excluded the adversary's
+//! real capability: a *conforming* peer publishes whole descriptors and only a byzantine one
 //! leaves a slot half-rewritten.
 //!
 //! [`SlotField::Verdict`] is the one word no first-party producer can put an
@@ -81,7 +81,7 @@ const WORDS_PER_SLOT: usize = 4;
 ///
 /// An enum rather than an index, so no caller can name a fifth word: the
 /// bound `store_slot_field`'s safety argument rests on is carried by the type
-/// instead of by a check the caller is trusted to have made (DOC-9).
+/// instead of by a check the caller is trusted to have made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotField {
     Buffer,

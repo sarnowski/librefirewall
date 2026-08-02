@@ -1,6 +1,6 @@
 //! The signed A/B GPT disk: on-disk layout and assembly.
 //!
-//! The deployable artifact is a fixed-layout GPT image (see CONCEPT §14.1). The
+//! The deployable artifact is a fixed-layout GPT image. The
 //! partitions are placed at fixed, 1 MiB-aligned offsets so the byte offsets the
 //! partition writes seek to match the sector ranges handed to `sgdisk` exactly —
 //! the layout is const data, not discovered at runtime, which is what lets
@@ -45,7 +45,7 @@ const DISK_SIZE_MIB: u64 = 128;
 
 /// The GPT layout of the deployable disk. `SLOTA` and `SLOTB` are the two
 /// software slots; `STATE` carries the mutable boot-selection env; `DATA` is
-/// reserved for configuration and secrets (CONCEPT §14.1) and is deliberately
+/// reserved for configuration and secrets and is deliberately
 /// left as a bare GPT partition with no filesystem — no in-system component
 /// maps it yet, so [`write_disk`] lays down its partition entry but writes no
 /// image into it.

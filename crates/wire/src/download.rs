@@ -1,9 +1,9 @@
 //! The recording download channel: a one-outstanding-request window through
 //! which the management domain reads a recording sink it cannot reach itself.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1) from both sides,
+//! Faces the byzantine neighbour protection domain from both sides,
 //! and behind the responder the block device — a hostile or malfunctioning
-//! device (§7.1) one indirection away, since what the recorder publishes here
+//! device one indirection away, since what the recorder publishes here
 //! is what that medium returned. Nothing on this side judges the bytes: whether
 //! a window is a valid pcapng segment is the reader's question, and it is asked
 //! of an artifact rather than of a region.
@@ -11,8 +11,8 @@
 //! # Why the channel exists at all
 //!
 //! The recorder owns the block device and is the only domain that can read the
-//! rings on it (CONCEPT §15). The management domain serves `GET` of a recording
-//! as pcapng (§12) and owns no storage capability. Handing management the
+//! rings on it. The management domain serves `GET` of a recording
+//! as pcapng and owns no storage capability. Handing management the
 //! device instead would put an HTTP surface on the same domain as the medium
 //! holding every recorded payload, which is the one grant this split exists to
 //! withhold.
@@ -27,7 +27,7 @@
 //! merely a wrong answer.
 //!
 //! The handles carry that asymmetry rather than restating it: each reaches the
-//! other's region only through a view with no store on it (DOC-9).
+//! other's region only through a view with no store on it.
 //!
 //! # The sequence number is the whole correlation
 //!
@@ -69,7 +69,7 @@
 //!   [`DownloadDemand::len`] before the recorder can size a read from it.
 //! * **A hostile responder cannot make management read past the window.** The
 //!   published length is checked against the window and against what was
-//!   actually asked for, and both refusals are counted (ENG-4).
+//!   actually asked for, and both refusals are counted.
 //! * **A status outside the closed set is a fault, not a success.** There is no
 //!   value of the word that means "assume it worked".
 
@@ -112,7 +112,7 @@ pub const DOWNLOAD_REPLY_REGION_SIZE: usize =
 
 /// Which recording a request names.
 ///
-/// The two sinks of CONCEPT §15.1, and the reason there are exactly two is
+/// The appliance's two recording sinks, and the reason there are exactly two is
 /// there: they are separate rings because their rates differ by three to four
 /// orders of magnitude, so a traffic burst cannot evict connection history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,8 +152,8 @@ impl DownloadSink {
 ///
 /// The decoded form is [`DownloadPoll`], which splits this into the case that
 /// carries bytes and the cases that cannot — so a refusal accompanied by a
-/// length is a fault rather than something a caller has to remember not to read
-/// (DOC-9). This enum is the wire encoding, and exists in the public surface
+/// length is a fault rather than something a caller has to remember not to
+/// read. This enum is the wire encoding, and exists in the public surface
 /// because an implementation of either side needs the numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadStatus {
@@ -208,7 +208,7 @@ impl DownloadStatus {
 ///
 /// A separate type so [`DownloadResponder::refuse`] cannot publish a success
 /// and [`DownloadPoll::Refused`] cannot carry one — the encoding's one word
-/// becomes two shapes that mean different things (DOC-9).
+/// becomes two shapes that mean different things.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadRefusal {
     NotReady,
@@ -249,7 +249,7 @@ impl DownloadRefusal {
 ///
 /// Every field is private and no accessor reaches one, so the ordering each
 /// word carries is a property of this type rather than a convention its two
-/// domains are asked to keep (DOC-9).
+/// domains are asked to keep.
 #[repr(C)]
 pub struct DownloadRequest {
     sequence: AtomicU32,
@@ -365,7 +365,7 @@ impl Default for DownloadReply {
 ///
 /// A module of their own, and that is the whole mechanism: the borrow each view
 /// wraps is private to it, so nothing outside — including the two handles in the
-/// parent — can reach past a view to the region behind it (DOC-9).
+/// parent — can reach past a view to the region behind it.
 mod peer {
     use core::sync::atomic::Ordering;
 
@@ -442,7 +442,7 @@ use peer::{PeerReply, PeerRequest};
 /// [`DownloadRequester::request`]: the sequence number a reply must match
 /// cannot be conjured, duplicated, or kept across an answer, so "believe only
 /// the reply to the request you made" is a property of the type rather than a
-/// discipline (DOC-9).
+/// discipline.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "a request nothing polls is a download that never completes"]
 pub struct PendingDownload {
@@ -491,8 +491,8 @@ pub enum DownloadPoll<'buf> {
     /// No reply to *this* request yet — either the recorder has not answered or
     /// what is in the region answers something else. The handle comes back so
     /// the caller can poll again; this is one attempt, and a caller that spins
-    /// on it has written the unbounded loop the single attempt exists to avoid
-    /// (ENG-4).
+    /// on it has written the unbounded loop the single attempt exists to
+    /// avoid.
     Outstanding(PendingDownload),
     /// The recorder served the request. `bytes` is the window it published,
     /// already bounded by both what the window holds and what was asked for.
@@ -646,7 +646,7 @@ impl DownloadRequester<'_> {
 /// Consumed by [`DownloadResponder::deliver`] and
 /// [`DownloadResponder::refuse`], so one demand produces exactly one reply: a
 /// second answer would publish a window under a sequence the requester has
-/// already read (DOC-9).
+/// already read.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "a demand nothing answers leaves the requester waiting"]
 pub struct DownloadDemand {
@@ -681,7 +681,7 @@ impl DownloadDemand {
     }
 
     /// How many bytes to read, already clamped to [`DOWNLOAD_WINDOW_LEN`], so
-    /// no request can size a read beyond what a reply could carry (ENG-4).
+    /// no request can size a read beyond what a reply could carry.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len as usize
@@ -796,12 +796,12 @@ impl DownloadResponder<'_> {
 }
 
 // Two cross-PD shared-memory ABIs: pin both layouts so a field reorder or a size
-// change is a compile error rather than a silently corrupted mapping (TEST-5).
+// change is a compile error rather than a silently corrupted mapping.
 const _: () = {
     use core::mem::{align_of, offset_of};
 
     // Every published length is compared as a `u32` and then used as a `usize`,
-    // which is exact only while a `usize` is at least as wide (CONCEPT §3).
+    // which is exact only while a `usize` is at least as wide; x86_64's is.
     assert!(size_of::<usize>() >= size_of::<u32>());
     assert!(DOWNLOAD_WINDOW_LEN <= u32::MAX as usize);
     assert!(DOWNLOAD_WINDOW_LEN > 0);

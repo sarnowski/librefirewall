@@ -746,7 +746,7 @@ fn an_unconfigured_node_declares_the_family_and_carries_no_series() {
     );
 }
 
-/// The family is a gauge and carries no `_total`, because MONITORING.md's
+/// The family is a gauge and carries no `_total`, because the exposed
 /// counter semantics are statements about counters and a constant is none of
 /// them.
 #[test]

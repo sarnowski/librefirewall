@@ -3,10 +3,10 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **management-plane attacker**, with nothing in between. Every
-//! byte here is that party's, and so is *where the segments fall* — which is the
-//! authority a harness that fed the whole buffer at once would model away
-//! (TEST-8). Request smuggling is exactly a disagreement about where a message
+//! The **management-plane attacker**, with nothing in between. Every
+//! byte here is that party's, and so is *where the segments fall* — which is
+//! the authority a harness that fed the whole buffer at once would model
+//! away. Request smuggling is exactly a disagreement about where a message
 //! ends, so a parser whose verdict depended on the segmentation would be one an
 //! attacker could steer.
 //!

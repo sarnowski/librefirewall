@@ -2,7 +2,7 @@
 //!
 //! # The adversaries and the surface
 //!
-//! Two distrust boundaries meet in the driver PD (CONCEPT §7.1), and this is
+//! Two distrust boundaries meet in the driver PD, and this is
 //! the only harness that drives them together, which is the point: the
 //! interesting failures are the ones where a device completion and a peer
 //! descriptor interact.
@@ -34,8 +34,8 @@
 //! after nothing was done is an MMIO write or a peer notification for no
 //! reason, which on a shared bus is cost the adversary chose. Each call below
 //! is therefore bracketed and its answer compared with what actually moved,
-//! rather than discarded — discarding it is the "it did not panic" shape TEST-9
-//! names.
+//! rather than discarded — discarding it would prove nothing beyond "it did
+//! not panic".
 //!
 //! # What the adversary may express here
 //!
@@ -122,7 +122,7 @@ const TX_POOL_PADDR: u64 = 0x3200_0000;
 /// plain shared memory to a peer, and the values that decode to *nothing* are
 /// precisely the ones the transmit path has to account for separately — so the
 /// draw weights the two decodable values against the rest of the space rather
-/// than excluding either side of it (TEST-8).
+/// than excluding either side of it.
 fn any_descriptor(unstructured: &mut Unstructured<'_>) -> Descriptor {
     let buffer = any_u32(unstructured);
     let offset = any_u32(unstructured);
@@ -457,7 +457,7 @@ pub fn driver_paths_harness(data: &[u8]) {
                     // The span is biased so the valid path is reached; the
                     // verdict is not, because the two values that decode are
                     // two of four billion and a bias towards them is exactly
-                    // what would delete the undecodable case (TEST-8). It is
+                    // what would delete the undecodable case. It is
                     // instead drawn from a distribution that weights all three
                     // outcomes, in `any_descriptor`.
                 }

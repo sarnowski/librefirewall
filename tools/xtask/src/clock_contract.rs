@@ -61,7 +61,7 @@ pub(crate) fn judge(serial: &[u8], log: &Path) -> Result<String, String> {
             "the clock domain refused to establish a time: {record:?}. The cause token names \
              which of the three stages refused — `hpet-` the timer block, `tsc-` the \
              measurement, `rtc-` the real-time clock, `cmos-ioport-` the port capability \
-             itself — and MONITORING.md lists what each one's operands are.\n  full run log: {}",
+             itself — and the book's reference section lists what each one's operands are.\n  full run log: {}",
             log.display()
         ));
     }
@@ -120,7 +120,7 @@ fn value<'a>(record: &'a str, key: &str, log: &Path) -> Result<&'a str, String> 
     field_value(record, key).ok_or_else(|| {
         format!(
             "{record:?} carries no `{key}=` field, and the clock domain's ready record is \
-             specified with one (MONITORING.md)\n  full run log: {}",
+             specified with one\n  full run log: {}",
             log.display()
         )
     })
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn a_record_that_did_not_begin_its_line_is_still_recovered() {
-        // MONITORING.md's obligation, which the debug kernel's own output makes
+        // The contract's obligation, which the debug kernel's own output makes
         // real: a record preceded on its line by kernel prose is still a record.
         let torn = capture(&format!("Bootstrapping node #0{READY}"));
         judge(torn.as_bytes(), log()).expect("a record that shares its line with prose");

@@ -5,7 +5,7 @@
 //!
 //! Every byte read here — the configuration-space ids, the capability chain,
 //! the BAR type bits, the feature bitmap, the `device_status` readback, the
-//! queue count, each queue's `queue_notify_off` — is written by CONCEPT §7.1's
+//! queue count, each queue's `queue_notify_off` — is written by a
 //! **hostile or malfunctioning device**. A merely broken device produces the
 //! same bytes as a malicious one, so both are answered the same way: a typed
 //! [`BringUpError`] naming the cause. A driver protection domain that cannot
@@ -13,7 +13,7 @@
 //!
 //! # Why the sequence is a typestate
 //!
-//! virtio 1.0 §3.1.1 fixes the initialization order, and getting it wrong is
+//! virtio 1.0 section 3.1.1 fixes the initialization order, and getting it wrong is
 //! silent: a device whose features are written before `DRIVER` is set, or which
 //! is told `DRIVER_OK` before its virtqueues carry addresses, misbehaves as a
 //! dead link rather than as an error, so no readback distinguishes the two.
@@ -37,7 +37,7 @@ pub const TX_QUEUE: u16 = 1;
 
 /// Descriptors per virtqueue: a driver constant rather than the device-reported
 /// queue maximum, so a loop bounded by it is bounded by a value the adversary
-/// does not choose (ENG-4).
+/// does not choose.
 pub const QUEUE_SIZE: usize = 16;
 
 /// Byte offset of the transmit virtqueue within the virtqueue DMA region; the
@@ -46,7 +46,7 @@ pub const TX_VQ_OFFSET: usize = 0x800;
 
 /// Size of the virtqueue DMA region a driver protection domain maps.
 ///
-/// **Cross-artifact (DOC-7):** equal to the `size` attribute of the `vq0`/`vq1`
+/// **Cross-artifact fact:** equal to the `size` attribute of the `vq0`/`vq1`
 /// memory regions in `systems/qemu-x86_64/librefirewall.system`, which
 /// `xtask::sysdesc` reads back and holds to this constant in the fast gate and
 /// again before the image is assembled — proved by its
@@ -59,7 +59,7 @@ pub const VQ_REGION_SIZE: usize = 0x1000;
 /// [`Identified::place_bar`] requires of the address the BAR is relocated to —
 /// so the mapped window and the decoded window describe the same bytes.
 ///
-/// **Cross-artifact (DOC-7):** as [`VQ_REGION_SIZE`], equal to the `size` of
+/// **Cross-artifact fact:** as [`VQ_REGION_SIZE`], equal to the `size` of
 /// the `bar0`/`bar1` regions in `systems/qemu-x86_64/librefirewall.system`,
 /// and held to it by the same check and the same test.
 pub const BAR_WINDOW_SIZE: usize = 0x4000;
@@ -88,9 +88,9 @@ const _: () = assert!(pci::COMMON_CFG_MIN_LEN <= BAR_WINDOW_SIZE);
 /// Why bring-up refused to continue.
 ///
 /// Each variant carries the value that caused the rejection: an operator with
-/// no shell (CONCEPT §11) can only tell a device that exposes no capability
+/// no shell on this appliance can only tell a device that exposes no capability
 /// list from one whose chain loops if the two produce different console lines,
-/// and a single "bring-up failed" is the collapse ENG-12 names.
+/// and a single "bring-up failed" would swallow that distinction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BringUpError {
     NotVirtioNet {
@@ -130,7 +130,7 @@ pub enum BringUpError {
     NoVirtio1 {
         offered: u64,
     },
-    /// The device cleared `FEATURES_OK` on readback; virtio 1.0 §3.1.1 requires
+    /// The device cleared `FEATURES_OK` on readback; virtio 1.0 section 3.1.1 requires
     /// initialization to stop here.
     FeaturesRejected {
         status: u8,
@@ -158,7 +158,7 @@ pub enum BringUpError {
 impl BringUpError {
     /// Whether `STATUS_FAILED` was written to the device before this error was
     /// returned — which of two states the device was left in, for the console
-    /// line an operator reads (MONITORING.md).
+    /// line an operator reads.
     ///
     /// False for every rejection raised before [`PlacedBar::map`]: the status
     /// register lives in the common-configuration structure inside a BAR that
@@ -420,7 +420,7 @@ impl VirtioDevice for MappedDevice {
 /// Identify the device at the pinned function and validate everything about it
 /// that can be checked before its BAR is placed.
 ///
-/// **This function is the enforcer the rest of the chain names (DOC-7).** Both
+/// **This function is the enforcer the rest of the chain names.** Both
 /// device-offset checks — `VirtioCaps::within(BAR_WINDOW_SIZE)` for the extent
 /// and `VirtioCaps::common_is_aligned` for the alignment — are made here, and
 /// every later state is reachable only through the [`Identified`] this returns,
@@ -521,8 +521,7 @@ impl PlacedBar {
     /// [`identify`] is their enforcer, proved by
     /// `a_structure_outside_the_mapped_window_is_refused_before_any_dereference`
     /// and
-    /// `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`
-    /// (DOC-7).
+    /// `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`.
     #[must_use]
     pub unsafe fn map(self, bar_base: *mut u8) -> Offered<MappedDevice> {
         // SAFETY: `CommonCfg::new` requires `COMMON_CFG_MIN_LEN` readable and
@@ -566,7 +565,7 @@ impl<D: VirtioDevice> Offered<D> {
     /// to drive it (`ACKNOWLEDGE`, then `ACKNOWLEDGE | DRIVER`).
     ///
     /// Both writes are cumulative ORs of the bits set so far, as virtio 1.0
-    /// §3.1.1 requires: the device latches the status byte as written, so
+    /// section 3.1.1 requires: the device latches the status byte as written, so
     /// setting `DRIVER` alone would retract `ACKNOWLEDGE`. A refused reset
     /// writes `STATUS_FAILED` before returning.
     pub fn acknowledge(self) -> Result<Acknowledged<D>, BringUpError> {
@@ -778,9 +777,9 @@ mod tests {
     /// through the raw pointer, and such a write invalidates any reference
     /// derived from the same allocation, so a fixture that read a register back
     /// through one would itself be undefined behaviour while claiming to prove
-    /// the driver's conduct against a hostile device (TEST-6). Exposing no
+    /// the driver's conduct against a hostile device. Exposing no
     /// reference is what makes that unrepresentable rather than a rule to
-    /// remember (DOC-9).
+    /// remember.
     struct MappedRegion<const N: usize> {
         page: *mut Page<N>,
     }
@@ -964,7 +963,7 @@ mod tests {
 
     #[test]
     fn every_capability_list_fault_reaches_the_operator_distinctly() {
-        // ENG-12: a device with no capability list and one whose chain loops
+        // A device with no capability list and one whose chain loops
         // must not produce the same console line. Each is driven to its own
         // `CapError`, and the error carries which.
         let mut absent = FakeConfig::conforming();

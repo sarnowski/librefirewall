@@ -1,6 +1,6 @@
 //! The A/B boot state-machine system test.
 //!
-//! GRUB's slot selection follows the `OK`/`TRY`/`ORDER` scheme (CONCEPT §14.2):
+//! GRUB's slot selection follows the `OK`/`TRY`/`ORDER` scheme:
 //! a confirmed slot (`*_OK`) boots immediately; an unconfirmed slot is tried
 //! once (its `*_TRY` is set before hand-off) and, if it never confirms health,
 //! the next slot in `ORDER` is used. GRUB's single-attempt model means a slot
@@ -9,7 +9,7 @@
 //! exactly what a watchdog reset leaves behind.
 //!
 //! Each [`Scenario`] starts from a fresh copy of a pristine disk built in the
-//! RELEASE kernel configuration — the image a release publishes (BLD-3) — sets
+//! RELEASE kernel configuration — the image a release publishes — sets
 //! the boot-selection state (and, where relevant, breaks a slot or tears the
 //! env block) exactly as the real update flow or a failed boot would leave it,
 //! then boots through OVMF/GRUB and asserts two independent things.
@@ -103,7 +103,7 @@ struct Scenario<'a> {
 ///
 /// A [`Run::Diagnostic`] re-run assembles its own into the build tree; it may
 /// not call [`image::image`], which publishes into `dist/` and would overwrite
-/// the release artifact the failing run was judging (BLD-3).
+/// the release artifact the failing run was judging.
 fn pristine_disk(root: &Path, run: Run) -> Result<PathBuf, String> {
     match run {
         Run::Shipping => {

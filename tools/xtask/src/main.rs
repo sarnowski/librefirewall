@@ -34,7 +34,7 @@
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
 //! composes the two gates. [`ci`] is the complete pull-request gate, and every
 //! end-to-end scenario in it boots the RELEASE configuration — the image a
-//! release publishes (BLD-3). [`release`] is that gate plus the guarantee
+//! release publishes. [`release`] is that gate plus the guarantee
 //! `dist/` never survives a run that failed to prove what it holds; it boots
 //! nothing of its own, because there is nothing left for it to prove.
 
@@ -101,7 +101,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             // diagnostics (PRINTING, IRQ_REPORTING, the user stack traces) are
             // worth their cost here exactly as they are not in a gate that
             // asserts on machine-observable contracts. Nothing is proved here,
-            // so nothing about BLD-3 is at stake.
+            // so the shipped-profile guarantee is not at stake.
             image::image(&root, image::DEBUG_CONFIG)?;
             qemu::run_system(&root)?;
         }
@@ -134,8 +134,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 ///
 /// # Why every end-to-end scenario boots the release configuration
 ///
-/// Because it is the image a release publishes, and BLD-3 is that the shipped
-/// profile is the tested profile. The arrangement this replaced booted the
+/// Because it is the image a release publishes, and the shipped
+/// profile must be the tested profile. The arrangement this replaced booted the
 /// debug image here and left the release image to `release`, which nothing runs
 /// on push — and two consecutive changes shipped defects reachable only in the
 /// configuration no gate touched: a console that emitted nothing, because
@@ -163,7 +163,7 @@ fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
 /// [`ci`] already assembles the release configuration into `dist/` — manifest,
 /// SBOM, checksums and the signed A/B disk — and already boots that disk
 /// through every system and A/B scenario. So `release` adds no boot of its
-/// own; what it adds is BLD-3's other half: when the gate did not prove the
+/// own; what it adds is the rule's other half: when the gate did not prove the
 /// artifact, `dist/` is emptied rather than left holding an unproven image that
 /// looks finished.
 ///
@@ -182,7 +182,7 @@ fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
 /// The emptying covers the whole of [`ci`], not a boot alone: assembly
 /// populates `dist/` partway through, so a failure after that point leaves an
 /// incomplete release behind exactly as a failed boot leaves an unproven one,
-/// and BLD-3 does not distinguish the two. A failure *before* assembly is
+/// and the guarantee does not distinguish the two. A failure *before* assembly is
 /// covered for the same reason — `dist/` may still hold a previous build, and
 /// a release run that did not prove an artifact must not leave one publishable.
 fn release(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -204,7 +204,7 @@ fn release(root: &Path) -> Result<(), Box<dyn Error>> {
 /// describe what actually happened to it.
 ///
 /// The returned sentence is the only thing an operator sees, so it may not
-/// claim a removal that did not occur (ENG-12). BLD-3's guarantee is that a
+/// claim a removal that did not occur. The guarantee is that a
 /// failed release leaves no unproven image behind; reporting "discarded" over a
 /// directory that is still there states the opposite of the truth and hides the
 /// one condition that needs acting on. Each of the three outcomes therefore

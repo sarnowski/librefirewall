@@ -4,7 +4,7 @@
 //! # The adversary and the surface
 //!
 //! Every byte of a PCI function's 4 KiB configuration space is the device's
-//! (CONCEPT §7.1, hostile or malfunctioning device). The capability chain the
+//! — a hostile or malfunctioning device's. The capability chain the
 //! driver walks to find the virtio structures is therefore attacker-controlled
 //! in its entirety: the chain pointers, the capability lengths and types, the
 //! BAR index, and all four structure offsets. So is the BAR window the driver
@@ -80,7 +80,7 @@
 //! Every one of the device's six answers is chosen by a `u32` the fuzzer owns,
 //! and every answer deviates from a conforming device on exactly one quarter of
 //! those values (`selector % 4 == 3`). That is a **bias**, not a capability
-//! filter (TEST-8): each deviation stays reachable on a quarter of all
+//! filter: each deviation stays reachable on a quarter of all
 //! selectors and each deviating answer's payload is unreduced, so no outcome is
 //! excluded — but a device that refused half of what it was asked would stop
 //! most inputs at the first state and leave `go_live` reached by luck. The
@@ -105,7 +105,7 @@
 //!   independent facts about a device-chosen offset — `within(BAR_WINDOW_SIZE)`
 //!   for the extent and `common_is_aligned()` for the alignment. Both are
 //!   asserted here on every successful `identify`, so the named guarantor is
-//!   checked rather than believed (AGENTS.md DOC-6, DOC-7).
+//!   checked rather than believed.
 //! * **Every register access lands where virtio 1.0 says.** The offsets
 //!   `drive_registers` arms are asserted against the accessors that read
 //!   them, in both directions, by
@@ -129,7 +129,7 @@
 //!   that caused it, including that `QueueSetupRefused`/`DoorbellRefused` name
 //!   the queue the *driver* was programming and not the index the device put
 //!   inside the error it returned.
-//! * **The ordering virtio 1.0 §3.1.1 fixes, under a hostile device.** Reset
+//! * **The ordering virtio 1.0 section 3.1.1 fixes, under a hostile device.** Reset
 //!   first; driver features never before `ACKNOWLEDGE | DRIVER`; `DRIVER_OK`
 //!   never before both queues are programmed and both doorbells placed; no
 //!   doorbell rung before `DRIVER_OK`. The typestate exists to get this right
@@ -158,15 +158,15 @@
 //! machine, and a split transaction on the wire. `Doorbell::new` had checked
 //! `offset.is_multiple_of(2)` for the notify slot all along, so the pattern
 //! existed; it had never been applied to the common-configuration base. The
-//! delegation chain terminated nowhere, which is the DOC-7 failure mode, and
-//! `map`'s safety comment named `identify` as the guarantor of something
-//! `identify` did not guarantee (DOC-6).
+//! delegation chain terminated nowhere — no component enforced the
+//! precondition — and `map`'s safety comment named `identify` as the guarantor
+//! of something `identify` did not guarantee.
 //!
 //! **What closed it.** The fix is in the crates that own the fault, not here:
 //! `virtio::pci::VirtioCaps::common_is_aligned` is the predicate, and
 //! `nic_driver_core::bringup::identify` now refuses a device that fails it with
 //! `BringUpError::CommonCfgMisaligned` before any `CommonCfg` is constructed.
-//! Per TEST-10 the finding is a regression test in each owning crate's own
+//! The finding is a regression test in each owning crate's own
 //! suite rather than only a corpus entry — `crates/virtio/src/pci.rs`'s
 //! `a_misaligned_common_offset_survives_the_capability_walk_and_is_caught_by_the_predicate`
 //! and `crates/nic-driver-core/src/bringup.rs`'s
@@ -180,7 +180,7 @@
 //! cannot use — an extent check says nothing about alignment, and vice versa.
 //! Both are asserted below on every successful `identify`, and the bring-up
 //! chain stays in this target: removing it to shorten the harness would delete
-//! the reach that found the defect, which is the TEST-8 failure mode.
+//! the reach that found the defect — a harness narrowed below the adversary.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -228,7 +228,7 @@ struct BarWindow([u8; BAR_WINDOW_SIZE]);
 /// Byte offsets of the `virtio_pci_common_cfg` registers this harness arms,
 /// relative to the structure's base.
 ///
-/// **Cross-artifact (DOC-7):** these are virtio 1.0 §4.1.4.3's layout, which
+/// **Cross-artifact fact:** these are virtio 1.0 section 4.1.4.3's layout, which
 /// `crates/virtio/src/pci.rs` transcribes into private `CommonOff` constants a
 /// consumer cannot name. The enforcer is
 /// [`tests::the_register_offsets_are_the_ones_virtio_1_0_fixes`], which drives
@@ -248,7 +248,7 @@ mod offsets {
 }
 
 /// What one run of the harness reached, so a test can *demonstrate* that a
-/// device behaviour is generable rather than assert that it is (TEST-8).
+/// device behaviour is generable rather than assert that it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Observed {
     pub(crate) caps_found: bool,
@@ -414,7 +414,7 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
         // `caps.common_is_aligned()`, also just checked, plus the 4096-byte
         // alignment `BarWindow` carries, makes the sum `COMMON_CFG_ALIGN`-
         // aligned. Those are exactly the two facts `CommonCfg::new` requires,
-        // and they are established here rather than delegated (DOC-7).
+        // and they are established here rather than delegated.
         let registers = unsafe { Registers::new(base, caps.common as usize) };
         drive_registers(&mut unstructured, &registers, &caps, base, &mut observed);
     }
@@ -506,7 +506,7 @@ fn take_run<'data>(unstructured: &mut Unstructured<'data>, requested: u32) -> &'
     // fuzzer asked for, and `Unstructured::bytes` returns `Ok` for any size at
     // most the remaining length. The proof is arithmetic rather than an
     // assumption about the input, which is what makes the `expect` sound
-    // on a path reachable from untrusted bytes (AGENTS.md ENG-5).
+    // on a path reachable from untrusted bytes.
     let take = (requested as usize) % (available + 1);
     unstructured
         .bytes(take)
@@ -591,7 +591,7 @@ impl QueueDoorbell for ScriptedDoorbell {
 /// The share of selector values on which the device deviates from a conforming
 /// one: `selector % DEVIATION == DEVIATION - 1`.
 ///
-/// A coverage bias and not a capability filter (TEST-8) — every deviation stays
+/// A coverage bias and not a capability filter — every deviation stays
 /// reachable on a quarter of all selectors, and the payload of a deviating
 /// answer is never reduced. See this module's header.
 const DEVIATION: u32 = 4;
@@ -777,7 +777,7 @@ fn run_handshake<D: VirtioDevice>(offered: Offered<D>) -> Result<(), BringUpErro
     Ok(())
 }
 
-/// The order virtio 1.0 §3.1.1 fixes, asserted against a device free to
+/// The order virtio 1.0 section 3.1.1 fixes, asserted against a device free to
 /// misbehave at every step. None of this is observable through a passive
 /// window, which is why the typestate carries it and why it is checked here.
 fn assert_ordering(record: &DeviceRecord) {
@@ -1033,7 +1033,7 @@ fn drive_registers(
     let layout = &DriverVirtqueue::LAYOUT;
     // `LAYOUT.size` is `nic_driver_core::bringup::QUEUE_SIZE`, a driver
     // constant chosen so a loop bounded by it is bounded by a value the
-    // adversary does not choose (ENG-4). It is not device input, so this
+    // adversary does not choose. It is not device input, so this
     // conversion cannot be driven to fail from outside.
     let required = u16::try_from(layout.size).expect("the driver's queue size fits a u16");
 
@@ -1594,7 +1594,7 @@ mod tests {
     }
 
     /// A device that clears `FEATURES_OK` when the driver reads the status back
-    /// inside the same call that set it — the refusal virtio 1.0 §3.1.1
+    /// inside the same call that set it — the refusal virtio 1.0 section 3.1.1
     /// requires initialization to stop on, and the one the readback exists to
     /// catch.
     fn features_ok_cleared_on_readback() -> Vec<u8> {

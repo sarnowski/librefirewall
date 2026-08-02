@@ -10,7 +10,7 @@ fn a_fresh_timer_carries_the_initial_timeout_and_no_measurement() {
     assert_eq!(timer, RetransmissionTimer::default());
 }
 
-/// RFC 6298 §2.2 worked through: a 400 ms sample gives SRTT 400 ms,
+/// RFC 6298 section 2.2 worked through: a 400 ms sample gives SRTT 400 ms,
 /// RTTVAR 200 ms, and RTO = 400 + 4*200 = 1200 ms — above the floor, so the
 /// clamp does not hide the arithmetic.
 #[test]
@@ -21,7 +21,7 @@ fn the_first_measurement_follows_the_initialisation_rule() {
     assert_eq!(timer.timeout(), Duration::from_millis(1_200));
 }
 
-/// §2.3 worked through from the state above: a second 400 ms sample leaves SRTT
+/// section 2.3 worked through from the state above: a second 400 ms sample leaves SRTT
 /// at 400 ms and shrinks RTTVAR to 3/4 of 200 ms, so RTO = 400 + 4*150 = 1000 ms.
 #[test]
 fn a_repeated_sample_shrinks_the_variance() {
@@ -50,7 +50,7 @@ fn one_outlying_sample_widens_the_variance_rather_than_the_estimate() {
     assert!(timer.timeout() < Duration::from_millis(2_400));
 }
 
-/// §2.4's floor, which a fast local peer reaches immediately: a zero sample
+/// section 2.4's floor, which a fast local peer reaches immediately: a zero sample
 /// gives SRTT 0 and RTTVAR 0, so the formula yields the clock granularity and
 /// the clamp lifts it to the minimum.
 #[test]
@@ -60,7 +60,7 @@ fn a_zero_sample_is_lifted_to_the_floor() {
     assert_eq!(timer.timeout(), MIN_RTO);
 }
 
-/// §5.5's backoff doubles and then holds at the ceiling, and the count is what a
+/// section 5.5's backoff doubles and then holds at the ceiling, and the count is what a
 /// caller's retry limit is compared against.
 #[test]
 fn the_backoff_doubles_and_saturates_at_the_ceiling() {
@@ -78,7 +78,7 @@ fn the_backoff_doubles_and_saturates_at_the_ceiling() {
     assert_eq!(timer.timeout(), MAX_RTO);
 }
 
-/// §5.3: a measurement after a backoff restarts from the measured path rather
+/// section 5.3: a measurement after a backoff restarts from the measured path rather
 /// than from the doubled guess, so one lost segment does not leave a connection
 /// slow for the rest of its life.
 #[test]

@@ -2,8 +2,8 @@
 //! observations, laid out across the two regions its two directions are granted
 //! in.
 //!
-//! Faces two of CONCEPT §7.1's adversaries at once, and they are not the same
-//! adversary. The **byzantine peer protection domain** writes both cursors, the
+//! Faces two adversaries at once, and they are not the same
+//! adversary. The **byzantine neighbour protection domain** writes both cursors, the
 //! annotation words and the drop count, so every one of them is a value chosen
 //! rather than computed. **Untrusted network traffic** supplies the payload: the
 //! forwarder copies frame bytes in, so a slot's payload is attacker-chosen even
@@ -20,11 +20,11 @@
 //! exactly the direction it speaks in, and a recorder that could store into the
 //! slots could mint an observation of traffic that never crossed the appliance.
 //! That last is the difference that matters here, because the artifact this ring
-//! feeds is evidence (CONCEPT §15).
+//! feeds is evidence.
 //!
 //! The handles carry the asymmetry rather than restating it, as the log ring's
 //! do: [`TapWriter`] reaches the consume cursor only through a view with no
-//! store on it, and [`TapReader`] is the mirror image (DOC-9).
+//! store on it, and [`TapReader`] is the mirror image.
 //!
 //! # Fixed slots, because variable-length framing has a wrap
 //!
@@ -63,7 +63,7 @@
 //! overwrote the slot being read would let a payload be assembled out of two
 //! frames and recorded as a third that never existed.
 //!
-//! `epb_dropcount` is the pcapng field the count lands in (CONCEPT §15.2), which
+//! `epb_dropcount` is the pcapng field the count lands in, which
 //! is why it is a field of the shared region and not a number the producer keeps
 //! to itself: a capture that silently omits is worse than one that states how
 //! much it omitted.
@@ -143,7 +143,7 @@ const MASK: u32 = (TAP_SLOTS - 1) as u32;
 
 /// Which way past the appliance the observed frame was going.
 ///
-/// pcapng's `epb_flags` direction bits (CONCEPT §15.2), reduced to the two
+/// pcapng's `epb_flags` direction bits, reduced to the two
 /// values a forwarding appliance distinguishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapDirection {
@@ -176,7 +176,7 @@ impl TapDirection {
 /// What the appliance decided about the observed frame — `routing::Decision`
 /// without its payload, which lives in the annotation's own fields.
 ///
-/// pcapng carries it as `epb_verdict` (CONCEPT §15.2).
+/// pcapng carries it as `epb_verdict`, a custom option of the recording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapVerdict {
     Forwarded,
@@ -266,8 +266,8 @@ impl TapDropReason {
 /// nothing cannot be built.
 ///
 /// On the wire they are two words and a peer may set them independently; here
-/// a forwarded frame has no reason to carry and a dropped one cannot fail to
-/// (DOC-9). [`TapAnnotation::new`] takes this rather than the two words, so no
+/// a forwarded frame has no reason to carry and a dropped one cannot fail
+/// to. [`TapAnnotation::new`] takes this rather than the two words, so no
 /// first-party producer can emit the pairs [`TapFault::DropReasonOnForwarded`]
 /// and [`TapFault::DropReasonMissingOnDropped`] name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +297,7 @@ impl TapOutcome {
 /// Every field is private and the two lengths are absent from
 /// [`new`](Self::new) entirely: [`TapWriter::write`] derives `captured_len` from
 /// the bytes it actually copied and takes `original_len` beside them, so no
-/// producer can state a length its payload does not have (DOC-9). A peer
+/// producer can state a length its payload does not have. A peer
 /// writing the region directly still can, which is what the reader checks.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,7 +318,7 @@ impl TapAnnotation {
     /// `packet_id` is the value pcapng carries as `epb_packetid`: the *same*
     /// number on the ingress and the egress observation of one forwarded frame,
     /// which is what lets a reader relate the two rather than infer the relation
-    /// by comparing tuples (CONCEPT §15.2).
+    /// by comparing tuples.
     ///
     /// `timestamp` is the raw timestamp-counter reading at observation, not a
     /// wall-clock instant: converting it needs the calibration
@@ -427,7 +427,7 @@ pub enum TapFault {
 /// The bound and the length are established once, in [`take`](Self::take),
 /// which is the only constructor — so the recorded `captured_len` cannot
 /// disagree with the bytes recorded beside it, and no conversion anywhere else
-/// needs a fallible step or a fallback for a case that cannot arise (DOC-9).
+/// needs a fallible step or a fallback for a case that cannot arise.
 struct Snapped<'frame> {
     bytes: &'frame [u8],
     len: u32,
@@ -648,7 +648,7 @@ impl TapSlot {
 ///
 /// Every field is private and no accessor reaches one, so the ordering each
 /// word carries is a property of this type rather than a convention its users
-/// are asked to keep (DOC-9).
+/// are asked to keep.
 #[repr(C)]
 pub struct TapRecords {
     tail: AtomicU32,
@@ -750,7 +750,7 @@ impl Default for TapConsume {
 ///
 /// A module of their own, and that is the whole mechanism: the borrow each view
 /// wraps is private to it, so nothing outside — including the two handles in the
-/// parent — can reach past a view to the region behind it (DOC-9).
+/// parent — can reach past a view to the region behind it.
 mod peer {
     use core::sync::atomic::Ordering;
 
@@ -821,7 +821,7 @@ pub enum TapWriteError {
     /// More bytes to record than the frame is said to have had on the wire,
     /// which is a first-party inconsistency rather than a peer's. Refused
     /// rather than clamped, because clamping either length would silently
-    /// change what the record claims (ENG-12), and not counted, because
+    /// change what the record claims, and not counted, because
     /// nothing well-formed was ever offered.
     FrameExceedsWireLength { frame_len: usize, original_len: u32 },
 }
@@ -974,7 +974,7 @@ impl TapReader<'_> {
     /// drain finite for *any* caller, including one that passed [`usize::MAX`].
     /// A peer that keeps advancing its published cursor keeps
     /// [`read`](Self::read) returning `Some`, so an unbounded loop over it never
-    /// returns and the recorder stops progressing on anything else (ENG-4).
+    /// returns and the recorder stops progressing on anything else.
     /// [`len`](Self::len) must not supply either bound, being peer-influenced.
     ///
     /// A callback rather than an iterator because the item borrows `into`: an
@@ -1029,7 +1029,7 @@ impl TapReader<'_> {
 }
 
 // Two cross-PD shared-memory ABIs: pin both layouts so a field reorder or a size
-// change is a compile error rather than a silently corrupted mapping (TEST-5).
+// change is a compile error rather than a silently corrupted mapping.
 const _: () = {
     use core::mem::{align_of, offset_of};
 
@@ -1037,7 +1037,7 @@ const _: () = {
     assert!(TAP_SLOTS >= 2, "a ring of one slot holds nothing");
     assert!(TAP_SLOTS - 1 <= u32::MAX as usize, "cursors are u32");
     // Every captured length is compared as a `u32` and then used as a `usize`,
-    // which is exact only while a `usize` is at least as wide (CONCEPT §3).
+    // which is exact only while a `usize` is at least as wide; x86_64's is.
     assert!(size_of::<usize>() >= size_of::<u32>());
     assert!(TAP_SNAP_LEN <= u32::MAX as usize);
     // A zeroed region is the valid empty state: no observation is published,

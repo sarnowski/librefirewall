@@ -117,7 +117,7 @@ fn a_republished_calibration_is_read_on_the_next_question() {
 
 proptest! {
     /// Total over the whole triple a peer can write: every one of them yields a
-    /// stamp or the absence of one, and never a panic (ENG-5).
+    /// stamp or the absence of one, and never a panic.
     #[test]
     fn any_published_triple_yields_a_stamp_or_none(
         tsc_hz in any::<u64>(),

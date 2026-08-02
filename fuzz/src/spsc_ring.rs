@@ -2,7 +2,7 @@
 //!
 //! # The adversary and the surface
 //!
-//! The peer maps the whole ring read-write (CONCEPT §7.1): both published
+//! The peer maps the whole ring read-write: both published
 //! cursors and every one of the `4 * CAP` slot words. The crate's central claim
 //! is that this buys the peer *values*, never *positions* — each side's own
 //! position lives in private memory the peer cannot map.
@@ -109,7 +109,7 @@ enum Wrote {
 ///
 /// Returned so the tests below can *demonstrate* that a shape is generable —
 /// a claim that an adversary capability is reachable is worth nothing without
-/// an input that reaches it (TEST-8). Every invariant resting on these counters
+/// an input that reaches it. Every invariant resting on these counters
 /// is asserted inside [`observe`] as it runs, not here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Observed {
@@ -231,7 +231,7 @@ pub(crate) fn observe(data: &[u8]) -> Observed {
                 // the *producer*, and `wire::Descriptor::new` would restrict
                 // that word to a decodable value. The ring moves what it is
                 // given, so restricting it here would leave the one word a
-                // consumer must decode permanently well-formed (TEST-8).
+                // consumer must decode permanently well-formed.
                 let descriptor = Descriptor {
                     buffer: any_u32(&mut unstructured),
                     offset: any_u32(&mut unstructured),

@@ -126,8 +126,8 @@ fn write_line<C: fmt::Display>(
 /// The instant, immediately after the record identifier and before every field
 /// that identifies *what* happened.
 ///
-/// It goes after `LFW-…` rather than in front of it because MONITORING.md makes
-/// that prefix a reader's only handle on where a record starts: a field written
+/// It goes after `LFW-…` rather than in front of it because that prefix is
+/// a reader's only documented handle on where a record starts: a field written
 /// ahead of it would be outside every record the documented scan recovers.
 fn write_stamp(at: Stamp, cursor: &mut Cursor<'_>) -> fmt::Result {
     cursor.write_str(" time=")?;
@@ -289,7 +289,7 @@ mod tests {
     /// The two forms of the leading field. The absence renders as a token an
     /// operator can read and a parser can match, never as an instant — a record
     /// dated 1970 would be indistinguishable from one this node actually
-    /// emitted at the epoch (ENG-12).
+    /// emitted at the epoch.
     #[test]
     fn a_record_with_no_time_carries_the_token_and_not_the_epoch() {
         let event = Event::Domain {
@@ -307,8 +307,8 @@ mod tests {
         );
     }
 
-    /// The field sits after the record identifier, which is the handle
-    /// MONITORING.md gives a reader for where a record starts: a stamp written
+    /// The field sits after the record identifier, which is the documented
+    /// handle a reader has for where a record starts: a stamp written
     /// in front of `LFW-` would fall outside every record the documented scan
     /// recovers.
     #[test]

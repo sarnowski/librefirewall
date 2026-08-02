@@ -9,7 +9,7 @@
 //!
 //! # Untrusted inputs, and which layer answers for each
 //!
-//! Two of CONCEPT §7.1's distrust boundaries meet in this crate, and one is
+//! Two distrust boundaries meet in this crate, and one is
 //! answered a layer below:
 //!
 //! - The **hostile or malfunctioning device**. Everything it can *say* about a
@@ -42,8 +42,8 @@
 //! pipeline's pool, whose ledger lives in the peer driver that owns it. A
 //! byzantine peer can still name a buffer the pool owner has posted as its
 //! own NIC's receive DMA target, in which case the 12-byte header write races
-//! that DMA. Closing that needs either an IOMMU confining NIC DMA (CONCEPT
-//! §7.2) or a cross-domain per-buffer ownership epoch; neither exists yet, and
+//! that DMA. Closing that needs either an IOMMU confining NIC DMA
+//! or a cross-domain per-buffer ownership epoch; neither exists yet, and
 //! no code in this domain can substitute for them. The damage is bounded to
 //! corrupting a frame inside the shared pool, because the address handed to the
 //! device is derived from an index that passed the pool bounds check.
@@ -139,7 +139,7 @@ pub struct InputDrops {
     pub tx_discarded: u64,
     /// Transmit descriptors whose verdict word decodes to neither variant. The
     /// buffer is returned as a discard's is, so nothing leaks, but the value is
-    /// a defect in the producing domain and is never coerced to one (ENG-12).
+    /// a defect in the producing domain and is never coerced to one.
     pub tx_verdict_undecodable: u64,
     /// Each one loses its buffer to the pool owner's ledger for good; the
     /// alternative — asserting — would let a peer that stalls the ring take
@@ -181,7 +181,7 @@ pub struct InvariantFaults {
 }
 
 /// A snapshot of everything a driver protection domain can say about its two
-/// neighbours and itself, in the shape the metrics endpoint (CONCEPT §11) will
+/// neighbours and itself, in the shape the appliance's metrics endpoint will
 /// scrape. Taken by value because a scrape wants one consistent picture, not
 /// four live borrows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -281,7 +281,7 @@ impl<'ring, const Q: usize> RxPath<'ring, Q> {
     /// Take the receive pipeline's `rx` producer handle. `pool_paddr` is the
     /// physical base of the pool this NIC receives into.
     ///
-    /// **Unenforced precondition (DOC-7):** call once per protection domain.
+    /// **Unenforced precondition:** call once per protection domain.
     /// The handle is this domain's publish position, so a second path over the
     /// same pipeline overwrites slots the first has already handed to the
     /// peer. No type refuses the second call; `queue`'s crate header
@@ -439,7 +439,7 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
     /// `pool` and `pool_paddr` are the mapped pool this NIC transmits out of
     /// and the physical base of that same region.
     ///
-    /// **Unenforced precondition (DOC-7):** call once per protection domain. A
+    /// **Unenforced precondition:** call once per protection domain. A
     /// second path over the same pipeline re-consumes frames the first has
     /// already handed to the device and returns their buffers twice. No type
     /// refuses the second call; `queue`'s crate header states that
@@ -536,7 +536,7 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
                 }
                 // Same handling of the buffer, separate tally: a word decoding
                 // to nothing is a defect in the producing domain, and merging
-                // the two would let it hide inside ordinary traffic (ENG-12).
+                // the two would let it hide inside ordinary traffic.
                 None => {
                     bump(&mut counters.input.tx_verdict_undecodable);
                     if in_pool {
@@ -588,7 +588,7 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
             };
             let paddr = buffer_paddr(self.pool_paddr, descriptor.buffer) + header_offset as u64;
             // A first-party invariant, not device or peer input, so it fails
-            // visibly rather than being counted (ENG-5). The guarantor is
+            // visibly rather than being counted. The guarantor is
             // `virtio::queue::SplitVirtqueue::add_chain` — the body behind both
             // `add_*` methods — which refuses a one-segment chain only when
             // `num_free` is zero, and whose `free_count()` *is* `num_free`.
@@ -627,7 +627,7 @@ impl<'ring, const Q: usize> TxPath<'ring, Q> {
     /// cannot fail. A failure means accounting has already broken — a byzantine
     /// peer over-filling the ring — which is untrusted input, so it is counted
     /// and the buffer dropped rather than asserted: a peer must not be able to
-    /// fault a well-behaved driver (CONCEPT §7.1).
+    /// fault a well-behaved driver.
     fn return_buffer(&mut self, descriptor: Descriptor, counters: &mut Counters) {
         if self.free.try_enqueue(descriptor).is_err() {
             bump(&mut counters.input.tx_free_ring_full);
@@ -999,7 +999,7 @@ mod tests {
 
     /// Every counter this driver keeps reaches a slot of the shard it publishes,
     /// and none reaches two. `lfw_metrics` names the vocabulary and depends on
-    /// none of this, so this is the enforcer that separation obliges (DOC-7).
+    /// none of this, so this is the enforcer that separation obliges.
     #[test]
     fn every_driver_counter_reaches_its_own_slot() {
         let stats = DriverStats {
@@ -1951,7 +1951,7 @@ mod tests {
 
     #[test]
     fn driver_stats_sample_both_virtqueues_and_the_counters() {
-        // The metrics endpoint (CONCEPT §11) needs one consistent picture, and
+        // The appliance's metrics endpoint needs one consistent picture, and
         // device misbehaviour must reach it rather than stay inside the queue.
         let mut rx = RxFixture::new();
         let mut tx = TxFixture::new();
@@ -2087,7 +2087,7 @@ mod tests {
     /// A verdict word as a byzantine peer writes it: both values that
     /// decode, and the whole of the space that does not. The undecodable case
     /// is not a rare accident of `any::<u32>()` here — it is weighted in, so a
-    /// strategy edit cannot quietly stop generating it (TEST-8).
+    /// strategy edit cannot quietly stop generating it.
     fn any_verdict_bits() -> impl Strategy<Value = u32> {
         prop_oneof![
             3 => Just(Verdict::Transmit.to_bits()),
@@ -2239,7 +2239,7 @@ mod tests {
                 // all, while arbitrary ones keep forged spans in the mix. The
                 // verdict is not reduced at all: it is one word wholly the
                 // peer's, and the values that decode to nothing are exactly the
-                // ones a bias towards the two variants would delete (TEST-8).
+                // ones a bias towards the two variants would delete.
                 let descriptor = Descriptor {
                     buffer: buffer % (POOL_BUFFERS as u32 + 2),
                     offset: offset % (BUFFER_SIZE as u32 + 2),

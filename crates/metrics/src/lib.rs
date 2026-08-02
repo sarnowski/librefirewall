@@ -1,11 +1,11 @@
 //! The appliance's metric surface: the shared-memory counter shards protection
 //! domains publish into, the catalogue that says what every slot means, and the
 //! Prometheus exposition renderer that turns a set of shards into the bytes
-//! `GET /metrics` answers with (MONITORING.md, CONCEPT §11).
+//! `GET /metrics` answers with.
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **byzantine neighbour protection domain**, and through the
+//! The **byzantine neighbour protection domain**, and through the
 //! endpoint that serves the rendered bytes, its **management-plane attacker**.
 //! Every word this crate reads out of a shard was stored by another domain, so
 //! nothing here judges a value: a counter is a `u64` and every bit pattern of
@@ -45,7 +45,7 @@
 //! A domain accumulates in the in-memory counters it already keeps and calls
 //! [`StatsShard::publish`] **once per drain**, not once per frame — so the whole
 //! surface costs one bounded run of relaxed stores per batch of up to
-//! `DRAIN_LIMIT` descriptors (OBS-3).
+//! `DRAIN_LIMIT` descriptors: no measurable dataplane cost.
 //!
 //! # Nothing is summed here
 //!
@@ -88,7 +88,7 @@ pub use sample::{
 ///
 /// Sized by the largest domain — the management endpoint, whose transport alone
 /// keeps twenty-six — with room left so a new counter is a table entry rather
-/// than a region resize, which would be a capability change (ENG-1). The
+/// than a region resize, which would be a capability change. The
 /// assertions in [`sample`] hold every domain's table to it, so a table that
 /// outgrew the shard is a build error and never a silently dropped counter.
 pub const STATS_SLOTS: usize = 96;
@@ -98,7 +98,7 @@ pub const STATS_SLOTS: usize = 96;
 /// Every field is private and the only ways in are [`publish`](Self::publish)
 /// and [`sample`](Self::sample), so "one writer, relaxed, whole slots" is a
 /// property of the type rather than a convention its two domains are asked to
-/// keep (DOC-9).
+/// keep.
 ///
 /// `align(64)` is a cache line: two domains' counters sharing one would put the
 /// coherence traffic sharding exists to avoid back on the dataplane's hot path.
@@ -154,7 +154,7 @@ impl StatsShard {
 /// than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
 pub const STATS_REGION_SIZE: usize = size_of::<StatsShard>().next_multiple_of(MAPPING_ALIGN);
 
-// The layout two protection domains agree on, fixed at build time (TEST-5). One
+// The layout two protection domains agree on, fixed at build time. One
 // maps this region read-write and the other read-only, and neither can see the
 // other's view of it, so a width change or a stray field must be a compile error
 // here rather than a reader attributing one domain's counter to another series.

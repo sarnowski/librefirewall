@@ -9,12 +9,12 @@
 //! number. What settles the question is a file a process outside the guest
 //! pulled through a real HTTP client and parsed as pcapng, and the same bytes
 //! read straight off the disk image afterwards — two paths to one artifact,
-//! neither of them the guest's own account of itself (TEST-13).
+//! neither of them the guest's own account of itself.
 //!
 //! # No adversary
 //!
-//! Build orchestration on the host side of an emulator (CON-2 names no CONCEPT
-//! §7.1 adversary for it). The guest composes the bytes — that is the point —
+//! Build orchestration on the host side of an emulator; no threat-model
+//! adversary is named for it. The guest composes the bytes — that is the point —
 //! and this module walks them by length, which is exactly the discipline it is
 //! asserting the guest kept.
 
@@ -208,8 +208,8 @@ pub fn fetch(host_port: u16, target: &'static str) -> Result<Download, String> {
 /// multiple of four, or runs past the body stops the walk, and `consumed` then
 /// says where.
 ///
-/// The walk is bounded by the body's own length rather than by anything in it
-/// (ENG-4): the smallest legal block is [`BLOCK_FRAMING_LEN`] and the walk
+/// The walk is bounded by the body's own length rather than by anything in
+/// it: the smallest legal block is [`BLOCK_FRAMING_LEN`] and the walk
 /// refuses a shorter one, so no file of `n` bytes can present more than
 /// `n / BLOCK_FRAMING_LEN` blocks however its length fields are written. The
 /// same bound covers the memory this allocates, every captured slice being a
@@ -233,7 +233,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         }
         // Checked rather than `at + len`: both come out of the body, and an
         // offset a file chose may not be added to a length the same file chose
-        // without saying what happens when the sum leaves the type (ENG-5).
+        // without saying what happens when the sum leaves the type.
         let Some(end) = at.checked_add(len) else {
             break;
         };
@@ -321,7 +321,7 @@ fn packet(block: &[u8]) -> Packet {
 /// The value of the first option coded `wanted`, walking the option list that
 /// starts at `from`.
 ///
-/// Bounded like the block walk above and for the same reason (ENG-4): an option
+/// Bounded like the block walk above and for the same reason: an option
 /// occupies at least [`OPTION_HEADER_LEN`] bytes, so a block of `n` bytes holds
 /// at most `n / OPTION_HEADER_LEN` of them whatever its length fields say.
 fn option(block: &[u8], from: usize, wanted: u16) -> Option<&[u8]> {
@@ -333,7 +333,7 @@ fn option(block: &[u8], from: usize, wanted: u16) -> Option<&[u8]> {
             return None;
         }
         // Every offset here is a sum of two numbers the block chose, so each is
-        // checked rather than left to wrap (ENG-5).
+        // checked rather than left to wrap.
         let value_at = at.checked_add(OPTION_HEADER_LEN)?;
         let value = block.get(value_at..value_at.checked_add(len)?)?;
         if code == wanted {

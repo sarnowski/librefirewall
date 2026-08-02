@@ -1,7 +1,7 @@
 //! A bounded single-producer/single-consumer ring of [`LogRecord`]s, laid out
 //! across the two regions its two directions are granted in.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1) from both sides at
+//! Faces the byzantine neighbour protection domain from both sides at
 //! once: a writing domain owns [`LogRecords`] and the console domain owns
 //! [`LogConsume`], each reads the other's, and neither may assume the other
 //! wrote anything a correct implementation would.
@@ -26,8 +26,8 @@
 //! The handles carry that asymmetry rather than restating it: [`LogWriter`]
 //! holds a `&LogRecords` and reaches the consume cursor only through
 //! [`PeerConsume`], which has no store on it, and [`LogReader`] is the mirror
-//! image. Neither can name the method that would write the peer's region
-//! (DOC-9). What the types do not close is a domain holding both references
+//! image. Neither can name the method that would write the peer's
+//! region. What the types do not close is a domain holding both references
 //! minting the *other* side's handle — the console could ask a records region
 //! for a writer — and that is where the mapping is the enforcement rather than
 //! the reminder: the store faults on a read-only page. The types keep the call
@@ -63,8 +63,8 @@
 //! And it is what this ring is for: it carries the boot transcript, and when a
 //! domain parks the earliest records are the ones that say why.
 //!
-//! This is the opposite bias from the `GET /logs` retention buffer MONITORING.md
-//! specifies, which drops the oldest because it answers "what is this node
+//! This is the opposite bias from the `GET /logs` retention buffer the operator
+//! contract specifies, which drops the oldest because it answers "what is this node
 //! doing *right now*": recent history and first history are different
 //! questions, and each buffer counts what it dropped.
 //!
@@ -82,7 +82,7 @@
 //!   [`LogRecord::check`] before anything is rendered.
 //! * **The drop count is the writer's own claim about itself** and bounds
 //!   nothing here. It restarts at zero when the writing domain does — the one
-//!   discontinuity MONITORING.md's counter semantics admit.
+//!   discontinuity the exposed counter semantics admit.
 
 use core::{
     mem::size_of,
@@ -126,7 +126,7 @@ const MASK: u32 = (LOG_RING_SLOTS - 1) as u32;
 ///
 /// Every field is private and no accessor reaches one, so the ordering each
 /// word carries is a property of this type rather than a convention its users
-/// are asked to keep (DOC-9).
+/// are asked to keep.
 #[repr(C)]
 pub struct LogRecords {
     tail: AtomicU32,
@@ -232,7 +232,7 @@ impl Default for LogConsume {
 /// wraps is private to it, so nothing outside — including the two handles
 /// below, which sit in the parent — can reach past a view to the region behind
 /// it. "Neither side writes the other's region" is thereby a fact about the
-/// types rather than about care taken at each call site (DOC-9). A child module
+/// types rather than about care taken at each call site. A child module
 /// still reads its parent's private items, which is what lets these reach the
 /// cursors and slots they load.
 mod peer {
@@ -401,8 +401,8 @@ impl<'ring> LogReader<'ring> {
     /// clamp is what makes a single drain finite for *any* caller, including
     /// one that passed [`usize::MAX`]. A peer that keeps advancing its published
     /// cursor keeps [`read`](Self::read) returning `Some`, so an unbounded loop
-    /// over it never returns and the console stops progressing on anything else
-    /// (ENG-4). [`len`](Self::len) must not supply either bound, being
+    /// over it never returns and the console stops progressing on anything
+    /// else. [`len`](Self::len) must not supply either bound, being
     /// peer-influenced.
     #[must_use = "a drain iterator reads nothing until it is consumed"]
     pub fn drain(&mut self, limit: usize) -> LogDrain<'_, 'ring> {

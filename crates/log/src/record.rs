@@ -3,14 +3,14 @@
 //!
 //! # Adversary
 //!
-//! Decoding faces the byzantine peer protection domain (CONCEPT §7.1). A record
+//! Decoding faces the byzantine peer protection domain. A record
 //! reaching [`Event::decode`] was assembled from bytes another domain wrote, so
 //! every vocabulary token in it was chosen by that domain. `wire` has already
 //! refused the shapes it owns — an unreadable variant, a length past its
 //! storage, a byte outside the console alphabet — and what is left is the
 //! question only this crate can answer: whether a token `wire` bounded against
 //! its `LOG_*_COUNT` names a variant this crate actually has. That is a typed
-//! refusal here, never a panic and never a coerced variant (ENG-5).
+//! refusal here, never a panic and never a coerced variant.
 //!
 //! Encoding faces nobody. It runs in the domain that minted the event.
 //!
@@ -34,7 +34,7 @@
 //! and the `TryFrom` below is the one place a literal is measured against it.
 //! A literal that does not fit is this domain's own defect rather than a
 //! peer's, and it is refused with the value that made it one rather than
-//! truncated into a token an operator would read as whole (ENG-12).
+//! truncated into a token an operator would read as whole.
 
 use wire::{
     CheckedBody, CheckedDetail, CheckedIdentifier, CheckedOperands, CheckedRecord, CheckedValue,
@@ -63,7 +63,7 @@ pub enum DecodeError {
     /// holds and a record came through `wire`'s own check — but a
     /// [`CheckedBody`] is a public value with public fields, so this is the
     /// answer for one built by hand, and it is a typed refusal rather than an
-    /// index (ENG-5).
+    /// index into the variant table.
     Vocabulary { vocabulary: Vocabulary, token: u8 },
     /// Text `wire` passed that this crate's own identifier rules refuse. The
     /// two alphabets are separate copies facing different adversaries, so their

@@ -13,7 +13,7 @@
 //!
 //! # The device is untrusted
 //!
-//! The adversary is CONCEPT §7.1's **hostile or malfunctioning device**. Every
+//! The adversary is a **hostile or malfunctioning device**. Every
 //! byte this module reads is the device's: its configuration registers, its
 //! capability list, its BAR type bits, and — after the handshake — its
 //! `queue_size` and `queue_notify_off` registers. A device that is merely
@@ -35,7 +35,7 @@
 //! What is **not** checked, because it is not checkable from this side: whether
 //! the device honours anything it was programmed with. It may ignore the queue
 //! size it acknowledged, DMA outside the addresses it was given (nothing but an
-//! IOMMU can stop that — CONCEPT §7.2, an open item), or never complete a
+//! IOMMU can stop that, and none is deployed yet), or never complete a
 //! descriptor. The first two are outside this module's reach; the third is a
 //! stall, visible to the driver as a queue that stops making progress.
 
@@ -170,7 +170,7 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 // virtio device-status bits, ORed cumulatively into the common-config
 // `device_status` register to step the device through the initialization
-// handshake (virtio 1.x §2.1); the device latches them.
+// handshake (virtio 1.x section 2.1); the device latches them.
 pub const STATUS_ACKNOWLEDGE: u8 = 1;
 pub const STATUS_DRIVER: u8 = 2;
 pub const STATUS_DRIVER_OK: u8 = 4;
@@ -409,8 +409,8 @@ const NOTIFY_SLOT_LEN: usize = 2;
 const DEVICE_CFG_MIN_LEN: usize = 1;
 
 // `notify_off * multiplier` is bounded by `u16::MAX * u32::MAX < 2^48`, so on a
-// 64-bit `usize` the product cannot overflow. x86_64 is the only target
-// (CONCEPT §3), and this holds that reasoning to the code.
+// 64-bit `usize` the product cannot overflow. x86_64 is the only target,
+// and this holds that reasoning to the code.
 const _: () = assert!(
     usize::BITS >= 64,
     "notify-slot arithmetic assumes a 64-bit usize"
@@ -737,7 +737,7 @@ impl CommonCfg {
     /// outside tests is reachable only from one. Its
     /// `a_structure_outside_the_mapped_window_is_refused_before_any_dereference`
     /// and `a_misaligned_common_configuration_offset_is_refused_before_any_dereference`
-    /// tests prove that enforcement rather than assert it (DOC-7).
+    /// tests prove that enforcement rather than assert it.
     #[must_use]
     pub unsafe fn new(base: *mut u8) -> Self {
         Self { base }
@@ -840,7 +840,7 @@ impl CommonCfg {
     /// `notify_multiplier`. Turn it into a doorbell only through
     /// [`Doorbell::new`], which bounds it against the mapped BAR window;
     /// `doorbell_rejects_a_slot_outside_the_bar` and
-    /// `notify_slot_bound_is_computable_and_exact` prove that (DOC-7).
+    /// `notify_slot_bound_is_computable_and_exact` prove that.
     ///
     /// # Errors
     /// [`QueueSetupError`] when the device's own `queue_size` register says the
@@ -1014,9 +1014,9 @@ mod tests {
     /// registers through the raw pointer, and such a write invalidates any
     /// reference derived from the same allocation, so a fixture that read a
     /// register back through one would itself be undefined behaviour while
-    /// claiming to prove the transport's conduct against a hostile device
-    /// (TEST-6). Exposing no reference makes that unrepresentable rather than a
-    /// rule to remember (DOC-9).
+    /// claiming to prove the transport's conduct against a hostile device.
+    /// Exposing no reference makes that unrepresentable rather than a
+    /// rule to remember.
     struct MappedRegion<const N: usize> {
         page: *mut Page<N>,
     }

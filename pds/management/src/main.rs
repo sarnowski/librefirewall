@@ -9,19 +9,19 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **management-plane attacker**, reached through a **byzantine
+//! The **management-plane attacker**, reached through a **byzantine
 //! neighbour PD**. Whatever is attached to the management port is the first, and
 //! this is now the domain that *answers* it: a reply is a frame the appliance
 //! originates because of something that party sent. Nothing it sends arrives
 //! here directly — the driver instance that owns the port publishes a
 //! descriptor, so every buffer index, span and verdict word read here is that
 //! domain's choice. Both are answered in `pd_runtime::endpoint` and
-//! `lfw_ip_endpoint`, where host tests drive them (LAY-2); this file maps seven
+//! `lfw_ip_endpoint`, where host tests drive them; this file maps seven
 //! regions and calls two functions.
 //!
 //! # The port carries no forwarded traffic, and that is a grant
 //!
-//! CONCEPT §9.1 isolates the management port from the dataplane. This domain
+//! The design isolates the management port from the dataplane. This domain
 //! holds no dataplane region, no device capability and no I/O port, and the
 //! forwarder holds no management region — the mutual exclusion is stated in
 //! `systems/qemu-x86_64/librefirewall.system` and checked in both directions by
@@ -40,7 +40,7 @@
 //!
 //! # It reads the configuration and acknowledges nothing
 //!
-//! The addressing comes from the configuration document (CONCEPT §12.3), so this
+//! The addressing comes from the configuration document, so this
 //! domain maps `cfg` READ-ONLY and `cfgack` **not at all**. That asymmetry with
 //! the forwarder is the point: the forwarder is the *consumer* of the two-phase
 //! commit — it reads the offered generation, stages a table and acknowledges,
@@ -76,7 +76,7 @@
 //! The calibration region is mapped READ-ONLY, on the same footing as `cfg`. One
 //! that could write it would be able to move this node's own idea of time —
 //! every retransmission and reaping deadline, and one day every certificate's
-//! validity window (CONCEPT §7.2) — from the domain that answers the
+//! validity window — from the domain that answers the
 //! management-plane attacker. Every number in it is judged rather than believed
 //! (`pd_runtime::calibration_from`), the clock domain having measured them
 //! against a device; a triple this domain refuses leaves the port answering ARP
@@ -94,19 +94,19 @@
 //! the renderer walks one uniform array rather than seven regions plus a live
 //! read of its own counters.
 //!
-//! # Deviation from CONCEPT §11: the endpoint is plain HTTP (CON-1, STA-4)
+//! # Deviation from the design: the endpoint is plain HTTP
 //!
-//! CONCEPT §11 requires the management API to carry encryption, authentication
+//! The design requires the management API to carry encryption, authentication
 //! and read/write authorization through an mTLS certificate pair. **None of it
 //! exists.** There is no TLS in this appliance, this domain authenticates
 //! nobody, and anything that can reach the management port can read every metric
 //! this node exposes. `GET /config` and `GET /logs` are absent too and answer 404
-//! rather than being stubbed (ENG-7). Until CONCEPT §11's TLS termination
-//! exists the port belongs on an isolated network; README's status records it.
+//! rather than being stubbed. Until the required TLS termination
+//! exists the port belongs on an isolated network; the status table records it.
 //!
 //! # What a console record says, and why not one per frame
 //!
-//! The console carries system state and never traffic (OBS-1), so nothing here
+//! The console carries system state and never traffic, so nothing here
 //! reports a frame. What it reports is the port's running total, on any pass
 //! that moved at least one: "this port is receiving", which is a fact about the
 //! node. Every count now also reaches `/metrics`, where the rest of what this
@@ -251,7 +251,7 @@ fn init() -> Management {
     if !registered {
         // A build fact rather than a run-time condition — the endpoint's target
         // table is one size — so it is recorded and the port carries on serving
-        // everything else (ENG-12).
+        // everything else.
         announce(
             &sink,
             DomainState::Ready,

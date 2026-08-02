@@ -68,7 +68,7 @@ fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
 }
 
 /// The byte layout two protection domains agree on, written out rather than
-/// derived, so a reorder fails here as well as in the assertion block (TEST-5).
+/// derived, so a reorder fails here as well as in the assertion block.
 #[test]
 fn the_two_headers_occupy_the_bytes_the_recorded_layout_names() {
     assert_eq!(offset_of!(DownloadRequest, sequence), 0);

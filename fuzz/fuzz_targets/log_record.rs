@@ -8,8 +8,8 @@
 //! text bytes that are ESC or newline — and the harness asserts every outcome
 //! against an independent restatement of the ABI's own rules and their order,
 //! that an accepted body carries only the fields its kind names, and that the
-//! console line an accepted record renders to is printable ASCII throughout
-//! (OBS-5): no control character, no escape sequence, and no newline but the
+//! console line an accepted record renders to is printable ASCII
+//! throughout: no control character, no escape sequence, and no newline but the
 //! single terminator the console appends.
 
 use libfuzzer_sys::fuzz_target;

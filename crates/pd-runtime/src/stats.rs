@@ -10,7 +10,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **byzantine neighbour protection domain**, on the writing
+//! A **byzantine neighbour protection domain**, on the writing
 //! side. A shard is one region this domain is the sole writer of and the
 //! management domain reads, so a store here is a claim about *this* domain and
 //! never about another — which is what makes a per-domain series something an

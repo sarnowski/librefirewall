@@ -7,7 +7,7 @@
 //! domains emit `LFW-CFG ` records and a scenario declares the same. Nothing
 //! here reads prose, and nothing here waits on a clock: the records carry the
 //! generation and a per-boot sequence number precisely because no record on
-//! this channel is timestamped (MONITORING.md).
+//! this channel is timestamped.
 //!
 //! # Where the expectation comes from
 //!
@@ -30,7 +30,7 @@
 //! `console::tests::the_rotation_serves_the_later_ring_first_when_its_turn_comes`
 //! hold it). So *which* domain's record reaches the line first is decided by
 //! where that rotation stood, not by which event happened first, and the
-//! records carry no timestamp to appeal to (MONITORING.md). Production order is not
+//! records carry no timestamp to appeal to. Production order is not
 //! emission order, and asserting one as the other asserts against the rotation.
 //!
 //! The transcript is therefore judged as the merge of two chains — each totally
@@ -340,8 +340,8 @@ impl From<ContractError> for String {
 /// serialising them, and one domain's whole record written inside another's,
 /// mid-record, is what a capture then routinely carried.
 ///
-/// The reader's obligation outlived the defect, and MONITORING.md still states
-/// it as part of the contract — recover records by scanning for the `LFW-`
+/// The reader's obligation outlived the defect, and the console contract still
+/// states it — recover records by scanning for the `LFW-`
 /// prefix anywhere in the stream, never by assuming a line is a record.
 /// [`crate::console_records`] is that scan, held to what the contract obliges
 /// rather than to what the current captures happen to contain. The single-writer
@@ -449,8 +449,8 @@ mod tests {
     /// capture carries whole; the split is this test's, made where a second
     /// writer would have fallen. Nothing in the tree tears a record any more,
     /// the port having one writer, so the input the reader is held to has to be
-    /// constructed rather than quoted — which is the point, the contract in
-    /// MONITORING.md being what this reader answers to.
+    /// constructed rather than quoted — which is the point, the specified
+    /// console contract being what this reader answers to.
     const TORN_HEAD: &str = "LFW-PD domain=nic-driver sta";
     const TORN_TAIL: &str = "te=ready rx-posted=16";
 
@@ -826,7 +826,7 @@ mod tests {
     fn prose_quoting_a_record_is_now_indistinguishable_from_one_and_fails_closed() {
         // The price of scanning for the marker, paid deliberately and recorded
         // here rather than discovered later. The marker is the *only* handle
-        // MONITORING.md gives a reader, so prose that quotes it is a record; the
+        // the console contract gives a reader, so prose that quotes it is a record; the
         // previous reader ignored such a line only because it happened not to
         // begin one, which is the same accident that hid a torn refusal.
         //
@@ -855,7 +855,7 @@ mod tests {
         // record's tail — which carries no marker of its own — on the next
         // line. No capture under build/image/ carries this shape now that the
         // port has a single writer; it is what captures carried before, and it
-        // is what MONITORING.md still makes the reader's job to recover, so the
+        // is what the contract still makes the reader's job to recover, so the
         // reader is held to the contract rather than to the console of the day.
         let capture = "LFW-PD domain=nic-driver staLFW-CFG generation=0 outcome=applied \
                        changes=0\r\nte=ready rx-posted=16\r\n";

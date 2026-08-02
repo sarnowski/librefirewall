@@ -3,7 +3,7 @@
 //!
 //! # The adversary and the surface
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**, and it owns more here
+//! A **hostile or malfunctioning device**, and it owns more here
 //! than on a NIC. The DMA region carries this driver's virtqueue *and* the
 //! per-slot request headers *and* the per-slot status bytes, and the device can
 //! write every byte of all three — the status byte legitimately, the rest by
@@ -37,7 +37,7 @@
 //! against a capacity that came from the device, and a driver that trusted
 //! either would let a sum wrap past the medium.
 //!
-//! # What is asserted (TEST-9)
+//! # What is asserted
 //!
 //! Not merely the absence of a panic. Against an independent model:
 //!
@@ -62,14 +62,14 @@
 
 use arbitrary::Unstructured;
 use lfw_blk::io::{IoRegion, IoSector};
-use lfw_blk::request::{Completed, Operation, Outcome, RequestFaults, Requests, SubmitError};
 use lfw_blk::request::SLOTS;
+use lfw_blk::request::{Completed, Operation, Outcome, RequestFaults, Requests, SubmitError};
 use lfw_blk::{BlkVirtqueue, DMA_REGION_SIZE, QUEUE_SIZE, SECTOR_SIZE, io::IO_SECTORS};
 
 use crate::region::{BlkIoRegion, DmaRegion};
 
 /// Operations one input may drive. Bounded so a single input cannot run for
-/// unbounded time (ENG-4); the interesting interleavings are short.
+/// unbounded time; the interesting interleavings are short.
 const MAX_OPERATIONS: usize = 512;
 
 /// The physical addresses the two regions claim. Page-aligned and far apart, so
@@ -182,7 +182,8 @@ fn faults_only_rise(earlier: RequestFaults, now: RequestFaults) {
     assert!(now.device.completion_out_of_range >= earlier.device.completion_out_of_range);
     assert!(now.device.completion_not_posted >= earlier.device.completion_not_posted);
     assert!(
-        now.device.completion_length_over_reported >= earlier.device.completion_length_over_reported
+        now.device.completion_length_over_reported
+            >= earlier.device.completion_length_over_reported
     );
 }
 

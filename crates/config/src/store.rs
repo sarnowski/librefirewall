@@ -1,4 +1,4 @@
-//! The candidate/running datastore of CONCEPT §12.1.
+//! The candidate/running configuration datastore.
 //!
 //! Two operations and one shape: a candidate is assembled and validated
 //! without touching what is running, and a commit swaps it in under a new
@@ -7,9 +7,9 @@
 //! `&self`, so "an operation that changes nothing" is a property the signature
 //! carries.
 //!
-//! # The bytes are not kept, and the §12 property still holds
+//! # The bytes are not kept, and the validated-is-applied property still holds
 //!
-//! CONCEPT §12 requires that the exact bytes validated are the bytes applied.
+//! The design requires that the exact bytes validated are the bytes applied.
 //! Keeping the document beside the model was rejected: 64 KiB of it
 //! ([`MAX_DOCUMENT_BYTES`](crate::MAX_DOCUMENT_BYTES)) has no allocator to live
 //! in and no 16 KiB stack to sit on. What makes the property hold is structural
@@ -60,7 +60,7 @@ impl Generation {
 /// A candidate a document became, and the generation a commit would assign it.
 ///
 /// Handed back by [`Datastore::stage`] rather than fetched again afterwards, so
-/// there is no second question to ask and no absent answer to it (ENG-12).
+/// there is no second question to ask and no absent answer to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Staged {
     pub generation: Generation,
@@ -96,7 +96,7 @@ pub enum CommitOutcome {
         changes: DiffSummary,
     },
     /// The candidate's content was already running, so no generation was
-    /// assigned and no record was written (CONCEPT §12.2).
+    /// assigned and no record was written: a commit is keyed by content.
     Unchanged { generation: Generation },
 }
 
@@ -128,7 +128,7 @@ impl CommitOutcome {
 /// The running configuration and an optional candidate.
 ///
 /// The hash beside the generation is what recognises a commit of the content
-/// already running (CONCEPT §12.2); the model is what a diff is taken against.
+/// already running; the model is what a diff is taken against.
 #[derive(Clone, Debug)]
 pub struct Datastore {
     generation: Generation,
@@ -179,8 +179,8 @@ impl Datastore {
         })
     }
 
-    /// Read a document and keep nothing — the operation CONCEPT §12.1 requires
-    /// to change nothing, which `&self` is the whole of the proof of.
+    /// Read a document and keep nothing — validation must change nothing,
+    /// which `&self` is the whole of the proof of.
     ///
     /// # Errors
     /// [`ConfigError`], exactly as [`Datastore::stage`] would have refused it.
@@ -582,8 +582,8 @@ mod tests {
             }
         }
 
-        /// Idempotence, stated the way CONCEPT §12.2 keys it: the same content
-        /// committed twice moves the configuration once.
+        /// Idempotence, stated the way a content-keyed commit implies: the same
+        /// content committed twice moves the configuration once.
         #[test]
         fn committing_one_configuration_twice_applies_it_once(variant in 0usize..4) {
             let mut store = store();

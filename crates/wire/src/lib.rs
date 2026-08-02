@@ -1,7 +1,7 @@
 //! The layout of the descriptor protection domains exchange over the
 //! shared-memory dataplane queues.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1): everything read
+//! Faces the byzantine neighbour protection domain: everything read
 //! out of a shared region here is peer-written input. The descriptor is fixed
 //! but not checked — whether one is in bounds is a question about the pool it
 //! indexes, so only the domain that owns that pool can answer it. The
@@ -9,7 +9,7 @@
 //! rule about this ABI and no later owner knows more than the layout does.
 //!
 //! Every field is a little-endian `u32` and no byte-swapping code exists,
-//! because x86_64 is the only target (CONCEPT §3): the native image of a
+//! because x86_64 is the only target: the native image of a
 //! `#[repr(C)]` struct of `u32`s already *is* the wire image. The byte-image
 //! tests below exist so a port to a big-endian target fails them rather than
 //! silently shipping swapped descriptors. That fixes the descriptor as a peer
@@ -45,8 +45,8 @@
 //! whose two halves are one region per direction as the handover is;
 //! [`ClockCalibration`] under a seqlock; the recording tap [`TapRecords`] feeds;
 //! and the window a recording is downloaded through. Each decodes peer-written
-//! bytes first — the last step before a hostile writer reaches a serial line
-//! (OBS-5), or before those bytes reach a file offered as evidence.
+//! bytes first — the last step before a hostile writer reaches a serial
+//! line, or before those bytes reach a file offered as evidence.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -208,7 +208,7 @@ pub struct InterfaceImage {
     /// Network order, as the address appears in a header.
     pub address: [u8; 4],
     /// The `id` of the document's `<interface>`, which nothing else here implies:
-    /// a port is hardware topology (CONCEPT §12.3).
+    /// a port is hardware topology, fixed at build time rather than configured.
     pub id: IdentifierImage,
 }
 
@@ -248,7 +248,7 @@ impl NeighbourImage {
 }
 
 /// The management interface as the validating domain left it: the appliance's
-/// own presence on the port CONCEPT §9.1 keeps out of the dataplane.
+/// own presence on the management port, which is kept out of the dataplane.
 ///
 /// It carries no port, unlike an [`InterfaceImage`]: the management port is not
 /// in the router's port set and no number in this image can put it there.
@@ -590,7 +590,7 @@ impl ConfigSlot {
 ///
 /// Every field is private and the image has no accessor of its own, so the
 /// ordering each word carries is a property of this type rather than a
-/// convention its users are asked to keep (DOC-9).
+/// convention its users are asked to keep.
 #[repr(C)]
 pub struct ConfigHandover {
     offered: AtomicU32,
@@ -730,7 +730,7 @@ pub enum ConfigImageError {
         mac: [u8; 6],
     },
     /// The `id` bytes are not an identifier. Checked rather than copied through
-    /// because the id becomes a label value and a console field (OBS-5).
+    /// because the id becomes a label value and a console field.
     InterfaceIdNotAnIdentifier {
         index: usize,
         fault: TextFault,
@@ -1038,7 +1038,7 @@ impl CheckedNeighbour {
 /// region itself, and a view into bytes the writer can still change is not a
 /// configuration anybody can decide under. The entries are `Option` slots
 /// filled from the front, so the length is carried by the data and the writer's
-/// count bounds nothing here: iteration is bounded by the arrays (ENG-4).
+/// count bounds nothing here: iteration is bounded by the arrays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckedConfig {
     generation: u32,
@@ -1887,7 +1887,7 @@ mod tests {
         // And a byte outside the alphabet, at the position it sits at. An upper
         // case letter and a quote are both refused: the second is the one that
         // would end a label value early and let a document's text become a label
-        // name of its own (OBS-5).
+        // name of its own on the metric surface.
         for (text, offset) in [(&b"waN"[..], 2), (b"a\"b", 1), (b"a b", 1)] {
             assert_eq!(
                 with(IdentifierImage::from_text(text)),
@@ -1926,7 +1926,7 @@ mod tests {
             any::<[u8; 6]>(),
             any::<[u8; 2]>(),
             any::<[u8; 4]>(),
-            // The id is the peer's too, bytes and stated length alike (TEST-8).
+            // The id is the peer's too, bytes and stated length alike.
             (
                 any::<[u8; LOG_IDENTIFIER_BYTES]>(),
                 any::<u8>(),
@@ -2057,7 +2057,7 @@ mod tests {
     }
 
     /// Mostly one the document could hold, sometimes one no reader will take: each
-    /// of the three faults is reachable (TEST-8).
+    /// of the three faults is reachable.
     fn plausible_identifier_image() -> BoxedStrategy<IdentifierImage> {
         prop_oneof![
             8 => prop::collection::vec(

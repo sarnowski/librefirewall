@@ -4,7 +4,7 @@
 //! # The adversary and the surface
 //!
 //! Whatever is attached to the management port chooses every byte of every segment
-//! and every instant at which one arrives (CONCEPT §7.1: untrusted network traffic
+//! and every instant at which one arrives (untrusted network traffic
 //! **and** the management-plane attacker). What it does *not* choose is the
 //! connection table's size or the clock's direction, and those are the two bounds
 //! every assertion below is stated against.
@@ -20,7 +20,7 @@
 //!
 //! # Modelling authority, not politeness
 //!
-//! TEST-8 is what this is shaped by. Every value that crosses the boundary is
+//! Modelling the adversary's full authority is what this is shaped by. Every value that crosses the boundary is
 //! taken unreduced: the segment bytes, the source address, the instant, the window
 //! a caller sets, the range it claims to be retransmitting. In particular the
 //! *clock* is arbitrary and may move **backwards** — a peer cannot move a real
@@ -37,7 +37,7 @@
 //!   processed, or a typed refusal — and nothing panics, indexes past a bound or
 //!   overflows.
 //! * **Boundedness of state.** The connection table never exceeds its capacity,
-//!   whatever stream of distinct 4-tuples arrives (ENG-4). This is the
+//!   whatever stream of distinct 4-tuples arrives. This is the
 //!   connection-flood invariant, and it is asserted after every operation rather
 //!   than at the end.
 //! * **Boundedness of work.** Draining the timers terminates, and the harness

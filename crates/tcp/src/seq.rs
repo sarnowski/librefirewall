@@ -1,5 +1,5 @@
 //! TCP sequence numbers: the modulo-2^32 arithmetic and the four comparisons
-//! RFC 793 §3.3 states the protocol in.
+//! RFC 793 section 3.3 states the protocol in.
 //!
 //! Every value here arrives from the network, so no operation may overflow and
 //! none may panic. That is why the type wraps a `u32` privately and exposes no
@@ -15,7 +15,7 @@ use core::fmt;
 ///
 /// Deliberately not `Ord`: sequence space is a circle, so no total order exists
 /// over the whole of it and the derived one would be wrong across the wrap. The
-/// relations below hold over the half-space RFC 793 §3.3 reasons in — two
+/// relations below hold over the half-space RFC 793 section 3.3 reasons in — two
 /// numbers less than 2^31 apart — which is the only region a window can span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SeqNumber(u32);

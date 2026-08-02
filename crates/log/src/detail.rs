@@ -11,7 +11,7 @@
 //! A refusal names itself with text, and that text reaches this crate from two
 //! directions that cannot be given one type. A call site mints a literal, which
 //! is `&'static str` and is the whole reason a byte an adversary chose cannot
-//! reach the field (OBS-5). A console domain reconstructs one from a shared
+//! reach the field. A console domain reconstructs one from a shared
 //! region, where the bytes are a peer's and there is no allocator to own them,
 //! so it is [`Cause`]. The type parameter on [`Refusal`] is that seam, and its
 //! default keeps every minting call site writing what it wrote before.
@@ -28,8 +28,8 @@ use lfw_clock::UtcNanos;
 /// against, and the whole of a [`Cause`]'s storage.
 pub const MAX_CAUSE_LEN: usize = 40;
 
-/// Why a byte string is not a [`Cause`]. Names the position, never the byte
-/// (OBS-5).
+/// Why a byte string is not a [`Cause`]. Names the position, never the byte:
+/// an adversary-chosen byte must not reach an operator surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CauseError {
     TooLong { len: usize },
@@ -50,7 +50,7 @@ impl fmt::Display for CauseError {
 /// A refusal cause token in storage of its own: `[a-z0-9-]{0,40}`.
 ///
 /// [`Identifier`](crate::Identifier)'s alphabet for the reason that type gives
-/// — it is what makes text safe to put on a console at all (OBS-5) — and the
+/// — it is what makes text safe to put on a console at all — and the
 /// empty token is admitted where an identifier's is not, a refusal that names
 /// no cause being a record rather than a malformed one.
 ///
@@ -143,7 +143,7 @@ pub enum DomainDetail<C = &'static str> {
     },
     /// What a terminal endpoint has taken off its pipeline since it started,
     /// cumulative and monotonic. Counts and nothing else: no byte an adversary
-    /// put on a wire has a representation here (OBS-5).
+    /// put on a wire has a representation here.
     Received {
         frames: u64,
         bytes: u64,
@@ -155,7 +155,7 @@ pub enum DomainDetail<C = &'static str> {
         leading_word: u64,
     },
     /// Where one of a domain's recordings lives on that medium — the only way
-    /// an operator learns it, there being no shell and no CLI (CONCEPT §11).
+    /// an operator learns it, there being no shell and no CLI.
     Extent {
         start_sector: u64,
         sectors: u64,

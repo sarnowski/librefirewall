@@ -126,8 +126,7 @@ fn streaming_endpoint() -> Endpoint {
 ///
 /// One value rather than two drivers, because the loop around it — poll until
 /// the pass has nothing left, then let the peer's acknowledgement open the
-/// window again — is the same either way and two copies of it would drift
-/// (ENG-6).
+/// window again — is the same either way and two copies of it would drift.
 #[derive(Clone, Copy, Debug)]
 enum Supply {
     Rendered(Body),

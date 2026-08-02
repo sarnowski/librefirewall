@@ -9,8 +9,8 @@
 //! # The management port is a different kind of thing, not a third port
 //!
 //! It is not in [`PORTS`], carries no [`Endpoint`], and **no probe crosses it**:
-//! the routed contract must never expect it to forward anything, because CONCEPT
-//! §9.1 says it carries no forwarded traffic. What it gets instead is a contract
+//! the routed contract must never expect it to forward anything, because the
+//! design gives it no forwarded traffic. What it gets instead is a contract
 //! of its own, injected once at the point the capture proves every port is up so
 //! an exact count is possible:
 //!
@@ -31,7 +31,7 @@
 //!
 //! # The isolation is asserted in both directions, not described
 //!
-//! CONCEPT §9.1's mutual exclusion is two prohibitions, and a boot must satisfy
+//! The management/dataplane mutual exclusion is two prohibitions, and a boot must satisfy
 //! both: **no frame the harness put on the management wire may appear on either
 //! dataplane port**, and **no dataplane probe may appear on the management
 //! port**. Neither is a property of what the appliance was asked to do — it is a
@@ -1488,7 +1488,7 @@ fn tcp_frame(
     frame
 }
 
-/// The RFC 793 §3.1 checksum over the pseudo-header and the segment.
+/// The RFC 793 section 3.1 checksum over the pseudo-header and the segment.
 ///
 /// Answers zero for a segment whose own field is consistent, which is what makes
 /// one call serve both directions: composing (with the field zero) yields the
@@ -1758,7 +1758,7 @@ impl ManagementProbe {
         for probe in probes {
             if contains(frame, probe.marker) {
                 return Err(format!(
-                    "probe {} came back on the management port. CONCEPT §9.1 isolates that port \
+                    "probe {} came back on the management port. The design isolates that port \
                      from the dataplane, and no domain is granted a region on both sides of it, so \
                      a dataplane frame reaching it means one of those grants has changed",
                     probe.name
@@ -1803,7 +1803,7 @@ impl ManagementProbe {
     /// Every assertion is a **field comparison**: the flags that must be set and
     /// the flags that must not, the acknowledgement number against what the client
     /// actually sent, the payload against the bytes it actually sent. Nothing here
-    /// matches a substring or a rendered line (TEST-13).
+    /// matches a substring or a rendered line.
     ///
     /// # Errors
     /// The verdict, naming the field and the two values. A segment that arrives at
@@ -2368,8 +2368,8 @@ fn is_tcp(frame: &[u8]) -> bool {
 ///
 /// Both belong to nothing else on either bench (`crate::qemu`'s and
 /// `crate::topology`'s tests hold them to it), so either appearing in a frame on
-/// a dataplane port is the isolation CONCEPT §9.1 requires having stopped being
-/// true — in the direction no console record would ever show.
+/// a dataplane port is the required management/dataplane isolation having
+/// stopped being true — in the direction no console record would ever show.
 fn carries_management_traffic(frame: &[u8], management: &ManagementPort) -> bool {
     contains(frame, MANAGEMENT_MARKER)
         || contains(frame, &management.mac)
@@ -2913,8 +2913,8 @@ fn run_boot(
                 // dataplane port.
                 if carries_management_traffic(&frame, &test.topology.management()) {
                     break 'run Err(format!(
-                        "{} bytes carrying management traffic came back on port{egress}. CONCEPT \
-                         §9.1 isolates the management port from the dataplane, and no domain is \
+                        "{} bytes carrying management traffic came back on port{egress}. The design \
+                         isolates the management port from the dataplane, and no domain is \
                          granted a region on both sides of it, so a frame crossing means one of \
                          those grants has changed; see {}",
                         frame.len(),
@@ -4411,7 +4411,7 @@ mod tests {
         let (probe, _) = ManagementProbe::new(management);
         let probes = probes(&bench()).expect("the shipped bench");
 
-        // A dataplane probe: the isolation CONCEPT §9.1 requires, in the
+        // A dataplane probe: the required management/dataplane isolation, in the
         // direction a leak would be silent.
         let leaked = &probes[0].frame;
         let verdict = probe

@@ -7,8 +7,8 @@ use core::fmt;
 /// be `Copy` with no allocator behind it.
 pub const MAX_IDENTIFIER_LEN: usize = 16;
 
-/// Why a byte string is not an identifier. Names the position, never the byte
-/// (OBS-5).
+/// Why a byte string is not an identifier. Names the position, never the byte:
+/// an attacker-chosen byte must not reach an operator surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentifierError {
     Empty,
@@ -33,7 +33,7 @@ impl fmt::Display for IdentifierError {
 /// A configuration object's stable name: `[a-z0-9-]{1,16}`.
 ///
 /// The alphabet is not a style choice — it is what makes an operator-supplied
-/// string safe to put on a console at all (OBS-5), so it is checked once, here,
+/// string safe to put on a console at all, so it is checked once, here,
 /// and every later consumer receives text it can render without asking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
@@ -71,7 +71,7 @@ impl Identifier {
     /// The fallback is unreachable: [`Identifier::new`] is what sets `len`, and
     /// it does so only after comparing it against the array's own size. An
     /// empty slice rather than a panic because a branch safe Rust cannot delete
-    /// is not a failure to surface (ENG-12) and a rendered line is not worth
+    /// is not a failure to surface and a rendered line is not worth
     /// faulting a domain over.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {

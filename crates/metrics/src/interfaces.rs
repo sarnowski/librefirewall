@@ -18,10 +18,10 @@
 //!
 //! [`PORT_DOMAINS`] is the join key's source and is a **cross-artifact fact**,
 //! not a value this crate may choose: which protection domain drives which port
-//! is fixed in the system description at build time (CONCEPT §12.3). It is
+//! is fixed in the system description at build time. It is
 //! recorded once here, where the `domain` label values already live, so it
 //! cannot be spelled two ways — and it is *checked* against the description by
-//! `xtask::sysdesc`, which is the enforcer its DOC-7 precondition names.
+//! `xtask::sysdesc`, the named enforcer of the precondition below.
 
 use wire::{CheckedIdentifier, MAX_INTERFACES};
 
@@ -30,7 +30,7 @@ use crate::sample::PIPELINES;
 
 /// The protection domain driving each dataplane port, indexed by port number.
 ///
-/// **Delegated precondition (DOC-7).** That port *n* is driven by the domain at
+/// **Delegated precondition.** That port *n* is driven by the domain at
 /// index *n* is made true by `systems/qemu-x86_64/librefirewall.system`, where
 /// the domain named here maps port *n*'s receive pipeline region as its own
 /// `rx_fwd_vaddr`. Nothing in a configuration document states it and nothing in
@@ -51,17 +51,17 @@ pub const MANAGEMENT_PORT_DOMAIN: &str = "nic_driver2";
 ///
 /// The only way to obtain the `domain` label of a dataplane interface, so a call
 /// site cannot state one — which is what keeps the mapping a single fact rather
-/// than a convention each caller keeps (DOC-9).
+/// than a convention each caller keeps.
 #[must_use]
 pub fn port_domain(port: u8) -> Option<&'static str> {
     PORT_DOMAINS.get(usize::from(port)).copied()
 }
 
-/// What a port is for, in CONCEPT §9.1's terms.
+/// What a port is for, in the architecture's terms.
 ///
-/// §9.1 makes the role the architectural unit rather than the port number, so it
-/// is what a query groups by. The vocabulary is these two today and grows with
-/// §9.1's remaining roles when they exist.
+/// The design makes the role the architectural unit rather than the port number,
+/// so it is what a query groups by. The vocabulary is these two today and grows
+/// with the design's remaining roles when they exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// A port in the router's set, carrying forwarded traffic.
@@ -175,14 +175,14 @@ impl InterfaceInfo {
 /// dataplane interface a configuration image holds, plus the one management
 /// interface.
 ///
-/// Under CONCEPT §9.2's port model this is at most 7 — six dataplane ports and
+/// Under the designed port model this is at most 7 — six dataplane ports and
 /// the management one — so the bound the exposition is sized by is well above
 /// what the appliance will ever configure.
 pub const MAX_INTERFACE_SERIES: usize = MAX_INTERFACES + 1;
 
 /// The inventory is full. Unreachable from a checked configuration image, which
 /// holds at most [`MAX_INTERFACES`] interfaces and one management entry; a typed
-/// error rather than a silently dropped series all the same (ENG-12).
+/// error rather than a silently dropped series all the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InventoryFull;
 
@@ -238,7 +238,7 @@ impl Default for InterfaceInventory {
 
 // The join key is one word on both sides or the join silently matches nothing,
 // so the domain a port's info series carries is held equal to the domain that
-// port's driver shard publishes its counters under (TEST-5).
+// port's driver shard publishes its counters under.
 const _: () = {
     assert!(PORT_DOMAINS.len() == PIPELINES);
     // The driver shards sit at 1..=3 in `SHARDS`, the forwarder holding slot 0.

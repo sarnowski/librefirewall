@@ -6,7 +6,7 @@
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **byzantine neighbour**: the tap annotations arrive from the
+//! A **byzantine neighbour protection domain**: the tap annotations arrive from the
 //! forwarding domain through shared memory, already checked by `wire::tap` into
 //! a [`CheckedTap`], and the frame bytes they describe are the network's. A
 //! frame length is therefore never allowed to steer a write, and every record
@@ -260,7 +260,7 @@ pub enum Locate {
     Overrun,
 }
 
-/// Saturating, monotone counts for MONITORING.md.
+/// Saturating, monotone counts for the operator-facing metrics contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SinkCounters {
     pub records: u64,

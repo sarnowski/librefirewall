@@ -4,16 +4,16 @@
 //! # Why a type and not a pointer and a length
 //!
 //! A data segment is an address handed to a device that will DMA to it, and
-//! there is no IOMMU on this platform (CONCEPT §7.2), so an offset computed
+//! there is no IOMMU on this platform, so an offset computed
 //! wrong is the device writing somewhere else. The authority to name a byte
 //! therefore exists in one shape, [`IoSector`], `< IO_SECTORS` by
 //! construction; every address here is that index times
 //! [`SECTOR_SIZE`](crate::SECTOR_SIZE), so "inside the region" is arithmetic
-//! rather than a check somebody remembered (DOC-9).
+//! rather than a check somebody remembered.
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**, on the read path: the
+//! A **hostile or malfunctioning device**, on the read path: the
 //! bytes copied out are whatever it DMA'd in, so they are payload and never a
 //! value that steers a later access, and nothing here reads them. The base
 //! address is the `io_paddr` setvar rather than the device's, and is checked
@@ -84,7 +84,7 @@ impl IoSector {
 /// Why a staging window could not be attached: its patched physical base is
 /// zero, not page-aligned, or so high that the region's end is not
 /// representable. `paddr` is the diagnosis, and the console is the only place
-/// an operator sees it (CONCEPT §11): zero means the `setvar` is missing or
+/// an operator sees it, there being no shell: zero means the `setvar` is missing or
 /// misspelled, any other value means it is misplaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoRegionUnusable {
@@ -167,15 +167,15 @@ impl IoRegion<'_> {
     /// The whole window, for a caller composing transfers in place — a
     /// recording, which is hundreds of kilobytes and has no other home: a
     /// protection domain's stack is tens and it has no allocator. `&mut self`
-    /// is the aliasing argument, and offsets are bounded by the slice (DOC-9).
+    /// is the aliasing argument, and offsets are bounded by the slice.
     pub fn staging(&mut self) -> &mut [u8] {
         // SAFETY: `attach`'s contract makes `base` a live `BLK_IO_REGION_SIZE`
         // mapping held for `'region`, so the slice is in bounds for the whole
         // borrow; `u8` needs no alignment and has no invalid bit pattern, so
         // whatever the device left there is initialized. Exclusivity is this
         // `&mut self` plus the grant: `blk_io` is mapped `rw` to the recorder
-        // alone, whose ENFORCER (DOC-7) is `xtask::sysdesc`'s `REGIONS` rule
-        // for it. The device may DMA in concurrently, so bytes read back are
+        // alone, which `xtask::sysdesc`'s `REGIONS` rule for it enforces.
+        // The device may DMA in concurrently, so bytes read back are
         // payload and never a value that steers an access, exactly as `take`'s.
         unsafe { core::slice::from_raw_parts_mut(self.base, BLK_IO_REGION_SIZE) }
     }

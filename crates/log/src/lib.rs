@@ -8,13 +8,13 @@
 //!
 //! # Adversary
 //!
-//! The byzantine peer protection domain (CONCEPT §7.1), on one path: a record
+//! The byzantine peer protection domain, on one path: a record
 //! decoded out of a shared region was written by another domain, and `record.rs`
 //! is where that is refused. Everything else faces the management-plane attacker
 //! at one remove — values derived from a configuration document are rendered
 //! here, which is what shapes [`Value`]: already-parsed domain types with no
 //! arbitrary-bytes variant, so a byte string out of a document reaches no
-//! console line as itself (OBS-5), [`Identifier`] excepted for its alphabet.
+//! console line as itself, [`Identifier`] excepted for its alphabet.
 //!
 //! # Every record is stamped, and half of them with nothing
 //!
@@ -22,8 +22,8 @@
 //! and both cases are ordinary: a domain emitting before this node established
 //! a time gets [`Stamp::Unsynchronized`], which is most of a boot transcript.
 //! The absence is a case of the type rather than a zero, so no reader can take
-//! it for 1970 (ENG-12). What it is not is a *trusted* time — the epoch behind
-//! it is an unauthenticated CMOS reading (README, *Trusted time source*) — nor
+//! it for 1970. What it is not is a *trusted* time — the epoch behind
+//! it is an unauthenticated CMOS reading, a known open point — nor
 //! an ordering: a change is attributed by `generation` and `sequence`, and an
 //! instant is not an attribution.
 //!

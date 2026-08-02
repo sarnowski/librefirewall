@@ -7,7 +7,7 @@
 //! other one names.
 //!
 //! `LFW-BOOT` is deliberately outside it. Those records are written by the boot
-//! manager **before seL4 starts** (MONITORING.md, *Boot-manager records*), so
+//! manager **before seL4 starts**, so
 //! there is no protection domain, no calibration region and no counter reading
 //! behind them; a stamp on one would be a different mechanism wearing the same
 //! field name.
@@ -28,13 +28,13 @@
 //!   stamped one from the same domain would mean a calibration was withdrawn,
 //!   which nothing in this system can do.
 //! * **A domain's own stamps do not go backwards.** Within one ring the console
-//!   renders in emission order (MONITORING.md), and one domain reads one
+//!   renders in emission order, and one domain reads one
 //!   counter, so its instants are non-decreasing.
 //!
 //! # Why the ordering is per domain and never across the capture
 //!
-//! The console serves the rings round-robin (MONITORING.md, *Ordering and
-//! time*), so which domain's record reaches the line first is decided by where
+//! The console serves the rings round-robin, so which
+//! domain's record reaches the line first is decided by where
 //! that rotation stood — not by which event happened first. A monotonicity
 //! assertion over the capture as a whole would therefore fail on a healthy
 //! node, and passing would prove only that the rotation happened to agree.
@@ -156,7 +156,7 @@ fn parse(record: &str, log: &Path) -> Result<Instant, String> {
         return Err(verdict(
             &format!(
                 "{record:?} carries no `{TIME_KEY}=` field, and every record of every channel is \
-                 specified with one (MONITORING.md)"
+                 specified with one"
             ),
             log,
         ));

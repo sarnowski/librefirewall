@@ -1,8 +1,8 @@
 //! The 16550-compatible UART at x86 I/O port `0x3F8` (COM1): the register
 //! protocol that programs it, and the write path that puts a byte on it.
 //!
-//! It carries the console, which on a node with no shell and no CLI (CONCEPT
-//! §11) is a last-resort channel. The register sequencing lives here rather
+//! It carries the console, which on a node with no shell and no CLI
+//! is a last-resort channel. The register sequencing lives here rather
 //! than in the protection domain so that it can be driven by a host test;
 //! [`PortIo`] is the seam the caller supplies the port behind.
 //!
@@ -16,7 +16,7 @@
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**. Every byte read back
+//! A **hostile or malfunctioning device**. Every byte read back
 //! here — the interrupt-enable readback, the line-control readback, the divisor
 //! latches, the interrupt-identification bits, the line status — is chosen by
 //! the device, and a device that simply never answers is indistinguishable from
@@ -31,7 +31,7 @@
 //! Azure Serial Console attaches to "ttyS0 or COM1" and QEMU's q35 machine
 //! exposes COM1 as a 16550A: the same 16550-compatible UART at the same port.
 //! There is therefore no second, Azure-specific driver to write, and writing one
-//! would be this driver duplicated (ENG-6). Where the two differ is
+//! would be this driver duplicated. Where the two differ is
 //! *availability*, not registers, and neither difference is expressible in code:
 //! Azure reaches the console only when boot diagnostics are enabled on the VM,
 //! and Microsoft documents the serial console as possibly unavailable after a
@@ -41,7 +41,7 @@
 //! # Why there is nothing to configure
 //!
 //! [`COM1_BASE`] and [`DIVISOR`] are constants rather than parameters because
-//! they are hardware topology, and CONCEPT §12.3 fixes hardware in the system
+//! they are hardware topology, and hardware is fixed in the system
 //! description: the port window this driver may touch is granted by an
 //! `<ioport>` element, so a runtime base would be a value the capability could
 //! not follow. The build-time constant and the grant are one fact stated twice,
@@ -79,7 +79,7 @@ pub const COM1_BASE: u16 = 0x3F8;
 /// Consecutive I/O ports the controller occupies, and the width of the
 /// `<ioport>` grant that admits them.
 ///
-/// **Cross-artifact (DOC-7):** equal to the `size` attribute of the
+/// **Cross-artifact fact:** equal to the `size` attribute of the
 /// `<ioport id="0" addr="0x3f8" size="8" />` element granted to the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`; [`Register::port`] and
 /// its assertions keep every address formed here inside it.
@@ -121,7 +121,7 @@ pub const FIFO_DEPTH: usize = 16;
 /// and traps to the hypervisor under virtualization — so this is upwards of a
 /// hundred times the longest wait a working controller can impose. It is a
 /// constant of this crate rather than anything derived from the device, which is
-/// what makes the loop bounded by a value the adversary does not choose (ENG-4).
+/// what makes the loop bounded by a value the adversary does not choose.
 pub const THRE_POLL_LIMIT: u32 = 10_000;
 
 /// Reads of the interrupt-identification register one [`Uart::initialise`] may
@@ -181,7 +181,7 @@ const LSR_THRE: u8 = 0x20;
 /// within the granted [`PORT_COUNT`]-port window.
 ///
 /// The enum is the whole of what [`PortIo`] can be asked for, so an offset
-/// outside the window is unrepresentable rather than rejected (DOC-9). Only the
+/// outside the window is unrepresentable rather than rejected. Only the
 /// five offsets this driver uses are declared: the modem-control, modem-status
 /// and scratch registers are granted by the same `<ioport>` element and touched
 /// by nothing here.
@@ -227,7 +227,7 @@ impl Register {
     ///
     /// An OR, not an addition: the assertions below zero [`COM1_BASE`]'s low
     /// three bits, so the offset cannot leave the granted window and nothing can
-    /// overflow (ENG-5). `pub` so the out-of-crate [`PortIo`] need not restate
+    /// overflow. `pub` so the out-of-crate [`PortIo`] need not restate
     /// it unchecked.
     #[must_use]
     pub const fn port(self) -> u16 {
@@ -265,10 +265,10 @@ pub trait PortIo {
 
 /// Why the controller was not accepted as a usable console.
 ///
-/// Every variant carries what the device answered, because an operator with no
-/// shell (CONCEPT §11) distinguishes an absent controller — which answers `0xFF`
-/// to everything — from one that took the divisor and then refused the word
-/// format only if the two produce different console lines (ENG-12).
+/// Every variant carries what the device answered, because an operator — who
+/// has no shell on this appliance — distinguishes an absent controller, which
+/// answers `0xFF` to everything, from one that took the divisor and then
+/// refused the word format only if the two produce different console lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError {
     /// The interrupt-enable register did not read back as cleared. This is the
@@ -302,8 +302,8 @@ pub enum WriteError {
     TransmitterNeverReady { polls: u32 },
 }
 
-/// What this driver can say about itself, in the shape the metrics endpoint
-/// (CONCEPT §11) scrapes.
+/// What this driver can say about itself, in the shape the appliance's
+/// metrics endpoint scrapes.
 ///
 /// Every field is **monotonic** for the protection domain's life and
 /// **saturates** at [`u64::MAX`] rather than wrapping, and there is no reset: a
@@ -343,7 +343,7 @@ impl UartStats {
 /// The write path is not on this type. It is on [`Transmitter`], which only
 /// [`initialise`](Self::initialise) produces, so writing to an unprogrammed
 /// controller — at whatever baud rate the firmware happened to leave — cannot
-/// be written rather than being a rule to remember (DOC-9).
+/// be written rather than being a rule to remember.
 pub struct Uart<P> {
     port: P,
     stats: UartStats,
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn each_refused_step_reaches_the_operator_as_its_own_error() {
-        // ENG-12: six ways for a controller to be unusable must not collapse
+        // Six ways for a controller to be unusable must not collapse
         // into one console line. Each is driven to its own variant, and no two
         // are equal.
         let refusals = [

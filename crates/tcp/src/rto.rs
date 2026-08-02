@@ -21,7 +21,7 @@
 //!
 //! # The rounding, and where it differs from a fast LAN's habit
 //!
-//! RFC 6298 §2.4 rounds every computed timeout up to one second, and this
+//! RFC 6298 section 2.4 rounds every computed timeout up to one second, and this
 //! follows it rather than the sub-second minimum a local-network stack usually
 //! picks. The reason is which error each choice makes: a floor that is too low
 //! turns a momentarily slow peer into a duplicate-segment source, and this stack
@@ -31,21 +31,21 @@
 
 use lfw_clock::Duration;
 
-/// RFC 6298 §2.1's initial value, in force until the first round-trip
+/// RFC 6298 section 2.1's initial value, in force until the first round-trip
 /// measurement replaces it.
 pub const INITIAL_RTO: Duration = Duration::from_millis(1_000);
 
-/// RFC 6298 §2.4's floor. See the module header on why the RFC's own second is
+/// RFC 6298 section 2.4's floor. See the module header on why the RFC's own second is
 /// kept rather than lowered.
 pub const MIN_RTO: Duration = Duration::from_millis(1_000);
 
-/// The ceiling RFC 6298 §2.5 permits, chosen at the low end of what it allows
+/// The ceiling RFC 6298 section 2.5 permits, chosen at the low end of what it allows
 /// (at least 60 seconds): a connection whose timeout has backed off this far is
 /// one about to be abandoned, and a larger ceiling only lengthens how long its
 /// table slot is held.
 pub const MAX_RTO: Duration = Duration::from_millis(60_000);
 
-/// The clock granularity `G` of RFC 6298 §2.4's `max(G, 4*RTTVAR)`.
+/// The clock granularity `G` of RFC 6298 section 2.4's `max(G, 4*RTTVAR)`.
 ///
 /// One microsecond, because the reading behind a [`lfw_clock::Monotonic`] is a
 /// timestamp counter converted to nanoseconds: the quantity is finer than this,
@@ -56,7 +56,7 @@ const CLOCK_GRANULARITY: Duration = Duration::from_micros(1);
 /// RFC 6298's `SRTT` and `RTTVAR`, and the timeout derived from them.
 ///
 /// `srtt` is `None` until the first measurement, which is what distinguishes
-/// §2.2's initialisation from §2.3's update — a distinction a zero would lose,
+/// section 2.2's initialisation from section 2.3's update — a distinction a zero would lose,
 /// zero being also a perfectly possible sample from a fast local peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetransmissionTimer {
@@ -64,7 +64,7 @@ pub struct RetransmissionTimer {
     rttvar: Duration,
     rto: Duration,
     /// How many times the timeout has doubled without a measurement, which is
-    /// what §5.5's exponential backoff counts and what the caller compares
+    /// what section 5.5's exponential backoff counts and what the caller compares
     /// against its own retry limit.
     backoff: u32,
 }
@@ -97,24 +97,24 @@ impl RetransmissionTimer {
         self.srtt.is_some()
     }
 
-    /// Take one round-trip measurement, per RFC 6298 §2.2 and §2.3.
+    /// Take one round-trip measurement, per RFC 6298 section 2.2 and section 2.3.
     ///
     /// The caller is responsible for Karn's algorithm — a sample must not come
     /// from a segment that was retransmitted — because only it knows which
     /// segment an acknowledgement covered. `crate::connection::Unacked` records
     /// that, and `Connection::acknowledge` is what refuses the sample; the
     /// property `a_retransmitted_segment_yields_no_sample` in `crate::tests`
-    /// holds it to that (DOC-7).
+    /// holds it to that.
     pub fn measure(&mut self, sample: Duration) {
         let sample_nanos = sample.as_nanos();
         match self.srtt {
             None => {
-                // §2.2: SRTT <- R, RTTVAR <- R/2.
+                // section 2.2: SRTT <- R, RTTVAR <- R/2.
                 self.srtt = Some(sample);
                 self.rttvar = Duration::from_nanos(sample_nanos / 2);
             }
             Some(srtt) => {
-                // §2.3, with alpha = 1/8 and beta = 1/4. The difference is
+                // section 2.3, with alpha = 1/8 and beta = 1/4. The difference is
                 // taken as an absolute value, so the order of the two readings
                 // cannot make it negative.
                 let srtt_nanos = srtt.as_nanos();
@@ -128,25 +128,25 @@ impl RetransmissionTimer {
             }
         }
         self.recompute();
-        // §5.3: a new measurement resets the backoff, the timeout no longer
+        // section 5.3: a new measurement resets the backoff, the timeout no longer
         // resting on a guess.
         self.backoff = 0;
     }
 
-    /// §5.5: double the timeout on an expiry, up to [`MAX_RTO`].
+    /// section 5.5: double the timeout on an expiry, up to [`MAX_RTO`].
     pub fn back_off(&mut self) {
         self.rto = clamp(self.rto.as_nanos().saturating_mul(2));
         self.backoff = self.backoff.saturating_add(1);
     }
 
-    /// §2.4: `RTO <- SRTT + max(G, 4*RTTVAR)`, clamped to the band.
+    /// section 2.4: `RTO <- SRTT + max(G, 4*RTTVAR)`, clamped to the band.
     fn recompute(&mut self) {
         let srtt = match self.srtt {
             Some(srtt) => srtt.as_nanos(),
             // Unreachable from `measure`, which sets `srtt` on both arms before
             // calling this; expressed as a value rather than an assertion
-            // because an `assert!` on a path a peer's acknowledgement reaches is
-            // what ENG-5 refuses.
+            // because an `assert!` must not sit on a path a peer's
+            // acknowledgement reaches.
             None => return,
         };
         let variance = self

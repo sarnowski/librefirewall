@@ -7,7 +7,7 @@
 //! are **private fields with no accessor**, and that is correct: the crate's
 //! own header gives the reason — a caller that could reach a field could choose
 //! its own `Ordering`, and which ordering each word carries is a property of
-//! the transport rather than a convention its users are asked to keep (DOC-9).
+//! the transport rather than a convention its users are asked to keep.
 //!
 //! A peer protection domain is under no such constraint. It maps the very same
 //! pages, and which of the two it maps read-write is the whole of the
@@ -15,8 +15,8 @@
 //! cursor, the console domain owns the consume region and reads the records.
 //! Every word on the side a domain owns is a plain address it may store to at
 //! any moment. A harness that could not write them would be modelling a
-//! *polite* peer and would exclude the entire adversarial region — the TEST-8
-//! failure this workspace exists to correct.
+//! *polite* peer and would exclude the entire adversarial region — the
+//! harness failure mode this workspace exists to correct.
 //!
 //! So the peer is reproduced the way the peer really works: through the
 //! regions' `#[repr(C)]` ABI, with atomic stores of the widths the ABI
@@ -54,8 +54,8 @@
 //! `log_ring`'s own header names ("per-field atomics mean a write concurrent
 //! with a read can yield a record whose fields come from different writes"),
 //! and a view that could only store whole records would have excluded it —
-//! TEST-8, because a *conforming* writer publishes whole records and only a
-//! byzantine one leaves a slot half-rewritten.
+//! excluding the adversary's real capability, because a *conforming* writer
+//! publishes whole records and only a byzantine one leaves a slot half-rewritten.
 //!
 //! [`store_location`](LogRingPeer::store_location) is therefore the primitive
 //! and [`store_record`](LogRingPeer::store_record) is 152 of it. Single-location
@@ -136,8 +136,8 @@ pub const LOCATION_COUNT: usize = 154;
 ///
 /// A type with a private field rather than a bare index, so no caller can name
 /// a location the slot does not have: the bound the accesses below rest on is
-/// carried by the type instead of by a check every call site is trusted to have
-/// made (DOC-9).
+/// carried by the type instead of by a check every call site is trusted to
+/// have made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Location(usize);
 

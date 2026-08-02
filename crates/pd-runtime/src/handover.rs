@@ -3,7 +3,7 @@
 //!
 //! # Adversary
 //!
-//! A byzantine peer protection domain (CONCEPT §7.1). The handover region is
+//! A byzantine neighbour protection domain. The handover region is
 //! written by another domain and is mapped here read-only, which stops nothing
 //! that matters: every field in it is that domain's claim, the counts may name
 //! more entries than the arrays hold, and the bytes may change again while they
@@ -90,7 +90,7 @@ pub fn router_from<const MAX_I: usize, const MAX_N: usize>(
 ///
 /// Every field comes out of the image except the `domain` each entry joins on,
 /// which [`lfw_metrics::port_domain`] supplies from the port — a cross-artifact
-/// fact no configuration carries (CONCEPT §12.3). An interface whose port has no
+/// build-time hardware fact no configuration carries. An interface whose port has no
 /// driver is left out rather than reported under a wrong domain; the image's own
 /// reader has already refused one, so it is unreachable from a commit.
 #[must_use]
@@ -108,7 +108,7 @@ pub fn interfaces_from(checked: &CheckedConfig) -> InterfaceInventory {
         };
         // `MAX_INTERFACES` plus the management entry is exactly the inventory's
         // capacity, so this is unreachable — and dropped rather than asserted,
-        // nothing about a metric being worth faulting a domain over (ENG-12).
+        // nothing about a metric being worth faulting a domain over.
         if inventory.push(info).is_err() {
             return inventory;
         }
@@ -320,7 +320,7 @@ pub struct ConfigCounters {
 ///
 /// `MAX_I` and `MAX_N` are this domain's own capacity, deliberately not read
 /// from the region: an image naming more entries than the domain can hold is
-/// refused by a bound the writer of that region does not choose (ENG-4).
+/// refused by a bound the writer of that region does not choose.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigurationSwitch<const MAX_I: usize, const MAX_N: usize> {
     active: Router<MAX_I, MAX_N>,
@@ -378,8 +378,8 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     /// a decision made on bytes the publisher may rewrite underneath it is no
     /// decision at all. One offer costs one read and yields one outcome however
     /// often this is called, which is what puts a refusal on the publisher's
-    /// rate and not on the caller's polling rate — the console rests on that
-    /// (OBS-1). A re-write under the word already on offer is therefore not an
+    /// rate and not on the caller's polling rate — the console, which carries
+    /// system state only, rests on that. A re-write under the word already on offer is therefore not an
     /// offer this side can read.
     ///
     /// The generation acknowledged is the *offered* word and never the label
@@ -513,7 +513,7 @@ impl CommittedReader {
     ///
     /// `ports` is the caller's own port count, so an image naming a port this
     /// build has no driver for is refused by a bound the publisher does not
-    /// choose (ENG-4).
+    /// choose.
     pub fn take(&mut self, handover: &ConfigHandover, ports: u8) -> Option<Committed> {
         let generation = handover.committed_generation();
         if generation <= self.taken {
@@ -869,8 +869,8 @@ mod tests {
         );
     }
 
-    /// The console is the last-resort channel and carries system state alone
-    /// (OBS-1), so a refusal is an event of the offer and never of the poll: a
+    /// The console is the last-resort channel and carries system state alone,
+    /// so a refusal is an event of the offer and never of the poll: a
     /// caller polling an unchanged refused offer must be told once. Anyone able
     /// to raise this domain's wakeup rate would otherwise set the rate of a
     /// console record.
@@ -1233,7 +1233,7 @@ mod tests {
 
     /// A committed image this reader will not read is reported once and consumes
     /// the generation: the publisher has already released it, so re-reading it
-    /// would report the same refusal on the caller's polling rate (OBS-1).
+    /// would report the same refusal on the caller's polling rate.
     #[test]
     fn a_committed_image_that_cannot_be_read_is_refused_once() {
         let (handover, _ack) = regions();

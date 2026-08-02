@@ -4,7 +4,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device** — the timer block, whose
+//! The **hostile or malfunctioning device** — the timer block, whose
 //! every answer is its own choice and whose window may decode nothing at all.
 //! Nothing here judges one: every value goes straight to `lfw_hpet`, which
 //! ranges what it is told and bounds every wait. No peer domain and no network
@@ -42,7 +42,7 @@ use sel4_microkit::memory_region_symbol;
 ///
 /// It carries the base and nothing else — no length and no register map — for
 /// the reason `pds/console`'s `Com1` carries neither base nor capability
-/// pointer: both are fixed by the system description (CONCEPT §12.3), and a
+/// pointer: both are fixed by the system description at build time, and a
 /// field would be a second, unchecked statement of what `lfw_hpet`'s
 /// const-assertions already hold. The private field makes [`map`](Self::map)
 /// the only way to obtain one, so no pointer this domain did not receive from
@@ -57,7 +57,7 @@ impl HpetPage {
     /// It reads the patched symbol itself rather than taking a pointer, which
     /// is what leaves this constructor with no precondition to delegate: there
     /// is no argument a caller could get wrong, so there is no `# Safety`
-    /// section here and no obligation for a call site to discharge (DOC-9).
+    /// section here and no obligation for a call site to discharge.
     ///
     /// A second handle is a second view of one device and not a second device.
     /// Every access below is volatile and the block is what both would be

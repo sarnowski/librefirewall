@@ -5,14 +5,14 @@
 //! It is read **once, at boot**, to establish the epoch a node's time is
 //! anchored to; from there `lfw_clock::Calibration` advances time from the
 //! timestamp counter, so no drift correction, no periodic re-read and no
-//! comparison of two readings belongs here. CONCEPT §13.1 leaves the
-//! trusted-time mechanism open, and §7.2 records that TLS certificate
+//! comparison of two readings belongs here. The appliance's
+//! trusted-time mechanism is a deliberately open question, and TLS certificate
 //! validation depends on accurate time; this crate is the anchoring half of
 //! what would settle that, and it exposes no signal of its own.
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**. Every byte here is one
+//! A **hostile or malfunctioning device**. Every byte here is one
 //! the part chose: each time and date register, the century, and the two status
 //! registers that say how the rest are encoded. A part that answers nothing —
 //! an unclaimed port reads `0xFF` — is indistinguishable from one that answers
@@ -20,7 +20,7 @@
 //! from one whose update-in-progress bit is stuck high. All of it is met the
 //! same way: the wait is bounded by a named constant of this crate's own
 //! ([`UIP_POLL_LIMIT`], [`SNAPSHOT_ATTEMPTS`]) rather than by anything the
-//! device reports (ENG-4), nothing is believed without being ranged, and every
+//! device reports, nothing is believed without being ranged, and every
 //! refusal is its own [`RtcError`]. A clock that cannot be read must cost a
 //! node its epoch and say so, not its liveness.
 //!
@@ -68,8 +68,8 @@
 //! ranged against [`MIN_PLAUSIBLE_YEAR`] and [`MAX_PLAUSIBLE_YEAR`] and refused
 //! outside it. Defaulting to `20xx` when the register looks wrong was rejected:
 //! it would turn a part that answers `0x00` or `0xFF` into a confident,
-//! plausible-looking epoch, which is the silent-fallback ENG-12 forbids — and
-//! an appliance with no epoch can be told so, while one with a wrong epoch
+//! plausible-looking epoch, the silent fallback that papers over a failure —
+//! and an appliance with no epoch can be told so, while one with a wrong epoch
 //! cannot tell anyone anything.
 //!
 //! # Rejected alternatives
@@ -118,7 +118,7 @@ pub const DATA_PORT: u16 = 0x71;
 /// Consecutive I/O ports the part occupies, and so the width an `<ioport>`
 /// grant admitting a [`CmosPortIo`] implementation has to have.
 ///
-/// **Cross-artifact (DOC-7):** the grant is the `clock` domain's `<ioport
+/// **Cross-artifact fact:** the grant is the `clock` domain's `<ioport
 /// id="0" addr="0x70" size="2" />` in `systems/qemu-x86_64/librefirewall.system`,
 /// held to this constant by `xtask::sysdesc`'s `IO_PORTS` rule. The domain
 /// enforces the match the way `pds/console/src/com1.rs` does, and `pds/clock`'s
@@ -180,7 +180,7 @@ const _: () = assert!(MIN_PLAUSIBLE_YEAR < MAX_PLAUSIBLE_YEAR);
 /// trap to the hypervisor under virtualization — so this is upwards of four
 /// times that. It is a constant of this crate rather than anything derived from
 /// the device, which is what makes the loop bounded by a value the adversary
-/// does not choose (ENG-4).
+/// does not choose.
 pub const UIP_POLL_LIMIT: u32 = 10_000;
 
 /// Snapshots of the register file one [`Rtc::read_unix_seconds`] may take while
@@ -219,7 +219,7 @@ pub const READ_PORT_OPS_MAX: u32 = SNAPSHOT_ATTEMPTS * SNAPSHOT_PORT_OPS_MAX;
 ///
 /// The enum is the whole of what this crate will ask [`CmosPortIo`] for, so an
 /// index outside the vocabulary — including one with [`NMI_DISABLE`] set — is
-/// unrepresentable rather than rejected (DOC-9). Only the nine registers this
+/// unrepresentable rather than rejected. Only the nine registers this
 /// crate reads are declared: the alarm registers, status C and D, and the
 /// hundred-odd bytes of general-purpose CMOS lie in the same index space and are
 /// touched by nothing here.
@@ -326,7 +326,7 @@ const SNAPSHOT_REGISTERS: [Register; 8] = [
 
 /// Byte-wide access to the part's register file.
 ///
-/// **Precondition, delegated (DOC-7):** `index` names a member of
+/// **Precondition, delegated to the caller:** `index` names a member of
 /// [`Register::ALL`], so it carries no [`NMI_DISABLE`] bit and selects a
 /// register within the CMOS index space an implementation's `<ioport>` grant
 /// covers. Enforced by [`Rtc`], which is this crate's only caller of the trait
@@ -347,11 +347,11 @@ pub trait CmosPortIo {
 
 /// Why the part named no Unix instant.
 ///
-/// Every variant carries what the device answered, because an operator with no
-/// shell (CONCEPT §11) separates an absent part — every read answering `0xFF` —
-/// from one whose battery died and answers zeroes, and a clock stuck mid-update
-/// from one ticking too fast to catch, only if the cases produce different
-/// console lines (ENG-12).
+/// Every variant carries what the device answered, because an operator — who
+/// has no shell on this appliance — separates an absent part, every read
+/// answering `0xFF`, from one whose battery died and answers zeroes, and a
+/// clock stuck mid-update from one ticking too fast to catch, only if the
+/// cases produce different console lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RtcError {
     /// Status A reported an update in progress for [`UIP_POLL_LIMIT`] reads,
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn a_date_no_calendar_has_is_refused_by_the_conversion_it_is_delegated_to() {
-        // The delegation the crate header names (DOC-7). Whether a day exists
+        // The delegation the crate header names. Whether a day exists
         // depends on the month and on the leap rule, and `lfw_clock` owns both;
         // the refusal reaching a caller is its verdict, carried whole.
         let base = CONFORMING_INSTANT;
@@ -1270,7 +1270,7 @@ mod tests {
 
     #[test]
     fn each_way_a_read_can_fail_reaches_an_operator_as_its_own_error() {
-        // ENG-12: six ways for a part to be unreadable must not collapse into
+        // Six ways for a part to be unreadable must not collapse into
         // one console line. Each is driven to its own variant, and no two are
         // equal.
         let refusals = [
@@ -1309,8 +1309,8 @@ mod tests {
         );
         assert!(log.len() as u32 <= READ_PORT_OPS_MAX);
 
-        // A part with nothing to answer at all, which the double is required to
-        // tolerate rather than refuse (TEST-8), reads the same way.
+        // A part with nothing to answer at all — a shape the double must keep
+        // generable rather than refuse — reads the same way.
         let (_, outcome) = read(FakeCmos::conforming().answering(vec![]));
         assert_eq!(
             outcome,
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn the_double_answers_a_data_read_with_no_register_selected() {
-        // TEST-8: the fake constrains nothing about the order a part may be
+        // The fake constrains nothing about the order a part may be
         // driven in, so a data read before any index write, and one after an
         // index outside the vocabulary, are answered and logged like any other.
         // A guard here would delete the region

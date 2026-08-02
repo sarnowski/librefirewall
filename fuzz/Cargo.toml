@@ -15,7 +15,7 @@ cargo-fuzz = true
 
 # Every workspace crate that parses or interprets bytes it did not write is a
 # dependency here, and each has a target below. That is the reviewable form of
-# AGENTS.md TEST-7: this list is diffed against `crates/` whenever a crate is
+# that obligation: this list is diffed against `crates/` whenever a crate is
 # added, and a crate on an untrusted-input path without an entry is a finding.
 #
 #   wire            the descriptor ABI, the config handover image and the log
@@ -69,16 +69,16 @@ packet-buffer = { path = "../crates/packet-buffer" }
 virtio = { path = "../crates/virtio" }
 pd-runtime = { path = "../crates/pd-runtime" }
 nic-driver-core = { path = "../crates/nic-driver-core" }
-# The block device class: every byte it reads is a device's, so TEST-7 owes it
+# The block device class: every byte it reads is a device's, so it is owed
 # a target — the used-ring index decides which slot's status byte is read.
 lfw-blk = { path = "../crates/blk" }
 # The recording pass and the ring under it: the tap's annotations, a download's
 # offset and a superblock read back off the medium are all somebody else's
-# bytes, so TEST-7 owes both a target.
+# bytes, so both are owed a target.
 lfw-recorder = { path = "../crates/recorder" }
 lfw-capture-ring = { path = "../crates/capture-ring" }
 # The encoder those two write through. It parses nothing, which is why it was
-# once left off this list — but TEST-7 is owed by a crate that *interprets*
+# once left off this list — but a target is owed by a crate that *interprets*
 # bytes it did not write, and this one interprets two: the frame length the wire
 # stated and the annotation bytes a peer PD chose, both of which become a length
 # field and a padding run. A length that steered a write here would be a write
@@ -91,7 +91,7 @@ lfw-pcapng = { path = "../crates/pcapng" }
 # the one that earned its place: in a harness a refusal *is* the finding — the
 # opposite of the dataplane's drop-and-count choice — so a dropped `#[must_use]`
 # rejection must not compile. `missing_docs` is deliberately absent, matching
-# the root workspace (AGENTS.md DOC-4).
+# the root workspace, which also leaves `missing_docs` unenforced.
 #
 # These are enforced by the gate through `cargo test --locked --lib` in this
 # directory (`xtask fuzz` runs it first), which compiles the harness library.

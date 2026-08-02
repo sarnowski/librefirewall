@@ -117,7 +117,7 @@ closed_vocabulary! {
     /// The first group is the document's syntax and the hardening bounds a
     /// hostile document is held to; the second is semantic validation over the
     /// parsed model. A reason never carries the offending bytes — the record
-    /// pairs it with a byte offset instead (OBS-5).
+    /// pairs it with a byte offset instead.
     RejectReason {
         Malformed => "malformed",
         Doctype => "doctype",
@@ -159,7 +159,7 @@ closed_vocabulary! {
 ///
 /// Closed by construction: every variant is an already-parsed domain type, so a
 /// byte string out of a configuration document has no representation here and
-/// cannot reach a rendered line as itself (OBS-5). [`Value::Id`] is the one
+/// cannot reach a rendered line as itself. [`Value::Id`] is the one
 /// route text takes, and only through [`Identifier`], whose alphabet is what
 /// makes it renderable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -224,7 +224,7 @@ pub enum Event<C = &'static str> {
         outcome: GenerationOutcome,
         changes: u32,
     },
-    /// A document was refused. Names where and why, never the bytes (OBS-5).
+    /// A document was refused. Names where and why, never the attacker's bytes.
     ConfigRejected {
         generation: u32,
         reason: RejectReason,

@@ -8,8 +8,8 @@ use wire::CheckedStamp;
 ///
 /// A sum type rather than a `u64` with a reserved value: zero nanoseconds is
 /// 1970-01-01, an instant a reader would take for a reading, and the records
-/// emitted before this node establishes a time are most of a boot transcript
-/// (ENG-12).
+/// emitted before this node establishes a time are most of a boot transcript,
+/// too much to misdate silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stamp {
     Unsynchronized,

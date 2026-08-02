@@ -68,7 +68,7 @@ fn a_publish_in_progress_is_not_read_under() {
 
 /// A counter that changes under every attempt is a writer a reader cannot win
 /// against, and the retry limit is what keeps that a lost timestamp rather than a
-/// hung domain (ENG-4).
+/// hung domain.
 #[test]
 fn a_reader_gives_up_after_a_bounded_number_of_attempts() {
     let region = ClockCalibration::zero();

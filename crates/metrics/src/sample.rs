@@ -16,7 +16,7 @@
 //! struct, so the mapping is defined once and can carry no second copy to drift
 //! from.
 //!
-//! Field-level documentation is deliberately absent (DOC-4): every field's
+//! Field-level documentation is deliberately absent: every field's
 //! meaning is the `help` text of the metric its slot renders as, which is the
 //! sentence an operator actually reads, and a second one here would be an
 //! untested assertion beside it.
@@ -927,7 +927,7 @@ pub struct SinkSample {
     pub download_overruns: u64,
 }
 
-/// Recordings this appliance keeps, which is CONCEPT §15.1's two.
+/// Recordings this appliance keeps: the capture sink and the log sink.
 pub const SINKS: usize = 2;
 
 const SINK_SLOTS: usize = 10;
@@ -1084,7 +1084,7 @@ impl RecorderSample {
 
 /// Place one value at the running slot. Bounded by the array rather than by the
 /// cursor, so an arithmetic slip is a dropped write and never an index that
-/// leaves it (ENG-5) — and the assertions below make even that unreachable.
+/// leaves it — and the assertions below make even that unreachable.
 fn put(values: &mut [u64], at: &mut usize, value: u64) {
     if let Some(slot) = values.get_mut(*at) {
         *slot = value;
@@ -1100,7 +1100,7 @@ fn put_all(values: &mut [u64], at: &mut usize, source: &[u64]) {
 
 // Slot order and table length are one fact, so a series added without a value —
 // or a value without a series — is a build error rather than a slot that
-// renders as zero forever (TEST-5).
+// renders as zero forever.
 const _: () = {
     assert!(ForwarderSample::SERIES.len() == FORWARDER_SLOTS);
     assert!(DriverSample::SERIES.len() == DRIVER_SLOTS);

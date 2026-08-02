@@ -282,7 +282,7 @@ fn a_boot_that_forwarded_nothing_is_refused_rather_than_trivially_satisfied() {
 }
 
 /// A node that summed its own pipelines would publish one series, which is the
-/// shape MONITORING.md's no-total rule refuses.
+/// shape the no-total rule refuses: a domain restart would corrupt the sum.
 #[test]
 fn a_pre_summed_forwarded_total_is_refused() {
     let mut text = body((9, 0), (4, 5));
@@ -573,8 +573,8 @@ fn a_missing_or_duplicated_info_series_is_refused() {
     assert!(verdict.contains("reported twice"), "{verdict}");
 }
 
-/// An extra label is an extra dimension nothing in MONITORING.md's inventory
-/// names, and unbounded cardinality is what OBS-3 forbids.
+/// An extra label is an extra dimension nothing in the metric inventory
+/// names, and metric cardinality must stay bounded.
 #[test]
 fn an_info_series_carrying_a_label_the_contract_does_not_name_is_refused() {
     let text = body((5, 4), (4, 5)).replacen(

@@ -1,7 +1,7 @@
 //! Lock-free single-producer/single-consumer ring of [`Descriptor`]s over
 //! memory two protection domains map at once.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1), which maps the
+//! Faces a byzantine neighbour protection domain, which maps the
 //! whole region read-write: both cursors and every slot.
 //!
 //! # Why each side's position is private
@@ -23,7 +23,7 @@
 //! store publishes a position and the peer's acquire load observes it; on x86
 //! those are plain loads and stores plus compiler fences.
 //!
-//! # The single-handle rule is an unenforced caller contract (DOC-9)
+//! # The single-handle rule is an unenforced caller contract
 //!
 //! At most one handle of each kind may exist per ring for the ring's life. A
 //! second restarts at position zero and re-walks slots the first already used,

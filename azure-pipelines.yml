@@ -63,7 +63,7 @@ jobs:
       # Explicitly gated on the job, and deliberately NOT the
       # `succeededOrFailed` of the step above: an artifact published after a red
       # gate is an unproven image wearing the appearance of a finished one, and
-      # `dist/` is exactly what the gate exists to qualify (BLD-3). The
+      # `dist/` is exactly what the gate exists to qualify. The
       # condition restates the default so that copying the neighbouring step's
       # condition is a visible change rather than an invisible one.
       - task: PublishPipelineArtifact@1

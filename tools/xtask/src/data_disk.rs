@@ -9,7 +9,7 @@
 //! negotiated features with a device and never moved a byte through it would
 //! produce the identical line. What settles the question is a file on the host
 //! side of the emulation, written by the guest and read back by a process the
-//! guest cannot reach (TEST-13).
+//! guest cannot reach.
 //!
 //! So the contract is a byte comparison against
 //! [`lfw_blk::smoke::witness_pattern`] — the appliance's own definition of what
@@ -28,8 +28,8 @@
 //!
 //! # No adversary
 //!
-//! This is build orchestration on the host side of an emulator (CON-2 names no
-//! CONCEPT §7.1 adversary for it). The guest can write the file — that is the
+//! This is build orchestration on the host side of an emulator; no threat-model
+//! adversary is named for it. The guest can write the file — that is the
 //! point — but nothing here parses what it wrote: the whole judgement is a
 //! comparison of 512 bytes against a constant.
 
@@ -214,7 +214,7 @@ impl DataDisk {
     /// give: a recorder that answered a plausible body out of its own memory
     /// would satisfy every HTTP client and leave the medium empty, and the only
     /// thing that notices is a process on the host side reading the file the
-    /// guest wrote (TEST-13).
+    /// guest wrote.
     ///
     /// # Errors
     /// A superblock that does not decode, or an extent whose payload segments

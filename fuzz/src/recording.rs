@@ -17,7 +17,7 @@
 //!
 //! # The adversary and the surface
 //!
-//! Three of CONCEPT §7.1's at once, which is why one harness drives them
+//! Three adversaries at once, which is why one harness drives them
 //! together: the pass is where their inputs meet.
 //!
 //! * **A byzantine neighbour PD** on the tap: it writes annotation words and
@@ -34,7 +34,7 @@
 //! The superblock is the same medium's bytes read back, so arbitrary input is
 //! exactly what `decode_superblock` faces on a fresh, corrupt or forged disk.
 //!
-//! # What is asserted (TEST-9)
+//! # What is asserted
 //!
 //! * **Containment.** Every transfer the pass asks for lies inside the staging
 //!   area it names *and* inside the device — the arbitrary-write invariant, and
@@ -436,7 +436,7 @@ const MAX_RING_STEPS: usize = 48;
 /// adversary's full authority and is never narrowed. The second is a region
 /// assembled field by field from the same input and finished with a *correct*
 /// CRC, so it reaches `RingState::new` and `Geometry::new` with values nobody
-/// filtered. Additive, in the sense TEST-8 turns on: the first region is
+/// filtered. Additive, in the sense that matters: the first region is
 /// checked whatever the second contains, so nothing the fuzzer can express is
 /// taken away by the targeting — what is added is the ability to express it
 /// past the checksum, which an offline attacker holding the disk plainly has.
@@ -508,8 +508,8 @@ fn examine_region(region: &[u8; SUPERBLOCK_BYTES], unstructured: &mut Unstructur
 
     // Two geometries the deployment might have been configured with: the one
     // that agrees with what the medium claims, which is the only way to reach
-    // `Ring::resume` at all, and one that does not, which is the rebound extent
-    // of CONCEPT §15.5 and must be refused by name.
+    // `Ring::resume` at all, and one that does not — a rebound extent, a disk
+    // moved between deployments — and must be refused by name.
     let agreeing = Geometry::new(
         stored.start_sector(),
         stored.sectors(),
@@ -766,7 +766,7 @@ fn forged_region(unstructured: &mut Unstructured<'_>) -> [u8; SUPERBLOCK_BYTES] 
 /// Field offsets within one copy, restated from the ABI the crate header pins
 /// rather than imported: they are the on-disk layout, and a harness that took
 /// them from the code under test would follow a field that moved instead of
-/// noticing it had (TEST-5 is what fails then, and it should).
+/// noticing it had (the layout assertions fail then, and they should).
 const MAGIC_AT: usize = 0;
 const VERSION_AT: usize = 8;
 const READER_COUNT_AT: usize = 12;
@@ -949,7 +949,7 @@ const MAX_SINK_STEPS: usize = 96;
 ///
 /// # The adversary and the surface
 ///
-/// Two of CONCEPT §7.1's. The annotations and frame bytes are **a byzantine
+/// Two adversaries. The annotations and frame bytes are **a byzantine
 /// neighbour PD**'s — the forwarder fills the tap slots — and the frames behind
 /// them are **untrusted network traffic** one remove out. What the sink does
 /// with them is arithmetic on sector numbers, so a length that steered a write
@@ -962,7 +962,7 @@ const MAX_SINK_STEPS: usize = 96;
 /// That one is deliberate and is not a claim that a peer can forge it: `wire`
 /// establishes `interface_id < MAX_INTERFACES` before a `CheckedTap` exists, so
 /// driving the sink past that bound asks a different question — whether the
-/// sink *relies* on a precondition it did not establish (DOC-7). It must not
+/// sink *relies* on a precondition it did not establish. It must not
 /// index with the value, and this is what says so.
 ///
 /// The **ordering** is the other half, and it is the caller's authority rather
@@ -974,7 +974,7 @@ const MAX_SINK_STEPS: usize = 96;
 /// harness that only produced the documented order would leave the placement
 /// arithmetic exercised on exactly the path its author already believed.
 ///
-/// # What is asserted (TEST-9)
+/// # What is asserted
 ///
 /// * **Containment, twice over.** Guard bytes surround the staging buffer and
 ///   are never written; and every [`Flush`] lies inside the extent, inside the
@@ -1204,8 +1204,8 @@ pub fn recorder_sink(data: &[u8]) {
 /// it does not filter an input**: every misordering is still generated, still
 /// executed, and still held to every other invariant here — containment, sector
 /// discipline, staging bounds and span validity are unconditional, because
-/// none of them is contingent on the caller's ordering. TEST-8 forbids
-/// narrowing what the adversary may express; the ordering of a sink's own
+/// none of them is contingent on the caller's ordering. A harness must never
+/// narrow what the adversary may express; the ordering of a sink's own
 /// obligations is not the adversary's to choose in the first place, and where
 /// the harness lets it be chosen anyway, the outcome is observed rather than
 /// prevented.

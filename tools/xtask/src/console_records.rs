@@ -1,7 +1,7 @@
 //! Recovering the appliance's structured records out of one boot's serial
 //! capture, for the three contracts that judge them.
 //!
-//! MONITORING.md makes the `LFW-` prefix a reader's only handle: a record is not
+//! The console contract makes the `LFW-` prefix a reader's only handle: a record is not
 //! a line, and nothing promises one line is one record. Two things in the
 //! capture make that concrete — the debug kernel writes the same port for its
 //! own prose, and GRUB writes it before anything else does — so a record may
@@ -14,7 +14,7 @@
 //! exactly this scan. It lived in all three, differing only in the prefix they
 //! filtered on, with a comment in each saying the duplication was deliberate.
 //! One copy taking the prefix as a parameter is the same three behaviours with
-//! one place for the marker rule to be right (ENG-6).
+//! one place for the marker rule to be right.
 //!
 //! # What it deliberately does not do, and what that costs
 //!
@@ -32,8 +32,8 @@
 //! # No adversary
 //!
 //! Nothing here reads hostile input. The capture is the appliance's own output
-//! on a wire only the harness is attached to, so CON-2 names no CONCEPT §7.1
-//! adversary for this path; what it defends against is a contract reading a
+//! on a wire only the harness is attached to, so no threat-model
+//! adversary is named for this path; what it defends against is a contract reading a
 //! record that was never written.
 
 /// What opens a record on any channel, and therefore what closes the one before

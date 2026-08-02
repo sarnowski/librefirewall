@@ -1,11 +1,11 @@
-//! The DOC-11 and ENG-13 ratchets: recorded comment and `unsafe` budgets that
-//! the gate only ever lets fall.
+//! The comment and `unsafe` ratchets: recorded budgets that the gate only
+//! ever lets fall.
 //!
-//! Both rules are of the same shape. DOC-11 holds that prose is a liability —
-//! nothing fails when a comment becomes false — so the comment-line ratio of a
-//! production file may shrink but never grow. ENG-13 holds that every `unsafe`
-//! block obliges a DOC-6 claim the compiler cannot check, so the per-crate
-//! `unsafe` count may shrink but never grow. Neither is a threshold anybody can
+//! Both budgets are of the same shape. Prose is a liability — nothing fails
+//! when a comment becomes false — so the comment-line ratio of a production
+//! file may shrink but never grow. Every `unsafe` block obliges a safety
+//! claim the compiler cannot check, so the per-crate `unsafe` count may
+//! shrink but never grow. Neither is a threshold anybody can
 //! pick a defensible number for; both are *ratchets* against a recorded state,
 //! and this module is that recording plus the comparison.
 //!
@@ -34,8 +34,8 @@
 //!
 //! # Loud on anything it does not understand
 //!
-//! Every construct the scanner cannot classify is an error that fails the gate
-//! (ENG-12), never a value quietly left out of a count. An `unsafe` keyword in
+//! Every construct the scanner cannot classify is an error that fails the
+//! gate, never a value quietly left out of a count. An `unsafe` keyword in
 //! a form this module does not know how to count, a `cfg` gate mentioning
 //! `test` in a shape other than the exact `#[cfg(test)]`, an unterminated
 //! block comment, a file recorded in the baseline that no longer exists — all
@@ -55,14 +55,14 @@ pub(crate) const BASELINE: &str = "tools/xtask/budgets.toml";
 
 /// The trees whose files and crates are measured. `tools/` is deliberately
 /// absent: `xtask` is build orchestration that never runs on a deployed
-/// appliance, the same reason it is outside the coverage floor (TEST-3 reason
-/// 2), and a ratchet on the orchestrator's own prose would defend nothing about
+/// appliance, the same reason it is outside the coverage floor, and a ratchet
+/// on the orchestrator's own prose would defend nothing about
 /// the product.
 const MEASURED_TREES: &[&str] = &["crates", "pds"];
 
 /// Path components that mark a file as harness rather than product. A criterion
 /// bench and an integration-test binary are neither shipped nor part of the
-/// documentation surface DOC-11 constrains (TEST-3 reason 3).
+/// documentation surface the comment budget constrains.
 const HARNESS_DIRS: &[&str] = &["benches", "tests", "examples"];
 
 /// Decimal places a recorded ratio is stored with. Four keeps the file
@@ -83,7 +83,7 @@ const RATIO_EPSILON: f64 = 1e-4;
 const HOW_TO_RERECORD: &str = "re-record with `LIBREFIREWALL_BUDGETS_UPDATE=1 cargo test -p xtask update_the_recorded_budgets`, \
      and state in the commit message why the budget moved";
 
-/// What ENG-13 counts, kept as three separate kinds rather than one total so a
+/// What the `unsafe` budget counts, kept as three kinds rather than one so a
 /// failure can tell the author which construct to remove: they are not
 /// interchangeable, and the work to delete one is not the work to delete
 /// another.
@@ -130,7 +130,7 @@ struct CommentBudget {
     /// comment.
     comment_lines: usize,
     /// Lines outside every `#[cfg(test)]` item, blank lines included — the
-    /// denominator DOC-11 is expressed against.
+    /// denominator the comment ratio is expressed against.
     production_lines: usize,
 }
 
@@ -162,8 +162,8 @@ struct Measured {
     files: BTreeMap<String, CommentBudget>,
     /// Per crate directory, per kind. Every crate appears under every kind,
     /// including with a zero: recording an absence is what makes the *first*
-    /// `unsafe` in a crate that has none fail the gate, which is ENG-11 stated
-    /// as a number instead of as a review note.
+    /// `unsafe` in a crate that has none fail the gate — keeping `unsafe`
+    /// confined to the crates that need it, stated as a number.
     unsafes: BTreeMap<(UnsafeKind, String), usize>,
 }
 
@@ -190,8 +190,8 @@ pub(crate) fn enforce(root: &Path) -> Result<(), String> {
 
     if findings.is_empty() {
         println!(
-            "budgets: {} production files and {} crates are within their recorded DOC-11 / \
-             ENG-13 budgets",
+            "budgets: {} production files and {} crates are within their recorded comment and \
+             `unsafe` budgets",
             measured.files.len(),
             crate_count(&measured)
         );
@@ -208,7 +208,7 @@ pub(crate) fn enforce(root: &Path) -> Result<(), String> {
         report.push_str(finding);
         report.push('\n');
     }
-    report.push_str("A budget may only fall. If the rise is deliberate and approved (SCM-6), ");
+    report.push_str("A budget may only fall. If the rise is deliberate and human-approved, ");
     report.push_str(HOW_TO_RERECORD);
     report.push('.');
     Err(report)
@@ -268,13 +268,13 @@ fn check_comment_ratios(measured: &Measured, baseline: &Baseline, findings: &mut
             // that way, and the ratchet would then defend everything except
             // whatever was written most recently.
             None => findings.push(format!(
-                "DOC-11 {path}: no recorded comment ratio. A new production file enters the \
+                "comment budget {path}: no recorded comment ratio. A new production file enters the \
                  ratchet at the ratio it is written with ({current:.RATIO_DECIMALS$}, \
                  {}/{} lines) — {HOW_TO_RERECORD}",
                 budget.comment_lines, budget.production_lines,
             )),
             Some(&recorded) if current > recorded + RATIO_EPSILON => findings.push(format!(
-                "DOC-11 {path}: comment ratio rose to {current:.RATIO_DECIMALS$} \
+                "comment budget {path}: comment ratio rose to {current:.RATIO_DECIMALS$} \
                  ({}/{} production lines) from the recorded {recorded:.RATIO_DECIMALS$}",
                 budget.comment_lines, budget.production_lines,
             )),
@@ -284,7 +284,7 @@ fn check_comment_ratios(measured: &Measured, baseline: &Baseline, findings: &mut
     for path in baseline.ratios.keys() {
         if !measured.files.contains_key(path) {
             findings.push(format!(
-                "DOC-11 {path}: recorded in the baseline but no longer a production file. A \
+                "comment budget {path}: recorded in the baseline but no longer a production file. A \
                  stale entry hides whether the budget was met or the file merely vanished — \
                  {HOW_TO_RERECORD}"
             ));
@@ -296,15 +296,15 @@ fn check_unsafe_counts(measured: &Measured, baseline: &Baseline, findings: &mut 
     for (&(kind, ref krate), &count) in &measured.unsafes {
         match baseline.unsafes.get(&(kind, krate.clone())) {
             None => findings.push(format!(
-                "ENG-13 {krate}: no recorded budget in [{}]. It currently has {count} {} — \
+                "unsafe budget {krate}: no recorded budget in [{}]. It currently has {count} {} — \
                  {HOW_TO_RERECORD}",
                 kind.section(),
                 kind.what_it_counts(),
             )),
             Some(&recorded) if count > recorded => findings.push(format!(
-                "ENG-13 {krate}: {} rose to {count} from the recorded {recorded}. This count is \
+                "unsafe budget {krate}: {} rose to {count} from the recorded {recorded}. This count is \
                  {} in production code (outside every `#[cfg(test)]` item), and every one of \
-                 them obliges a DOC-6 claim the compiler cannot check",
+                 them obliges a safety claim the compiler cannot check",
                 kind.what_it_counts(),
                 kind.what_it_counts(),
             )),
@@ -314,7 +314,7 @@ fn check_unsafe_counts(measured: &Measured, baseline: &Baseline, findings: &mut 
     for (kind, krate) in baseline.unsafes.keys() {
         if !measured.unsafes.contains_key(&(*kind, krate.clone())) {
             findings.push(format!(
-                "ENG-13 {krate}: recorded in [{}] but is no longer a crate under {} — \
+                "unsafe budget {krate}: recorded in [{}] but is no longer a crate under {} — \
                  {HOW_TO_RERECORD}",
                 kind.section(),
                 MEASURED_TREES.join("/ or "),
@@ -340,7 +340,7 @@ fn measure(root: &Path) -> Result<Measured, String> {
         let tree_path = root.join(tree);
         if !tree_path.is_dir() {
             return Err(format!(
-                "{} is not a directory, so the DOC-11/ENG-13 budgets would silently measure \
+                "{} is not a directory, so the comment and `unsafe` budgets would silently measure \
                  nothing there",
                 tree_path.display()
             ));
@@ -506,7 +506,7 @@ enum Lex {
 /// How a line is counted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
-    /// Blank, or whitespace only. Counted in the denominator: DOC-11's ratio is
+    /// Blank, or whitespace only. Counted in the denominator: the ratio is
     /// against production *lines*, and re-deriving which of them are "real"
     /// would make the recorded number depend on a second judgement call.
     Blank,
@@ -534,12 +534,12 @@ struct Attribute {
     inner: bool,
 }
 
-/// Lex `source` into the counts DOC-11 and ENG-13 are expressed in.
+/// Lex `source` into the counts the comment and `unsafe` budgets use.
 ///
 /// Errors, rather than a best guess, on anything it cannot classify: an
 /// unterminated comment or string, an unbalanced `#[cfg(test)]` item, a
 /// `cfg(...)` mentioning `test` in an unrecognised shape, or an `unsafe`
-/// keyword in a form this counter does not know (ENG-12).
+/// keyword in a form this counter does not know.
 fn scan(source: &str) -> Result<Scan, String> {
     let bytes = source.as_bytes();
     let mut lines = vec![LineKind::Blank];
@@ -881,14 +881,14 @@ fn classify_unsafe(
             "fn" => Ok(UnsafeKind::Function),
             "impl" => Ok(UnsafeKind::Implementation),
             other => Err(format!(
-                "line {}: `unsafe {other}` is a form the ENG-13 budget does not know how to \
+                "line {}: `unsafe {other}` is a form the `unsafe` budget does not know how to \
                  count. Teach `classify_unsafe` about it rather than letting it go uncounted",
                 line + 1
             )),
         };
     }
     Err(format!(
-        "line {}: `unsafe` is followed by `{}`, which is neither a block nor an item the ENG-13 \
+        "line {}: `unsafe` is followed by `{}`, which is neither a block nor an item the `unsafe` \
          budget knows how to count",
         line + 1,
         char::from(bytes[at])
@@ -1031,11 +1031,11 @@ const SECTIONS: &[&str] = &[
 fn render_baseline(measured: &Measured) -> String {
     let mut out = String::new();
     out.push_str(
-        "# Recorded comment and `unsafe` budgets — the DOC-11 and ENG-13 ratchets.\n\
+        "# Recorded comment and `unsafe` budgets — ratchets the gate only lets fall.\n\
          #\n\
          # Generated by `tools/xtask/src/budgets.rs`; do not hand-edit. Every number here may\n\
          # fall and may never rise: the gate (`xtask test`) fails on any increase. Re-record\n\
-         # after a deliberate, approved (SCM-6) reduction with\n\
+         # after a deliberate, human-approved reduction with\n\
          #\n\
          #     LIBREFIREWALL_BUDGETS_UPDATE=1 cargo test -p xtask update_the_recorded_budgets\n\
          #\n\
@@ -1072,11 +1072,11 @@ fn render_baseline(measured: &Measured) -> String {
 /// Nothing is tolerated: an unknown section, a malformed entry, a duplicate key
 /// or an out-of-range value fails with the line number. A budget file is the
 /// gate's entire notion of what is allowed, so a line it cannot read is a line
-/// it must not skip (ENG-12).
+/// it must not skip.
 fn read_baseline(path: &Path) -> Result<Baseline, String> {
     let text = fs::read_to_string(path).map_err(|error| {
         format!(
-            "read {}: {error}. The DOC-11/ENG-13 budgets have no recorded state to compare \
+            "read {}: {error}. The comment and `unsafe` budgets have no recorded state to compare \
              against — {HOW_TO_RERECORD}",
             path.display()
         )
@@ -1443,7 +1443,7 @@ mod tests {
 
     #[test]
     fn an_unterminated_construct_is_a_hard_failure_not_a_guess() {
-        // ENG-12: a gate that cannot read its input must fail, never default to
+        // A gate that cannot read its input must fail, never default to
         // a passing measurement.
         for (source, expected) in [
             ("/* never closed\n", "unterminated block comment"),
@@ -1659,7 +1659,7 @@ mod tests {
         let mut findings = Vec::new();
         check_unsafe_counts(&measured, &baseline, &mut findings);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].contains("ENG-13"), "{findings:?}");
+        assert!(findings[0].contains("unsafe budget"), "{findings:?}");
         // The definition must travel with the number, or the author cannot tell
         // which construct the count is even about.
         assert!(
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn the_first_unsafe_in_a_crate_recorded_at_zero_fails() {
-        // Recording an absence is ENG-11 expressed as a number: a crate with no
+        // Recording the absence as a number means a crate with no
         // hardware or ABI reason for `unsafe` cannot acquire one quietly.
         let mut measured = Measured::default();
         measured

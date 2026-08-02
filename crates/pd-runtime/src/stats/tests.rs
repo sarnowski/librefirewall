@@ -6,7 +6,7 @@ use super::*;
 
 /// The metric surface names the router's reasons itself, because `lfw_metrics`
 /// depends on none of the crates whose counters it mirrors. This is the enforcer
-/// that obligation names (DOC-7): the two lists are one vocabulary in two places,
+/// that obligation names: the two lists are one vocabulary in two places,
 /// and a reason added to `routing` without a slot here would render under the
 /// wrong name rather than not at all.
 #[test]
@@ -151,9 +151,9 @@ fn an_unaddressed_port_publishes_its_stage_and_zeroes_the_rest() {
 }
 
 /// Every field of `TcpCounters` reaches a slot of its own. The transport has
-/// twenty-six causes and MONITORING.md's attribution rule turns on them staying
-/// apart, so a conversion that merged two would be the one defect that rule
-/// exists to prevent.
+/// twenty-six causes, and counters must attribute a refusal to what the peer
+/// sent — kept apart from what accuses this code — so a conversion that merged
+/// two would be the one defect that attribution exists to prevent.
 #[test]
 fn every_transport_counter_reaches_its_own_slot() {
     // A distinct value per field, produced by walking the struct through its own

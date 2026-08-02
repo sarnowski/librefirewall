@@ -4,7 +4,7 @@
 //!
 //! # The adversary
 //!
-//! Two of CONCEPT §7.1's at once. The **byzantine neighbour** is on both
+//! Two adversaries at once. The **byzantine neighbour** is on both
 //! handovers: the tap ring's annotations arrive already checked by `wire::tap`,
 //! and a download's sink, offset and length are the management domain's claims,
 //! bounded here and nowhere else — only this side knows how long a snapshot is.
@@ -20,7 +20,7 @@
 //! is backpressured, a download the writer wrapped past mid-read, a completion
 //! for a flush already acknowledged — is hours of traffic away on real hardware
 //! and one call away against a fake [`Medium`]. So the domain holding the
-//! device capability implements that trait and nothing else (LAY-2).
+//! device capability implements that trait and nothing else.
 //!
 //! # A record a sink cannot take yet is held, never dropped
 //!
@@ -28,7 +28,7 @@
 //! refused for want of staging has nowhere else to live. [`Pending`] holds it
 //! and the pass stops draining until both have taken it; dropping it would be
 //! silent omission from an artifact whose whole value is that it states its own
-//! losses (CONCEPT §15.2).
+//! losses in-band.
 
 use lfw_clock::{Calibration, Ticks};
 
@@ -79,7 +79,7 @@ const SEGMENT_SECTORS: u64 = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
 const _: () = {
     assert!(LOG_START_SECTOR >= RESERVED_SECTORS);
     // Adjacent and disjoint, as one comparison, so a change to either extent
-    // that overlapped the other fails the build (TEST-5).
+    // that overlapped the other fails the build.
     assert!(LOG_START_SECTOR + LOG_SECTORS <= CAPTURE_START_SECTOR);
     assert!(CAPTURE_SNAP_LEN as usize <= TAP_SNAP_LEN);
     assert!(SEGMENT_BYTES.is_multiple_of(SECTOR_SIZE));
@@ -91,7 +91,7 @@ const _: () = {
 ///
 /// The window is carved once, here, and every transfer names an area rather
 /// than an offset — so no arithmetic a caller performs can put one recording's
-/// bytes in another's buffer, or a download's read over a pending write (DOC-9).
+/// bytes in another's buffer, or a download's read over a pending write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Area {
     Log,
@@ -255,7 +255,7 @@ pub struct Refused;
 ///
 /// Three methods and no state machine: submission is asynchronous because the
 /// device is, and hiding that behind a blocking call would put an unbounded
-/// wait on the one domain that must keep draining a tap (ENG-4).
+/// wait on the one domain that must keep draining a tap.
 pub trait Medium {
     /// The bytes of one staging area — the source or destination of a transfer
     /// naming it. Always exactly `area.extent().1` bytes long.
@@ -275,7 +275,7 @@ pub trait Medium {
 }
 
 /// Completions one pass settles. A device answering faster than this leaves the
-/// rest for the next pass, which is what keeps the tap drained (ENG-4).
+/// rest for the next pass, which is what keeps the tap drained.
 pub const COMPLETION_BUDGET: usize = 8;
 
 /// Tap records one pass drains, bounded independently of the ring's own
@@ -283,7 +283,7 @@ pub const COMPLETION_BUDGET: usize = 8;
 /// drain.
 pub const TAP_BUDGET: usize = 16;
 
-/// Saturating, monotone counts for MONITORING.md.
+/// Saturating, monotone counts for the operator-facing metrics contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecorderCounters {
     /// Per recording, in [`Which::ALL`] order.
@@ -329,7 +329,7 @@ struct Recording {
     sink: Sink,
     /// The flush the medium was handed, or is about to be. Held because a
     /// [`Flush`] is the caller's single obligation to write those bytes and
-    /// `Sink::acknowledge` consumes it (DOC-9), so it cannot be dropped on a
+    /// `Sink::acknowledge` consumes it, so it cannot be dropped on a
     /// refused submit and re-derived later.
     in_flight: Option<Flush>,
     /// Whether that flush has actually reached the medium. A refused submit
@@ -526,7 +526,7 @@ impl Deck {
     ///
     /// Every step has a bound that is this crate's own rather than a peer's, so
     /// no pass can be held open by a device that keeps completing or a producer
-    /// that keeps publishing (ENG-4).
+    /// that keeps publishing.
     pub fn poll(
         &mut self,
         medium: &mut impl Medium,
@@ -672,7 +672,7 @@ impl Deck {
         };
         // The held length is this crate's own, recorded from the slice the
         // reader filled, so the slice is the record; an empty one settles
-        // rather than looping (ENG-5).
+        // rather than looping, and no path here can panic.
         let bytes = held.bytes.get(..held.len).unwrap_or_default();
         let mut still_owed = false;
         for which in Which::ALL {
@@ -921,7 +921,7 @@ impl Deck {
                 let staging = medium.staging(Area::Download);
                 // Both bounds are this crate's own: `skip` is below a sector
                 // and `len` below the window, and the slicing that produces the
-                // answer is what enforces them (ENG-5).
+                // answer is what enforces them, with no panic possible.
                 let bytes = staging
                     .get(skip..)
                     .and_then(|tail| tail.get(..len))

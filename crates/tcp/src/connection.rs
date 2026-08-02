@@ -1,4 +1,4 @@
-//! One connection: RFC 793 §3.9's *SEGMENT ARRIVES* for everything a passive
+//! One connection: RFC 793 section 3.9's *SEGMENT ARRIVES* for everything a passive
 //! open can reach, with RFC 5961's validation and RFC 6298's timer over it.
 //!
 //! # What a connection holds, and what it deliberately does not
@@ -13,7 +13,7 @@
 //!
 //! # Why RFC 5961 is applied to `SYN_RECEIVED` too
 //!
-//! RFC 5961 §3.2 speaks of synchronized states, and `SYN_RECEIVED` is not one.
+//! RFC 5961 section 3.2 speaks of synchronized states, and `SYN_RECEIVED` is not one.
 //! Its rule — a `RST` is accepted only when its sequence number is exactly the
 //! next byte expected, an in-window one that is not gets a challenge
 //! acknowledgement — is applied here anyway, in every state. A peer that really
@@ -24,10 +24,10 @@
 //! # The one place RFC 793 is deliberately not followed
 //!
 //! A segment for a port nothing listens on is answered with a `RST` by RFC 793
-//! §3.4, and is dropped in silence here. This appliance's own port is not a
+//! section 3.4, and is dropped in silence here. This appliance's own port is not a
 //! host's: an appliance that answers every closed port confirms its own presence
-//! and its address to anyone who asks, which is authority handed to CONCEPT
-//! §7.1's management-plane attacker for nothing in return. A peer that really did
+//! and its address to anyone who asks, which is authority handed to the
+//! management-plane attacker for nothing in return. A peer that really did
 //! reach the wrong port learns the same thing from its own timeout, one
 //! round-trip later. It is counted as a refusal so the silence is not also
 //! invisible.
@@ -50,7 +50,7 @@ pub const MAX_UNACKED: usize = 4;
 
 /// How many times a segment is re-sent before the connection is abandoned.
 ///
-/// RFC 1122 §4.2.3.5 requires the give-up threshold to be an interval rather
+/// RFC 1122 section 4.2.3.5 requires the give-up threshold to be an interval rather
 /// than a count, and with RFC 6298's doubling this count *is* one: five retries
 /// from a one-second floor is at least 31 seconds, and more on a slow path where
 /// the estimate is larger. It is expressed as a count because that is the
@@ -62,7 +62,7 @@ pub const MAX_RETRANSMITS: u32 = 5;
 ///
 /// It exists so that *every* connection becomes reapable in finite time, which
 /// is what bounds the table under a flood of connections that complete a
-/// handshake and then go silent (ENG-4). Five minutes is long enough that no
+/// handshake and then go silent. Five minutes is long enough that no
 /// management exchange reaches it and short enough that a slot is not held for
 /// the life of the node.
 pub const IDLE_TIMEOUT: Duration = Duration::from_millis(300_000);
@@ -154,7 +154,7 @@ pub(crate) struct Reply {
     pub flags: Flags,
     pub sequence: SeqNumber,
     pub acknowledgement: SeqNumber,
-    /// A `SYN-ACK`, which is the only segment RFC 793 and RFC 7323 §2.2 permit
+    /// A `SYN-ACK`, which is the only segment RFC 793 and RFC 7323 section 2.2 permit
     /// the maximum-segment-size and window-scale options on.
     pub with_options: bool,
 }
@@ -185,9 +185,9 @@ pub(crate) struct Processed<'a> {
 pub enum Refusal {
     OutOfWindow,
     /// An in-window `RST` whose sequence number was not the next byte expected
-    /// (RFC 5961 §3.2), answered with a challenge acknowledgement.
+    /// (RFC 5961 section 3.2), answered with a challenge acknowledgement.
     UnvalidatedReset,
-    /// A `SYN` on a synchronized connection (RFC 5961 §4), likewise challenged.
+    /// A `SYN` on a synchronized connection (RFC 5961 section 4), likewise challenged.
     UnexpectedSyn,
     /// An acknowledgement of something never sent.
     UnacceptableAck,
@@ -246,7 +246,7 @@ impl Connection {
     /// Accept a `SYN`, taking every value the handshake negotiates from it.
     ///
     /// `mss_limit` and `receive_window` are the *stack's* — a bound the peer does
-    /// not choose (ENG-4) — and `iss` comes from the generator, so nothing about
+    /// not choose — and `iss` comes from the generator, so nothing about
     /// a new connection is the peer's to decide except which values it offered.
     pub(crate) fn accept(
         now: Monotonic,
@@ -461,7 +461,7 @@ impl Connection {
 
     pub(crate) fn window_scale(&self) -> Option<u8> {
         // The option is sent exactly when the peer offered one, which is what
-        // RFC 7323 §2.2 makes the condition for scaling in either direction.
+        // RFC 7323 section 2.2 makes the condition for scaling in either direction.
         if self.snd_scale > 0 || self.rcv_scale > 0 {
             Some(self.rcv_scale)
         } else {
@@ -549,7 +549,7 @@ impl Connection {
     /// it, and mark the oldest range so Karn's algorithm refuses a round-trip
     /// sample from it.
     ///
-    /// Once per expiry, never once per segment written: RFC 6298 §5.5 doubles the
+    /// Once per expiry, never once per segment written: RFC 6298 section 5.5 doubles the
     /// timeout when the timer fires, and a stack that doubled again when the
     /// caller supplied the bytes would back off twice for one loss.
     pub(crate) fn note_expiry(&mut self, now: Monotonic) {
@@ -612,7 +612,7 @@ impl Connection {
         })
     }
 
-    /// RFC 793 §3.9's *SEGMENT ARRIVES* for one segment on an existing
+    /// RFC 793 section 3.9's *SEGMENT ARRIVES* for one segment on an existing
     /// connection.
     pub(crate) fn receive<'a>(&mut self, now: Monotonic, segment: &Segment<'a>) -> Processed<'a> {
         // A `SYN` at the initial receive sequence with no `ACK`, while still in
@@ -652,7 +652,7 @@ impl Connection {
         }
 
         if segment.flags.contains(Flags::SYN) {
-            // RFC 5961 §4: a challenge rather than RFC 793's reset, so a blind
+            // RFC 5961 section 4: a challenge rather than RFC 793's reset, so a blind
             // in-window `SYN` cannot tear a connection down.
             return self.refuse(Refusal::UnexpectedSyn, Some(self.acknowledgement()));
         }
@@ -715,7 +715,7 @@ impl Connection {
         }
     }
 
-    /// RFC 5961 §3.2, applied in every state; see the module header.
+    /// RFC 5961 section 3.2, applied in every state; see the module header.
     fn receive_reset<'a>(&mut self, segment: &Segment<'a>) -> Processed<'a> {
         if segment.sequence != self.rcv_nxt {
             return self.refuse(Refusal::UnvalidatedReset, Some(self.acknowledgement()));
@@ -770,7 +770,7 @@ impl Connection {
         } else if ack.follows(self.snd_nxt) {
             // An acknowledgement of something never sent. RFC 793 answers with
             // an acknowledgement of what really was, which is also RFC 5961
-            // §5's challenge.
+            // section 5's challenge.
             return Err(self.refuse(Refusal::UnacceptableAck, Some(self.acknowledgement())));
         }
 
@@ -974,15 +974,15 @@ fn advertisable(window: u32, scale: u8) -> u32 {
 /// The segment size to send under, from the peer's offer and this end's own
 /// limit.
 ///
-/// A peer that offers none gets RFC 1122 §4.2.2.6's default of 536; a peer that
+/// A peer that offers none gets RFC 1122 section 4.2.2.6's default of 536; a peer that
 /// offers more than this end can compose is clamped to it, and one that offers
-/// an absurdly small size is lifted to the floor RFC 1122 §4.2.2.6 makes a
+/// an absurdly small size is lifted to the floor RFC 1122 section 4.2.2.6 makes a
 /// receiver honour — a 1-byte segment size would otherwise turn one response
 /// into hundreds of segments, which is an amplifier a peer chooses for free.
 fn negotiated_mss(offered: Option<u16>, limit: u16) -> u16 {
-    /// RFC 1122 §4.2.2.6's default when no option is offered.
+    /// RFC 1122 section 4.2.2.6's default when no option is offered.
     const DEFAULT_MSS: u16 = 536;
-    /// RFC 1122 §3.3.3's smallest reassembly buffer, less the two headers: the
+    /// RFC 1122 section 3.3.3's smallest reassembly buffer, less the two headers: the
     /// least a peer may be held to.
     const FLOOR_MSS: u16 = 576 - 20 - 20;
     offered

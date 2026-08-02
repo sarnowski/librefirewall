@@ -6,17 +6,17 @@
 //!
 //! # Adversary
 //!
-//! A hostile or malfunctioning NIC device (CONCEPT §7.1). This domain maps the
+//! A hostile or malfunctioning NIC device. This domain maps the
 //! device's configuration space, the MMIO window its BAR is relocated to, and
 //! the DMA regions it writes, so everything the device produces is untrusted
-//! input. DMA is unconfined — no IOMMU on this platform (CONCEPT §7.2) — so an
+//! input. DMA is unconfined — this platform has no IOMMU — so an
 //! address handed to the device is an address it may write.
 //!
 //! # What is decided elsewhere, and the one thing that is not
 //!
 //! Which devices are acceptable, what order the handshake runs in, and what a
 //! poll pass does all live in `nic_driver_core`, where a host test can drive
-//! them against a stand-in device (LAY-2). [`PoolDmaBase`] deviates from that
+//! them against a stand-in device. [`PoolDmaBase`] deviates from that
 //! and is recorded here as the deviation it is: the value it guards enters
 //! `nic_driver_core` through
 //! [`NicPort::attach`](nic_driver_core::port::NicPort::attach) as a plain
@@ -26,7 +26,7 @@
 //!
 //! # Everything this domain touches is patched in at build time
 //!
-//! Hardware topology is static (CONCEPT §12.3), so this driver performs no PCI
+//! Hardware topology is static, fixed at build time, so this driver performs no PCI
 //! enumeration: it never scans a bus and holds capabilities for exactly one
 //! function's ECAM page, and three instances of one binary drive three devices
 //! with no code difference — nothing below distinguishes a dataplane port from
@@ -80,7 +80,7 @@
 //! than by control flow — a property of the system, not of this file. Microkit's
 //! optional `notify` attribute on a `<channel>`'s `<end>` "indicates that the
 //! protection domain for this end can send a notification to the other end;
-//! defaults to **true**" (Microkit 2.3.0 user manual §7.6). The peer's end of
+//! defaults to **true**" (Microkit 2.3.0 user manual, section 7.6). The peer's end of
 //! every driver channel is marked `notify="false"` in the system description, so
 //! each driver keeps its send capability on its peer while no peer holds one on
 //! a driver. The entrypoint satisfies `sel4_microkit::Handler`.
@@ -138,7 +138,7 @@ enum StartupError {
     /// of the address space.
     ///
     /// `paddr` is the diagnosis, and the console is the only place an operator
-    /// sees it (CONCEPT §11): zero means the `setvar` is missing or misspelled
+    /// sees it, the appliance having no shell: zero means the `setvar` is missing or misspelled
     /// in the system description, any other value means it is misaligned.
     PoolDmaBaseUnusable { region: PoolRegion, paddr: usize },
     /// The device refused bring-up, or build data it is programmed with was
@@ -245,7 +245,7 @@ fn init() -> NicDriver {
                 // Compared rather than stored unconditionally: this is a busy
                 // loop with no wakeup, so an unconditional publish would dirty
                 // the shard's cache line millions of times a second on an idle
-                // port for nothing (OBS-3). The comparison is twenty-five words
+                // port for nothing. The comparison is twenty-five words
                 // in this domain's own memory; the store crosses to another
                 // domain's view.
                 if sample != published {
@@ -257,7 +257,7 @@ fn init() -> NicDriver {
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
-            // (CONCEPT §11) this record is all an operator gets.
+            // on the appliance, this record is all an operator gets.
             announce(
                 &sink,
                 DomainState::Refused,
@@ -271,7 +271,7 @@ fn init() -> NicDriver {
 /// This port's counters in the shape its shard lays them out.
 ///
 /// Assembled in `nic_driver_core`, where a test holds the metric surface's
-/// vocabulary to the enums it names (LAY-2); this file supplies the one thing
+/// vocabulary to the enums it names; this file supplies the one thing
 /// only it has, the log ring's own drop counts.
 fn sample(port: &NicPort<'static>, sink: &RingSink<'static, PdClock<'static>>) -> DriverSample {
     port.stats().to_sample(

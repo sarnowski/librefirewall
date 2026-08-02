@@ -127,7 +127,7 @@ fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
 }
 
 /// The byte layout two protection domains agree on, written out rather than
-/// derived, so a reorder fails here as well as in the assertion block (TEST-5).
+/// derived, so a reorder fails here as well as in the assertion block.
 #[test]
 fn the_annotation_occupies_the_bytes_the_recorded_layout_names() {
     assert_eq!(offset_of!(TapAnnotation, packet_id), 0);
@@ -506,8 +506,8 @@ fn drain_stops_at_its_limit_and_at_the_capacity() {
     assert_eq!(reader.drain(usize::MAX, &mut into, |_| ()), 0);
 }
 
-/// The ENG-4 clamp: a caller that asks for everything gets at most the ring,
-/// so one drain is finite for any caller and for any peer.
+/// The bounded-work clamp: a caller that asks for everything gets at most the
+/// ring, so one drain is finite for any caller and for any peer.
 #[test]
 fn a_drain_never_exceeds_the_capacity_however_large_the_limit() {
     for limit in [usize::MAX, TAP_SLOTS * 1000, TAP_SLOTS] {
@@ -1209,7 +1209,7 @@ proptest! {
             prop_assert_eq!(writer.is_empty(), writer_len == 0);
         }
         // Every observation offered either landed or was counted; a forged
-        // cursor cannot make one disappear unaccounted for (ENG-12).
+        // cursor cannot make one disappear unaccounted for.
         prop_assert_eq!(written + usize::try_from(refused).expect("a count fits"), offered);
     }
 

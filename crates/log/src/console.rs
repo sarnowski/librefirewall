@@ -4,7 +4,7 @@
 //!
 //! # Adversary
 //!
-//! The byzantine peer protection domain (CONCEPT §7.1). Every record here came
+//! The byzantine peer protection domain. Every record here came
 //! out of a region a writing domain owns and the console maps read-only, so its
 //! bytes, its vocabulary tokens and the cursor that published it were all
 //! chosen by that domain and none of them can be corrected here. A console that
@@ -15,14 +15,14 @@
 //!
 //! Drain order, how much of one ring a pass may take, what becomes of a record
 //! that decodes to nothing, and which counter accuses whom are decisions, and a
-//! decision inside a protection domain is reachable by no host test (LAY-2).
+//! decision inside a protection domain is reachable by no host test.
 //! What is left for the domain is mapping the regions, claiming the port and
 //! calling [`ConsolePrinter::drain`] in a loop.
 //!
 //! # Why the writer is a trait rather than the UART
 //!
-//! [`ByteSink`] keeps `crates/log` free of `uart-16550`, which is the ENG-11
-//! boundary seen from the other side: this crate would otherwise depend on the
+//! [`ByteSink`] keeps `crates/log` free of `uart-16550` — keeping `unsafe` in
+//! the hardware crate, seen from the other side: this crate would otherwise depend on the
 //! one crate in the workspace that executes `in`/`out`, and a host test of the
 //! fairness rule below would be a test that cannot link. It is also what lets
 //! every property here be asserted against a writer that fails on demand.
@@ -31,7 +31,7 @@
 //!
 //! [`ConsolePrinter::print`] is generic over the cause type, so a record
 //! decoded out of a peer's ring and the console domain's own lifecycle event
-//! reach the device through the same call (ENG-7). There is deliberately no
+//! reach the device through the same call. There is deliberately no
 //! second path for "the console's own output".
 //!
 //! # Why this is not a [`Sink`](crate::Sink)
@@ -55,7 +55,7 @@ use crate::stamp::Stamp;
 /// Records one pass may take from a single ring before it moves to the next.
 ///
 /// The fairness bound, and it is a constant of this crate rather than anything
-/// read out of a region (ENG-4): a domain that fills its ring faster than the
+/// read out of a region: a domain that fills its ring faster than the
 /// line drains must cost the other domains a delay and never their records.
 /// Sized at half the transmit FIFO so a full burst is bytes the controller
 /// takes without the caller waiting on it — the FIFO is 16 bytes and a rendered
@@ -87,7 +87,7 @@ pub trait ByteSink {
 }
 
 /// What the console can say about itself, in the shape the metrics endpoint
-/// (CONCEPT §11) scrapes.
+/// scrapes.
 ///
 /// Four failure counters rather than one, because they accuse four different
 /// parties and an operator's next action differs for each: the peer's bytes,
@@ -152,7 +152,7 @@ fn bump(counter: &mut u64) {
 ///
 /// It owns the writer outright. The device has exactly one owner in this system
 /// — that is the whole reason the console is a domain — and a borrowed writer
-/// would make a second printer expressible in a type (DOC-9).
+/// would make a second printer expressible in a type.
 pub struct ConsolePrinter<W> {
     writer: W,
     /// Which ring the next pass starts at. Rotating the *start* rather than
@@ -197,7 +197,7 @@ impl<W: ByteSink> ConsolePrinter<W> {
         };
         // `render` never reports more than it was given, so this cannot be
         // `None`; it is a `get` rather than a range index because a slice index
-        // on the path a peer's record travels is what ENG-5 forbids, and the
+        // on the path a peer's record travels is a forbidden panic path, and the
         // rule is worth more than the one branch it costs.
         let Some(text) = line.get(..written) else {
             bump(&mut self.counters.unrenderable);
@@ -219,7 +219,7 @@ impl<W: ByteSink> ConsolePrinter<W> {
     /// domain's own — the slice is the set of regions the system description
     /// granted it, and the burst is the constant above. Nothing a writing
     /// domain publishes can extend a pass, which is what keeps a flooding peer
-    /// from starving the rest (ENG-4).
+    /// from starving the rest.
     pub fn drain(&mut self, readers: &mut [LogReader<'_>]) -> usize {
         let Some(start) = self.next.checked_rem(readers.len()) else {
             // No rings to read. A console domain granted none is a system

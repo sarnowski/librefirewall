@@ -6,8 +6,8 @@
 //! come to depend on how the document was written rather than on what it says.
 //!
 //! Every rule refuses a configuration that is *internally* inconsistent or that
-//! this build cannot express. Two of them are wider than CONTRACTS.md §4c
-//! states: a neighbour's address and MAC are held to the same unicast rules as
+//! this build cannot express. Two of them are wider than the documented
+//! contract states: a neighbour's address and MAC are held to the same unicast rules as
 //! an interface's, because a multicast next-hop MAC and a broadcast next-hop
 //! address are exactly as unforwardable as their interface counterparts, and
 //! the vocabulary already had the tokens for both.
@@ -99,7 +99,7 @@ pub enum SemanticError {
     ManagementAddressNotAHostAddress,
     ManagementMacNotUnicast,
     /// One address reachable two ways: routed out of `other`'s port, and
-    /// terminated off the dataplane (CONCEPT §9.1).
+    /// terminated off the dataplane.
     ManagementPrefixCollidesWithInterface {
         other: Identifier,
     },
@@ -191,7 +191,7 @@ pub fn validate(model: &Model) -> Result<(), SemanticError> {
 
 /// The management interface's own rules, then the two that hold it apart from
 /// the dataplane: neither a shared prefix nor a shared MAC is representable in
-/// the grant set (CONCEPT §9.1), so a document may not describe one.
+/// the capability grants, so a document may not describe one.
 fn management(model: &Model) -> Result<(), SemanticError> {
     let Some(entry) = model.management() else {
         return Ok(());

@@ -1,8 +1,8 @@
 //! The ring's identity and delivery state as it sits on the medium, so a node
-//! that restarts — or falls back to its other slot (CONCEPT §14.2) — resumes
-//! every cursor from the same device that holds the data (CONCEPT §15.4).
+//! that restarts — or falls back to its other A/B image slot — resumes
+//! every cursor from the same device that holds the data.
 //!
-//! Faces a hostile or malfunctioning device (CONCEPT §7.1). Everything decoded
+//! Faces a hostile or malfunctioning device. Everything decoded
 //! here arrived as bytes off a disk: a sector the device mis-addressed, a
 //! superblock the other image wrote, or an extent an offline attacker composed
 //! at leisure. A copy is a superblock only if it carries the magic, the
@@ -34,7 +34,7 @@
 //! meaning in a byte this writer zeroes is not a copy this writer produced, and
 //! deciding that now is cheaper than deciding later what it meant.
 //! [`SUPERBLOCK_VERSION`] is how the layout changes; there is no compatibility
-//! path (ENG-6).
+//! path.
 
 use crate::{Cursor, Geometry, SECTOR_SIZE};
 
@@ -48,7 +48,7 @@ pub const SUPERBLOCK_MAGIC: u64 = u64::from_le_bytes(*b"LFWCAPRG");
 pub const SUPERBLOCK_VERSION: u32 = 1;
 
 /// Independent cursors one ring records. The pcapng download, the
-/// OpenTelemetry exporter and a live console stream are three (CONCEPT §15.4);
+/// OpenTelemetry exporter and a live console stream are three;
 /// the fourth is the headroom that keeps adding one from being a layout change.
 pub const MAX_READERS: usize = 4;
 
@@ -85,7 +85,7 @@ const CRC_AT: usize = SUPERBLOCK_COPY_BYTES - 4;
 
 // The on-disk ABI of an appliance that must still read its own recordings after
 // a rebuild: a field moving or growing has to be a compile error here, not a
-// ring that decodes to plausible nonsense (TEST-5).
+// ring that decodes to plausible nonsense.
 const _: () = {
     assert!(SUPERBLOCK_BYTES == 1024);
     assert!(SUPERBLOCK_COPY_BYTES == 512);
@@ -272,7 +272,7 @@ impl RingState {
     /// # Errors
     /// [`RingStateError`], naming the field that disagreed and both values. A
     /// mismatch is a ring the medium is holding for somebody else — the extent
-    /// was rebound (CONCEPT §15.5) or the device is not the one it was — and
+    /// was rebound to another ring or the device is not the one it was — and
     /// adopting it would place writes over another object's bytes.
     pub const fn check(&self, configured: &Geometry) -> Result<CheckedState, RingStateError> {
         if self.geometry.start_sector() != configured.start_sector() {

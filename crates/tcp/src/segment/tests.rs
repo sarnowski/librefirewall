@@ -67,7 +67,7 @@ fn sealed(source: Ipv4Address, destination: Ipv4Address, mut segment: Vec<u8>) -
     segment
 }
 
-/// The RFC 793 §3.1 checksum, written from the specification rather than reused
+/// The RFC 793 section 3.1 checksum, written from the specification rather than reused
 /// from the crate: agreement between two independent summations is what makes
 /// the round-trip tests below evidence.
 fn independent_checksum(source: Ipv4Address, destination: Ipv4Address, segment: &[u8]) -> u16 {
@@ -215,7 +215,7 @@ fn every_option_this_stack_reads_is_read() {
     assert!(segment.options.sack_permitted);
 }
 
-/// RFC 7323 §2.3: a shift above the maximum is clamped rather than refused.
+/// RFC 7323 section 2.3: a shift above the maximum is clamped rather than refused.
 #[test]
 fn an_oversized_window_scale_is_clamped_rather_than_refused() {
     for offered in [15u8, 32, 200, 255] {
@@ -689,7 +689,7 @@ proptest! {
 
     /// Every option area a peer can compose is walked in bounded time and
     /// answered: the loop consumes at least one byte per iteration, so the header
-    /// bounds it (ENG-4).
+    /// bounds it.
     #[test]
     fn any_option_area_terminates(options in prop::collection::vec(any::<u8>(), 0..40)) {
         // Padded to a whole number of words, as a data offset can only name one.

@@ -2,7 +2,7 @@
 //! edits routing a frame requires, and the two replies an addressed endpoint
 //! sends.
 //!
-//! Faces untrusted network traffic (CONCEPT §7.1): every byte reaching
+//! Faces untrusted network traffic: every byte reaching
 //! [`Frame::parse`] was put on the wire by whatever is attached to a dataplane
 //! port. The ARP and ICMP halves additionally face the management-plane
 //! attacker, reached through `lfw_ip_endpoint`, which is what puts them on a
@@ -33,8 +33,8 @@
 //! * **Only the first fragment carries a transport header.** A non-initial
 //!   fragment reports [`Transport::NonInitialFragment`] rather than reading
 //!   payload bytes as though they were a UDP header.
-//! * **IPv6 is absent**, so CONCEPT §5's L3 row is met for one of its two
-//!   protocols.
+//! * **IPv6 is absent**: of the two L3 protocols the design names, only
+//!   IPv4 is handled.
 //! * **ARP is IPv4-over-Ethernet or nothing.** Any other hardware type,
 //!   protocol type or address length is an [`ArpError`] rather than a packet
 //!   with fields nobody checked, and the only operations that decode are request
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[test]
     fn every_rejection_renders_as_the_values_that_caused_it() {
-        // MONITORING.md records that a drop is currently unobservable: these
+        // A drop is currently unobservable on any operator surface: these
         // renderings are what a rejection will read as once it is, so a `{}`
         // that printed the variant name and none of its values would be
         // discovered on the one path where nothing else is available.

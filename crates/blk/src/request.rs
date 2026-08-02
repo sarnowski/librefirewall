@@ -4,7 +4,7 @@
 //!
 //! # The adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**, on three surfaces this
+//! A **hostile or malfunctioning device**, on three surfaces this
 //! module is the last check before. The used-ring completion decides which
 //! request is being answered; the status byte the device DMAs into this
 //! driver's own region decides whether that request succeeded; and the byte
@@ -69,9 +69,8 @@ pub const SLOTS: usize = 8;
 /// The 16-byte header every virtio-blk request begins with, which the device
 /// reads out of the DMA region.
 ///
-/// `reserved` is not a field a caller can set: virtio 1.0 §5.2.6 requires it
-/// zero, and a constructor that cannot produce a non-zero one is the check
-/// (DOC-9).
+/// `reserved` is not a field a caller can set: virtio 1.0 section 5.2.6 requires
+/// it zero, and a constructor that cannot produce a non-zero one is the check.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestHeader {
@@ -110,7 +109,7 @@ impl RequestHeader {
 
 // The header is DMA'd verbatim to the device, so its layout is a wire ABI and
 // not a Rust struct's business: a reorder or a width change has to fail the
-// build rather than silently shift every request by four bytes (TEST-5).
+// build rather than silently shift every request by four bytes.
 const _: () = {
     assert!(size_of::<RequestHeader>() == 16);
     assert!(align_of::<RequestHeader>() == 8);
@@ -245,7 +244,7 @@ pub struct Token {
 ///
 /// Every count is monotonic for the driver's life and saturates at [`u64::MAX`]
 /// rather than wrapping, on the same terms as [`DeviceFaults`]: a metrics
-/// endpoint (CONCEPT §11) differences successive scrapes, so a reset would
+/// endpoint differences successive scrapes, so a reset would
 /// forge a negative rate and a wrap would turn a sustained flood into a small
 /// number.
 ///
@@ -361,7 +360,7 @@ impl<'dma> Requests<'dma> {
     /// the header and status areas after it, and a queue over some other region
     /// would leave them overlapping whatever is at this one's base.
     ///
-    /// **The enforcer of the address (DOC-7)** is
+    /// **The enforcer of the address** is
     /// [`crate::bringup::Negotiated::configure_queue`], which refuses a zero,
     /// misaligned or wrapping `dma_paddr` before the device is ever programmed
     /// with it — proved by its `an_unusable_dma_region_address_is_refused`. The
@@ -418,7 +417,7 @@ impl<'dma> Requests<'dma> {
 
     /// Publish one request as a descriptor chain and return its identity.
     ///
-    /// The chain is the shape virtio 1.0 §5.2.6 fixes: a device-readable
+    /// The chain is the shape virtio 1.0 section 5.2.6 fixes: a device-readable
     /// header, then for a read or a write the caller's data buffer at the
     /// permission that operation implies, then a device-writable status byte.
     /// A flush has no data segment and is two descriptors.
@@ -480,7 +479,7 @@ impl<'dma> Requests<'dma> {
     ///
     /// One per call by design, so a caller drains in a loop it bounds itself
     /// and a device flooding its used ring cannot park this domain inside a
-    /// single call (ENG-4). `None` also ends the drain when a completion could
+    /// single call. `None` also ends the drain when a completion could
     /// not be attributed to a request, which is counted in
     /// [`RequestFaults::completion_unmapped`] rather than passed off as an
     /// idle queue.
@@ -661,8 +660,8 @@ mod tests {
     /// raw pointer, and such a write invalidates any reference derived from the
     /// same allocation, so a fixture that read a header back through one would
     /// itself be undefined behaviour while claiming to prove the driver's
-    /// conduct against a hostile device (TEST-6). Exposing no reference makes
-    /// that unrepresentable rather than a rule to remember (DOC-9).
+    /// conduct against a hostile device. Exposing no reference makes
+    /// that unrepresentable rather than a rule to remember.
     struct MappedRegion {
         page: *mut Page,
     }
@@ -730,7 +729,7 @@ mod tests {
     /// The far side of the ring, driven by the test in the same thread: it
     /// reads what the driver made available, writes status bytes wherever it
     /// likes, and publishes completions — including ones it was never given,
-    /// which is how the hostile cases are driven (TEST-8).
+    /// which is how the hostile cases are driven.
     struct RingDevice {
         region: *mut u8,
         last_avail: u16,
@@ -887,7 +886,7 @@ mod tests {
 
         /// Write `value` into every slot's status byte, which a device with no
         /// IOMMU in front of it is free to do whether or not it completed the
-        /// requests holding them (TEST-8).
+        /// requests holding them.
         fn scribble_statuses(&self, value: u8) {
             for slot in 0..SLOTS {
                 self.region.write(STATUS_AREA_OFFSET + slot, [value]);

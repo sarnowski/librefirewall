@@ -11,7 +11,7 @@
 //!
 //! # The device is untrusted
 //!
-//! The adversary is CONCEPT §7.1's hostile or malfunctioning device, and it can
+//! The adversary is a hostile or malfunctioning device, and it can
 //! write **every byte of the region** — not only the used ring it owns by
 //! protocol, but the descriptor table and the driver ring as well. The
 //! governing rule is therefore stronger than "validate the used ring": *no
@@ -95,7 +95,7 @@ pub struct Segment {
 /// exactly like an idle link.
 ///
 /// Every field is monotonic for the queue's life and saturates at [`u64::MAX`]
-/// rather than wrapping. A metrics endpoint (CONCEPT §11) derives a rate by
+/// rather than wrapping. The appliance's metrics endpoint derives a rate by
 /// differencing successive scrapes, so a reset would forge a negative rate and
 /// a wrap would turn a sustained flood back into a small number.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -606,9 +606,9 @@ mod tests {
     /// `Box` does not survive that: moving it into a fixture retags the
     /// allocation and invalidates every pointer already handed out, so the
     /// queue's next volatile write would itself be undefined behaviour while
-    /// claiming to prove the queue's conduct against a hostile device (TEST-6).
+    /// claiming to prove the queue's conduct against a hostile device.
     /// Exposing no reference makes that unrepresentable rather than a rule to
-    /// remember (DOC-9).
+    /// remember.
     struct MappedRegion {
         page: *mut Page,
     }

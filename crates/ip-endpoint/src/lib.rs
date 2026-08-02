@@ -9,13 +9,13 @@
 //!
 //! # Adversary
 //!
-//! Two of CONCEPT §7.1's five at once.
+//! Two adversaries at once.
 //!
 //! * **Untrusted network traffic.** Every byte handed to [`Endpoint::handle`] was
 //!   put on a wire by whatever is attached to the port, so each is parsed through
 //!   `net_headers` or `lfw_tcp` and refused by a typed error rather than believed.
-//! * **The management-plane attacker.** The port this runs on is the management port
-//!   (CONCEPT §9.1), so the station on it is the party the management API answers,
+//! * **The management-plane attacker.** The port this runs on is the management port,
+//!   held out of the dataplane, so the station on it is the party the management API answers,
 //!   and everything it sends arrives here. A reply is a frame the appliance
 //!   originates, and what decides whether one is composed is entirely below.
 //!
@@ -41,14 +41,14 @@
 //! [`Endpoint::poll_output`] is what a caller drives until a pass has nothing
 //! left to send.
 //!
-//! # Deviation from CONCEPT §11: the service is plain HTTP (CON-1, STA-4)
+//! # A known, deliberate gap in the target design: the service is plain HTTP
 //!
-//! CONCEPT §11 requires the management API to carry encryption, authentication
+//! The target design requires the management API to carry encryption, authentication
 //! and read/write authorization through an mTLS certificate pair. None of it
 //! exists: there is no TLS in this appliance, this endpoint authenticates nobody,
 //! and **anything that can reach the management port can read every metric the
 //! node exposes**, or any registered stream. `GET /config` and `GET /logs` are
-//! absent too and answer 404 rather than being stubbed (ENG-7). README records it.
+//! absent too and answer 404 rather than being stubbed. The gap is recorded.
 //!
 //! # Deliberate narrowness, and what each exclusion costs
 //!
@@ -95,14 +95,14 @@ pub mod http;
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
 
 /// Connections one management port holds at once, and so the bound a connection
-/// flood is answered by (ENG-4).
+/// flood is answered by.
 ///
 /// Eight rather than one, because a browser opens several at a time; rather than
 /// many, because each carries a [`REQUEST_CAPACITY`] slot.
 pub const TCP_CONNECTIONS: usize = 8;
 
 /// The port this endpoint listens on: the management HTTP port. A constant rather
-/// than a configured value because the service is the constant — CONCEPT §11 puts
+/// than a configured value because the service is the constant — the design puts
 /// `/metrics`, `/config` and `/logs` on the management interface, and a port a
 /// document could move is one a scraper could not find.
 pub const MANAGEMENT_PORT: u16 = 80;
@@ -303,7 +303,7 @@ impl Outcome {
     }
 }
 
-/// What an endpoint has seen, in the shape the metrics endpoint (CONCEPT §11) will
+/// What an endpoint has seen, in the shape the metrics endpoint will
 /// scrape. Monotonic and saturating on `routing::DropCounters`' terms: no reset,
 /// because a scrape differences successive samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +315,7 @@ pub struct EndpointCounters {
     /// Frames addressed to somebody else.
     pub not_for_us: u64,
     /// Frames no parser would read. One counter for every [`Malformed`]: this
-    /// endpoint has no surface to report which (MONITORING.md), so a finer split
+    /// endpoint exposes no surface that reports which, so a finer split
     /// would be numbers nobody reads.
     pub malformed: u64,
     /// Replies decided on and not written: a caller-side failure, and the one count
@@ -357,7 +357,7 @@ impl EndpointCounters {
     pub fn unhandled(&self, reason: Unhandled) -> u64 {
         // Every reason has a slot by construction — the array is sized by
         // `Unhandled::ALL` — so the zero is a value rather than an assertion,
-        // ENG-5 admitting none on a path a frame reaches.
+        // a path a frame reaches admitting no panic.
         self.unhandled.get(reason.slot()).copied().unwrap_or(0)
     }
 
@@ -423,7 +423,7 @@ pub struct Endpoint {
 /// Where one connection's frames arrive from, and so the only pair a segment this
 /// endpoint originates unprompted can be addressed to. Not an ARP cache and
 /// unable to become one: learned from the frame that opened the connection and
-/// forgotten with it, so bounded by the connection table (ENG-4).
+/// forgotten with it, so bounded by the connection table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReturnPath {
     connection: ConnectionId,
@@ -805,7 +805,7 @@ impl Endpoint {
     /// [`Ipv4Frame::PAYLOAD_AT`], answering the frame's length.
     ///
     /// It cannot refuse, and the zero is a value rather than an assertion because
-    /// ENG-5 admits none here: `len` bytes were written into `out[PAYLOAD_AT..]`,
+    /// no panic is admissible here: `len` bytes were written into `out[PAYLOAD_AT..]`,
     /// so `out` is at least as long as the frame needs. A zero would mean this
     /// crate wrote a segment somewhere other than where it said.
     fn frame_around(

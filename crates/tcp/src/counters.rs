@@ -2,7 +2,7 @@
 //!
 //! # Why one field per cause and not one total
 //!
-//! MONITORING.md's *Attribution* rule is binding and it is the reason this
+//! Attribution is binding and it is the reason this
 //! module is as long as it is: three classes must never merge — what a **peer
 //! sent** that a layer refused, what a **device** got wrong about its own
 //! protocol, and what **we** got wrong. A single `dropped` would collapse a port
@@ -110,7 +110,7 @@ pub struct TcpCounters {
     pub challenge_acks: u64,
     /// `RST`s accepted, each of which destroyed a connection.
     pub resets_received: u64,
-    /// `RST`s sent, for any of the reasons RFC 793 §3.4 lists.
+    /// `RST`s sent, for any of the reasons RFC 793 section 3.4 lists.
     pub resets_sent: u64,
 
     /// Segments this stack decided to send and could not: the caller's storage

@@ -50,7 +50,7 @@
 //! 70000 instead would spend almost every run memcpying and would reach the
 //! boundary by accident, if at all.
 //!
-//! # What is asserted (TEST-9)
+//! # What is asserted
 //!
 //! * **Containment.** Guard bytes surround every buffer offered, and a write
 //!   never touches one. This is the claim that matters: the encoder is handed a

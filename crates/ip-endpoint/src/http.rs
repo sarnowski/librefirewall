@@ -5,16 +5,16 @@
 //! a target its owner registered through [`Server::serve_stream_at`] by
 //! streaming a body that owner produces a window at a time, and everything else
 //! with a status. It replaced the byte echo wholesale rather than being layered
-//! on it (ENG-6): nothing of that stand-in survives.
+//! on it: nothing of that stand-in survives.
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **management-plane attacker**, one layer above `lfw_http`.
+//! The **management-plane attacker**, one layer above `lfw_http`.
 //! That crate refuses a malformed head; this one decides what a well-formed one
 //! gets, and holds the state a connection accumulates while it does. Both
 //! dimensions of that state are fixed arrays: [`REQUEST_CAPACITY`] per
 //! connection for the head being read, and one [`RESPONSE_CAPACITY`] buffer for
-//! the one exposition that may be in flight (ENG-4).
+//! the one exposition that may be in flight.
 //!
 //! # One exposition at a time, and what a second connection gets
 //!
@@ -108,7 +108,7 @@ pub const METRICS_TARGET: &str = "/metrics";
 ///
 /// Derived rather than chosen, which is what makes a new metric unable to
 /// silently truncate an operator's scrape — a family added to `lfw_metrics`
-/// moves this number and the array with it (ENG-12).
+/// moves this number and the array with it.
 pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN;
 
 /// The tail a window keeps behind the byte being sent: everything the transport
@@ -126,14 +126,14 @@ pub const WINDOW_LEN: usize = 16 * 1024;
 /// carry the wrong bytes. A longer recording is refused, never truncated.
 pub const MAX_STREAM_LEN: u64 = 1 << 31;
 
-/// Targets an owner may register as streamed: several, CONCEPT §11's management
+/// Targets an owner may register as streamed: several, the management
 /// surface naming several, and bounded because each is compared against every
-/// request target (ENG-4).
+/// request target.
 pub const MAX_STREAM_TARGETS: usize = 4;
 
 // The bound the whole streaming design rests on, stated where both halves are
 // visible: the worst-case exposition and the head in front of it fit the buffer
-// they are composed into, so a scrape is never answered short (TEST-5). Both are
+// they are composed into, so a scrape is never answered short. Both are
 // stated as numbers, so a new family moves this reservation in a diff.
 const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
@@ -280,7 +280,7 @@ impl Window {
 /// Where one connection's response bytes are, and in what shape. One value
 /// rather than a flag beside a cursor: the variants are exclusive by
 /// construction, which makes a buffered and a windowed response owning the one
-/// staging array at once unrepresentable (DOC-9).
+/// staging array at once unrepresentable.
 #[derive(Clone, Copy, Debug)]
 enum Body {
     /// A status with no body, in the slot's own [`Slot::head`].
@@ -389,7 +389,7 @@ struct Shared {
 
 impl Shared {
     /// Bytes of head in front of the body, derived rather than stored so the two
-    /// cannot disagree (DOC-9).
+    /// cannot disagree.
     const fn head_len(&self) -> usize {
         MAX_HEAD_LEN.saturating_sub(self.start)
     }
@@ -682,7 +682,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
             });
         let Some(len) = composed else {
             // Counted rather than asserted so a divergence surfaces as a refused
-            // scrape with a number attached (ENG-12). The buffer is released
+            // scrape with a number attached. The buffer is released
             // here: the refusal has no body to keep it for.
             bump(&mut self.counters.expositions_refused);
             self.release_shared(index);
@@ -787,7 +787,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
         }
         // `bytes` is at most `WINDOW_LEN`, which the module's assertion holds to
         // fit behind the head, so the zip copies all of it. An iteration rather
-        // than a slice leaves no bound to refuse at runtime (ENG-5).
+        // than a slice leaves no bound to refuse at runtime.
         for (target, byte) in self
             .shared
             .bytes
@@ -945,7 +945,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
         let payload = match self.chunk_for(index)? {
             Chunk::Missing => {
                 // Inventing bytes would put data in a recording that was never
-                // recorded, so the miss is counted and the place kept (ENG-12).
+                // recorded, so the miss is counted and the place kept.
                 bump(&mut self.counters.window_misses);
                 return None;
             }

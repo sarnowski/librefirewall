@@ -4,11 +4,11 @@
 //! Every step can refuse, and which state the domain is left in is decided
 //! here rather than in the protection domain that runs it: a domain binary
 //! cannot be host-tested, and what happens to a document this build will not
-//! accept is the behaviour that most needs testing (LAY-2).
+//! accept is the behaviour that most needs testing.
 //!
 //! A refusal publishes nothing and the consumer stays on generation 0, which
 //! forwards nothing. There is deliberately no default configuration behind the
-//! document (ENG-12): a fallback would make a typo indistinguishable from a
+//! document: a fallback would make a typo indistinguishable from a
 //! working appliance until traffic went somewhere nobody intended.
 
 use lfw_log::{DomainState, Event, GenerationOutcome, RejectReason, Sink};
@@ -26,7 +26,7 @@ use crate::{
 /// Three outcomes rather than the two an `Option` carries: a commit whose
 /// content was already running assigned nothing and refused nothing, and folding
 /// the two together had a domain announce `state=refused` for a document it had
-/// accepted (OBS-1).
+/// accepted — a console must carry the system's true state.
 #[expect(
     clippy::large_enum_variant,
     reason = "boxing needs an allocator; the value is a temporary destructured at once"
@@ -35,7 +35,7 @@ use crate::{
 pub enum CommitReport {
     /// The configuration moved, and this is the image the consumer is handed.
     Published(ConfigImage),
-    /// Committed, and already running (CONCEPT §12.2): nothing to publish.
+    /// Committed, and already running — a commit is keyed by content: nothing to publish.
     Unchanged,
     /// Nothing is in force from this document.
     Refused,
@@ -61,10 +61,10 @@ impl CommitReport {
         }
     }
 
-    /// The state the domain announces, decided here so that it is host-tested
-    /// (LAY-2). `Unchanged` is `Ready` because the configuration in force *is*
+    /// The state the domain announces, decided here so that it is host-tested.
+    /// `Unchanged` is `Ready` because the configuration in force *is*
     /// the one the document names; which of the two got there is the `LFW-CFG`
-    /// record before it, and MONITORING.md has an operator read both.
+    /// record before it, and an operator is expected to read both.
     #[must_use]
     pub const fn state(self) -> DomainState {
         match self {

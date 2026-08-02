@@ -1,7 +1,7 @@
 //! The development payload-signing trust anchor.
 //!
 //! GRUB in the boot base enforces detached-signature verification on every file
-//! it loads (CONCEPT §14.3), so the build must sign the kernel and system image.
+//! it loads, so the build must sign the kernel and system image.
 //! Development builds generate a local, throwaway RSA key once per checkout
 //! under `build/dev-keys/`: the private key never leaves that directory and is
 //! removed by `clean`; only the detached signatures and the exported public key

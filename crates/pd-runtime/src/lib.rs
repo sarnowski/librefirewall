@@ -1,7 +1,7 @@
 //! The shared dataplane regions and the buffer-ownership protocol common to the
 //! protection domains.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1): this crate *is*
+//! Faces the byzantine neighbour protection domain: this crate *is*
 //! the inter-PD protocol, so it defines what one domain must withstand from
 //! another.
 //!
@@ -29,7 +29,7 @@
 //! at all. A [`Pool`] goes to the forwarder and the transmitting driver, and to
 //! the receiving one as a physical address with no mapping at all.
 //!
-//! # Handles are taken once, at attach (DOC-9)
+//! # Handles are taken once, at attach
 //!
 //! A handle holds its side's ring position, so a second one restarts at slot
 //! zero and redelivers descriptors the first already handed over. Every role
@@ -80,12 +80,12 @@
 //!   it may rewrite them after the snapshot and before the transmitting NIC
 //!   reads them, so what leaves the port can differ from what was decided on,
 //!   in every field the rewrite does not overwrite. Nothing here closes that —
-//!   an IOMMU (CONCEPT §7.2) or a per-buffer cross-domain ownership epoch would.
+//!   an IOMMU or a per-buffer cross-domain ownership epoch would; neither exists yet.
 //! * **Frame loss and reordering**, by forging a cursor.
 //! * **Writing pool bytes at any time.** The two drivers share a pool, and no
 //!   Rust type stops one of them scribbling a buffer it does not own. That is
 //!   contained by the pool never handing out a safe reference to those bytes,
-//!   and it is why an IOMMU (CONCEPT §7.2) is what finally confines a NIC's DMA
+//!   and it is why an IOMMU — still an open item — is what finally confines a NIC's DMA
 //!   rather than anything here.
 
 #![cfg_attr(not(test), no_std)]
@@ -278,7 +278,7 @@ impl Default for ReturnRing {
 ///
 /// # Panics
 /// If `index >= POOL_BUFFERS`, in every build profile — a `debug_assert!` would
-/// be absent from every image that boots (ENG-10, BLD-3). The result would
+/// be absent from every image that boots, and the release build ships. The result would
 /// otherwise address *outside* the region, and a driver posts it to a NIC as a
 /// DMA target: with no IOMMU, an arbitrary physical write.
 ///
@@ -293,7 +293,7 @@ impl Default for ReturnRing {
 ///
 /// A hostile peer or device therefore reaches a rejection, never this
 /// assertion; reaching it means an enforcer broke, which is surfaced visibly
-/// rather than counted as traffic (ENG-5, ENG-12).
+/// rather than counted as traffic.
 #[must_use]
 pub const fn buffer_paddr(pool_paddr: u64, index: u32) -> u64 {
     assert!(
@@ -309,7 +309,7 @@ pub const fn buffer_paddr(pool_paddr: u64, index: u32) -> u64 {
 ///
 /// # Panics
 /// If `ptr` is not aligned for `T`, in every build profile: a bound absent from
-/// the shipped image is not a bound (ENG-10), and it costs one compare.
+/// the shipped image is not a bound, and it costs one compare.
 ///
 /// # Safety
 /// `ptr` must be aligned to `align_of::<T>()`, point to a live mapping of at
@@ -417,8 +417,8 @@ pub use wire::{
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
 /// invisible: a byzantine peer's activity looks exactly like an idle link.
 ///
-/// Monotonic for the domain's life and saturating; there is no reset, because a
-/// metrics endpoint (CONCEPT §11) differences successive scrapes and a reset
+/// Monotonic for the domain's life and saturating; there is no reset, because
+/// the appliance's metrics endpoint differences successive scrapes and a reset
 /// would forge a negative rate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PoolCounters {
@@ -614,8 +614,8 @@ pub struct RouteCounters {
     pub snapshot_failed: u64,
     /// Frames that are not the IPv4-over-Ethernet packet they would have to be
     /// to be routed. One counter for every [`net_headers::ParseError`]: this
-    /// domain has no surface to report which (MONITORING.md — a drop is
-    /// currently unobservable), so a finer split would be numbers nobody reads.
+    /// domain has no exposed surface to report which — a drop is
+    /// currently unobservable — so a finer split would be numbers nobody reads.
     pub unparsable: u64,
     /// Frames the router would forward out of a port this stage is not wired
     /// to. A stage is a fixed cross-connect between one ingress and one egress
@@ -678,7 +678,7 @@ impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
 /// * a frame recorded as forwarded that a later refusal still lost — the pool
 ///   declining the rewritten header, the destination ring declining the
 ///   descriptor, or `rewrite_for_forwarding` refusing a TTL the router had
-///   already accepted. Each has its own series in MONITORING.md.
+///   already accepted. Each has its own exposed counter series.
 pub struct RouteStage<'ring> {
     ingress: PortId,
     egress: PortId,

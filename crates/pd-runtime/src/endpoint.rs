@@ -3,9 +3,9 @@
 //!
 //! # Adversary
 //!
-//! Two of CONCEPT §7.1's, and they arrive by different routes. Every descriptor
+//! Two adversaries, and they arrive by different routes. Every descriptor
 //! read here was written by the driver that owns the receive pool, so its buffer
-//! index, its span and its verdict word are a **byzantine peer protection
+//! index, its span and its verdict word are a **byzantine neighbour protection
 //! domain**'s choice and none of them is trusted. Every *frame byte* behind such
 //! a descriptor was chosen by whatever is attached to the port — untrusted
 //! network traffic, and on the management port the **management-plane
@@ -81,7 +81,7 @@ use crate::{
 
 /// How many segments one pass may send out of the transport's own timers.
 ///
-/// A bound the peer does not choose (ENG-4): every answer from
+/// A bound the peer does not choose: every answer from
 /// `Endpoint::poll_timeouts` either frees a connection or moves a deadline, so
 /// the loop terminates on its own — this is what keeps a pass short even so, and
 /// it is derived from the connection table rather than chosen, one connection
@@ -90,7 +90,7 @@ pub const TIMER_LIMIT: usize = 2 * lfw_ip_endpoint::TCP_CONNECTIONS;
 
 /// How many segments one pass may send out of the server above the transport.
 ///
-/// A bound the peer does not choose (ENG-4), derived rather than picked: a
+/// A bound the peer does not choose, derived rather than picked: a
 /// connection may have at most `lfw_tcp::MAX_UNACKED` ranges outstanding before
 /// its window refuses another, so this is every connection saturated at once and
 /// the loop stops long before it on any real pass.
@@ -153,8 +153,8 @@ pub fn calibration_from(image: CalibrationImage) -> Result<Calibration, Calibrat
 /// composed here and then dropped.
 pub const MAX_REPLY_LEN: usize = BUFFER_SIZE - DEVICE_HEADER_LEN as usize;
 
-/// What a terminal endpoint has seen, in the shape the metrics endpoint
-/// (CONCEPT §11) will scrape.
+/// What a terminal endpoint has seen, in the shape the appliance's own
+/// metrics endpoint will scrape.
 ///
 /// Monotonic for the domain's life and saturating, on
 /// [`PoolCounters`](crate::PoolCounters)'s terms: there is no reset, because a
@@ -295,7 +295,7 @@ pub struct EndpointRegions<'ring> {
 impl<'ring> EndpointStage<'ring> {
     /// Take every handle a terminal port needs.
     ///
-    /// **Unenforced precondition (DOC-7):** call once per protection domain per
+    /// **Unenforced precondition:** call once per protection domain per
     /// pipeline. Each handle is this domain's own position in a ring, so a
     /// second stage over the same pipelines re-consumes descriptors the first
     /// already returned and produces a second return for each — which is
@@ -435,7 +435,7 @@ impl<'ring> EndpointStage<'ring> {
     /// registered, where it is the exposition's own, or where the table is full
     /// — none of which a fixed set of start-up registrations can reach, and all
     /// of which are answered rather than asserted so a caller learns of its own
-    /// mistake (ENG-12).
+    /// mistake instead of having it swallowed.
     pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
         if target == METRICS_TARGET || self.targets.iter().flatten().any(|it| *it == target) {
             return false;
@@ -636,14 +636,14 @@ impl<'ring> EndpointStage<'ring> {
     /// Write this domain's own counters into the shard it owns.
     ///
     /// Once per pass rather than once per frame, which is what keeps the whole
-    /// metric surface off the hot path (OBS-3): the cost of a drain of up to
+    /// metric surface at no measurable dataplane cost: the cost of a drain of up to
     /// `DRAIN_LIMIT` descriptors is one bounded run of relaxed stores.
     ///
     /// A scrape answered *during* a pass therefore reads this domain's own
     /// series as of the end of the previous one; every other domain's is as
     /// fresh as that domain last published. A self-reporting metric cannot do
     /// better — a scrape can never include the bytes of its own answer — and
-    /// MONITORING.md records it.
+    /// the operator contract records it.
     pub fn publish(&self, log: LogSample) {
         let sample = crate::stats::management_sample(
             &self.counters,

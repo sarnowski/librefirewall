@@ -12,7 +12,7 @@
 //! renders a valid exposition; a tap that loses an observation leaves both
 //! surfaces internally consistent. None of the three notices. What notices is
 //! holding them to each other and to the bytes the harness knows it injected,
-//! which no surface has any way to agree with by construction (TEST-13).
+//! which no surface has any way to agree with by construction.
 //!
 //! # Why a module of its own
 //!
@@ -29,11 +29,11 @@
 //!
 //! # No adversary
 //!
-//! Build orchestration on the host side of an emulator (CON-2 names no CONCEPT
-//! §7.1 adversary for it). The guest composes the recordings — that is the
-//! point — and every walk over them is bounded by the body's own length
-//! (ENG-4), refuses a malformed file by name rather than indexing off its end
-//! (ENG-5), and is performed by [`crate::recording_contract::parse`] before a
+//! Build orchestration on the host side of an emulator; no threat-model
+//! adversary is named for it. The guest composes the recordings — that is the
+//! point — and every walk over them is bounded by the body's own length,
+//! refuses a malformed file by name rather than indexing off its end,
+//! and is performed by [`crate::recording_contract::parse`] before a
 //! byte reaches this module.
 
 use std::collections::BTreeMap;

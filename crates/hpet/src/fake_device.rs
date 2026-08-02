@@ -14,7 +14,7 @@
 //! It models the *authority a device has* — any capabilities word at all, any
 //! counter reading, a different one on every read, a configuration register
 //! that drops the bit written to it — and constrains none of it to what a
-//! conforming part would do (TEST-8). [`FakeHpet::conforming`] is the
+//! conforming part would do. [`FakeHpet::conforming`] is the
 //! well-behaved baseline; every builder method takes one capability away from
 //! it.
 

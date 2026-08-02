@@ -1,7 +1,7 @@
 //! The fixed-layout log record a writing domain hands the console domain, and
 //! the decode that turns peer-written bytes back into one.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1). The console maps
+//! Faces the byzantine neighbour protection domain. The console maps
 //! a region a writing domain also maps, so every byte of a record it reads was
 //! chosen by another domain: the discriminants that say which fields mean
 //! anything, the tokens that name a vocabulary, and the text that reaches a
@@ -25,7 +25,7 @@
 //! * **Text is this crate's**, because the console writes it to a UART. A byte
 //!   a hostile writer put in an identifier reaches an operator's terminal
 //!   unless something between the two refuses it, and this decode is that
-//!   something (OBS-5). `lfw_log::Identifier` checks the same alphabet on the
+//!   something. `lfw_log::Identifier` checks the same alphabet on the
 //!   way in; the two checks face different adversaries and neither stands in
 //!   for the other.
 //! * **Vocabulary cardinality is shared.** A token is bounded here by the
@@ -73,7 +73,7 @@ pub const LOG_REJECT_REASON_COUNT: u8 = 30;
 ///
 /// A discriminant rather than a reserved value of [`LogRecord::stamp_nanos`]:
 /// zero is a real instant, so a sentinel would date 1970 every record emitted
-/// before this node established a time — most of a boot transcript (ENG-12).
+/// before this node established a time — most of a boot transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogStampKind {
     Unsynchronized,
@@ -282,7 +282,7 @@ impl<const N: usize> TextImage<N> {
     /// Lay `text` out as this image carries it. The copy is bounded by the array
     /// and the length narrows saturatingly, so text this image cannot carry
     /// produces a length [`check_bounded_text`] refuses rather than one that
-    /// indexes past the bytes (ENG-5).
+    /// indexes past the bytes.
     #[must_use]
     pub fn from_text(text: &[u8]) -> Self {
         let mut image = Self::ZERO;
@@ -649,13 +649,13 @@ const fn boolean(raw: u8) -> Option<bool> {
 }
 
 /// The alphabet `lfw_log::Identifier` admits, which is what makes a byte safe
-/// to put on a console at all (OBS-5).
+/// to put on a console at all.
 const fn in_alphabet(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-')
 }
 
 /// Why a byte string in a shared region is not text this ABI carries. Names a
-/// length or a position, never the byte at it (OBS-5). Separate from
+/// length or a position, never the peer-chosen byte at it. Separate from
 /// [`LogRecordError`] because two ABIs check one alphabet — a record's key and an
 /// interface id — and each maps this onto its own refusals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,7 +781,7 @@ impl<const N: usize> CheckedText<N> {
     /// own region readers.
     ///
     /// # Errors
-    /// [`TextFault`], naming a length or a position and never a byte (OBS-5).
+    /// [`TextFault`], naming a length or a position and never a byte.
     pub fn new(text: &[u8]) -> Result<Self, TextFault> {
         check_slice(text, false)
     }
@@ -789,7 +789,7 @@ impl<const N: usize> CheckedText<N> {
     /// The fallback is unreachable: [`LogRecord::check`] is what sets `len`,
     /// and it does so only after indexing the array with it. An empty slice
     /// rather than a panic because a branch safe Rust cannot delete is not a
-    /// failure to surface (ENG-12).
+    /// failure to surface.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.get(..usize::from(self.len)).unwrap_or_default()
@@ -910,7 +910,7 @@ pub enum CheckedDetail {
 /// When a [`LogRecord`] says it was emitted.
 ///
 /// A sum type rather than a number with a reserved value, so an absent instant
-/// has no `u64` in it to be mistaken for a reading (DOC-9).
+/// has no `u64` in it to be mistaken for a reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckedStamp {
     Unsynchronized,

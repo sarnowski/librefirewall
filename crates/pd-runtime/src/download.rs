@@ -4,8 +4,8 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **management-plane attacker** in front and a **byzantine
-//! peer protection domain** behind. The attacker chooses when and how often to
+//! A **management-plane attacker** in front and a **byzantine
+//! neighbour protection domain** behind. The attacker chooses when and how often to
 //! ask; nothing here allocates, waits or retries on their account, and a pass
 //! with no window yet does nothing and comes back. The recorder chooses every
 //! byte of the answer: `wire::download` refuses a reply that is not this
@@ -96,7 +96,7 @@ pub const CAPTURE_TARGET: &str = "/capture.pcapng";
 /// browser that guessed at one would render an evidence artifact as text.
 const CONTENT_TYPE: &str = "application/octet-stream";
 
-/// Saturating, monotone counts for MONITORING.md.
+/// Saturating, monotone counts for the operator-facing metrics contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DownloadCounters {
     /// Streams begun — one per `GET` of a recording that the recorder answered.

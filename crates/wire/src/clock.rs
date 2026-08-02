@@ -2,7 +2,7 @@
 //! the reading it was anchored on, and the wall-clock instant that reading
 //! corresponds to.
 //!
-//! Faces the byzantine peer protection domain (CONCEPT §7.1). The domain that
+//! Faces the byzantine neighbour protection domain. The domain that
 //! writes this region measured its numbers against a device (`pds/clock`), so
 //! what arrives here is a hostile or malfunctioning device's answer one
 //! indirection away — and the writing domain itself is a peer whose behaviour a
@@ -31,8 +31,8 @@
 //!
 //! # Bounded, because the writer is a peer
 //!
-//! A reader retries a torn read [`LOAD_ATTEMPTS`] times and then gives up
-//! (ENG-4). A peer that holds the counter odd — by faulting mid-publish, or on
+//! A reader retries a torn read [`LOAD_ATTEMPTS`] times and then gives
+//! up. A peer that holds the counter odd — by faulting mid-publish, or on
 //! purpose — must not be able to spin a reader forever; a caller that is told
 //! "nothing" once has lost a timestamp, which is a refusal it can report.
 
@@ -71,7 +71,7 @@ pub struct CalibrationImage {
 ///
 /// Every field is private and the only ways in are [`publish`](Self::publish) and
 /// [`load`](Self::load), so the protocol is a property of the type rather than a
-/// convention its two domains are asked to keep (DOC-9).
+/// convention its two domains are asked to keep.
 #[repr(C)]
 pub struct ClockCalibration {
     generation: AtomicU32,
@@ -174,7 +174,7 @@ impl ClockCalibration {
 pub const CLOCK_CALIBRATION_REGION_SIZE: usize =
     size_of::<ClockCalibration>().next_multiple_of(MAPPING_ALIGN);
 
-// The layout two protection domains agree on, fixed at build time (TEST-5). One
+// The layout two protection domains agree on, fixed at build time. One
 // maps this region read-write and the other read-only, and neither can see the
 // other's view of it, so a reorder or a width change must be a compile error
 // here rather than a silent break of the triple the reading domain assembles.

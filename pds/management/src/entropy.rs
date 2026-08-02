@@ -7,7 +7,7 @@
 //! node must hold for one boot and never reveal. An attacker who knows it can
 //! predict the sequence number a listener will choose for any 4-tuple, and with
 //! that can inject into a connection it cannot see and complete a handshake as an
-//! address it does not hold — off the path, against CONCEPT §7.1's
+//! address it does not hold — off the path, exactly the threat model's
 //! **management-plane attacker**. So the secret must be unpredictable, and it
 //! must be *per boot*: a constant compiled in, or one derived from the
 //! configuration, is one an attacker reads out of the image.
@@ -23,8 +23,8 @@
 //! A weak secret is worse than no port, because a port with a weak secret *looks*
 //! like a working one. So every failure below — no `RDRAND` at all, or one that
 //! will not produce a number — is a refusal that leaves the management port
-//! unaddressed and says why on the console (ENG-12). An operator with no shell
-//! (CONCEPT §11) gets one line, and it names the cause.
+//! unaddressed and says why on the console. An operator with no shell —
+//! the appliance has none — gets one line, and it names the cause.
 //!
 //! # Why the retry count is what Intel's own guidance says
 //!
@@ -32,7 +32,7 @@
 //! when the hardware's queue is momentarily empty; the documented remedy is a
 //! bounded retry, and the documented bound is ten. Beyond that the generator is
 //! not busy but broken, and looping further would spin a protection domain
-//! forever on a hardware fault (ENG-4).
+//! forever on a hardware fault, unbounded by anything this node controls.
 
 use core::arch::x86_64::{__cpuid, _rdrand64_step};
 
@@ -93,7 +93,7 @@ fn feature_word() -> u32 {
     // `__cpuid` is a safe call on this toolchain, which is the compiler's
     // statement that the instruction has no precondition a caller could violate:
     // it is architectural on x86_64 and unprivileged, and
-    // `support/targets/x86_64-sel4-minimal.json` targets nothing else (CON-4).
+    // `support/targets/x86_64-sel4-minimal.json` targets x86_64 and nothing else.
     // The one fact left is third-party runtime behaviour and is recorded rather
     // than asserted: the seL4 kernel does not trap `CPUID` in a protection
     // domain, the same premise `read_timestamp_counter` records for `RDTSC`.
@@ -107,7 +107,7 @@ fn feature_word() -> u32 {
 ///
 /// `None` where the generator did not answer in [`DRAW_ATTEMPTS`] attempts, which
 /// is reported as a refusal rather than answered with the zero the instruction
-/// leaves behind (ENG-12).
+/// leaves behind.
 fn draw() -> Option<u64> {
     for _ in 0..DRAW_ATTEMPTS {
         let mut value = 0u64;

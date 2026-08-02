@@ -7,13 +7,13 @@
 //! `csum_offset`), or merged receive buffers (`num_buffers`) — so a conformant
 //! device leaves all of them zero until the governing feature is negotiated.
 //! Acting on one would mean trusting a hostile device's description of a
-//! buffer it also wrote (CONCEPT §7.1); ignoring it cannot be wrong, because
+//! buffer it also wrote; ignoring it cannot be wrong, because
 //! the frame bytes following the header stand on their own and are bounded by
 //! the length the driver programmed. Negotiating an offload feature is what
 //! makes the field it governs need a validator.
 //!
 //! Multi-byte fields are little-endian per virtio 1.0. x86_64 is the only
-//! target (CONCEPT §3) and its native integer layout already equals the wire
+//! target and its native integer layout already equals the wire
 //! layout, so the fields are plain integers with no byte-swapping.
 
 use core::mem::{align_of, offset_of, size_of};

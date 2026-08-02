@@ -6,12 +6,12 @@
 //! It is the stack the management endpoint answers on today and the one the
 //! proxy dataplane will run on. That second use is what fixes every constraint
 //! below, so none of them is a management-endpoint economy: a proxy terminating
-//! traffic at 10 Gbit/s per port pair (CONCEPT §5) cannot afford a copy, cannot
+//! traffic at the 10 Gbit/s-per-port-pair target cannot afford a copy, cannot
 //! afford a lock, and cannot afford an allocator.
 //!
 //! # Adversary
 //!
-//! Two of CONCEPT §7.1's five, and both reach every byte here.
+//! Two adversaries, and both reach every byte here.
 //!
 //! * **Untrusted network traffic.** A segment is bytes a peer chose: its ports,
 //!   its sequence numbers, its window, its options and its length. Nothing is
@@ -19,7 +19,7 @@
 //!   read, the sequence space is checked against the window before a byte is
 //!   delivered, and every refusal is a typed error with a counter.
 //! * **The management-plane attacker.** The port this runs on is the management
-//!   port (CONCEPT §9.1), so the party on it is the one that will hold a session
+//!   port, kept out of the dataplane, so the party on it is the one that will hold a session
 //!   with the appliance. Two consequences shape the code: initial sequence
 //!   numbers are unpredictable (RFC 6528, `isn`), because a predictable one lets
 //!   that attacker inject into a connection it cannot see; and the connection
@@ -47,7 +47,7 @@
 //!
 //! A [`TcpStack`] owns its whole connection table and reaches nothing outside
 //! itself: no `static`, no lock, no cell, no atomic. Several instances therefore
-//! run on several cores with no coordination at all (ENG-2), and that is
+//! run on several cores with no coordination, locks or shared state, and that is
 //! structural — every method takes `&mut self`, so the compiler refuses two
 //! concurrent users of one shard and needs no runtime check to do it. The
 //! capacity is a const generic, so a shard's memory is fixed at compile time and
@@ -134,7 +134,7 @@ use connection::Reply;
 /// would deliver bytes into a new one on a different 4-tuple. The generation
 /// makes that unrepresentable rather than merely unlikely: the table refuses a
 /// handle whose generation is not the one it issued, so a stale handle is a typed
-/// error and never a wrong connection (DOC-9).
+/// error and never a wrong connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConnectionId {
     slot: usize,
@@ -281,7 +281,7 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
     ///
     /// `mss_limit` is the largest payload this end will compose, which the
     /// caller derives from the storage it will offer; `receive_window` is what it
-    /// can absorb. Both are bounds the peer does not choose (ENG-4).
+    /// can absorb. Both are bounds the peer does not choose.
     #[must_use]
     pub fn new(
         address: Ipv4Address,
@@ -511,7 +511,7 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
     /// [`SendError`], and [`SendError::WrongRange`] where the bytes offered are
     /// not the range [`Timeout::Retransmit`] named — which is the check that
     /// keeps a caller's bookkeeping mistake from putting the wrong bytes into a
-    /// stream (DOC-7: this is the enforcer that obligation names, held to it by
+    /// stream (this is the enforcer that obligation names, held to it by
     /// `tests::retransmitting_the_wrong_range_is_refused`).
     pub fn retransmit(
         &mut self,
@@ -571,7 +571,7 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
     ///
     /// Called in a loop until it answers `None`. Each answer either frees a slot
     /// or re-arms the timer it fired, so a loop over it terminates: no timer can
-    /// be reported twice at one instant (ENG-4).
+    /// be reported twice at one instant.
     pub fn poll_timeouts(&mut self, now: Monotonic, out: &mut [u8]) -> Option<Timeout> {
         // Reaping first, so a table under pressure recovers its slots before it
         // spends work re-sending on connections that are already dead.
@@ -665,8 +665,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                 )
             });
         // The zero is unreachable — the caller found the slot occupied to reach
-        // here — and is a value rather than an assertion, ENG-5 admitting none on
-        // a path a peer's traffic reaches.
+        // here — and is a value rather than an assertion, no panic being
+        // admissible on a path a peer's traffic reaches.
         let len = composed.map_or(0, |(peer, port, window, reply)| {
             self.send_reset(peer, port, window, &reply, out)
         });
@@ -688,13 +688,13 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         out: &mut [u8],
     ) -> Received<'a> {
         if segment.flags.contains(Flags::RST) {
-            // RFC 793 §3.4: a `RST` for a connection that does not exist is
+            // RFC 793 section 3.4: a `RST` for a connection that does not exist is
             // dropped, and never answered with another.
             TcpCounters::bump(&mut self.counters.refused_no_connection);
             return self.rejected(Rejection::NoConnection);
         }
         if !segment.flags.contains(Flags::SYN) || segment.flags.contains(Flags::ACK) {
-            // RFC 793 §3.4's "reset generation": a segment that is not a fresh
+            // RFC 793 section 3.4's "reset generation": a segment that is not a fresh
             // `SYN` names a connection the peer believes in and this end does
             // not, so it is told. The sequence numbers are the ones that section
             // prescribes — the peer's acknowledgement where it carried one, so

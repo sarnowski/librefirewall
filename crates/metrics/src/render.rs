@@ -9,7 +9,7 @@
 //! caller's storage is too small the answer is [`RenderError::OutOfSpace`] and
 //! **nothing partial is claimed** — a truncated exposition is one a scraper
 //! parses happily and reads short values from, which is worse than no scrape at
-//! all (ENG-12).
+//! all.
 //!
 //! [`MAX_EXPOSITION_LEN`] makes that refusal unreachable for the appliance's own
 //! staging buffer: it is the exact worst case of the catalogue, computed at
@@ -56,7 +56,7 @@ const INFO_VALUE: &[u8] = b"1";
 ///
 /// Arithmetic rather than an index into a table: the value is bounded by the mask
 /// and the sums cannot leave a `u8`, so there is no index to be out of range and
-/// no addition to overflow (ENG-5).
+/// no addition to overflow.
 const fn hex_digit(nibble: u8) -> u8 {
     let low = nibble & 0x0f;
     if low < 10 {
@@ -171,7 +171,7 @@ impl Snapshot {
                 writer.bytes(b"} ")?;
                 // A slot past the shard is unreachable — every table is asserted
                 // to fit `STATS_SLOTS` — and reads as zero rather than as a
-                // panic, ENG-5 admitting none on a path a peer's region reaches.
+                // panic: a path a peer's region reaches admits none.
                 writer.number(values.get(slot).copied().unwrap_or(0))?;
                 writer.bytes(b"\n")?;
             }
@@ -252,7 +252,7 @@ impl Writer<'_> {
     }
 
     /// A MAC in the lower-case colon-separated form every other surface of this
-    /// appliance writes one in, both nibbles always (MONITORING.md's alphabet).
+    /// appliance writes one in, both nibbles always — one alphabet on every surface.
     fn mac(&mut self, mac: [u8; 6]) -> Result<(), Full> {
         for (index, octet) in mac.into_iter().enumerate() {
             if index > 0 {

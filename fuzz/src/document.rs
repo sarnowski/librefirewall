@@ -2,7 +2,7 @@
 //!
 //! # The adversary and the surface
 //!
-//! CONCEPT §7.1's management-plane attacker chooses every byte of a
+//! The management-plane attacker chooses every byte of a
 //! configuration document, so the input here *is* the document: no length
 //! prefix, no operation selector, no prologue this harness supplies, and no
 //! filter on encoding. A corpus entry is a file, which is what lets the
@@ -24,7 +24,7 @@
 //! [`MAX_DOCUMENT_BYTES`], nesting past [`MAX_DEPTH`], a DTD, an entity
 //! declaration, and an expansion attack are all ordinary inputs, and the
 //! assertion is that the reader's *own* bounds refuse them. Capping the input
-//! here would delete exactly the region those bounds exist for (TEST-8), so
+//! here would delete exactly the region those bounds exist for, so
 //! nothing is capped: the seeds deliberately include a document past the size
 //! bound so the refusal itself is exercised rather than assumed.
 //!
@@ -46,7 +46,7 @@
 //!   position an operator cannot go and look at.
 //! * **Determinism.** The same bytes yield the same answer, and an accepted
 //!   document yields the same hash every time it is read. Configuration is
-//!   keyed by that hash (CONCEPT §12.2), so a hash that moved between two reads
+//!   keyed by that hash, so a hash that moved between two reads
 //!   of one file would make an unchanged document look like a change.
 //! * **Canonicality.** A model never differs from itself: the diff of an
 //!   accepted model against itself is empty, and it does not overflow the
@@ -286,7 +286,7 @@ fn assert_reader_is_bounded(document: &[u8]) {
 /// A rejection an operator can act on: a reason, and somewhere to look.
 ///
 /// The offset is the whole of what a refusal says about position — the bytes
-/// are deliberately not carried (OBS-5) — so an offset outside the document is
+/// are deliberately not carried onto any exposed surface — so an offset outside the document is
 /// a refusal nobody can act on. The size refusal is reported at the bound
 /// rather than at a scanned position, and it is only reached by a document
 /// longer than that, so it lies inside too and needs no exemption here.

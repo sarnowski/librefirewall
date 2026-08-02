@@ -25,7 +25,7 @@
 //! ([`crate::surface_contract`]).
 //!
 //! Every scenario boots the RELEASE kernel configuration, because that is the
-//! image a release publishes (BLD-3). A scenario that fails there is re-run
+//! image a release publishes. A scenario that fails there is re-run
 //! once against the debug kernel by [`crate::diagnose`], whose verdict reports
 //! the divergence; that re-run is evidence and never changes the outcome.
 //!
@@ -358,7 +358,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     // *unpredictability* of it can be judged across boots. RFC 6528 makes that a
     // security property and no single boot can show it: a constant initial
     // sequence number is an off-path injection primitive against exactly the
-    // party this port faces (CONCEPT §7.1), and it looks perfectly correct in one
+    // adversary this port faces, and it looks perfectly correct in one
     // scenario.
     let mut sequence_numbers: Vec<(&str, u32)> = Vec::new();
     for scenario in &scenarios {
@@ -437,7 +437,7 @@ fn scenario_log(root: &Path, scenario: &Scenario, run: Run) -> PathBuf {
 /// tree, `ImageUnderTest::Published` scenarios included. It may not call
 /// [`image::image`]: that publishes into `dist/`, which holds the release
 /// artifact the failing run was judging, and overwriting it with a debug disk
-/// would destroy the thing under assessment (BLD-3).
+/// would destroy the thing under assessment.
 fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, String> {
     let name = scenario.name;
     match (&scenario.image, run) {
@@ -1013,7 +1013,7 @@ fn qemu_base(
     // The recorder's device, beside the boot disk and before the NICs. It is
     // attached to every invocation rather than to the scenarios that judge it,
     // because a domain staring at an absent device is a different boot from the
-    // one the image was assembled for (BLD-3).
+    // one the image was assembled for.
     data.attach(&mut command);
     Ok(Invocation {
         command,

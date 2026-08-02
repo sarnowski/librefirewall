@@ -42,7 +42,7 @@ use crate::topology::PORTS;
 /// Driver instances the image carries, and so the number of `state=ready`
 /// records the drivers produce between them: one per dataplane port plus the
 /// management port's. A build fact — the system description declares an instance
-/// per port (CONCEPT §12.3) — and the reason a reader cannot tell them apart is
+/// per port — and the reason a reader cannot tell them apart is
 /// that all three report as `domain=nic-driver`, one binary having one name.
 const DRIVER_INSTANCES: usize = PORTS + 1;
 
@@ -126,7 +126,7 @@ pub fn judge(serial: &[u8], log: &Path, injected: ManagementInjection) -> Result
         let bytes = value(record, "bytes").ok_or_else(|| {
             format!(
                 "{record:?} carries `frames=` and no `bytes=`, and the pair is specified to travel \
-                 together (MONITORING.md)\n  full run log: {}",
+                 together\n  full run log: {}",
                 log.display()
             )
         })?;

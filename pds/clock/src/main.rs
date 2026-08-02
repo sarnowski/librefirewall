@@ -11,7 +11,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device**, twice over: the timer
+//! The **hostile or malfunctioning device**, twice over: the timer
 //! block whose page this domain maps, and the battery-backed register file
 //! behind its two I/O ports. Every number either produces is that device's
 //! choice — a period, a counter reading, a packed-decimal byte, a century — and
@@ -24,7 +24,7 @@
 //!
 //! The calibration goes into a shared region (`wire::ClockCalibration`) the
 //! management domain maps read-only; it arrived with its first consumer, the
-//! condition the note it replaces set (ENG-7).
+//! condition the note it replaces set.
 //! **Publishing is the last thing this domain does**, after the record saying what
 //! it measured, so an operator reading a frequency off the line and a domain
 //! converting readings with one never see different numbers. A refusal publishes
@@ -38,7 +38,7 @@
 //!
 //! # Why the time this establishes is not trusted time
 //!
-//! CONCEPT §13.1 leaves the trusted-time mechanism open, and this is not it.
+//! The design leaves the trusted-time mechanism open, and this is not it.
 //! The CMOS answer is unauthenticated and unattested; a hypervisor, a dead
 //! battery or firmware that set the part to local time all produce a plausible
 //! instant this domain cannot tell from a correct one (`lfw_rtc`'s header
@@ -96,7 +96,7 @@ const CALIBRATION_WINDOW: Duration = Duration::from_millis(1);
 
 // The window has to be one the reference timer can actually serve on the least
 // favourable block its specification admits, and that bound is `lfw_hpet`'s to
-// state rather than this domain's to assume (DOC-7). An order of magnitude of
+// state rather than this domain's to assume. An order of magnitude of
 // headroom, asserted rather than argued.
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() <= WORST_CASE_SERVICEABLE_WAIT.as_nanos());
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() > 0);
@@ -150,7 +150,7 @@ enum StartupError {
     /// `MIN_PLAUSIBLE_YEAR..=MAX_PLAUSIBLE_YEAR`, whose ceiling is three orders
     /// of magnitude short of what `u64` nanoseconds hold — but that bound is
     /// that crate's and this domain does not restate it, so the multiplication
-    /// is checked here rather than assumed (ENG-5). The seconds it refused are
+    /// is checked here rather than assumed. The seconds it refused are
     /// the whole of the diagnosis.
     EpochOutOfRange { unix_seconds: u64 },
 }
@@ -363,7 +363,7 @@ fn init() -> Clock {
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
-            // (CONCEPT §11) this record is all an operator gets.
+            // on the appliance, this record is all an operator gets.
             announce(
                 &sink,
                 DomainState::Refused,

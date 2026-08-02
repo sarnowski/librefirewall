@@ -1,7 +1,7 @@
 //! Fail on the shipped kernel configuration, diagnose on the debug one.
 //!
 //! Every end-to-end scenario boots the release configuration, because that is
-//! the image a release publishes (BLD-3). That closes the hole two consecutive
+//! the image a release publishes. That closes the hole two consecutive
 //! changes fell into — a console that reached nothing because `debug_println!`
 //! compiles to a kernel debug syscall the release kernel is not built with, and
 //! a Multiboot2 module GRUB placed below 1 MiB that the debug image survived
@@ -35,12 +35,12 @@
 //!
 //! # It is evidence, never a second chance
 //!
-//! The debug re-run cannot change the verdict (ENG-12): `after_shipping_failure`
+//! The debug re-run cannot change the verdict: `after_shipping_failure`
 //! returns a failure string on every path, including the one where the debug
 //! boot passed. A scenario that fails on the image that ships has failed.
 //!
 //! And the surfaced serial text is *diagnostic output shown to a human*, never
-//! an assertion input (TEST-13). Nothing in this module parses it, matches it,
+//! an assertion input. Nothing in this module parses it, matches it,
 //! or lets it decide anything; the only thing read out of a log is whether it
 //! carried any guest bytes at all, which is a size and not a contract.
 
@@ -213,7 +213,7 @@ impl Diagnosis {
 /// The tail of a run log's guest output, framed for a human to read.
 ///
 /// This is text printed for a person, never anything a contract is judged
-/// against (TEST-13). It is quoted verbatim and interpreted by nobody.
+/// against. It is quoted verbatim and interpreted by nobody.
 fn quote_capture(log: &Path) -> String {
     let path = log.display();
     let Some(output) = guest_output(log) else {
@@ -252,7 +252,7 @@ fn quote_capture(log: &Path) -> String {
 /// over one reads as a second, mysterious fault rather than as the expected
 /// silence of a kernel built without `CONFIG_PRINTING`. Saying which it is, and
 /// pointing at where the diagnosis actually comes from, is the difference
-/// between an actionable failure and the one that cost real time (ENG-12).
+/// between an actionable failure and the one that cost real time.
 fn silent_release_note(shipping_log: &Path) -> String {
     match guest_output(shipping_log) {
         Some(output) if output.trim().is_empty() => String::from(
@@ -352,7 +352,7 @@ mod tests {
             verdict.contains("there is no debug binary"),
             "the identical PD compilation must be stated: {verdict}"
         );
-        // ENG-12: passing on debug is evidence, not a second chance.
+        // Passing on debug is evidence, not a second chance.
         assert!(
             verdict.contains("failed on the RELEASE image"),
             "the verdict must remain a failure: {verdict}"

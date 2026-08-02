@@ -120,7 +120,7 @@ pub enum RequestError {
     /// A field value longer than [`MAX_HEADER_VALUE_LEN`], or one carrying a
     /// byte a field value may not.
     MalformedHeaderValue,
-    /// A continuation line: RFC 9112 §5.2 deprecates obs-fold and requires a
+    /// A continuation line: RFC 9112 section 5.2 deprecates obs-fold and requires a
     /// server that does not support it to refuse the message.
     ObsoleteLineFolding,
     /// A request announcing a body. See the crate header.
@@ -137,7 +137,7 @@ impl RequestError {
             Self::TargetTooLong => Status::UriTooLong,
             Self::TooManyHeaders | Self::MalformedHeaderName | Self::MalformedHeaderValue => {
                 // 431 covers both "too many" and "one too large", which is what
-                // RFC 6585 §5 defines it for; the length rules are the only way
+                // RFC 6585 section 5 defines it for; the length rules are the only way
                 // to reach these three, a name or value that is merely
                 // ill-formed being refused by the same variant.
                 Status::HeadersTooLarge
@@ -226,7 +226,7 @@ fn check_line_endings(bytes: &[u8]) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// `METHOD SP request-target SP HTTP-version`, and nothing else: RFC 9112 §3
+/// `METHOD SP request-target SP HTTP-version`, and nothing else: RFC 9112 section 3
 /// admits exactly two spaces, so a target carrying one is a malformed line
 /// rather than a target to unescape.
 fn parse_request_line(line: &str) -> Result<(&str, &str), RequestError> {
@@ -293,7 +293,7 @@ fn parse_header(line: &str) -> Result<Header<'_>, RequestError> {
     if value.len() > MAX_HEADER_VALUE_LEN {
         return Err(RequestError::MalformedHeaderValue);
     }
-    // VCHAR, SP and HTAB: RFC 9110 §5.5's field-content, minus the obs-text a
+    // VCHAR, SP and HTAB: RFC 9110 section 5.5's field-content, minus the obs-text a
     // strict recipient need not accept.
     if !value
         .bytes()
@@ -318,7 +318,7 @@ fn refuse_a_body(request: &Request<'_>) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// RFC 9110 §5.6.2's `tchar`.
+/// RFC 9110 section 5.6.2's `tchar`.
 const fn is_token_byte(byte: u8) -> bool {
     matches!(byte,
         b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'

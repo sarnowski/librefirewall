@@ -3,9 +3,9 @@
 //! # The adversary and the surface
 //!
 //! The configuration domain writes the handover region and the forwarding
-//! domain reads it (CONTRACTS.md §6). The reader maps it read-only, but nothing
+//! domain reads it. The reader maps it read-only, but nothing
 //! makes the *writer* honest: a compromised or malfunctioning configuration
-//! domain is CONCEPT §7.1's byzantine neighbour, and every byte of that region
+//! domain is a byzantine neighbour, and every byte of that region
 //! is then a value of its choosing. [`ConfigImage::check`] is the whole of the
 //! forwarding domain's defence, so it is what this drives.
 //!
@@ -14,7 +14,7 @@
 //! The region is a fixed-layout POD, so the fuzzer's bytes *are* the region:
 //! [`image_from_region`] lays the input over the ABI field for field and zeroes
 //! what the input does not reach, which is what a partially written region
-//! holds. Nothing is reduced into a plausible range on the way (TEST-8), so
+//! holds. Nothing is reduced into a plausible range on the way, so
 //! counts far past capacity, `enabled` bytes that are neither 0 nor 1, ports
 //! naming hardware that does not exist, prefix lengths above 32, multicast and
 //! all-zero MACs, and arbitrary padding are all ordinary inputs — as is an
@@ -24,8 +24,8 @@
 //! two count refusals and rarely reach the per-entry rules behind them. The
 //! harness therefore checks a **second** image whose counts are folded into the
 //! band around capacity, in addition to — never instead of — the unmodified
-//! one. That widens what is reached without narrowing what is reachable, which
-//! is the distinction TEST-8 turns on; the adversary's full authority is still
+//! one. That widens what is reached without narrowing what is reachable —
+//! the distinction that matters; the adversary's full authority is still
 //! exercised on every input by the first check.
 //!
 //! `port_count` is varied over its own edges for the same reason. It is not the
@@ -325,7 +325,7 @@ fn is_unicast(mac: [u8; 6]) -> bool {
 
 /// The rule an interface id is held to, restated here for the same reason: the
 /// bytes become a Prometheus label value an operator's dashboard renders, so an
-/// id outside `[a-z0-9-]` is a byte a peer could paint into a scrape (OBS-5).
+/// id outside `[a-z0-9-]` is a byte a peer could paint into a scrape.
 fn identifier_fault(id: &wire::IdentifierImage) -> Option<wire::TextFault> {
     let len = usize::from(id.len);
     let Some(value) = id.bytes.get(..len) else {
@@ -380,7 +380,7 @@ fn assert_region_round_trips(image: &ConfigImage) {
 /// so a seed can be authored and read as one; and the mapping stays fixed
 /// whatever `arbitrary` does internally, so a curated regression seed keeps
 /// meaning the image it was committed for. Little-endian because the target is
-/// x86_64 and nothing else (CON-4).
+/// x86_64 and nothing else.
 #[must_use]
 pub fn image_from_region(data: &[u8]) -> ConfigImage {
     let mut unstructured = Unstructured::new(data);
@@ -401,8 +401,8 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
             _pad2: bytes(&mut unstructured),
             address: bytes(&mut unstructured),
             // Every byte of the identity, and its stated length, are the peer's:
-            // a harness that only produced admissible ids would never reach the
-            // alphabet check (TEST-8).
+            // a harness that only produced admissible ids would never reach
+            // the alphabet check.
             id: wire::TextImage {
                 bytes: bytes(&mut unstructured),
                 len: byte(&mut unstructured),

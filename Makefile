@@ -15,7 +15,7 @@ else
 CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
 endif
 
-.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks clean
+.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks book clean
 
 # `image` provisions the pinned builder and is therefore the ONLY target that
 # reaches the network. Every other target requires that image to already exist
@@ -24,7 +24,7 @@ endif
 # prose.
 #
 # It builds the RELEASE seL4 kernel configuration: the artifact a deployment
-# gets, and the one every end-to-end scenario in `ci` boots (BLD-3).
+# gets, and the one every end-to-end scenario in `ci` boots.
 image:
 	$(provision_builder)
 	$(call xtask,image)
@@ -83,6 +83,12 @@ release:
 hooks:
 	git config core.hooksPath .githooks
 	@echo "git hooks path set to .githooks (pre-commit=make test, pre-push=make ci)"
+
+# The documentation book renders on the host: mdbook is a reading convenience,
+# not a build input, so it is neither pinned into the builder nor part of any
+# gate. The source under book/src is plain Markdown either way.
+book:
+	mdbook build book
 
 # xtask owns the list of generated directories (tools/xtask host::clean), so
 # clean runs in the container like every other command rather than restating

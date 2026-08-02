@@ -202,7 +202,7 @@ fn a_handshake_opens_a_connection_and_negotiates_the_segment_size() {
     assert_eq!(syn_ack.acknowledgement, SeqNumber::new(0x1001));
     assert_eq!(syn_ack.options.mss, Some(MSS_LIMIT));
     assert_eq!(syn_ack.window, 8192);
-    // The peer offered no window scale, so none is sent back (RFC 7323 §2.2).
+    // The peer offered no window scale, so none is sent back (RFC 7323 section 2.2).
     assert_eq!(syn_ack.options.window_scale, None);
 
     let connection = stack.connection(id).expect("the connection");
@@ -223,7 +223,7 @@ fn a_handshake_opens_a_connection_and_negotiates_the_segment_size() {
     assert_eq!(stack.outstanding(id), 0, "the SYN-ACK is acknowledged");
 }
 
-/// RFC 7323 §2.2: scaling applies only where both ends offered it, so a peer
+/// RFC 7323 section 2.2: scaling applies only where both ends offered it, so a peer
 /// that offers a shift gets one back and has its own window scaled.
 #[test]
 fn window_scaling_is_negotiated_at_the_handshake() {
@@ -448,7 +448,7 @@ fn an_out_of_window_segment_is_answered_with_an_acknowledgement() {
     );
 }
 
-/// RFC 5961 §3.2: a `RST` is accepted only at the exact next byte expected, and
+/// RFC 5961 section 3.2: a `RST` is accepted only at the exact next byte expected, and
 /// an in-window one that is not gets a challenge acknowledgement.
 #[test]
 fn a_blind_in_window_reset_is_challenged_rather_than_obeyed() {
@@ -484,7 +484,7 @@ fn a_blind_in_window_reset_is_challenged_rather_than_obeyed() {
     assert_eq!(stack.counters().resets_received, 1);
 }
 
-/// RFC 5961 §4: a `SYN` on a synchronized connection is challenged rather than
+/// RFC 5961 section 4: a `SYN` on a synchronized connection is challenged rather than
 /// answered with RFC 793's reset.
 #[test]
 fn a_syn_on_an_established_connection_is_challenged() {
@@ -736,7 +736,7 @@ fn a_segment_for_a_port_nothing_listens_on_is_dropped_in_silence() {
     assert_eq!(stack.connections(), 0);
 }
 
-/// RFC 793 §3.4: a segment naming a connection that does not exist is answered
+/// RFC 793 section 3.4: a segment naming a connection that does not exist is answered
 /// with a `RST`, so a peer holding half a connection learns to let go — but a
 /// `RST` itself never provokes one.
 #[test]
@@ -944,7 +944,7 @@ fn re_sending_data_asks_the_caller_for_the_bytes_again() {
 }
 
 /// The check that keeps a caller's bookkeeping mistake out of the stream, and
-/// the enforcer `TcpStack::retransmit`'s documentation names (DOC-7).
+/// the enforcer `TcpStack::retransmit`'s documentation names.
 #[test]
 fn retransmitting_the_wrong_range_is_refused() {
     let mut stack = stack();
@@ -1397,7 +1397,7 @@ fn a_stack_reports_what_it_listens_on() {
 proptest! {
     /// The state machine never panics for an arbitrary sequence of arbitrary
     /// segments against an arbitrary state, and the table never exceeds its
-    /// capacity. This is TEST-4's first invariant, over the whole surface at
+    /// capacity. This is the no-panic-on-arbitrary-input invariant, over the whole surface at
     /// once: the bytes are arbitrary, so every parser, every window computation
     /// and every transition is reached by inputs nobody chose.
     #[test]
@@ -1435,7 +1435,7 @@ proptest! {
     }
 
     /// A flood of distinct 4-tuples leaves state bounded by the table and by
-    /// nothing the peer chooses (ENG-4). The counters are what make the
+    /// nothing the peer chooses. The counters are what make the
     /// boundedness observable rather than merely true.
     #[test]
     fn a_flood_of_distinct_tuples_leaves_bounded_state(

@@ -27,7 +27,7 @@ fn every_state_has_a_distinct_name() {
     assert_eq!(State::Established.name(), "established");
 }
 
-/// RFC 1122 §4.2.2.6's default when the peer offers no option, and the clamp in
+/// RFC 1122 section 4.2.2.6's default when the peer offers no option, and the clamp in
 /// both directions.
 #[test]
 fn the_segment_size_is_negotiated_between_the_offer_and_our_limit() {

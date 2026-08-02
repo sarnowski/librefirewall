@@ -13,7 +13,7 @@
 //!
 //! # Adversary
 //!
-//! The management-plane attacker of CONCEPT §7.1. Today the document arrives
+//! The management-plane attacker. Today the document arrives
 //! compiled into the image, which makes the threat theoretical; it is written
 //! against a fully attacker-controlled byte string anyway, because the whole
 //! reason this crate is separate from the domain that applies its output is
@@ -32,13 +32,13 @@
 //!   is nothing there to borrow. Refusing references instead would have kept
 //!   the borrow and made some legal identifiers unwritable.
 //! * **No `Display` for a rejection.** Every error names a position or an
-//!   already-parsed [`Identifier`] and never the offending bytes (OBS-5), and
+//!   already-parsed [`Identifier`] and never the offending attacker-chosen bytes, and
 //!   rendering one is [`lfw_log`]'s business rather than this crate's.
 //! * **The document's own vocabulary is closed.** An element or attribute the
 //!   schema does not name is refused; nothing is skipped, and nothing is
 //!   defaulted. A misspelling an operator cannot see is the failure this is
 //!   built to prevent, there being no shell and no second channel to discover
-//!   it through (CONCEPT §11).
+//!   it through.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -116,7 +116,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The document from CONTRACTS.md §4b, which must survive both halves.
+    /// The canonical contract configuration document, which must survive both halves.
     const CONTRACT_DOCUMENT: &str = concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
         "<configuration>\n",

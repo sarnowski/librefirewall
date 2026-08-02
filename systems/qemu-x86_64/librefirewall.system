@@ -9,7 +9,7 @@
          forwards nothing. Each dataplane pipeline's buffer pool is DMA'd into by
          the receiving NIC and out of by the transmitting NIC, so a frame crosses
          the whole system without ever being copied. The session-replication and
-         mirror ports of the full port model (CONCEPT.md §9) are not part of this
+         mirror ports of the full port model are not part of this
          slice. A seventh domain, the RECORDER, owns the appliance's virtio-blk
          device and touches no frame: it is joined to the forwarder by a capture
          tap it may only read, and to the management domain by a download
@@ -122,8 +122,8 @@
          regions above: 0xFED00000 is where every x86 chipset places the block,
          and it is `lfw_hpet::MMIO_BASE`, which that crate forms every register
          address inside. The authoritative source is the ACPI HPET description
-         table — and it is unusable here for the reason CONCEPT §12.3 fixes
-         hardware at build time: a base discovered at run time is one no
+         table — and it is unusable here because hardware topology is fixed
+         at build time: a base discovered at run time is one no
          statically granted capability could map, so the conventional answer is
          the one that can be checked and the authoritative one is the one that
          cannot.
@@ -209,7 +209,7 @@
          0x31046000 through 0x3108C000.
 
          BOTH PIPELINES ARE NOW USED IN BOTH DIRECTIONS, which is the change this
-         port's addressing brought (ENG-1, SCM-6). The receive three carry frames
+         port's addressing brought, a reviewed capability change. The receive three carry frames
          to the management domain as before; the transmit three now carry the
          replies that domain originates, so the driver binary's transmit side —
          which existed because the binary is port-agnostic and takes one whatever
@@ -235,7 +235,7 @@
          mgmt_rx_pool was mapped by no protection domain at all until this
          change, and that claim is gone rather than weakened: the grant arrived
          with the code that reads a frame, which is exactly the condition the
-         note it replaces set for it (ENG-7). `xtask::sysdesc` carries the new
+         note it replaces set for it. `xtask::sysdesc` carries the new
          mapper set as a rule, read-only side included, so a widening to
          read-write fails the gate at the point the edit is made. -->
     <memory_region name="mgmt_rx_pool" size="0x20000" phys_addr="0x31046000" />
@@ -262,7 +262,7 @@
          segment of every request names a byte of this region by physical
          address, and the device DMAs to it, so the recorder is told where it is
          (`io_paddr`, below) exactly as each driver is told where its pool is.
-         There is no IOMMU on this platform (CONCEPT §7.2), so that address is an
+         There is no IOMMU on this platform, so that address is an
          address the device may write — which is what `lfw_blk::io::IoRegion`
          exists for: the authority to name a byte of this window exists in one
          shape, an `IoSector` that is in range by construction, so a wrong
@@ -297,9 +297,9 @@
          rewrite the configuration it is about to be judged by.
 
          `cfg` HAS TWO READERS AND `cfgack` STILL ONE WRITER, and the asymmetry
-         is a decision rather than an omission (ENG-1, SCM-6). The management
-         domain maps `cfg` read-only — its addressing comes from the document
-         (CONCEPT §12.3) — and maps `cfgack` NOT AT ALL, because it is not the
+         is a decision rather than an omission. The management
+         domain maps `cfg` read-only — its addressing comes from the
+         document — and maps `cfgack` NOT AT ALL, because it is not the
          *consumer* of the two-phase commit. The forwarder is: it reads the
          offered generation, stages a table and acknowledges, and a commit waits
          for that. The management domain reads the COMMITTED generation only
@@ -327,8 +327,7 @@
     <memory_region name="cfgack" size="0x1000" />
 
     <!-- THE CLOCK CALIBRATION, and the first region in this system published
-         under a SEQLOCK rather than under an identifying generation
-         (ENG-1, SCM-6).
+         under a SEQLOCK rather than under an identifying generation.
 
          It carries three words — the timestamp counter's measured frequency, the
          reading it was anchored on, and the wall-clock instant that reading
@@ -351,10 +350,10 @@
          write it would be able to move this node's own idea of time — every
          retransmission deadline and every reaping deadline of the transport on
          the management port, every instant a log record is dated with, and one
-         day every certificate's validity window (CONCEPT §7.2) — from a domain
+         day every certificate's validity window — from a domain
          that answers an attacker.
 
-         THE READ GRANT WIDENED (ENG-1, SCM-6) when every log record gained the
+         THE READ GRANT WIDENED — a reviewed capability change — when every record gained the
          instant it was emitted at. Six domains were added: the forwarder, the
          configuration domain, the three drivers and the console. Each stamps its
          own records, so each needs the three words that turn a counter reading
@@ -407,7 +406,7 @@
 
     <!-- THE CAPTURE TAP, one region per direction, and the third handover in
          this system built the way the log ring and the configuration handover
-         are (ENG-1, SCM-6).
+         are.
 
          `tap` carries what the forwarder has to say about the frames it decided
          on — an annotation per record and nothing else — and `tap_consume`
@@ -590,8 +589,7 @@
 
 
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
-         that domain alone and read by the management domain alone
-         (ENG-1, SCM-6).
+         that domain alone and read by the management domain alone.
 
          WHY NINE REGIONS AND NOT ONE. A region is the unit of grant, and the
          property worth having here is that a domain's numbers are *its own
@@ -609,8 +607,8 @@
          A summed total is corrupted by a domain restart — one shard goes back to
          zero, the sum goes backwards, and a scraper differencing two samples
          forges an enormous rate — whereas a `domain=`-labelled series resets
-         alone, which Prometheus handles by design. MONITORING.md records the
-         decision; this row set is what makes it possible.
+         alone, which Prometheus handles by design. This row set is what
+         makes that no-total decision possible.
 
          SINGLE WRITER IS THE WHOLE SYNCHRONISATION. Exactly one domain has each
          region read-write, so an increment is a relaxed 64-bit load, an add and
@@ -667,10 +665,10 @@
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
          REGION, in either direction and of either pipeline, and the management
          domain below is granted no dataplane region — the mutual exclusion
-         CONCEPT §9.1 requires of a management port that carries no forwarded
+         required of a management port that carries no forwarded
          traffic. Neither half is a comment: `xtask::sysdesc` names the mapper
          set of every region exactly, so either grant appearing fails the gate at
-         the point the edit is made (ENG-1, SCM-6).
+         the point the edit is made.
          `RouteStage` decides on each frame and rewrites its Ethernet and IPv4
          headers in the buffer the receiving NIC DMA'd it into, so it is granted
          the two pools as well as the two ring pairs: a domain that rewrites a
@@ -702,7 +700,7 @@
          between two domains rather than a shared scratch area.
 
          IT NOW ALSO PRODUCES ONTO THE CAPTURE TAP, and the perms are the log
-         ring's argument on a different pair of domains (ENG-1, SCM-6). `tap` is
+         ring's argument on a different pair of domains. `tap` is
          read-write here because this domain is the producer: what it decided
          about a frame is its own testimony, and it is the only domain that may
          make it. `tap_consume` is READ-ONLY, so THIS DOMAIN CANNOT FORGE HOW
@@ -778,7 +776,6 @@
 
          =================================================================
          `<ioport>` IS NO LONGER A CAPABILITY CLASS ONE DOMAIN HOLDS ALONE
-         (ENG-1, SCM-6)
          =================================================================
 
          READ THE CONSOLE DOMAIN'S `<ioport>` BLOCK BELOW BEFORE THIS ONE. The
@@ -882,7 +879,7 @@
 
          =================================================================
          WHY THIS DOMAIN IS THE RETURNER ON ONE PIPELINE AND THE OWNER ON
-         THE OTHER (ENG-1, SCM-6)
+         THE OTHER
          =================================================================
 
          The forwarder maps NEITHER dataplane `free` ring, and the note beside
@@ -923,12 +920,12 @@
              Read is the whole of the authority parsing needs: a frame this
              appliance was sent is never altered, and the reply is composed
              elsewhere. This is the grant the previous note deferred to "the day
-             this port parses ARP or IP", and it arrived with that code (ENG-7).
+             this port parses ARP or IP", and it arrived with that code.
            * mgmt_tx_pool (rw) — write the reply into the buffer it owns.
            * mgmt_tx_fwd (rw) — lend the reply to the driver.
            * mgmt_tx_free (rw) — consume the driver's returns as the pool's owner.
            * cfg (READ-ONLY) — the addressing comes from the configuration
-             document (CONCEPT §12.3). Read-only because a domain that could
+             document. Read-only because a domain that could
              write it would rewrite the addressing it is about to be judged by,
              and because the publisher must be able to read back what it wrote.
            * clock (READ-ONLY) — what a counter reading means. Every timer of the
@@ -948,8 +945,8 @@
            * stats_recorder (READ-ONLY) — the ninth shard, on exactly the terms
              of the other seven that are not this domain's own.
 
-         WHAT STAYS WITHHELD, and it is the whole of the isolation CONCEPT §9.1
-         asks for: NO dataplane region of any kind — not a pool, not a
+         WHAT STAYS WITHHELD, and it is the whole of the management/dataplane
+         isolation: NO dataplane region of any kind — not a pool, not a
          `ForwardRings`, not a return ring — NO ECAM page, NO BAR window, NO
          virtqueue and NO ioport. A compromise of the domain that will one day
          terminate an operator's TLS session therefore reaches no frame in flight
@@ -1160,7 +1157,7 @@
              reads and cannot write.
 
          =================================================================
-         WHAT STAYS WITHHELD, AND IT IS MOST OF THE SYSTEM (ENG-1, SCM-6)
+         WHAT STAYS WITHHELD, AND IT IS MOST OF THE SYSTEM
          =================================================================
 
          NO DATAPLANE POOL, of either direction and of either kind — not pool0,
@@ -1210,8 +1207,8 @@
          What that costs, named rather than left to be measured: a device that
          withholds a completion cannot be waited on indefinitely here, because
          waiting is spending a shared timeslice. `lfw_blk::smoke::POLL_BUDGET` is
-         what bounds it — a driver constant, not a device-controlled condition
-         (ENG-4) — and a device that exhausts it parks this domain on a refusal
+         what bounds it — a driver constant, not a device-controlled
+         condition — and a device that exhausts it parks this domain on a refusal
          rather than starving the other three.
 
          STACK 0x8000, the drivers'. This domain holds a sector-sized buffer or
@@ -1227,7 +1224,7 @@
          a later change. The Microkit tool refuses a `setvar_vaddr` naming a
          symbol no program image defines, so the attribute arrives with the code
          that reads it and never before it — a symbol declared and left unread
-         would be machinery with no consumer (ENG-7). The address is fixed here
+         would be machinery with no consumer. The address is fixed here
          and the region is granted and mapped at it either way; README's status
          records what is still deferred.
 
@@ -1260,7 +1257,7 @@
     <!-- The console domain: the one holder of the serial controller.
 
          =================================================================
-         `<ioport>` ENTERED THIS SYSTEM HERE (ENG-1, SCM-6)
+         `<ioport>` ENTERED THIS SYSTEM HERE
          =================================================================
 
          Memory mappings and notification channels were the whole of what this
@@ -1283,8 +1280,8 @@
 
          The three attributes are exactly what the Microkit 2.3.0 tool accepts
          — `id`, `addr`, `size`, and nothing else — and the tool refuses the
-         element outright off x86, which is the platform assumption CONCEPT §3
-         already fixes.
+         element outright off x86 — this project is x86_64 only, with no
+         accommodation made for another architecture.
 
          WHAT IT GRANTS: eight consecutive I/O ports, 0x3F8 through 0x3FF, the
          PC-compatible COM1 window. That is the whole of the first 16550
@@ -1446,7 +1443,7 @@
          recorder busy-polls `dl_request` on every pass of its loop, exactly as
          it polls the tap and its own request queue, so a notification would tell
          it nothing it is not about to read anyway — and a send capability that
-         no path consumes is reach granted for nothing (ENG-1). It would also be
+         no path consumes is reach granted for nothing. It would also be
          a wakeup capability held by the domain an attacker reaches first on the
          domain that owns the disk, which is authority worth refusing on its own
          terms even if the recorder ever did block.
@@ -1470,9 +1467,9 @@
          domain can: by reading the cursor each writing domain publishes, which
          it does on every pass regardless. A send capability on this domain
          would therefore be authority granted for nothing — a widening of five
-         writers' reach with no path that consumes it (ENG-1) — so no channel is
+         writers' reach with no path that consumes it — so no channel is
          declared, and the machinery that fed one is gone rather than left
-         dormant (ENG-7).
+         dormant.
 
          The direction that stays refused on its own terms: nothing here grants
          the console a send capability on any domain. A console that could

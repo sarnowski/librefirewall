@@ -24,8 +24,8 @@
 //! ```
 //!
 //! `<management>` is a sibling of `<interfaces>`, not an entry inside it: that
-//! port is not a dataplane one — no `port` number, not in the router's set
-//! (CONCEPT §9.1). Required like the other two; `enabled="false"` means no address.
+//! port is not a dataplane one — no `port` number, not in the router's set.
+//! Required like the other two; `enabled="false"` means no address.
 
 use crate::{
     model::{InterfaceEntry, ManagementEntry, Model, NeighbourEntry},
@@ -302,7 +302,7 @@ mod tests {
 
     const MANAGEMENT: &str = management!();
 
-    /// The document from CONTRACTS.md §4b, verbatim. Every negative test below
+    /// The canonical contract configuration document, verbatim. Every negative test below
     /// is a single edit to it, so what each proves is that *that* edit is
     /// caught rather than that some fragment fails for its own reasons.
     pub(crate) const CONTRACT_DOCUMENT: &str = concat!(

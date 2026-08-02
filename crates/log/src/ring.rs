@@ -4,13 +4,13 @@
 //!
 //! There is nothing to wake. The console busy-polls the cursors every writing
 //! domain publishes and never reaches the Microkit event loop, so a send
-//! capability on it would be authority granted for nothing (ENG-1).
+//! capability on it would be authority granted for nothing.
 //!
 //! # Why it can only refuse, never wait
 //!
 //! A full records region means the console has not drained it, and the domains
 //! that log the most are the ones logging *because* something went wrong.
-//! Waiting would park a driver inside its own refusal path (ENG-4).
+//! Waiting would park a driver inside its own refusal path.
 //!
 //! # Two counters, because they accuse different parties
 //!
@@ -18,7 +18,7 @@
 //! [`RingSink::refused`] is this domain's own defect, an event it minted that
 //! the ABI cannot carry. One number would leave an operator unable to tell "we
 //! log faster than the console reads" from "this build emits records nothing
-//! can read" (MONITORING.md's attribution rule).
+//! can read": a counter accuses one party, never several.
 
 use core::cell::{Cell, RefCell};
 
@@ -36,7 +36,7 @@ pub struct RingSink<'ring, C> {
     /// every subsystem with something to say — while publishing needs the
     /// writer's private position. Every borrow is fallible because a protection
     /// domain has no unwinder: a panicking `borrow_mut` would fault the domain
-    /// over a log line (ENG-5).
+    /// over a log line.
     writer: RefCell<LogWriter<'ring>>,
     clock: C,
     dropped: Cell<u32>,

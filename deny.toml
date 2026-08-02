@@ -116,7 +116,7 @@ include-workspace = true
 executables = "deny"
 interpreted = "deny"
 allow-build-scripts = [
-    # The rust-sel4 trusted base (CONCEPT §7). These build scripts generate the
+    # The rust-sel4 trusted base. These build scripts generate the
     # seL4 syscall bindings and kernel configuration from the pinned,
     # sha256-verified SDK; they are the mechanism by which the kernel ABI
     # reaches Rust and cannot be removed.

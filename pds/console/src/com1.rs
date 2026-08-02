@@ -3,7 +3,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **hostile or malfunctioning device** — the controller, which
+//! The **hostile or malfunctioning device** — the controller, which
 //! may answer anything or never answer. Nothing here judges it: every byte goes
 //! straight to `uart_16550`, which bounds each wait and confirms each step by
 //! readback. No peer domain and no network byte reaches this path.
@@ -25,13 +25,13 @@
 //! can be granted except this one: `channel.rs` declares
 //! `BASE_OUTPUT_NOTIFICATION_SLOT`, `BASE_ENDPOINT_SLOT`, `BASE_IRQ_SLOT` and
 //! `BASE_TCB_SLOT` but no ioport base, and the one ioport symbol it reads —
-//! `pd_ioports` in `sel4-microkit/base/src/symbols.rs:175` — is `pub(crate)`
-//! and `dead_code`. ENG-8 says prefer the framework; there is nothing to
+//! `pd_ioports` in `sel4-microkit/base/src/symbols.rs` — is `pub(crate)`
+//! and `dead_code`. The framework is to be preferred; there is nothing to
 //! prefer, so the slot is stated below and [`Com1::claim`] proves it.
 //!
 //! **Rejected: re-declaring `microkit_ioports`** to read the grant bitmask the
 //! Microkit tool patches into the image. It is a `pub(crate)` framework
-//! internal, reaching it needs `unsafe` (ENG-13), and the only case it uniquely
+//! internal, reaching it needs `unsafe` under budget, and the only case it uniquely
 //! catches — an *empty* slot, which cap-faults rather than returning an error —
 //! already reaches an operator as the monitor's `faulting PD: console`. Copying
 //! an internal to make a loud failure quieter is a poor trade.
@@ -41,12 +41,12 @@ use uart_16550::{PortIo, Register};
 
 /// Microkit's CNode slot for a domain's first I/O-port capability.
 ///
-/// **Cross-artifact (DOC-7).** Nothing here can check this at build time: the
+/// **Cross-artifact fact.** Nothing here can check this at build time: the
 /// Microkit tool chooses it and emits no header for it. Two things enforce it.
 ///
 /// *Detection* is the pinned SDK. `MICROKIT_VERSION=2.3.0` in
-/// `third-party/sources.lock` is checksum-verified on every build (DEP-1) and
-/// moves only through a change that runs the whole gate (DEP-3); `xtask image`
+/// `third-party/sources.lock` is checksum-verified on every build and
+/// moves only through a change that runs the whole gate; `xtask image`
 /// then writes the slot that SDK actually assigned into
 /// `build/image/<config>/report.txt` — under `cnode_console`, where
 /// `ioports_0x3f8_console` stands at slot 394, and in no other domain's CNode.
@@ -58,7 +58,7 @@ use uart_16550::{PortIo, Register};
 const BASE_IOPORT_SLOT: seL4_CPtr = 394;
 
 /// The `id` of the `<ioport id="0" addr="0x3f8" size="8" />` element on the
-/// console domain in `systems/qemu-x86_64/librefirewall.system:575` — this
+/// console domain in `systems/qemu-x86_64/librefirewall.system` — this
 /// grant's index within the ioport bank.
 const COM1_IOPORT_ID: seL4_CPtr = 0;
 
@@ -83,7 +83,7 @@ pub struct PortFault {
 /// The COM1 controller, reached by invoking this domain's I/O-port capability.
 ///
 /// It carries neither base address nor capability pointer: both are fixed by
-/// the system description (CONCEPT §12.3), so a field would be a second,
+/// the system description, fixed at build time, so a field would be a second,
 /// unchecked statement of [`COM1_IOPORT`] and of `uart_16550`'s `COM1_BASE`.
 /// The private unit field makes [`claim`](Self::claim) — and so the probe —
 /// the only way to obtain one.
@@ -93,7 +93,7 @@ impl Com1 {
     /// Prove the capability answers for every port the driver can address, and
     /// take it.
     ///
-    /// This is the check that replaces a #GP with a verdict (ENG-12). It reads
+    /// This is the check that replaces a #GP with a verdict. It reads
     /// each register in [`Register::ALL`], which is the driver's entire demand
     /// — `uart_16550` can ask [`PortIo`] for nothing else, and
     /// `every_register_is_in_all` holds that list exhaustive — so success means
@@ -146,7 +146,7 @@ impl PortIo for Com1 {
 /// Invoke `seL4_X86_IOPort_In8` and turn the kernel's verdict into a `Result`.
 ///
 /// The verdict stays a raw code rather than becoming `sel4::Error`, which would
-/// otherwise be the framework's type to prefer (ENG-8): `sel4::Error::from_sys`
+/// otherwise be the framework's type to prefer: `sel4::Error::from_sys`
 /// panics on a code outside the ten it knows, and a diagnosis that faults on an
 /// unfamiliar answer is the failure mode this file replaces.
 fn in8(port: u16) -> Result<u8, seL4_Error::Type> {

@@ -4,7 +4,7 @@
 //!
 //! # Adversary
 //!
-//! CONCEPT §7.1's **management-plane attacker**, directly and with nothing in
+//! The **management-plane attacker**, directly and with nothing in
 //! between. Every byte [`parse`] reads arrived on a TCP connection to the
 //! management port, so the whole surface is that party's to choose: the method,
 //! the target, how many headers there are, how long each is, where a line ends,
@@ -16,17 +16,17 @@
 //!   [`MAX_TARGET_LEN`], [`MAX_HEADERS`], [`MAX_HEADER_NAME_LEN`],
 //!   [`MAX_HEADER_VALUE_LEN`], [`MAX_METHOD_LEN`] — because an unbounded header
 //!   count or line length is that attacker exhausting a protection domain's
-//!   fixed memory (ENG-4). The caller enforces the first against its own
+//!   fixed memory. The caller enforces the first against its own
 //!   accumulation buffer; this crate enforces the rest.
 //! * **Nothing panics and nothing indexes.** Arbitrary bytes produce a
-//!   [`Request`] or a [`RequestError`], never a fault (ENG-5), which a fuzz
+//!   [`Request`] or a [`RequestError`], never a fault, which a fuzz
 //!   target asserts over arbitrary input split into arbitrary segments.
 //! * **A refusal names a status.** [`RequestError::status`] maps every cause to
 //!   the code the client is owed, so a caller answers rather than closing.
 //!
 //! # `\r\n` only, and a bare `\n` is refused
 //!
-//! RFC 9112 §2.2 permits a *recipient* to accept a bare LF as a line
+//! RFC 9112 section 2.2 permits a *recipient* to accept a bare LF as a line
 //! terminator. This one does not, and the decision is deliberate: request
 //! smuggling lives in exactly that latitude — two parties on a path disagreeing
 //! about where a line ends is how one request becomes two. There will be a
@@ -45,25 +45,25 @@
 //!
 //! # Built for the proxy, used by the management port
 //!
-//! CONCEPT §6.4's inspecting proxy needs an HTTP/1.1 parser on a path where the
+//! The design's inspecting proxy needs an HTTP/1.1 parser on a path where the
 //! bytes belong to *two* untrusted parties at once, so this crate owns no
 //! buffer, decides no policy and knows nothing about `/metrics`: [`parse`] takes
 //! a slice the caller accumulated and hands back borrowed fields. What the
 //! management server adds on top — which targets exist, what a response body
 //! is — is `lfw_ip_endpoint::http`. The pieces a proxy needs and a server does
 //! not, chiefly response *parsing* and chunked framing, are absent rather than
-//! stubbed (ENG-7).
+//! stubbed.
 //!
-//! # Deviation from CONCEPT §11: this is plain HTTP (CON-1, STA-4)
+//! # A known, deliberate gap in the target design: this is plain HTTP
 //!
-//! CONCEPT §11 requires the management API to carry encryption, authentication
+//! The target design requires the management API to carry encryption, authentication
 //! and read/write authorization through an mTLS certificate pair. **None of that
 //! exists here.** There is no TLS anywhere in this appliance, so this crate
 //! parses cleartext and the server above it authenticates nobody: *anything that
 //! can reach the management port can read every metric the node exposes.* That
-//! is recorded in README's status as a deviation and is why the port belongs on
-//! an isolated management network until the TLS termination and the certificate
-//! handling CONCEPT §11 describes exist. Nothing here is a step toward them —
+//! is a recorded, deliberate deviation and is why the port belongs on
+//! an isolated management network until the intended TLS termination and
+//! certificate handling exist. Nothing here is a step toward them —
 //! TLS terminates below HTTP and will be a layer under this crate rather than a
 //! change to it.
 
@@ -87,8 +87,8 @@ pub use response::{MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE
 /// [`Status::HeadersTooLarge`], not waited on.
 pub const MAX_REQUEST_BYTES: usize = 2048;
 
-/// Bytes of request target. Enough for `/metrics` and every path CONCEPT §11
-/// names with query parameters to spare, and short enough that a target is never
+/// Bytes of request target. Enough for `/metrics` and every management path
+/// with query parameters to spare, and short enough that a target is never
 /// the reason a request head fills its buffer.
 pub const MAX_TARGET_LEN: usize = 128;
 

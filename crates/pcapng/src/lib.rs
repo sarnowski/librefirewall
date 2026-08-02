@@ -1,8 +1,8 @@
-//! The pcapng encoder behind the appliance's two recording sinks (CONCEPT
-//! §15): Section Header, Interface Description, Enhanced Packet, Interface
+//! The pcapng encoder behind the appliance's two recording sinks:
+//! Section Header, Interface Description, Enhanced Packet, Interface
 //! Statistics and Custom blocks, written into storage the caller already owns.
 //!
-//! Faces untrusted network traffic (CONCEPT §7.1), one step behind the parsers
+//! Faces untrusted network traffic, one step behind the parsers
 //! that read it. This crate writes rather than reads, so no adversary picks its
 //! control flow directly — but every Enhanced Packet Block embeds bytes that
 //! arrived on a dataplane port and takes its Captured Packet Length from that
@@ -32,16 +32,16 @@
 //! # Deliberate narrowness, and what it costs
 //!
 //! * **Encoder only.** Nothing here parses pcapng. A download serves a byte
-//!   range off the ring without re-encoding (CONCEPT §15.4), so the appliance
+//!   range off the ring without re-encoding, so the appliance
 //!   never reads back what it wrote and a reader would be untested weight on
 //!   the medium's format.
 //! * **Little-endian only.** The byte-order magic is written, not chosen: the
-//!   sinks run on x86_64 (CONCEPT §3) and a configurable endianness would
+//!   sinks run on x86_64, the only target, and a configurable endianness would
 //!   double the encoding paths to serve a machine this appliance is not.
 //! * **One custom code, at either level.** Only the binary, copyable forms are
 //!   emitted — option 2989 and [`CUSTOM_BLOCK_COPYABLE`]; see [`CustomBinary`].
-//! * **No Decryption Secrets Block and no Name Resolution Block.** CONCEPT
-//!   §15.2 wants the first once there is TLS material to carry; neither has a
+//! * **No Decryption Secrets Block and no Name Resolution Block.** The first
+//!   is intended once there is TLS material to carry; neither has a
 //!   producer yet, and a block type nothing emits is a block type nothing
 //!   tests.
 //! * **Options are written in ascending code order.** The format does not ask
@@ -310,7 +310,7 @@ impl TimestampResolution {
 }
 
 /// A PEN-tagged custom option: the structured firewall state pcapng has no
-/// standard field for (CONCEPT §15.2), in whatever layout the sink and its
+/// standard field for, in whatever layout the sink and its
 /// readers agree on.
 ///
 /// The encoder treats `data` as opaque. A reader that does not recognise
@@ -330,7 +330,7 @@ pub struct Verdict<'a> {
     pub data: &'a [u8],
 }
 
-/// Opens a section, and so opens every ring segment (CONCEPT §15.4).
+/// Opens a section, and so opens every ring segment of a recording.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SectionHeader<'a> {
     pub hardware: Option<&'a str>,
@@ -377,8 +377,7 @@ pub struct EnhancedPacket<'a> {
     pub original_len: u32,
     pub flags: Option<u32>,
     /// Frames the interface lost between this packet and the previous one it
-    /// recorded, which is what makes a sink's own loss legible in-band
-    /// (CONCEPT §15.2).
+    /// recorded — a recording is meant to state its own loss in-band.
     pub drop_count: Option<u64>,
     /// Correlates the ingress and egress observations of one forwarded frame,
     /// so a rewrite is a relation between two records rather than something an

@@ -13,7 +13,7 @@
 //!
 //! It models the *authority a device has* — any byte, for any index, a different
 //! one on every read, and an index register that was never written — and
-//! constrains none of it to what a conforming part would do (TEST-8).
+//! constrains none of it to what a conforming part would do.
 //! [`FakeCmos::conforming`] is the well-behaved baseline; every builder method
 //! takes one capability away from it.
 

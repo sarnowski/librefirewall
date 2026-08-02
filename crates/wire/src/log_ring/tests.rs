@@ -299,8 +299,8 @@ fn drain_stops_at_its_limit_and_reports_its_bound() {
     assert_eq!(reader.drain(LOG_RING_SLOTS).count(), 4);
 }
 
-/// The ENG-4 clamp: a caller that asks for everything gets at most the ring,
-/// so one drain is finite for any caller and for any peer.
+/// The bounded-work clamp: a caller that asks for everything gets at most the
+/// ring, so one drain is finite for any caller and for any peer.
 #[test]
 fn a_drain_never_exceeds_the_capacity_const_however_large_the_limit() {
     let ring = Ring::zero();
@@ -784,7 +784,7 @@ proptest! {
             prop_assert_eq!(writer.is_empty(), writer_len == 0);
         }
         // Every record offered either landed or was counted; a forged cursor
-        // cannot make one disappear unaccounted for (ENG-12).
+        // cannot make one disappear unaccounted for.
         prop_assert_eq!(written + usize::try_from(refused).expect("a count fits"), offered);
         prop_assert_eq!(writer.dropped(), refused);
     }
