@@ -16,12 +16,12 @@ frame is counted in memory instead (see [Prometheus metrics](metrics.md)).
 
 One record sits at the edge of that and is stated here rather than left to be discovered: the
 management port's `frames=`/`bytes=` pair is a *cumulative count of traffic*, emitted per drain and
-never per frame. It is on this surface because it is the only evidence a node offers that its
-management port is receiving at all, and because there is nowhere else yet — `/metrics` does not
-exist. It carries no address, no port, no length of any individual frame and no byte of one, so
-nothing about a packet is observable through it; what it says is "this port is up and taking
-traffic", which is system state. It moves to the metrics endpoint when there is one, and the
-[metric inventory](metrics.md) is where that move will be recorded.
+never per frame. It is on this surface because it is the only evidence **the console** offers that
+the management port is receiving at all. It carries no address, no port, no length of any
+individual frame and no byte of one, so nothing about a packet is observable through it; what it
+says is "this port is up and taking traffic", which is system state. The same counts are scrapable
+as `librefirewall_endpoint_frames_total` and `librefirewall_endpoint_bytes_total` in the
+[metric inventory](metrics.md).
 
 Everything below is what the renderer writes, field for field. Every record of the grammars below is
 one line of at most **228 bytes**, and a line is never truncated — see *Reading records off the
@@ -392,9 +392,9 @@ That guarantee is exact **in the release profile**, and one caveat qualifies it 
 - **A record that will not render is dropped and counted, not reported.** There is no
   `LFW-PD unrendered=…` line and no other escape hatch: a record whose bytes the ABI refuses, whose
   vocabulary token this build does not know, or that will not fit the 228-byte line is counted and
-  discarded silently. Those counters are described below and **nothing exposes them**, so an
-  operator reading the console cannot currently tell a record that was never emitted from one that
-  was emitted and lost.
+  discarded silently. Those counters are described below and are scrapable on
+  [`/metrics`](metrics.md), so an operator reading the console alone cannot tell a record that was
+  never emitted from one that was emitted and lost — the metrics endpoint is what can.
 
 ## What the console loses, and what counts it
 
@@ -403,8 +403,11 @@ into a ring, decoding it, rendering it, handing the bytes to the device — and 
 bounds is lossy. Each has its own counter, because they accuse different parties. Every counter
 below follows the counter semantics stated in [Prometheus metrics](metrics.md) — monotonic for its
 domain's life, saturating, no reset — and follows the **attribution** rule stated there: a drop
-names who misbehaved, and the three classes never merge. **None of them is exposed on any surface
-today.**
+names who misbehaved, and the three classes never merge. **Every one of them is scrapable**: the
+writer-side pair as `librefirewall_log_records_dropped_total` and
+`librefirewall_log_records_refused_total`, the console's outcomes as
+`librefirewall_console_records_total{outcome=…}`, and the UART's as the `librefirewall_uart_*`
+families.
 
 | counter | kept by | accuses | what it means |
 |---|---|---|---|
