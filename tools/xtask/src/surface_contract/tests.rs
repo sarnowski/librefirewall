@@ -23,14 +23,14 @@ const PORTS: usize = 2;
 fn injected() -> Vec<Injected> {
     vec![
         Injected {
-            name: "routed-0-to-1",
+            name: String::from("routed-0-to-1"),
             frame: (0..65u8).collect(),
             observed: true,
             verdict: VERDICT_FORWARDED,
             event: Some(EVENT_FLOW_OPENED),
         },
         Injected {
-            name: "routed-1-to-0",
+            name: String::from("routed-1-to-0"),
             frame: (100..166u8).collect(),
             observed: true,
             verdict: VERDICT_FORWARDED,
@@ -40,7 +40,7 @@ fn injected() -> Vec<Injected> {
         // capture: it is here so a change that started demanding every probe
         // fails a test rather than a ten-minute boot.
         Injected {
-            name: "legacy-l2-broadcast",
+            name: String::from("legacy-l2-broadcast"),
             frame: vec![0xff; 60],
             observed: false,
             verdict: VERDICT_DROPPED,
@@ -652,7 +652,7 @@ fn a_log_capture_past_the_snap_length_is_a_finding() {
     let probes = [
         injected(),
         vec![Injected {
-            name: "oversized",
+            name: String::from("oversized"),
             frame: long,
             observed: false,
             verdict: VERDICT_FORWARDED,
@@ -680,7 +680,7 @@ fn a_log_capture_past_the_snap_length_is_a_finding() {
 fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way() {
     let long: Vec<u8> = (0..200u8).collect();
     let probes = vec![Injected {
-        name: "oversized",
+        name: String::from("oversized"),
         frame: long.clone(),
         observed: true,
         verdict: VERDICT_FORWARDED,

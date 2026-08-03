@@ -153,7 +153,7 @@ struct Invocation {
 ///
 /// It does not decide a [`Run::Diagnostic`] re-run, which always assembles its
 /// own disk into the build tree — see [`scenario_disk`].
-enum ImageUnderTest {
+pub(crate) enum ImageUnderTest {
     /// The disk `dist/` already holds — what `image` published and what an
     /// operator would deploy. `dist/` is left exactly as it is.
     Published,
@@ -168,7 +168,7 @@ enum ImageUnderTest {
 /// harness that plays a station on the wire sees every frame and composes every
 /// reply, and a harness that lets a real client in sees none of them. Asserting
 /// both in one boot would mean two things on one wire.
-enum ManagementRole {
+pub(crate) enum ManagementRole {
     /// The harness is the station: it injects opaque frames, an ARP request, an
     /// ICMP echo request and a whole TCP exchange, and judges every answer field
     /// by field.
@@ -201,6 +201,18 @@ impl ManagementRole {
     }
 }
 
+impl Scenario {
+    /// Whether a real client can reach this boot's management port, and so whether
+    /// it pulls every surface the endpoint serves and holds the three to each other.
+    ///
+    /// Exposed because the status pages state how many scenarios do, and a count
+    /// restated in prose beside a list nothing compares it to goes stale
+    /// ([`crate::reference_contract`]).
+    pub(crate) const fn reaches_the_management_port(&self) -> bool {
+        self.management.user_network()
+    }
+}
+
 /// Whether a scenario reads the console beside the traffic.
 ///
 /// One flag for every channel rather than one each, because it is one decision:
@@ -210,14 +222,29 @@ impl ManagementRole {
 /// ([`crate::config_transcript`]) and two records on the `LFW-PD` channel — the
 /// clock domain's ([`crate::clock_contract`]) and the management port's count
 /// ([`crate::management_contract`]).
-enum Console {
+pub(crate) enum Console {
     Ignored,
     Judged,
+    /// The node **refused the document its own image carries**, so it committed no
+    /// generation, has no address, and the console is the only surface it has.
+    ///
+    /// Judged as part of the boot contract ([`BootContract::FailedClosed`]) rather
+    /// than after it, and for a reason the other two do not have: the records are
+    /// also what tell the run the node has finished refusing, so there is nothing
+    /// to wait for otherwise — such a node runs indefinitely, forwarding nothing.
+    ///
+    /// It reaches none of the three contracts [`Self::Judged`] runs. Two of them
+    /// have nothing to state: there is no committed configuration to compare a
+    /// transcript against, and no management frame is injected, so the port's own
+    /// count has no number to equal. The third — the clock record — is a domain that
+    /// does come up, and holding it here would make a clock failure read as a
+    /// fail-closed failure.
+    JudgedOnARefusal,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
 /// in it was built from, and what the boot must prove.
-struct Scenario {
+pub(crate) struct Scenario {
     name: &'static str,
     /// The document, relative to the workspace root. It is what the endpoints
     /// are derived from *and* what the appliance was compiled around, which is
@@ -234,6 +261,20 @@ struct Scenario {
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
 /// behaviour, in the kernel configuration a release ships. Returns what the run
 /// proved.
+///
+/// What each boot is for is on [`SCENARIOS`], beside the entries themselves.
+pub(crate) fn test_system(root: &Path) -> Result<String, String> {
+    run_scenarios(root, SCENARIOS)
+}
+
+/// Every system scenario the gate boots, in the order it boots them.
+///
+/// A module constant rather than a local, so the two counts the status pages
+/// state about this gate — how many scenarios there are, and how many of them
+/// reach the management port — are readable as data by
+/// [`crate::reference_contract`] and held to those pages. A count restated in
+/// prose beside a list nothing compares it to is a number that goes stale with
+/// every stage green, which is the defect that check exists for.
 ///
 /// The list below numbers the first eight; the ones after them carry their reasons
 /// beside the entries themselves, where a reader meets them.
@@ -288,262 +329,347 @@ struct Scenario {
 /// and holds that port to carrying nothing back, whatever else it judges; the
 /// two that read the console also hold the management domain's own count to the
 /// frames and bytes injected.
-pub(crate) fn test_system(root: &Path) -> Result<String, String> {
-    let scenarios = [
-        Scenario {
-            name: "routed-forwarding",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Station,
-            traffic: Traffic::Routed,
-        },
-        Scenario {
-            name: "generation-swap",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Judged,
-            management: ManagementRole::Station,
-            traffic: Traffic::Routed,
-        },
-        Scenario {
-            name: "alternate-configuration",
-            document: ALTERNATE_DOCUMENT,
-            image: ImageUnderTest::BuiltForTheScenario,
-            console: Console::Judged,
-            management: ManagementRole::Station,
-            traffic: Traffic::Routed,
-        },
-        Scenario {
-            name: "metrics-endpoint",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            // The console is not judged here and it is not an omission: this
-            // scenario injects no management frame, so the `frames=`/`bytes=`
-            // equality the other two hold the console to has nothing to be
-            // stated against. What it judges instead is the endpoint's answer.
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Routed,
-        },
-        // The same scrape against a disk built from the second document, and the
-        // one thing the scenario above cannot show: that the identity the
-        // interface info series carry comes from the document rather than from
-        // the build. Both scrapes are judged against the document their own image
-        // was assembled from, and the two documents share no id, no address and
-        // no MAC — so a label compiled in would satisfy one of the two and fail
-        // the other.
-        //
-        // Its management addressing differs too, which is why this works at all:
-        // QEMU's user-mode stack is told the network, the station and the
-        // endpoint out of the document (`forward_harness::user_netdev`), so the
-        // forward reaches whatever address the document names.
-        Scenario {
-            name: "metrics-endpoint-alternate",
-            document: ALTERNATE_DOCUMENT,
-            image: ImageUnderTest::BuiltForTheScenario,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Routed,
-        },
-        // The recording milestone's own scenario. It is no longer the only one
-        // that pulls the recordings — every [`ManagementRole::Client`] scenario
-        // does, which is the point of there being one role — and it remains
-        // because it is the pairing of the published disk with the recording
-        // surfaces, where the two above pair the same surfaces with the two
-        // documents. The download proves the whole chain from tap to HTTP; the
-        // disk read after it proves what is on the medium independently, so a
-        // recorder that composed a plausible body out of nothing would pass one
-        // and fail the other.
-        Scenario {
-            name: "recording-download",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Routed,
-        },
-        // The filter's own two scenarios, and the reason there are two of them
-        // rather than one: the three outcomes have to be shown to follow from the
-        // *document* rather than from the build, exactly as the routed contract
-        // does. Each boots a disk assembled around its own policy, and the two
-        // policies name different ports under different rule ids — so a per-rule
-        // counter labelled with a name the build carried, or a port a rule no
-        // longer covers, satisfies one and fails the other.
-        //
-        // Both are `Client` scenarios, because the metric is half the evidence: a
-        // drop reason says which of the two refusals happened and the per-rule
-        // counter says which rule reached it, and neither is visible on the wire
-        // — where all a refused probe leaves is its absence.
-        Scenario {
-            name: "policy-filter",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Policy,
-        },
-        Scenario {
-            name: "policy-filter-alternate",
-            document: ALTERNATE_DOCUMENT,
-            image: ImageUnderTest::BuiltForTheScenario,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Policy,
-        },
-        // The one contract a stateless filter cannot meet, on both documents.
-        //
-        // A request goes out, its reply comes back — and the reply is addressed to
-        // a port neither document says anything about, so nothing in the policy
-        // permits it. What carries it is the flow the request opened, and the
-        // scrape says so: `librefirewall_flow_packets_total{outcome="established"}`
-        // rises while the accepting rule's hit counter counts only the openings.
-        //
-        // Beside it, the two refusals that keep that from being a hole: the same
-        // packet with no request in front of it, and a TCP segment from the middle
-        // of a conversation the appliance never saw begin. Both are refused, and
-        // the two are told apart by reason — one falls to the default deny, the
-        // other is refused as mid-stream before the filter is consulted at all.
-        //
-        // `Client` scenarios, because every one of those statements is a metric:
-        // on the wire a refused probe leaves only its absence, and the reply's
-        // arrival alone would not say which mechanism let it through.
-        Scenario {
-            name: "stateful-tracking",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Stateful,
-        },
-        Scenario {
-            name: "stateful-tracking-alternate",
-            document: ALTERNATE_DOCUMENT,
-            image: ImageUnderTest::BuiltForTheScenario,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Stateful,
-        },
-        // The one thing a connection history needs that no other scenario can
-        // produce: a conversation that **opens and closes**.
-        //
-        // It boots its own document because a close needs TCP and both other
-        // documents' rules name `protocol="udp"`, so a TCP segment matches
-        // neither and falls to the default deny — correct behaviour that leaves a
-        // lifecycle unreachable. This one's rules are the shipped document's with
-        // the protocol criterion widened, and nothing else changed.
-        //
-        // A `Client` scenario, because the whole of what it proves is on the two
-        // recordings: on the wire an opening and a close are two frames that were
-        // forwarded, and nothing about either says a conversation began or ended.
-        // The one scenario that CHANGES what the appliance is doing, and the only
-        // evidence there is that this node is configurable at all.
-        //
-        // It boots the published disk, so the policy in force is the shipped
-        // document's, and injects the two probes that document decides: the
-        // accepted port is forwarded and the denied one is dropped by a rule. It
-        // then hands the node, over HTTP and with `curl`, a document that is the
-        // shipped one with those two rules' ACTIONS SWAPPED and nothing else
-        // changed — reads the running document back, holds the answer to naming the
-        // generation it assigned, submits a malformed document and holds *that* to
-        // being refused with a reason and moving nothing, waits for the forwarding
-        // domain to report the committed generation, and only then injects the same
-        // two ports again. Both verdicts must have reversed.
-        //
-        // Both directions, and that is the point: a document that only tightened
-        // the policy would leave "the new rules are in force" and "the dataplane
-        // has stopped" looking alike. Here the traffic the shipped policy dropped
-        // is FORWARDED after the commit, so the dataplane is demonstrably still
-        // deciding — and the forwarded totals it publishes rise across the swap
-        // rather than resetting, which is what says no domain restarted under it.
-        //
-        // A `Client` scenario necessarily: the document is submitted with a real
-        // client through QEMU's own user-mode stack, and the generation the
-        // dataplane switched to is a metric.
-        Scenario {
-            name: "configuration-submission",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Reconfiguration,
-        },
-        // The landing that closed the model's one real hole, and the only scenario
-        // that states what a policy commit did to the conversations the appliance
-        // was ALREADY CARRYING. Every other scenario that submits a document opens
-        // its second wave's conversations afresh, because before this there was no
-        // way for a commit to reach one that was already running.
-        //
-        // It boots the published disk and opens two conversations under the shipped
-        // policy that differ in their source port and in nothing else, answering
-        // both so each is a flow the tracker has seen in both directions. It then
-        // submits a document that is the shipped one with its accept rule narrowed
-        // by ONE ATTRIBUTE — a `source-port` — waits for the forwarding domain to
-        // report the generation, and works the pass that commit armed off to
-        // completion. Only then does it inject each conversation's next packet, on
-        // the five-tuple it has been using all along.
-        //
-        // FOUR THINGS THEN HAVE TO HOLD TOGETHER, and no three of them are enough.
-        // The occupancy gauge must fall and the revocation must be counted, so a
-        // conversation really was ended. The doomed conversation's next packet must
-        // NOT cross — which under the previous behaviour it would have, a tracked
-        // flow being forwarded before the filter is consulted at all. The surviving
-        // conversation's next packet MUST cross, and no rule of either document is
-        // about the direction it travels in, so only its flow can be carrying
-        // it — which is what separates re-deciding the table from flushing it, a
-        // flush satisfying every other clause here. And that crossing is also the
-        // dataplane demonstrably still forwarding across the commit.
-        //
-        // A `Client` scenario necessarily: the document goes over HTTP with a real
-        // client, and three of the four statements are metrics.
-        Scenario {
-            name: "policy-revocation",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Revocation,
-        },
-        // The scenario that proves an ICMP error the tracker RELATES to a live
-        // conversation is still the filter's to decide — which is what keeps
-        // recognising related traffic from being a way past the policy.
-        //
-        // It boots the published disk and opens a conversation under the shipped
-        // policy, then injects an error from the far side quoting one of that
-        // conversation's datagrams. The quote is built to satisfy every agreement
-        // `lfw_flow::icmp` corroborates one by, so the frame really is related and
-        // is not merely refused as unreadable — and the shipped policy, whose rules
-        // are both about UDP, has no rule about it, so it falls to the default deny.
-        // A document adding one `tracking="related"` rule is then submitted, and the
-        // same error on the same flow crosses.
-        //
-        // BOTH HALVES ARE THE EXPERIMENT and neither alone is. A denial on its own
-        // would leave "the policy refused it" and "the tracker never related it"
-        // looking alike; an admission on its own would say nothing about the
-        // default. And the denial is what the connection history carries: an error
-        // opens no conversation, so a filter decision on it names no lifecycle event
-        // unless the record says which policy outcome it was.
-        //
-        // A `Client` scenario necessarily: the document goes over HTTP with a real
-        // client, and the classification is a metric.
-        Scenario {
-            name: "related-icmp",
-            document: image::CONFIGURATION_DOCUMENT,
-            image: ImageUnderTest::Published,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Related,
-        },
-        Scenario {
-            name: "connection-lifecycle",
-            document: LIFECYCLE_DOCUMENT,
-            image: ImageUnderTest::BuiltForTheScenario,
-            console: Console::Ignored,
-            management: ManagementRole::Client,
-            traffic: Traffic::Lifecycle,
-        },
-    ];
+pub(crate) const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "routed-forwarding",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+    },
+    Scenario {
+        name: "generation-swap",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Judged,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+    },
+    Scenario {
+        name: "alternate-configuration",
+        document: ALTERNATE_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::Judged,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+    },
+    Scenario {
+        name: "metrics-endpoint",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        // The console is not judged here and it is not an omission: this
+        // scenario injects no management frame, so the `frames=`/`bytes=`
+        // equality the other two hold the console to has nothing to be
+        // stated against. What it judges instead is the endpoint's answer.
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+    },
+    // The same scrape against a disk built from the second document, and the
+    // one thing the scenario above cannot show: that the identity the
+    // interface info series carry comes from the document rather than from
+    // the build. Both scrapes are judged against the document their own image
+    // was assembled from, and the two documents share no id, no address and
+    // no MAC — so a label compiled in would satisfy one of the two and fail
+    // the other.
+    //
+    // Its management addressing differs too, which is why this works at all:
+    // QEMU's user-mode stack is told the network, the station and the
+    // endpoint out of the document (`forward_harness::user_netdev`), so the
+    // forward reaches whatever address the document names.
+    Scenario {
+        name: "metrics-endpoint-alternate",
+        document: ALTERNATE_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+    },
+    // The recording milestone's own scenario. It is no longer the only one
+    // that pulls the recordings — every [`ManagementRole::Client`] scenario
+    // does, which is the point of there being one role — and it remains
+    // because it is the pairing of the published disk with the recording
+    // surfaces, where the two above pair the same surfaces with the two
+    // documents. The download proves the whole chain from tap to HTTP; the
+    // disk read after it proves what is on the medium independently, so a
+    // recorder that composed a plausible body out of nothing would pass one
+    // and fail the other.
+    Scenario {
+        name: "recording-download",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+    },
+    // The filter's own two scenarios, and the reason there are two of them
+    // rather than one: the three outcomes have to be shown to follow from the
+    // *document* rather than from the build, exactly as the routed contract
+    // does. Each boots a disk assembled around its own policy, and the two
+    // policies name different ports under different rule ids — so a per-rule
+    // counter labelled with a name the build carried, or a port a rule no
+    // longer covers, satisfies one and fails the other.
+    //
+    // Both are `Client` scenarios, because the metric is half the evidence: a
+    // drop reason says which of the two refusals happened and the per-rule
+    // counter says which rule reached it, and neither is visible on the wire
+    // — where all a refused probe leaves is its absence.
+    Scenario {
+        name: "policy-filter",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Policy,
+    },
+    Scenario {
+        name: "policy-filter-alternate",
+        document: ALTERNATE_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Policy,
+    },
+    // The one contract a stateless filter cannot meet, on both documents.
+    //
+    // A request goes out, its reply comes back — and the reply is addressed to
+    // a port neither document says anything about, so nothing in the policy
+    // permits it. What carries it is the flow the request opened, and the
+    // scrape says so: `librefirewall_flow_packets_total{outcome="established"}`
+    // rises while the accepting rule's hit counter counts only the openings.
+    //
+    // Beside it, the two refusals that keep that from being a hole: the same
+    // packet with no request in front of it, and a TCP segment from the middle
+    // of a conversation the appliance never saw begin. Both are refused, and
+    // the two are told apart by reason — one falls to the default deny, the
+    // other is refused as mid-stream before the filter is consulted at all.
+    //
+    // `Client` scenarios, because every one of those statements is a metric:
+    // on the wire a refused probe leaves only its absence, and the reply's
+    // arrival alone would not say which mechanism let it through.
+    Scenario {
+        name: "stateful-tracking",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Stateful,
+    },
+    Scenario {
+        name: "stateful-tracking-alternate",
+        document: ALTERNATE_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Stateful,
+    },
+    // The one thing a connection history needs that no other scenario can
+    // produce: a conversation that **opens and closes**.
+    //
+    // It boots its own document because a close needs TCP and both other
+    // documents' rules name `protocol="udp"`, so a TCP segment matches
+    // neither and falls to the default deny — correct behaviour that leaves a
+    // lifecycle unreachable. This one's rules are the shipped document's with
+    // the protocol criterion widened, and nothing else changed.
+    //
+    // That widening is also what makes this the only scenario in the gate
+    // where a **rule** refuses a TCP segment. It injects an opening segment to
+    // the port the dropping rule names, and the rule drops it — where on every
+    // other bench the same segment is refused for its protocol by the default
+    // deny, so no rule about a port ever decides one. Protocol-specific
+    // matching is therefore stated in both directions on a booted image: a
+    // segment a rule admits crosses, and a segment a rule denies is dropped
+    // with the reason and the hit counter that name that rule.
+    //
+    // A `Client` scenario, because the whole of what it proves is on the two
+    // recordings and in the exposition: on the wire an opening and a close are
+    // two frames that were forwarded, nothing about either says a conversation
+    // began or ended, and all a denied segment leaves is its absence.
+    // The one scenario that CHANGES what the appliance is doing, and the only
+    // evidence there is that this node is configurable at all.
+    //
+    // It boots the published disk, so the policy in force is the shipped
+    // document's, and injects the two probes that document decides: the
+    // accepted port is forwarded and the denied one is dropped by a rule. It
+    // then hands the node, over HTTP and with `curl`, a document that is the
+    // shipped one with those two rules' ACTIONS SWAPPED and nothing else
+    // changed — reads the running document back, holds the answer to naming the
+    // generation it assigned, submits a malformed document and holds *that* to
+    // being refused with a reason and moving nothing, waits for the forwarding
+    // domain to report the committed generation, and only then injects the same
+    // two ports again. Both verdicts must have reversed.
+    //
+    // Both directions, and that is the point: a document that only tightened
+    // the policy would leave "the new rules are in force" and "the dataplane
+    // has stopped" looking alike. Here the traffic the shipped policy dropped
+    // is FORWARDED after the commit, so the dataplane is demonstrably still
+    // deciding — and the forwarded totals it publishes rise across the swap
+    // rather than resetting, which is what says no domain restarted under it.
+    //
+    // A `Client` scenario necessarily: the document is submitted with a real
+    // client through QEMU's own user-mode stack, and the generation the
+    // dataplane switched to is a metric.
+    Scenario {
+        name: "configuration-submission",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Reconfiguration,
+    },
+    // The landing that closed the model's one real hole, and the only scenario
+    // that states what a policy commit did to the conversations the appliance
+    // was ALREADY CARRYING. Every other scenario that submits a document opens
+    // its second wave's conversations afresh, because before this there was no
+    // way for a commit to reach one that was already running.
+    //
+    // It boots the published disk and opens two conversations under the shipped
+    // policy that differ in their source port and in nothing else, answering
+    // both so each is a flow the tracker has seen in both directions. It then
+    // submits a document that is the shipped one with its accept rule narrowed
+    // by ONE ATTRIBUTE — a `source-port` — waits for the forwarding domain to
+    // report the generation, and works the pass that commit armed off to
+    // completion. Only then does it inject each conversation's next packet, on
+    // the five-tuple it has been using all along.
+    //
+    // FOUR THINGS THEN HAVE TO HOLD TOGETHER, and no three of them are enough.
+    // The occupancy gauge must fall and the revocation must be counted, so a
+    // conversation really was ended. The doomed conversation's next packet must
+    // NOT cross — which under the previous behaviour it would have, a tracked
+    // flow being forwarded before the filter is consulted at all. The surviving
+    // conversation's next packet MUST cross, and no rule of either document is
+    // about the direction it travels in, so only its flow can be carrying
+    // it — which is what separates re-deciding the table from flushing it, a
+    // flush satisfying every other clause here. And that crossing is also the
+    // dataplane demonstrably still forwarding across the commit.
+    //
+    // A `Client` scenario necessarily: the document goes over HTTP with a real
+    // client, and three of the four statements are metrics.
+    Scenario {
+        name: "policy-revocation",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Revocation,
+    },
+    // The scenario that proves an ICMP error the tracker RELATES to a live
+    // conversation is still the filter's to decide — which is what keeps
+    // recognising related traffic from being a way past the policy.
+    //
+    // It boots the published disk and opens a conversation under the shipped
+    // policy, then injects an error from the far side quoting one of that
+    // conversation's datagrams. The quote is built to satisfy every agreement
+    // `lfw_flow::icmp` corroborates one by, so the frame really is related and
+    // is not merely refused as unreadable — and the shipped policy, whose rules
+    // are both about UDP, has no rule about it, so it falls to the default deny.
+    // A document adding one `tracking="related"` rule is then submitted, and the
+    // same error on the same flow crosses.
+    //
+    // BOTH HALVES ARE THE EXPERIMENT and neither alone is. A denial on its own
+    // would leave "the policy refused it" and "the tracker never related it"
+    // looking alike; an admission on its own would say nothing about the
+    // default. And the denial is what the connection history carries: an error
+    // opens no conversation, so a filter decision on it names no lifecycle event
+    // unless the record says which policy outcome it was.
+    //
+    // A `Client` scenario necessarily: the document goes over HTTP with a real
+    // client, and the classification is a metric.
+    Scenario {
+        name: "related-icmp",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Related,
+    },
+    Scenario {
+        name: "connection-lifecycle",
+        document: LIFECYCLE_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Lifecycle,
+    },
+    // The one scenario that puts a **flood** across the appliance, and the only
+    // one whose contract is about how much state a burst of traffic can make
+    // the node hold. The threat model carries a connection-flood adversary
+    // separately from untrusted traffic for exactly this reason: its every
+    // frame is well formed and its weapon is the per-connection state each one
+    // commits.
+    //
+    // It opens one conversation the shipped policy admits and, alongside it
+    // from the first injection pass, sixty-four distinct five-tuples addressed
+    // to a port no rule is about. Each of those opens a flow and is then
+    // refused by the default deny, so the appliance gives every slot back in
+    // the evaluation that refused it — which is the property that keeps
+    // default deny from being a state-exhaustion amplifier.
+    //
+    // The conversation's reply is deferred past the burst, so **its delivery is
+    // a packet the table carried after the table had absorbed the flood**, and
+    // no rule of the document names the port it is addressed to: only its flow
+    // could have carried it. Beside it the exposition states the arithmetic —
+    // the openings, what gave each slot back, and an occupancy that is a small
+    // fraction of the burst rather than a multiple of it.
+    //
+    // Its own boot rather than an extension of `stateful-tracking`, which
+    // already opens a conversation: the flood moves the occupancy, lifecycle
+    // and refusal counters that scenario asserts a quiet table's values for, so
+    // merging the two would make either one's failure unattributable — and it
+    // would put the burst's frames into two scenarios' recordings, which are
+    // judged block by block.
+    //
+    // A `Client` scenario, because the whole of the bounded-state claim is
+    // arithmetic in the exposition: on the wire a flood leaves nothing but
+    // sixty-four absences.
+    Scenario {
+        name: "connection-flood",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::Ignored,
+        management: ManagementRole::Client,
+        traffic: Traffic::Flood,
+    },
+    // The only scenario that boots a node onto **generation 0** — the fail-closed
+    // empty configuration — and the only one whose contract is that the appliance
+    // forwards nothing at all.
+    //
+    // Every other scenario boots a document the fast gate has already proved
+    // `config::load` accepts, so no other one can reach this state: a node that
+    // committed a document is a node with a table. This one boots the document that
+    // list registers as one the appliance REFUSES, and the registration is what
+    // makes that a declared expectation rather than a bypass — a document that
+    // quietly became valid fails the fast gate for saying so, long before this
+    // boot.
+    //
+    // Its evidence is the two things such a node has, and no others. Its management
+    // port takes its addressing from the *committed* configuration and is therefore
+    // unaddressed, so nothing can scrape it, download from it, or ask it anything:
+    // what is left is the **serial console** and the **absence of any forwarded
+    // frame**. Both are held inside the boot contract
+    // ([`crate::forward_harness::BootContract::FailedClosed`]), which is also what
+    // decides when the run may stop — such a node runs indefinitely and never
+    // exits, so nothing else would end the boot.
+    //
+    // The probes it injects are the shipped document's own, between the same
+    // endpoints and over the same ports, because this document's addressing is the
+    // shipped one to the byte. That is what makes their absence attributable: the
+    // identical traffic crosses on eleven other scenarios, and here nothing does —
+    // not for want of a route or an interface, but because no policy was ever
+    // committed for one to be admitted by.
+    Scenario {
+        name: "fail-closed-boot",
+        document: image::DUPLICATE_RULE_ID_DOCUMENT,
+        image: ImageUnderTest::BuiltForTheScenario,
+        console: Console::JudgedOnARefusal,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+    },
+];
 
+/// Boot every scenario in `scenarios` and answer what the run proved.
+fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> {
     let judged = scenarios
         .iter()
         .filter(|scenario| matches!(scenario.console, Console::Judged))
@@ -560,7 +686,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     // adversary this port faces, and it looks perfectly correct in one
     // scenario.
     let mut sequence_numbers: Vec<(&str, u32)> = Vec::new();
-    for scenario in &scenarios {
+    for scenario in scenarios {
         match run_scenario(root, scenario, Run::Shipping) {
             Ok(Some(isn)) => sequence_numbers.push((scenario.name, isn)),
             Ok(None) => {}
@@ -671,10 +797,20 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     let path = root.join(scenario.document);
     let document = fs::read(&path)
         .map_err(|error| format!("scenario {name}: read {}: {error}", path.display()))?;
-    let topology = Topology::from_document(&document)
+    // The bench, read out of the document under the standing that document is
+    // registered with — so a document a fail-closed scenario boots is one whose
+    // refusal has been asserted rather than assumed, and a document every other
+    // scenario boots is one `config::load` accepts whole.
+    let standing = image::standing_of(Path::new(scenario.document))
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+    let topology = Topology::from_document_with(&document, standing)
         .map_err(|error| format!("scenario {name}: {}: {error}", path.display()))?;
 
     let disk = scenario_disk(root, scenario, run)?;
+
+    if matches!(scenario.console, Console::JudgedOnARefusal) {
+        return run_fail_closed_scenario(root, scenario, run, &disk, &document, &topology);
+    }
 
     let log_name = format!("qemu-{name}{}.log", run.name_suffix());
     let backing = if scenario.management.user_network() {
@@ -787,7 +923,10 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
         }
     };
     let judged = match scenario.console {
-        Console::Ignored => String::new(),
+        // Unreachable: `run_scenario` hands a refusal scenario to
+        // `run_fail_closed_scenario` before reaching here, and there is no
+        // transcript of an accepted document to judge on a node that accepted none.
+        Console::Ignored | Console::JudgedOnARefusal => String::new(),
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -819,6 +958,47 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
         log.display()
     );
     Ok(booted.management_tcp_isn)
+}
+
+/// Boot one scenario whose node comes up **forwarding nothing**, and report what
+/// the console said about why.
+///
+/// Short by comparison with its sibling, and every omission is a surface such a
+/// node does not have. It committed no generation, so its management port is
+/// unaddressed: nothing scrapes it, nothing downloads a recording from it, and no
+/// counter exists to cross-check. What is left is the two things the criterion
+/// names — the serial console, and the absence of any forwarded frame — and both
+/// are decided inside the boot contract, whose verdict is this function's.
+///
+/// Answers `None`: no connection was opened to the management port, there being
+/// nothing there to open one to.
+fn run_fail_closed_scenario(
+    root: &Path,
+    scenario: &Scenario,
+    run: Run,
+    disk: &Path,
+    document: &[u8],
+    topology: &Topology,
+) -> Result<Option<u32>, String> {
+    let name = scenario.name;
+    let transcript = crate::config_transcript::RefusedContract::from_document(document)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
+    let booted = boot_and_fail_closed(root, disk, &log_name, topology, &transcript)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+    // The table, which on this scenario is the evidence rather than the preamble:
+    // every row is a probe the shipped document forwards, and every one of them
+    // reads `refused`.
+    print!("{}", booted.traffic.render());
+    let log = scenario_log(root, scenario, run);
+    println!(
+        "  system scenario ok: {name} on the {} kernel ({}; {}); QEMU output is in {}",
+        run.config(),
+        booted.traffic.summary(),
+        transcript.summary(),
+        log.display()
+    );
+    Ok(None)
 }
 
 /// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the
@@ -1018,6 +1198,40 @@ fn append_evidence(log: &Path, heading: &str, evidence: &str) -> Result<(), Stri
         .map_err(|error| format!("append the evidence to {}: {error}", log.display()))
 }
 
+/// Boot `disk` expecting the node to come up and **forward nothing**, because the
+/// configuration domain refuses the document the image carries.
+///
+/// No injected packet may come back on any port, the management wire included, and
+/// the console must carry the whole of `transcript` — the refusal naming the
+/// document's own reason, the configuration domain's `state=refused`, the
+/// forwarding domain's fail-closed record, and nothing that says a generation above
+/// zero ever reached the dataplane.
+pub(crate) fn boot_and_fail_closed(
+    root: &Path,
+    disk: &Path,
+    log_name: &str,
+    topology: &Topology,
+    transcript: &crate::config_transcript::RefusedContract,
+) -> Result<Booted, String> {
+    boot(
+        root,
+        disk,
+        log_name,
+        BootContract::FailedClosed { transcript },
+        topology,
+        // Socket-backed, so the harness sees every frame that port emits and can
+        // hold it to emitting none. A real client would be pointless: there is
+        // nothing at the other end of the forward, the port being unaddressed until
+        // a generation commits.
+        ManagementBacking::Socket,
+        // The probes the shipped document forwards, injected between the same
+        // endpoints over the same ports — which is what makes their absence the
+        // policy having never been committed rather than a bench mismatch. This
+        // document's addressing is the shipped one to the byte, for exactly that.
+        Traffic::Routed,
+    )
+}
+
 /// Boot `disk` expecting NO slot to be bootable: no injected packet may come
 /// back in any form, and the guest must emit `marker` — the boot manager's
 /// structured halt record. Returns the same observation as
@@ -1083,7 +1297,14 @@ fn boot(
     // Which data-disk verdict this boot owes, taken before the contract is
     // handed over: a boot that runs the appliance must leave the witness pattern
     // on the medium, and one with no bootable slot must leave the sector alone.
-    let ran_the_appliance = matches!(contract, BootContract::Routed);
+    //
+    // A node that refused its own configuration is on the first side of that line
+    // and not the second, which is the distinction the two absences make easy to
+    // get wrong. It forwards nothing — but every protection domain came up, and the
+    // recorder's proof of the path to the medium is not a dataplane matter: it maps
+    // no configuration at all. So the witness must be there, and its absence would
+    // mean a domain never started rather than a policy never committed.
+    let ran_the_appliance = !matches!(contract, BootContract::Halted { .. });
     let booted = forward_harness::run_boot_test(
         command,
         backends,

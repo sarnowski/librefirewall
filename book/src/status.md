@@ -33,10 +33,15 @@ committed under the next generation and picked up by the dataplane at its next p
 end-to-end gate proves the whole of that on the release image — it boots a node, injects traffic the
 shipped policy forwards, `POST`s a document that reverses that policy, waits for the forwarding
 domain to report the new generation, and injects again: the traffic that was forwarded is now dropped
-and the traffic that was dropped is now forwarded, with no domain having restarted in between. A
-malformed document submitted after it is refused with a reason and leaves the generation where it
-was. The document a build embeds is now the *first* generation rather than the only one; a
-**hardware** change still requires a new image, which is the line the design draws.
+and the traffic that was dropped is now forwarded, with no domain having restarted in between. Two
+documents submitted after it are refused with a reason and leave the generation where it was: one the
+reader stops, and one that parses cleanly and a *rule* refuses — the case where a configuration could
+half-apply at all, so the node is additionally held to still stating what it committed and still
+deciding traffic by it. A separate boot shows the other end of the same posture: a node whose *own*
+document a rule refuses comes up on generation 0, forwards nothing at all, and says so on its serial
+console, which is the only surface it has. The document a build embeds is now the *first* generation
+rather than the only one; a **hardware** change still requires a new image, which is the line the
+design draws.
 
 **Anyone who can reach the management port can replace this appliance's policy.** There is no
 authentication and no TLS in front of it — see the paragraph below — so the port must not be exposed
@@ -180,7 +185,7 @@ revocation nothing emits one.
 | Capability | Status | Notes |
 |---|---|---|
 | Stateful L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; a ruleset decides which flows may open, and a commit re-decides the flow table so removing a rule **does** end the conversations it admitted. There is no `reject` and no zones — [detail](developers/status-detail.md#stateful-filtering) |
-| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. A configuration commit re-decides the whole table against the new policy and takes back the flows it no longer admits, a bounded window of the table per wakeup whose size scales with occupancy so a pass takes the same number of wakeups however full the table is — [detail](developers/status-detail.md#connection-tracking) |
+| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. A flood of distinct five-tuples is now watched on the release image: every opening the default deny refuses gives its slot straight back, occupancy stays at the one conversation the policy admits, and that conversation's own traffic still crosses afterwards — what remains host-level is the behaviour at the capacity boundary, which no scenario can inject its way to. A configuration commit re-decides the whole table against the new policy and takes back the flows it no longer admits, a bounded window of the table per wakeup whose size scales with occupancy so a pass takes the same number of wakeups however full the table is — [detail](developers/status-detail.md#connection-tracking) |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |

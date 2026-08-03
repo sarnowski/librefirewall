@@ -90,7 +90,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | Dependency, license and source policy | `cargo deny check bans licenses sources` |
 | The system description agrees with the constants the domains compile against: every region's extent, cacheability and per-grant permissions, the **exact** set of domains that map it, both I/O-port windows against the constants the drivers form addresses from, every channel end's notify direction, the port→driver attribution, and that each of the 115 mappings is named by a `setvar_vaddr` | `xtask test` (`sysdesc::check`) |
 | The shipped configuration document is one the appliance would accept: it goes through the same `config::load` the configuration domain runs at boot | `xtask test` (`image::check_configuration`) |
-| The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves | `xtask test` (`reference_contract`) |
+| The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves — plus the counts the status detail chapter states about the gate: how many system scenarios there are, how many reach the management port, and how many library crates carry the coverage floor | `xtask test` (`reference_contract`) |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
 | Boot, forwarding and A/B contracts | `xtask test-system`, `xtask test-ab` |
 
@@ -101,8 +101,10 @@ names, which is authority granted to a domain with no line of code in it able to
 
 `reference_contract` is why the book's *content* is now gated without the book becoming a build
 input: rendering is still a reading convenience, mdbook is still not pinned into the builder, and
-no gate calls `make book` — but two chapters are read as data and held to the code, so the
-operator's interface definition can no longer go stale with every stage green.
+no gate calls `make book` — but three chapters are read as data and held to the code, so the
+operator's interface definition can no longer go stale with every stage green. Two of them are the
+reference chapters; the third is the status detail, read for the counts it states about the gate,
+because three of those had gone stale at once with every stage passing.
 
 Four things that table must not be read as saying.
 
@@ -121,13 +123,16 @@ and `undocumented_unsafe_blocks` are workspace lints and bind every member; the 
 separate `fuzz/` workspace. For `xtask` and the fuzz harnesses the discipline is review, not a
 gate.
 
-And `reference_contract` sees less of its two chapters than the row above may suggest. It compares
+And `reference_contract` sees less of its chapters than the row above may suggest. It compares
 the parsed tables and the counts the chapters state about themselves — and deliberately not: prose
 of any kind, a family's `HELP` text included; label *values*, because a shard's series carry what a
 running node happens to publish rather than a closed set; `librefirewall_interface_info`'s label
 names, which are byte literals in the exposition writer rather than a table; and which group a
-token sits in, since a domain's tables are compared as one set per domain. A check whose reach is
-unstated invites confidence it has not earned, so those four gaps stay the reader's to close.
+token sits in, since a domain's tables are compared as one set per domain. In the status detail
+chapter it reads a count only where the page states a number in front of the phrase it looks for:
+a sentence that mentions the scenarios without counting them is prose and is left alone, so a
+number deleted from one of several places while another keeps it passes. A check whose reach is
+unstated invites confidence it has not earned, so those five gaps stay the reader's to close.
 
 ## Build profiles
 

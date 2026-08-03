@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, not a shipping configuration — and the one document in this
+     tree the appliance REFUSES.
+
+     It is the shipped document with one byte of meaning changed: both rules are
+     called `probe-forward`. Every attribute is present and every value is well
+     formed, so the reader accepts it and hands over a model; the rule that
+     identifiers are unique is what refuses it. That is deliberately a refusal
+     the READER cannot reach — a malformed document yields no model at all, so
+     nothing could read the bench out of it, and the scenario that boots this one
+     has to address the appliance it built.
+
+     Two scenarios use it, at the two points in a node's life a document can
+     arrive.
+
+     Built into an image, it is refused in the configuration domain's `init`: no
+     generation is published, the forwarding domain stays on the fail-closed
+     generation 0, and the node comes up forwarding nothing. That node has no
+     address — the management port is unaddressed until a generation commits — so
+     the only place it can say what happened is the serial console, and the
+     absence of any forwarded frame is the other half of the evidence. Nothing
+     can scrape it, and a scenario that expected to is a scenario that
+     misunderstands what fail-closed means.
+
+     Submitted over HTTP to a node already running the shipped document, it is
+     answered with the same reason and must move nothing: the running generation
+     stays where it was and the ruleset does not half-apply, which the traffic
+     injected afterwards still gets the previous verdict for.
+
+     The addressing is the shipped document's, deliberately and to the byte. What
+     that buys is the sharpest available statement about a fail-closed boot: the
+     probes a scenario injects into it are the same probes the shipped document
+     has forwarded in every other scenario, between the same endpoints and over
+     the same ports, so their absence is the policy having never been committed
+     and cannot be anything else. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+    <rules>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" tracking="any" action="drop"/>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

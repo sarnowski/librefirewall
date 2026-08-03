@@ -92,6 +92,12 @@ const FLOW_REFUSED: &str = "librefirewall_flow_packets_refused_total";
 /// Slots of the table, by the state of the flow in each.
 const FLOW_ENTRIES: &str = "librefirewall_flow_table_entries";
 
+/// What ended the flows that left the table, by cause.
+const FLOW_LIFECYCLE: &str = "librefirewall_flow_lifecycle_total";
+
+/// The one state that is not a flow: how much of the table is left.
+const VACANT: &str = "vacant";
+
 /// Metric families the scrape must carry, one per subsystem this change made
 /// observable. Deliberately not the whole catalogue — `lfw_metrics`' own tests
 /// hold that to itself — but one name from each shard kind, so a shard that
@@ -733,6 +739,15 @@ fn judge_policy(
 /// **It saw at least what came back.** Every frame the harness observed forwarded
 /// passed through the tracker, so the packets it was offered cannot be fewer.
 ///
+/// **Every flow it opened is either still there or accounted for by what ended
+/// it.** The openings, less the flows withdrawn, expired, evicted and revoked, are
+/// the flows the table is holding — and a flow that reached `Closed` or `TimeWait`
+/// is *not* subtracted, because such a flow still occupies its slot until its idle
+/// timeout takes it. That is the whole of what "bounded state" means as
+/// arithmetic, and it is what a flood is judged by: a node that opened a slot per
+/// refused connection attempt and left it behind satisfies every other identity
+/// here and breaks this one.
+///
 /// # Errors
 /// The verdict, naming the identity and the numbers that broke it.
 fn judge_flow_table(
@@ -823,10 +838,146 @@ fn judge_flow_table(
         ));
     }
 
+    asserted.extend(judge_bounded_state(exposition, &entries, witness)?);
     asserted.push(seen);
     asserted.push(established);
     asserted.push(mid_stream);
     asserted.extend(entries);
+    Ok(asserted)
+}
+
+/// Hold the table's occupancy to what opened and ended the flows in it, and — on
+/// the boot that floods the appliance — to being bounded rather than growing with
+/// the flood.
+///
+/// # The identity, which every boot owes
+///
+/// A flow enters the table by being opened and leaves it by being withdrawn,
+/// expiring, being evicted, or being revoked. A flow that reached `Closed` or
+/// `TimeWait` has *not* left: it holds its slot until its idle timeout, which is
+/// why `closed` is counted and not subtracted here. So the flows the table is
+/// holding are the openings less those four, exactly — and a node that opened a
+/// slot per refused connection attempt and never gave one back satisfies every
+/// other identity in this module and breaks this one.
+///
+/// # What the flood adds
+///
+/// The identity alone would hold on a quiet bench, so it is only evidence
+/// alongside traffic that tests it. The flood set puts [`PolicyWitness`]'s
+/// `flooded_tuples` distinct five-tuples across the appliance, every one of them
+/// refused by the default deny, and four things then have to hold together: the
+/// tracker opened at least that many flows, gave back at least that many, holds
+/// *fewer* than that many, and turned no new connection away for want of room.
+/// Three of the four would each be satisfied by a node that never saw the flood at
+/// all; the first is what says it did.
+///
+/// Two of the clauses are asserted on **every** boot rather than only the flooding
+/// one, because no scenario in this gate reaches the pressure that would justify
+/// them moving: nothing may be evicted, and nothing may be refused for a full
+/// table or a full bucket. A rise on a quiet bench is a defect wherever it happens.
+///
+/// # Errors
+/// The verdict, naming the identity or the clause and the numbers that broke it.
+fn judge_bounded_state<'a>(
+    exposition: &'a Exposition,
+    entries: &[&'a Sample],
+    witness: PolicyWitness,
+) -> Result<Vec<&'a Sample>, String> {
+    let vacant = entries
+        .iter()
+        .find(|sample| sample.labels.get("state").map(String::as_str) == Some(VACANT))
+        .ok_or_else(|| {
+            format!(
+                "{FLOW_ENTRIES}{{state=\"{VACANT}\"}} is not in the exposition, so how much of the \
+                 table is left is not published and nothing about bounded state can be stated"
+            )
+        })?;
+    let held = (FLOW_CAPACITY as u64)
+        .checked_sub(vacant.value)
+        .ok_or_else(|| {
+            format!(
+                "{FLOW_ENTRIES}{{state=\"{VACANT}\"}} reports {} slots free of a table that holds \
+             {FLOW_CAPACITY}",
+                vacant.value
+            )
+        })?;
+
+    let opened = one(exposition, FLOW_PACKETS, &[("outcome", "new")])?;
+    let mut ended = Vec::new();
+    let mut left = 0u64;
+    for event in ["withdrawn", "expired", "evicted", "revoked"] {
+        let sample = one(exposition, FLOW_LIFECYCLE, &[("event", event)])?;
+        // Nothing in this gate reaches the pressure that justifies an eviction,
+        // and an assured conversation may never be the flow taken — so a rise
+        // here is either a table that leaked slots or an eviction rule reaching a
+        // flow it may not.
+        if event == "evicted" && sample.value != 0 {
+            return Err(format!(
+                "{FLOW_LIFECYCLE}{{event=\"evicted\"}} reports {}, so a flow was taken back to \
+                 make room for another. No scenario in this gate injects enough distinct \
+                 five-tuples to reach that pressure",
+                sample.value
+            ));
+        }
+        left = left.saturating_add(sample.value);
+        ended.push(sample);
+    }
+    if held.saturating_add(left) != opened.value {
+        return Err(format!(
+            "the tracker reports {} flow(s) opened and the table holds {held} with {left} \
+             withdrawn, expired, evicted or revoked. A flow enters the table by being opened and \
+             leaves it those four ways alone — a close leaves it holding its slot until the idle \
+             timeout, which is why `closed` is not among them — so a disagreement is a slot \
+             leaked or a slot returned twice",
+            opened.value
+        ));
+    }
+    let mut turned_away = Vec::new();
+    for reason in ["table_full", "bucket_full"] {
+        let sample = one(exposition, FLOW_REFUSED, &[("reason", reason)])?;
+        if sample.value != 0 {
+            return Err(format!(
+                "{FLOW_REFUSED}{{reason={reason:?}}} reports {}, so a new connection was turned \
+                 away for want of room. No scenario in this gate injects enough distinct \
+                 five-tuples to fill a {FLOW_CAPACITY}-slot table, so this is a table holding \
+                 flows nothing gave back rather than a table that is genuinely full",
+                sample.value
+            ));
+        }
+        turned_away.push(sample);
+    }
+
+    if witness.flooded_tuples > 0 {
+        let flood = witness.flooded_tuples;
+        if opened.value < flood {
+            return Err(format!(
+                "the boot flooded the appliance with {flood} distinct five-tuples and the tracker \
+                 reports {} flow(s) opened, so the burst did not reach the table and every \
+                 statement below it is about a bench nothing flooded",
+                opened.value
+            ));
+        }
+        if left < flood {
+            return Err(format!(
+                "the boot flooded the appliance with {flood} distinct five-tuples the default \
+                 deny refuses and only {left} flow(s) left the table. Every refused opening must \
+                 be given back in the evaluation that refused it, or a default-deny policy is a \
+                 state-exhaustion amplifier: an attacker fills the table with connections the \
+                 policy has already refused"
+            ));
+        }
+        if held >= flood {
+            return Err(format!(
+                "the table holds {held} flow(s) after a flood of {flood} distinct five-tuples, so \
+                 its occupancy grew with the burst rather than staying bounded by the \
+                 conversations the policy admits"
+            ));
+        }
+    }
+
+    let mut asserted = vec![vacant, opened];
+    asserted.extend(ended);
+    asserted.extend(turned_away);
     Ok(asserted)
 }
 

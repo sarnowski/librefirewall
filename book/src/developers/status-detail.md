@@ -143,6 +143,18 @@ through both sides; and by two QEMU scenarios that inject three probes differing
 port and hold the three outcomes apart on the wire, by drop reason, and by per-rule counter — one
 against each of the two documents, whose policies name different ports under different ids.
 
+**A rule about a protocol is demonstrated to decide both transports, on the image.** Those two
+scenarios inject datagrams, so the ports a rule matched were UDP ports; the `connection-lifecycle`
+scenario is where the other transport is decided, because it is the one bench whose rules say
+`protocol="any"`. It injects two opening TCP segments that differ in their destination port and in
+nothing else — same flags, same sequence, same addresses. The one the accepting rule names is
+forwarded and opens a conversation; the one the *dropping* rule names is refused with
+`librefirewall_route_drops_total{reason="policy_denied"}` and attributed to that rule by
+`librefirewall_rule_hits_total{rule="lifecycle-deny"}`. On the other two benches the same segment is
+refused for its protocol by the default deny, so no rule about a port ever decides one — which means
+a filter that read a port criterion against a datagram's ports alone would have satisfied every other
+scenario in the gate.
+
 **A ruleset decides which conversations may open, and names related traffic where it admits it.** The
 connection tracker settles an *established* packet before the filter is consulted, so the traffic
 following an admitted conversation is carried by its flow. Two things do reach the filter, and the
@@ -164,10 +176,11 @@ Held by unit and property tests in `crates/pipeline` covering every criterion ag
 a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
 prefix length names, and all five unreadable transport shapes against all four port and type
 criteria; by the differential configuration tests that put an image breaking each of the twelve rules
-through both sides; and by five QEMU scenarios — two that inject three probes differing only in
+through both sides; and by six QEMU scenarios — two that inject three probes differing only in
 destination port and hold the three filter outcomes apart on the wire, by drop reason and by per-rule
-counter, two that inject a request and its reply and hold the reply's arrival to the tracker rather
-than to any rule, and one that puts the `related` criterion itself on a booted node.
+counter, one that does the same with two TCP segments and so decides a rule's port criterion on the
+other transport, two that inject a request and its reply and hold the reply's arrival to the tracker
+rather than to any rule, and one that puts the `related` criterion itself on a booted node.
 
 **The related decision is observed on a running node and not only tested.** The `related-icmp`
 scenario opens a conversation on the release image and then injects an ICMP destination-unreachable
@@ -208,9 +221,6 @@ what it can decide from a flow's key alone, where it is conservative and what it
 - **No logging per rule.** A rule cannot ask for its matches to be recorded. Every decision reaches
   the recording tap regardless, with its reason, and the per-rule counters are the only per-rule
   signal.
-- **No policy change without a reboot.** The `<rules>` section shares the configuration domain's one
-  limitation: the document is compiled into the image, so a policy change is a new image (see
-  *[Configuration management](#configuration-management)*).
 - **Nothing is measured.** `crates/pd-runtime`'s benchmarks now time a frame the filter permits, one
   it denies and one the router refuses, so the cost of consulting a policy is *measurable* — but the
   ruleset those benchmarks use is one wildcard rule, and no measurement exists of a realistic table
@@ -257,6 +267,48 @@ exactly where it was, and a property test says so. Every walk a packet can provo
 constant no peer chooses: a chain by thirty-two links, the eviction scan by sixty-four slots, the
 timeout sweep by two hundred and fifty-six.
 
+**A flood is observed on the release image, and the arithmetic is exact.** The `connection-flood`
+scenario opens one conversation the shipped policy admits and, alongside it from the first injection
+pass, sixty-four distinct five-tuples addressed to a port no rule is about. Each of those opens a flow
+and is then refused by the default deny, so the appliance gives every slot back in the evaluation that
+refused it. Four things hold together in the scrape that follows, and no three of them are enough:
+
+- **The burst reached the table.** `librefirewall_flow_packets_total{outcome="new"}` counts at least
+  the sixty-four openings, and the capture recording carries each of the sixty-four frames
+  byte-identically, which is what says they were sixty-four *distinct* conversations and not one
+  retransmitting.
+- **Every one of them was given back.** `librefirewall_flow_lifecycle_total{event="withdrawn"}` counts
+  at least the same sixty-four.
+- **Occupancy stayed bounded.** `librefirewall_flow_table_entries{state="vacant"}` reads one below
+  the table's capacity: it holds one flow, the conversation's, against a burst of sixty-four. And the
+  accounting closes exactly: the openings, less the flows withdrawn, expired, evicted and revoked, are
+  the flows the table is holding. A closed flow is deliberately *not* subtracted, because it keeps its
+  slot until its idle timeout. That identity is now asserted on every scraped scenario, not only this
+  one, and it is the only place a leaked slot is visible at all — a node holding a hundred stale flows
+  publishes an occupancy that sums to the capacity perfectly well.
+- **The established flow survived it.** The conversation's reply is deferred past the burst — it may
+  only go out once the request has been observed crossing — and it crosses, carried by its flow under a
+  policy that names nothing about the port it is addressed to. Beside it,
+  `librefirewall_flow_lifecycle_total{event="evicted"}` and
+  `librefirewall_flow_packets_refused_total{reason="table_full"}` both read zero, which the gate now
+  requires of *every* scenario: nothing here injects enough distinct five-tuples to fill a million
+  slots, so a rise either way would be a table holding flows nothing gave back.
+
+**What remains host-level, precisely.** The one thing the image does not show is the behaviour at the
+*capacity boundary*: `table_full` being answered, and an assured flow surviving a table with no room.
+Reaching it needs 1 048 576 live flows, which no scenario can inject — and a scenario image built
+around a smaller table is not the cheap change it looks like. `FLOW_CAPACITY` is one constant, but the
+region holding the table is sized from it in the Microkit system description, and `xtask::sysdesc`
+holds that description to the constants the domains compile against; a reduced-capacity image would
+therefore need a second system description, the constant threaded through `lfw-flow`, `pd-runtime` and
+every protection domain as a build feature, and a capability check that knows which description belongs
+to which capacity. That is a second shippable authority topology to keep correct, for one assertion, so
+it was not taken. The boundary is held instead by `crates/flow`'s property tests against a sixteen-slot
+table — a flood of two hundred distinct tuples, every established flow still in place, the new flow
+refused as `TableFull` — and by the `flow_table` fuzz target. What the image proves is the property that
+actually decides whether a default-deny appliance can be exhausted: that a refused opening costs no
+state at all, so the boundary is not approached in the first place.
+
 **Every outcome is a signal.** Each of the twelve refusals is its own drop reason on
 `/metrics` — refused before the filter, so a frame the tracker turned away never reaches a rule — and
 its own series in the tracker's own account beside the classified outcomes, the flow lifecycle, and
@@ -271,7 +323,7 @@ zeroes — and that zeroing is what makes forming the reference defined at all, 
 discriminant zero. The forwarder links the free list once at bring-up.
 
 **Measured.** Walking the million slots at bring-up costs about 13 ms under QEMU's emulated CPU, and
-the eight system scenarios take about 0.9 s more per boot than they do with a small table — the
+every system scenario takes about 0.9 s more per boot than it would with a small table — the
 loader creating and zeroing 17 409 page frames. Both are boot-time only and neither is on the packet
 path.
 
@@ -280,7 +332,8 @@ edge, both ICMP surfaces, floods against a small table, withdrawal, and the occu
 entries themselves), by a `cargo-fuzz` target that drives arbitrary packets at arbitrary instants
 over a table already holding a handshaked connection, by tests in `crates/pipeline` and
 `crates/pd-runtime` that drive the two halves through the real chain and the real ring plumbing, and
-by two QEMU scenarios that hold a reply's arrival to the tracker rather than to a rule.
+by two QEMU scenarios that hold a reply's arrival to the tracker rather than to a rule, and by the
+`connection-flood` scenario above.
 
 **A commit re-decides the whole table, and takes back what the new policy will not admit.** The
 moment a generation commits, the forwarding domain arms a pass over its own connection table
@@ -642,8 +695,8 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — eleven of the fourteen —
-boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
+**What the gate proves.** Every scenario whose management port is reachable — 12 of the 16 system
+scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`tools/xtask/src/surface_contract.rs`): every record
 of the connection history *of a frame* pairs into the capture by `epb_packetid` and none of it names
@@ -902,7 +955,7 @@ Held by the tests in `crates/config` and `crates/log`, by the handover's own tes
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the fourteen QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the 16 QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -999,9 +1052,52 @@ bytes rather than as a bad document), a fuzz target
 over the whole path from the `POST` body to the commit, and the `configuration-submission` QEMU
 scenario, which is the evidence that matters: it boots the release image, injects traffic the shipped
 policy forwards and traffic it drops, submits a document that exchanges those two verdicts, reads the
-running document back, submits a malformed one and holds it to being refused with the generation
-unmoved, waits for the forwarding domain to report the committed generation, and injects again — both
-verdicts reversed, with the totals rising across the swap rather than resetting.
+running document back, refuses two documents (below), waits for the forwarding domain to report the
+committed generation, and injects again — both verdicts reversed, with the totals rising across the
+swap rather than resetting.
+
+**Fail-closed is demonstrated on the image in all three of its clauses.** Each is a different thing
+that must not happen, and each needed its own experiment.
+
+*A refused document moves nothing.* The `configuration-submission` scenario submits a malformed
+document — unterminated, so the *reader* stops it — and the endpoint answers
+`400 … outcome=refused rejected=malformed offset=27` with the generation still reading the one that
+was committed.
+
+*A refused rule table does not half-apply.* That refusal is almost structural: a document the reader
+stops never becomes a model, so there was nothing to commit. The interesting case is a document that
+**parses cleanly** and a rule refuses — a whole model exists, its addressing sound, and the rules are
+what fail — because that is the only case in which a configuration could half-apply at all. The same
+scenario submits one: the shipped document with its two rules given one id. It is answered
+`400 … outcome=refused rejected=duplicate-identifier offset=0`, a reason about an *object* rather than
+a byte, and three things then hold together. The generation the answer names is the one still running;
+`GET /config` still states the committed document as a configuration, so the store did not take part
+of what it rejected; and the traffic injected afterwards still gets the committed policy's verdicts,
+which is the dataplane's own statement that its table did not change. The refusal is compared against
+the reason `config::load` gives the same bytes rather than against a literal, and against the *stage*
+that produced it — the two vocabularies are one, so a rule's refusal answering a parse reason would
+otherwise pass on the right token for the wrong reason.
+
+*Generation 0 forwards nothing.* Every other scenario boots a document the gate has already proved
+the appliance accepts, so none of them can reach the fail-closed generation. The `fail-closed-boot`
+scenario builds its image around the same duplicate-id document and boots it. The node comes up, every
+protection domain starts, the recorder puts its witness on the medium — and nothing crosses: the
+probes it injects are the shipped document's own, between the same endpoints over the same ports, and
+their absence is therefore the policy having never been committed rather than a missing route. What it
+says about itself is on the console, which is the only surface it has:
+
+```
+LFW-CFG time=… generation=0 rejected=duplicate-identifier offset=0
+LFW-PD  time=… domain=config state=refused
+LFW-CFG time=… generation=0 outcome=applied changes=0
+```
+
+and, as the clause with teeth, no `outcome=` record for any generation above zero and no change record
+at all. That the document is one the appliance refuses is **declared** rather than discovered: it is
+registered as refused in the one list of every configuration document in the tree, and the fast gate
+holds it to exactly that — a document listed as refused that every rule accepts fails the gate for
+saying so, long before the boot, so the scenario cannot quietly come to prove the opposite of what it
+claims.
 
 **Missing.**
 
@@ -1050,6 +1146,9 @@ verdicts reversed, with the totals rising across the swap rather than resetting.
   `librefirewall_configuration_submissions_total{outcome="refused"}` reads 1 and its generation reads
   0, which is a signal — but it has no address, so nothing can ask it for either. A submitted
   document's refusal is answered to the client that submitted it and counted in the same family.
+  This is a property of the design rather than an omission, and the `fail-closed-boot` scenario is
+  stated within it: the console and the absence of any forwarded frame are its whole evidence,
+  because they are the whole of what such a node offers.
 
 ## Console device and log transport
 
@@ -1112,7 +1211,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the thirteen system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 16 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected. Both halves were needed to make the defect non-recurring: a missing
@@ -1332,7 +1431,7 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the thirteen scenarios additionally hold the console's own record to the frames and the bytes
+Two of the 16 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1588,7 +1687,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the thirteen QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the 16 QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -1909,8 +2008,8 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `crates/` and `pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-three library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (thirteen system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the ten scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 24 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| QEMU end-to-end gate (16 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

@@ -81,6 +81,18 @@ const CONSOLE_PAGE: &str = "book/src/reference/console.md";
 /// The metrics reference chapter.
 const METRICS_PAGE: &str = "book/src/reference/metrics.md";
 
+/// The status detail chapter, which is read for one thing only: the counts it
+/// states about the gate.
+///
+/// Not for its prose, and not for its status verdicts — those are a human's
+/// judgement about the product and no comparison can make them. What is readable as
+/// data is a number it states about a list this build holds: how many system
+/// scenarios there are, how many of them reach the management port, and how many
+/// library crates carry the coverage floor. Every one of those had gone stale at
+/// least once, silently, with every stage of the gate green — which is the same
+/// defect the two chapters above are read for.
+const STATUS_DETAIL_PAGE: &str = "book/src/developers/status-detail.md";
+
 /// Which console vocabulary a source file's hyphen-bearing lowercase literals
 /// belong to.
 enum Vocabulary {
@@ -170,11 +182,14 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     let metrics = read_page(root, METRICS_PAGE)?;
     let literals = budgets::production_literals(root)?;
 
+    let status = read_page(root, STATUS_DETAIL_PAGE)?;
+
     let mut findings = Vec::new();
     check_literal_sites(&literals, &mut findings);
     check_causes(&literals, &console, &mut findings);
     check_reject_reasons(&console, &mut findings);
     check_metric_families(&metrics, &mut findings);
+    check_stated_counts(&status, &mut findings);
 
     if findings.is_empty() {
         // Said out loud, like every other stage of the gate. A check that passes
@@ -183,7 +198,8 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
         println!(
             "reference: {CONSOLE_PAGE} and {METRICS_PAGE} agree with the code they describe: \
              every refusal cause token, every `rejected=` reason, and every metric family with \
-             its type, labels and publishing domains"
+             its type, labels and publishing domains; and every count \
+             {STATUS_DETAIL_PAGE} states about the gate agrees with the list it is about"
         );
         return Ok(());
     }
@@ -197,9 +213,89 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     }
     let _ = write!(
         report,
-        "\n  ({CONSOLE_PAGE}, {METRICS_PAGE}; this comparison is `xtask::reference_contract`)"
+        "\n  ({CONSOLE_PAGE}, {METRICS_PAGE}, {STATUS_DETAIL_PAGE}; this comparison is \
+         `xtask::reference_contract`)"
     );
     Err(report)
+}
+
+/// Every count the status detail chapter states about a list this build holds,
+/// with the phrase it states it in.
+///
+/// **The phrase is the handle, and a number in front of it is the claim.** Every
+/// occurrence that states a number is compared, and the page must state at least
+/// one — so a claim that went stale fails, and a page that dropped the claim
+/// entirely fails too. An occurrence with *no* number is prose and is left alone:
+/// "every system scenario boots the release image" is a sentence, not a count, and
+/// a checker that demanded a number there would be editing the chapter's English
+/// rather than holding its arithmetic.
+///
+/// What that leaves unread, stated rather than discovered: a number deleted from
+/// one occurrence while another keeps it. The claim still exists, so this passes,
+/// and the sentence that lost its number is now prose. It is the same shape of gap
+/// the two reference chapters' checks leave, and it is closed the same way — by a
+/// reader.
+///
+/// The counts are written as digits in the chapter, as the two gated reference
+/// chapters already write theirs, because that is what makes them readable back.
+const STATED_COUNTS: &[StatedCount] = &[
+    StatedCount {
+        phrase: "system scenarios",
+        count: || crate::qemu::SCENARIOS.len(),
+    },
+    StatedCount {
+        phrase: "scenarios that reach the management port",
+        count: || {
+            crate::qemu::SCENARIOS
+                .iter()
+                .filter(|scenario| scenario.reaches_the_management_port())
+                .count()
+        },
+    },
+    StatedCount {
+        phrase: "library crates",
+        count: crate::host::library_crate_count,
+    },
+];
+
+/// One count the chapter states, and the list this build reads it back from.
+struct StatedCount {
+    /// The words the claim is written in, which is how this check finds it.
+    phrase: &'static str,
+    /// The number the code holds, read rather than restated.
+    count: fn() -> usize,
+}
+
+/// Hold every count the status detail chapter states about the gate to the list it
+/// is about.
+fn check_stated_counts(status: &str, findings: &mut Vec<String>) {
+    let flat = flatten(status);
+    for StatedCount { phrase, count } in STATED_COUNTS {
+        let owed = count();
+        let stated: Vec<usize> = stated_counts_before(&flat, phrase)
+            .into_iter()
+            .flatten()
+            .collect();
+        if stated.is_empty() {
+            findings.push(format!(
+                "{STATUS_DETAIL_PAGE} states no count before \"{phrase}\" anywhere, so the {owed} \
+                 this build holds is compared against nothing. The phrase is the handle this \
+                 check finds the claim by, so a rewording that drops it puts the number back out \
+                 of reach"
+            ));
+            continue;
+        }
+        for (at, found) in stated.iter().enumerate() {
+            if *found != owed {
+                findings.push(format!(
+                    "{STATUS_DETAIL_PAGE} says \"{found} {phrase}\" and this build holds {owed} \
+                     (the {} of {} place(s) that state a number)",
+                    at + 1,
+                    stated.len()
+                ));
+            }
+        }
+    }
 }
 
 fn read_page(root: &Path, page: &str) -> Result<String, String> {
@@ -796,14 +892,37 @@ fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The decimal number before *every* occurrence of `phrase`, in order.
+///
+/// Every one rather than the first, because a page states the same count in several
+/// places — "11 of the 16 system scenarios" in one section and "16 system
+/// scenarios" in a table row — and checking one of them leaves the others free to
+/// drift. An occurrence with no number before it yields `None`, so a claim this
+/// reader cannot check is reported rather than skipped.
+fn stated_counts_before(text: &str, phrase: &str) -> Vec<Option<usize>> {
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some(at) = text.get(from..).and_then(|rest| rest.find(phrase)) {
+        let absolute = from + at;
+        found.push(text.get(..absolute).and_then(trailing_count));
+        from = absolute + phrase.len();
+    }
+    found
+}
+
 /// The decimal number immediately before `phrase`'s first occurrence.
 ///
-/// This is how both chapters state a count about themselves — "23 the
-/// `nic-driver` domain raises", "74 families", "one of 30 reasons" — so reading
-/// the number back is reading the claim rather than a restatement of it.
+/// This is how both reference chapters state a count about themselves — "23 the
+/// `nic-driver` domain raises", "74 families", "one of 30 reasons" — so reading the
+/// number back is reading the claim rather than a restatement of it.
 fn stated_count_before(text: &str, phrase: &str) -> Option<usize> {
     let at = text.find(phrase)?;
-    let before = text[..at].trim_end();
+    text.get(..at).and_then(trailing_count)
+}
+
+/// The decimal number `text` ends in, ignoring trailing space.
+fn trailing_count(text: &str) -> Option<usize> {
+    let before = text.trim_end();
     let digits: String = before
         .chars()
         .rev()

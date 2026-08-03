@@ -45,6 +45,8 @@ use config::{
 };
 use net_headers::{Ipv4Address, Protocol, prefix_mask};
 
+use crate::image::Standing;
+
 /// Dataplane ports the appliance is built with, and so the ports this harness
 /// plays a station on. A property of the build — the system description
 /// declares a driver instance per port — which is why it is `config`'s constant
@@ -196,7 +198,44 @@ impl Topology {
     /// # Errors
     /// [`TopologyError`], as [`Topology::read`].
     pub(crate) fn from_document(document: &[u8]) -> Result<Self, TopologyError> {
-        let model = config::load(document).map_err(TopologyError::Refused)?;
+        Self::from_document_with(document, Standing::Accepted)
+    }
+
+    /// Read the bench out of a document whose [`Standing`] is `standing`.
+    ///
+    /// The two standings read the same bench by two different paths, and the
+    /// difference is which half of `config::load` has to succeed.
+    /// [`Standing::Accepted`] needs both: a document the appliance would refuse
+    /// describes a bench no contract can be stated against, because the appliance
+    /// in the image would never commit it.
+    /// [`Standing::RefusedByRule`] needs the *reader* to accept it and a rule to
+    /// refuse it — which is exactly the shape that still names its interfaces, its
+    /// neighbours and its management port, so the bench is readable while the
+    /// policy is not committable.
+    ///
+    /// The expectation is asserted rather than tolerated in both directions. A
+    /// document declared refused that the rules accept yields
+    /// [`TopologyError::UnexpectedlyAccepted`], because a scenario built around
+    /// "the appliance will not commit this" would otherwise pass while proving the
+    /// opposite of what it says.
+    ///
+    /// # Errors
+    /// [`TopologyError`], as [`Topology::read`], plus the mismatch above.
+    pub(crate) fn from_document_with(
+        document: &[u8],
+        standing: Standing,
+    ) -> Result<Self, TopologyError> {
+        let model = match standing {
+            Standing::Accepted => config::load(document).map_err(TopologyError::Refused)?,
+            Standing::RefusedByRule => {
+                let parsed = config::parse(document)
+                    .map_err(|fault| TopologyError::Refused(ConfigError::Document(fault)))?;
+                match config::validate(&parsed) {
+                    Err(_) => parsed,
+                    Ok(()) => return Err(TopologyError::UnexpectedlyAccepted),
+                }
+            }
+        };
         let mut topology = Self::from_model(&model)?;
         topology.document = document.to_vec();
         Ok(topology)
@@ -509,21 +548,48 @@ fn same_prefix(left: [u8; 4], right: [u8; 4], prefix_length: u8) -> bool {
 /// Why a document does not describe a bench this harness can play.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TopologyError {
-    Unreadable { path: String, error: String },
+    Unreadable {
+        path: String,
+        error: String,
+    },
     Refused(ConfigError),
-    PortBeyondTheBuild { port: usize },
-    PortUnclaimed { port: usize },
-    PortClaimedTwice { port: usize },
-    PortDisabled { port: usize },
-    PortWithoutAStation { port: usize },
-    PortWithSeveralStations { port: usize },
-    NeighbourOnAnUnclaimedPort { id: Identifier },
+    /// A document declared to be one the appliance refuses that every rule
+    /// accepts. Carries nothing: what is wrong is the absence of a refusal, and
+    /// there is no value to name.
+    UnexpectedlyAccepted,
+    PortBeyondTheBuild {
+        port: usize,
+    },
+    PortUnclaimed {
+        port: usize,
+    },
+    PortClaimedTwice {
+        port: usize,
+    },
+    PortDisabled {
+        port: usize,
+    },
+    PortWithoutAStation {
+        port: usize,
+    },
+    PortWithSeveralStations {
+        port: usize,
+    },
+    NeighbourOnAnUnclaimedPort {
+        id: Identifier,
+    },
     NoManagementInterface,
     ManagementDisabled,
-    ManagementPrefixHasNoStation { address: [u8; 4] },
-    PolicyIsNotTwoPortRules { rules: usize },
+    ManagementPrefixHasNoStation {
+        address: [u8; 4],
+    },
+    PolicyIsNotTwoPortRules {
+        rules: usize,
+    },
     PolicyDoesNotAcceptAndDrop,
-    PolicyDecidesOnePortTwice { port: u16 },
+    PolicyDecidesOnePortTwice {
+        port: u16,
+    },
     PolicyLeavesNoUnmatchedPort,
 }
 
@@ -537,6 +603,11 @@ impl fmt::Display for TopologyError {
                 f,
                 "the configuration domain would refuse this document: {}",
                 error.reason().name()
+            ),
+            Self::UnexpectedlyAccepted => f.write_str(
+                "this document is declared to be one the appliance refuses and every rule \
+                 accepts it, so a scenario built around its refusal would prove the opposite of \
+                 what it says while passing",
             ),
             Self::PortBeyondTheBuild { port } => write!(
                 f,

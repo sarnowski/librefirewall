@@ -99,6 +99,14 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-rtc",
 ];
 
+/// How many library crates carry the coverage floors.
+///
+/// Exposed so the status pages' claim about that number is held to this list
+/// rather than restated beside it ([`crate::reference_contract`]).
+pub(crate) fn library_crate_count() -> usize {
+    LIBRARY_PACKAGES.len()
+}
+
 /// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced
 /// by the fast gate so a coverage regression fails locally and in CI. Set well
 /// below the measured ~99.3% combined coverage: a real floor that is not
@@ -210,7 +218,7 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // into `make ci`, after every host stage and every earlier scenario has
     // passed — so leaving them out put the cheapest possible finding behind the
     // most expensive gate there is.
-    for document in image::EVERY_CONFIGURATION_DOCUMENT {
+    for (document, _) in image::EVERY_CONFIGURATION_DOCUMENT {
         image::check_configuration(root, Path::new(document))?;
     }
     run_command(

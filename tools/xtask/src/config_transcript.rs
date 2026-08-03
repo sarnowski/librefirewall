@@ -78,6 +78,10 @@ pub(crate) enum ContractError {
     /// bytes: every field of one is a parsed domain type, so the rendering is
     /// the same closed vocabulary a console line is.
     Unrenderable { event: String },
+    /// Every rule accepts it, where a contract was asked for that is *about* the
+    /// refusal: a fail-closed transcript over an accepted document would assert
+    /// nothing at all.
+    Accepted,
 }
 
 impl std::fmt::Display for ContractError {
@@ -95,6 +99,10 @@ impl std::fmt::Display for ContractError {
             Self::Unrenderable { event } => write!(
                 f,
                 "{event} does not fit the {MAX_LINE_LEN}-byte console line"
+            ),
+            Self::Accepted => f.write_str(
+                "every rule accepts this document, so there is no refusal to state a fail-closed \
+                 transcript against",
             ),
         }
     }
@@ -283,6 +291,203 @@ impl ConfigContract {
         }
     }
 }
+
+/// The transcript a boot must produce when the appliance **refuses the document
+/// its own image carries**.
+///
+/// The mirror of [`ConfigContract`], and the case that one exists to rule out: it
+/// refuses any `rejected=` record, because a node that would not commit its own
+/// configuration is the larger finding on every scenario but this one. Here the
+/// refusal *is* the contract.
+///
+/// # Why the console is the whole of the evidence
+///
+/// Such a node has committed no generation, and the management port is unaddressed
+/// until one commits — so there is no endpoint to scrape, no recording to download
+/// and no counter to read. What is left is the serial capture and the absence of
+/// any forwarded frame, and those two are what a fail-closed scenario is judged by.
+/// A harness that reached for a metric here would be asking a node with no address
+/// for its opinion.
+///
+/// # The three records, and why no two of them are enough
+///
+/// * **The refusal**, from the configuration domain: `generation=0` with the
+///   `rejected=` reason the document's own text produces. On its own it would leave
+///   "the document was refused" and "the dataplane went on forwarding under
+///   something" indistinguishable.
+/// * **The domain's own state**, `config state=refused` on the lifecycle channel:
+///   the domain that could not come up under the document its image carries says so
+///   where an operator watching domains come up will see it. On its own it names no
+///   reason.
+/// * **The forwarding domain's fail-closed record**, `generation=0
+///   outcome=applied changes=0`, which every boot emits in `init` — and which here
+///   is the *last* thing that channel says about a generation. That is the clause
+///   with teeth: what must be absent is any `outcome=applied` for a generation
+///   above zero and any change record at all, because either would be a document
+///   this appliance refused reaching the dataplane anyway.
+pub(crate) struct RefusedContract {
+    /// The token the appliance's refusal must name, taken from the document by the
+    /// same `config::load` the configuration domain runs — so the expectation is
+    /// derived from the document and the crate under test rather than written down.
+    reason: String,
+    /// The one `LFW-CFG` record the configuration domain must emit, rendered.
+    refusal: String,
+    /// The fail-closed record the forwarding domain emits in `init`.
+    fail_closed: String,
+}
+
+impl RefusedContract {
+    /// Derive the transcript a boot from `document` must produce.
+    ///
+    /// # Errors
+    /// [`ContractError::Accepted`] where every rule accepts the document, so there
+    /// would be no refusal to judge; [`ContractError::Unrenderable`] where a record
+    /// does not fit a console line.
+    pub(crate) fn from_document(document: &[u8]) -> Result<Self, ContractError> {
+        let Err(refusal) = config::load(document) else {
+            return Err(ContractError::Accepted);
+        };
+        let reason = refusal.reason();
+        Ok(Self {
+            reason: reason.name().to_owned(),
+            // `offset=0`, and it is the document's fact rather than a placeholder:
+            // `config`'s own `offset` reports zero for a semantic refusal, because
+            // such a refusal is about an object and an index into the bytes would
+            // point at the XML declaration.
+            refusal: line(&Event::ConfigRejected {
+                generation: 0,
+                reason,
+                offset: 0,
+            })?,
+            fail_closed: Self::fail_closed()?,
+        })
+    }
+
+    /// The forwarding domain's `init` record, which is the same one every boot
+    /// emits — and on this boot the last word that channel has about a generation.
+    fn fail_closed() -> Result<String, ContractError> {
+        ConfigContract::fail_closed()
+    }
+
+    /// Whether the capture already carries everything this contract is about, which
+    /// is what lets a run stop waiting rather than spend its whole budget.
+    ///
+    /// Deliberately only the *positive* half: the absences are judged once the
+    /// capture is complete, because a record that has not arrived yet and one that
+    /// never will look alike while a guest is still running.
+    pub(crate) fn satisfied(&self, serial: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(serial);
+        let carried = config_records(&text);
+        let observed = borrowed(&carried);
+        observed.contains(&self.refusal.as_str())
+            && observed.contains(&self.fail_closed.as_str())
+            && refused_domains(&text).contains(&CONFIG_DOMAIN)
+    }
+
+    /// Judge one boot's complete serial capture.
+    ///
+    /// # Errors
+    /// The verdict, naming which of the three records is missing or which record
+    /// the channel carried that a refused document may not produce.
+    pub(crate) fn judge(&self, serial: &[u8], log: &Path) -> Result<(), String> {
+        let text = String::from_utf8_lossy(serial);
+        let carried = config_records(&text);
+        let observed = borrowed(&carried);
+        let where_to_look = format!(
+            "\n  observed: {observed:#?}\n  full run log: {}",
+            log.display()
+        );
+
+        if !observed.contains(&self.refusal.as_str()) {
+            return Err(format!(
+                "the configuration channel carries no record refusing the document this image was \
+                 built from. It must carry {:?} exactly once — a node that committed the document \
+                 anyway is one that disagrees with its own validator{where_to_look}",
+                self.refusal
+            ));
+        }
+        let refusals = observed
+            .iter()
+            .filter(|record| **record == self.refusal)
+            .count();
+        if refusals != 1 {
+            return Err(format!(
+                "the configuration channel carries the refusal {refusals} times and the domain \
+                 refuses one document once, in `init`{where_to_look}"
+            ));
+        }
+        if !refused_domains(&text).contains(&CONFIG_DOMAIN) {
+            return Err(format!(
+                "the configuration domain refused the document and never reported \
+                 `state=refused` on the lifecycle channel, so an operator watching domains come \
+                 up sees a healthy node{where_to_look}"
+            ));
+        }
+        if !observed.contains(&self.fail_closed.as_str()) {
+            return Err(format!(
+                "the forwarding domain never reported {:?}, so nothing says it came up running \
+                 the empty table{where_to_look}",
+                self.fail_closed
+            ));
+        }
+        // The clause with teeth, and the reason the two records above are not the
+        // contract on their own: nothing may have reached the dataplane.
+        let committed: Vec<&str> = observed
+            .iter()
+            .copied()
+            .filter(|record| record.contains(" outcome=") && *record != self.fail_closed.as_str())
+            .collect();
+        if !committed.is_empty() {
+            return Err(format!(
+                "the appliance refused the document its image carries and the configuration \
+                 channel still reports {committed:#?}. Generation 0 is the empty table, so a \
+                 generation above it is a document this appliance refused deciding \
+                 traffic{where_to_look}"
+            ));
+        }
+        let changes: Vec<&str> = observed
+            .iter()
+            .copied()
+            .filter(|record| record.contains(" change="))
+            .collect();
+        if !changes.is_empty() {
+            return Err(format!(
+                "the appliance refused the document its image carries and the configuration \
+                 channel reports {} value(s) moved: {changes:#?}. A refusal is judged before \
+                 anything is committed, so a change record means the store moved under a document \
+                 that never passed{where_to_look}",
+                changes.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// One clause naming what this transcript rests on, for a passing run.
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "the appliance refused its own document as `{}`, reported `config state=refused`, and \
+             committed nothing above generation 0",
+            self.reason
+        )
+    }
+}
+
+/// How the lifecycle channel spells the configuration domain.
+const CONFIG_DOMAIN: &str = "config";
+
+/// Every domain that reported `state=refused` on the lifecycle channel.
+fn refused_domains(text: &str) -> Vec<&str> {
+    crate::console_records::lifecycle_records(text)
+        .into_iter()
+        .filter(|record| {
+            crate::console_records::value(record, "state") == Some(DOMAIN_STATE_REFUSED)
+        })
+        .filter_map(|record| crate::console_records::value(record, "domain"))
+        .collect()
+}
+
+/// The lifecycle state a domain that could not come up reports.
+const DOMAIN_STATE_REFUSED: &str = "refused";
 
 /// Render one event as the console line the domain's own `Sink` would write,
 /// less its instant.

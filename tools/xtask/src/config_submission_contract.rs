@@ -88,6 +88,28 @@ pub const NARROWED: &[u8] = include_bytes!("../scenarios/revocation-narrow.xml")
 /// conversation is the reason for. Submitted by the related-traffic scenario.
 pub const RELATED: &[u8] = include_bytes!("../scenarios/related-icmp.xml");
 
+/// The shipped document with its two rules given one id: a document that **parses
+/// cleanly and a rule refuses**.
+///
+/// It is the second of the two refusals every reconfiguration scenario makes, and
+/// the two are refused at different stages on purpose. [`MALFORMED`] is stopped by
+/// the reader, which never builds a model at all, so "nothing moved" is almost
+/// structural there. This one gets all the way through the reader: a whole model
+/// exists, its interfaces and neighbours are sound, and the *rules* are what fail
+/// — which is the case where a half-applied commit is actually conceivable, and so
+/// the case worth showing on a booted node.
+///
+/// `image::DUPLICATE_RULE_ID_DOCUMENT` names the same file, registered there as one
+/// the appliance refuses, so the fast gate holds it to being refused by a rule
+/// rather than by the reader. The same bytes are booted into an image by the
+/// fail-closed scenario, which is what makes the pair one statement: this document
+/// is refused for the same reason whichever way it reaches a node.
+pub const REFUSED_BY_RULE: &[u8] = include_bytes!("../scenarios/duplicate-rule-id.xml");
+
+/// A document the **reader** refuses: unterminated, so the refusal is about a byte
+/// and an operator can act on it with no knowledge of this appliance's capacities.
+const MALFORMED: &[u8] = b"<configuration><interfaces><interface id=\"broken\"";
+
 /// The gauge the connection table publishes its occupancy under, one series per
 /// state.
 const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
@@ -113,9 +135,12 @@ pub struct Applied {
     pub generation: u32,
     /// The document the node stated after the change.
     pub after: String,
-    /// The line the malformed submission was refused with.
+    /// The line the malformed submission was refused with — the reader's refusal.
     pub refusal: String,
-    /// The generation still running after that refusal.
+    /// And the line the document a **rule** refused was refused with, which is the
+    /// half a parse failure cannot show: a model existed and was thrown away whole.
+    pub rule_refusal: String,
+    /// The generation still running after both refusals.
     pub unmoved: u32,
 }
 
@@ -129,11 +154,13 @@ impl Applied {
              \x20   POST /config        -> 200 {}\n\
              \x20   GET  /config after  -> {} bytes, the document it now states\n\
              \x20   POST /config (bad)  -> 400 {}\n\
-             \x20   the forwarding domain reports generation {}, which the refusal left it on",
+             \x20   POST /config (rule) -> 400 {}\n\
+             \x20   the forwarding domain reports generation {}, which neither refusal moved",
             self.before.len(),
             self.answer,
             self.after.len(),
             self.refusal,
+            self.rule_refusal,
             self.unmoved,
         )
     }
@@ -303,9 +330,37 @@ pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Appl
         ));
     }
 
-    // And the fail-closed half, with something to lose: a malformed document must
-    // be refused with a reason and must move nothing.
-    let refusal = refuse(host_port, generation)?;
+    // And the fail-closed half, with something to lose: a refused document must be
+    // answered with a reason and must move nothing. Twice, because the two
+    // interesting refusals happen at different stages and only one of them is
+    // structurally safe.
+    //
+    // First the reader's: an unterminated document that never becomes a model.
+    let refusal = refuse(host_port, generation, MALFORMED, RefusedBy::Reader)?;
+    // Then the one a parse failure cannot show. This document reads cleanly — a
+    // whole model exists, its addressing sound — and a rule about the policy refuses
+    // it, which is the only case in which a configuration could half-apply at all.
+    let rule_refusal = refuse(host_port, generation, REFUSED_BY_RULE, RefusedBy::Rule)?;
+    // And the half that makes that a statement about the *store* rather than about
+    // the answer on the wire: the node still states the document it committed, byte
+    // for byte as a configuration. A commit that had taken the refused document's
+    // rules and kept its own interfaces would answer a refusal and read back as
+    // something neither document describes.
+    let after_the_refusals = state(host_port, "after both refusals")?;
+    let still_running = config::load(after_the_refusals.as_bytes()).map_err(|error| {
+        format!(
+            "after two refusals the node states a document it would not itself accept ({error:?}), \
+             so a refusal left the store holding something no document describes:\n\
+             {after_the_refusals}"
+        )
+    })?;
+    if !submitted.has_same_content(&still_running) {
+        return Err(format!(
+            "two documents were refused and the node now states a configuration that is not the \
+             one it committed, so a refusal applied part of what it rejected:\n\
+             {after_the_refusals}"
+        ));
+    }
 
     // Only now is the dataplane waited for. The configuration domain answered when
     // *it* committed; the forwarding domain switches between two polls, and the
@@ -320,8 +375,11 @@ pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Appl
         .body;
     for (family, outcome, least) in [
         (SUBMISSIONS, Some("applied"), 2u64),
-        (SUBMISSIONS, Some("refused"), 1),
-        (READS, None, 2),
+        // Two refusals now, at the two stages, and the count is where the deciding
+        // domain says so independently of the two answers on the wire.
+        (SUBMISSIONS, Some("refused"), 2),
+        // Three reads: before the change, after it, and after both refusals.
+        (READS, None, 3),
     ] {
         let reported = counted(&exposition, family, outcome).ok_or_else(|| {
             format!(
@@ -346,6 +404,7 @@ pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Appl
         generation,
         after,
         refusal,
+        rule_refusal,
         unmoved,
     })
 }
@@ -548,17 +607,81 @@ fn plain(exposition: &str, family: &str) -> Option<u64> {
     })
 }
 
-/// A malformed document, refused with a reason and changing nothing.
+/// Which half of `config::load` a submitted document is expected to be refused by.
 ///
-/// The document is unterminated rather than semantically wrong, so the refusal is
-/// the *reader's* and the reason is one an operator can act on with no knowledge
-/// of this appliance's capacities.
-fn refuse(host_port: u16, running: u32) -> Result<String, String> {
-    const MALFORMED: &[u8] = b"<configuration><interfaces><interface id=\"broken\"";
-    let answered = request(host_port, "POST", "/config", Some(MALFORMED))?;
+/// The distinction is the whole reason there are two refusals rather than one. A
+/// document the **reader** stops never becomes a model, so "nothing was committed"
+/// is nearly structural: there was nothing to commit. A document a **rule** stops
+/// got all the way through the reader — a whole model existed, was judged, and was
+/// thrown away entire — which is the only case where a *partly* applied
+/// configuration is even conceivable, and therefore the case worth showing on a
+/// booted node.
+///
+/// It is also what the reason token is checked against: a rule's refusal that
+/// answered a parse reason, or the other way round, would name a token from the
+/// right vocabulary for the wrong stage, and the token alone cannot tell them
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusedBy {
+    Reader,
+    Rule,
+}
+
+impl RefusedBy {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Reader => "the reader",
+            Self::Rule => "a semantic rule",
+        }
+    }
+}
+
+/// Submit a document this appliance refuses and hold the refusal to naming the
+/// right reason, at the right stage, and to having moved nothing.
+///
+/// The expected reason is not written here: it comes from running the same
+/// `config::load` the appliance runs over the same bytes, so a refusal is compared
+/// against the crate under test rather than against a literal that could be wrong
+/// about both sides at once. The stage is asserted the same way — `ConfigError`'s
+/// two variants *are* the two stages — so a document that is not refused where this
+/// case says it is fails here rather than being judged under the wrong claim.
+///
+/// # Errors
+/// The verdict, naming what the endpoint answered and what was owed.
+fn refuse(
+    host_port: u16,
+    running: u32,
+    document: &[u8],
+    stage: RefusedBy,
+) -> Result<String, String> {
+    let owed = match (stage, config::load(document)) {
+        (RefusedBy::Reader, Err(config::ConfigError::Document(fault))) => fault.reason(),
+        (RefusedBy::Rule, Err(config::ConfigError::Semantic(fault))) => fault.reason(),
+        (_, Err(other)) => {
+            return Err(format!(
+                "this case submits a document {} must refuse and `config::load` refuses it \
+                 elsewhere, as `{}`. The two stages answer reasons from one vocabulary, so a \
+                 refusal judged under the wrong stage would pass on the right token for the wrong \
+                 reason",
+                stage.describe(),
+                other.reason().name()
+            ));
+        }
+        (_, Ok(_)) => {
+            return Err(format!(
+                "this case submits a document {} must refuse and `config::load` accepts it, so \
+                 the node would commit it and the assertion that a refusal moves nothing would be \
+                 stated about a commit",
+                stage.describe()
+            ));
+        }
+    };
+
+    let answered = request(host_port, "POST", "/config", Some(document))?;
     if answered.status != Status::BadRequest.code() {
         return Err(format!(
-            "a malformed document was answered {} rather than {}: {:?}",
+            "a document {} refuses was answered {} rather than {}: {:?}",
+            stage.describe(),
             answered.status,
             Status::BadRequest.code(),
             answered.body
@@ -576,6 +699,15 @@ fn refuse(host_port: u16, running: u32) -> Result<String, String> {
             "a refused document named `{reason}`, which is not one of the {} reasons the console \
              vocabulary carries",
             lfw_log::RejectReason::ALL.len()
+        ));
+    }
+    if reason != owed.name() {
+        return Err(format!(
+            "a document {} refuses as `{}` was answered `{reason}`. The reason is what an operator \
+             acts on, and one naming the wrong stage sends them to look at the wrong thing — a \
+             byte offset for a rule about an object, or an object for a malformed byte: {line:?}",
+            stage.describe(),
+            owed.name()
         ));
     }
     if token(&line, "outcome").as_deref() != Some("refused") {

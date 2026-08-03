@@ -90,22 +90,98 @@ pub(crate) const ALTERNATE_DOCUMENT: &str = "tools/xtask/scenarios/alternate-add
 /// [`ALTERNATE_DOCUMENT`]'s reason.
 pub(crate) const LIFECYCLE_DOCUMENT: &str = "tools/xtask/scenarios/protocol-agnostic-policy.xml";
 
-/// Every configuration document in the tree: the one that ships, and the
-/// harness's own, each of which an end-to-end scenario builds a disk from.
+/// What the configuration domain says about one document, and so what a build or
+/// a scenario may state with it.
+///
+/// A document a scenario *wants* refused is the awkward case this type exists for.
+/// The fast gate holds every document in the tree to `config::load`, which is what
+/// keeps a scenario from discovering a typo at its own boot a dozen minutes in —
+/// and a fail-closed scenario needs a document that fails exactly that check. So
+/// the expectation is declared rather than the check bypassed: a document listed
+/// as refused and then accepted fails the gate as loudly as the other way round,
+/// which is the whole point. A bypass would have made "the appliance refuses this"
+/// an assumption nothing tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Every rule accepts it. An image built around it commits it at boot and
+    /// forwards under it.
+    Accepted,
+    /// The reader accepts it and a **semantic rule** refuses it, so the refusal is
+    /// about an object in the document rather than about a byte of it.
+    ///
+    /// The stage matters to more than the message. A document the *reader* refuses
+    /// yields no model at all, so nothing can be read out of it — while one refused
+    /// by a rule about the policy still names its interfaces, its neighbours and
+    /// its management port, which is what lets a scenario boot it and address the
+    /// bench it describes. That is why this variant is the one a fail-closed
+    /// scenario uses, and why it is narrower than "refused".
+    RefusedByRule,
+}
+
+/// Every configuration document in the tree, with what the appliance says about
+/// it: the one that ships, and the harness's own, each of which an end-to-end
+/// scenario builds a disk from or submits over HTTP.
 ///
 /// The scenarios name these same constants, so a document a scenario boots is one
 /// this list holds by construction rather than by somebody remembering. That is
 /// what lets the fast gate hold *all* of them to `config::load`: a scenario
 /// document is otherwise refused at that scenario's boot, a dozen minutes into the
 /// full gate, for a finding that costs milliseconds to read.
-pub(crate) const EVERY_CONFIGURATION_DOCUMENT: &[&str] = &[
-    CONFIGURATION_DOCUMENT,
-    ALTERNATE_DOCUMENT,
-    LIFECYCLE_DOCUMENT,
-    SUBMITTED_DOCUMENT,
-    NARROWED_DOCUMENT,
-    RELATED_DOCUMENT,
+///
+/// [`standing_of`] is the only reader of the second column, and it refuses a
+/// document that is not listed here at all — so registering one is not optional.
+pub(crate) const EVERY_CONFIGURATION_DOCUMENT: &[(&str, Standing)] = &[
+    (CONFIGURATION_DOCUMENT, Standing::Accepted),
+    (ALTERNATE_DOCUMENT, Standing::Accepted),
+    (LIFECYCLE_DOCUMENT, Standing::Accepted),
+    (SUBMITTED_DOCUMENT, Standing::Accepted),
+    (NARROWED_DOCUMENT, Standing::Accepted),
+    (RELATED_DOCUMENT, Standing::Accepted),
+    (DUPLICATE_RULE_ID_DOCUMENT, Standing::RefusedByRule),
 ];
+
+/// The one document in the tree the appliance **refuses**, and the only one whose
+/// entry above says so.
+///
+/// It is the shipped document with its two rules given one id, so the reader
+/// accepts it and the rule about unique identifiers refuses it. Two scenarios use
+/// it, at the two points in a node's life a document can arrive:
+///
+/// * **built into an image**, where the configuration domain refuses it at boot and
+///   the node comes up on the fail-closed generation 0 — forwarding nothing, and
+///   saying so on the one channel a node with no address has;
+/// * **submitted over HTTP** to a node already running the shipped document, where
+///   it must be refused with the *rule's* reason and must leave the running
+///   generation and the ruleset exactly as they were.
+///
+/// One document for both because that is the sharper statement: the same bytes are
+/// refused for the same reason whichever way they arrive, and its addressing is the
+/// shipped bench's, so the traffic a fail-closed boot refuses to forward is
+/// byte-for-byte the traffic the shipped document forwards.
+pub(crate) const DUPLICATE_RULE_ID_DOCUMENT: &str = "tools/xtask/scenarios/duplicate-rule-id.xml";
+
+/// What the appliance says about `document`, from the one list that records it.
+///
+/// # Errors
+/// A document this tree does not register. Every document a build or a scenario
+/// reaches for is one the fast gate has already judged, and a path that is not in
+/// that list is one nothing judged — so it is refused here rather than built from.
+pub(crate) fn standing_of(document: &Path) -> Result<Standing, Error> {
+    EVERY_CONFIGURATION_DOCUMENT
+        .iter()
+        .find(|(path, _)| Path::new(path) == document)
+        .map(|(_, standing)| *standing)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "{} is not one of the {} configuration documents this tree registers, so nothing \
+                 has judged what the appliance would say about it. Add it to \
+                 EVERY_CONFIGURATION_DOCUMENT with the standing it is meant to have; the fast gate \
+                 then holds it to exactly that",
+                document.display(),
+                EVERY_CONFIGURATION_DOCUMENT.len()
+            ))
+        })
+}
 
 /// The one document in this tree that is never built into an image: it is
 /// **submitted over the management API** to a node already running
@@ -358,12 +434,31 @@ fn assemble(
 /// hold it to `crates/config` — the same [`config::load`] the configuration
 /// domain runs at boot, so the build refuses exactly what the appliance would
 /// refuse rather than approximating it.
+///
+/// What "refuses" means is the document's own registered [`Standing`], both
+/// directions: a document listed [`Standing::Accepted`] and refused fails, and one
+/// listed [`Standing::RefusedByRule`] and *accepted* fails too. The second half is
+/// the load-bearing one — a fail-closed scenario boots a document precisely
+/// because the appliance will not commit it, and a document that quietly became
+/// valid would leave that scenario proving nothing while passing.
 pub(crate) fn check_configuration(root: &Path, document: &Path) -> Result<(), Error> {
+    let standing = standing_of(document)?;
     let path = root.join(document);
-    let document = fs::read(&path)
+    let bytes = fs::read(&path)
         .map_err(|error| Error::io("read the configuration document", &path, error))?;
-    let model = config::load(&document).map_err(|refusal| {
-        Error::invalid(format!(
+    match (standing, config::load(&bytes)) {
+        (Standing::Accepted, Ok(model)) => {
+            println!(
+                "config: {} declares {} interfaces and {} neighbours, every one of which \
+                 `config::load` accepts — the same judgement the configuration domain makes at \
+                 boot",
+                path.display(),
+                model.interface_count(),
+                model.neighbour_count(),
+            );
+            Ok(())
+        }
+        (Standing::Accepted, Err(refusal)) => Err(Error::invalid(format!(
             "{}: the configuration domain would refuse this document — {}. It is embedded \
              verbatim into pds/config and committed in `init`, and a refused document leaves the \
              handover region untouched: the forwarder stays on generation 0, the node boots \
@@ -371,16 +466,44 @@ pub(crate) fn check_configuration(root: &Path, document: &Path) -> Result<(), Er
              token that line would carry.",
             path.display(),
             located(refusal),
-        ))
-    })?;
-    println!(
-        "config: {} declares {} interfaces and {} neighbours, every one of which `config::load` \
-         accepts — the same judgement the configuration domain makes at boot",
-        path.display(),
-        model.interface_count(),
-        model.neighbour_count(),
-    );
-    Ok(())
+        ))),
+        // The document is registered as one the appliance refuses, and it must be
+        // refused by a *rule* rather than by the reader: a reader's refusal yields
+        // no model, so nothing could read the bench out of it and no scenario could
+        // address the appliance it built.
+        (Standing::RefusedByRule, Err(ConfigError::Semantic(fault))) => {
+            println!(
+                "config: {} is registered as a document the appliance refuses, and \
+                 `config::load` refuses it — {} at {:?}. A node built around it comes up on the \
+                 fail-closed generation 0; submitted to a running node it is answered with that \
+                 reason and moves nothing",
+                path.display(),
+                fault.reason().name(),
+                fault.id().as_str(),
+            );
+            Ok(())
+        }
+        (Standing::RefusedByRule, Err(ConfigError::Document(fault))) => {
+            Err(Error::invalid(format!(
+                "{}: this document is registered as one a semantic RULE refuses, and the reader \
+             refused it first — {} at byte offset {}. A reader's refusal yields no model, so the \
+             bench cannot be read out of it and the scenario that boots it has no addresses to \
+             state a contract between. Make the document well formed and wrong about an object.",
+                path.display(),
+                fault.reason().name(),
+                fault.offset,
+            )))
+        }
+        (Standing::RefusedByRule, Ok(model)) => Err(Error::invalid(format!(
+            "{}: this document is registered as one the appliance refuses and `config::load` \
+             accepts it — {} interfaces and {} neighbours, every rule satisfied. The scenario \
+             that boots it exists to show a node coming up on the fail-closed generation 0, so \
+             an accepted document would have it prove nothing while passing.",
+            path.display(),
+            model.interface_count(),
+            model.neighbour_count(),
+        ))),
+    }
 }
 
 /// The reason a document was refused, and where.

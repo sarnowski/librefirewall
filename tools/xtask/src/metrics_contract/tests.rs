@@ -102,12 +102,29 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
     family(&mut text, FLOW_ENTRIES, "gauge", "Slots.");
     for state in lfw_metrics::FLOW_STATES {
         let count = match state {
-            "vacant" => FLOW_CAPACITY as u64 - 1,
-            "udp_unreplied" => 1,
+            "vacant" => FLOW_CAPACITY as u64 - HELD_FLOWS,
+            "udp_unreplied" => HELD_FLOWS,
             _ => 0,
         };
         text.push_str(&format!(
             "{FLOW_ENTRIES}{{domain=\"forwarder\",state=\"{state}\"}} {count}\n"
+        ));
+    }
+    // And what ended the flows that are not in it any more, so the fixture's
+    // occupancy accounts for its own openings: every opening the table is not
+    // holding was withdrawn, which is what a default-deny appliance does with an
+    // opening its filter refuses.
+    family(&mut text, FLOW_LIFECYCLE, "counter", "Ended.");
+    for event in lfw_metrics::FLOW_LIFECYCLE_EVENTS {
+        let count = match event {
+            "withdrawn" => {
+                forwarded.0 + forwarded.1 + DENIED_PROBES + UNMATCHED_PROBES
+                    - HELD_FLOWS.min(forwarded.0 + forwarded.1 + DENIED_PROBES + UNMATCHED_PROBES)
+            }
+            _ => 0,
+        };
+        text.push_str(&format!(
+            "{FLOW_LIFECYCLE}{{domain=\"forwarder\",event=\"{event}\"}} {count}\n"
         ));
     }
     family(
@@ -291,6 +308,11 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
 const DENIED_PROBES: u64 = 2;
 const UNMATCHED_PROBES: u64 = 1;
 
+/// Flows the fixture's table is holding: one conversation, in `udp_unreplied`.
+/// Every other opening it reports was withdrawn, which is what closes the
+/// bounded-state identity.
+const HELD_FLOWS: u64 = 1;
+
 /// What the harness measured about the filter, with the rules read out of the
 /// shipped document exactly as a scenario reads them. The filter probe set's
 /// witness, so both of its refusal counters are obliged to have risen.
@@ -309,6 +331,7 @@ fn witness() -> PolicyWitness {
         // rule added to it moves the fixture body and this together.
         rules: topology().rule_ids().len(),
         reconfigured: false,
+        flooded_tuples: 0,
     }
 }
 
@@ -1022,4 +1045,145 @@ fn a_boot_that_changed_its_policy_is_judged_on_the_sum_of_its_rules() {
         .expect_err("nine matches short of eleven");
     assert!(verdict.contains("matches between them"), "{verdict}");
     assert!(verdict.contains("two policies"), "{verdict}");
+}
+
+/// The fixture's openings: every frame it reports forwarded plus every one it
+/// reports refused, each of which reached the tracker before the filter decided.
+const FIXTURE_OPENINGS: u64 = 5 + 4 + DENIED_PROBES + UNMATCHED_PROBES;
+
+/// And what it reports gave those slots back: every opening the table is not
+/// holding. Derived rather than written down, so a fixture whose forwarded totals
+/// move takes these cases with it.
+const FIXTURE_WITHDRAWN: u64 = FIXTURE_OPENINGS - HELD_FLOWS;
+
+/// One `librefirewall_flow_lifecycle_total` series of the fixture body, as the
+/// exposition spells it, so a case can bend one number by replacing one line.
+fn ended(event: &str, count: u64) -> String {
+    format!("{FLOW_LIFECYCLE}{{domain=\"forwarder\",event=\"{event}\"}} {count}")
+}
+
+/// One `librefirewall_flow_table_entries` series, on [`ended`]'s terms.
+fn slots(state: &str, count: u64) -> String {
+    format!("{FLOW_ENTRIES}{{domain=\"forwarder\",state=\"{state}\"}} {count}")
+}
+
+/// **A slot the table opened and never gave back is a leak, and the identity is
+/// where it shows.** The occupancy gauge alone cannot say so: a node holding a
+/// hundred stale flows publishes a perfectly consistent occupancy that sums to the
+/// capacity, and only the openings it reports beside it disagree.
+#[test]
+fn an_opening_the_table_neither_holds_nor_accounts_for_is_refused() {
+    let leaked = body((5, 4), (4, 5)).replace(
+        &ended("withdrawn", FIXTURE_WITHDRAWN),
+        &ended("withdrawn", FIXTURE_WITHDRAWN - 1),
+    );
+    let verdict = judge(&only(leaked), 9, witness(), &topology())
+        .expect_err("one opening is neither held nor ended");
+    assert!(verdict.contains("slot leaked"), "{verdict}");
+}
+
+/// The reverse: a slot returned twice. Same identity, other direction, and worth
+/// its own case because the arithmetic is the one place either is visible.
+#[test]
+fn a_slot_the_table_gave_back_twice_is_refused() {
+    let doubled = body((5, 4), (4, 5)).replace(
+        &ended("withdrawn", FIXTURE_WITHDRAWN),
+        &ended("withdrawn", FIXTURE_WITHDRAWN + 1),
+    );
+    let verdict =
+        judge(&only(doubled), 9, witness(), &topology()).expect_err("a slot returned twice");
+    assert!(verdict.contains("returned twice"), "{verdict}");
+}
+
+/// Nothing in this gate reaches the pressure an eviction answers, and an assured
+/// conversation may never be the flow taken — so a rise is refused on every boot
+/// rather than only on the flooding one.
+#[test]
+fn an_eviction_is_refused_on_a_bench_that_cannot_have_needed_one() {
+    // One withdrawal reclassified as an eviction, so the identity still closes and
+    // the eviction clause is what the case is about.
+    let evicted = body((5, 4), (4, 5))
+        .replace(
+            &ended("withdrawn", FIXTURE_WITHDRAWN),
+            &ended("withdrawn", FIXTURE_WITHDRAWN - 1),
+        )
+        .replace(&ended("evicted", 0), &ended("evicted", 1));
+    let verdict = judge(&only(evicted), 9, witness(), &topology()).expect_err("an eviction");
+    assert!(verdict.contains("taken back to"), "{verdict}");
+}
+
+/// A table that turned a new connection away is refused on every boot too: no
+/// scenario injects enough distinct five-tuples to fill a million slots, so the
+/// only way to reach it is a table holding flows nothing gave back.
+#[test]
+fn a_connection_turned_away_for_want_of_room_is_refused() {
+    for reason in ["table_full", "bucket_full"] {
+        let refused = |count: u64| {
+            format!("{FLOW_REFUSED}{{domain=\"forwarder\",reason=\"{reason}\"}} {count}")
+        };
+        // The refusal is one more packet the tracker saw and one the filter never
+        // decided, so the fixture's "every packet went exactly one way" identity
+        // has to close around it.
+        let full = body((5, 4), (4, 5))
+            .replace(&refused(0), &refused(1))
+            .replace(
+                &format!("{FLOW_SEEN}{{domain=\"forwarder\"}} {FIXTURE_OPENINGS}"),
+                &format!(
+                    "{FLOW_SEEN}{{domain=\"forwarder\"}} {}",
+                    FIXTURE_OPENINGS + 1
+                ),
+            );
+        let verdict =
+            judge(&only(full), 9, witness(), &topology()).expect_err("a connection turned away");
+        assert!(verdict.contains("want of room"), "{verdict}");
+    }
+}
+
+/// **The flooding witness, all three of its clauses.** Each is bent on its own, so
+/// a check that silently stopped being made is a case that stops failing rather
+/// than a run that stays green.
+#[test]
+fn a_flood_is_held_to_reaching_the_table_and_leaving_it_bounded() {
+    let flooding = |tuples: u64| PolicyWitness {
+        flooded_tuples: tuples,
+        ..witness()
+    };
+    // The fixture is a bench nothing flooded, so a witness claiming a burst larger
+    // than every opening it reports fails on the first clause: the burst never
+    // reached the table, and every statement below it would be about a quiet bench.
+    let verdict = judge(&pair(), 9, flooding(FIXTURE_OPENINGS + 1), &topology())
+        .expect_err("the witness claims a burst larger than the openings reported");
+    assert!(verdict.contains("did not reach the table"), "{verdict}");
+
+    // The second clause, on a body whose identity still closes: the table is
+    // holding what the flood opened rather than having given it back. Both the
+    // occupancy and the withdrawals move, or the identity would fire first — which
+    // is the right order, an inconsistent table being the larger finding.
+    let kept = body((5, 4), (4, 5))
+        .replace(
+            &slots("vacant", FLOW_CAPACITY as u64 - HELD_FLOWS),
+            &slots("vacant", FLOW_CAPACITY as u64 - 5),
+        )
+        .replace(
+            &slots("udp_unreplied", HELD_FLOWS),
+            &slots("udp_unreplied", 5),
+        )
+        .replace(
+            &ended("withdrawn", FIXTURE_WITHDRAWN),
+            &ended("withdrawn", FIXTURE_WITHDRAWN - 4),
+        );
+    // Eight, so the seven withdrawals the body reports do not cover the burst.
+    let verdict = judge(&only(kept.clone()), 9, flooding(8), &topology())
+        .expect_err("the flood's openings were not given back");
+    assert!(verdict.contains("must be given back"), "{verdict}");
+
+    // The third: the same table against a smaller burst, so the withdrawals cover
+    // it and what is left is an occupancy as large as the flood.
+    let verdict = judge(&only(kept), 9, flooding(4), &topology())
+        .expect_err("the table holds as many flows as the flood opened");
+    assert!(verdict.contains("staying bounded"), "{verdict}");
+
+    // And the passing shape: openings the table gave back beside the one
+    // conversation it keeps, which is what the flood scenario's own scrape is.
+    judge(&pair(), 9, flooding(4), &topology()).expect("a flood the table absorbed");
 }

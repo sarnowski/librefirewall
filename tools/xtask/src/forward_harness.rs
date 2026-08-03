@@ -705,7 +705,11 @@ impl Expectation {
 #[derive(Debug)]
 struct Probe {
     /// Names the probe in a verdict.
-    name: &'static str,
+    ///
+    /// Owned rather than borrowed, because a probe set decides how many probes
+    /// its experiment needs: a flood puts one probe per five-tuple on the wire,
+    /// and a name per tuple cannot be a literal written out beside the set.
+    name: String,
     /// The bytes that distinguish this probe's frames from every other probe's,
     /// so a delivery is attributed to the packet that caused it and a stray can
     /// never satisfy the wrong assertion.
@@ -789,7 +793,7 @@ impl Probe {
     /// wrong; naming the field says whether the router rewrote the wrong MAC,
     /// failed to decrement, or corrupted the payload.
     fn judge(&self, egress: usize, frame: &[u8]) -> Result<Delivery, String> {
-        let name = self.name;
+        let name = &self.name;
         let (expected_egress, expected_bytes, datagram) = match &self.expectation {
             Expectation::Dropped { because } => {
                 return Err(format!(
@@ -903,7 +907,7 @@ impl Seen {
 #[derive(Debug)]
 struct Row {
     seen: Seen,
-    name: &'static str,
+    name: String,
     path: String,
     detail: String,
 }
@@ -917,16 +921,37 @@ pub struct TrafficReport {
     endpoints: [Endpoint; PORTS],
 }
 
+/// Whether the node the report describes had a committed policy to forward under.
+///
+/// It changes what a probe's *absence* means, which is the one thing a table of
+/// absences cannot say for itself. Under a policy, a probe the document admits and
+/// that never came back is a contract unmet and the row must read as one. On a node
+/// that committed nothing, the same absence **is** the contract — nothing may cross
+/// — and a row calling it `missing` would put failure words on the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forwarding {
+    /// A generation is in force, so a probe the policy admits must have crossed.
+    UnderAPolicy,
+    /// The node refused its own configuration and is running generation 0, so
+    /// nothing may cross whatever the probes are addressed to.
+    NothingCommitted,
+}
+
 impl TrafficReport {
     /// Derive the report from what the run recorded: the delivery accepted for
     /// each probe, if any, and the index of the probe whose delivery ended the
     /// run. Deriving it here rather than accumulating lines as the run goes
     /// keeps one place deciding what each state means.
+    ///
+    /// `forwarding` decides how an absence reads, which is the whole of the
+    /// difference between a fail-closed boot's evidence and a routed boot's
+    /// failure — see [`Forwarding`].
     fn new(
         endpoints: [Endpoint; PORTS],
         probes: &[Probe],
         deliveries: &[Option<Delivery>],
         broke: Option<usize>,
+        forwarding: Forwarding,
     ) -> Self {
         let rows = probes
             .iter()
@@ -951,16 +976,27 @@ impl TrafficReport {
                         Seen::Broke,
                         format!("{because}, yet {} bytes came back", delivery.bytes),
                     ),
-                    (false, None, Expectation::Routed { .. }) => {
-                        (Seen::Missing, "never came back".to_owned())
-                    }
+                    (false, None, Expectation::Routed { .. }) => match forwarding {
+                        Forwarding::UnderAPolicy => (Seen::Missing, "never came back".to_owned()),
+                        // The row this boot is run to produce: the shipped
+                        // document forwards this probe, and here it did not
+                        // cross — because no policy was ever committed for it to
+                        // be admitted by.
+                        Forwarding::NothingCommitted => (
+                            Seen::Refused,
+                            String::from(
+                                "the document this image carries forwards it, and this node \
+                                 committed no generation, so nothing admitted it",
+                            ),
+                        ),
+                    },
                     (false, None, Expectation::Dropped { because }) => {
                         (Seen::Refused, (*because).to_owned())
                     }
                 };
                 Row {
                     seen,
-                    name: probe.name,
+                    name: probe.name.clone(),
                     path,
                     detail,
                 }
@@ -1226,7 +1262,7 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
             },
         ),
         Probe {
-            name: "legacy-l2-broadcast",
+            name: String::from("legacy-l2-broadcast"),
             marker: b"LFW-PROBE/legacy-l2-broadcast",
             from: a,
             frame: legacy_broadcast_frame(b"LFW-PROBE/legacy-l2-broadcast"),
@@ -1273,6 +1309,13 @@ pub enum Traffic {
     /// documents' rules and falls to the default deny, which is correct and
     /// leaves a lifecycle unreachable. What it produces that no other set can is
     /// an open event and a close event that says *how* the conversation ended.
+    ///
+    /// The same document is what makes the **other** thing only this set reaches
+    /// possible: an opening segment to the port the *dropping* rule names, which
+    /// that rule refuses. On every other bench a TCP segment is refused by the
+    /// default deny for its protocol, so no rule about a port ever decides one —
+    /// and a filter that matched a port criterion against a datagram's ports and
+    /// nothing else would satisfy every other scenario in this gate.
     Lifecycle,
     /// The set only a *stateful* appliance can pass, and the one no rule of the
     /// shipped policy permits more than half of.
@@ -1324,9 +1367,63 @@ pub enum Traffic {
     /// admission alone would say nothing about the default. Together they are the
     /// policy deciding.
     Related,
+    /// The set that puts a **connection flood** across the appliance: one
+    /// conversation the policy admits, and [`FLOOD_TUPLES`] distinct five-tuples it
+    /// does not.
+    ///
+    /// Every datagram of the burst opens a flow and is then refused by the default
+    /// deny, so the appliance gives each slot back in the same evaluation — which
+    /// is the denial-of-service property a default-deny appliance owes and the one
+    /// the isolation model carries a separate adversary for. The conversation's own
+    /// reply is deferred past the burst, so what its delivery says is that the
+    /// table still held the flow the flood had been arriving alongside.
+    Flood,
 }
 
 impl Traffic {
+    /// Every probe set, so a check stated over all of them cannot be one a new set
+    /// silently escapes.
+    ///
+    /// That it really is every one of them is *checked* rather than asserted here:
+    /// [`Self::position`] is an exhaustive match, so a variant added to this enum
+    /// does not compile without a line there, and
+    /// `the_list_of_every_probe_set_holds_every_one_of_them` holds the two to each
+    /// other. A comment claiming completeness that nothing compared would be the
+    /// defect this exists to close — a set added and left out of the attribution
+    /// check fails at its own boot, minutes in, with the harness in the wrong.
+    ///
+    /// The checks are the only consumer, so it exists only in a test build: a
+    /// production-visible list nothing reads would be dead code.
+    #[cfg(test)]
+    pub const ALL: [Self; 8] = [
+        Self::Routed,
+        Self::Policy,
+        Self::Lifecycle,
+        Self::Stateful,
+        Self::Flood,
+        Self::Reconfiguration,
+        Self::Revocation,
+        Self::Related,
+    ];
+
+    /// Where this set sits in [`Self::ALL`].
+    ///
+    /// Its only purpose is to be an exhaustive match beside that array, so the two
+    /// cannot disagree about which sets exist.
+    #[cfg(test)]
+    const fn position(self) -> usize {
+        match self {
+            Self::Routed => 0,
+            Self::Policy => 1,
+            Self::Lifecycle => 2,
+            Self::Stateful => 3,
+            Self::Flood => 4,
+            Self::Reconfiguration => 5,
+            Self::Revocation => 6,
+            Self::Related => 7,
+        }
+    }
+
     /// The document this set's second wave is decided under, where it submits one
     /// over the management API.
     ///
@@ -1339,7 +1436,7 @@ impl Traffic {
             Self::Reconfiguration => Some(crate::config_submission_contract::SUBMITTED),
             Self::Revocation => Some(crate::config_submission_contract::NARROWED),
             Self::Related => Some(crate::config_submission_contract::RELATED),
-            Self::Routed | Self::Policy | Self::Lifecycle | Self::Stateful => None,
+            Self::Routed | Self::Policy | Self::Lifecycle | Self::Stateful | Self::Flood => None,
         }
     }
 
@@ -1356,6 +1453,7 @@ impl Traffic {
             | Self::Policy
             | Self::Lifecycle
             | Self::Stateful
+            | Self::Flood
             | Self::Reconfiguration
             | Self::Revocation => 0,
         }
@@ -1428,6 +1526,15 @@ pub struct PolicyWitness {
     /// reached the filter and matched something is an opening or a denial, whichever
     /// generation decided it.
     pub reconfigured: bool,
+    /// How many distinct five-tuples this boot floods the appliance with, or zero
+    /// where it floods it with none.
+    ///
+    /// The number the bounded-state claims are stated against: the tracker must
+    /// have opened at least this many flows and given back at least this many, and
+    /// its occupancy must be a small fraction of it rather than a multiple. Zero
+    /// says nothing about the counters — every set that has a probe the filter
+    /// refuses withdraws a flow — so the assertions it gates are one-directional.
+    pub flooded_tuples: u64,
 }
 
 /// The probes one boot injects, and what they oblige the filter to have counted.
@@ -1458,12 +1565,13 @@ fn injected_probes(
         // falls past every rule, and nothing in this set is addressed to the port
         // the dropping rule names.
         Traffic::Stateful => (stateful_probes(topology, policy), false, true, true),
-        // Neither of the filter's refusals: every segment is addressed to the
-        // port the accepting rule names, and the one that is refused is refused
-        // by the tracker before the filter is consulted. So this set obliges both
-        // filter refusal counters to still read zero, which is as strong a
-        // statement as a rise.
-        Traffic::Lifecycle => (lifecycle_probes(topology, policy), false, false, false),
+        // The dropping rule, and not the fallthrough: one segment is addressed to
+        // the port that rule names and every other one to the port the accepting
+        // rule names, so nothing here falls past the last rule. The zero is the
+        // stronger half of the pair, as it is for the routed set — and the rise is
+        // the only place in this gate where a *rule* refuses a TCP segment, every
+        // other bench's rules being about UDP alone.
+        Traffic::Lifecycle => (lifecycle_probes(topology, policy), true, false, false),
         // The dropping rule under both policies — the shipped one refuses the first
         // wave's second probe and the submitted one refuses the second wave's — and
         // the fallthrough under neither: both ports are named by both documents, so
@@ -1478,6 +1586,12 @@ fn injected_probes(
         // related traffic, so the error falls past every rule, and no probe here is
         // addressed to the port the dropping rule names.
         Traffic::Related => (related_probes(topology, policy), false, true, false),
+        // The fallthrough, sixty-four times over plus once for good measure: every
+        // datagram of the burst is addressed to the port no rule is about. Nothing
+        // here carries the dropping rule's port, so that counter must still read
+        // zero — which is what keeps a flood that somehow matched a rule from
+        // reading as the default deny doing its job.
+        Traffic::Flood => (flood_probes(topology, policy), false, true, false),
     };
     Ok((
         probes,
@@ -1485,11 +1599,12 @@ fn injected_probes(
             policy,
             probed_the_denying_rule: denying_rule,
             probed_the_fallthrough: fallthrough || stateful,
-            // The revocation set reaches it deliberately too, and with a packet no
-            // rule permits: the surviving conversation's last frame is carried by
-            // its flow under a policy whose one accept rule is about the other
-            // direction.
-            probed_an_established_flow: stateful || matches!(traffic, Traffic::Revocation),
+            // The revocation and flood sets reach it deliberately too, and each with
+            // a packet no rule permits: the surviving conversation's last frame is
+            // carried by its flow under a policy whose one accept rule is about the
+            // other direction.
+            probed_an_established_flow: stateful
+                || matches!(traffic, Traffic::Revocation | Traffic::Flood),
             probed_mid_stream: stateful,
             // The booted document's rules, plus whatever the submitted one adds.
             rules: topology.rule_ids().len() + traffic.rules_added(),
@@ -1497,6 +1612,16 @@ fn injected_probes(
                 traffic,
                 Traffic::Reconfiguration | Traffic::Revocation | Traffic::Related
             ),
+            flooded_tuples: match traffic {
+                Traffic::Flood => u64::from(FLOOD_TUPLES),
+                Traffic::Routed
+                | Traffic::Policy
+                | Traffic::Lifecycle
+                | Traffic::Stateful
+                | Traffic::Reconfiguration
+                | Traffic::Revocation
+                | Traffic::Related => 0,
+            },
         },
     ))
 }
@@ -1865,7 +1990,7 @@ fn related_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
         // record names no lifecycle event and the whole of what it proves is the
         // delivery and the rule that admitted it.
         after_the_commit(carried_by_its_flow(Probe {
-            name: "related-allowed",
+            name: String::from("related-allowed"),
             marker: b"LFW-PROBE/related-allowed",
             from: b,
             frame: allowed.build(),
@@ -2009,7 +2134,7 @@ fn stateful_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
 }
 
 /// A TCP conversation that opens, is refused a segment outside its window, and
-/// closes — the whole of a connection lifecycle in three frames.
+/// closes — plus the one segment a rule refuses outright.
 ///
 /// **The close is a reset, and that is the shortest honest one.** A graceful close
 /// needs four more segments and every one of them a sequence number this harness
@@ -2025,13 +2150,23 @@ fn stateful_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
 /// all, which is a different refusal. So it is injected exactly once, into the
 /// state the opening established, and its reason is the one that state produces.
 ///
-/// Both segments carry the accepting rule's destination port, so the difference
-/// between the reset's fate and the out-of-window segment's is the connection
-/// table and nothing else. The port comes from `policy` rather than from a
-/// literal, so a document that renamed its ports is asserted against its own text.
+/// The three segments above carry the accepting rule's destination port, so the
+/// difference between the reset's fate and the out-of-window segment's is the
+/// connection table and nothing else.
+///
+/// **The fourth segment is the only probe in this harness a rule refuses for its
+/// protocol.** It is a `SYN` to the port the *dropping* rule names, and it is
+/// reachable on no other bench: both other documents' rules say `protocol="udp"`,
+/// so a TCP segment matches neither and is refused by the default deny — a
+/// refusal that says nothing about protocol matching, since a rule about the port
+/// never decided it. Here the two rules say `protocol="any"`, so the segment
+/// reaches the dropping rule and the rule refuses it: the same rule that drops a
+/// datagram to that port drops a segment to it, and the per-rule counter is what
+/// separates that from the fallthrough. Every port comes from `policy` rather than
+/// from a literal, so a document that renamed its ports is asserted against its
+/// own text.
 fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
     let [a, b] = topology.endpoints();
-    let permitted = policy.accepted.destination_port;
     /// The sequence space the conversation opens on. Its value decides nothing;
     /// what matters is that the two segments below are stated against it.
     const CLIENT_ISN: u32 = 0x0051_0000;
@@ -2039,17 +2174,17 @@ fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
     /// bytes a `SYN` can advertise, so no window this exchange establishes
     /// reaches it.
     const PAST_THE_WINDOW: u32 = 1_000_000;
-    let segment = |flags: u8, sequence: u32, marker: &[u8]| {
+    let to_port = |destination_port: u16, flags: u8, sequence: u32, marker: &[u8]| {
         TcpPacket {
             destination_mac: a.gateway_mac,
             source_mac: a.mac,
             source: a.address,
             destination: b.address,
             source_port: SOURCE_PORT,
-            destination_port: permitted,
+            destination_port,
             flags,
             sequence,
-            // Neither segment carries an `ACK` flag, so the field is read by
+            // No segment here carries an `ACK` flag, so the field is read by
             // nothing and is left at zero rather than given a plausible value
             // nothing would check.
             acknowledgement: 0,
@@ -2058,6 +2193,9 @@ fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
         }
         .build()
     };
+    let permitted = policy.accepted.destination_port;
+    let segment =
+        |flags: u8, sequence: u32, marker: &[u8]| to_port(permitted, flags, sequence, marker);
     vec![
         // `SYN`, which is the only thing that opens a TCP flow here.
         routed_frame(
@@ -2066,7 +2204,26 @@ fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
             a,
             b,
             recording_contract::EVENT_FLOW_OPENED,
-            segment(0x02, CLIENT_ISN, b"LFW-PROBE/lifecycle-open"),
+            segment(TCP_SYN, CLIENT_ISN, b"LFW-PROBE/lifecycle-open"),
+        ),
+        // The same opening segment, one destination port along: routable in every
+        // other respect, and refused because a rule about that port says drop.
+        refused_by_policy(
+            recording_contract::EVENT_POLICY_DENIED,
+            dropped_frame(
+                "lifecycle-denied",
+                b"LFW-PROBE/lifecycle-denied",
+                a,
+                "a rule matched it and says drop, and it is a TCP segment rather than a datagram: \
+                 this bench's rules say `protocol=\"any\"`, so the rule decided it on its port \
+                 rather than the default deny refusing it for its protocol",
+                to_port(
+                    policy.denied.destination_port,
+                    TCP_SYN,
+                    CLIENT_ISN,
+                    b"LFW-PROBE/lifecycle-denied",
+                ),
+            ),
         ),
         // `RST` well past the window the `SYN` opened. Refused, so it moves no
         // state, refreshes no timeout and closes nothing.
@@ -2077,7 +2234,7 @@ fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
             "its sequence number is a million bytes past anything the peer authorised, so the \
              tracker refuses it rather than letting it move the flow",
             segment(
-                0x04,
+                TCP_RST,
                 CLIENT_ISN.wrapping_add(PAST_THE_WINDOW),
                 b"LFW-PROBE/lifecycle-out-of-window",
             ),
@@ -2096,13 +2253,127 @@ fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
                 // One past the `SYN`, which occupies a byte of sequence space of
                 // its own: the reset is the next thing this side sends.
                 segment(
-                    0x04,
+                    TCP_RST,
                     CLIENT_ISN.wrapping_add(1),
                     b"LFW-PROBE/lifecycle-close",
                 ),
             )
         },
     ]
+}
+
+/// How many distinct five-tuples the flood set puts across the appliance.
+///
+/// Chosen against what it has to demonstrate rather than against the table's
+/// size, which nothing this harness can inject would fill: the claim is that
+/// occupancy does not grow with the flood, so the count has to be large enough
+/// that a table holding one conversation is unmistakably not holding the flood
+/// too. Sixty-four openings against the one that survives is a ratio no
+/// accounting slip reproduces, and it is a burst two ports carry in one pass —
+/// the frames go out together, every one of them is refused, and each is put on
+/// the wire again on every retransmission pass until the run settles.
+const FLOOD_TUPLES: u16 = 64;
+
+/// The first source port the flood opens a conversation from; the burst takes
+/// [`FLOOD_TUPLES`] consecutive ports up from here.
+///
+/// High in the ephemeral range and disjoint from every other port this harness
+/// sends from, so no flood conversation can be the one the surviving
+/// conversation is carried by.
+const FLOOD_FIRST_SOURCE_PORT: u16 = 0xf000;
+
+/// The marker every flood datagram carries.
+///
+/// One marker across the whole burst, and that is not a weakening: a marker
+/// attributes a *delivery*, every frame here must be refused, and a frame of
+/// this burst coming back fails the run whichever of the sixty-four it was. What
+/// the frames are told apart by is their source port, which is what makes them
+/// distinct five-tuples — and the capture recording is where each of them is
+/// held to having arrived, byte for byte and one block per probe
+/// ([`crate::surface_contract`]).
+///
+/// It is deliberately not `LFW-PROBE/flood`. Attribution is by *substring*, so a
+/// marker that is a prefix of another probe's makes that probe's delivery read as
+/// this one's — and this set's other two markers begin `LFW-PROBE/flood-`.
+/// `every_probe_set_is_attributable_marker_by_marker` is what holds every set to
+/// that rather than a reader noticing.
+const FLOOD_MARKER: &[u8] = b"LFW-PROBE/burst";
+
+/// A conversation the policy admits, and a burst of distinct five-tuples it does
+/// not: what a **connection flood** looks like from the wire.
+///
+/// The order the three parts reach the appliance in is the experiment, and it
+/// follows from how this harness injects rather than from a phase written for it.
+/// The request and the whole burst go out together from the first pass and on
+/// every retransmission pass after it, so the flood is running before the
+/// appliance has answered anything. The reply is deferred — it may only go out
+/// once the request has been observed coming out the far side — so **its delivery
+/// is a packet the connection table carried after the table had already absorbed
+/// the flood**, which is what "evicts no established flow" means on a wire. No
+/// rule of any document names the port that reply is addressed to, so its flow is
+/// the only thing that could have carried it.
+///
+/// Every datagram in the burst is addressed to the port no rule is about, so each
+/// falls past the last rule to the default deny — and each therefore *opens* a
+/// flow the filter then refuses, which the appliance gives back in the same
+/// evaluation. That is the property this set exists for: on a default-deny
+/// appliance the flood's own refusal is what returns the slot, and a node that
+/// left them behind would be a state-exhaustion amplifier with a correct-looking
+/// policy.
+///
+/// The ports come from `policy` rather than from literals, so the burst is
+/// addressed to a port *this document's* rules leave to the default deny.
+fn flood_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let permitted = policy.accepted.destination_port;
+    let mut probes = Vec::with_capacity(2 + usize::from(FLOOD_TUPLES));
+    probes.push(routed(
+        "flood-request",
+        b"LFW-PROBE/flood-request",
+        a,
+        b,
+        UdpPacket {
+            destination_port: permitted,
+            payload: b"LFW-PROBE/flood-request".to_vec(),
+            ..datagram(a, b, INJECTED_TTL, b"LFW-PROBE/flood-request")
+        },
+    ));
+    // The reply, on the flow the request opened and on a port no rule names.
+    // Deferred, so it goes onto the wire after the request has crossed — by which
+    // time the burst below has been arriving since the first injection pass.
+    probes.push(routed_after(
+        "flood-survivor",
+        b"LFW-PROBE/flood-survivor",
+        b,
+        a,
+        UdpPacket {
+            source_port: permitted,
+            destination_port: SOURCE_PORT,
+            payload: b"LFW-PROBE/flood-survivor".to_vec(),
+            ..datagram(b, a, INJECTED_TTL, b"LFW-PROBE/flood-survivor")
+        },
+    ));
+    for index in 0..FLOOD_TUPLES {
+        probes.push(refused_by_policy(
+            recording_contract::EVENT_POLICY_NO_MATCH,
+            dropped(
+                // Zero-padded so the report's rows sort as they were injected.
+                format!("flood-{index:04}"),
+                FLOOD_MARKER,
+                a,
+                "it is one of a burst of distinct five-tuples addressed to a port no rule is \
+                 about, so it opens a flow, falls past the last rule to the default deny, and the \
+                 appliance gives the slot straight back",
+                UdpPacket {
+                    source_port: FLOOD_FIRST_SOURCE_PORT.wrapping_add(index),
+                    destination_port: policy.unmatched,
+                    payload: FLOOD_MARKER.to_vec(),
+                    ..datagram(a, b, INJECTED_TTL, FLOOD_MARKER)
+                },
+            ),
+        ));
+    }
+    probes
 }
 
 /// One probe per outcome the filter can reach, differing in the one field that
@@ -2175,7 +2446,7 @@ fn datagram(from: Endpoint, to: Endpoint, ttl: u8, marker: &[u8]) -> UdpPacket {
 /// expectation from the injection rather than writing it out is what makes
 /// "every other byte unchanged" the default the contract has to break.
 fn routed(
-    name: &'static str,
+    name: impl Into<String>,
     marker: &'static [u8],
     from: Endpoint,
     to: Endpoint,
@@ -2188,7 +2459,7 @@ fn routed(
         ..sent.clone()
     };
     Probe {
-        name,
+        name: name.into(),
         marker,
         from,
         frame: sent.build(),
@@ -2217,7 +2488,7 @@ fn routed(
 /// A probe that has to wait is one whose flow another probe opened, so what its
 /// record names is an *advance* of that conversation and never an opening.
 fn routed_after(
-    name: &'static str,
+    name: impl Into<String>,
     marker: &'static [u8],
     from: Endpoint,
     to: Endpoint,
@@ -2239,7 +2510,7 @@ fn routed_after(
 /// rather than written out for [`routed`]'s reason: "every other byte unchanged"
 /// stays the default the contract has to break.
 fn routed_frame(
-    name: &'static str,
+    name: impl Into<String>,
     marker: &'static [u8],
     from: Endpoint,
     to: Endpoint,
@@ -2248,7 +2519,7 @@ fn routed_frame(
 ) -> Probe {
     let delivered = hopped(&frame, to);
     Probe {
-        name,
+        name: name.into(),
         marker,
         from,
         frame,
@@ -2318,14 +2589,14 @@ fn only_once(probe: Probe) -> Probe {
 }
 
 fn dropped(
-    name: &'static str,
+    name: impl Into<String>,
     marker: &'static [u8],
     from: Endpoint,
     because: &'static str,
     sent: UdpPacket,
 ) -> Probe {
     Probe {
-        name,
+        name: name.into(),
         marker,
         from,
         frame: sent.build(),
@@ -2346,14 +2617,14 @@ fn dropped(
 /// A probe that must be refused, carrying a frame this harness built itself
 /// rather than a [`UdpPacket`].
 fn dropped_frame(
-    name: &'static str,
+    name: impl Into<String>,
     marker: &'static [u8],
     from: Endpoint,
     because: &'static str,
     frame: Vec<u8>,
 ) -> Probe {
     Probe {
-        name,
+        name: name.into(),
         marker,
         from,
         frame,
@@ -2399,6 +2670,29 @@ pub enum BootContract<'a> {
         /// The structured record whose presence proves the halt path was
         /// reached. It is matched as an exact byte substring, never as prose.
         marker: &'a str,
+    },
+    /// **The node booted and forwards nothing**, because it refused the
+    /// configuration document its own image carries.
+    ///
+    /// Distinct from both siblings, and from each for a different reason. Unlike
+    /// [`Self::Routed`], no injected packet may come back — there is no committed
+    /// policy for one to be admitted by, and no route for one to take. Unlike
+    /// [`Self::Halted`], a slot *did* boot: every protection domain is running, the
+    /// recorder puts its witness on the medium, and the guest never exits. So the
+    /// absence of traffic alone would be indistinguishable from a node that died
+    /// before its drivers came up, and what separates the two is the console —
+    /// which is the only surface such a node has, its management port being
+    /// unaddressed until a generation commits.
+    ///
+    /// Nothing may come back on the management wire either, and that is a second
+    /// statement rather than a restatement: the port answers ARP and ICMP echo for
+    /// the address a *committed* configuration gives it, so a reply here would be a
+    /// domain answering under addressing no generation published.
+    FailedClosed {
+        /// The transcript the boot must produce. It also decides when the run may
+        /// stop waiting: the absences are judged once the capture is complete, but
+        /// the records are what say the node has finished refusing.
+        transcript: &'a crate::config_transcript::RefusedContract,
     },
 }
 
@@ -4223,6 +4517,17 @@ fn run_boot(
                                 log_path.display()
                             ));
                         }
+                        BootContract::FailedClosed { .. } => {
+                            break 'run Err(format!(
+                                "{} bytes came back on the management port of a node that \
+                                 committed no generation. The port takes its addressing from the \
+                                 committed configuration and is unaddressed until one commits, so \
+                                 an answer here is a domain replying under addressing nothing \
+                                 published; see {}",
+                                frame.len(),
+                                log_path.display()
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -4264,6 +4569,17 @@ fn run_boot(
                             break 'run Err(format!(
                                 "probe {} came back on port{egress}, so a slot booted where none \
                                  may be bootable; see {}",
+                                probe.name,
+                                log_path.display()
+                            ));
+                        }
+                        BootContract::FailedClosed { .. } => {
+                            break 'run Err(format!(
+                                "probe {} came back on port{egress} from a node that committed no \
+                                 configuration. Generation 0 is the empty table: it has no \
+                                 interface to admit a frame on, no route to send one by and no \
+                                 rule to permit one, so a delivery means the dataplane is \
+                                 forwarding under something the appliance refused; see {}",
                                 probe.name,
                                 log_path.display()
                             ));
@@ -4568,6 +4884,21 @@ fn run_boot(
                         break 'run Ok(());
                     }
                 }
+                // The node keeps running, so nothing ends this boot but the
+                // harness. Wait for the console to have said its piece — the
+                // refusal, the domain's own state and the fail-closed record —
+                // and then out a settle window with no frame having come back,
+                // which is the same window every refused probe elsewhere is
+                // judged over. The absences the transcript also owes are judged
+                // once the capture is complete: a record still in the log ring
+                // and one that will never be written look alike from here.
+                BootContract::FailedClosed { transcript } => match settling_since {
+                    None if transcript.satisfied(&output) => {
+                        settling_since = Some(Instant::now());
+                    }
+                    Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
+                    _ => {}
+                },
             }
             match child.try_wait() {
                 Ok(Some(status)) => match &test.contract {
@@ -4585,6 +4916,16 @@ fn run_boot(
                     // still be in flight. Leave the verdict to the post-drain
                     // check below, which sees every byte QEMU wrote.
                     BootContract::Halted { .. } => break 'run Ok(()),
+                    // A node that refused its own document keeps running, so an
+                    // exit is a domain that faulted rather than an outcome.
+                    BootContract::FailedClosed { .. } => {
+                        break 'run Err(format!(
+                            "QEMU exited ({status}) on a boot whose contract is that the node \
+                             comes up and forwards nothing. Every domain runs on such a node — \
+                             only its configuration was refused — so an exit is a fault; see {}",
+                            log_path.display()
+                        ));
+                    }
                 },
                 Ok(None) => {}
                 Err(error) => break 'run Err(format!("poll QEMU: {error}")),
@@ -4603,6 +4944,14 @@ fn run_boot(
                         "timed out after {}s waiting for {marker:?} on the serial channel{}; \
                          see {}",
                         total_timeout.as_secs(),
+                        describe_injection_failures(&endpoints),
+                        log_path.display()
+                    ),
+                    BootContract::FailedClosed { transcript } => format!(
+                        "timed out after {}s waiting for the console to report that the node \
+                         refused its own document: {}{}; see {}",
+                        total_timeout.as_secs(),
+                        transcript.summary(),
                         describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
@@ -4682,7 +5031,15 @@ fn run_boot(
         Ok(())
     });
     let outcome = decide(outcome, &test.contract, &output, log_path);
-    let traffic = TrafficReport::new(stations, &probes, &deliveries, broke);
+    // How an absence reads follows from the contract, and from nothing the loop
+    // observed: a node that refused its own configuration is one whose probes must
+    // all be absent, and a table reporting that as `missing` would put failure
+    // words on the evidence the boot exists to produce.
+    let forwarding = match &test.contract {
+        BootContract::Routed | BootContract::Halted { .. } => Forwarding::UnderAPolicy,
+        BootContract::FailedClosed { .. } => Forwarding::NothingCommitted,
+    };
+    let traffic = TrafficReport::new(stations, &probes, &deliveries, broke, forwarding);
 
     // Persisting the log must never destroy the verdict that produced it, so
     // the two are reported together rather than one replacing the other.
@@ -4726,7 +5083,7 @@ fn run_boot(
         injected: probes
             .iter()
             .map(|probe| Injected {
-                name: probe.name,
+                name: probe.name.clone(),
                 frame: probe.frame.clone(),
                 observed: probe.observed,
                 // What the harness watched happen on the wire, turned into the
@@ -4781,9 +5138,9 @@ fn describe_pending(probes: &[Probe], deliveries: &[Option<Delivery>]) -> String
             continue;
         }
         if seen.is_some() {
-            arrived.push(probe.name);
+            arrived.push(probe.name.as_str());
         } else {
-            missing.push(probe.name);
+            missing.push(probe.name.as_str());
         }
     }
     format!(
@@ -4811,6 +5168,10 @@ fn decide(
                 log_path.display()
             ))
         }
+        // The whole transcript, including the clauses that are absences: what a
+        // refused document may NOT have produced is only decidable once the
+        // capture is complete.
+        (BootContract::FailedClosed { transcript }, Ok(())) => transcript.judge(output, log_path),
         (_, outcome) => outcome,
     }
 }
@@ -5235,16 +5596,17 @@ mod tests {
 
         let (lifecycle, witness) =
             injected_probes(&topology, Traffic::Lifecycle).expect("the shipped bench");
-        assert_eq!(lifecycle.len(), 3);
-        // Neither of the filter's refusals: every segment carries the accepting
-        // rule's port, and the one that is refused is refused by the tracker
-        // before the filter is consulted.
-        assert!(!witness.probed_the_denying_rule);
+        assert_eq!(lifecycle.len(), 4);
+        // The dropping rule and not the fallthrough: one segment carries that
+        // rule's port and every other one the accepting rule's, so nothing here
+        // falls past the last rule.
+        assert!(witness.probed_the_denying_rule);
         assert!(!witness.probed_the_fallthrough);
     }
 
-    /// **The lifecycle set, as the events it obliges.** Three segments, one
-    /// conversation: an opening, a refusal that must not move it, and a close.
+    /// **The lifecycle set, as the events it obliges.** Three segments on one
+    /// conversation — an opening, a refusal that must not move it, and a close —
+    /// and a fourth on a five-tuple a rule denies.
     ///
     /// Every claim here is what the recording contract then holds the appliance
     /// to, so a probe set that stopped obliging an event would weaken that
@@ -5283,12 +5645,36 @@ mod tests {
             "a close must follow the opening it closes onto the wire"
         );
 
-        // All three are the same five-tuple, so they are one conversation: the
-        // difference between their fates is the connection table and nothing else.
-        for probe in &probes {
+        // The fourth segment, which is the only probe in this harness a rule
+        // refuses for its protocol. Its opening flags are the admitted opening's
+        // exactly, so the one thing that separates their fates is the destination
+        // port the two rules disagree about.
+        let denied = named("lifecycle-denied");
+        assert_eq!(denied.event, Some(recording_contract::EVENT_POLICY_DENIED));
+        assert!(!denied.expectation.is_routed());
+        assert!(
+            !denied.once && !denied.deferred,
+            "a rule refuses it the same way however often it arrives, and it waits on no flow"
+        );
+
+        let destination_port = |probe: &Probe| {
             let segment = &probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..];
+            u16::from_be_bytes([segment[2], segment[3]])
+        };
+        let flags = |probe: &Probe| probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 13];
+        assert_eq!(destination_port(denied), policy.denied.destination_port);
+        assert_eq!(
+            flags(denied),
+            flags(open),
+            "the denied segment must be an opening too, or the rule is not the only difference"
+        );
+
+        // The other three are the same five-tuple, so they are one conversation:
+        // the difference between their fates is the connection table and nothing
+        // else.
+        for probe in [open, refused, close] {
             assert_eq!(
-                u16::from_be_bytes([segment[2], segment[3]]),
+                destination_port(probe),
                 policy.accepted.destination_port,
                 "probe {} does not carry the accepting rule's port",
                 probe.name
@@ -5302,6 +5688,84 @@ mod tests {
         };
         assert!(sequence(refused) > sequence(open).wrapping_add(u32::from(u16::MAX)));
         assert_eq!(sequence(close), sequence(open).wrapping_add(1));
+    }
+
+    /// **The flood set, as the burst it is.** Sixty-four distinct five-tuples that
+    /// must all be refused, and one conversation that must survive them.
+    ///
+    /// Every claim here is what the run then rests on: a burst whose datagrams
+    /// shared a five-tuple would be one conversation retransmitting rather than a
+    /// flood, and a survivor addressed to a port some rule names would be carried by
+    /// the policy rather than by its flow.
+    #[test]
+    fn the_flood_set_opens_one_conversation_and_floods_with_distinct_five_tuples() {
+        let topology = bench();
+        let policy = topology.port_policy().expect("the shipped policy");
+        let probes = flood_probes(&topology, policy);
+        assert_eq!(probes.len(), 2 + usize::from(FLOOD_TUPLES));
+
+        let named = |name: &str| {
+            probes
+                .iter()
+                .find(|probe| probe.name == name)
+                .unwrap_or_else(|| panic!("the set names {name}"))
+        };
+        let request = named("flood-request");
+        assert!(request.expectation.is_routed());
+        assert!(!request.deferred, "the request opens the conversation");
+
+        // The survivor is the reply, and it must go out after the request has been
+        // observed crossing — by which time the burst has been arriving since the
+        // first pass. That deferral is the whole of "the flow survived the flood".
+        let survivor = named("flood-survivor");
+        assert!(survivor.expectation.is_routed());
+        assert!(survivor.deferred, "the survivor must follow the request");
+        assert_eq!(
+            survivor.event,
+            Some(recording_contract::EVENT_FLOW_ADVANCED),
+            "a reply advances the conversation the request opened rather than opening one"
+        );
+        // And no rule of the document is about the port it is addressed to, so only
+        // its flow could carry it.
+        let port_of = |probe: &Probe| {
+            let datagram = &probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..];
+            u16::from_be_bytes([datagram[2], datagram[3]])
+        };
+        assert_ne!(port_of(survivor), policy.accepted.destination_port);
+        assert_ne!(port_of(survivor), policy.denied.destination_port);
+
+        // The burst: every datagram refused by the default deny, every one of them a
+        // five-tuple of its own, and none of them the conversation's.
+        let burst: Vec<&Probe> = probes
+            .iter()
+            .filter(|probe| probe.name.starts_with("flood-0"))
+            .collect();
+        assert_eq!(burst.len(), usize::from(FLOOD_TUPLES));
+        let mut sources = BTreeSet::new();
+        for probe in &burst {
+            assert!(!probe.expectation.is_routed());
+            assert_eq!(probe.event, Some(recording_contract::EVENT_POLICY_NO_MATCH));
+            assert_eq!(
+                port_of(probe),
+                policy.unmatched,
+                "a flood datagram must fall past every rule rather than match one"
+            );
+            let datagram = &probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..];
+            let source = u16::from_be_bytes([datagram[0], datagram[1]]);
+            assert!(
+                sources.insert(source),
+                "two flood datagrams share source port {source}, so they are one conversation \
+                 retransmitting rather than two"
+            );
+            assert_ne!(
+                source, SOURCE_PORT,
+                "a flood datagram must not open the conversation the survivor is carried by"
+            );
+        }
+        // Distinct as *frames* too, which is what the capture recording holds each of
+        // them to: one block per probe, byte for byte.
+        let frames: BTreeSet<&Vec<u8>> = burst.iter().map(|probe| &probe.frame).collect();
+        assert_eq!(frames.len(), burst.len());
     }
 
     /// A frame this harness does not model field by field is still judged as
@@ -5674,27 +6138,75 @@ mod tests {
         header[10..12].copy_from_slice(&checksum.to_be_bytes());
     }
 
+    /// [`Traffic::ALL`] is every probe set, and this is what makes that true rather
+    /// than a claim: [`Traffic::position`] is an exhaustive match, so a set added to
+    /// the enum must be given a position, and a position outside the array — or one
+    /// that collides with another set's — fails here. Every check stated over
+    /// `Traffic::ALL` therefore reaches every set there is.
     #[test]
-    fn every_probe_is_attributable_to_itself_alone() {
-        let probes = probes(&bench()).expect("the shipped bench");
-        assert_eq!(probes.len(), 6);
-        for probe in &probes {
-            assert!(
-                contains(&probe.frame, probe.marker),
-                "probe {} does not carry its own marker",
-                probe.name
+    fn the_list_of_every_probe_set_holds_every_one_of_them() {
+        for (at, traffic) in Traffic::ALL.iter().enumerate() {
+            assert_eq!(
+                traffic.position(),
+                at,
+                "{traffic:?} is at {at} in the list and claims position {}",
+                traffic.position()
             );
-            for other in &probes {
-                if other.name == probe.name {
-                    continue;
+        }
+    }
+
+    /// **Attribution is by substring, so a marker may not appear in a frame that
+    /// is not its own.** Over every probe set and both benches, because a set that
+    /// gets this wrong fails at its own boot with the appliance in the right and the
+    /// harness in the wrong — which is exactly what happened when a flood's marker
+    /// was made a prefix of the marker on the conversation beside it.
+    ///
+    /// Stated marker by marker rather than probe by probe, because a marker is what
+    /// identifies a *group*: a flood is sixty-four probes sharing one, every frame of
+    /// which must be refused, so two probes carrying one marker is correct and two
+    /// markers one frame answers to never is.
+    ///
+    /// The management wire's own two markers are held to the same rule, and for the
+    /// same reason: the endpoint refuses any frame carrying a dataplane probe's
+    /// marker, so a probe marker appearing in one of those would make a legitimate
+    /// reply read as a leak across the isolation boundary.
+    #[test]
+    fn every_probe_set_is_attributable_marker_by_marker() {
+        for topology in [bench(), alternate()] {
+            for traffic in Traffic::ALL {
+                let (probes, _) = injected_probes(&topology, traffic)
+                    .unwrap_or_else(|error| panic!("{traffic:?} on this bench: {error}"));
+                for probe in &probes {
+                    assert!(
+                        contains(&probe.frame, probe.marker),
+                        "{traffic:?}: probe {} does not carry its own marker",
+                        probe.name
+                    );
+                    for other in &probes {
+                        if other.marker == probe.marker {
+                            continue;
+                        }
+                        assert!(
+                            !contains(&other.frame, probe.marker),
+                            "{traffic:?}: probe {}'s marker also appears in {}'s frame, so a \
+                             delivery of one would be attributed to the other",
+                            probe.name,
+                            other.name
+                        );
+                    }
+                    for (what, marker) in [
+                        ("the opaque management frame", MANAGEMENT_MARKER),
+                        ("the echo request payload", ECHO_PAYLOAD),
+                    ] {
+                        assert!(
+                            !contains(&probe.frame, marker) && !contains(marker, probe.marker),
+                            "{traffic:?}: probe {}'s marker and {what}'s are confusable, so a \
+                             reply the management port owes would read as a dataplane frame that \
+                             crossed the isolation boundary",
+                            probe.name
+                        );
+                    }
                 }
-                assert!(
-                    !contains(&other.frame, probe.marker),
-                    "probe {}'s marker also appears in {}",
-                    probe.name,
-                    other.name
-                );
-                assert_ne!(other.name, probe.name);
             }
         }
     }
@@ -5725,7 +6237,7 @@ mod tests {
                     .judge(port, &probe.frame)
                     .expect_err("a refused probe must never be accepted");
                 assert!(
-                    verdict.contains(probe.name) && verdict.contains(because),
+                    verdict.contains(probe.name.as_str()) && verdict.contains(because),
                     "{verdict}"
                 );
             }
@@ -5823,7 +6335,13 @@ mod tests {
                 Expectation::Dropped { .. } => None,
             })
             .collect();
-        let report = TrafficReport::new(endpoints(), &probes, &deliveries, None);
+        let report = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &deliveries,
+            None,
+            Forwarding::UnderAPolicy,
+        );
         let rendered = report.render();
 
         assert_eq!(report.summary(), "2 routed, 4 dropped");
@@ -5832,7 +6350,11 @@ mod tests {
             "every probe reached an end state: {rendered}"
         );
         for probe in &probes {
-            assert!(rendered.contains(probe.name), "{}\n{rendered}", probe.name);
+            assert!(
+                rendered.contains(probe.name.as_str()),
+                "{}\n{rendered}",
+                probe.name
+            );
         }
         // A->B: the far endpoint's address and MAC, the far interface as the
         // new source MAC, one TTL gone, and the length the frame arrived at.
@@ -5870,7 +6392,7 @@ mod tests {
             };
             let line = rendered
                 .lines()
-                .find(|line| line.contains(probe.name))
+                .find(|line| line.contains(probe.name.as_str()))
                 .unwrap_or_else(|| panic!("no row for {}:\n{rendered}", probe.name));
             assert!(line.contains("dropped") && line.contains(because), "{line}");
             assert!(
@@ -5910,8 +6432,13 @@ mod tests {
         let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
         deliveries[at("routed-0-to-1")] = Some(arrival(&probes[at("routed-0-to-1")]));
 
-        let report =
-            TrafficReport::new(endpoints(), &probes, &deliveries, Some(at("routed-1-to-0")));
+        let report = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &deliveries,
+            Some(at("routed-1-to-0")),
+            Forwarding::UnderAPolicy,
+        );
         let rendered = report.render();
         let row = |name: &str| {
             rendered
@@ -5935,13 +6462,77 @@ mod tests {
         // A routed probe that simply never arrived is neither a failure of its
         // own nor a delivery: it is outstanding, and says so.
         let nothing: Vec<Option<Delivery>> = vec![None; probes.len()];
-        let outstanding = TrafficReport::new(endpoints(), &probes, &nothing, None);
+        let outstanding = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &nothing,
+            None,
+            Forwarding::UnderAPolicy,
+        );
         assert!(
             outstanding.render().contains("missing"),
             "{}",
             outstanding.render()
         );
         assert_eq!(outstanding.summary(), "0 routed, 4 dropped");
+    }
+
+    /// **A node that committed nothing reports its absences as the contract, not as
+    /// failures.** The same probes and the same empty deliveries, read under the two
+    /// forwardings, must produce two different tables: on a routed boot every routed
+    /// probe is outstanding and the run is unfinished, and on a fail-closed one every
+    /// one of them is a refusal and the table is complete.
+    ///
+    /// Worth a case of its own because the evidence a reader looks at *is* the table:
+    /// a fail-closed boot whose rows read `missing` and whose heading read
+    /// `unfinished` would present the thing it proved as the thing that went wrong.
+    #[test]
+    fn a_node_that_committed_nothing_reports_every_absence_as_the_contract() {
+        let probes = probes(&bench()).expect("the shipped bench");
+        let nothing: Vec<Option<Delivery>> = vec![None; probes.len()];
+        let routed = probes
+            .iter()
+            .filter(|probe| probe.expectation.is_routed())
+            .count();
+        assert!(routed > 0, "the routed set forwards something");
+
+        let fail_closed = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &nothing,
+            None,
+            Forwarding::NothingCommitted,
+        );
+        let rendered = fail_closed.render();
+        assert!(
+            !rendered.contains("missing"),
+            "an absence is the contract on this boot: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unfinished"),
+            "every probe reached the end state this contract defines: {rendered}"
+        );
+        assert!(
+            rendered.contains("committed no generation"),
+            "a row must say why nothing crossed: {rendered}"
+        );
+        // Every probe is a refusal, the ones the document forwards included.
+        assert_eq!(
+            fail_closed.summary(),
+            format!("0 routed, {} dropped", probes.len())
+        );
+
+        // And the same inputs under a committed policy, which is the contrast that
+        // makes the above a decision rather than a rename.
+        let under_a_policy = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &nothing,
+            None,
+            Forwarding::UnderAPolicy,
+        );
+        assert!(under_a_policy.render().contains("missing"));
+        assert!(under_a_policy.render().contains("unfinished"));
     }
 
     #[test]
@@ -5958,11 +6549,17 @@ mod tests {
         let mut deliveries: Vec<Option<Delivery>> = vec![None; probes.len()];
         deliveries[refused] = Some(arrival(&probes[0]));
 
-        let report = TrafficReport::new(endpoints(), &probes, &deliveries, None);
+        let report = TrafficReport::new(
+            endpoints(),
+            &probes,
+            &deliveries,
+            None,
+            Forwarding::UnderAPolicy,
+        );
         let line = report
             .render()
             .lines()
-            .find(|line| line.contains(probes[refused].name))
+            .find(|line| line.contains(probes[refused].name.as_str()))
             .expect("the refused probe has a row")
             .to_owned();
         assert!(
@@ -6196,7 +6793,7 @@ mod tests {
         let verdict = probe
             .judge(leaked, &probes, &mut TcpClient::new())
             .expect_err("a dataplane probe on the management wire");
-        assert!(verdict.contains(probes[0].name), "{verdict}");
+        assert!(verdict.contains(probes[0].name.as_str()), "{verdict}");
         assert!(verdict.contains("isolates that port"), "{verdict}");
 
         // One of the opaque frames coming back: the endpoint answers nothing for

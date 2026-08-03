@@ -55,7 +55,11 @@ use crate::recording_contract::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Injected {
     /// The probe that put it there, which is what names it in a verdict.
-    pub name: &'static str,
+    ///
+    /// Owned rather than borrowed for the reason the harness's own probe names
+    /// are: a probe set that floods the appliance names one probe per five-tuple
+    /// it puts on the wire, and those names are derived rather than written out.
+    pub name: String,
     pub frame: Vec<u8>,
     /// Whether the appliance's tap must have observed this frame.
     ///

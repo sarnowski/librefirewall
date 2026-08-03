@@ -33,7 +33,10 @@ Read the rest on demand:
   work is a violation; fix the finding instead.
 - Changing an exposed signal means changing its reference chapter in the same change: the console
   and metrics chapters are held to the code by the fast gate, so a chapter that drifts fails
-  `make test` rather than going stale unnoticed.
+  `make test` rather than going stale unnoticed. The same check reads the status detail chapter for
+  the counts it states about the gate — scenarios, scraped scenarios, floored crates — so a number
+  that goes stale fails there too; state a new such count in the phrasing that check looks for, or
+  it is unread.
 - Run the reviewer checklist against your own change before declaring it done. A green gate is
   necessary, never sufficient.
 - A change with security consequence — the capability topology in `systems/`, a trust boundary,

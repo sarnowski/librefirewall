@@ -72,8 +72,9 @@ reviewers produce comparable output.
    chapters where it alters an exposed signal; any page, header, or comment the change falsified;
    any deviation from the [design](../design/architecture.md) documented and human-approved. The
    gate reads the console and metrics chapters and will catch a token, family or count that moved
-   without its table; the prose around them, the label values, and which group a token was filed
-   under are unread, so those stay here.
+   without its table, and reads the status detail chapter for the counts it states about the gate
+   itself; the prose around them, the label values, and which group a token was filed under are
+   unread, so those stay here.
 7. **Coverage and exclusions.** The floors hold, and any exclusion cites a reason from the
    [closed list](engineering.md#testing) — the trusted-base argument is never available.
 8. **Residue.** No compatibility path, no dead code, no `TODO`/stub/placeholder, and no correctness

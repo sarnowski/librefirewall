@@ -242,7 +242,10 @@ Observability is a product feature of a firewall, and it is the *only* window in
 there is no shell and no CLI. The exact contract — the console records, the log structure, the
 metric names and labels, the recording downloads — is the book's reference part, which is the
 operator's interface definition. Keep it true: **any change to an exposed signal updates the
-matching reference chapter in the same change.**
+matching reference chapter in the same change.** The console and metrics chapters are read as data
+by the gate and held to the code, as are the counts the [status detail](status-detail.md) states
+about the gate itself, so those cannot go stale unnoticed; everything else in the book is held true
+by review.
 
 The decisions that constrain all observability code:
 

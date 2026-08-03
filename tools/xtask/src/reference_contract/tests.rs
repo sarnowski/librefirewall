@@ -595,3 +595,93 @@ fn a_count_claim_split_across_a_line_break_is_still_read() {
         Some(25)
     );
 }
+
+/// **Every count the status detail chapter states about the gate is compared, and
+/// the phrase is the handle.** Three cases, because three things can go wrong with
+/// a restated number: it can be right, it can be stale, and it can vanish.
+#[test]
+fn a_stated_count_about_the_gate_is_held_to_the_list_it_is_about() {
+    let scenarios = crate::qemu::SCENARIOS.len();
+    let sound = format!(
+        "The gate boots {scenarios} system scenarios, and the {} scenarios that reach the \
+         management port judge every surface. Coverage covers {} library crates.",
+        crate::qemu::SCENARIOS
+            .iter()
+            .filter(|scenario| scenario.reaches_the_management_port())
+            .count(),
+        crate::host::library_crate_count(),
+    );
+    let mut findings = Vec::new();
+    check_stated_counts(&sound, &mut findings);
+    assert!(findings.is_empty(), "{findings:#?}");
+
+    // Stale: the number moved and the page did not.
+    let stale = sound.replace(
+        &format!("{scenarios} system scenarios"),
+        &format!("{} system scenarios", scenarios + 1),
+    );
+    let mut findings = Vec::new();
+    check_stated_counts(&stale, &mut findings);
+    let joined = findings.join("\n");
+    assert!(
+        joined.contains(&format!("\"{} system scenarios\"", scenarios + 1)),
+        "{joined}"
+    );
+    assert!(joined.contains(&format!("holds {scenarios}")), "{joined}");
+
+    // Gone: the claim was reworded out of reach, which must fail rather than pass in
+    // silence — a check that only compares what it finds is one a rewording defeats.
+    let mut findings = Vec::new();
+    check_stated_counts("nothing here counts anything", &mut findings);
+    assert_eq!(findings.len(), STATED_COUNTS.len(), "{findings:#?}");
+    for finding in &findings {
+        assert!(finding.contains("states no count before"), "{finding}");
+    }
+}
+
+/// A mention with no number in front of it is prose, and prose is not this check's
+/// to read: demanding a number in every sentence that names the scenarios would be
+/// editing the chapter's English rather than holding its arithmetic.
+#[test]
+fn a_mention_that_states_no_number_is_left_alone() {
+    let scenarios = crate::qemu::SCENARIOS.len();
+    let mixed = format!(
+        "Every system scenario boots the release image. The gate boots {scenarios} system \
+         scenarios in all, and the {} scenarios that reach the management port are scraped. \
+         Coverage runs over {} library crates, and the library crates are all `no_std`.",
+        crate::qemu::SCENARIOS
+            .iter()
+            .filter(|scenario| scenario.reaches_the_management_port())
+            .count(),
+        crate::host::library_crate_count(),
+    );
+    let mut findings = Vec::new();
+    check_stated_counts(&mixed, &mut findings);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+/// The reader takes the number before *each* occurrence rather than before the
+/// first, so a second place that went stale is found. The bug this pins is a real
+/// one: a reader that re-searched from the start reported the first number twice
+/// and never looked at the second.
+#[test]
+fn a_second_statement_of_one_count_is_compared_too() {
+    let scenarios = crate::qemu::SCENARIOS.len();
+    let phrase = "system scenarios";
+    let text = format!("{scenarios} {phrase} exist, and 99 {phrase} is what a stale page says");
+    assert_eq!(
+        stated_counts_before(&text, phrase),
+        [Some(scenarios), Some(99)]
+    );
+
+    let mut findings = Vec::new();
+    check_stated_counts(&text, &mut findings);
+    let joined = findings.join("\n");
+    assert!(joined.contains("\"99 system scenarios\""), "{joined}");
+    assert_eq!(
+        findings.len(),
+        // The two counts the text says nothing about, plus the stale one.
+        STATED_COUNTS.len() - 1 + 1,
+        "{findings:#?}"
+    );
+}
