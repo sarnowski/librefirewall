@@ -41,9 +41,10 @@ use std::fmt::Write as _;
 
 use crate::recording_contract::{
     ANNOTATION_VERSION, Annotation, CLASSIFICATION_ESTABLISHED, CLASSIFICATION_NEW,
-    EVENT_FLOW_ADVANCED, EVENT_FLOW_CLOSED, EVENT_FLOW_OPENED, EVENT_POLICY_DENIED, Packet, Parsed,
-    STATE_CLOSED, STATE_TIME_WAIT, VERDICT_DROPPED, VERDICT_FORWARDED, VERDICT_KIND,
-    classification_name, event_name,
+    EVENT_FLOW_ADVANCED, EVENT_FLOW_CLOSED, EVENT_FLOW_OPENED, EVENT_FLOW_REVOKED,
+    EVENT_POLICY_DENIED, FLAGS_INBOUND, Packet, Parsed, STATE_CLOSED, STATE_TIME_WAIT,
+    VERDICT_DROPPED, VERDICT_FORWARDED, VERDICT_KIND, VERDICT_REVOKED, classification_name,
+    event_name,
 };
 
 /// One frame the harness put on a dataplane port, as the contract compares
@@ -298,25 +299,44 @@ fn count(surface: &Surface) -> Counted {
 
 /// **The two recordings differ by selection, and this is that law.** The
 /// connection history holds an observation exactly where it carries a lifecycle
-/// or policy event; the capture holds every observation. So the log's identities
-/// are a subset of the capture's, and no record of the log names no event.
+/// or policy event; the capture holds every observation **of a frame**. So the
+/// log's frame observations are a subset of the capture's, and no record of the
+/// log names no event.
 ///
-/// The selection is the landing's central decision and it is what makes the two
-/// files different *artifacts* rather than one truncated twice. Both directions
-/// are findings and they catch different faults: a log record the capture does not
-/// pair is a connection history describing traffic that never crossed the
-/// appliance, and a log record with no event is a sink that stopped selecting and
-/// went back to being a truncated capture.
+/// The selection is what makes the two files different *artifacts* rather than one
+/// truncated twice. Both directions are findings and they catch different faults:
+/// a log record of a frame that the capture does not pair is a connection history
+/// describing traffic that never crossed the appliance, and a log record with no
+/// event is a sink that stopped selecting and went back to being a truncated
+/// capture.
+///
+/// **The one record that is in the log and never in the capture** is the flow a
+/// policy commit ended: a capture is the frames themselves with the verdict on
+/// each, and that conversation was ended on no wire. It is therefore excluded from
+/// both halves of the subset law — counted out of the totals and not owed a pairing
+/// — while the honesty of what it *does* claim is [`annotation_laws`]'.
 fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
     let mut found = Vec::new();
-    if log.parsed.packets.len() > capture.parsed.packets.len() {
+    let framed = |surface: &Surface| {
+        surface
+            .parsed
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet
+                    .annotation
+                    .is_none_or(|annotation| !annotation.is_revocation())
+            })
+            .count()
+    };
+    if framed(log) > framed(capture) {
         found.push(format!(
-            "{} holds {} record(s) and {} holds {}; the connection history is a selection of the \
-             observations the capture holds, so it can never hold more",
+            "{} holds {} record(s) of a frame and {} holds {}; the connection history is a \
+             selection of the frame observations the capture holds, so it can never hold more",
             log.target,
-            log.parsed.packets.len(),
+            framed(log),
             capture.target,
-            capture.parsed.packets.len(),
+            framed(capture),
         ));
     }
     let paired = identities(capture);
@@ -333,7 +353,7 @@ fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
         .collect();
     if !unpaired.is_empty() {
         found.push(format!(
-            "{} carries packet id(s) {} does not pair: {}. Every observation the connection \
+            "{} carries packet id(s) {} does not pair: {}. Every frame observation the connection \
              history selects was offered to the capture too, so an unpaired one describes traffic \
              no packet of the capture accounts for",
             log.target,
@@ -435,8 +455,67 @@ fn annotation_laws(surface: &Surface, packet: &Packet, annotation: Annotation) -
         VERDICT_DROPPED if annotation.drop_reason == 0 => {
             found.push(at("a dropped frame naming no reason"));
         }
-        VERDICT_FORWARDED | VERDICT_DROPPED => {}
+        VERDICT_REVOKED if annotation.drop_reason != 0 => found.push(at(&format!(
+            "a revoked flow carrying drop reason {}, and no frame was dropped",
+            annotation.drop_reason
+        ))),
+        VERDICT_FORWARDED | VERDICT_DROPPED | VERDICT_REVOKED => {}
         other => found.push(at(&format!("a verdict octet of {other}"))),
+    }
+    // **The one record that is about a flow and about no frame, held to claiming
+    // none.** Both directions, because the pair is what keeps the connection
+    // history honest about the one way a conversation ends that no packet caused:
+    // without the second half a record about no packet would be readable as a
+    // record about one.
+    if annotation.is_revocation() != (annotation.event == EVENT_FLOW_REVOKED) {
+        found.push(at(&format!(
+            "verdict {} beside {}; a flow the appliance ended is one fact written twice and \
+             either half alone is a record that says something else",
+            annotation.verdict,
+            event_name(annotation.event)
+        )));
+    }
+    if annotation.is_revocation() {
+        if packet.original_len != 0 || !packet.captured.is_empty() {
+            found.push(at(&format!(
+                "a flow the appliance ended, in a block claiming {} wire byte(s) and {} captured: \
+                 there was no frame, and a record that claimed one would be a fabricated cause \
+                 in an artifact that is evidence",
+                packet.original_len,
+                packet.captured.len()
+            )));
+        }
+        if packet.flags.is_some() {
+            found.push(at(
+                "a flow the appliance ended, carrying epb_flags: a direction is a property of a \
+                 packet on a wire and there was none",
+            ));
+        }
+        if annotation.classification != 0 {
+            found.push(at(&format!(
+                "a flow the appliance ended, classified {}: a classification is a statement \
+                 about a packet",
+                classification_name(annotation.classification)
+            )));
+        }
+    } else {
+        if packet.original_len == 0 {
+            found.push(at(
+                "a frame of no wire length, which no packet the pipeline reached a verdict on can \
+                 be",
+            ));
+        }
+        // Every observation of a frame is taken on the port it arrived on, so
+        // there is never a second one to relate it to and the direction is always
+        // inbound. Checked rather than assumed, because it is the field the record
+        // that is about no frame is told from one that is.
+        if packet.flags != Some(FLAGS_INBOUND) {
+            found.push(at(&format!(
+                "epb_flags reads {:?} and every observation of a frame is taken inbound, on the \
+                 port the frame arrived on",
+                packet.flags
+            )));
+        }
     }
     // `epb_verdict` and the annotation are two statements of one decision, and a
     // reader that knows only the standard option relies on the first.
@@ -456,7 +535,7 @@ fn annotation_laws(surface: &Surface, packet: &Packet, annotation: Annotation) -
     }
     let names_a_flow = matches!(
         annotation.event,
-        EVENT_FLOW_OPENED | EVENT_FLOW_ADVANCED | EVENT_FLOW_CLOSED
+        EVENT_FLOW_OPENED | EVENT_FLOW_ADVANCED | EVENT_FLOW_CLOSED | EVENT_FLOW_REVOKED
     );
     if names_a_flow && !annotation.names_a_flow() {
         found.push(at(&format!(
@@ -479,6 +558,12 @@ fn annotation_laws(surface: &Surface, packet: &Packet, annotation: Annotation) -
     if !annotation.names_a_flow() && (annotation.flow_slot != 0 || annotation.flow_generation != 0)
     {
         found.push(at("a flow identity with no classification to interpret it"));
+    }
+    if annotation.is_revocation() && annotation.flow_state == 0 {
+        found.push(at(
+            "a flow the appliance ended, in no state: the state it was in when the commit \
+             reached it is the whole of what the record says about the conversation",
+        ));
     }
     // **The reply's law.** A conversation is opened by exactly one packet and
     // advanced by the ones after it, so an advance or a close is `established` and
@@ -720,7 +805,11 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
     {
         if annotation.verdict == VERDICT_FORWARDED {
             forwarded = forwarded.saturating_add(1);
-        } else {
+        } else if !annotation.is_revocation() {
+            // A conversation the appliance ended refused no frame, so it is
+            // attributable to no drop reason and belongs in neither total: the
+            // series it *is* attributable to is `librefirewall_flow_lifecycle_total`,
+            // which the revocation contract reads.
             *per_reason.entry(annotation.drop_reason).or_insert(0) += 1;
         }
     }
@@ -804,6 +893,15 @@ pub const DROP_REASONS: [&str; 25] = [
 fn identities(surface: &Surface) -> BTreeMap<u64, usize> {
     let mut counts = BTreeMap::new();
     for packet in &surface.parsed.packets {
+        // The record about no frame is left out: it is offered to the connection
+        // history alone, so pairing it against the capture would report the
+        // selection working as a selection that failed.
+        if packet
+            .annotation
+            .is_some_and(|annotation| annotation.is_revocation())
+        {
+            continue;
+        }
         if let Some(id) = packet.packet_id {
             *counts.entry(id).or_insert(0) += 1;
         }
@@ -1044,9 +1142,21 @@ fn presence_differences(capture: &Surface, wire: &Wire) -> Result<usize, Vec<Str
 /// starts with nothing, so a zero-length capture would otherwise match the first
 /// injected frame of the right claimed length and pass — a fabricated block that
 /// retained no byte being exactly the one this direction exists to catch.
+///
+/// The one block this cannot be about is the one that is about no frame — a
+/// conversation a policy commit ended. It carries no bytes because there were
+/// none, so there is nothing here to compare it against; what it claims is held to
+/// its own laws in [`annotation_laws`], which refuse it exactly if it claims a
+/// frame.
 fn fabrication_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     for packet in &surface.parsed.packets {
+        if packet
+            .annotation
+            .is_some_and(|annotation| annotation.is_revocation())
+        {
+            continue;
+        }
         let known = wire
             .injected
             .iter()

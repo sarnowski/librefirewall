@@ -191,16 +191,40 @@ fn annotation(packet_id: u64, interface_id: u8) -> TapAnnotation {
         interface_id,
         TapDecision {
             outcome: TapOutcome::Forwarded,
-            direction: TapDirection::Inbound,
+            direction: Some(TapDirection::Inbound),
             generation: 1,
             flow: Some(TapFlow {
                 slot: 11,
                 generation: 3,
-                classification: TapClassification::New,
+                classification: Some(TapClassification::New),
                 state: TapFlowState::UdpUnreplied,
             }),
             rule: TapRule::new(0),
             event: Some(TapEvent::FlowOpened),
+        },
+    )
+}
+
+/// The one observation that is about no frame: a flow the appliance ended when a
+/// policy commit stopped admitting it. The **log** holds it and the capture does
+/// not, which is the other half of the selection law.
+fn revocation(packet_id: u64, interface_id: u8) -> TapAnnotation {
+    TapAnnotation::new(
+        packet_id,
+        1_000 + packet_id,
+        interface_id,
+        TapDecision {
+            outcome: TapOutcome::Revoked,
+            direction: None,
+            generation: 2,
+            flow: Some(TapFlow {
+                slot: 11,
+                generation: 3,
+                classification: None,
+                state: TapFlowState::UdpAssured,
+            }),
+            rule: None,
+            event: Some(TapEvent::FlowRevoked),
         },
     )
 }
@@ -214,12 +238,12 @@ fn unremarkable(packet_id: u64, interface_id: u8) -> TapAnnotation {
         interface_id,
         TapDecision {
             outcome: TapOutcome::Forwarded,
-            direction: TapDirection::Inbound,
+            direction: Some(TapDirection::Inbound),
             generation: 1,
             flow: Some(TapFlow {
                 slot: 11,
                 generation: 3,
-                classification: TapClassification::Established,
+                classification: Some(TapClassification::Established),
                 state: TapFlowState::UdpAssured,
             }),
             rule: None,
@@ -501,6 +525,54 @@ fn a_failing_medium_is_counted_and_the_recording_keeps_going() {
     for sink in counters.sinks {
         assert_eq!(sink.records, 6);
     }
+}
+
+/// **The selection law, both ways.** The connection history holds an observation
+/// that carries an event; the capture holds an observation *of a frame*. So the
+/// record for a flow the appliance ended goes to the log alone — a capture is the
+/// frames themselves, and that one was on no wire — while traffic on a
+/// conversation already accounted for goes to the capture alone.
+///
+/// Both directions in one test because they are one decision: a sink that took
+/// everything, or that took nothing frameless, would fail exactly one of the two.
+#[test]
+fn a_revoked_flow_reaches_the_connection_history_and_not_the_capture() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    {
+        let mut writer = ring.writer();
+        let frame = vec![0xAB; 100];
+        // An opening, which both take; a packet on the running conversation, which
+        // only the capture takes; and the revocation, which only the log takes.
+        writer
+            .write(&annotation(0, 0), 100, &frame)
+            .expect("the ring holds three");
+        writer
+            .write(&unremarkable(1, 0), 100, &frame)
+            .expect("the ring holds three");
+        writer
+            .write(&revocation(2, 0), 0, &[])
+            .expect("the ring holds three");
+    }
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    for _ in 0..12 {
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    }
+
+    let counters = deck.counters();
+    assert_eq!(counters.tap_records, 3, "every observation was drained");
+    assert_eq!(
+        counters.sinks[Which::Log.index()].records,
+        2,
+        "the opening and the revocation carry an event; the traffic between them does not"
+    );
+    assert_eq!(
+        counters.sinks[Which::Capture.index()].records,
+        2,
+        "the two frames, and not the record that is about no frame"
+    );
 }
 
 #[test]

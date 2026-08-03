@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lfw_clock::Monotonic;
-use lfw_flow::FlowTable;
+use lfw_flow::{ApplianceFlowTable, FLOW_CAPACITY, FLOW_TABLE_BYTES, FlowTable, REVISIT_BUCKETS};
 use net_headers::{
     ETHERNET_HEADER_LEN, EtherType, IPV4_HEADER_LEN, Ipv4Address, MacAddress, Protocol,
     UDP_HEADER_LEN,
@@ -41,7 +41,7 @@ use pd_runtime::{
     Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
     RouteStage, Tracking, Verdict,
 };
-use pipeline::{Pipeline, Rule, RuleAction, Ruleset};
+use pipeline::{Pipeline, PolicySweep, Rule, RuleAction, Ruleset};
 use routing::{Interface, Neighbour, PortId, Router};
 
 /// Representative Ethernet payload sizes: a minimum frame, a mid-size frame,
@@ -378,11 +378,109 @@ fn route_unparsable(c: &mut Criterion) {
     );
 }
 
+/// The appliance's own table, built off the bench thread's stack.
+///
+/// Sixty-eight mebibytes cannot be constructed on a thread with an eight-mebibyte
+/// stack, and a `Box` is filled from a temporary. So the temporary is made on a
+/// thread given room for it and the box is carried back out: the heap allocation
+/// is what the measurement then runs against, and no `unsafe` is needed to reach a
+/// full-capacity table.
+fn appliance_table() -> Box<ApplianceFlowTable> {
+    std::thread::Builder::new()
+        // Room for several copies: `FlowTable::new` fills a temporary and returns
+        // it, and the optimiser is not obliged to elide either move.
+        .stack_size(4 * FLOW_TABLE_BYTES + (8 << 20))
+        .spawn(|| Box::new(ApplianceFlowTable::new()))
+        .expect("a thread with room for one table")
+        .join()
+        .expect("the table to be built")
+}
+
+/// Fill `table` with `count` distinct UDP flows, so a re-decision has flows to
+/// decide on rather than only buckets to walk.
+fn populate(table: &mut ApplianceFlowTable, count: usize) {
+    for index in 0..count {
+        // Distinct in the source port alone, which spreads the keys across
+        // buckets the way a real workload's ephemeral ports do.
+        let source_port = 1024u32.wrapping_add(index as u32);
+        let header = [0u8; UDP_HEADER_LEN];
+        let udp = net_headers::UdpHeader {
+            source_port: source_port as u16,
+            destination_port: 5000,
+            length: UDP_HEADER_LEN as u16,
+            checksum: 0,
+        };
+        table.classify(
+            Monotonic::BOOT,
+            &lfw_flow::Packet {
+                ingress: PORT0.0,
+                source: HOST_A,
+                destination: HOST_B,
+                transport: net_headers::Transport::Udp(udp),
+                transport_bytes: &header,
+            },
+        );
+    }
+}
+
+/// What one wakeup's worth of re-decision costs, and what a whole pass costs.
+///
+/// The number that decides `REVISIT_BUCKETS`, and the reason it is measured
+/// rather than assumed: a commit that stalled forwarding for a visible interval
+/// would be a worse defect than the one re-deciding exists to fix. Two shapes,
+/// because they are the two costs: an empty table pays the index walk alone, and a
+/// populated one pays a routing lookup and a rule walk per live flow on top.
+///
+/// Each measurement is **one `advance`** — one wakeup's window — so the reported
+/// time is what a commit adds to a wakeup. A whole pass is
+/// `FLOW_CAPACITY / REVISIT_BUCKETS` of them.
+fn policy_sweep(c: &mut Criterion) {
+    let policy = ruleset(RuleAction::Accept);
+    let configuration = Configuration::new(GENERATION, &ROUTER, &policy);
+    let mut table = appliance_table();
+
+    for flows in [0usize, 1 << 16] {
+        if flows > 0 {
+            populate(&mut table, flows);
+        }
+        let mut group = c.benchmark_group("policy_sweep_window");
+        group.throughput(Throughput::Elements(REVISIT_BUCKETS as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(flows), &flows, |b, _| {
+            let mut sweep = PolicySweep::new();
+            b.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    // Armed per iteration and timed for one window only: a
+                    // saturated drain is what buys exactly one, and a whole pass is
+                    // `FLOW_CAPACITY / REVISIT_BUCKETS` of them.
+                    sweep.arm(GENERATION);
+                    let mut tracking = Tracking::new(&mut table, Monotonic::BOOT);
+                    let started = Instant::now();
+                    let swept = black_box(sweep.advance(
+                        &configuration,
+                        &mut tracking,
+                        pipeline::WAKEUP_FRAME_BUDGET,
+                        |_| unreachable!("this policy admits every flow the table holds"),
+                    ));
+                    elapsed += started.elapsed();
+                    assert!(swept.is_some(), "an armed sweep advances");
+                }
+                elapsed
+            });
+        });
+        group.finish();
+    }
+    // Stated rather than left to a reader's arithmetic: the pass length is what
+    // the window is traded against.
+    assert_eq!(FLOW_CAPACITY / REVISIT_BUCKETS, 256);
+}
+
 criterion_group!(
     benches,
     route_forwarded,
     route_dropped_by_routing,
     route_denied_by_policy,
-    route_unparsable
+    route_unparsable,
+    policy_sweep
 );
 criterion_main!(benches);

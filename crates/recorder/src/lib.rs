@@ -65,15 +65,21 @@ pub const TAIL_RESERVE: usize = 2 * SECTOR_SIZE;
 ///
 /// A reader keys on this rather than on the length it happens to see, which is
 /// what lets the layout grow: version 1 carried the verdict, its reason and the
-/// configuration generation, and version 2 adds the flow the observation is
-/// about, what the packet did to it, and the rule that decided it.
-pub const ANNOTATION_VERSION: u8 = 2;
+/// configuration generation, version 2 added the flow the observation is about,
+/// what the packet did to it, and the rule that decided it, and version 3 widens
+/// two of its vocabularies — a third verdict for the record that is about a flow
+/// and about no frame, and the event that goes with it.
+pub const ANNOTATION_VERSION: u8 = 3;
 
 /// Bytes of firewall annotation carried in each record's Custom Option.
 pub const ANNOTATION_LEN: usize = 24;
 
 const ANNOTATION_VERDICT_FORWARDED: u8 = 0;
 const ANNOTATION_VERDICT_DROPPED: u8 = 1;
+/// Neither: the record is about a flow the appliance ended and about no frame.
+/// Its packet block therefore carries no bytes and states a wire length of zero,
+/// which is what says there was no packet rather than that a packet was empty.
+const ANNOTATION_VERDICT_REVOKED: u8 = 2;
 
 /// Where each field of the annotation begins: the offsets a reader outside this
 /// workspace navigates by, so a shifted one is a field read as another.
@@ -470,7 +476,9 @@ impl Sink {
             timestamp: tap.timestamp,
             captured,
             original_len: tap.original_len,
-            flags: Some(match tap.direction {
+            // Absent on a record about no frame: `epb_flags`' direction bits
+            // describe a packet on a wire, and there was none.
+            flags: tap.direction.map(|direction| match direction {
                 TapDirection::Inbound => FLAGS_INBOUND,
                 TapDirection::Outbound => FLAGS_OUTBOUND,
             }),
@@ -727,7 +735,7 @@ impl Sink {
     fn annotation(&self, tap: &CheckedTap) -> [u8; ANNOTATION_LEN] {
         let mut annotation = [0u8; ANNOTATION_LEN];
         let drop_reason = match tap.outcome {
-            TapOutcome::Forwarded => 0,
+            TapOutcome::Forwarded | TapOutcome::Revoked => 0,
             TapOutcome::Dropped(reason) => reason.to_bits() as u8,
         };
         let octets = [
@@ -737,15 +745,18 @@ impl Sink {
             (ANNOTATION_AT_INTERFACE, tap.interface_id),
             (
                 ANNOTATION_AT_DIRECTION,
+                // Zero also names inbound, which is what a record with no
+                // direction shares with one that came in: the verdict octet is
+                // what tells them apart, and it is checked before this is read.
                 match tap.direction {
-                    TapDirection::Inbound => 0,
-                    TapDirection::Outbound => 1,
+                    Some(TapDirection::Inbound) | None => 0,
+                    Some(TapDirection::Outbound) => 1,
                 },
             ),
             (
                 ANNOTATION_AT_CLASSIFICATION,
-                match tap.flow {
-                    Some(flow) => flow.classification.to_bits() as u8,
+                match tap.flow.and_then(|flow| flow.classification) {
+                    Some(classification) => classification.to_bits() as u8,
                     None => 0,
                 },
             ),
@@ -880,6 +891,7 @@ const fn annotation_verdict(tap: &CheckedTap) -> u8 {
     match tap.outcome {
         TapOutcome::Forwarded => ANNOTATION_VERDICT_FORWARDED,
         TapOutcome::Dropped(_) => ANNOTATION_VERDICT_DROPPED,
+        TapOutcome::Revoked => ANNOTATION_VERDICT_REVOKED,
     }
 }
 

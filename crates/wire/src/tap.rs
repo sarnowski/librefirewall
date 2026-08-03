@@ -64,6 +64,24 @@
 //! decision the filter never took — are unrepresentable in what a first-party
 //! producer builds, and refused by name in what a peer writes.
 //!
+//! # One observation is about no frame, and says so rather than inventing one
+//!
+//! The appliance can end a conversation *itself*, by re-deciding the connection
+//! table when a policy commits and taking back a flow the new policy would not
+//! admit. That is the one thing worth recording that no packet caused: there is no
+//! frame, no wire length, no direction and no classification, because there was
+//! nothing on a wire. Recording it as a frame would put a fabricated cause into an
+//! artifact that is evidence, and leaving it out would make the connection history
+//! silent about the one way a conversation ends that an operator asked for.
+//!
+//! So the ABI carries a third [`TapVerdict`] — [`TapVerdict::Revoked`] — and the
+//! absence travels with it as a set of relations a reader checks in both
+//! directions: a revocation names a flow and its state, carries no wire length, no
+//! captured bytes, no direction, no classification and no rule, and every other
+//! observation carries a wire length and a direction. Each half is a named
+//! [`TapFault`], so "this record is anchored to no packet" is a property of the
+//! encoding rather than a convention a reader is asked to keep.
+//!
 //! # A full ring refuses the newest record, and never the producer
 //!
 //! **A tap that backpressured the forwarder would be a traffic-generator denial
@@ -139,7 +157,7 @@ pub const TAP_FLOW_STATE_COUNT: u32 = 12;
 
 /// Lifecycle and policy events this ABI encodes, which is
 /// [`TapEvent::ALL`]'s length.
-pub const TAP_EVENT_COUNT: u32 = 6;
+pub const TAP_EVENT_COUNT: u32 = 7;
 
 /// Rules one generation may carry, which is `pipeline::MAX_RULES`.
 ///
@@ -217,6 +235,10 @@ impl TapDirection {
 pub enum TapVerdict {
     Forwarded,
     Dropped,
+    /// Neither, because there was no frame: the appliance ended a flow of its own
+    /// accord. See this module's header on what such a record does and does not
+    /// carry.
+    Revoked,
 }
 
 impl TapVerdict {
@@ -225,6 +247,7 @@ impl TapVerdict {
         match self {
             Self::Forwarded => 0,
             Self::Dropped => 1,
+            Self::Revoked => 2,
         }
     }
 
@@ -235,6 +258,7 @@ impl TapVerdict {
         match bits {
             0 => Some(Self::Forwarded),
             1 => Some(Self::Dropped),
+            2 => Some(Self::Revoked),
             _ => None,
         }
     }
@@ -461,7 +485,10 @@ impl TapFlowState {
 pub struct TapFlow {
     pub slot: u32,
     pub generation: u32,
-    pub classification: TapClassification,
+    /// What the frame was to the flow, absent on the one observation no frame
+    /// caused: a classification is a statement about a packet, so a revocation
+    /// carries none rather than borrowing the last one the flow saw.
+    pub classification: Option<TapClassification>,
     pub state: TapFlowState,
 }
 
@@ -489,18 +516,23 @@ pub enum TapEvent {
     /// The tracker refused the packet outright, and it never reached the filter.
     /// The drop reason says which refusal.
     FlowRefused,
+    /// A newly committed policy no longer admits a conversation it had admitted,
+    /// so the appliance took the flow back. The one event no packet caused, which
+    /// is why it is the one that carries no frame.
+    FlowRevoked,
 }
 
 impl TapEvent {
     /// Every event, so a reader's table and this ABI's own bound are built by
     /// iteration rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::FlowOpened,
         Self::FlowAdvanced,
         Self::FlowClosed,
         Self::PolicyDenied,
         Self::PolicyNoMatch,
         Self::FlowRefused,
+        Self::FlowRevoked,
     ];
 
     /// One higher than this enum's index, so zero is free to mean *no event*.
@@ -513,6 +545,7 @@ impl TapEvent {
             Self::PolicyDenied => 4,
             Self::PolicyNoMatch => 5,
             Self::FlowRefused => 6,
+            Self::FlowRevoked => 7,
         }
     }
 
@@ -527,6 +560,7 @@ impl TapEvent {
             4 => Some(Self::PolicyDenied),
             5 => Some(Self::PolicyNoMatch),
             6 => Some(Self::FlowRefused),
+            7 => Some(Self::FlowRevoked),
             _ => None,
         }
     }
@@ -536,7 +570,7 @@ impl TapEvent {
     pub const fn names_a_flow(self) -> bool {
         matches!(
             self,
-            Self::FlowOpened | Self::FlowAdvanced | Self::FlowClosed
+            Self::FlowOpened | Self::FlowAdvanced | Self::FlowClosed | Self::FlowRevoked
         )
     }
 
@@ -604,7 +638,10 @@ impl TapRule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapDecision {
     pub outcome: TapOutcome,
-    pub direction: TapDirection,
+    /// Which way past the appliance the frame was going, absent on the one
+    /// observation no frame caused: a direction is a property of a packet on a
+    /// wire, and a revocation happened on none.
+    pub direction: Option<TapDirection>,
     /// The configuration generation the decision was taken under.
     pub generation: u32,
     /// The flow the frame belongs to, absent where the tracker resolved none.
@@ -633,7 +670,17 @@ impl TapDecision {
 
     const fn classification(&self) -> u32 {
         match self.flow {
-            Some(flow) => flow.classification.to_bits(),
+            Some(TapFlow {
+                classification: Some(classification),
+                ..
+            }) => classification.to_bits(),
+            Some(_) | None => 0,
+        }
+    }
+
+    const fn flags(&self) -> u32 {
+        match self.direction {
+            Some(direction) => direction.to_bits(),
             None => 0,
         }
     }
@@ -672,19 +719,32 @@ impl TapDecision {
 pub enum TapOutcome {
     Forwarded,
     Dropped(TapDropReason),
+    /// The observation is about a flow the appliance ended and about no frame, so
+    /// there is nothing that was forwarded or dropped. It carries no reason for
+    /// the same reason a forwarded frame does not: the [`TapEvent::FlowRevoked`]
+    /// beside it is the whole of why.
+    Revoked,
 }
 
 impl TapOutcome {
+    /// Whether this outcome is about a frame at all, which is what decides every
+    /// per-frame field of the record.
+    #[must_use]
+    pub const fn observes_a_frame(self) -> bool {
+        !matches!(self, Self::Revoked)
+    }
+
     const fn verdict(self) -> TapVerdict {
         match self {
             Self::Forwarded => TapVerdict::Forwarded,
             Self::Dropped(_) => TapVerdict::Dropped,
+            Self::Revoked => TapVerdict::Revoked,
         }
     }
 
     const fn drop_reason(self) -> u32 {
         match self {
-            Self::Forwarded => 0,
+            Self::Forwarded | Self::Revoked => 0,
             Self::Dropped(reason) => reason.to_bits(),
         }
     }
@@ -749,7 +809,7 @@ impl TapAnnotation {
             captured_len: 0,
             verdict: decision.outcome.verdict().to_bits(),
             drop_reason: decision.outcome.drop_reason(),
-            flags: decision.direction.to_bits(),
+            flags: decision.flags(),
             generation: decision.generation,
             flow_slot: decision.flow_slot(),
             flow_generation: decision.flow_generation(),
@@ -778,7 +838,9 @@ pub struct CheckedTap {
     /// than and never longer.
     pub original_len: u32,
     pub outcome: TapOutcome,
-    pub direction: TapDirection,
+    /// Which way past the appliance the frame was going, absent where the
+    /// observation is about no frame.
+    pub direction: Option<TapDirection>,
     /// The configuration generation in force when the frame was observed.
     pub generation: u32,
     /// The flow the frame belongs to, absent where the tracker resolved none.
@@ -839,6 +901,50 @@ pub enum TapFault {
     },
     /// A dropped frame naming no reason, which no routing decision produces.
     DropReasonMissingOnDropped,
+    /// A revocation carrying a reason. Its verdict is neither of the two a reason
+    /// belongs to, and the event beside it is already the whole of why the flow
+    /// ended.
+    DropReasonOnRevocation {
+        drop_reason: u32,
+    },
+    /// A revocation claiming a frame was on a wire. Refused rather than trusted
+    /// in either direction, because these two words are the whole of how a reader
+    /// tells a record about a flow from a record about a packet.
+    WireLengthOnRevocation {
+        original_len: u32,
+        captured_len: u32,
+    },
+    /// A revocation carrying a direction, which is a property of a packet on a
+    /// wire and there was none.
+    DirectionOnRevocation {
+        flags: u32,
+    },
+    /// A revocation carrying a classification, which is a statement about a
+    /// packet.
+    ClassificationOnRevocation {
+        classification: u32,
+    },
+    /// An observation of a frame whose wire length is zero, which no frame the
+    /// pipeline reached a decision about can have — it parsed as IPv4 over
+    /// Ethernet, so it carried at least the two headers. The mirror of
+    /// [`Self::WireLengthOnRevocation`]: without it a peer could write a record
+    /// about no packet under an event that claims one.
+    WireLengthMissing {
+        verdict: u32,
+    },
+    /// An observation of a frame naming no direction, which the two the ABI
+    /// encodes leave no room for.
+    DirectionMissing {
+        verdict: u32,
+    },
+    /// A revocation whose event is not [`TapEvent::FlowRevoked`], or that event on
+    /// a verdict that is not [`TapVerdict::Revoked`]. The two are one fact written
+    /// twice, so a reader that accepted them apart would report a flow ended by a
+    /// policy as a frame, or the reverse.
+    RevocationEventMismatch {
+        verdict: u32,
+        event: u32,
+    },
     ClassificationUnknown {
         classification: u32,
     },
@@ -1092,10 +1198,6 @@ impl TapSlot {
             });
         }
 
-        let Some(direction) = TapDirection::from_bits(raw.flags) else {
-            return Err(TapFault::FlagsUnknown { flags: raw.flags });
-        };
-
         let Some(verdict) = TapVerdict::from_bits(raw.verdict) else {
             return Err(TapFault::VerdictUnknown {
                 verdict: raw.verdict,
@@ -1116,15 +1218,59 @@ impl TapSlot {
         let outcome = match (verdict, reason) {
             (TapVerdict::Forwarded, None) => TapOutcome::Forwarded,
             (TapVerdict::Dropped, Some(reason)) => TapOutcome::Dropped(reason),
+            (TapVerdict::Revoked, None) => TapOutcome::Revoked,
             (TapVerdict::Forwarded, Some(reason)) => {
                 return Err(TapFault::DropReasonOnForwarded {
                     drop_reason: reason.to_bits(),
                 });
             }
             (TapVerdict::Dropped, None) => return Err(TapFault::DropReasonMissingOnDropped),
+            (TapVerdict::Revoked, Some(reason)) => {
+                return Err(TapFault::DropReasonOnRevocation {
+                    drop_reason: reason.to_bits(),
+                });
+            }
         };
 
-        let decoded = decode_decision(&raw)?;
+        // The whole of what tells a record about a flow from a record about a
+        // packet, checked in both directions before anything downstream reads
+        // either: a revocation carries none of the four per-frame facts, and every
+        // other observation carries the two that no frame can be without.
+        let direction = if outcome.observes_a_frame() {
+            if raw.original_len == 0 {
+                return Err(TapFault::WireLengthMissing {
+                    verdict: raw.verdict,
+                });
+            }
+            match TapDirection::from_bits(raw.flags) {
+                Some(direction) => Some(direction),
+                None => return Err(TapFault::FlagsUnknown { flags: raw.flags }),
+            }
+        } else {
+            if raw.original_len != 0 || captured_len != 0 {
+                return Err(TapFault::WireLengthOnRevocation {
+                    original_len: raw.original_len,
+                    captured_len,
+                });
+            }
+            if raw.flags != 0 {
+                return Err(TapFault::DirectionOnRevocation { flags: raw.flags });
+            }
+            if raw.classification != 0 {
+                return Err(TapFault::ClassificationOnRevocation {
+                    classification: raw.classification,
+                });
+            }
+            None
+        };
+        if outcome.observes_a_frame() == (raw.event == TapEvent::FlowRevoked.to_bits()) {
+            return Err(TapFault::RevocationEventMismatch {
+                verdict: raw.verdict,
+                event: raw.event,
+            });
+        }
+
+        let decoded = decode_decision(&raw, outcome.observes_a_frame())?;
 
         for (byte, cell) in target.iter_mut().zip(&self.payload) {
             *byte = cell.load(Ordering::Relaxed);
@@ -1161,7 +1307,12 @@ struct Decoded {
     event: Option<TapEvent>,
 }
 
-fn decode_decision(raw: &TapAnnotation) -> Result<Decoded, TapFault> {
+/// `observes_a_frame` is the caller's already-checked answer to whether this
+/// record is about a packet at all. It is passed in rather than re-derived
+/// because the four relations that hang off it are checked in one place — here
+/// the only one left is the classification, which a revocation may not carry and
+/// every other observation must.
+fn decode_decision(raw: &TapAnnotation, observes_a_frame: bool) -> Result<Decoded, TapFault> {
     let classification = match raw.classification {
         0 => None,
         bits => match TapClassification::from_bits(bits) {
@@ -1184,7 +1335,17 @@ fn decode_decision(raw: &TapAnnotation) -> Result<Decoded, TapFault> {
         (Some(classification), Some(state)) => Some(TapFlow {
             slot: raw.flow_slot,
             generation: raw.flow_generation,
-            classification,
+            classification: Some(classification),
+            state,
+        }),
+        // A state with no classification is a flow with no packet, which is
+        // exactly a revocation and nothing else: the caller has already refused a
+        // classification on one, so reaching here with a frame means an
+        // observation of one arrived unclassified.
+        (None, Some(state)) if !observes_a_frame => Some(TapFlow {
+            slot: raw.flow_slot,
+            generation: raw.flow_generation,
+            classification: None,
             state,
         }),
         (None, None) => {
@@ -1652,9 +1813,13 @@ const _: () = {
     // which is exact only while a `usize` is at least as wide; x86_64's is.
     assert!(size_of::<usize>() >= size_of::<u32>());
     assert!(TAP_SNAP_LEN <= u32::MAX as usize);
-    // A zeroed region is the valid empty state: no observation is published,
-    // and a slot that a peer publishes unchanged decodes as an inbound,
-    // forwarded, zero-length observation on interface 0 rather than as a fault.
+    // A zeroed region is the valid empty state: with both cursors at zero no slot
+    // is ever read. A zeroed slot a peer publishes *anyway* is refused, by
+    // `TapFault::WireLengthMissing` — it claims a forwarded frame of no length,
+    // which no frame the pipeline decided on can be, having parsed as IPv4 over
+    // Ethernet. That is a tightening of what a reader accepts and it is the point:
+    // the only way to reach one is a forged cursor, and a record about no packet
+    // must not be readable as a record about one.
     assert!(TapVerdict::Forwarded.to_bits() == 0);
     assert!(TapDirection::Inbound.to_bits() == 0);
     assert!(TapDropReason::from_bits(0).is_none());
@@ -1673,7 +1838,7 @@ const _: () = {
     assert!(TapFlowState::IcmpReplied.to_bits() == TAP_FLOW_STATE_COUNT);
     assert!(TapFlowState::from_bits(TAP_FLOW_STATE_COUNT).is_some());
     assert!(TapFlowState::from_bits(TAP_FLOW_STATE_COUNT + 1).is_none());
-    assert!(TapEvent::FlowRefused.to_bits() == TAP_EVENT_COUNT);
+    assert!(TapEvent::FlowRevoked.to_bits() == TAP_EVENT_COUNT);
     assert!(TapEvent::ALL.len() == TAP_EVENT_COUNT as usize);
     assert!(TapEvent::from_bits(TAP_EVENT_COUNT).is_some());
     assert!(TapEvent::from_bits(TAP_EVENT_COUNT + 1).is_none());

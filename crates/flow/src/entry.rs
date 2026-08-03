@@ -346,6 +346,25 @@ mod entry_flags {
     pub(super) const ORIGIN_IS_UPPER: u8 = 1 << 0;
 }
 
+/// What the packet that opened a flow was, as much of it as an entry holds.
+///
+/// The five-tuple **in the orientation that packet travelled in** — not the
+/// canonical one a key is sorted into — plus the port it arrived on, because
+/// those are what a filter decided the conversation on. It carries no length, no
+/// lifetime and no header field beyond them: a caller re-deciding on a flow has
+/// no packet left to consult, and inventing one of those values would be
+/// answering a criterion out of nothing.
+///
+/// [`Endpoint::port`]'s two meanings both travel here unchanged: a transport
+/// port for TCP and UDP, and for an ICMP echo the identifier both ends carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowOpening {
+    pub ingress: u8,
+    pub source: Endpoint,
+    pub destination: Endpoint,
+    pub protocol: Protocol,
+}
+
 /// One flow: its identity, its state, and what each direction has sent.
 ///
 /// Exactly one cache line, asserted below. The tuple a probe compares occupies
@@ -360,7 +379,10 @@ pub struct FlowEntry {
     protocol: u8,
     state: FlowState,
     flags: u8,
-    reserved: u8,
+    /// The dataplane port the packet that opened this flow arrived on. It occupies
+    /// the byte the layout held in reserve, so the entry is the same cache line it
+    /// was; nothing here reads it, a lookup comparing a tuple.
+    ingress: u8,
     /// Bumped every time this slot is filled, so a handle to a flow that is over
     /// cannot address the one that replaced it.
     generation: u32,
@@ -382,7 +404,7 @@ impl FlowEntry {
         protocol: 0,
         state: FlowState::Vacant,
         flags: 0,
-        reserved: 0,
+        ingress: 0,
         generation: 0,
         link: NO_SLOT,
         last_seen: 0,
@@ -397,6 +419,7 @@ impl FlowEntry {
     pub(crate) fn open(
         &mut self,
         key: &FlowKey,
+        ingress: u8,
         origin_is_lower: bool,
         state: FlowState,
         now: Monotonic,
@@ -414,7 +437,7 @@ impl FlowEntry {
             } else {
                 entry_flags::ORIGIN_IS_UPPER
             },
-            reserved: 0,
+            ingress,
             generation,
             link: NO_SLOT,
             last_seen: now.as_nanos(),
@@ -463,6 +486,33 @@ impl FlowEntry {
             Protocol(self.protocol),
         );
         key
+    }
+
+    /// What the packet that opened this flow was.
+    ///
+    /// The orientation is recovered from the one bit that records it, so the
+    /// source is the end that spoke first however the canonical pair happens to
+    /// sort — which is the whole reason that bit is stored.
+    #[must_use]
+    pub fn opening(&self) -> FlowOpening {
+        let lower = Endpoint::new(
+            Ipv4Address::from_octets(self.lower_address.to_be_bytes()),
+            self.lower_port,
+        );
+        let upper = Endpoint::new(
+            Ipv4Address::from_octets(self.upper_address.to_be_bytes()),
+            self.upper_port,
+        );
+        let (source, destination) = match self.direction_of_lower() {
+            Direction::Original => (lower, upper),
+            Direction::Reply => (upper, lower),
+        };
+        FlowOpening {
+            ingress: self.ingress,
+            source,
+            destination,
+            protocol: Protocol(self.protocol),
+        }
     }
 
     /// Whether this entry holds exactly the flow `key` names.
@@ -616,6 +666,7 @@ const _: () = {
     assert!(offset_of!(FlowEntry, protocol) == 12);
     assert!(offset_of!(FlowEntry, state) == 13);
     assert!(offset_of!(FlowEntry, flags) == 14);
+    assert!(offset_of!(FlowEntry, ingress) == 15);
     assert!(offset_of!(FlowEntry, generation) == 16);
     assert!(offset_of!(FlowEntry, link) == 20);
     assert!(offset_of!(FlowEntry, last_seen) == 24);

@@ -57,11 +57,19 @@
 //!   generation refuses one whose slot has been reused.
 //! * **The sweep is bounded.** It examines what it says it examines and reclaims no
 //!   more than that.
+//! * **A re-decision terminates over whatever the stream left behind, and takes
+//!   back exactly what it was told to.** The pass walks the index rather than the
+//!   entries, so which flows it can reach is decided by the chains an arbitrary
+//!   stream of colliding tuples built — and the caller's own answer is arbitrary
+//!   too, so the pass is exercised keeping everything, revoking everything, and
+//!   every mixture. What it must never do is fail to terminate, revoke a flow the
+//!   caller kept, or leave the occupancy disagreeing with itself.
 
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_flow::{
-    FlowCounters, FlowEntry, FlowId, FlowState, FlowTable, Outcome, Packet, Refusal, SWEEP_STRIDE,
+    Disposition, FlowCounters, FlowEntry, FlowId, FlowState, FlowTable, Outcome, Packet, Refusal,
+    REVISIT_BUCKETS, REVISIT_FLOWS, SWEEP_STRIDE,
 };
 use net_headers::{IcmpHeader, Ipv4Address, Protocol, TcpFlags, TcpHeader, Transport, UdpHeader};
 use std::num::NonZeroU64;
@@ -76,6 +84,9 @@ const CAPACITY: usize = 16;
 
 /// The tuple the harness's own connection is established on, so the synchronized
 /// paths are reached even by an input that could never compose a handshake.
+/// The port the harness's own connection is opened on.
+const HARNESS_INGRESS: u8 = 0;
+
 const CLIENT: Ipv4Address = Ipv4Address::from_octets([10, 0, 1, 10]);
 const SERVER: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 20]);
 const CLIENT_PORT: u16 = 40_000;
@@ -147,12 +158,90 @@ pub fn flow_table_harness(data: &[u8]) {
         assert!(sweep.expired <= sweep.examined);
         assert_occupancy(&table);
 
+        // And a whole re-decision over whatever the stream has left in the table,
+        // with the caller's answer taken from the same input: the pass must
+        // terminate, must revoke only what it was told to, and must leave the
+        // occupancy consistent whichever chains the tuples happened to build.
+        assert_revisiting_takes_back_only_what_it_is_told(
+            &mut table,
+            u8::arbitrary(&mut unstructured).unwrap_or(0),
+        );
+        assert_occupancy(&table);
+        assert_accounted(table.counters(), packets);
+
         if operations >= MAX_OPERATIONS {
             break;
         }
     }
 
     assert_initialising_empties_the_table(&mut table, established);
+}
+
+/// One whole pass over the index, keeping a flow exactly where `keep` says so.
+///
+/// `keep` is a bit pattern the input chose, taken against the flow's own slot, so
+/// one input reaches "keep everything", "revoke everything" and every mixture
+/// between — which is what makes the selectivity property meaningful rather than a
+/// restatement of one branch.
+///
+/// The pass is bounded per call, so a caller has to loop; a bound on how many calls
+/// that may take is what makes non-termination a finding here rather than a hang.
+fn assert_revisiting_takes_back_only_what_it_is_told<const N: usize>(
+    table: &mut FlowTable<N>,
+    keep: u8,
+) {
+    let before = table.len();
+    let revoked_before = table.counters().flows_revoked;
+    let mut kept = Vec::new();
+    let mut cursor = 0usize;
+    let mut calls = 0usize;
+    let mut revoked = 0usize;
+    loop {
+        let pass = table.revisit(cursor, |flow| {
+            assert!(
+                (flow.id.slot() as usize) < N,
+                "a re-decision reported a slot the table does not have"
+            );
+            if keep & (1u8 << (flow.id.slot() % 8)) == 0 {
+                revoked += 1;
+                Disposition::Revoke
+            } else {
+                kept.push(flow.id);
+                Disposition::Keep
+            }
+        });
+        assert!(pass.buckets <= REVISIT_BUCKETS);
+        assert!(pass.examined <= REVISIT_FLOWS + lfw_flow::MAX_CHAIN);
+        assert!(pass.revoked <= pass.examined);
+        cursor = pass.next;
+        calls += 1;
+        // One window covers `REVISIT_BUCKETS` buckets and the table has `N`, so a
+        // pass that has not finished by this many calls is not advancing.
+        assert!(
+            calls <= N.div_ceil(REVISIT_BUCKETS) + N + 1,
+            "a re-decision did not terminate"
+        );
+        if pass.complete {
+            break;
+        }
+    }
+    // Exactly the flows the caller disowned, and no others.
+    assert_eq!(
+        table.len(),
+        before - revoked,
+        "a re-decision took back a different number of flows than it reported"
+    );
+    assert_eq!(
+        table.counters().flows_revoked,
+        revoked_before + revoked as u64,
+        "a revocation was performed without being counted"
+    );
+    for id in kept {
+        assert!(
+            table.flow(id).is_some(),
+            "a re-decision took back a flow the caller kept"
+        );
+    }
 }
 
 /// The counts the table reports sum to its capacity and agree with its own length.
@@ -224,6 +313,11 @@ fn assert_initialising_empties_the_table<const N: usize>(
 
 /// One packet, owning its own bytes so a [`Packet`] can borrow them.
 struct Wire {
+    /// Unreduced, on every other field's terms: the port is the *caller's* claim
+    /// rather than the network's, and a table that read it would be reading a value
+    /// nothing here validates. It is carried through to the opening a re-decision
+    /// reports, so an arbitrary one is what proves that round trip.
+    ingress: u8,
     source: Ipv4Address,
     destination: Ipv4Address,
     transport: Transport,
@@ -233,6 +327,7 @@ struct Wire {
 impl Wire {
     fn packet(&self) -> Packet<'_> {
         Packet {
+            ingress: self.ingress,
             source: self.source,
             destination: self.destination,
             transport: self.transport,
@@ -276,6 +371,7 @@ fn tcp_packet(unstructured: &mut Unstructured<'_>) -> Wire {
         bytes.push(u8::arbitrary(unstructured).unwrap_or(0));
     }
     Wire {
+        ingress: u8::arbitrary(unstructured).unwrap_or(0),
         source,
         destination: SERVER,
         transport: Transport::Tcp(TcpHeader {
@@ -298,6 +394,7 @@ fn udp_packet(unstructured: &mut Unstructured<'_>) -> Wire {
     let source_port = any_u16(unstructured);
     let destination_port = any_u16(unstructured);
     Wire {
+        ingress: u8::arbitrary(unstructured).unwrap_or(0),
         source,
         destination: SERVER,
         transport: Transport::Udp(UdpHeader {
@@ -324,6 +421,7 @@ fn icmp_packet(unstructured: &mut Unstructured<'_>) -> Wire {
         bytes.push(u8::arbitrary(unstructured).unwrap_or(0));
     }
     Wire {
+        ingress: u8::arbitrary(unstructured).unwrap_or(0),
         source,
         destination: if any_u16(unstructured) % 2 == 0 {
             SERVER
@@ -396,6 +494,7 @@ fn quoting_error(unstructured: &mut Unstructured<'_>) -> Wire {
     bytes.truncate(keep);
 
     Wire {
+        ingress: u8::arbitrary(unstructured).unwrap_or(0),
         source: address(unstructured),
         destination: CLIENT,
         transport: Transport::Icmp(IcmpHeader {
@@ -409,6 +508,10 @@ fn quoting_error(unstructured: &mut Unstructured<'_>) -> Wire {
 }
 
 /// One segment of the harness's own handshake.
+///
+/// The one `Wire` whose ingress is fixed rather than arbitrary: this is the
+/// harness's *own* connection, composed so the synchronized paths are reachable at
+/// all, and every value in it is chosen for that.
 fn handshake_segment(from_server: u8, flags: TcpFlags, sequence: u32, acknowledgement: u32) -> Wire {
     let (source, destination, source_port, destination_port) = if from_server == 0 {
         (CLIENT, SERVER, CLIENT_PORT, SERVER_PORT)
@@ -416,6 +519,7 @@ fn handshake_segment(from_server: u8, flags: TcpFlags, sequence: u32, acknowledg
         (SERVER, CLIENT, SERVER_PORT, CLIENT_PORT)
     };
     Wire {
+        ingress: HARNESS_INGRESS,
         source,
         destination,
         transport: Transport::Tcp(TcpHeader {

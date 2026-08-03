@@ -60,9 +60,15 @@ not, and the difference is a design decision rather than an accident of the file
   The cost is stated with it, in both directions. A packet the appliance cannot keep state for — a
   fragment, a protocol it does not decode, a segment from the middle of a conversation it never saw
   begin — is refused before the filter, so no rule can permit one. And editing the policy changes
-  which conversations may *start*: it does not end one already running. What closes the second is
-  re-evaluating the flow table on commit rather than consulting the policy per packet, and it does
-  not exist yet — the [development status](../status.md) records it as missing.
+  which conversations may *start*, so on the packet path it does not reach one already running.
+
+  **What reaches one is the commit, and it reaches it by re-deciding the flow table rather than by
+  consulting the policy per packet.** A commit sweeps the table against the new policy and takes back
+  every conversation it would no longer admit, so removing a rule ends the connections it had
+  admitted — which is what the model owes an operator who has found a host compromised. Once per
+  commit rather than once per packet, so the ruleset stays off the hot path; and every flow the new
+  policy still allows is left exactly as it was, which is the guarantee this whole model exists for
+  and the one a sweep that merely flushed the table would have destroyed.
 - **A rule that could never match is refused, not committed.** A criterion combination with no
   satisfying packet — a range whose ends run backwards, a port criterion on a protocol that has no
   ports, a block written with host bits set — is a line an operator wrote believing it was in force.

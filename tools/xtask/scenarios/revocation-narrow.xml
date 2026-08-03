@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, and the second document in this tree that is never built into
+     an image: it is SUBMITTED over the management API to a node already running
+     `systems/qemu-x86_64/configuration.xml`, and what it proves is that a policy
+     commit ENDS the conversations it no longer admits — and only those.
+
+     IT DIFFERS FROM THE SHIPPED DOCUMENT IN ONE ATTRIBUTE. `probe-forward` gains
+     `source-port="4444"`; every other attribute of every element, both rule ids,
+     both actions and both destination ports are the shipped document's. That one
+     attribute is the whole of the experiment, and it is why the experiment is
+     selective rather than a flush:
+
+       * a conversation opened from source port 4444 to destination 5000 is still
+         admitted by this document, so it must survive the commit untouched and
+         must go on carrying traffic no rule names;
+       * a conversation opened from source port 4445 to the same destination 5000
+         is not, so it must be taken back — and its next packet must then be
+         refused, which under the previous behaviour it would not have been, a
+         tracked flow being forwarded before the filter is consulted at all.
+
+     Two conversations that differ in one field of one header, decided differently
+     by a document that differs in one attribute. A commit that flushed the table
+     would end both; a commit that did nothing would end neither. Only re-deciding
+     the table against this policy ends exactly one.
+
+     THE ACCEPT RULE STAYS AN ACCEPT AND KEEPS ITS ID. What moves is its
+     *criteria*, which is deliberately the harder case for the appliance: a rule
+     whose action changed would be visible in the per-rule counters on its own,
+     while a rule that narrowed matches the same id and the same action and is
+     told apart only by which conversations it still admits.
+
+     `probe-blocked` is carried through unchanged, drop and all, so nothing about
+     the fallthrough or the denying rule moves under this submission either. The
+     management addressing is the shipped document's, because the client that
+     submits this reaches the node at that address and would otherwise be cut off
+     by its own submission. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+    <rules>
+        <rule id="probe-blocked" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="4444" destination-port="5000" icmp-type="any" action="accept"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

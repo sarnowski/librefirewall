@@ -42,6 +42,11 @@ const OPTION_HEADER_LEN: usize = 4;
 /// types are.
 const OPT_END_OF_OPT: u16 = 0;
 const IF_NAME: u16 = 2;
+const EPB_FLAGS: u16 = 2;
+
+/// `epb_flags`' direction bits as the appliance writes them: 1 inbound, 2
+/// outbound. A number on the block types' terms.
+pub(crate) const FLAGS_INBOUND: u32 = 1;
 const EPB_PACKETID: u16 = 5;
 const EPB_VERDICT: u16 = 7;
 
@@ -57,7 +62,7 @@ const UNREGISTERED_PEN: u32 = 0xFFFF_FFFF;
 /// The layout version the annotation must declare. A reader keys on this rather
 /// than on the length it happens to see, so a file that grew a field without
 /// saying so is a finding here.
-pub const ANNOTATION_VERSION: u8 = 2;
+pub const ANNOTATION_VERSION: u8 = 3;
 
 /// Bytes of annotation this layout version carries.
 pub const ANNOTATION_LEN: usize = 24;
@@ -70,6 +75,9 @@ pub const VERDICT_KIND: u8 = 0xFF;
 /// it.
 pub const VERDICT_FORWARDED: u8 = 0;
 pub const VERDICT_DROPPED: u8 = 1;
+/// Neither, because the record is about no frame: a conversation the appliance
+/// ended itself when a policy commit stopped admitting it.
+pub const VERDICT_REVOKED: u8 = 2;
 
 /// The events an annotation may name, as the numbers the tap ABI encodes them
 /// as. A vocabulary, restated as numbers, on the block types' terms.
@@ -79,6 +87,7 @@ pub const EVENT_FLOW_CLOSED: u8 = 3;
 pub const EVENT_POLICY_DENIED: u8 = 4;
 pub const EVENT_POLICY_NO_MATCH: u8 = 5;
 pub const EVENT_FLOW_REFUSED: u8 = 6;
+pub const EVENT_FLOW_REVOKED: u8 = 7;
 
 /// The classifications an annotation may name.
 pub const CLASSIFICATION_NEW: u8 = 1;
@@ -114,6 +123,7 @@ pub fn event_name(event: u8) -> &'static str {
         EVENT_POLICY_DENIED => "policy-denied",
         EVENT_POLICY_NO_MATCH => "policy-no-match",
         EVENT_FLOW_REFUSED => "flow-refused",
+        EVENT_FLOW_REVOKED => "flow-revoked",
         _ => "an event this walk does not know",
     }
 }
@@ -241,9 +251,20 @@ impl Annotation {
     }
 
     /// Whether the annotation names a flow at all.
+    ///
+    /// A classification, **or** the one record that names a flow and no packet: a
+    /// revocation has nothing for a classification to be about, a classification
+    /// being a statement about a frame and there having been none.
     #[must_use]
     pub const fn names_a_flow(&self) -> bool {
-        self.classification != 0
+        self.classification != 0 || self.is_revocation()
+    }
+
+    /// Whether this record is about a flow the appliance ended rather than about a
+    /// frame that crossed it.
+    #[must_use]
+    pub const fn is_revocation(&self) -> bool {
+        self.verdict == VERDICT_REVOKED
     }
 
     /// The rule's position, or `None` where none matched.
@@ -287,6 +308,10 @@ pub struct Packet {
     /// The frame's length on the wire, which exceeds `captured.len()` exactly
     /// when the sink truncated it.
     pub original_len: u32,
+    /// The `epb_flags` option, or `None` where the block declares none — which is
+    /// the one record that is about no frame, a direction being a property of a
+    /// packet on a wire.
+    pub flags: Option<u32>,
     /// The bytes the block retained.
     pub captured: Vec<u8>,
     /// The `epb_verdict` option's octets, or `None` where the block declares
@@ -497,6 +522,9 @@ fn packet(block: &[u8]) -> Packet {
         interface_id: word(block, 8).unwrap_or(0),
         packet_id: option(block, options_at, EPB_PACKETID).and_then(long),
         original_len: word(block, 24).unwrap_or(0),
+        flags: option(block, options_at, EPB_FLAGS)
+            .and_then(|value| value.first_chunk::<4>().copied())
+            .map(u32::from_le_bytes),
         captured,
         verdict: option(block, options_at, EPB_VERDICT).map(<[u8]>::to_vec),
         // The PEN is the option's own first four octets and the annotation

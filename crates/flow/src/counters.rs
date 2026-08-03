@@ -61,6 +61,11 @@ pub struct FlowCounters {
     /// tracks refused connection attempts, so a number climbing beside
     /// `flows_created` is a policy turning traffic away rather than a fault.
     pub flows_withdrawn: u64,
+    /// Flows taken back because the caller re-decided on them and no longer admits
+    /// them. Its own field because it accuses the opposite of `flows_withdrawn`: a
+    /// withdrawal is a connection attempt turned away as it arrived, and this is a
+    /// conversation a policy *had* admitted and has stopped admitting.
+    pub flows_revoked: u64,
 
     /// Packets of a protocol this tracker holds no state for.
     pub refused_unsupported_protocol: u64,
@@ -119,6 +124,7 @@ impl FlowCounters {
             flows_evicted: 0,
             flows_closed: 0,
             flows_withdrawn: 0,
+            flows_revoked: 0,
             refused_unsupported_protocol: 0,
             refused_fragment: 0,
             refused_malformed: 0,

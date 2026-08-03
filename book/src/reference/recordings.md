@@ -101,10 +101,10 @@ below that it does not know.
 
   | option | what it holds |
   |---|---|
-  | `epb_flags` | direction; every record reads *inbound* — see below |
+  | `epb_flags` | direction; every record reads *inbound* — see below. **Absent** on the one record that is about no frame, a direction being a property of a packet on a wire |
   | `epb_dropcount` | tap-ring observations lost before this record, and any `u64`. The recorder differences the forwarder's own tap-drop count on every pass and holds the rise as a debt until there is a record to carry it, so the number belongs to the gap before this block and not to the packet in it. It accounts for the tap ring **and nothing else**: what a sink could not encode, or could not write, is on `/metrics` and not in the file |
   | `epb_packetid` | the appliance-wide packet identity. It is the same number on the connection history's record of an event and on the capture's record of the packet that caused it, so the two files relate to each other by it |
-  | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped |
+  | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped, `2` neither — a conversation the appliance ended itself |
   | custom option, PEN-tagged | 24 bytes carrying the whole decision — see below |
 
 ### The annotation: what the appliance decided
@@ -114,9 +114,9 @@ field for it. It is 24 bytes, little-endian, at these offsets:
 
 | at | width | what it holds |
 |---|---|---|
-| 0 | 1 | **layout version**, currently `2`. A reader keys on this and not on the length it happens to see |
-| 1 | 1 | verdict: `0` forwarded, `1` dropped — the same value `epb_verdict` carries |
-| 2 | 1 | drop reason, or `0` on a forwarded frame. The numbering is the [`reason` label's](metrics.md) order, counting from one |
+| 0 | 1 | **layout version**, currently `3`. A reader keys on this and not on the length it happens to see |
+| 1 | 1 | verdict: `0` forwarded, `1` dropped, `2` a conversation the appliance ended — the same value `epb_verdict` carries |
+| 2 | 1 | drop reason, or `0` where no frame was dropped. The numbering is the [`reason` label's](metrics.md) order, counting from one |
 | 3 | 1 | interface id, the same value the block's own `interface_id` names |
 | 4 | 1 | direction: `0` inbound, `1` outbound |
 | 5 | 1 | flow classification: `0` no flow, `1` new, `2` established, `3` related |
@@ -142,7 +142,8 @@ rule at position 0 is the first rule the document declares.
 them:
 
 - a forwarded record carries no drop reason, and a dropped one always carries one;
-- an open, an advance and a close always name a flow; a refusal and a policy decision may not;
+- an open, an advance, a close and a revocation always name a flow; a refusal and a policy decision
+  may not;
 - a **close always names a state a conversation does not leave** — `time_wait` or `closed` — so a
   close always says *how* it closed;
 - an open is classified `new`; an advance and a close are classified `established`;
@@ -162,17 +163,35 @@ them:
 | `policy-denied` | 4 | a rule matched the opening packet and its action is to drop. The flow it had just opened was withdrawn |
 | `policy-no-match` | 5 | no rule was about the opening packet, so the default deny refused it. The flow it had just opened was withdrawn |
 | `flow-refused` | 6 | the connection tracker refused the packet outright, so it never reached the filter. The drop reason says which refusal |
+| `flow-revoked` | 7 | a policy commit no longer admits a conversation it had admitted, so the appliance ended it. **The one record that is about no frame** — see below |
 
-Two things the vocabulary does not say, and an operator will otherwise infer wrongly.
+Three things the vocabulary does not say, and an operator will otherwise infer wrongly.
+
+**A revocation is about a conversation and about no packet, and says so in every field pcapng has
+for one.** Nothing was on a wire, so the block carries no captured bytes, states a wire length of
+zero — which no frame the appliance reaches a verdict on can have, having parsed as IPv4 over
+Ethernet — carries no `epb_flags` and no classification, and names no rule. What it *does* carry is
+the flow it ended and the state that conversation was in when the commit reached it, so it folds onto
+the record that opened the conversation by the same (slot, occupant) pair every other record is
+folded by. It appears in `/logs.pcapng` alone: a capture is the frames themselves, and this one was
+on no wire.
+
+That is the honest shape rather than the convenient one. Writing a plausible frame into the block
+would have put a fabricated cause into an artifact that is evidence; omitting the record would have
+left the connection history silent about the one way a conversation ends that an operator asked
+for. A reader that does not know this layout sees a zero-length packet, which is what "no packet"
+looks like in a format whose every record is a packet.
 
 **A refusal names no flow.** A packet the tracker refused is one it keeps no state for, so there is
 no conversation to name — including for the two refusals that are *about* an existing flow, a
 segment outside its window and one its state does not admit. What locates such a record is the
 five-tuple in the causing packet's own headers, which the record carries.
 
-**A conversation that times out produces no close.** Every record is anchored to the packet that
-caused it, and a flow reclaimed by its idle timeout has no such packet. What states a timeout is
-`librefirewall_flow_expired_total` on [`/metrics`](metrics.md).
+**A conversation that times out produces no close.** Almost every record is anchored to the packet
+that caused it, and a flow reclaimed by its idle timeout has no such packet. What states a timeout is
+`librefirewall_flow_expired_total` on [`/metrics`](metrics.md). A revocation is the one record with no
+causing packet that *is* written, and the paragraph above says how it is written honestly; a timeout
+has no such record.
 
 - **A Custom Block of padding** fills whatever the encoder must leave empty to keep every write to
   the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
@@ -191,16 +210,17 @@ caused it, and a flow reclaimed by its idle timeout has no such packet. What sta
 
 ## What the two recordings hold
 
-**`/capture.pcapng` holds every observation, with its verdict.** Every frame the appliance reached a
-decision about is a record, and every record carries the annotation above: allow or deny, the reason,
+**`/capture.pcapng` holds every observation of a frame, with its verdict.** Every frame the appliance
+reached a decision about is a record, and every record carries the annotation above: allow or deny, the reason,
 the rule where one matched, and the conversation it belongs to. It keeps up to 2048 bytes of each
 frame, which is the whole of every frame a dataplane link carries at a standard MTU.
 
 **`/logs.pcapng` holds a record only where the appliance reached a lifecycle or policy event** — a
-conversation opened, advanced or closed, a policy refusal, a tracker refusal. Its records are
-therefore a subset of the capture's, relatable to them one for one by `epb_packetid`, and it holds
-**no record for a packet that caused no event**: traffic on a conversation already accounted for, and
-frames refused by admission or routing, are in the capture alone.
+conversation opened, advanced, closed or revoked, a policy refusal, a tracker refusal. Its records of
+*frames* are therefore a subset of the capture's, relatable to them one for one by `epb_packetid`, and
+it holds **no record for a packet that caused no event**: traffic on a conversation already accounted
+for, and frames refused by admission or routing, are in the capture alone. The revocation runs the
+other way — it is in the connection history and in no capture, there being no frame to capture.
 
 That selection is the point of there being two files, and the reason is a rate. A record per
 connection admitted is three to four orders of magnitude below a record per packet, so a connection

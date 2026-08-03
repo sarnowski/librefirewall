@@ -125,37 +125,48 @@ for is forwarded without the filter being consulted at all. So a ruleset decides
 may **open**, and the traffic that follows one is carried by the flow. A reply comes back with no
 rule naming it, which is the whole value of tracking state — the alternative is writing the reverse
 of every rule and opening the appliance in both directions to permit one. And an edit to the policy
-cannot cut a conversation already running, because the rule that admitted it was consulted once,
-when it opened. Under netfilter's model that acceptance is a rule an operator writes and can forget;
+cannot cut a conversation already running *on the packet path*, because the rule that admitted it was
+consulted once, when it opened. Under netfilter's model that acceptance is a rule an operator writes and can forget;
 here it is structural, which is the trade this appliance makes for the OT environments it is aimed
-at. There is deliberately **no state criterion**: every frame a rule is asked about has just opened a
+at.
+
+**And a commit can still end a conversation, because it re-decides the table rather than the
+packet.** The moment a configuration commits, the appliance sweeps its own flow table against the new
+policy and takes back every conversation that policy would no longer admit — once per commit rather
+than once per packet, so the ruleset stays off the hot path and every flow the new policy still allows
+is left exactly as it was. A host found to be compromised can therefore be cut off by an edit to the
+document, which is what the model owed and did not previously deliver. What a revocation costs and how
+long it takes is [in the detail](developers/status-detail.md#connection-tracking). There is deliberately **no state criterion**: every frame a rule is asked about has just opened a
 flow, so such a criterion would have one reachable value and would read as a choice an operator did
 not have.
 
 It costs something, and the cost is in two places. A packet the tracker cannot keep state for is
 refused *before* the filter, so no rule can permit a non-initial fragment, a protocol the appliance
 does not decode, or a TCP segment from the middle of a conversation it never saw begin; each of
-those refusals is its own reason on `/metrics`. And **removing a rule does not stop the flows it
-admitted** — see the gap recorded below. There is no NAT. The ARP and ICMP that exist belong to the
+those refusals is its own reason on `/metrics`. There is no NAT. The ARP and ICMP that exist belong to the
 management port alone — the dataplane resolves a next hop from a static neighbour table and answers
 nothing for itself.
 
 **The tracker's lifecycle reaches the recordings.** `/logs.pcapng` is a connection history: a
 conversation opening names the rule that admitted it, an advance names what the packet moved, a close
-names *how* it closed, a policy refusal names the rule or the default deny that refused it, and a
-tracker refusal names its reason. Every record is anchored to the packet that caused it, so the file
-opens in a pcapng reader as a packet list with real addresses and ports. What is still missing is a
-**recording selector**: the capture sink records every frame the dataplane decided on rather than the
-flows a policy picks out, and the filter rules above decide what the appliance *forwards* and select
-nothing for recording. A conversation reclaimed by its idle timeout also produces no close event —
-every record is anchored to a causing packet and a timeout has none.
+names *how* it closed, a policy refusal names the rule or the default deny that refused it, a tracker
+refusal names its reason, and a conversation a policy commit ended names the flow it ended and the
+state it was in. Every record but that last one is anchored to the packet that caused it, so the file
+opens in a pcapng reader as a packet list with real addresses and ports; the revocation is anchored to
+no packet and **says so** rather than inventing one — no captured bytes, no wire length, no direction
+and no classification, which is what a record about a conversation rather than about a frame looks
+like. What is still missing is a **recording selector**: the capture sink records every frame the
+dataplane decided on rather than the flows a policy picks out, and the filter rules above decide what
+the appliance *forwards* and select nothing for recording. A conversation reclaimed by its idle
+timeout still produces no close event — that record would have no causing packet either, and unlike a
+revocation nothing emits one.
 
 ## Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
-| Stateful L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; a ruleset decides which flows may open, so **removing a rule does not end the flows it admitted**, and there is no `reject` and no way to change a policy without a new image — [detail](developers/status-detail.md#stateful-filtering) |
-| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. **A configuration commit does not re-evaluate the table**, so a flow the new policy would refuse keeps running — [detail](developers/status-detail.md#connection-tracking) |
+| Stateful L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; a ruleset decides which flows may open, and a commit re-decides the flow table so removing a rule **does** end the conversations it admitted. There is no `reject` and no zones — [detail](developers/status-detail.md#stateful-filtering) |
+| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. A configuration commit re-decides the whole table against the new policy and takes back the flows it no longer admits, a bounded window of the table per wakeup — [detail](developers/status-detail.md#connection-tracking) |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |

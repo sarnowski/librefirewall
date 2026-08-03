@@ -2,7 +2,8 @@ use lfw_flow::FlowTable;
 use lfw_http::Status;
 use lfw_metrics::{
     FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_STATES, HTTP_STATUSES, PIPELINES,
-    ROUTE_STAGE_DROP_REASONS, SHARDS, STATS_SLOTS,
+    POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, ROUTE_STAGE_DROP_REASONS, SHARDS,
+    STATS_SLOTS,
 };
 use lfw_tcp::TcpCounters;
 use net_headers::{ParseCounters, ParseError, ParseFailure};
@@ -149,10 +150,10 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
         forwarded: 22,
         ..RouteCounters::default()
     };
-    let sample = forwarder_sample(
-        [&first, &second],
-        7,
-        ConfigCounters {
+    let sample = forwarder_sample(&ForwarderCounters {
+        pipelines: [&first, &second],
+        generation: 7,
+        configuration: ConfigCounters {
             applied: 3,
             refused: 1,
         },
@@ -160,18 +161,21 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
         // pipelines. What the policy block maps to is driven through a real poll
         // by `the_filters_three_outcomes_reach_three_different_places_in_the_shard`,
         // the counters being the stage's to move and nobody else's.
-        &PolicyCounters::new(),
+        policy: &PolicyCounters::new(),
         // As the filter: a table that has classified nothing, so this case stays
         // about the two pipelines. What the flow block maps to is driven through
         // a real table by `every_flow_counter_reaches_the_slot_its_series_names`.
-        flow_sample(&FlowCounters::new(), FlowTable::<16>::new().occupancy()),
-        TapCounters {
+        flow: flow_sample(&FlowCounters::new(), FlowTable::<16>::new().occupancy()),
+        // As the two above: a re-decision that has run no pass, so the sweep block
+        // reads zero here; what it maps to is `a_swept_pass_reaches_the_slots_its_series_name`.
+        sweep: &PolicySweep::new(),
+        tap: TapCounters {
             observed: 33,
             dropped: 4,
             refused: 0,
         },
-        log_sample(5, 2),
-    );
+        log: log_sample(5, 2),
+    });
     assert_eq!(sample.pipelines[0].forwarded, 11);
     assert_eq!(sample.pipelines[1].forwarded, 22);
     assert_eq!(sample.generation, 7);
@@ -458,8 +462,12 @@ fn the_flow_vocabularies_are_the_trackers_own() {
     // one counter would invite an operator to add them.
     assert_eq!(
         FLOW_LIFECYCLE_EVENTS,
-        ["expired", "evicted", "closed", "withdrawn"]
+        ["expired", "evicted", "closed", "withdrawn", "revoked"]
     );
+    // And the two the re-decision publishes, whose order is the slot order a
+    // transposed pair would report a restart as a completed pass under.
+    assert_eq!(POLICY_SWEEP_OUTCOMES, ["completed", "restarted"]);
+    assert_eq!(POLICY_SWEEP_PROGRESS_KINDS, ["buckets", "flows"]);
 }
 
 /// Every flow counter reaches the slot its series names, and no two share one.
@@ -478,6 +486,7 @@ fn every_flow_counter_reaches_the_slot_its_series_names() {
     counters.flows_evicted = 6;
     counters.flows_closed = 7;
     counters.flows_withdrawn = 8;
+    counters.flows_revoked = 11;
     counters.probe_tag_collisions = 9;
     counters.internal_slot_desync = 10;
     counters.refused_unsupported_protocol = 21;
@@ -498,7 +507,7 @@ fn every_flow_counter_reaches_the_slot_its_series_names() {
 
     assert_eq!(sample.packets_seen, 1);
     assert_eq!(sample.outcomes, [2, 3, 4]);
-    assert_eq!(sample.lifecycle, [5, 6, 7, 8]);
+    assert_eq!(sample.lifecycle, [5, 6, 7, 8, 11]);
     assert_eq!(sample.probe_collisions, 9);
     assert_eq!(sample.slot_desync, 10);
     for (slot, kind) in sample.refusals.iter().zip(RefusalKind::ALL) {
@@ -511,5 +520,84 @@ fn every_flow_counter_reaches_the_slot_its_series_names() {
         sample.entries.first().copied(),
         Some(16),
         "a fresh table does not report every slot vacant"
+    );
+}
+
+/// The re-decision's four numbers reach the slots their series name, and the
+/// gauge that says a window is open reads 1 while it is.
+///
+/// Driven through a real pass rather than assembled from literals, so the mapping
+/// is between the counters a pass actually moved and the slots an operator reads —
+/// which is what a transposed pair would break while a hand-built sample would not.
+#[test]
+fn a_swept_pass_reaches_the_slots_its_series_name() {
+    // Wider than one window walks, so the gauge can be read mid-pass at all.
+    let mut flows: lfw_flow::FlowTable<{ 2 * lfw_flow::REVISIT_BUCKETS }> =
+        lfw_flow::FlowTable::new();
+    let router = routing::Router::<1, 1>::empty();
+    let rules = pipeline::Ruleset::EMPTY;
+    let configuration = crate::Configuration::new(1, &router, &rules);
+    let mut sweep = PolicySweep::new();
+
+    assert_eq!(
+        policy_sweep_sample(&sweep),
+        lfw_metrics::PolicySweepSample::default()
+    );
+
+    sweep.arm(1);
+    let first = sweep
+        .advance(
+            &configuration,
+            &mut crate::Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+            pipeline::WAKEUP_FRAME_BUDGET,
+            |_| unreachable!("an empty table has no flow to disown"),
+        )
+        .expect("an armed sweep advances");
+    assert!(!first.complete);
+    let mid = policy_sweep_sample(&sweep);
+    assert_eq!(mid.running, 1, "the window a commit opened is still open");
+    assert_eq!(mid.outcomes, [0, 0]);
+    assert_eq!(
+        mid.progress,
+        [lfw_flow::REVISIT_BUCKETS as u64, 0],
+        "one window of buckets walked and no live flow judged"
+    );
+
+    // A commit mid-pass, then the pass run out: the two outcomes then read one
+    // each, which is the pair a transposition would swap.
+    sweep.arm(2);
+    while sweep.running() {
+        sweep
+            .advance(
+                &configuration,
+                &mut crate::Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                pipeline::WAKEUP_FRAME_BUDGET,
+                |_| unreachable!("an empty table has no flow to disown"),
+            )
+            .expect("an armed sweep advances");
+    }
+    let done = policy_sweep_sample(&sweep);
+    assert_eq!(done.running, 0, "and closed once the pass finished");
+    assert_eq!(done.outcomes, [1, 1], "one completed, one restarted");
+    assert_eq!(
+        done.progress[0],
+        3 * lfw_flow::REVISIT_BUCKETS as u64,
+        "the abandoned window plus the two the restarted pass took"
+    );
+}
+
+/// What the re-decision costs the forwarding domain's own state, stated as a
+/// number rather than left to be inferred from a stack test's slack.
+///
+/// It is a cursor, a generation and four counters, so it is tens of bytes against a
+/// 128 KiB stack — which is why the domain's declared `stack_size` did not move for
+/// it. The assertion is here so that a field added to it later moves a number a
+/// reader can see rather than quietly eating headroom.
+#[test]
+fn the_re_decisions_own_state_is_tens_of_bytes() {
+    assert!(
+        core::mem::size_of::<PolicySweep>() <= 64,
+        "a re-decision carries {} bytes of state",
+        core::mem::size_of::<PolicySweep>()
     );
 }

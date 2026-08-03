@@ -47,7 +47,7 @@ fn tagged(packet_id: u64) -> TapAnnotation {
 fn forwarded() -> TapDecision {
     TapDecision {
         outcome: TapOutcome::Forwarded,
-        direction: TapDirection::Inbound,
+        direction: Some(TapDirection::Inbound),
         generation: 0,
         flow: None,
         rule: None,
@@ -62,7 +62,7 @@ fn flow(classification: TapClassification, state: TapFlowState) -> TapFlow {
     TapFlow {
         slot: 4_321,
         generation: 17,
-        classification,
+        classification: Some(classification),
         state,
     }
 }
@@ -131,6 +131,46 @@ fn decision(flow: Option<TapFlow>, rule: Option<TapRule>, event: Option<TapEvent
         event,
         ..forwarded()
     }
+}
+
+/// One observation of a frame, with the lengths [`TapAnnotation::new`] leaves to
+/// the writer already filled in.
+///
+/// A helper because a wire length of zero is no longer readable as an observation:
+/// it is what says a record is about no frame, so a test that means to assert on
+/// the decision words has to state a frame the record is about.
+fn observed(decision: TapDecision) -> TapAnnotation {
+    TapAnnotation {
+        original_len: 4,
+        captured_len: 4,
+        ..TapAnnotation::new(0, 0, 1, decision)
+    }
+}
+
+/// The one observation that is about no frame: a flow the appliance ended when a
+/// policy commit stopped admitting it.
+///
+/// Composed here the way `pd_runtime::Tap::observe_revocation` composes it, so the
+/// tests below assert on the shape a producer actually writes.
+fn revocation(state: TapFlowState) -> TapAnnotation {
+    TapAnnotation::new(
+        0,
+        0,
+        1,
+        TapDecision {
+            outcome: TapOutcome::Revoked,
+            direction: None,
+            generation: 0,
+            flow: Some(TapFlow {
+                slot: 4_321,
+                generation: 17,
+                classification: None,
+                state,
+            }),
+            rule: None,
+            event: Some(TapEvent::FlowRevoked),
+        },
+    )
 }
 
 /// Publish one forged slot and read it back, which is the shape every hostile
@@ -228,37 +268,28 @@ fn zeroed_regions_are_an_empty_ring() {
     assert_eq!(reader.dropped_by_writer(), 0);
 }
 
-/// A zeroed slot is not merely safe to read but *decodes*, so a producer that
-/// published one has emitted a meaningless observation rather than a fault the
-/// recorder has to special-case.
+/// A zeroed slot is safe to read and is **refused**: it claims a forwarded frame
+/// of no length, and no frame the pipeline reached a verdict on can have one — it
+/// parsed as IPv4 over Ethernet, so it carried at least the two headers.
+///
+/// Refusing it is what keeps a record about no packet from being readable as a
+/// record about one, which is the whole of how the revocation record stays honest.
+/// The only way to reach a zeroed slot is a forged cursor: both cursors start at
+/// zero, so a correct producer never publishes one.
 #[test]
-fn a_zeroed_slot_decodes_to_an_empty_forwarded_observation() {
+fn a_zeroed_slot_is_refused_as_an_observation_of_no_frame() {
     let ring = Ring::zero();
     let mut reader = ring.reader();
     let mut into = buffer();
     ring.records.tail.store(1, Ordering::Release);
 
-    let (checked, payload) = reader
-        .read(&mut into)
-        .expect("a slot is published")
-        .expect("a zeroed slot is well formed");
     assert_eq!(
-        checked,
-        CheckedTap {
-            packet_id: 0,
-            timestamp: 0,
-            interface_id: 0,
-            original_len: 0,
-            outcome: TapOutcome::Forwarded,
-            direction: TapDirection::Inbound,
-            generation: 0,
-            flow: None,
-            rule: None,
-            event: None,
-        }
+        reader.read(&mut into).expect("a slot is published"),
+        Err(TapFault::WireLengthMissing {
+            verdict: TapVerdict::Forwarded.to_bits(),
+        })
     );
-    assert!(payload.is_empty());
-    assert_eq!(reader.refused(), 0);
+    assert_eq!(reader.refused(), 1);
 }
 
 /// The slot's own zero state, reached at run time rather than through the
@@ -317,7 +348,7 @@ fn every_field_and_every_payload_byte_survives_the_region() {
         (MAX_INTERFACES - 1) as u8,
         TapDecision {
             outcome: TapOutcome::Dropped(TapDropReason::TtlExpired),
-            direction: TapDirection::Outbound,
+            direction: Some(TapDirection::Outbound),
             generation: 42,
             flow: Some(flow(TapClassification::New, TapFlowState::SynSent)),
             rule: TapRule::new(9),
@@ -338,7 +369,7 @@ fn every_field_and_every_payload_byte_survives_the_region() {
             interface_id: (MAX_INTERFACES - 1) as u8,
             original_len: 1500,
             outcome: TapOutcome::Dropped(TapDropReason::TtlExpired),
-            direction: TapDirection::Outbound,
+            direction: Some(TapDirection::Outbound),
             generation: 42,
             flow: Some(flow(TapClassification::New, TapFlowState::SynSent)),
             rule: TapRule::new(9),
@@ -409,16 +440,19 @@ fn a_frame_of_exactly_the_snap_length_crosses_whole() {
     assert_eq!(payload, &exact[..]);
 }
 
+/// A frame of one byte is the shortest an *observation* may carry, and it crosses
+/// whole. Zero is not among them: a wire length of none is what says the record is
+/// about no frame at all, which is the revocation's encoding and nothing else.
 #[test]
-fn an_empty_frame_crosses_as_an_empty_payload() {
+fn the_shortest_frame_crosses_as_its_own_payload() {
     let ring = Ring::zero();
     let mut writer = ring.writer();
     let mut reader = ring.reader();
     let mut into = buffer();
-    assert_eq!(writer.write(&tagged(1), 0, &[]), Ok(0));
+    assert_eq!(writer.write(&tagged(1), 1, &[0x5a]), Ok(1));
     let (checked, payload) = reader.read(&mut into).expect("one").expect("well formed");
-    assert_eq!(checked.original_len, 0);
-    assert!(payload.is_empty());
+    assert_eq!(checked.original_len, 1);
+    assert_eq!(payload, &[0x5a]);
 }
 
 /// A first-party inconsistency, refused rather than clamped, and never counted
@@ -725,13 +759,13 @@ fn a_flags_word_with_an_undefined_bit_is_refused() {
     };
     assert_eq!(
         read_forged(&raw).map(|checked| checked.direction),
-        Ok(TapDirection::Outbound)
+        Ok(Some(TapDirection::Outbound))
     );
 }
 
 #[test]
 fn an_unknown_verdict_is_refused() {
-    for verdict in [2, u32::MAX] {
+    for verdict in [3, u32::MAX] {
         let raw = TapAnnotation {
             verdict,
             ..sound_raw()
@@ -860,10 +894,10 @@ fn every_decision_value_round_trips_through_the_region() {
             let expected = TapFlow {
                 slot: 4_321,
                 generation: 17,
-                classification: *classification,
+                classification: Some(*classification),
                 state: *state,
             };
-            let raw = TapAnnotation::new(0, 0, 1, decision(Some(expected), None, None));
+            let raw = observed(decision(Some(expected), None, None));
             assert_eq!(
                 read_forged(&raw).map(|checked| checked.flow),
                 Ok(Some(expected))
@@ -877,18 +911,19 @@ fn every_decision_value_round_trips_through_the_region() {
         } else {
             TapFlowState::Established
         };
-        let raw = TapAnnotation::new(
-            0,
-            0,
-            1,
-            decision(
+        // The one event that is about no frame takes the revocation's own shape,
+        // and it must: every per-frame word is refused on it.
+        let raw = if *event == TapEvent::FlowRevoked {
+            revocation(state)
+        } else {
+            observed(decision(
                 Some(flow(TapClassification::Established, state)),
                 event
                     .names_a_rule()
                     .then(|| TapRule::new(0).expect("a position")),
                 Some(*event),
-            ),
-        );
+            ))
+        };
         assert_eq!(
             read_forged(&raw).map(|checked| checked.event),
             Ok(Some(*event))
@@ -897,21 +932,144 @@ fn every_decision_value_round_trips_through_the_region() {
     for position in [0, 1, TAP_RULE_COUNT as usize - 1] {
         let rule = TapRule::new(position).expect("a declarable position");
         assert_eq!(usize::from(rule.position()), position);
-        let raw = TapAnnotation::new(
-            0,
-            0,
-            1,
-            decision(
-                Some(flow(TapClassification::New, TapFlowState::SynSent)),
-                Some(rule),
-                Some(TapEvent::FlowOpened),
-            ),
-        );
+        let raw = observed(decision(
+            Some(flow(TapClassification::New, TapFlowState::SynSent)),
+            Some(rule),
+            Some(TapEvent::FlowOpened),
+        ));
         assert_eq!(
             read_forged(&raw).map(|checked| checked.rule),
             Ok(Some(rule))
         );
     }
+}
+
+/// The one record that is about no frame, read back whole — and the four absences
+/// that are what make it honest rather than a frame with the fields blanked.
+#[test]
+fn a_revocation_names_a_flow_and_no_frame() {
+    let raw = revocation(TapFlowState::UdpAssured);
+    let checked = read_forged(&raw).expect("a revocation is well formed");
+    assert_eq!(checked.outcome, TapOutcome::Revoked);
+    assert!(!checked.outcome.observes_a_frame());
+    assert_eq!(checked.event, Some(TapEvent::FlowRevoked));
+    // The conversation it ended, still identifiable: this is what a reader folds
+    // the end of a connection onto the record that opened it by.
+    assert_eq!(
+        checked.flow,
+        Some(TapFlow {
+            slot: 4_321,
+            generation: 17,
+            classification: None,
+            state: TapFlowState::UdpAssured,
+        })
+    );
+    // And nothing that would claim a packet.
+    assert_eq!(checked.original_len, 0);
+    assert_eq!(checked.direction, None);
+    assert_eq!(checked.rule, None);
+}
+
+/// Every per-frame fact a revocation may not carry, broken one at a time; and the
+/// two an observation of a frame may not be without.
+///
+/// This is the pair of laws that keeps the encoding from having two ways to say
+/// one thing: without the second half a peer could write a record about no packet
+/// under an event that claims one, which is exactly the fabricated cause the
+/// frameless record exists to avoid.
+#[test]
+fn a_record_that_confuses_a_flow_with_a_frame_is_refused() {
+    let sound = revocation(TapFlowState::UdpAssured);
+    let cases: [(TapAnnotation, TapFault); 6] = [
+        (
+            TapAnnotation {
+                original_len: 60,
+                ..sound
+            },
+            TapFault::WireLengthOnRevocation {
+                original_len: 60,
+                captured_len: 0,
+            },
+        ),
+        (
+            TapAnnotation {
+                original_len: 60,
+                captured_len: 60,
+                ..sound
+            },
+            TapFault::WireLengthOnRevocation {
+                original_len: 60,
+                captured_len: 60,
+            },
+        ),
+        (
+            TapAnnotation {
+                flags: TAP_FLAG_OUTBOUND,
+                ..sound
+            },
+            TapFault::DirectionOnRevocation {
+                flags: TAP_FLAG_OUTBOUND,
+            },
+        ),
+        (
+            TapAnnotation {
+                classification: TapClassification::Established.to_bits(),
+                ..sound
+            },
+            TapFault::ClassificationOnRevocation {
+                classification: TapClassification::Established.to_bits(),
+            },
+        ),
+        // The revocation verdict without its event, and the event without its
+        // verdict: one fact written twice, so either half alone is refused.
+        (
+            TapAnnotation {
+                event: TapEvent::FlowClosed.to_bits(),
+                flow_state: TapFlowState::TimeWait.to_bits(),
+                ..sound
+            },
+            TapFault::RevocationEventMismatch {
+                verdict: TapVerdict::Revoked.to_bits(),
+                event: TapEvent::FlowClosed.to_bits(),
+            },
+        ),
+        (
+            TapAnnotation {
+                event: TapEvent::FlowRevoked.to_bits(),
+                classification: TapClassification::Established.to_bits(),
+                flow_state: TapFlowState::Established.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::RevocationEventMismatch {
+                verdict: TapVerdict::Forwarded.to_bits(),
+                event: TapEvent::FlowRevoked.to_bits(),
+            },
+        ),
+    ];
+    for (raw, expected) in cases {
+        assert_eq!(read_forged(&raw), Err(expected), "{raw:?}");
+    }
+    // And the mirror: an observation of a frame with no wire length and one with
+    // no direction, neither of which any frame can be.
+    assert_eq!(
+        read_forged(&TapAnnotation {
+            original_len: 0,
+            captured_len: 0,
+            ..sound_raw()
+        }),
+        Err(TapFault::WireLengthMissing {
+            verdict: TapVerdict::Forwarded.to_bits(),
+        })
+    );
+    assert_eq!(
+        read_forged(&TapAnnotation {
+            flags: TAP_FLAGS_KNOWN + 1,
+            ..sound_raw()
+        }),
+        Err(TapFault::FlagsUnknown {
+            flags: TAP_FLAGS_KNOWN + 1,
+        })
+    );
 }
 
 /// The relations the six decision words must stand in, each broken on its own.
@@ -1064,7 +1222,8 @@ fn a_rule_on_a_decision_the_filter_did_not_take_is_refused() {
 fn the_closed_sets_refuse_every_value_outside_them() {
     assert_eq!(TapVerdict::from_bits(0), Some(TapVerdict::Forwarded));
     assert_eq!(TapVerdict::from_bits(1), Some(TapVerdict::Dropped));
-    assert_eq!(TapVerdict::from_bits(2), None);
+    assert_eq!(TapVerdict::from_bits(2), Some(TapVerdict::Revoked));
+    assert_eq!(TapVerdict::from_bits(3), None);
     assert_eq!(TapDirection::from_bits(0), Some(TapDirection::Inbound));
     assert_eq!(
         TapDirection::from_bits(TAP_FLAG_OUTBOUND),
@@ -1420,7 +1579,7 @@ fn assert_yield_is_recordable(checked: &CheckedTap, payload: &[u8]) -> Result<()
         u64::try_from(payload.len()).expect("a length fits") <= u64::from(checked.original_len)
     );
     match checked.outcome {
-        TapOutcome::Forwarded => {}
+        TapOutcome::Forwarded | TapOutcome::Revoked => {}
         TapOutcome::Dropped(reason) => {
             prop_assert!(reason.to_bits() >= 1);
             prop_assert!(reason.to_bits() <= TAP_DROP_REASON_COUNT);
@@ -1430,10 +1589,28 @@ fn assert_yield_is_recordable(checked: &CheckedTap, payload: &[u8]) -> Result<()
     // coherence a reader of the recording relies on and not merely that four
     // more words decoded.
     if let Some(flow) = checked.flow {
-        prop_assert!(flow.classification.to_bits() >= 1);
-        prop_assert!(flow.classification.to_bits() <= TAP_CLASSIFICATION_COUNT);
+        // A classification exactly where the record is about a frame: the one
+        // that is not carries a flow and no packet.
+        prop_assert_eq!(
+            flow.classification.is_some(),
+            checked.outcome.observes_a_frame()
+        );
+        if let Some(classification) = flow.classification {
+            prop_assert!(classification.to_bits() >= 1);
+            prop_assert!(classification.to_bits() <= TAP_CLASSIFICATION_COUNT);
+        }
         prop_assert!(flow.state.to_bits() >= 1);
         prop_assert!(flow.state.to_bits() <= TAP_FLOW_STATE_COUNT);
+    }
+    // And the four facts a record about no frame may not carry, on the same terms.
+    prop_assert_eq!(
+        checked.direction.is_some(),
+        checked.outcome.observes_a_frame()
+    );
+    if !checked.outcome.observes_a_frame() {
+        prop_assert_eq!(checked.original_len, 0);
+        prop_assert_eq!(checked.rule, None);
+        prop_assert_eq!(checked.event, Some(TapEvent::FlowRevoked));
     }
     if let Some(rule) = checked.rule {
         prop_assert!(u32::from(rule.position()) < TAP_RULE_COUNT);
@@ -1567,7 +1744,9 @@ proptest! {
     /// delivered is exactly the one written under that `packet_id`.
     #[test]
     fn every_offered_observation_is_delivered_or_counted(
-        steps in proptest::collection::vec((0u8..=3, 0usize..=64), 1..=400),
+        // A frame of at least one byte, because zero is what says a record is
+        // about no frame — action 1 offers those, so both record kinds cross.
+        steps in proptest::collection::vec((0u8..=4, 1usize..=64), 1..=400),
     ) {
         let ring = Ring::zero();
         let mut writer = ring.writer();
@@ -1582,13 +1761,16 @@ proptest! {
                 let bytes = frame(next_tag, size);
                 let len = u32::try_from(size).expect("a test length fits");
                 offered += 1;
-                if writer.write(&tagged(next_tag), len, &bytes).is_ok() {
-                    next_tag += 1;
-                } else {
-                    // A refused observation is never retried under the same
-                    // tag, so the sequence the reader sees stays a prefix.
-                    next_tag += 1;
-                }
+                // A refused observation is never retried under the same tag
+                // either way, so the sequence the reader sees stays a prefix.
+                let _ = writer.write(&tagged(next_tag), len, &bytes);
+                next_tag += 1;
+            } else if action == 1 {
+                offered += 1;
+                let mut annotation = revocation(TapFlowState::UdpAssured);
+                annotation.packet_id = next_tag;
+                let _ = writer.write(&annotation, 0, &[]);
+                next_tag += 1;
             } else {
                 let mut error: Option<TestCaseError> = None;
                 delivered += reader.drain(size, &mut into, |read| {

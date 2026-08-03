@@ -13,16 +13,15 @@
 //! printed and written into the run log, so an unnoticed degradation to
 //! emulation cannot pass for an accelerated run.
 //!
-//! [`test_system`] is the black-box system gate. It boots six [`Scenario`]s,
-//! each of which asserts the machine-observable routed contract — a datagram
-//! sent from the host endpoint on each NIC port reaches the endpoint on the
-//! other rewritten for its next hop, and the packets the appliance must refuse
-//! reach nobody — driven by [`crate::forward_harness`]. Two of them
+//! [`test_system`] is the black-box system gate. It boots one [`Scenario`] per
+//! contract the appliance owes, each asserting the machine-observable routed
+//! contract — a datagram sent from the host endpoint on each NIC port reaches the
+//! endpoint on the other rewritten for its next hop, and the packets the appliance
+//! must refuse reach nobody — driven by [`crate::forward_harness`]. Some
 //! additionally judge the `LFW-CFG` console channel through
-//! [`crate::config_transcript`], and the three whose management port a real
-//! client can reach ([`ManagementRole::Client`]) pull every surface the
-//! endpoint serves and hold the three of them to each other
-//! ([`crate::surface_contract`]).
+//! [`crate::config_transcript`], and every one whose management port a real client
+//! can reach ([`ManagementRole::Client`]) pulls every surface the endpoint serves
+//! and holds the three of them to each other ([`crate::surface_contract`]).
 //!
 //! Every scenario boots the RELEASE kernel configuration, because that is the
 //! image a release publishes. A scenario that fails there is re-run
@@ -233,8 +232,11 @@ struct Scenario {
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour across eight scenarios, in the kernel configuration a release
-/// ships. Returns what the run proved.
+/// behaviour, in the kernel configuration a release ships. Returns what the run
+/// proved.
+///
+/// The list below numbers the first eight; the ones after them carry their reasons
+/// beside the entries themselves, where a reader meets them.
 ///
 /// 1. **routed-forwarding** — the published disk, judged by the routed contract
 ///    alone. It is the regression guard: exactly the contract that existed
@@ -466,6 +468,42 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             management: ManagementRole::Client,
             traffic: Traffic::Reconfiguration,
         },
+        // The landing that closed the model's one real hole, and the only scenario
+        // that states what a policy commit did to the conversations the appliance
+        // was ALREADY CARRYING. Every other scenario that submits a document opens
+        // its second wave's conversations afresh, because before this there was no
+        // way for a commit to reach one that was already running.
+        //
+        // It boots the published disk and opens two conversations under the shipped
+        // policy that differ in their source port and in nothing else, answering
+        // both so each is a flow the tracker has seen in both directions. It then
+        // submits a document that is the shipped one with its accept rule narrowed
+        // by ONE ATTRIBUTE — a `source-port` — waits for the forwarding domain to
+        // report the generation, and works the pass that commit armed off to
+        // completion. Only then does it inject each conversation's next packet, on
+        // the five-tuple it has been using all along.
+        //
+        // FOUR THINGS THEN HAVE TO HOLD TOGETHER, and no three of them are enough.
+        // The occupancy gauge must fall and the revocation must be counted, so a
+        // conversation really was ended. The doomed conversation's next packet must
+        // NOT cross — which under the previous behaviour it would have, a tracked
+        // flow being forwarded before the filter is consulted at all. The surviving
+        // conversation's next packet MUST cross, and no rule of either document is
+        // about the direction it travels in, so only its flow can be carrying
+        // it — which is what separates re-deciding the table from flushing it, a
+        // flush satisfying every other clause here. And that crossing is also the
+        // dataplane demonstrably still forwarding across the commit.
+        //
+        // A `Client` scenario necessarily: the document goes over HTTP with a real
+        // client, and three of the four statements are metrics.
+        Scenario {
+            name: "policy-revocation",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Revocation,
+        },
         Scenario {
             name: "connection-lifecycle",
             document: LIFECYCLE_DOCUMENT,
@@ -674,6 +712,19 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             }
+            if let Some(revoked) = &booted.revoked {
+                // Beside the submission it followed, because the two are one
+                // statement: the document changed and these are the conversations
+                // it ended.
+                let transcript = revoked.render();
+                println!("{transcript}");
+                append_evidence(
+                    &log,
+                    "what that commit did to the conversations the node was already carrying",
+                    &transcript,
+                )
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            }
             let judged = judge_recordings(root, name, &booted, &topology, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             println!("{judged}");
@@ -687,9 +738,16 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             match &booted.applied {
                 Some(applied) => format!(
                     "; {} scrapes and both recordings judged together; generation {} submitted \
-                     over HTTP and in force on the dataplane",
+                     over HTTP and in force on the dataplane{}",
                     booted.scrapes.len(),
-                    applied.generation
+                    applied.generation,
+                    match &booted.revoked {
+                        Some(revoked) => format!(
+                            ", which took back {} of the {} conversations it was carrying",
+                            revoked.revoked, revoked.assured_before
+                        ),
+                        None => String::new(),
+                    }
                 ),
                 None => format!(
                     "; {} scrapes and both recordings judged together",

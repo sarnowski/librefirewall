@@ -90,6 +90,7 @@ fn recording(snap_len: u32, ids: &[(u64, usize)]) -> Parsed {
                     interface_id: interface,
                     packet_id: Some(*id),
                     original_len: frame.len() as u32,
+                    flags: Some(crate::recording_contract::FLAGS_INBOUND),
                     captured: frame
                         .iter()
                         .take(snap_len as usize)
@@ -114,6 +115,7 @@ fn record(snap_len: u32, id: u64, probe: usize, annotation: Annotation) -> Packe
         interface_id: u32::from(annotation.interface_id),
         packet_id: Some(id),
         original_len: frame.len() as u32,
+        flags: Some(crate::recording_contract::FLAGS_INBOUND),
         captured: frame.into_iter().take(snap_len as usize).collect(),
         verdict: Some(vec![VERDICT_KIND, annotation.verdict]),
         annotation: Some(annotation),
@@ -697,6 +699,7 @@ fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way()
             interface_id: 0,
             packet_id: Some(0),
             original_len: 200,
+            flags: Some(crate::recording_contract::FLAGS_INBOUND),
             captured: long.iter().take(snap).copied().collect(),
             verdict: Some(vec![VERDICT_KIND, VERDICT_FORWARDED]),
             annotation: Some(opening(0, 0)),

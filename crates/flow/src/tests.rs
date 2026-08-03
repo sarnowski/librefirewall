@@ -53,6 +53,11 @@ fn after(span: lfw_clock::Duration) -> Monotonic {
     at(span.as_nanos().saturating_add(1))
 }
 
+/// The dataplane port these fixtures inject on. A value rather than zero so a
+/// field that stopped being carried reads as a wrong port rather than as the
+/// first one.
+const INGRESS: u8 = 1;
+
 /// One packet, ready to be handed over.
 struct Wire {
     source: Ipv4Address,
@@ -66,6 +71,7 @@ impl Wire {
         table.classify(
             now,
             &Packet {
+                ingress: INGRESS,
                 source: self.source,
                 destination: self.destination,
                 transport: self.transport,
@@ -2058,4 +2064,285 @@ fn every_outcome_names_the_counter_that_moved() {
         mid_stream.classify(&mut table, at(5_000)).classification(),
         None
     );
+}
+
+/// A pass with nothing to disown changes nothing whatever — not a state, not an
+/// idle timer, not a slot.
+///
+/// This is the half of re-deciding that the live-connection guarantee rests on:
+/// the whole reason the appliance keeps a flow table is that a policy edit must
+/// not cut a conversation it still permits, so a pass over a table of flows the
+/// caller still admits has to be observationally nothing but the walk.
+#[test]
+fn a_pass_that_keeps_every_flow_leaves_the_table_exactly_as_it_was() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+    let syn = exchange.syn();
+    syn.classify(&mut table, at(1_000));
+    let syn_ack = exchange.syn_ack();
+    syn_ack.classify(&mut table, at(1_100));
+    exchange.ack(true).classify(&mut table, at(1_200));
+    udp(CLIENT, SERVER, 5_000, 53).classify(&mut table, at(1_300));
+
+    let before = table.occupancy();
+    let counters = *table.counters();
+    // The entries themselves, byte for byte: the strongest statement available
+    // that a `Keep` is a read. Reached directly because these tests are inside the
+    // crate, so no accessor exists on the production surface for it.
+    let entries = table.entries;
+
+    // A pass over the whole index, at a moment far past every flow's last
+    // packet: a `Keep` must not refresh a timer any more than it may reap one.
+    let mut cursor = 0usize;
+    let mut examined = 0usize;
+    loop {
+        let pass = table.revisit(cursor, |_| Disposition::Keep);
+        examined += pass.examined;
+        cursor = pass.next;
+        if pass.complete {
+            break;
+        }
+    }
+    assert_eq!(examined, 2, "both conversations were offered exactly once");
+    assert_eq!(table.occupancy(), before);
+    assert_eq!(*table.counters(), counters);
+    assert_eq!(table.entries, entries, "not one byte of an entry moved");
+}
+
+/// A pass reaches every live flow, however the keys are spread — and reaches each
+/// exactly once, so a caller counting what it disowned is counting conversations
+/// and not chain steps.
+#[test]
+fn a_pass_offers_every_live_flow_exactly_once() {
+    let mut table = table();
+    let mut opened = std::collections::BTreeSet::new();
+    for port in 0..table.capacity() {
+        let flow = udp(CLIENT, SERVER, 5_000 + port as u16, 53);
+        match flow.classify(&mut table, at(1_000)) {
+            Outcome::New { flow, .. } => {
+                opened.insert((flow.slot(), flow.generation()));
+            }
+            other => panic!("a fresh tuple opens a flow: {other:?}"),
+        }
+    }
+    assert_eq!(opened.len(), table.capacity(), "the table is full");
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = 0usize;
+    loop {
+        let pass = table.revisit(cursor, |flow| {
+            assert!(
+                seen.insert((flow.id.slot(), flow.id.generation())),
+                "a flow was offered twice"
+            );
+            Disposition::Keep
+        });
+        cursor = pass.next;
+        if pass.complete {
+            break;
+        }
+    }
+    assert_eq!(seen, opened);
+}
+
+/// The opening a re-decision is handed is the one that was on the wire: the
+/// source is the end that spoke first, whichever way the canonical pair sorts,
+/// and the ingress is the port the caller named.
+///
+/// Both orientations, because the key is sorted and the orientation is one bit —
+/// a bit read the wrong way round would hand a caller a reversed conversation,
+/// and a policy decided on a reversed five-tuple is a policy decided on somebody
+/// else's traffic.
+#[test]
+fn the_opening_a_pass_reports_is_the_one_that_was_on_the_wire() {
+    for (source, destination, source_port, destination_port) in [
+        (CLIENT, SERVER, 5_000u16, 53u16),
+        // The reverse, which sorts the other way round the canonical pair.
+        (SERVER, CLIENT, 53, 5_000),
+    ] {
+        let mut table = table();
+        udp(source, destination, source_port, destination_port).classify(&mut table, at(1_000));
+        let mut reported = Vec::new();
+        let mut cursor = 0usize;
+        loop {
+            let pass = table.revisit(cursor, |flow| {
+                reported.push(flow.opening);
+                Disposition::Keep
+            });
+            cursor = pass.next;
+            if pass.complete {
+                break;
+            }
+        }
+        assert_eq!(
+            reported,
+            std::vec![FlowOpening {
+                ingress: INGRESS,
+                source: Endpoint::new(source, source_port),
+                destination: Endpoint::new(destination, destination_port),
+                protocol: net_headers::Protocol::UDP,
+            }]
+        );
+    }
+}
+
+/// A revoked flow's slot comes back, its handle stops naming it, and the count
+/// that says so is its own rather than the withdrawal's.
+///
+/// The two are separate counters because they accuse opposite things: a
+/// withdrawal is a connection attempt a policy turned away as it arrived, and a
+/// revocation is a conversation a policy had admitted and has stopped admitting.
+#[test]
+fn a_revoked_flow_gives_back_its_slot_and_is_counted_apart_from_a_withdrawal() {
+    let mut table = table();
+    let Outcome::New { flow: kept, .. } =
+        udp(CLIENT, SERVER, 5_000, 53).classify(&mut table, at(1))
+    else {
+        panic!("a fresh tuple opens a flow");
+    };
+    let Outcome::New { flow: doomed, .. } =
+        udp(CLIENT, SERVER, 5_001, 53).classify(&mut table, at(2))
+    else {
+        panic!("a fresh tuple opens a flow");
+    };
+    assert_eq!(table.len(), 2);
+
+    let mut cursor = 0usize;
+    let mut revoked = 0usize;
+    loop {
+        let pass = table.revisit(cursor, |flow| {
+            if flow.opening.source.port == 5_001 {
+                Disposition::Revoke
+            } else {
+                Disposition::Keep
+            }
+        });
+        revoked += pass.revoked;
+        cursor = pass.next;
+        if pass.complete {
+            break;
+        }
+    }
+    assert_eq!(revoked, 1);
+    assert_eq!(table.len(), 1);
+    assert!(table.flow(kept).is_some(), "the flow kept is still there");
+    assert!(
+        table.flow(doomed).is_none(),
+        "and the handle to the revoked one names nothing"
+    );
+    assert_eq!(table.counters().flows_revoked, 1);
+    assert_eq!(
+        table.counters().flows_withdrawn,
+        0,
+        "a revocation is not a withdrawal"
+    );
+
+    // The revoked flow's tuple opens a *new* flow rather than resolving to the
+    // old one, which is what says the slot really came back.
+    let reopened = udp(CLIENT, SERVER, 5_001, 53).classify(&mut table, at(3));
+    assert!(matches!(reopened, Outcome::New { .. }));
+}
+
+/// One call is bounded in both of the two ways a window can be unbounded: by how
+/// much of the index it walks, and by how many flows it hands over.
+///
+/// The second bound is the one a full table needs — a window of buckets this wide
+/// could hold `REVISIT_BUCKETS * MAX_CHAIN` flows — and a chain is finished once
+/// started, so the bound is stated as the budget plus one chain's worth.
+#[test]
+fn one_pass_window_is_bounded_by_the_buckets_it_walks_and_the_flows_it_offers() {
+    let mut table: FlowTable<{ 1 << 13 }> = FlowTable::new();
+    for port in 0..table.capacity() {
+        udp(CLIENT, SERVER, 1_024 + port as u16, 53).classify(&mut table, at(1_000));
+    }
+    let mut cursor = 0usize;
+    let mut calls = 0usize;
+    loop {
+        let pass = table.revisit(cursor, |_| Disposition::Keep);
+        assert!(pass.buckets <= REVISIT_BUCKETS, "{} buckets", pass.buckets);
+        assert!(
+            pass.examined <= REVISIT_FLOWS + MAX_CHAIN,
+            "{} flows",
+            pass.examined
+        );
+        cursor = pass.next;
+        calls += 1;
+        assert!(calls < 1_000, "a pass must terminate");
+        if pass.complete {
+            break;
+        }
+    }
+    // The flow budget is what binds here, not the bucket window: the table holds
+    // more flows than one window may hand over.
+    assert!(
+        calls > table.capacity() / REVISIT_BUCKETS,
+        "{calls} calls for {} flows",
+        table.capacity()
+    );
+}
+
+proptest! {
+    /// **A pass takes back exactly the flows the caller disowns and no others.**
+    ///
+    /// The property the whole re-decision rests on, stated over an arbitrary set
+    /// of live flows and an arbitrary predicate: whichever flows a caller answers
+    /// `Revoke` for are gone afterwards, every flow it answered `Keep` for is
+    /// still there under the same handle, and the count of revocations is the
+    /// number of flows in the first set. A pass that flushed the table would fail
+    /// the second clause and a pass that missed a flow would fail the first.
+    #[test]
+    fn a_pass_takes_back_exactly_the_flows_the_caller_disowns(
+        ports in prop::collection::vec(1024u16..1200, 1..16),
+        doomed in prop::collection::vec(any::<bool>(), 16),
+    ) {
+        let mut table = table();
+        let mut live = std::collections::BTreeMap::new();
+        for port in &ports {
+            if let Outcome::New { flow, .. } =
+                udp(CLIENT, SERVER, *port, 53).classify(&mut table, at(1_000))
+            {
+                live.insert(*port, flow);
+            }
+        }
+        // Which ports the predicate below disowns, decided before the pass so the
+        // expectation is independent of the order the walk reaches them in.
+        let refuse: std::collections::BTreeSet<u16> = live
+            .keys()
+            .enumerate()
+            .filter(|(index, _)| doomed.get(*index).copied().unwrap_or(false))
+            .map(|(_, port)| *port)
+            .collect();
+
+        let mut cursor = 0usize;
+        let mut revoked = 0usize;
+        let mut offered = std::collections::BTreeSet::new();
+        loop {
+            let pass = table.revisit(cursor, |flow| {
+                offered.insert(flow.opening.source.port);
+                if refuse.contains(&flow.opening.source.port) {
+                    Disposition::Revoke
+                } else {
+                    Disposition::Keep
+                }
+            });
+            revoked += pass.revoked;
+            cursor = pass.next;
+            if pass.complete {
+                break;
+            }
+        }
+
+        // Every live flow was offered, so nothing escaped the decision.
+        prop_assert_eq!(&offered, &live.keys().copied().collect());
+        prop_assert_eq!(revoked, refuse.len());
+        prop_assert_eq!(table.counters().flows_revoked, refuse.len() as u64);
+        prop_assert_eq!(table.len(), live.len() - refuse.len());
+        for (port, id) in &live {
+            if refuse.contains(port) {
+                prop_assert!(table.flow(*id).is_none(), "port {} survived", port);
+            } else {
+                prop_assert!(table.flow(*id).is_some(), "port {} was taken", port);
+            }
+        }
+    }
 }

@@ -36,6 +36,23 @@
 //!   amplifier — every refused connection attempt holding a slot is how an
 //!   attacker fills a table with connections that were never permitted.
 //!
+//! # A flow this table holds can be reached again
+//!
+//! A caller whose policy admitted a conversation once has no other way to end it:
+//! every packet of an established flow is settled here before the policy is
+//! consulted, which is the guarantee the model exists for and also the hole in
+//! it — a host found to be compromised keeps every connection it had open. So
+//! [`FlowTable::revisit`] is a bounded pass over the index that hands each live
+//! flow's *opening* identity back to the caller and takes back the ones it
+//! disowns.
+//!
+//! **It walks the buckets, not the entries.** A pass over a million entries
+//! touches sixty-four mebibytes; a pass over the index touches four, and reaches
+//! exactly the flows a *packet* can reach — so a flow the walk cannot get to is
+//! one no lookup can get to either, which can classify nothing and forward
+//! nothing. That is the fail-closed direction, and it is why the index rather
+//! than the entries is swept.
+//!
 //! # Strictness, and what it costs
 //!
 //! Every decision below is the strict one, deliberately:
@@ -131,7 +148,7 @@ use net_headers::{
 };
 
 pub use counters::FlowCounters;
-pub use entry::{DirectionState, FlowEntry, FlowState, STATE_COUNT};
+pub use entry::{DirectionState, FlowEntry, FlowOpening, FlowState, STATE_COUNT};
 pub use icmp::QuotedError;
 pub use key::{Direction, Endpoint, FlowKey};
 pub use tcp::WindowEdge;
@@ -240,6 +257,14 @@ impl FlowId {
 /// quotes.
 #[derive(Clone, Copy, Debug)]
 pub struct Packet<'a> {
+    /// The dataplane port the frame arrived on, as the caller numbers its ports.
+    ///
+    /// Recorded on a flow this packet opens and never read by anything here: a
+    /// tuple is what a lookup compares, and which link a conversation came in on
+    /// is not part of its identity. It is carried because it *is* part of what
+    /// admitted the conversation — a caller re-deciding on one later has no
+    /// packet left to ask, so the alternative is a criterion nothing can answer.
+    pub ingress: u8,
     pub source: Ipv4Address,
     pub destination: Ipv4Address,
     pub transport: Transport,
@@ -476,6 +501,35 @@ impl Occupancy {
     }
 }
 
+/// How many buckets one [`FlowTable::revisit`] walks.
+///
+/// The bound on work per call, and it is chosen against a cost this appliance
+/// already pays on every wakeup rather than tuned: at four bytes to a bucket
+/// head this window touches exactly the bytes [`SWEEP_STRIDE`] entries do at
+/// sixty-four bytes to an entry — the assertion below is what holds the two
+/// equal. So a caller that already affords the timeout sweep affords this one,
+/// and what it buys is that a whole pass takes `CAPACITY / REVISIT_BUCKETS`
+/// calls rather than `CAPACITY / SWEEP_STRIDE`.
+pub const REVISIT_BUCKETS: usize = 4096;
+
+/// How many flows one [`FlowTable::revisit`] hands to its caller.
+///
+/// The second bound, and the one that binds on a table holding flows rather than
+/// on a table that is mostly empty: a bucket window this wide can hold up to
+/// [`MAX_CHAIN`] flows per bucket, so the bucket count alone bounds the walk and
+/// not the deciding. A chain is finished once started — stopping inside one would
+/// need a second cursor naming a link the table may unlink underneath it — so a
+/// call decides at most this many plus [`MAX_CHAIN`].
+pub const REVISIT_FLOWS: usize = 256;
+
+// The equality [`REVISIT_BUCKETS`] is chosen by, asserted rather than stated: a
+// stride moved on one side of it is a per-wakeup cost that grew with nothing
+// saying so.
+const _: () = assert!(
+    REVISIT_BUCKETS * core::mem::size_of::<u32>()
+        == SWEEP_STRIDE * core::mem::size_of::<FlowEntry>()
+);
+
 /// What one [`FlowTable::poll`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sweep {
@@ -484,6 +538,47 @@ pub struct Sweep {
     pub examined: usize,
     /// Flows whose slot was taken back.
     pub expired: usize,
+}
+
+/// What a caller re-deciding on a live flow concluded about it.
+///
+/// Two values rather than a `bool`, because a `bool` at a call site reads as
+/// neither: the whole of this crate's contribution to the fail-closed direction
+/// is that a caller which cannot decide names [`Revoke`](Self::Revoke), and a
+/// name is what makes that reviewable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// The flow is still one this caller admits. Nothing about it changes — not
+    /// its state, not its timer, not its slot.
+    Keep,
+    /// The flow is one this caller no longer admits, or one it could not decide
+    /// about. Its slot is taken back.
+    Revoke,
+}
+
+/// One live flow, as [`FlowTable::revisit`] presents it.
+///
+/// The state is carried because it is gone the moment the flow is revoked, so a
+/// caller recording the end of the conversation could not recover it afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveFlow {
+    pub id: FlowId,
+    pub opening: FlowOpening,
+    pub state: FlowState,
+}
+
+/// What one [`FlowTable::revisit`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Revisit {
+    /// Where the next call resumes. Never wrapped: a pass is a walk from zero to
+    /// the capacity, and wrapping would make "the pass is over" unreadable from
+    /// the number.
+    pub next: usize,
+    pub buckets: usize,
+    pub examined: usize,
+    /// Flows the caller disowned, whose slots were taken back.
+    pub revoked: usize,
+    pub complete: bool,
 }
 
 /// The connection table.
@@ -702,6 +797,102 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
         true
     }
 
+    /// Re-decide on the live flows in one bounded window of the index, taking
+    /// back the ones the caller disowns.
+    ///
+    /// `from` is the bucket to start at and the answer's [`Revisit::next`] is
+    /// where the following call resumes, so a whole pass is the sequence of calls
+    /// from bucket zero until one answers [`Revisit::complete`]. The cursor is
+    /// the caller's rather than this table's on purpose: what *arms* a pass is
+    /// the caller's own state changing, and a table holding the cursor would have
+    /// to be told about that anyway.
+    ///
+    /// # What the caller owes, and what it is owed
+    ///
+    /// `decide` is asked about every live flow the window reaches, and it must
+    /// answer [`Disposition::Revoke`] wherever it cannot establish that the flow
+    /// is still admitted. That is the fail-closed direction, and this crate cannot
+    /// check it: a caller answering [`Disposition::Keep`] on a flow it could not
+    /// decide about would leave a conversation forwarding that nothing permits any
+    /// more. The appliance's own caller is `pipeline::PolicySweep::advance`, which
+    /// revokes on every absent answer from `pipeline::admits_opening`, held to it
+    /// by that crate's `a_flow_the_new_tables_cannot_place_is_taken_back` and by
+    /// its `a_pass_revokes_exactly_what_the_new_ruleset_would_refuse` property.
+    ///
+    /// In return, a [`Disposition::Keep`] changes nothing whatever about the
+    /// flow — not its state, not its idle timer, not its slot — so a pass over a
+    /// table of flows a caller still admits is observationally nothing but the
+    /// walk. That is what keeps re-deciding from being a way to extend or curtail
+    /// the life of a conversation.
+    ///
+    /// # Why the buckets and not the entries
+    ///
+    /// The walk follows each bucket's chain, so it reaches exactly the flows a
+    /// lookup reaches — see this crate's header. It also costs a quarter of a
+    /// byte per slot where a walk over the entries costs sixty-four, which is
+    /// what makes a bounded window worth having at all.
+    pub fn revisit(
+        &mut self,
+        from: usize,
+        mut decide: impl FnMut(&LiveFlow) -> Disposition,
+    ) -> Revisit {
+        let start = from.min(CAPACITY);
+        let mut bucket = start;
+        let mut examined = 0usize;
+        let mut revoked = 0usize;
+        while bucket < CAPACITY {
+            if bucket.saturating_sub(start) >= REVISIT_BUCKETS || examined >= REVISIT_FLOWS {
+                break;
+            }
+            let mut slot = self.buckets.get(bucket).copied().unwrap_or(NO_SLOT);
+            // Bounded by the same constant a lookup's walk is, for the same
+            // reason: a link this table did not write must cost a finite walk
+            // rather than a hang.
+            for _ in 0..MAX_CHAIN {
+                if slot == NO_SLOT {
+                    break;
+                }
+                let index = slot as usize;
+                // Read before the flow can be taken back, the link included: a
+                // revocation unlinks the entry, so the successor has to be in
+                // hand before the walk can be allowed to lose it.
+                let Some(live) = self.entries.get(index).map(|entry| {
+                    (
+                        entry.link(),
+                        entry.is_occupied().then(|| LiveFlow {
+                            id: FlowId {
+                                slot,
+                                generation: entry.generation(),
+                            },
+                            opening: entry.opening(),
+                            state: entry.state(),
+                        }),
+                    )
+                }) else {
+                    break;
+                };
+                let (link, flow) = live;
+                if let Some(flow) = flow {
+                    examined = examined.saturating_add(1);
+                    if matches!(decide(&flow), Disposition::Revoke) {
+                        self.release(index);
+                        FlowCounters::bump(&mut self.counters.flows_revoked);
+                        revoked = revoked.saturating_add(1);
+                    }
+                }
+                slot = link;
+            }
+            bucket = bucket.saturating_add(1);
+        }
+        Revisit {
+            next: bucket,
+            buckets: bucket.saturating_sub(start),
+            examined,
+            revoked,
+            complete: bucket >= CAPACITY,
+        }
+    }
+
     /// Take the expired flows in one bounded window of slots.
     ///
     /// Called as often as the caller likes; each call advances a cursor by
@@ -764,7 +955,7 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
                 if !matches!(event, tcp::Event::Syn) {
                     return self.refuse(Refusal::MidStream);
                 }
-                self.open_tcp(now, &key, from_lower, &segment)
+                self.open_tcp(now, packet.ingress, &key, from_lower, &segment)
             }
         }
     }
@@ -773,11 +964,12 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
     fn open_tcp(
         &mut self,
         now: Monotonic,
+        ingress: u8,
         key: &FlowKey,
         from_lower: bool,
         segment: &tcp::Segment,
     ) -> Outcome {
-        let slot = match self.open(now, key, from_lower, FlowState::SynSent) {
+        let slot = match self.open(now, ingress, key, from_lower, FlowState::SynSent) {
             Ok(slot) => slot,
             Err(refusal) => return self.refuse(refusal),
         };
@@ -856,7 +1048,13 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
             Protocol::UDP,
         );
         let Some(slot) = self.find(now, &key) else {
-            return match self.open(now, &key, from_lower, FlowState::UdpUnreplied) {
+            return match self.open(
+                now,
+                packet.ingress,
+                &key,
+                from_lower,
+                FlowState::UdpUnreplied,
+            ) {
                 Ok(slot) => {
                     self.note_traffic(slot, from_lower);
                     Outcome::New {
@@ -924,7 +1122,13 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
     fn echo_request(&mut self, now: Monotonic, packet: &Packet<'_>, identifier: u16) -> Outcome {
         let (key, from_lower) = echo_key(packet, identifier);
         let Some(slot) = self.find(now, &key) else {
-            return match self.open(now, &key, from_lower, FlowState::IcmpUnreplied) {
+            return match self.open(
+                now,
+                packet.ingress,
+                &key,
+                from_lower,
+                FlowState::IcmpUnreplied,
+            ) {
                 Ok(slot) => {
                     self.note_traffic(slot, from_lower);
                     Outcome::New {
@@ -1086,13 +1290,14 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
     fn open(
         &mut self,
         now: Monotonic,
+        ingress: u8,
         key: &FlowKey,
         origin_is_lower: bool,
         state: FlowState,
     ) -> Result<usize, Refusal> {
         let slot = self.take_slot(now)?;
         if let Some(entry) = self.entries.get_mut(slot) {
-            entry.open(key, origin_is_lower, state, now);
+            entry.open(key, ingress, origin_is_lower, state, now);
         }
         self.record_state_change(FlowState::Vacant, state);
         if !self.link(key, slot) {

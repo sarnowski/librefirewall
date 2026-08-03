@@ -347,8 +347,13 @@ domain switches tables at its next poll boundary, which is what the two-phase ha
 happen between two frames rather than inside one — so what says a change is in force on the dataplane
 is `librefirewall_configuration_generation{domain="forwarder"}` reaching that number.
 
-**Editing the policy changes which conversations may start, and does not end one already running.** A
-packet an existing flow accounts for is forwarded before the filter is consulted at all, so traffic
-that was flowing under the previous policy goes on flowing until its flow expires. Re-evaluating the
-flow table on commit is what would close that, and it does not exist — the
-[development status](../status.md) records it as missing.
+**A commit ends the conversations the new policy no longer admits, over the wakeups that follow it.** A
+packet an existing flow accounts for is forwarded before the filter is consulted at all, so a policy
+edit does not reach a running conversation on the packet path. What reaches it is the pass the commit
+arms over the flow table, which re-decides every live flow against the new policy and takes back the
+ones it would not admit. The pass is bounded per wakeup, so it is worked off over the frames that
+follow the commit rather than inside it, and three series say where it has got to:
+`librefirewall_policy_sweep_running` reads 1 while a pass is still owed,
+`librefirewall_policy_sweep_total{outcome="completed"}` rises when one finishes, and
+`librefirewall_flow_lifecycle_total{event="revoked"}` counts the conversations it ended. While the
+first of those reads 1, a conversation the new policy forbids may still be forwarding.

@@ -433,10 +433,15 @@ fn a_shard_round_trips_a_published_sample() {
             packets_seen: 71,
             outcomes: [72, 73, 74],
             refusals: core::array::from_fn(|position| 200 + position as u64),
-            lifecycle: [81, 82, 83, 84],
+            lifecycle: [81, 82, 83, 84, 85],
             entries: core::array::from_fn(|position| 300 + position as u64),
             probe_collisions: 91,
             slot_desync: 92,
+        },
+        sweep: PolicySweepSample {
+            outcomes: [93, 94],
+            running: 1,
+            progress: [95, 96],
         },
         tap: TapSample {
             observed: 51,
@@ -1134,5 +1139,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 77_922);
+    assert_eq!(MAX_EXPOSITION_LEN, 79_496);
 }

@@ -354,18 +354,13 @@ impl Medium for Disk {
 /// refuses an incoherent annotation, so a sink only ever sees a coherent one —
 /// and a harness that generated only those would be asserting that the sink is
 /// total over exactly the inputs something else already guarantees. The same
-/// argument the interface id is left unreduced under.
+/// argument the interface id is left unreduced under, and the same argument that
+/// puts every verdict — the one that is about no frame included — beside every
+/// wire length, direction and classification, coherent or not.
 fn arbitrary_decision(unstructured: &mut Unstructured<'_>) -> Option<TapDecision> {
     Some(TapDecision {
-        outcome: match u8::arbitrary(unstructured).ok()? {
-            0 => TapOutcome::Forwarded,
-            bits => TapOutcome::Dropped(drop_reason(bits)),
-        },
-        direction: if bool::arbitrary(unstructured).ok()? {
-            TapDirection::Outbound
-        } else {
-            TapDirection::Inbound
-        },
+        outcome: arbitrary_outcome(u8::arbitrary(unstructured).ok()?),
+        direction: arbitrary_direction(u8::arbitrary(unstructured).ok()?),
         generation: u32::arbitrary(unstructured).ok()?,
         flow: arbitrary_flow(unstructured)?,
         rule: TapRule::new(usize::from(u8::arbitrary(unstructured).ok()?)),
@@ -402,9 +397,38 @@ fn arbitrary_flow(unstructured: &mut Unstructured<'_>) -> Option<Option<TapFlow>
     Some(Some(TapFlow {
         slot: u32::arbitrary(unstructured).ok()?,
         generation: u32::arbitrary(unstructured).ok()?,
-        classification: classifications[usize::from(tag) % classifications.len()],
+        // Absent as well as present, unreduced: a flow with no classification is
+        // what the record about no frame carries, and a sink must be total over one
+        // whose other fields contradict that.
+        classification: (tag % 8 != 0)
+            .then(|| classifications[usize::from(tag) % classifications.len()]),
         state: states[usize::from(u8::arbitrary(unstructured).ok()?) % states.len()],
     }))
+}
+
+/// A verdict the observation may carry, all three of them.
+///
+/// [`TapOutcome::Revoked`] is generated as freely as the other two and in every
+/// combination with the rest of the annotation, which is the point: it is the one
+/// outcome that must carry no frame, no direction, no classification and no rule,
+/// so a harness that only ever produced it *with* those absences would exercise
+/// none of the incoherence a sink has to survive.
+fn arbitrary_outcome(bits: u8) -> TapOutcome {
+    match bits % 3 {
+        0 => TapOutcome::Forwarded,
+        1 => TapOutcome::Revoked,
+        _ => TapOutcome::Dropped(drop_reason(bits)),
+    }
+}
+
+/// A direction the observation may carry, absence included, on
+/// [`arbitrary_outcome`]'s terms.
+fn arbitrary_direction(bits: u8) -> Option<TapDirection> {
+    match bits % 3 {
+        0 => None,
+        1 => Some(TapDirection::Inbound),
+        _ => Some(TapDirection::Outbound),
+    }
 }
 
 /// An event the observation may carry, or none.
@@ -1638,15 +1662,8 @@ fn arbitrary_tap(unstructured: &mut Unstructured<'_>) -> CheckedTap {
         // is deliberately crossed here.
         interface_id: u8::arbitrary(unstructured).unwrap_or(0),
         original_len: any_u32(unstructured),
-        outcome: match u8::arbitrary(unstructured).unwrap_or(0) {
-            0 => TapOutcome::Forwarded,
-            bits => TapOutcome::Dropped(drop_reason(bits)),
-        },
-        direction: if bool::arbitrary(unstructured).unwrap_or(false) {
-            TapDirection::Outbound
-        } else {
-            TapDirection::Inbound
-        },
+        outcome: arbitrary_outcome(u8::arbitrary(unstructured).unwrap_or(0)),
+        direction: arbitrary_direction(u8::arbitrary(unstructured).unwrap_or(0)),
         generation: any_u32(unstructured),
         // Unreduced, on `arbitrary_decision`'s terms: the sink must be total over
         // a decision whose parts contradict each other, not only over the ones

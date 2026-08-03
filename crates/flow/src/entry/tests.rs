@@ -2,6 +2,11 @@ use super::*;
 use lfw_clock::{Calibration, Ticks};
 use proptest::prelude::*;
 
+/// The dataplane port these fixtures open a flow on. A value rather than zero so
+/// a field that stopped being written reads as a wrong port rather than as the
+/// first one.
+const INGRESS: u8 = 3;
+
 fn at(nanos: u64) -> Monotonic {
     use core::num::NonZeroU64;
     let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
@@ -34,7 +39,7 @@ fn a_vacant_entry_holds_nothing_and_is_on_no_list() {
 fn opening_a_slot_records_the_key_and_bumps_the_generation() {
     let mut entry = FlowEntry::VACANT;
     let opened = key(40_000);
-    entry.open(&opened, true, FlowState::SynSent, at(7));
+    entry.open(&opened, INGRESS, true, FlowState::SynSent, at(7));
     assert!(entry.is_occupied());
     assert_eq!(entry.state(), FlowState::SynSent);
     assert_eq!(entry.generation(), 1);
@@ -56,7 +61,7 @@ fn opening_a_slot_records_the_key_and_bumps_the_generation() {
 #[test]
 fn a_flow_opened_from_the_upper_endpoint_reverses_the_orientation() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), false, FlowState::UdpUnreplied, at(0));
+    entry.open(&key(40_000), INGRESS, false, FlowState::UdpUnreplied, at(0));
     assert_eq!(entry.direction_of_lower(), Direction::Reply);
     assert_eq!(entry.direction_of(true), Direction::Reply);
     assert_eq!(entry.direction_of(false), Direction::Original);
@@ -72,11 +77,11 @@ fn a_flow_opened_from_the_upper_endpoint_reverses_the_orientation() {
 #[test]
 fn closing_a_slot_keeps_its_generation() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), true, FlowState::SynSent, at(1));
+    entry.open(&key(40_000), INGRESS, true, FlowState::SynSent, at(1));
     entry.close();
     assert!(!entry.is_occupied());
     assert_eq!(entry.generation(), 1);
-    entry.open(&key(40_002), true, FlowState::SynSent, at(2));
+    entry.open(&key(40_002), INGRESS, true, FlowState::SynSent, at(2));
     assert_eq!(entry.generation(), 2);
 }
 
@@ -84,11 +89,11 @@ fn closing_a_slot_keeps_its_generation() {
 #[test]
 fn a_reused_slot_carries_nothing_of_the_flow_before_it() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), true, FlowState::Established, at(0));
+    entry.open(&key(40_000), INGRESS, true, FlowState::Established, at(0));
     let (sender, _) = entry.halves(true);
     sender.open(sequence(0x1234), 4096);
     sender.note_fin();
-    entry.open(&key(40_001), true, FlowState::SynSent, at(1));
+    entry.open(&key(40_001), INGRESS, true, FlowState::SynSent, at(1));
     let (sender, peer) = entry.sides(true);
     assert!(!sender.spoken());
     assert!(!sender.seen_fin());
@@ -99,7 +104,13 @@ fn a_reused_slot_carries_nothing_of_the_flow_before_it() {
 #[test]
 fn idle_time_saturates_for_a_clock_that_went_backwards() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), true, FlowState::Established, at(1_000));
+    entry.open(
+        &key(40_000),
+        INGRESS,
+        true,
+        FlowState::Established,
+        at(1_000),
+    );
     assert_eq!(entry.idle_for(at(1_500)).as_nanos(), 500);
     assert_eq!(entry.idle_for(at(0)).as_nanos(), 0);
     entry.touch(at(2_000));
@@ -234,7 +245,7 @@ fn a_shift_is_recorded_only_where_it_was_offered_and_is_clamped() {
 #[test]
 fn the_closing_facts_report_both_directions() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), true, FlowState::Established, at(0));
+    entry.open(&key(40_000), INGRESS, true, FlowState::Established, at(0));
     assert_eq!(entry.closing_facts(), (false, false, false, false));
     let (lower, _) = entry.halves(true);
     lower.open(sequence(10), 4_096);
@@ -248,7 +259,7 @@ fn the_closing_facts_report_both_directions() {
 #[test]
 fn scaling_is_offered_only_when_both_directions_did() {
     let mut entry = FlowEntry::VACANT;
-    entry.open(&key(40_000), true, FlowState::SynReceived, at(0));
+    entry.open(&key(40_000), INGRESS, true, FlowState::SynReceived, at(0));
     assert!(!entry.both_offered_scaling());
     entry.halves(true).0.note_syn(Some(3));
     assert!(!entry.both_offered_scaling());
@@ -276,7 +287,7 @@ proptest! {
             Protocol(protocol),
         );
         let mut entry = FlowEntry::VACANT;
-        entry.open(&key, true, FlowState::UdpUnreplied, at(0));
+        entry.open(&key, INGRESS, true, FlowState::UdpUnreplied, at(0));
         prop_assert_eq!(entry.key(), key);
         prop_assert!(entry.matches(&key));
     }

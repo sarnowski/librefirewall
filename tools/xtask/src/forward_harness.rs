@@ -1273,6 +1273,45 @@ pub enum Traffic {
     /// only tightened the policy would leave "the dataplane applied the new rules"
     /// and "the dataplane stopped forwarding" looking alike.
     Reconfiguration,
+    /// The set that spans a configuration change and states what it did to the
+    /// conversations **already running** — which no other set can, every other one
+    /// opening its second wave's conversations afresh.
+    ///
+    /// Two conversations open under the shipped policy, differing in their source
+    /// port and in nothing else. A document is then submitted that narrows the
+    /// accepting rule to one of those source ports. Afterwards, the surviving
+    /// conversation's next packet still crosses — carried by its flow, which no
+    /// rule of the new policy names — and the other's does not, though under the
+    /// previous behaviour it would have, a tracked flow being forwarded before the
+    /// filter is consulted at all.
+    ///
+    /// **The fourth probe is the one that proves this is a re-decision and not a
+    /// flush**: a commit that emptied the table would refuse it too.
+    Revocation,
+}
+
+impl Traffic {
+    /// The document this set's second wave is decided under, where it submits one
+    /// over the management API.
+    ///
+    /// The one place a probe set and the document it is stated against are related,
+    /// so a set that grew a `Wave::Submitted` probe without a document to submit
+    /// fails here rather than injecting a probe whose verdict the shipped policy
+    /// still decides.
+    const fn submitted(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Reconfiguration => Some(crate::config_submission_contract::SUBMITTED),
+            Self::Revocation => Some(crate::config_submission_contract::NARROWED),
+            Self::Routed | Self::Policy | Self::Lifecycle | Self::Stateful => None,
+        }
+    }
+
+    /// Whether this set states what a commit did to the conversations already
+    /// running, which is the one contract that has to wait for the re-decision a
+    /// commit arms.
+    const fn re_decides(self) -> bool {
+        matches!(self, Self::Revocation)
+    }
 }
 
 /// What the injected probes oblige the appliance's filter to have counted.
@@ -1368,6 +1407,10 @@ fn injected_probes(
         // nothing here falls past the last rule. The zero is the stronger half of
         // the pair, as it is for the routed set.
         Traffic::Reconfiguration => (reconfiguration_probes(topology, policy), true, false, false),
+        // The fallthrough and nothing else: the revoked conversation's last packet
+        // falls past every rule once its flow is gone, and no probe here is
+        // addressed to the port the dropping rule names.
+        Traffic::Revocation => (revocation_probes(topology, policy), false, true, false),
     };
     Ok((
         probes,
@@ -1375,9 +1418,13 @@ fn injected_probes(
             policy,
             probed_the_denying_rule: denying_rule,
             probed_the_fallthrough: fallthrough || stateful,
-            probed_an_established_flow: stateful,
+            // The revocation set reaches it deliberately too, and with a packet no
+            // rule permits: the surviving conversation's last frame is carried by
+            // its flow under a policy whose one accept rule is about the other
+            // direction.
+            probed_an_established_flow: stateful || matches!(traffic, Traffic::Revocation),
             probed_mid_stream: stateful,
-            reconfigured: matches!(traffic, Traffic::Reconfiguration),
+            reconfigured: matches!(traffic, Traffic::Reconfiguration | Traffic::Revocation),
         },
     ))
 }
@@ -1396,19 +1443,15 @@ fn reconfiguration_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe>
     let [a, b] = topology.endpoints();
     /// The source port the second wave opens its conversations from.
     ///
-    /// **A different one, and this is the interesting constraint of the whole
-    /// scenario rather than a detail.** A policy decides which conversations may
-    /// *start*: a packet an existing flow already accounts for is forwarded before
-    /// the filter is consulted at all, so editing a rule does not end a
-    /// conversation already running. The first wave's accepted probe opened one, so
-    /// a second packet on the same five-tuple would be carried by that flow and
-    /// would come back — correctly, and saying nothing whatever about the new
-    /// policy. Re-evaluating the flow table on commit is what would close it, and
-    /// it does not exist yet; the development status records it as missing.
-    ///
-    /// So the second wave opens its own conversations, and what it proves is
-    /// exactly what the policy is about: which conversations may start under the
-    /// document now in force.
+    /// **A different one, and it is what keeps this scenario about the policy
+    /// alone.** A policy decides which conversations may *start*, and on the packet
+    /// path a packet an existing flow accounts for is forwarded before the filter
+    /// is consulted at all. The first wave's accepted probe opened a conversation,
+    /// so a second packet on the same five-tuple would test what the *commit* did
+    /// to that conversation rather than what the new document admits — which is a
+    /// different contract, and `Traffic::Revocation`'s. So the second wave opens its
+    /// own conversations, and what it proves is exactly what a policy is about:
+    /// which conversations may start under the document now in force.
     const REOPENED_FROM: u16 = SOURCE_PORT + 1;
 
     let to_port = |port: u16, marker: &'static [u8]| UdpPacket {
@@ -1472,6 +1515,125 @@ fn reconfiguration_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe>
             ),
         )),
     ]
+}
+
+/// Two conversations that differ in one header field, and the two packets that say
+/// what a narrowing commit did to each.
+///
+/// **Both open under the shipped policy's one accept rule** — same destination
+/// port, same addresses, same everything but the source port — so nothing about
+/// their fates before the commit distinguishes them. The submitted document then
+/// narrows that rule to one of the two source ports, and the last two probes are
+/// each conversation's *next* packet, on the five-tuple it has been using all
+/// along:
+///
+///   * the surviving conversation's crosses, and it can only be its flow that
+///     carries it: the new policy's accept rule is about the request direction and
+///     this frame is the reply direction, which no rule of either document names.
+///     That is also what says the dataplane is still forwarding across the commit;
+///   * the revoked conversation's does not, and that is the whole landing — under
+///     the behaviour before it, a tracked flow was forwarded before the filter was
+///     consulted, so this frame would have crossed.
+///
+/// A commit that flushed the table would refuse both and a commit that re-decided
+/// nothing would carry both, so the pair separates re-deciding from either.
+///
+/// Each probe carries its own marker, so a frame left over from the first wave can
+/// never satisfy the second — which matters more here than anywhere else in this
+/// harness, the last two probes reusing the first two's five-tuples exactly.
+fn revocation_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let permitted = policy.accepted.destination_port;
+    /// The source port the submitted document's narrowed rule still admits.
+    const KEPT_FROM: u16 = SOURCE_PORT;
+    /// The one it does not. A different source port is the whole of what tells the
+    /// two conversations apart, and it is the field the submitted document narrows
+    /// on — so the appliance's own re-decision is what has to separate them.
+    const REVOKED_FROM: u16 = SOURCE_PORT + 1;
+
+    let request = |source_port: u16, marker: &'static [u8]| UdpPacket {
+        source_port,
+        destination_port: permitted,
+        payload: marker.to_vec(),
+        ..datagram(a, b, INJECTED_TTL, marker)
+    };
+    // The reply direction of one of those conversations: source and destination
+    // exchanged, which is what makes it the same flow rather than a second one.
+    let reply = |destination_port: u16, marker: &'static [u8]| UdpPacket {
+        source_port: permitted,
+        destination_port,
+        payload: marker.to_vec(),
+        ..datagram(b, a, INJECTED_TTL, marker)
+    };
+    vec![
+        routed(
+            "revocation-kept-open",
+            b"LFW-PROBE/revocation-kept-open",
+            a,
+            b,
+            request(KEPT_FROM, b"LFW-PROBE/revocation-kept-open"),
+        ),
+        routed(
+            "revocation-doomed-open",
+            b"LFW-PROBE/revocation-doomed-open",
+            a,
+            b,
+            request(REVOKED_FROM, b"LFW-PROBE/revocation-doomed-open"),
+        ),
+        // Each conversation answered, so both are flows the tracker has seen in
+        // both directions — the state an operator would least expect a policy edit
+        // to be able to end, and the one this scenario ends exactly one of.
+        routed_after(
+            "revocation-kept-reply",
+            b"LFW-PROBE/revocation-kept-reply",
+            b,
+            a,
+            reply(KEPT_FROM, b"LFW-PROBE/revocation-kept-reply"),
+        ),
+        routed_after(
+            "revocation-doomed-reply",
+            b"LFW-PROBE/revocation-doomed-reply",
+            b,
+            a,
+            reply(REVOKED_FROM, b"LFW-PROBE/revocation-doomed-reply"),
+        ),
+        // And after the commit, on those same two five-tuples. The surviving
+        // conversation is already two-way, so its next packet leaves the flow's
+        // state where it was — traffic on a conversation already accounted for,
+        // which the connection history deliberately does not record. That is why
+        // this one names no event: it is a delivery on the wire and nothing else,
+        // and the wire is where the whole of what it proves lies.
+        after_the_commit(carried_by_its_flow(routed(
+            "revocation-kept-survives",
+            b"LFW-PROBE/revocation-kept-survives",
+            b,
+            a,
+            reply(KEPT_FROM, b"LFW-PROBE/revocation-kept-survives"),
+        ))),
+        after_the_commit(refused_by_policy(
+            recording_contract::EVENT_POLICY_NO_MATCH,
+            dropped(
+                "revocation-doomed-refused",
+                b"LFW-PROBE/revocation-doomed-refused",
+                b,
+                "the commit took back the flow this conversation was being carried by, so it \
+                 reaches the filter — where the narrowed policy has no rule about the reply \
+                 direction and the default deny refuses it",
+                reply(REVOKED_FROM, b"LFW-PROBE/revocation-doomed-refused"),
+            ),
+        )),
+    ]
+}
+
+/// A probe that must wait for the conversation it belongs to and that moves that
+/// conversation's state nowhere: traffic on a flow already accounted for, which the
+/// connection history holds no record of by design.
+fn carried_by_its_flow(probe: Probe) -> Probe {
+    Probe {
+        deferred: true,
+        event: None,
+        ..probe
+    }
 }
 
 /// A probe whose verdict is the submitted policy's, so it must not go out while the
@@ -3450,10 +3612,13 @@ pub struct Booted {
     /// Every frame this boot put on a dataplane port, with the probe that put
     /// it there and whether the appliance's tap must have observed it.
     ///
-    /// What the configuration submission proved, on the one scenario that makes
+    /// What the configuration submission proved, on the two scenarios that make
     /// one. `None` everywhere else, and a scenario that should have made one and
     /// did not has already failed above.
     pub applied: Option<crate::config_submission_contract::Applied>,
+    /// What the re-decision that commit armed did to the conversations already
+    /// running, on the one scenario that states it. `None` everywhere else.
+    pub revoked: Option<crate::config_submission_contract::Revoked>,
     /// Returned so [`crate::surface_contract`] can hold the recordings to the
     /// bytes the harness itself injected rather than to a literal: the probes
     /// are derived from the configuration document, so an image built from the
@@ -3549,6 +3714,7 @@ fn run_boot(
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
     let mut applied: Option<crate::config_submission_contract::Applied> = None;
+    let mut revoked: Option<crate::config_submission_contract::Revoked> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -3984,13 +4150,61 @@ fn run_boot(
                                  document is submitted with a real client",
                             ));
                         };
+                        let Some(document) = test.traffic.submitted() else {
+                            break 'run Err(String::from(
+                                "a probe set with a second wave must name the document that wave \
+                                 is decided under",
+                            ));
+                        };
+                        // Before the submission, so the drop in occupancy the
+                        // re-decision causes is measured across the change.
+                        let assured_before = if test.traffic.re_decides() {
+                            match crate::config_submission_contract::assured_flows(host_port) {
+                                Ok(before) => before,
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                        } else {
+                            0
+                        };
                         match crate::config_submission_contract::apply(
                             host_port,
                             test.topology.document(),
+                            document,
                         ) {
                             Ok(proved) => applied = Some(proved),
                             Err(verdict) => {
                                 break 'run Err(format!("{verdict}; see {}", log_path.display()));
+                            }
+                        }
+                        if test.traffic.re_decides() {
+                            // The commit armed a pass over the connection table and
+                            // a pass advances per wakeup, so the harness supplies
+                            // the wakeups a quiet bench does not have — with frames
+                            // the router's parser refuses, which reach no flow, no
+                            // policy counter and neither recording.
+                            let driver = legacy_broadcast_frame(b"LFW-SWEEP/wakeup");
+                            let outcome = crate::config_submission_contract::await_revocation(
+                                host_port,
+                                assured_before,
+                                || {
+                                    if let Some(attached) = endpoints.first_mut() {
+                                        attached.inject(&driver);
+                                    }
+                                },
+                            );
+                            match outcome {
+                                Ok(proved) => revoked = Some(proved),
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
                             }
                         }
                         // The second wave, into a dataplane the scrape above has
@@ -4185,6 +4399,18 @@ fn run_boot(
                 log_path.display()
             ));
         }
+        // And a scenario that states what a commit did to the running
+        // conversations must have watched the re-decision finish: its last two
+        // probes' fates are the pass's, and a boot that never ran one would have
+        // decided them under a table the commit left untouched.
+        if test.traffic.re_decides() && revoked.is_none() {
+            return Err(format!(
+                "the boot submitted a document and no pass over its connection table was \
+                 observed, so nothing was proved about the conversations it was already \
+                 carrying; see {}",
+                log_path.display()
+            ));
+        }
         Ok(())
     });
     let outcome = decide(outcome, &test.contract, &output, log_path);
@@ -4228,6 +4454,7 @@ fn run_boot(
         policy,
         recordings,
         applied,
+        revoked,
         injected: probes
             .iter()
             .map(|probe| Injected {

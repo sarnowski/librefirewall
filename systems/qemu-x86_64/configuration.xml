@@ -54,8 +54,10 @@
      cannot keep state for — a fragment, a protocol it does not decode, a TCP
      segment from the middle of a conversation it never saw begin — is refused
      before the filter, so no rule here can permit one. And editing these rules
-     changes which conversations may *start*: it does not end one already
-     running.
+     changes which conversations may *start*, so on the packet path an edit does
+     not reach one already running — what reaches one is the commit itself, which
+     re-decides the whole flow table and takes back every conversation the new
+     rules no longer admit.
 
      Its address is 10.0.2.15/24, which is not an arbitrary choice: QEMU's
      user-mode (SLIRP) stack places the guest at 10.0.2.15 with the gateway at

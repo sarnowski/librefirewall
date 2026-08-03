@@ -23,7 +23,7 @@
 //! not depend on `pipeline`, and `pipeline` reaches a verdict without knowing
 //! it is recorded. This crate is where both are visible.
 
-use lfw_flow::{Classification, FlowState};
+use lfw_flow::{Classification, FlowState, LiveFlow};
 use pipeline::{DropReason, FlowObservation, FlowTransition, Inspection, Verdict};
 use wire::{
     TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
@@ -109,7 +109,25 @@ pub const fn tap_flow(observation: FlowObservation) -> Option<TapFlow> {
         Some(state) => Some(TapFlow {
             slot: observation.id.slot(),
             generation: observation.id.generation(),
-            classification: tap_classification(observation.classification),
+            classification: Some(tap_classification(observation.classification)),
+            state,
+        }),
+        None => None,
+    }
+}
+
+/// A flow the appliance ended itself, as the tap ABI carries it: identity and
+/// state, and no classification — nothing was classified, there being no packet.
+///
+/// `None` for the vacant state on [`tap_flow`]'s terms, which a live flow cannot
+/// be in.
+#[must_use]
+pub const fn tap_revoked_flow(flow: &LiveFlow) -> Option<TapFlow> {
+    match tap_flow_state(flow.state) {
+        Some(state) => Some(TapFlow {
+            slot: flow.id.slot(),
+            generation: flow.id.generation(),
+            classification: None,
             state,
         }),
         None => None,
@@ -167,7 +185,7 @@ pub fn tap_decision(
     };
     TapDecision {
         outcome: tap_outcome(verdict),
-        direction,
+        direction: Some(direction),
         generation,
         flow: flow.and_then(tap_flow),
         // Only the two filter decisions may carry one, which is what the ring
@@ -245,6 +263,56 @@ impl<'ring> Tap<'ring> {
     /// caller carries on. That is the whole of the no-backpressure rule as a
     /// signature — there is no error for a forwarding path to handle,
     /// so none can be handled wrongly.
+    /// Publish the one observation that is about no frame: a flow a newly
+    /// committed policy no longer admits, which the appliance has taken back.
+    ///
+    /// The whole annotation is composed here rather than by the caller, and that
+    /// is what keeps the record honest by construction: the four per-frame facts
+    /// a revocation may not carry — a wire length, captured bytes, a direction and
+    /// a classification — are not parameters, so no caller can supply one. The
+    /// `wire::tap` reader refuses each of them by name in what a *peer* writes;
+    /// this is why no first-party producer can write one.
+    ///
+    /// Never fails, on [`Self::observe`]'s terms: a full ring costs the record and
+    /// is counted.
+    pub fn observe_revocation(&mut self, revocation: Revocation<'_>) {
+        let Revocation {
+            timestamp,
+            flow,
+            generation,
+        } = revocation;
+        let Some(recorded) = tap_revoked_flow(flow) else {
+            // A live flow is never vacant, so this is unreachable; dropped as a
+            // value rather than asserted, nothing about a record being worth
+            // faulting the dataplane over.
+            return;
+        };
+        let packet_id = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.saturating_add(1);
+        let annotation = TapAnnotation::new(
+            packet_id,
+            timestamp,
+            flow.opening.ingress,
+            TapDecision {
+                outcome: TapOutcome::Revoked,
+                direction: None,
+                generation,
+                flow: Some(recorded),
+                rule: None,
+                event: Some(TapEvent::FlowRevoked),
+            },
+        );
+        match self.writer.write(&annotation, 0, &[]) {
+            Ok(_) => self.observed = self.observed.saturating_add(1),
+            Err(TapWriteError::Full(_)) => {}
+            // Unreachable: no bytes are offered, so nothing can exceed a wire
+            // length of none. Counted rather than asserted for `observe`'s reason.
+            Err(TapWriteError::FrameExceedsWireLength { .. }) => {
+                self.refused = self.refused.saturating_add(1);
+            }
+        }
+    }
+
     pub fn observe(&mut self, observation: Observation<'_>) {
         let Observation {
             timestamp,
@@ -290,6 +358,20 @@ pub struct Observation<'frame> {
     pub decision: TapDecision,
     /// The frame as the stage snapshotted it, before any rewrite.
     pub frame: &'frame [u8],
+}
+
+/// One flow the appliance ended itself, as the pass that ended it describes it.
+///
+/// It carries no frame and no direction, and it carries the flow *before* the slot
+/// was handed back — which is the only moment its state can still be read.
+pub struct Revocation<'flow> {
+    /// The raw timestamp-counter reading, on [`Observation::timestamp`]'s terms.
+    pub timestamp: u64,
+    /// The flow that was taken back. Its interface is the port the conversation
+    /// was opened on, which is what a record of its end is attributed to.
+    pub flow: &'flow LiveFlow,
+    /// The configuration generation whose commit ended it.
+    pub generation: u32,
 }
 
 #[cfg(test)]

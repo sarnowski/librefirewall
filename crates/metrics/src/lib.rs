@@ -83,9 +83,10 @@ pub use sample::{
     DRIVER_SLOTS, DriverSample, EndpointSample, FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES,
     FLOW_REFUSALS, FLOW_SLOTS, FLOW_STATES, FORWARDER_SHARD_SLOTS, FORWARDER_SLOTS, FlowSample,
     ForwarderSample, GENERATION_OUTCOME_NAMES, GENERATION_OUTCOMES, HTTP_STATUSES, HttpSample,
-    LogSample, MANAGEMENT_SLOTS, ManagementSample, PIPELINES, PipelineSample, PolicySample,
-    PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE,
-    RecorderSample, SINKS, SinkSample, TapSample, TcpSample, UartSample,
+    LogSample, MANAGEMENT_SLOTS, ManagementSample, PIPELINES, POLICY_SWEEP_OUTCOMES,
+    POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS, PipelineSample, PolicySample,
+    PolicySweepSample, PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS,
+    RULE_HITS_BASE, RecorderSample, SINKS, SinkSample, TapSample, TcpSample, UartSample,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table
@@ -177,7 +178,7 @@ pub const STATS_REGION_SIZE: usize = size_of::<StatsShard>().next_multiple_of(MA
 // here rather than a reader attributing one domain's counter to another series.
 const _: () = {
     assert!(size_of::<StatsShard>() == STATS_SLOTS * 8);
-    assert!(size_of::<StatsShard>() == 3136);
+    assert!(size_of::<StatsShard>() == 3200);
     assert!(align_of::<StatsShard>() == 64);
     // Every slot naturally aligned, which is what makes each store and load a
     // single access rather than two a reader could tear across.

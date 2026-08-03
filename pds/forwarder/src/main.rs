@@ -50,6 +50,25 @@
 //! would let a traffic generator stall the dataplane. What is recorded is
 //! `pd_runtime::RouteStage`'s.
 //!
+//! # A commit re-decides the connection table, a window at a time
+//!
+//! The filter is consulted once per conversation, so narrowing a rule would leave
+//! every conversation it already admitted running. [`PolicySweep`] is what closes
+//! that: a commit arms a pass over the flow table, and each wakeup works off one
+//! bounded window of it, taking back the flows the new policy would not admit and
+//! offering each to the recorder as the end of that conversation. It runs on every
+//! wakeup while a pass is owed and costs nothing on the others.
+//!
+//! How much of a pass one wakeup works off is what the drain left unspent of its
+//! own frame budget, so a quiet wakeup finishes a pass four times sooner and a
+//! saturated one never spends more on re-deciding than the drain itself cost.
+//!
+//! The pass therefore advances on wakeups rather than on a timer, which is what
+//! bounds the window in the only terms that matter here: a conversation forwards
+//! only when its packets arrive, every arriving frame wakes this domain, so a flow
+//! the new policy forbids is generating the wakeups that end it. A node forwarding
+//! nothing does not finish its pass and is forwarding nothing either.
+//!
 //! # Numbers go to a shard, once per wakeup
 //!
 //! Every drop this domain counts reaches one region it is the sole writer of,
@@ -60,8 +79,9 @@ use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingS
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     ApplianceFlowTable, ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch,
-    ForwardRings, MAX_INTERFACES, MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, Tap, Tracking,
-    attach_flow_table, attach_region, flow_sample, forwarder_sample, log_sample,
+    ForwardRings, ForwarderCounters, MAX_INTERFACES, MAX_NEIGHBOURS, Offer, PdClock, PolicySweep,
+    Pool, Revocation, RouteStage, Tap, Tracking, attach_flow_table, attach_region, flow_sample,
+    forwarder_sample, log_sample, read_timestamp_counter,
 };
 use pipeline::Pipeline;
 use routing::PortId;
@@ -128,6 +148,7 @@ fn init() -> Forwarder {
         ],
         pipeline: Pipeline::new(),
         switch: ConfigurationSwitch::new(PORTS),
+        sweep: PolicySweep::new(),
         flows,
         clock: PdClock::new(clock),
         tap: Tap::attach(tap_records, tap_consume),
@@ -151,6 +172,8 @@ struct Forwarder {
     stages: [RouteStage<'static>; 2],
     pipeline: Pipeline,
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
+    /// The re-decision a commit owes the table, carried across wakeups.
+    sweep: PolicySweep,
     /// One per domain, not one per pipeline: a flow *is* both directions, so two
     /// tables would be two half-views agreeing about nothing.
     flows: &'static mut ApplianceFlowTable,
@@ -173,19 +196,18 @@ impl Forwarder {
     /// `pd_runtime::stats`, where a test holds the metric surface's vocabulary
     /// to the enums it names; this file supplies the log ring's own counts.
     fn publish(&self) {
-        let sample = forwarder_sample(
-            [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
-            self.switch.generation(),
-            self.switch.counters(),
-            // One filter serves both directions, so its counters come off the
-            // pipeline rather than off either stage.
-            self.pipeline.policy_counters(),
+        let sample = forwarder_sample(&ForwarderCounters {
+            pipelines: [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
+            generation: self.switch.generation(),
+            configuration: self.switch.counters(),
+            policy: self.pipeline.policy_counters(),
             // Both halves read from the one table at the same moment, so the
             // occupancy a scrape reports is the occupancy those counters left.
-            flow_sample(self.flows.counters(), self.flows.occupancy()),
-            self.tap.counters(),
-            log_sample(self.sink.dropped(), self.sink.refused()),
-        );
+            flow: flow_sample(self.flows.counters(), self.flows.occupancy()),
+            sweep: &self.sweep,
+            tap: self.tap.counters(),
+            log: log_sample(self.sink.dropped(), self.sink.refused()),
+        });
         self.stats.publish(&sample.values());
     }
 }
@@ -210,6 +232,11 @@ impl Handler for Forwarder {
         }
         if let Some(generation) = self.switch.take_commit(self.handover, self.ack) {
             self.sink.emit(&applied(generation));
+            // Both tables have just been replaced, so every flow the previous
+            // generation admitted is owed a re-decision — including on a commit
+            // that changed no rule, a routing change moving which egress a rule
+            // is about.
+            self.sweep.arm(generation);
         }
         let configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS> =
             self.switch.configuration();
@@ -218,18 +245,40 @@ impl Handler for Forwarder {
         // cost a serialising instruction on the hot path.
         let now = self.clock.monotonic();
         let mut tracking = Tracking::new(self.flows, now);
+        // Kept, because it is what the re-decision below sizes its share of this
+        // wakeup against: a wakeup that drained little has the budget of a full
+        // drain still unspent.
+        let mut forwarded = 0usize;
         for stage in &mut self.stages {
-            stage.poll(
+            forwarded = forwarded.saturating_add(stage.poll(
                 &mut self.pipeline,
                 configuration,
                 &mut tracking,
                 Some(&mut self.tap),
-            );
+            ));
         }
         // Unconditionally, and after the drain: the sweep is bounded to a window
         // of slots, so it costs the same whether traffic arrived or not, and a
         // wakeup that forwarded nothing is exactly when there is room to reclaim.
         self.flows.poll(now);
+        // And one window of the re-decision a commit owes, if one is owed. After
+        // the drain for the timeout sweep's reason, and after it for a second: a
+        // frame of a flow this window is about to revoke was decided under the
+        // generation in force when it arrived, which is the one that had already
+        // committed. The `Tap` is borrowed inside the closure rather than around
+        // the call, so nothing but a revoked flow reaches it.
+        let Self {
+            sweep, flows, tap, ..
+        } = self;
+        let generation = self.switch.generation();
+        let mut tracking = Tracking::new(flows, now);
+        sweep.advance(&configuration, &mut tracking, forwarded, |flow| {
+            tap.observe_revocation(Revocation {
+                timestamp: read_timestamp_counter().0,
+                flow,
+                generation,
+            });
+        });
         self.publish();
         Ok(())
     }

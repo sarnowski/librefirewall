@@ -57,6 +57,18 @@
 //! every frame the filter sees has just opened a flow. That is what a rule is
 //! about here, and it is why no criterion names a connection's state.
 //!
+//! # What closes the hole that leaves
+//!
+//! A conversation the filter admitted is carried by its flow, so narrowing a rule
+//! stops new conversations and leaves the ones it already admitted running. That
+//! is not a rough edge — a host found to be compromised keeps every connection it
+//! had open — and the answer is [`PolicySweep`], which re-decides the **flow
+//! table** against a newly committed configuration and takes back the flows it
+//! would not admit. Once per commit rather than once per packet, so the ruleset
+//! stays off the hot path and every flow the new policy still allows is left
+//! exactly as it was. What it can decide from a flow's key alone, and where that
+//! is conservative, is [`PolicySweep`]'s own header.
+//!
 //! A frame the tracker refuses never reaches the filter either, and each refusal
 //! carries a [`DropReason`] of its own. That is a real narrowing of what this
 //! appliance forwards: a protocol no flow can be kept for is one no rule can
@@ -85,7 +97,7 @@ use core::fmt;
 
 use lfw_clock::Monotonic;
 use lfw_flow::{Classification, FlowEntry, FlowId, FlowState, FlowTable, Outcome, RefusalKind};
-use net_headers::{Frame, Ipv4Address, MacAddress, Protocol, Transport};
+use net_headers::{Frame, IcmpHeader, Ipv4Address, MacAddress, Protocol, Transport};
 use routing::{PortId, Router};
 
 /// Why a frame was not forwarded — the flat, operator-facing vocabulary every
@@ -714,10 +726,11 @@ impl<'table, const FLOWS: usize> Tracking<'table, FLOWS> {
 /// never consulted. Two things follow, and both are the point. A reply is carried
 /// without a rule naming it, which is the entire value of tracking state — the
 /// alternative is writing the reverse of every rule and opening the appliance in
-/// both directions to permit one. And **an edit to the policy cannot break a live
+/// both directions to permit one. And **no packet-path decision can break a live
 /// connection**: the rule that admitted a conversation is consulted once, when it
 /// opened, so an operator narrowing a rule stops *new* connections rather than
-/// cutting established ones mid-stream.
+/// cutting established ones mid-stream. What does reach a running conversation is
+/// [`PolicySweep`], on the commit rather than on a packet.
 ///
 /// The consequence for [`Ruleset`] is worth stating here rather than leaving to
 /// be worked out: **every frame that reaches the filter has just opened a flow**.
@@ -753,6 +766,7 @@ impl ConnectionStage {
         let outcome = tracking.table.classify(
             tracking.now,
             &lfw_flow::Packet {
+                ingress: inspection.ingress().0,
                 source: header.source,
                 destination: header.destination,
                 transport: inspection.frame().transport(),
@@ -921,45 +935,38 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Whether this rule is about this frame.
+    /// Whether this rule is about a packet with these criteria.
     ///
-    /// # A truncated transport matches no port and no type
-    ///
-    /// The port and type criteria are answered from [`Transport`], and every
-    /// variant of it that carries no readable field answers `false` rather than
-    /// being skipped: a stated criterion on a frame whose transport header was
-    /// cut short, arrived as a non-initial fragment, or is a protocol this
-    /// build does not break down, does not match. That is the direction that
-    /// matters on a default-deny appliance — a rule cannot be *satisfied* by a
-    /// header nobody read, so a truncated packet cannot be carried through an
-    /// `accept` written for a port. It falls to the next rule, and past the
-    /// last of them to the default deny.
+    /// The **only** matcher. A rule is asked about two things that are not the
+    /// same object — a frame the chain is deciding on, and the opening of a flow
+    /// the chain admitted earlier and is re-deciding on — and a second matcher
+    /// for the second of them would be a policy engine with two answers, drifting
+    /// apart one criterion at a time. So both are reduced to a [`FlowSelector`]
+    /// first and this is what compares one.
     #[must_use]
-    fn matches(&self, ingress: PortId, egress: PortId, frame: &Frame<'_>) -> bool {
-        if self.ingress.is_some_and(|port| port != ingress)
-            || self.egress.is_some_and(|port| port != egress)
+    fn admits(&self, selector: &FlowSelector) -> bool {
+        if self.ingress.is_some_and(|port| port != selector.ingress)
+            || self.egress.is_some_and(|port| port != selector.egress)
         {
             return false;
         }
-        let header = frame.ipv4();
         if self
             .source
-            .is_some_and(|block| !block.covers(header.source))
+            .is_some_and(|block| !block.covers(selector.source))
             || self
                 .destination
-                .is_some_and(|block| !block.covers(header.destination))
+                .is_some_and(|block| !block.covers(selector.destination))
         {
             return false;
         }
         if self
             .protocol
-            .is_some_and(|protocol| protocol != header.protocol)
+            .is_some_and(|protocol| protocol != selector.protocol)
         {
             return false;
         }
-        let transport = frame.transport();
         if self.source_port.is_some() || self.destination_port.is_some() {
-            let Some((source, destination)) = transport_ports(transport) else {
+            let Some((source, destination)) = selector.ports else {
                 return false;
             };
             if self.source_port.is_some_and(|range| !range.covers(source))
@@ -970,15 +977,67 @@ impl Rule {
                 return false;
             }
         }
-        if let Some(wanted) = self.icmp_type {
-            let Transport::Icmp(icmp) = transport else {
-                return false;
-            };
-            if icmp.message_type != wanted {
-                return false;
-            }
+        if let Some(wanted) = self.icmp_type
+            && selector.icmp_type != Some(wanted)
+        {
+            return false;
         }
         true
+    }
+}
+
+/// Everything a [`Rule`] compares, separated from whatever the values came out
+/// of.
+///
+/// It exists because a rule is asked about a packet at two different moments: on
+/// the frame that opens a conversation, and again — with no frame left — on a
+/// conversation the policy already admitted, when [`PolicySweep`] re-decides one.
+/// Reducing both to this value is what makes those two answers the same answer.
+///
+/// # Every absent field is a criterion that cannot be satisfied
+///
+/// `ports` and `icmp_type` are `None` wherever the value was not read, and a
+/// stated criterion on an absent value does **not** match. That is the
+/// fail-closed direction on a default-deny appliance in both of its uses: a
+/// truncated transport header, a non-initial fragment or a protocol this build
+/// does not break down cannot be carried through an `accept` written for a port,
+/// and neither can a conversation whose opening a re-decision cannot fully
+/// reconstruct. It falls to the next rule, and past the last of them to the
+/// default deny.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowSelector {
+    pub ingress: PortId,
+    pub egress: PortId,
+    pub source: Ipv4Address,
+    pub destination: Ipv4Address,
+    pub protocol: Protocol,
+    /// The transport's source and destination ports, absent where no readable
+    /// header carried them.
+    pub ports: Option<(u16, u16)>,
+    /// The ICMP message type, absent for anything that is not a readable ICMP
+    /// header.
+    pub icmp_type: Option<u8>,
+}
+
+impl FlowSelector {
+    /// What a rule compares about one frame, under the forwarding decision the
+    /// routing stage reached for it.
+    #[must_use]
+    pub fn of_frame(ingress: PortId, egress: PortId, frame: &Frame<'_>) -> Self {
+        let header = frame.ipv4();
+        let transport = frame.transport();
+        Self {
+            ingress,
+            egress,
+            source: header.source,
+            destination: header.destination,
+            protocol: header.protocol,
+            ports: transport_ports(transport),
+            icmp_type: match transport {
+                Transport::Icmp(icmp) => Some(icmp.message_type),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -1075,18 +1134,13 @@ impl Ruleset {
     /// generation actually declared and not by [`MAX_RULES`], so an eight-rule
     /// document costs eight comparisons rather than two hundred and fifty-six.
     #[must_use]
-    fn first_match(
-        &self,
-        ingress: PortId,
-        egress: PortId,
-        frame: &Frame<'_>,
-    ) -> Option<(usize, Rule)> {
+    pub fn first_match(&self, selector: &FlowSelector) -> Option<(usize, Rule)> {
         self.rules
             .iter()
             .take(self.len)
             .flatten()
             .enumerate()
-            .find(|(_, rule)| rule.matches(ingress, egress, frame))
+            .find(|(_, rule)| rule.admits(selector))
             .map(|(position, rule)| (position, *rule))
     }
 }
@@ -1223,11 +1277,11 @@ impl PolicyStage {
         // what a byte total an operator compares against a link's throughput
         // has to be stated in.
         let bytes = u64::from(inspection.frame().ipv4().total_length);
-        let matched = configuration.rules().first_match(
+        let matched = configuration.rules().first_match(&FlowSelector::of_frame(
             inspection.ingress(),
             forwarding.egress,
             inspection.frame(),
-        );
+        ));
         match matched {
             Some((position, rule)) => {
                 self.counters.record(Some(position), rule.action, bytes);
@@ -1250,6 +1304,309 @@ impl PolicyStage {
 }
 
 impl Default for PolicyStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether the configuration would admit a conversation opening the way this one
+/// did, and under which rule.
+///
+/// The same chain a frame goes through, with the parts that are not about the flow
+/// left out — see [`PolicySweep`] for which parts those are and why. The order is
+/// [`AdmissionStage`]'s then [`RoutingStage`]'s, so a flow whose link or route the
+/// new configuration no longer has is disowned before the filter is reached: with
+/// no egress there is nothing for a rule naming one to be about, and the filter's
+/// own answer to a frame it cannot place is to deny.
+fn admits_opening<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+    configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    opening: &lfw_flow::FlowOpening,
+) -> Option<usize> {
+    let table = configuration.table();
+    let ingress = PortId(opening.ingress);
+    let interface = table.interface(ingress)?;
+    if !interface.enabled {
+        return None;
+    }
+    let source = opening.source.address;
+    let destination = opening.destination.address;
+    if !source.is_unicast() || table.is_local_address(source) {
+        return None;
+    }
+    if !destination.is_unicast() || table.is_local_address(destination) {
+        return None;
+    }
+    let egress = table.route(destination)?;
+    if egress.port == ingress {
+        return None;
+    }
+    table.neighbour(egress.port, destination)?;
+    let protocol = opening.protocol;
+    let selector = FlowSelector {
+        ingress,
+        egress: egress.port,
+        source,
+        destination,
+        protocol,
+        // An ICMP flow's endpoints carry the echo identifier where a port would
+        // sit, so it is *not* offered as one: a port criterion answered from an
+        // identifier would be a rule matching a number that is not what it names.
+        // A document stating one on ICMP is refused before it commits, so the
+        // absence costs nothing an operator can write.
+        ports: (protocol != Protocol::ICMP)
+            .then_some((opening.source.port, opening.destination.port)),
+        // An echo request is the only ICMP message that opens a flow, so the type
+        // the opening packet carried is recovered exactly rather than guessed.
+        icmp_type: (protocol == Protocol::ICMP).then_some(IcmpHeader::ECHO_REQUEST),
+    };
+    match configuration.rules().first_match(&selector) {
+        Some((position, rule)) if matches!(rule.action, RuleAction::Accept) => Some(position),
+        Some(_) | None => None,
+    }
+}
+
+/// Frames one wakeup may drain, which is `pd_runtime::DRAIN_LIMIT`.
+///
+/// Restated rather than imported — that crate depends on this one, so the edge
+/// cannot run the other way — and held equal to it by a const assertion there, the
+/// way [`MAX_RULES`] and `wire::MAX_RULES` are held equal.
+pub const WAKEUP_FRAME_BUDGET: usize = 128;
+
+/// Frames whose forwarding costs about what one window of re-deciding costs.
+///
+/// Measured rather than chosen, from the two benchmarks in `pd-runtime`: one
+/// window over an empty table is about 3.4 µs (`policy_sweep_window`) and a
+/// forwarded frame is about 85 ns (`route_forwarded`), so a window is about forty
+/// frames. It is a ratio between two costs on one machine, so it is a *scale* and
+/// not a promise: both move together on faster hardware.
+pub const FRAMES_PER_WINDOW: usize = 40;
+
+/// How many windows a wakeup that drained `forwarded` frames works off.
+///
+/// A wakeup's own work is bounded by [`WAKEUP_FRAME_BUDGET`] frames, and the
+/// re-decision spends what that bound leaves unspent: a saturated wakeup pays one
+/// window and a quiet one pays the slack. Two things follow, and both are the
+/// point. A wakeup never spends more on re-deciding than a full drain costs, so no
+/// traffic pattern can make the pass the expensive part of a wakeup. And a pass
+/// finishes in a quarter of the wakeups when there is little traffic, which is
+/// when a commit usually lands.
+///
+/// At least one window always, so a pass cannot stall on a domain that is busy.
+#[must_use]
+pub const fn windows_for(forwarded: usize) -> usize {
+    let spent = if forwarded > WAKEUP_FRAME_BUDGET {
+        WAKEUP_FRAME_BUDGET
+    } else {
+        forwarded
+    };
+    1 + (WAKEUP_FRAME_BUDGET - spent) / FRAMES_PER_WINDOW
+}
+
+/// What the re-decision has done, which is otherwise invisible: an operator who
+/// has narrowed a policy needs to know both that flows were ended by it and that
+/// the pass ending them has finished.
+///
+/// Monotonic and saturating, on [`DropCounters`]' terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicySweepCounters {
+    /// Passes that reached the last bucket, which is what says the window a commit
+    /// opens has closed.
+    pub completed: u64,
+    /// Passes abandoned part-way because a newer generation arrived. A number that
+    /// climbs is commits arriving faster than the table is swept.
+    pub restarted: u64,
+    pub buckets: u64,
+    pub examined: u64,
+}
+
+/// What one [`PolicySweep::advance`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swept {
+    /// The generation the flows were re-decided against.
+    pub generation: u32,
+    pub buckets: usize,
+    pub examined: usize,
+    pub revoked: usize,
+    pub complete: bool,
+}
+
+/// The re-decision: on a newly committed configuration, the pass over the
+/// connection table that takes back every flow the new policy would not admit.
+///
+/// # Why it is not per packet
+///
+/// [`ConnectionStage`]'s half in front settles an established frame before the
+/// filter is consulted, which is what carries a reply no rule names and what keeps
+/// an edit from cutting a conversation already running on the packet path. The cost
+/// is that narrowing a rule reaches nothing it had already admitted — a host found
+/// to be compromised keeps every connection it had open. Consulting the policy per
+/// packet would close that and give up the guarantee the model exists for, so the
+/// *table* is re-decided when the policy changes instead.
+///
+/// # What a re-decision can and cannot answer
+///
+/// A flow was admitted by a rule matching its opening packet, and that packet is
+/// gone. What is left is [`lfw_flow::FlowOpening`] — the five-tuple in the
+/// orientation it travelled in, and the port it arrived on — so the re-decision
+/// is over a key and not over a packet. Every criterion a [`Rule`] carries is
+/// recovered from it exactly: the addresses and the protocol are the key's, the
+/// ports are the key's for TCP and UDP, the ICMP type is an echo request because
+/// nothing else opens an ICMP flow, the ingress is the port the entry recorded,
+/// and the egress is resolved from the **new** table — which is the right answer
+/// rather than a remembered one, a rule naming an egress being about where the
+/// frame would now go.
+///
+/// Two facts of the opening packet are unrecoverable and neither is a criterion:
+/// its destination MAC and its remaining lifetime. Both are properties of a
+/// packet rather than of a conversation — a rule cannot name either — so their
+/// absence costs the re-decision nothing.
+///
+/// # Where it is conservative, and in which direction
+///
+/// Absent values never satisfy a criterion ([`FlowSelector`]), so the pass can
+/// only ever disown a flow the policy might have admitted and never keep one it
+/// forbids. It is conservative in exactly one place: a flow whose ingress
+/// interface the new configuration no longer has or has disabled, or whose
+/// original destination it can no longer route to a neighbour, is disowned — even
+/// though packets in that flow's *reply* direction might still have been
+/// forwarded. That is the safe direction and it is also the honest reading of the
+/// question: a packet opening this conversation now would be refused before the
+/// filter saw it, so the configuration no longer admits the conversation.
+///
+/// # It is bounded, and what that costs
+///
+/// A pass cannot run to completion in one wakeup: `pd-runtime`'s
+/// `policy_sweep_window` benchmark times one window of
+/// [`lfw_flow::REVISIT_BUCKETS`] buckets at about 3.4 µs over an empty table, so a
+/// whole pass over the appliance's own index is nearly a millisecond — and a
+/// commit that stalled forwarding for that long would be a worse defect than the
+/// one re-deciding exists to fix. So a pass is carried across wakeups, and a
+/// wakeup works off as many windows as [`windows_for`] gives it.
+///
+/// A flow the new policy forbids therefore keeps forwarding for up to as many
+/// wakeups as a pass takes. What bounds that is the flow itself: a conversation
+/// forwards only when its packets arrive, every arriving frame wakes the domain,
+/// and every wakeup advances the pass — so a forbidden flow that is *doing*
+/// anything is generating the wakeups that end it.
+///
+/// What that argument does **not** give is a bound in wall-clock time. A node
+/// forwarding nothing receives no wakeups and does not finish its pass; it is also
+/// forwarding nothing, so no conversation the new policy forbids is crossing, and
+/// the pass resumes with the traffic. [`PolicySweepCounters::completed`] and the
+/// gauge beside it are what say which of the two a node is in, and reading 1 for a
+/// long quiet stretch is the honest answer rather than a fault.
+pub struct PolicySweep {
+    /// The bucket the next call resumes at, or `None` while no pass is running.
+    cursor: Option<usize>,
+    /// The generation the running pass was armed by, kept so a [`Swept`] names
+    /// what its flows were judged against.
+    generation: u32,
+    counters: PolicySweepCounters,
+}
+
+impl PolicySweep {
+    /// Nothing to re-decide, which is what a domain that has committed nothing
+    /// is in.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cursor: None,
+            generation: 0,
+            counters: PolicySweepCounters {
+                completed: 0,
+                restarted: 0,
+                buckets: 0,
+                examined: 0,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> PolicySweepCounters {
+        self.counters
+    }
+
+    /// Whether a pass is still owed, which is the window an operator watches a
+    /// commit close over.
+    #[must_use]
+    pub const fn running(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// Start a pass over the whole table, because `generation` is now in force.
+    ///
+    /// Called on every commit, including one that changed no rule: what a commit
+    /// replaces is both tables at once, and a routing change moves which egress a
+    /// rule is about. Arming while a pass is already running restarts it from the
+    /// first bucket rather than continuing — the flows already re-decided were
+    /// judged against the policy this one replaces, so continuing would leave a
+    /// prefix of the table judged by a superseded document.
+    pub fn arm(&mut self, generation: u32) {
+        if self.cursor.is_some() {
+            self.counters.restarted = self.counters.restarted.saturating_add(1);
+        }
+        self.cursor = Some(0);
+        self.generation = generation;
+    }
+
+    /// Re-decide on one bounded window of the table, taking back the flows the
+    /// configuration no longer admits and telling `observe` about each.
+    ///
+    /// `None` while no pass is running, which is every wakeup but the ones a commit
+    /// is being worked off over.
+    ///
+    /// `observe` is called for exactly the flows this call revoked, before their
+    /// slots are handed back — so a caller recording the end of a conversation
+    /// still has its identity and its state. It is never consulted about a flow
+    /// that is kept: a caller able to change that decision would be a second
+    /// policy.
+    /// `forwarded` is how many frames the wakeup drained, which is what
+    /// [`windows_for`] sizes this call against.
+    pub fn advance<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS: usize>(
+        &mut self,
+        configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+        tracking: &mut Tracking<'_, FLOWS>,
+        forwarded: usize,
+        mut observe: impl FnMut(&lfw_flow::LiveFlow),
+    ) -> Option<Swept> {
+        let mut cursor = self.cursor?;
+        let mut swept = Swept {
+            generation: self.generation,
+            buckets: 0,
+            examined: 0,
+            revoked: 0,
+            complete: false,
+        };
+        for _ in 0..windows_for(forwarded) {
+            let revisited = tracking.table.revisit(cursor, |flow| {
+                if admits_opening(configuration, &flow.opening).is_some() {
+                    return lfw_flow::Disposition::Keep;
+                }
+                observe(flow);
+                lfw_flow::Disposition::Revoke
+            });
+            swept.buckets = swept.buckets.saturating_add(revisited.buckets);
+            swept.examined = swept.examined.saturating_add(revisited.examined);
+            swept.revoked = swept.revoked.saturating_add(revisited.revoked);
+            cursor = revisited.next;
+            if revisited.complete {
+                swept.complete = true;
+                break;
+            }
+        }
+        self.counters.buckets = self.counters.buckets.saturating_add(swept.buckets as u64);
+        self.counters.examined = self.counters.examined.saturating_add(swept.examined as u64);
+        if swept.complete {
+            self.cursor = None;
+            self.counters.completed = self.counters.completed.saturating_add(1);
+        } else {
+            self.cursor = Some(cursor);
+        }
+        Some(swept)
+    }
+}
+
+impl Default for PolicySweep {
     fn default() -> Self {
         Self::new()
     }

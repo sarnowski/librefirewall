@@ -198,7 +198,39 @@ pub const FLOW_PACKETS_REFUSED: Metric = metric(
 pub const FLOW_LIFECYCLE: Metric = metric(
     "librefirewall_flow_lifecycle_total",
     Kind::Counter,
-    "Flows that left the table, by what ended them. `expired` reached their state's idle timeout,      `evicted` were taken back under pressure and are never assured ones, `closed` were ended by      their own endpoints, and `withdrawn` were opened by a packet the filter then refused. There      is no `created`: a flow is created by exactly the packet counted as `new` above.",
+    "Flows that left the table, by what ended them. `expired` reached their state's idle timeout,      `evicted` were taken back under pressure and are never assured ones, `closed` were ended by      their own endpoints, `withdrawn` were opened by a packet the filter then refused, and      `revoked` were admitted by a policy a commit has replaced with one that no longer admits      them. There is no `created`: a flow is created by exactly the packet counted as `new` above.",
+);
+
+/// What the pass that re-decides the connection table against a newly committed
+/// policy has done.
+///
+/// The window a commit opens is what an operator watches here: a conversation the
+/// new policy forbids goes on forwarding until the pass reaches it, so `completed`
+/// rising past the commit is what says every flow has been re-decided. `restarted`
+/// is a commit that arrived while a pass was still running, which sends the cursor
+/// back to the start.
+pub const POLICY_SWEEP: Metric = metric(
+    "librefirewall_policy_sweep_total",
+    Kind::Counter,
+    "Passes over the connection table re-deciding it against a newly committed policy. `completed` \
+     reached the last bucket, so every flow has been judged against the running policy; \
+     `restarted` was abandoned part-way because a newer generation arrived.",
+);
+
+pub const POLICY_SWEEP_RUNNING: Metric = metric(
+    "librefirewall_policy_sweep_running",
+    Kind::Gauge,
+    "1 while a pass over the connection table is still owed, 0 once it has finished. The window a \
+     commit opens: while it reads 1, a conversation the new policy forbids may still be \
+     forwarding.",
+);
+
+pub const POLICY_SWEEP_PROGRESS: Metric = metric(
+    "librefirewall_policy_sweep_progress_total",
+    Kind::Counter,
+    "What the re-deciding passes have walked: `buckets` of the connection index, and `flows` that \
+     were live enough to be judged. Read against the table's capacity, they say how far a pass \
+     gets per wakeup.",
 );
 
 pub const FLOW_TABLE_ENTRIES: Metric = metric(
@@ -755,6 +787,9 @@ pub const ALL_METRICS: &[&Metric] = &[
     &FLOW_LIFECYCLE,
     &FLOW_TABLE_ENTRIES,
     &FLOW_PROBE_COLLISIONS,
+    &POLICY_SWEEP,
+    &POLICY_SWEEP_RUNNING,
+    &POLICY_SWEEP_PROGRESS,
     &TAP_OBSERVATIONS,
     &TAP_OBSERVATIONS_LOST,
     &RECEIVE_FRAMES,

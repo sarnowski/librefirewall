@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-90 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 337 counter and gauge series from the nine shards, plus
+93 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 343 counter and gauge series from the nine shards, plus
 one info series per configured interface and one hit counter per rule the running policy declares,
-and the document they render into is bounded at 77 922 bytes — a worst case computed from these
+and the document they render into is bounded at 79 496 bytes — a worst case computed from these
 tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -89,9 +89,12 @@ avoiding: it looks exactly like a healthy node.
 | `librefirewall_flow_packets_seen_total` | counter | `forwarder` | — | Packets offered to the connection tracker, whatever became of them. The denominator the classified and refused families are read against. |
 | `librefirewall_flow_packets_total` | counter | `forwarder` | `outcome`&nbsp;(`established`, `new`, `related`) | Packets the connection tracker classified, by what it made of them. `new` opened a flow, `established` advanced one the table already held, and `related` is an ICMP error reporting on one. A packet counted here was not refused; a packet refused is in `librefirewall_flow_packets_refused_total` and in neither of the two. |
 | `librefirewall_flow_packets_refused_total` | counter | `forwarder` | `reason`&nbsp;(`bucket_full`, `fragment`, `invalid_flags`, `invalid_state`, `malformed`, `mid_stream`, `no_such_flow`, `out_of_window`, `quoted_invalid`, `table_full`, `unsupported_icmp`, `unsupported_protocol`) | Packets the connection tracker turned away, by what refused them. `mid_stream` counts attempts to walk around default deny by starting inside a conversation this appliance never saw begin; `table_full` is the fail-closed answer to a connection flood and means legitimate new connections are being refused. |
-| `librefirewall_flow_lifecycle_total` | counter | `forwarder` | `event`&nbsp;(`closed`, `evicted`, `expired`, `withdrawn`) | Flows that left the table, by what ended them. `expired` reached their state's idle timeout, `evicted` were taken back under pressure and are never assured ones, `closed` were ended by their own endpoints, and `withdrawn` were opened by a packet the filter then refused. There is no `created`: a flow is created by exactly the packet counted as `new` above. |
+| `librefirewall_flow_lifecycle_total` | counter | `forwarder` | `event`&nbsp;(`closed`, `evicted`, `expired`, `revoked`, `withdrawn`) | Flows that left the table, by what ended them. `expired` reached their state's idle timeout, `evicted` were taken back under pressure and are never assured ones, `closed` were ended by their own endpoints, `withdrawn` were opened by a packet the filter then refused, and `revoked` were admitted by a policy a commit has replaced with one that no longer admits them. There is no `created`: a flow is created by exactly the packet counted as `new` above. |
 | `librefirewall_flow_table_entries` | gauge | `forwarder` | `state`&nbsp;(`close_wait`, `closed`, `closing`, `established`, `fin_wait`, `icmp_replied`, `icmp_unreplied`, `syn_received`, `syn_sent`, `time_wait`, `udp_assured`, `udp_unreplied`, `vacant`) | Slots of the connection table, by the state of the flow in each. `vacant` is how much room is left, so the values sum to the table's capacity and a flood is watched as `vacant` falling rather than as an occupancy needing a capacity nothing publishes. |
 | `librefirewall_flow_probe_collisions_total` | counter | `forwarder` | — | Chain steps that reached an entry which was not the one looked up. Not a refusal — the walk simply continued — and exposed because the ratio against `librefirewall_flow_packets_seen_total` is what says whether the index is doing its job. |
+| `librefirewall_policy_sweep_total` | counter | `forwarder` | `outcome`&nbsp;(`completed`, `restarted`) | Passes over the connection table re-deciding it against a newly committed policy. `completed` reached the last bucket, so every flow has been judged against the running policy; `restarted` was abandoned part-way because a newer generation arrived. |
+| `librefirewall_policy_sweep_running` | gauge | `forwarder` | — | 1 while a pass over the connection table is still owed, 0 once it has finished. The window a commit opens: while it reads 1, a conversation the new policy forbids may still be forwarding. |
+| `librefirewall_policy_sweep_progress_total` | counter | `forwarder` | `walked`&nbsp;(`buckets`, `flows`) | What the re-deciding passes have walked: `buckets` of the connection index, and `flows` that were live enough to be judged. Read against the table's capacity, they say how far a pass gets per wakeup. |
 | `librefirewall_tap_observations_total` | counter | `forwarder` | — | Frame observations the forwarder published to the recorder. |
 | `librefirewall_tap_observations_lost_total` | counter | `forwarder` | `reason`&nbsp;(`inconsistent`, `ring_full`) | Observations the tap could not publish; `ring_full` is the recorder falling behind, `inconsistent` is ours and expected to stay zero. |
 

@@ -105,6 +105,10 @@ enum TransportSpec {
     },
     Icmp {
         message_type: u8,
+        /// The echo identifier, which stands where a port would at *both* ends of
+        /// an ICMP flow's key — so a case that means to show a port criterion
+        /// cannot be answered from it needs a value that is not zero.
+        identifier: u16,
     },
     /// A datagram claiming `protocol` with two bytes behind its IPv4 header: too
     /// few for any of the three headers, so no port and no type was read.
@@ -159,8 +163,13 @@ impl TransportSpec {
                 // here was read — and these cases are about the criteria.
                 out[13] = 0x02;
             }
-            Self::Icmp { message_type } => {
+            Self::Icmp {
+                message_type,
+                identifier,
+            } => {
                 out.push(message_type);
+                out.resize(4, 0);
+                out.extend_from_slice(&identifier.to_be_bytes());
                 out.resize(ICMP_HEADER_LEN, 0);
             }
             // Two bytes: past no header's length, so every one of the three
@@ -777,6 +786,11 @@ fn prefix(octets: [u8; 4], prefix_length: u8) -> Prefix {
     Prefix::new(Ipv4Address::from_octets(octets), prefix_length)
 }
 
+/// The identifier every ICMP fixture here carries. Not zero, and not a value any
+/// UDP or TCP case uses, so a criterion answered from it is visibly answered from
+/// the wrong field.
+const ECHO_IDENTIFIER: u16 = 0x4d2;
+
 fn port(single: u16) -> PortRange {
     PortRange {
         low: single,
@@ -1095,14 +1109,14 @@ fn a_transport_nobody_read_matches_no_port_and_no_type() {
         let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
         for rule in criteria {
             assert!(
-                !rule.matches(PORT0, PORT1, &frame),
+                !rule.admits(&FlowSelector::of_frame(PORT0, PORT1, &frame)),
                 "{transport:?} satisfied a criterion nothing could be read for: {rule:?}"
             );
         }
         // And the criterion is what refused it, not the frame: the same rule
         // without the port matches the same bytes.
         assert!(
-            wildcard(RuleAction::Accept).matches(PORT0, PORT1, &frame),
+            wildcard(RuleAction::Accept).admits(&FlowSelector::of_frame(PORT0, PORT1, &frame)),
             "{transport:?} was refused by a rule that states no criterion"
         );
         // Through the whole chain none of them reaches the filter at all, which
@@ -1137,7 +1151,10 @@ fn an_icmp_type_criterion_matches_only_icmp() {
     assert_eq!(
         verdict_under(
             &rules,
-            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 8 })
+            &FrameSpec::carrying(TransportSpec::Icmp {
+                message_type: 8,
+                identifier: ECHO_IDENTIFIER,
+            })
         ),
         forwarded()
     );
@@ -1150,7 +1167,10 @@ fn an_icmp_type_criterion_matches_only_icmp() {
                 icmp_type: Some(0),
                 ..wildcard(RuleAction::Accept)
             }]),
-            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 8 })
+            &FrameSpec::carrying(TransportSpec::Icmp {
+                message_type: 8,
+                identifier: ECHO_IDENTIFIER,
+            })
         ),
         Verdict::Drop(DropReason::NoPolicyMatch)
     );
@@ -1992,5 +2012,450 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+// ── Re-deciding the table when the policy changes ───────────────────────────
+
+impl Bench {
+    /// Work a whole pass off under `rules`, answering the flows it took back.
+    ///
+    /// It loops to completion because a window is bounded and a test is about the
+    /// outcome rather than about the pacing; how far one window gets is
+    /// `crates/flow`'s own property to state.
+    fn resweep(&mut self, rules: &Ruleset, generation: u32) -> Vec<lfw_flow::LiveFlow> {
+        // A saturated wakeup, so a pass takes the most windows it ever takes and a
+        // case that means to run one to completion is not resting on the slack.
+        let mut sweep = PolicySweep::new();
+        sweep.arm(generation);
+        let mut revoked = Vec::new();
+        while sweep.running() {
+            let configuration = Configuration::new(generation, &self.table, rules);
+            let mut tracking = Tracking::new(&mut self.flows, at(self.nanos));
+            sweep
+                .advance(&configuration, &mut tracking, SATURATED, |flow| {
+                    revoked.push(*flow);
+                })
+                .expect("an armed sweep advances");
+        }
+        assert_eq!(sweep.counters().completed, 1);
+        revoked
+    }
+}
+
+/// A wakeup that drained its whole frame budget, which is the one that works off
+/// the fewest windows.
+const SATURATED: usize = WAKEUP_FRAME_BUDGET;
+
+/// A rule accepting exactly one UDP destination port, which is the shape both
+/// documents the appliance ships use.
+fn accepts_port(destination: u16) -> Ruleset {
+    Ruleset::build(core::iter::once(Rule {
+        protocol: Some(Protocol::UDP),
+        destination_port: Some(port(destination)),
+        ..wildcard(RuleAction::Accept)
+    }))
+    .expect("one rule is inside any capacity")
+}
+
+fn to_port(destination: u16) -> FrameSpec {
+    FrameSpec::carrying(TransportSpec::Udp {
+        source: 4444,
+        destination,
+    })
+}
+
+/// **The landing's central claim, on the chain itself.** Two conversations open
+/// under a policy that admits both; a policy that admits only one commits; the pass
+/// takes back exactly the other, and the one still admitted is left where it was.
+///
+/// The second half is what makes it a re-decision rather than a flush, and a flush
+/// would pass the first half alone. The third is what the whole model rests on:
+/// after the pass, the surviving conversation's next packet is still carried by its
+/// flow, with no rule naming it.
+#[test]
+fn a_commit_takes_back_the_flows_the_new_policy_refuses_and_leaves_the_others() {
+    let mut bench = Bench::new();
+    let broad = Ruleset::build(
+        [
+            Rule {
+                protocol: Some(Protocol::UDP),
+                destination_port: Some(port(5000)),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                protocol: Some(Protocol::UDP),
+                destination_port: Some(port(5001)),
+                ..wildcard(RuleAction::Accept)
+            },
+        ]
+        .into_iter(),
+    )
+    .expect("two rules fit");
+
+    let doomed = bench.decide(&broad, &to_port(5000), PORT0);
+    let kept = bench.decide(&broad, &to_port(5001), PORT0);
+    for decided in [&doomed, &kept] {
+        assert!(matches!(decided.verdict, Verdict::Forward { .. }));
+    }
+    assert_eq!(bench.flows.len(), 2);
+
+    // The narrower policy: port 5001 alone.
+    let revoked = bench.resweep(&accepts_port(5001), 8);
+    assert_eq!(revoked.len(), 1, "one conversation, not both");
+    let taken = revoked.first().expect("one was taken");
+    assert_eq!(taken.opening.destination.port, 5000);
+    assert_eq!(
+        taken.id,
+        doomed.flow.expect("the opening named a flow").id,
+        "the identity a record of its end is folded onto the opening by"
+    );
+    assert_eq!(taken.opening.ingress, PORT0.0);
+    assert_eq!(bench.flows.counters().flows_revoked, 1);
+    assert_eq!(bench.flows.len(), 1);
+
+    // The surviving conversation is untouched, and its next packet is still
+    // carried by the flow rather than by a rule — under the *new* policy, whose
+    // one rule does not name the reply direction at all.
+    let narrow = accepts_port(5001);
+    let reply = bench.decide(
+        &narrow,
+        &FrameSpec {
+            destination_mac: GATEWAY1_MAC,
+            source_mac: HOST_B_MAC,
+            source: host_b(),
+            destination: host_a(),
+            transport: TransportSpec::Udp {
+                source: 5001,
+                destination: 4444,
+            },
+            ..FrameSpec::a_to_b()
+        },
+        PORT1,
+    );
+    assert!(matches!(reply.verdict, Verdict::Forward { .. }));
+    assert_eq!(reply.matched, None, "no rule carried it; its flow did");
+    assert_eq!(
+        reply.flow.expect("the reply named a flow").id,
+        kept.flow.expect("the opening named a flow").id
+    );
+
+    // And the revoked conversation's next packet no longer crosses: with the flow
+    // gone it reaches the filter, which the new policy refuses.
+    let after = bench.decide(&narrow, &to_port(5000), PORT0);
+    assert_eq!(after.verdict, Verdict::Drop(DropReason::NoPolicyMatch));
+}
+
+/// A commit that widens the policy takes nothing back, and a commit that changed
+/// nothing at all takes nothing back either.
+///
+/// The second is worth its own assertion: the pass runs on **every** commit,
+/// because a commit replaces the routing table too, so a pass under an unchanged
+/// ruleset must be a no-op rather than a flush.
+#[test]
+fn a_commit_that_still_admits_every_flow_takes_nothing_back() {
+    for (opened_under, committed) in [
+        (accepts_port(5000), accepts_port(5000)),
+        (accepts_port(5000), allow_all()),
+    ] {
+        let mut bench = Bench::new();
+        assert!(matches!(
+            bench.send(&opened_under, &to_port(5000), PORT0),
+            Verdict::Forward { .. }
+        ));
+        assert_eq!(bench.flows.len(), 1);
+        assert!(bench.resweep(&committed, 9).is_empty());
+        assert_eq!(bench.flows.len(), 1);
+        assert_eq!(bench.flows.counters().flows_revoked, 0);
+    }
+}
+
+/// A rule whose action is `drop` is not an admission, so a flow the new policy
+/// matches with one is taken back rather than kept.
+///
+/// The distinction a `first_match` that only asked "did anything match" would
+/// lose, and the direction that matters: on a security device the failure mode of
+/// confusing the two is keeping a conversation an operator asked to end.
+#[test]
+fn a_flow_the_new_policy_matches_with_a_drop_is_taken_back() {
+    let mut bench = Bench::new();
+    assert!(matches!(
+        bench.send(&accepts_port(5000), &to_port(5000), PORT0),
+        Verdict::Forward { .. }
+    ));
+    let denying = Ruleset::build(core::iter::once(Rule {
+        protocol: Some(Protocol::UDP),
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Drop)
+    }))
+    .expect("one rule fits");
+    assert_eq!(bench.resweep(&denying, 10).len(), 1);
+    assert_eq!(bench.flows.len(), 0);
+}
+
+/// **Where re-deciding is conservative, and in which direction.** A conversation
+/// the new configuration can no longer place — its ingress interface gone or
+/// disabled, its destination unroutable or without a neighbour — is taken back,
+/// even though packets in its reply direction might still have been forwarded.
+///
+/// That is the safe direction and it is the honest reading of the question the
+/// pass asks: a packet opening this conversation now would be refused before the
+/// filter saw it, so the configuration no longer admits the conversation. Each
+/// case is a different table, so a single check standing in for all four would
+/// fail three of them.
+#[test]
+fn a_flow_the_new_tables_cannot_place_is_taken_back() {
+    let disabled_ingress = {
+        let mut interfaces = interfaces();
+        interfaces[0].enabled = false;
+        Router::from_slices(&interfaces, &neighbours()).expect("two of each fit")
+    };
+    let no_ingress_interface = Router::from_slices(&interfaces()[1..], &neighbours()[1..])
+        .expect("one of each fits in two");
+    let no_route = Router::from_slices(&interfaces()[..1], &neighbours()[..1])
+        .expect("one of each fits in two");
+    let no_neighbour =
+        Router::from_slices(&interfaces(), &neighbours()[..1]).expect("two and one fit");
+    // The destination is an address the appliance itself now holds, so a packet to
+    // it would be delivered locally rather than forwarded.
+    let destination_is_local = {
+        let mut interfaces = interfaces();
+        interfaces[1].address = host_b();
+        Router::from_slices(&interfaces, &neighbours()).expect("two of each fit")
+    };
+
+    for (name, table) in [
+        ("the ingress interface is disabled", disabled_ingress),
+        ("the ingress port has no interface", no_ingress_interface),
+        ("nothing routes the destination", no_route),
+        ("no neighbour holds the destination", no_neighbour),
+        ("the destination is now ours", destination_is_local),
+    ] {
+        let mut bench = Bench::new();
+        assert!(matches!(
+            bench.send(&allow_all(), &to_port(5000), PORT0),
+            Verdict::Forward { .. }
+        ));
+        bench.table = table;
+        assert_eq!(bench.resweep(&allow_all(), 11).len(), 1, "{name}");
+        assert_eq!(bench.flows.len(), 0, "{name}");
+    }
+}
+
+/// An ICMP echo conversation is re-decided under the type its opening packet
+/// carried, which is an echo request and nothing else — because nothing else opens
+/// one — and under no port criterion, its endpoints carrying an identifier where a
+/// port would sit.
+///
+/// Both halves are exactness rather than conservatism, and the identifier half is
+/// the one worth pinning: offering it as a port would let a rule match a number
+/// that is not what it names.
+#[test]
+fn an_icmp_flow_is_re_decided_as_an_echo_request_and_under_no_port() {
+    let echo = FrameSpec::carrying(TransportSpec::Icmp {
+        message_type: net_headers::IcmpHeader::ECHO_REQUEST,
+        identifier: ECHO_IDENTIFIER,
+    });
+    let accepts_echo = Ruleset::build(core::iter::once(Rule {
+        protocol: Some(Protocol::ICMP),
+        icmp_type: Some(net_headers::IcmpHeader::ECHO_REQUEST),
+        ..wildcard(RuleAction::Accept)
+    }))
+    .expect("one rule fits");
+    let accepts_another_type = Ruleset::build(core::iter::once(Rule {
+        protocol: Some(Protocol::ICMP),
+        icmp_type: Some(net_headers::IcmpHeader::ECHO_REPLY),
+        ..wildcard(RuleAction::Accept)
+    }))
+    .expect("one rule fits");
+    // A rule naming the echo identifier as though it were a port. It must not
+    // match: the criterion is stated and there is no port to answer it with. The
+    // identifier the spec's builder writes is the value below.
+    let accepts_a_port = Ruleset::build(core::iter::once(Rule {
+        destination_port: Some(port(ECHO_IDENTIFIER)),
+        ..wildcard(RuleAction::Accept)
+    }))
+    .expect("one rule fits");
+
+    for (name, committed, revocations) in [
+        ("an echo request is still admitted", accepts_echo, 0),
+        ("another type is not this one", accepts_another_type, 1),
+        ("an identifier is not a port", accepts_a_port, 1),
+    ] {
+        let mut bench = Bench::new();
+        assert!(
+            matches!(
+                bench.send(&allow_all(), &echo, PORT0),
+                Verdict::Forward { .. }
+            ),
+            "{name}"
+        );
+        assert_eq!(bench.resweep(&committed, 12).len(), revocations, "{name}");
+    }
+}
+
+/// A commit arriving while a pass is still running sends the cursor back to the
+/// start, and the counter says so.
+///
+/// Continuing would leave the flows already re-decided judged against a policy the
+/// newer commit has replaced — a prefix of the table under a superseded document,
+/// which is exactly the state re-deciding exists to end.
+#[test]
+fn a_commit_during_a_pass_restarts_it_rather_than_continuing() {
+    // A table with more buckets than one window walks, which is what makes a pass
+    // span calls at all: the sixteen-slot table the rest of these cases use is
+    // finished by a single window.
+    let mut flows: FlowTable<{ 2 * lfw_flow::REVISIT_BUCKETS }> = FlowTable::new();
+    let table = router();
+    let mut sweep = PolicySweep::new();
+    sweep.arm(1);
+    let rules = allow_all();
+    let configuration = Configuration::new(1, &table, &rules);
+    let first = sweep
+        .advance(
+            &configuration,
+            &mut Tracking::new(&mut flows, at(0)),
+            SATURATED,
+            |_| unreachable!("an empty table has no flow to disown"),
+        )
+        .expect("an armed sweep advances");
+    assert!(!first.complete, "one window does not finish a pass");
+    assert_eq!(sweep.counters().restarted, 0);
+
+    sweep.arm(2);
+    assert_eq!(sweep.counters().restarted, 1);
+    assert!(sweep.running());
+    // And the pass now under way is against the newer generation, from the first
+    // bucket rather than from where the abandoned one had got to.
+    let next = sweep
+        .advance(
+            &configuration,
+            &mut Tracking::new(&mut flows, at(0)),
+            SATURATED,
+            |_| unreachable!("an empty table has no flow to disown"),
+        )
+        .expect("an armed sweep advances");
+    assert_eq!(next.generation, 2);
+    assert_eq!(next.buckets, first.buckets, "it started over");
+    assert!(!next.complete);
+}
+
+/// How much of a pass a wakeup works off, at the two ends of the traffic it can
+/// have seen and in between.
+///
+/// The two properties this rests on, stated as numbers: a wakeup always works off
+/// something, so a busy domain cannot stall a pass; and it never works off more
+/// than a full drain's worth, so no traffic pattern makes re-deciding the expensive
+/// part of a wakeup.
+#[test]
+fn a_wakeup_works_off_what_its_own_frame_budget_left_unspent() {
+    assert_eq!(windows_for(0), 1 + WAKEUP_FRAME_BUDGET / FRAMES_PER_WINDOW);
+    assert_eq!(windows_for(WAKEUP_FRAME_BUDGET), 1);
+    // Saturating rather than wrapping on a drain wider than the budget, which is
+    // unreachable through `RouteStage::poll` and answered as a value regardless.
+    assert_eq!(windows_for(usize::MAX), 1);
+    // Monotone: more frames never buys more windows.
+    let mut previous = usize::MAX;
+    for forwarded in 0..=WAKEUP_FRAME_BUDGET {
+        let windows = windows_for(forwarded);
+        assert!(windows >= 1, "{forwarded} frames bought no window");
+        assert!(windows <= previous, "{forwarded} frames bought more");
+        previous = windows;
+    }
+}
+
+/// Nothing happens on a wakeup with no commit behind it, which is every wakeup
+/// but the ones a commit is being worked off over.
+#[test]
+fn an_unarmed_sweep_does_nothing() {
+    let mut bench = Bench::new();
+    let mut sweep = PolicySweep::new();
+    assert!(!sweep.running());
+    let rules = allow_all();
+    assert!(
+        sweep
+            .advance(
+                &Configuration::new(1, &bench.table, &rules),
+                &mut Tracking::new(&mut bench.flows, at(0)),
+                0,
+                |_| unreachable!("nothing is swept"),
+            )
+            .is_none()
+    );
+    assert_eq!(sweep.counters(), PolicySweepCounters::default());
+}
+
+proptest! {
+    /// **A pass revokes exactly the flows the new ruleset refuses and no others.**
+    ///
+    /// Stated against the *chain* rather than against the pass: for every flow the
+    /// table holds, whether the pass took it back must equal whether a fresh
+    /// packet opening that same conversation would be denied under the committed
+    /// policy. That equality is the whole correctness of re-deciding, and it is
+    /// what neither a flush nor a no-op can satisfy.
+    #[test]
+    fn a_pass_revokes_exactly_what_the_new_ruleset_would_refuse(
+        opened in prop::collection::vec(5000u16..5008, 1..8),
+        accepted in prop::collection::vec(5000u16..5008, 0..8),
+        deny_first in any::<bool>(),
+    ) {
+        let mut bench = Bench::new();
+        // Opened under a policy that admits everything, so which flows exist is
+        // the generator's and not the first policy's.
+        let mut live = std::collections::BTreeMap::new();
+        for destination in &opened {
+            if let Verdict::Forward { .. } =
+                bench.send(&allow_all(), &to_port(*destination), PORT0)
+            {
+                live.insert(*destination, ());
+            }
+        }
+
+        // The committed policy: accept rules for the generated ports, optionally
+        // behind a drop rule for the first of them — so first-match-wins is part
+        // of what the equality has to hold under.
+        let mut rules = Vec::new();
+        if deny_first && let Some(first) = accepted.first() {
+            rules.push(Rule {
+                protocol: Some(Protocol::UDP),
+                destination_port: Some(port(*first)),
+                ..wildcard(RuleAction::Drop)
+            });
+        }
+        for destination in &accepted {
+            rules.push(Rule {
+                protocol: Some(Protocol::UDP),
+                destination_port: Some(port(*destination)),
+                ..wildcard(RuleAction::Accept)
+            });
+        }
+        let committed = Ruleset::build(rules.into_iter()).expect("under the capacity");
+
+        let revoked: std::collections::BTreeSet<u16> = bench
+            .resweep(&committed, 13)
+            .iter()
+            .map(|flow| flow.opening.destination.port)
+            .collect();
+
+        // The independent answer: a fresh conversation on that port, under the
+        // committed policy, on a table of its own — so what the pass concluded is
+        // compared against what the chain concludes and not against a restatement
+        // of the pass's own logic.
+        for destination in live.keys() {
+            let mut fresh = Bench::new();
+            let denied = !matches!(
+                fresh.send(&committed, &to_port(*destination), PORT0),
+                Verdict::Forward { .. }
+            );
+            prop_assert_eq!(
+                revoked.contains(destination),
+                denied,
+                "port {} : revoked {}, denied {}",
+                destination,
+                revoked.contains(destination),
+                denied
+            );
+        }
+        prop_assert_eq!(bench.flows.len(), live.len() - revoked.len());
     }
 }

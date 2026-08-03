@@ -22,12 +22,13 @@ use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
-    ManagementSample, PipelineSample, PolicySample, PoolSample, ROUTE_DROP_REASONS, RecorderSample,
-    SHARD_COUNT, SINKS, SinkSample, Snapshot, StatsShard, TapSample, TcpSample,
+    ManagementSample, PipelineSample, PolicySample, PolicySweepSample, PoolSample,
+    ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS, SinkSample, Snapshot, StatsShard,
+    TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
-use pipeline::{DropReason, PolicyCounters};
+use pipeline::{DropReason, PolicyCounters, PolicySweep, PolicySweepCounters};
 
 use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, TapCounters};
 
@@ -135,6 +136,7 @@ pub fn flow_sample(counters: &FlowCounters, occupancy: Occupancy) -> FlowSample 
             counters.flows_evicted,
             counters.flows_closed,
             counters.flows_withdrawn,
+            counters.flows_revoked,
         ],
         entries: [0; FlowState::ALL.len()],
         probe_collisions: counters.probe_tag_collisions,
@@ -152,30 +154,71 @@ pub fn flow_sample(counters: &FlowCounters, occupancy: Occupancy) -> FlowSample 
     sample
 }
 
+/// What the pass re-deciding the table against a newly committed policy has done,
+/// as the forwarder's shard lays it out.
+///
+/// The sweep is taken whole rather than as its counters alone, because the gauge
+/// an operator reads the window off — whether a pass is still owed — is state and
+/// not a count.
+#[must_use]
+pub fn policy_sweep_sample(sweep: &PolicySweep) -> PolicySweepSample {
+    let PolicySweepCounters {
+        completed,
+        restarted,
+        buckets,
+        examined,
+    } = sweep.counters();
+    PolicySweepSample {
+        // In `lfw_metrics::POLICY_SWEEP_OUTCOMES` order, which is the ABI: the
+        // pair swapped here would report every restart as a completed pass, and
+        // so report a window as closed while it is open.
+        outcomes: [completed, restarted],
+        running: u64::from(sweep.running()),
+        // In `lfw_metrics::POLICY_SWEEP_PROGRESS_KINDS` order.
+        progress: [buckets, examined],
+    }
+}
+
+/// Everything the forwarding domain has counted, in one value.
+///
+/// A struct rather than eight arguments, on [`SubmissionCounters`]' terms and for
+/// a sharper version of its reason: two of the members are `&RouteCounters` and
+/// two more are plain counter structs, so a pair transposed in an argument list
+/// would attribute one direction's traffic to the other and compile.
+pub struct ForwarderCounters<'domain> {
+    /// One per routed direction, in pipeline order — which **is** the ABI.
+    pub pipelines: [&'domain RouteCounters; 2],
+    pub generation: u32,
+    pub configuration: ConfigCounters,
+    /// One filter serves both directions, so its counters come off the pipeline
+    /// rather than off either stage.
+    pub policy: &'domain PolicyCounters,
+    pub flow: FlowSample,
+    pub sweep: &'domain PolicySweep,
+    pub tap: TapCounters,
+    pub log: LogSample,
+}
+
 /// The forwarding domain's whole shard.
 #[must_use]
-pub fn forwarder_sample(
-    pipelines: [&RouteCounters; 2],
-    generation: u32,
-    configuration: ConfigCounters,
-    policy: &PolicyCounters,
-    flow: FlowSample,
-    tap: TapCounters,
-    log: LogSample,
-) -> ForwarderSample {
+pub fn forwarder_sample(counters: &ForwarderCounters<'_>) -> ForwarderSample {
     ForwarderSample {
-        pipelines: [pipeline_sample(pipelines[0]), pipeline_sample(pipelines[1])],
-        generation: u64::from(generation),
-        images_applied: configuration.applied,
-        images_refused: configuration.refused,
-        policy: policy_sample(policy),
-        flow,
+        pipelines: [
+            pipeline_sample(counters.pipelines[0]),
+            pipeline_sample(counters.pipelines[1]),
+        ],
+        generation: u64::from(counters.generation),
+        images_applied: counters.configuration.applied,
+        images_refused: counters.configuration.refused,
+        policy: policy_sample(counters.policy),
+        flow: counters.flow,
+        sweep: policy_sweep_sample(counters.sweep),
         tap: TapSample {
-            observed: tap.observed,
-            dropped: tap.dropped,
-            refused: tap.refused,
+            observed: counters.tap.observed,
+            dropped: counters.tap.dropped,
+            refused: counters.tap.refused,
         },
-        log,
+        log: counters.log,
     }
 }
 

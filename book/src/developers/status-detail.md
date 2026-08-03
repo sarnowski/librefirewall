@@ -161,16 +161,20 @@ destination port and hold the three filter outcomes apart on the wire, by drop r
 counter, and two that inject a request and its reply and hold the reply's arrival to the tracker
 rather than to any rule.
 
+**A commit ends the conversations the new policy no longer admits.** Removing a rule used to leave
+every connection it had already admitted running, which was a security gap rather than a rough edge —
+a host found to be compromised kept every connection it had open. It is closed, and not by evaluating
+the policy per packet: the *flow table* is re-decided on commit, and the flows the new policy would
+not admit are taken back. Once per commit rather than once per packet, so the ruleset stays off the
+hot path, and every flow the new policy still allows is left untouched — which is the whole reason the
+appliance follows pf's model, and would have been destroyed by a sweep that flushed. The mechanism,
+what it can decide from a flow's key alone, where it is conservative and what it costs are all in
+*[Connection tracking](#connection-tracking)*; the operator-facing half is
+`librefirewall_flow_lifecycle_total{event="revoked"}`, the three
+`librefirewall_policy_sweep_*` families, and a `flow-revoked` record in the connection history.
+
 **Missing.**
 
-- **Removing a rule does not stop the flows it admitted.** This is the one real consequence of the
-  model above, and it is a security gap rather than a rough edge: a host found to be compromised
-  keeps every connection it had already opened, and nothing in the appliance can end them. The fix is
-  **not** to evaluate the policy per packet — that would give up the guarantee the model exists for
-  and put the ruleset back on the hot path. It is to re-evaluate the *flow table* against the new
-  policy **on commit**, withdrawing the flows the new policy would not admit: once per commit rather
-  than once per packet, correct by construction, and it leaves the live-connection guarantee intact
-  for every flow the policy still allows. Nothing does this today.
 - **No `reject`.** A rule drops or accepts; it cannot answer an ICMP error. The forwarding domain
   owns no buffer pool it may allocate from — it forwards what arrived or it does not — so an action
   it could not carry out has no representation in the model rather than an unimplemented arm.
@@ -209,8 +213,9 @@ restart of the forwarding domain, which is the right side of that trade for a fi
 
 In front, a packet an existing flow already accounts for is forwarded under the facts the routing
 stage attached, and the filter is never consulted. That is what carries a reply no rule names, and it
-is what keeps a policy edit from cutting a conversation already running: the rule that admitted it
-was consulted once, when it opened.
+is what keeps a policy edit from cutting a conversation already running *on the packet path*: the rule
+that admitted it was consulted once, when it opened. What reaches such a conversation deliberately is
+the pass a commit arms over the whole table, below.
 
 Behind, a flow the classification *opened* is withdrawn where the filter then refused the packet that
 opened it. Without that, a default-deny policy is a state-exhaustion amplifier — every rejected
@@ -252,14 +257,67 @@ over a table already holding a handshaked connection, by tests in `crates/pipeli
 `crates/pd-runtime` that drive the two halves through the real chain and the real ring plumbing, and
 by two QEMU scenarios that hold a reply's arrival to the tracker rather than to a rule.
 
+**A commit re-decides the whole table, and takes back what the new policy will not admit.** The
+moment a generation commits, the forwarding domain arms a pass over its own connection table
+(`pipeline::PolicySweep`). Each live flow's *opening* identity — the five-tuple in the orientation it
+travelled in, plus the port it arrived on, which the entry records in the byte its layout held in
+reserve — goes back through the same chain a frame does: the ingress interface must still exist and be
+enabled, the destination must still route to a neighbour out of some other port, and the ruleset must
+still match with an `accept`. A flow that fails any of those is taken back, and the caller is told so
+it can record the end of the conversation.
+
+**It is exact over every criterion a rule carries.** The addresses and the protocol are the key's; the
+ports are the key's for TCP and UDP; the ICMP type is an echo request, because nothing else opens an
+ICMP flow; the ingress is the recorded port; and the egress is resolved from the **new** routing table,
+which is the right answer rather than a remembered one — a rule naming an egress is about where the
+frame would now go. The two facts of the opening packet that are unrecoverable, its destination MAC and
+its remaining lifetime, are properties of a packet rather than of a conversation and no rule can name
+either.
+
+**Where it is conservative, it is conservative towards ending flows.** An absent value never satisfies
+a stated criterion, so the pass can only disown a flow the policy might have admitted and never keep
+one it forbids. One case reaches that: a flow whose ingress interface the new configuration no longer
+has or has disabled, or whose original destination it can no longer route to a neighbour, is taken back
+even though packets in its *reply* direction might still have been forwarded. That is the honest
+reading of the question — a packet opening the conversation now would be refused before the filter saw
+it — and it is the safe direction either way.
+
+**It is bounded per wakeup, and that is measured rather than assumed.** One window of the pass —
+4096 bucket heads, which is exactly the bytes the timeout sweep's 256 entries already cost every
+wakeup — is about 3.4 µs on the development machine, against about 85 ns for a forwarded frame
+(`pd-runtime`'s `policy_sweep_window` and `route_forwarded` benchmarks). A whole pass over the
+million-slot index is therefore nearly a millisecond, and a commit that stalled forwarding for that
+long would be a worse defect than the one this closes. So a wakeup works off what its own frame budget
+left unspent: a saturated wakeup pays one window and a quiet one pays four, which bounds a wakeup's
+re-deciding at about what a full drain costs and finishes a pass in a quarter of the wakeups when
+traffic is light. The pass walks the *index* and not the entries — four mebibytes rather than
+sixty-four — and so reaches exactly the flows a packet can reach: one it cannot get to is one no lookup
+can get to either, which can classify nothing and forward nothing.
+
+**What the window costs, stated plainly.** A flow the new policy forbids keeps forwarding until the
+pass reaches it, which is up to as many wakeups as a pass takes. What bounds that is the flow itself:
+a conversation forwards only when its packets arrive, every arriving frame wakes the domain, and every
+wakeup advances the pass — so a forbidden flow that is *doing* anything is generating the wakeups that
+end it. What that does not give is a bound in wall-clock time: a node forwarding nothing receives no
+wakeups and does not finish its pass, and is also forwarding nothing.
+`librefirewall_policy_sweep_running` reads 1 for exactly as long as that is true, which is the honest
+answer rather than a fault.
+
+Held by unit and property tests in `crates/flow` (a pass that keeps every flow changes not one byte of
+an entry; every live flow is offered exactly once; the opening reported is the one that was on the wire
+in both orientations; one window is bounded in both of its two ways) and in `crates/pipeline` (a
+narrowing commit takes back exactly one of two conversations and leaves the other carrying traffic no
+rule names; a widening or unchanged commit takes back nothing; a rule that matches with `drop` is not
+an admission; each of five table changes the pass cannot place a flow under; an ICMP flow re-decided as
+an echo request and under no port criterion; a commit mid-pass restarting it), by a property that a
+pass revokes exactly the flows a fresh opening packet would be denied under the committed policy, and
+by the `policy-revocation` QEMU scenario, which opens two conversations differing in their source port
+alone, submits a document narrowing the accept rule by that one attribute, works the pass off to
+completion, and then holds the revoked conversation's next packet to being refused and the surviving
+conversation's to still crossing — carried by its flow, which no rule of either document names.
+
 **Missing.**
 
-- **A commit does not re-evaluate the table.** A flow the newly committed policy would refuse keeps
-  running, because nothing re-decides an existing flow against a new ruleset. It is the same gap the
-  filtering section records from the policy's side, and the fix belongs here: withdrawing, on commit,
-  the flows the new policy would not admit. The table already has everything that needs — a bounded
-  set of flows, each with its key and its handle — so what is missing is the pass over it, not the
-  mechanism.
 - **A conversation reclaimed by its idle timeout produces no close event.** Every record of the
   connection history is anchored to the packet that caused it, and a flow the sweep collected has no
   such packet, so its end is visible on `librefirewall_flow_expired_total` and in no recording. The
@@ -454,7 +512,15 @@ The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` o
 | Recording | Records | Extent | Segment | Snap length |
 |---|---|---|---|---|
 | connection history (`/logs.pcapng`) | an observation carrying a lifecycle or policy event | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
-| capture (`/capture.pcapng`) | every observation | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+| capture (`/capture.pcapng`) | every observation **of a frame** | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+
+One record is in the history and in no capture, and it is the only one that is about
+no frame: a conversation a policy commit ended. There was nothing on a wire, so it
+carries no captured bytes, states a wire length of zero, omits `epb_flags` and names
+no classification — every field pcapng has for a packet says there was none — while
+carrying the flow it ended and the state that conversation was in. The alternative
+would have been a fabricated frame in an artifact that is evidence, or a connection
+history silent about the one way a conversation ends that an operator asked for.
 
 The history's 128 bytes are derived rather than chosen: the longest L2–L4 header chain this appliance
 reaches a decision on is 98 bytes — an Ethernet header, an 802.1Q tag, an IPv4 header whose options
@@ -516,13 +582,15 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — three of the six —
+**What the gate proves.** Every scenario whose management port is reachable — ten of the thirteen —
 boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`tools/xtask/src/surface_contract.rs`): every record
-of the connection history pairs into the capture by `epb_packetid` and none of it names no event,
-neither recording exceeds the record count the recorder publishes for that sink, every injected probe
-appears in the capture byte-identically, and no block carries bytes the harness never injected. On top
+of the connection history *of a frame* pairs into the capture by `epb_packetid` and none of it names
+no event, the one record that is about no frame is held instead to claiming none of the four things a
+frame has, neither recording exceeds the record count the recorder publishes for that sink, every
+injected probe appears in the capture byte-identically, and no block carries bytes the harness never
+injected. On top
 of that the decision each record carries is judged as bytes: every record carries the PEN-tagged
 annotation at the layout version this build writes; the verdict it states agrees with what the harness
 independently watched that probe do on the wire; a rule it names is one the exposition credits with a
@@ -571,7 +639,7 @@ and wall-clock times. An independent parse of the two files established:
   parsed; **no deny coalescing**, so a port scan costs one record per probe rather than a counted
   per-bucket event; and **no periodic state event**, so a reader's reconstruction window grows with a
   long-lived conversation's age instead of being bounded. The annotation carries a version byte
-  precisely so the record can grow when they land — it reads 2 today.
+  precisely so the record can grow when they land — it reads 3 today.
 - **No recording selector.** The capture sink of the [recording design](../design/recording.md)
   records the flows a selector picks out; this one records everything the dataplane decided on, which
   is development state rather than a shipping posture: a deployed node would record every packet
@@ -774,7 +842,7 @@ Held by the tests in `crates/config` and `crates/log`, by the handover's own tes
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the six QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the thirteen QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -849,12 +917,6 @@ verdicts reversed, with the totals rising across the swap rather than resetting.
   was no management channel to sever, so commit-confirm protected nothing; now a document that
   validates and moves the management address is a document that locks an operator out of the node it
   was committed on, with nothing to undo it.
-- **A submission is not re-evaluated against the flow table.** Editing the policy changes which
-  conversations may *start*: a packet an existing flow accounts for is forwarded before the filter is
-  consulted, so traffic admitted under the previous policy goes on flowing until its flow expires. The
-  [configuration design](../design/configuration.md) records the intent and the QEMU scenario is
-  written around it — its second wave opens its own conversations, because a second packet on the
-  first wave's five-tuple would be carried by that flow and would say nothing about the new policy.
 - **A submission is answered when it is committed, not when the dataplane has switched.** The
   configuration domain holds no timer, so it cannot bound a wait on the forwarding domain's
   acknowledgement — and a refusal by that domain is the *absence* of one, so waiting would hang a
@@ -943,7 +1005,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the six system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the thirteen system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected. Both halves were needed to make the defect non-recurring: a missing
@@ -1163,9 +1225,9 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the six scenarios additionally hold the console's own record to the frames and the bytes
+Two of the thirteen scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
-them rather than tallied in advance — to the frame and to the byte; and one of the three boots a
+them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
 not satisfy it.
 
@@ -1419,7 +1481,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the six QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the thirteen QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -1741,7 +1803,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `crates/` and `pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the twenty-three library crates — `lfw-pcapng`, `lfw-blk`, `lfw-capture-ring` and `lfw-recorder` joined the floored set with this work. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (six system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the three scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (thirteen system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the ten scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

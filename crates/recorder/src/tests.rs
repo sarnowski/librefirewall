@@ -85,7 +85,7 @@ fn tap(packet_id: u64, interface_id: u8, original_len: u32) -> CheckedTap {
         interface_id,
         original_len,
         outcome: TapOutcome::Forwarded,
-        direction: TapDirection::Inbound,
+        direction: Some(TapDirection::Inbound),
         generation: 7,
         flow: None,
         rule: None,
@@ -100,7 +100,7 @@ fn tap_opening(packet_id: u64, interface_id: u8, original_len: u32) -> CheckedTa
         flow: Some(TapFlow {
             slot: 0x0002_2222,
             generation: 0x0033_3333,
-            classification: TapClassification::New,
+            classification: Some(TapClassification::New),
             state: TapFlowState::SynSent,
         }),
         rule: TapRule::new(5),
@@ -429,7 +429,7 @@ fn an_annotation_carries_the_flow_the_event_and_the_rule() {
     let annotation = packet.annotation.as_ref().expect("an annotation");
     assert_eq!(annotation.len(), 24);
     assert_eq!(annotation[0], ANNOTATION_VERSION);
-    assert_eq!(annotation[0], 2, "the layout a reader keys on");
+    assert_eq!(annotation[0], 3, "the layout a reader keys on");
     assert_eq!(annotation[1], ANNOTATION_VERDICT_FORWARDED);
     assert_eq!(annotation[2], 0, "no drop reason on a forwarded frame");
     assert_eq!(annotation[3], 1, "the interface");
@@ -511,7 +511,7 @@ fn a_dropped_frame_carries_its_reason_into_the_annotation() {
     let mut harness = Harness::new(2048, 4);
     let mut observation = tap(9, 1, 80);
     observation.outcome = TapOutcome::Dropped(wire::TapDropReason::TtlExpired);
-    observation.direction = TapDirection::Outbound;
+    observation.direction = Some(TapDirection::Outbound);
     let bytes = frame(80, 1);
     assert!(matches!(
         harness.record(&observation, &bytes),
@@ -529,6 +529,77 @@ fn a_dropped_frame_carries_its_reason_into_the_annotation() {
         wire::TapDropReason::TtlExpired.to_bits()
     );
     assert_eq!(annotation[4], 1, "outbound");
+}
+
+/// **A record about no frame carries no frame, and says so in every field pcapng
+/// has for one.** This is what keeps the connection history honest about the one
+/// conversation-ending event no packet caused: the block holds zero captured
+/// bytes, states a wire length of zero — which no frame the pipeline decided on
+/// can have — and omits `epb_flags` entirely, because a direction is a property of
+/// a packet on a wire. What it *does* carry is the flow it ended and the event
+/// naming why, which is the whole of what an operator reads it for.
+#[test]
+fn a_revoked_flow_is_recorded_as_a_block_that_claims_no_packet() {
+    let mut harness = Harness::new(2048, 4);
+    let observation = CheckedTap {
+        outcome: TapOutcome::Revoked,
+        direction: None,
+        original_len: 0,
+        flow: Some(TapFlow {
+            slot: 0x0002_2222,
+            generation: 0x0033_3333,
+            classification: None,
+            state: TapFlowState::UdpAssured,
+        }),
+        rule: None,
+        event: Some(TapEvent::FlowRevoked),
+        ..tap(4, 1, 0)
+    };
+    assert!(matches!(
+        harness.record(&observation, &[]),
+        Recorded::Placed { .. }
+    ));
+    harness.seal();
+
+    let file = parse(&harness.download());
+    let packet = &file.packets[0];
+    assert!(packet.captured.is_empty(), "no bytes were on a wire");
+    assert_eq!(packet.original_len, 0, "and none is claimed to have been");
+    assert_eq!(packet.flags, None, "a direction belongs to a packet");
+    let annotation = packet.annotation.as_ref().expect("an annotation");
+    assert_eq!(annotation[1], ANNOTATION_VERDICT_REVOKED);
+    assert_eq!(annotation[2], 0, "no drop reason: no frame was dropped");
+    assert_eq!(
+        annotation[5], 0,
+        "no classification: no packet was classified"
+    );
+    assert_eq!(annotation[6] as u32, TapEvent::FlowRevoked.to_bits());
+    assert_eq!(
+        annotation[7] as u32,
+        TapFlowState::UdpAssured.to_bits(),
+        "the state the conversation was in when it was ended"
+    );
+    // And the identity, which is what folds this record onto the one that opened
+    // the conversation.
+    assert_eq!(
+        u32::from_le_bytes(annotation[12..16].try_into().expect("four octets")),
+        0x0002_2222
+    );
+    assert_eq!(
+        u32::from_le_bytes(annotation[16..20].try_into().expect("four octets")),
+        0x0033_3333
+    );
+    assert_eq!(
+        u16::from_le_bytes(annotation[20..22].try_into().expect("two octets")),
+        0,
+        "no rule: the filter took no part in ending it"
+    );
+    // The standard option and the annotation still agree, as they do on every
+    // other record.
+    assert_eq!(
+        packet.verdict.as_deref(),
+        Some(&[0xFF, ANNOTATION_VERDICT_REVOKED][..])
+    );
 }
 
 #[test]

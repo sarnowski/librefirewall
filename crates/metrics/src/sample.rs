@@ -33,14 +33,14 @@ use crate::catalog::{
     HTTP_BODIES_TAKEN, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
     HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
     INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
-    POLICY_PACKETS, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
-    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
-    RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
-    RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
-    RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
-    RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
-    RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, Series,
-    TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS,
+    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
+    POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
+    RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
+    RECORDING_RECORDS_DROPPED, RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN,
+    RECORDING_SEGMENTS_CLOSED, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
+    RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
+    RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
+    Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS,
     TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS,
     TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES,
     UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
@@ -107,7 +107,14 @@ pub const FLOW_REFUSALS: [&str; 12] = [
 
 /// What ended a flow. Deliberately without `created`, which is the `new` value of
 /// [`FLOW_OUTCOMES`] seen from the other side: one counter, one series.
-pub const FLOW_LIFECYCLE_EVENTS: [&str; 4] = ["expired", "evicted", "closed", "withdrawn"];
+pub const FLOW_LIFECYCLE_EVENTS: [&str; 5] =
+    ["expired", "evicted", "closed", "withdrawn", "revoked"];
+
+/// The two outcomes a re-deciding pass over the connection table can reach.
+pub const POLICY_SWEEP_OUTCOMES: [&str; 2] = ["completed", "restarted"];
+
+/// What such a pass walks, one label per kind of thing counted.
+pub const POLICY_SWEEP_PROGRESS_KINDS: [&str; 2] = ["buckets", "flows"];
 
 /// The states a slot of the connection table can be in, in
 /// `lfw_flow::FlowState::ALL` order — which a test in `pd_runtime` holds this
@@ -228,6 +235,23 @@ pub struct FlowSample {
     pub slot_desync: u64,
 }
 
+/// What the pass re-deciding the connection table against a newly committed
+/// policy has done, which is one account for the whole domain: the table spans
+/// both directions, so the pass over it does too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicySweepSample {
+    /// In [`POLICY_SWEEP_OUTCOMES`] order.
+    pub outcomes: [u64; POLICY_SWEEP_OUTCOMES.len()],
+    /// 1 while a pass is still owed.
+    pub running: u64,
+    /// In [`POLICY_SWEEP_PROGRESS_KINDS`] order.
+    pub progress: [u64; POLICY_SWEEP_PROGRESS_KINDS.len()],
+}
+
+/// Slots [`PolicySweepSample`] occupies.
+pub const POLICY_SWEEP_SLOTS: usize =
+    POLICY_SWEEP_OUTCOMES.len() + 1 + POLICY_SWEEP_PROGRESS_KINDS.len();
+
 /// Slots [`FlowSample`] occupies.
 pub const FLOW_SLOTS: usize = 1
     + FLOW_OUTCOMES.len()
@@ -238,8 +262,11 @@ pub const FLOW_SLOTS: usize = 1
 
 /// Slots [`ForwarderSample`]'s own **table** occupies — the series the catalogue
 /// names, and so the slot the per-rule block starts at.
-pub const FORWARDER_SLOTS: usize =
-    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 12 + FLOW_SLOTS;
+pub const FORWARDER_SLOTS: usize = PIPELINES
+    * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len())
+    + 12
+    + FLOW_SLOTS
+    + POLICY_SWEEP_SLOTS;
 
 /// Where a rule's hit counter sits: its position in the running generation,
 /// offset past the table above.
@@ -265,6 +292,7 @@ pub struct ForwarderSample {
     pub images_refused: u64,
     pub policy: PolicySample,
     pub flow: FlowSample,
+    pub sweep: PolicySweepSample,
     pub tap: TapSample,
     pub log: LogSample,
 }
@@ -809,6 +837,7 @@ impl ForwarderSample {
         s(&FLOW_LIFECYCLE, &[Label::new("event", "evicted")]),
         s(&FLOW_LIFECYCLE, &[Label::new("event", "closed")]),
         s(&FLOW_LIFECYCLE, &[Label::new("event", "withdrawn")]),
+        s(&FLOW_LIFECYCLE, &[Label::new("event", "revoked")]),
         s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "vacant")]),
         s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "syn_sent")]),
         s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "syn_received")]),
@@ -830,6 +859,11 @@ impl ForwarderSample {
             &INVARIANT_FAULTS,
             &[Label::new("fault", "flow_slot_desync")],
         ),
+        s(&POLICY_SWEEP, &[Label::new("outcome", "completed")]),
+        s(&POLICY_SWEEP, &[Label::new("outcome", "restarted")]),
+        plain(&POLICY_SWEEP_RUNNING),
+        s(&POLICY_SWEEP_PROGRESS, &[Label::new("walked", "buckets")]),
+        s(&POLICY_SWEEP_PROGRESS, &[Label::new("walked", "flows")]),
         plain(&TAP_OBSERVATIONS),
         s(&TAP_OBSERVATIONS_LOST, &[Label::new("reason", "ring_full")]),
         s(
@@ -867,6 +901,9 @@ impl ForwarderSample {
         put_all(&mut values, &mut at, &self.flow.entries);
         put(&mut values, &mut at, self.flow.probe_collisions);
         put(&mut values, &mut at, self.flow.slot_desync);
+        put_all(&mut values, &mut at, &self.sweep.outcomes);
+        put(&mut values, &mut at, self.sweep.running);
+        put_all(&mut values, &mut at, &self.sweep.progress);
         put(&mut values, &mut at, self.tap.observed);
         put(&mut values, &mut at, self.tap.dropped);
         put(&mut values, &mut at, self.tap.refused);

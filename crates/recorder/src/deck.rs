@@ -223,10 +223,16 @@ impl Which {
     /// admitted and refused rather than by the packet rate. That is what keeps a
     /// connection history usable under the conditions it is wanted in: a flood
     /// recorded per packet evicts the whole history in seconds.
+    ///
+    /// The capture takes every observation **of a frame**, which is every one but
+    /// the revocation: a capture is the frames themselves with the verdict on
+    /// each, and a flow the appliance ended of its own accord was on no wire. That
+    /// record belongs to the connection history alone, where the conversation it
+    /// ends was opened.
     const fn records(self, tap: &CheckedTap) -> bool {
         match self {
             Self::Log => tap.event.is_some(),
-            Self::Capture => true,
+            Self::Capture => tap.outcome.observes_a_frame(),
         }
     }
 }

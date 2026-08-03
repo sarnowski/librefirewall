@@ -70,7 +70,8 @@ const GENERATION: &str = "librefirewall_configuration_generation";
 const SUBMISSIONS: &str = "librefirewall_configuration_submissions_total";
 const READS: &str = "librefirewall_configuration_reads_total";
 
-/// The document this contract submits, compiled in rather than read at run time.
+/// The document a **reconfiguration** scenario submits, compiled in rather than
+/// read at run time.
 ///
 /// `image::SUBMITTED_DOCUMENT` names the same file for the fast gate's sake — every
 /// document in the tree goes through `config::load` there — and this is the copy the
@@ -78,6 +79,23 @@ const READS: &str = "librefirewall_configuration_reads_total";
 /// twice: a scenario that submitted a document the gate had not read would be the
 /// hole that list closes.
 pub const SUBMITTED: &[u8] = include_bytes!("../scenarios/reconfiguration-swap.xml");
+
+/// The document a **revocation** scenario submits, on [`SUBMITTED`]'s terms:
+/// `image::NARROWED_DOCUMENT` names the same file for the fast gate.
+pub const NARROWED: &[u8] = include_bytes!("../scenarios/revocation-narrow.xml");
+
+/// The gauge the connection table publishes its occupancy under, one series per
+/// state.
+const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
+
+/// What ended a flow, one series per cause.
+const FLOW_LIFECYCLE: &str = "librefirewall_flow_lifecycle_total";
+
+/// The passes over the connection table a commit arms, one series per outcome.
+const POLICY_SWEEP: &str = "librefirewall_policy_sweep_total";
+
+/// 1 while a commit's pass is still owed.
+const POLICY_SWEEP_RUNNING: &str = "librefirewall_policy_sweep_running";
 
 /// What the submission surface answered, and what the node said about itself
 /// around it. Returned so the scenario can print it as evidence.
@@ -216,8 +234,7 @@ fn request(
 ///
 /// # Errors
 /// The verdict, naming which exchange failed and what it answered.
-pub fn apply(host_port: u16, booted_with: &[u8]) -> Result<Applied, String> {
-    let document = SUBMITTED;
+pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Applied, String> {
     let before = state(host_port, "before the change")?;
     // The node's own statement of what it booted with must be a document this
     // appliance would accept, and must be the *same configuration* as the file the
@@ -326,6 +343,197 @@ pub fn apply(host_port: u16, booted_with: &[u8]) -> Result<Applied, String> {
         after,
         refusal,
         unmoved,
+    })
+}
+
+/// What the re-decision a commit armed did, as the node's own numbers report it.
+#[derive(Clone, Copy, Debug)]
+pub struct Revoked {
+    /// Two-way UDP conversations the table held before the submission.
+    pub assured_before: u64,
+    /// And after the pass finished.
+    pub assured_after: u64,
+    /// Flows the pass took back.
+    pub revoked: u64,
+    /// Passes that reached the last bucket.
+    pub passes: u64,
+    /// Wakeups the harness had to manufacture to get there.
+    pub wakeups: usize,
+}
+
+impl Revoked {
+    /// The transcript a reader wants beside a scenario's verdict.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "  the commit re-decided the connection table:\n\
+             \x20   two-way conversations before -> {}, after -> {}\n\
+             \x20   {} flow(s) taken back, {} pass(es) over the table completed\n\
+             \x20   {} wakeup(s) manufactured to work the pass off, a pass advancing per wakeup",
+            self.assured_before, self.assured_after, self.revoked, self.passes, self.wakeups,
+        )
+    }
+}
+
+/// How many two-way UDP conversations the table holds.
+///
+/// The occupancy gauge's `udp_assured` series and no other: a conversation the
+/// harness has seen answered is in that state, and reading one state rather than
+/// summing them keeps the number independent of the transient flows a refused
+/// packet opens and the appliance withdraws in the same evaluation.
+///
+/// # Errors
+/// The verdict, where the series is absent — a node publishing no occupancy is one
+/// nothing below can be stated against.
+pub fn assured_flows(host_port: u16) -> Result<u64, String> {
+    let exposition = crate::metrics_contract::fetch(host_port)
+        .map_err(|error| format!("scraping the connection table's occupancy: {error}"))?
+        .body;
+    labelled(&exposition, TABLE_ENTRIES, "state", "udp_assured")
+        .ok_or_else(|| format!("{TABLE_ENTRIES}{{state=\"udp_assured\"}} is not in the exposition"))
+}
+
+/// Work the re-decision a commit armed off to completion, and hold what it did to
+/// its contract.
+///
+/// `assured_before` is [`assured_flows`] taken before the submission, so the drop in
+/// occupancy is measured across the change rather than asserted against a literal.
+/// `drive` is called to manufacture one wakeup — see below on why the harness has
+/// to.
+///
+/// # Why this waits at all, and why it makes wakeups to do it
+///
+/// The pass is bounded per wakeup, because a commit that walked a million-slot
+/// index in one go would stall forwarding for a visible interval. It therefore
+/// advances only when the forwarding domain is woken, and the forwarding domain is
+/// woken by frames arriving on a dataplane port — not by a scrape, which reaches
+/// the management domain alone. So a harness that only polled would wait forever on
+/// a node whose dataplane is quiet, which is exactly the node a scenario is.
+///
+/// That is not a workaround for a defect: on a running appliance the flows that
+/// matter are the ones carrying traffic, and their own frames are the wakeups that
+/// end them. What the harness has to supply is the traffic a quiet bench does not
+/// have.
+///
+/// The frames it supplies are **not IPv4**, deliberately. They wake the domain and
+/// reach nothing else: the router's parser refuses them before any decision, so
+/// they open no flow, move no policy counter and reach neither recording — which
+/// keeps the occupancy, the lifecycle counts and the two recordings the scenario
+/// judges free of the harness's own pacing.
+///
+/// # Errors
+/// The verdict, naming what the node reported: a pass that never finished, a
+/// re-decision that took back nothing, or one that took back more than the single
+/// conversation the submitted document stops admitting.
+pub fn await_revocation(
+    host_port: u16,
+    assured_before: u64,
+    mut drive: impl FnMut(),
+) -> Result<Revoked, String> {
+    /// How many wakeups the harness will manufacture before calling the pass
+    /// stalled. A pass takes at most `FLOW_CAPACITY / REVISIT_BUCKETS` windows and
+    /// a quiet wakeup works off several, so this is generous by a wide margin — and
+    /// bounded, so a pass that is not advancing is a finding rather than a hang.
+    const WAKEUPS: usize = 4_096;
+    /// How often the pass's own progress is read back. Every wakeup would spend
+    /// the whole budget on HTTP round trips.
+    const POLL_EVERY: usize = 64;
+
+    let deadline = Instant::now();
+    let mut wakeups = 0usize;
+    while wakeups < WAKEUPS && deadline.elapsed() < SWITCH_GRACE {
+        for _ in 0..POLL_EVERY {
+            drive();
+            wakeups += 1;
+        }
+        let exposition = crate::metrics_contract::fetch(host_port)
+            .map_err(|error| format!("scraping the re-decision's progress: {error}"))?
+            .body;
+        let passes =
+            labelled(&exposition, POLICY_SWEEP, "outcome", "completed").ok_or_else(|| {
+                format!(
+                    "{POLICY_SWEEP}{{outcome=\"completed\"}} is not in the exposition, so the \
+                     node publishes nothing about re-deciding its table at all"
+                )
+            })?;
+        if passes == 0 {
+            continue;
+        }
+        // The pass has finished, so every number below is final.
+        let running = plain(&exposition, POLICY_SWEEP_RUNNING)
+            .ok_or_else(|| format!("{POLICY_SWEEP_RUNNING} is not in the exposition"))?;
+        if running != 0 {
+            return Err(format!(
+                "{POLICY_SWEEP} reports {passes} completed pass(es) and {POLICY_SWEEP_RUNNING} \
+                 still reads {running}: the window a commit opens is stated by both, and they \
+                 disagree about whether it is closed"
+            ));
+        }
+        let revoked = labelled(&exposition, FLOW_LIFECYCLE, "event", "revoked").ok_or_else(|| {
+            format!(
+                "{FLOW_LIFECYCLE}{{event=\"revoked\"}} is not in the exposition, so nothing says \
+                 a commit ever ended a conversation"
+            )
+        })?;
+        if revoked != 1 {
+            return Err(format!(
+                "the commit took back {revoked} flow(s) and exactly one was owed: the submitted \
+                 document narrows one accept rule by one attribute, so of the two conversations \
+                 the bench opened it stops admitting one. {} would be a table flushed rather \
+                 than re-decided",
+                if revoked == 0 {
+                    "None"
+                } else {
+                    "More than one"
+                }
+            ));
+        }
+        let assured_after = labelled(&exposition, TABLE_ENTRIES, "state", "udp_assured")
+            .ok_or_else(|| {
+                format!("{TABLE_ENTRIES}{{state=\"udp_assured\"}} is not in the exposition")
+            })?;
+        if assured_after >= assured_before {
+            return Err(format!(
+                "the table held {assured_before} two-way conversation(s) before the commit and \
+                 {assured_after} after it, so the slot the revoked flow held did not come back"
+            ));
+        }
+        return Ok(Revoked {
+            assured_before,
+            assured_after,
+            revoked,
+            passes,
+            wakeups,
+        });
+    }
+    Err(format!(
+        "the forwarding domain committed the submitted generation and no pass over its connection \
+         table finished after {wakeups} manufactured wakeup(s) in {}s. A pass advances one bounded \
+         window per wakeup, so this is a re-decision that is not progressing rather than one that \
+         is slow",
+        SWITCH_GRACE.as_secs()
+    ))
+}
+
+/// One counter or gauge series' value, matched on its family and one label.
+fn labelled(exposition: &str, family: &str, label: &str, value: &str) -> Option<u64> {
+    exposition.lines().find_map(|line| {
+        let rest = line.strip_prefix(family)?;
+        let (labels, reading) = rest.rsplit_once(' ')?;
+        (labels.contains(&format!("{label}=\"{value}\""))
+            && labels.contains("domain=\"forwarder\""))
+        .then(|| reading.trim().parse().ok())?
+    })
+}
+
+/// One series with no label but the domain.
+fn plain(exposition: &str, family: &str) -> Option<u64> {
+    exposition.lines().find_map(|line| {
+        let rest = line.strip_prefix(family)?;
+        let (labels, reading) = rest.rsplit_once(' ')?;
+        labels
+            .contains("domain=\"forwarder\"")
+            .then(|| reading.trim().parse().ok())?
     })
 }
 

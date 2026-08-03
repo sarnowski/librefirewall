@@ -170,6 +170,12 @@ pub const FLOW_TABLE_REGION_SIZE: usize = FLOW_TABLE_BYTES.next_multiple_of(MAPP
 #[cfg(test)]
 pub(crate) type ApplianceTestFlows = lfw_flow::FlowTable<16>;
 
+// The re-decision sizes a wakeup's share of itself against the frames a wakeup
+// may drain, and it restates that bound rather than importing it: `pipeline` may
+// not depend on this crate. A number moved on one side alone would let a commit's
+// pass spend more than a full drain costs — or less, and take longer than it need.
+const _: () = assert!(pipeline::WAKEUP_FRAME_BUDGET == DRAIN_LIMIT);
+
 /// Whether a peer's descriptor names a span within one pool buffer; a failing one is rejected.
 #[must_use]
 pub fn descriptor_in_bounds(descriptor: &Descriptor) -> bool {
@@ -540,14 +546,15 @@ pub use handover::{
 /// are part of it.
 pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
-pub use pipeline::{Configuration, Tracking};
+pub use pipeline::{Configuration, PolicySweep, Tracking};
 pub use stats::{
-    BlockCounters, StatsRegions, SubmissionCounters, config_sample, flow_sample, forwarder_sample,
-    log_sample, management_sample, pipeline_sample, policy_sample, recorder_sample,
+    BlockCounters, ForwarderCounters, StatsRegions, SubmissionCounters, config_sample, flow_sample,
+    forwarder_sample, log_sample, management_sample, pipeline_sample, policy_sample,
+    policy_sweep_sample, recorder_sample,
 };
 pub use tap::{
-    Observation, Tap, TapCounters, tap_classification, tap_decision, tap_drop_reason, tap_flow,
-    tap_flow_state, tap_outcome,
+    Observation, Revocation, Tap, TapCounters, tap_classification, tap_decision, tap_drop_reason,
+    tap_flow, tap_flow_state, tap_outcome, tap_revoked_flow,
 };
 pub use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE,
@@ -1262,13 +1269,18 @@ mod tests {
         const FORWARDER_STACK: usize = 0x20000;
         /// Eight `&'static` region references, a `RingSink` and the handler's
         /// own alignment slack, rounded up: what the composition below carries
-        /// beside the four measured fields.
+        /// beside the five measured fields.
         const REFERENCES: usize = 256;
 
         let state = size_of::<ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>>()
             + size_of::<pipeline::Pipeline>()
             + 2 * size_of::<RouteStage<'static>>()
             + size_of::<Tap<'static>>()
+            // The re-decision a commit owes, carried across wakeups. A cursor, a
+            // generation and four counters, so it moves this total by tens of
+            // bytes — measured here rather than assumed, which is the whole point
+            // of the composition being written out.
+            + size_of::<pipeline::PolicySweep>()
             + REFERENCES;
 
         assert!(
@@ -3322,7 +3334,7 @@ mod tests {
         let (first, first_bytes) = &read[0];
         assert_eq!(first.outcome, wire::TapOutcome::Forwarded);
         assert_eq!(first.interface_id, PORT0.0);
-        assert_eq!(first.direction, wire::TapDirection::Inbound);
+        assert_eq!(first.direction, Some(wire::TapDirection::Inbound));
         assert_eq!(
             first.generation, 1,
             "the generation `running` decides under"
@@ -3391,7 +3403,7 @@ mod tests {
                 interface_id: 0,
                 decision: wire::TapDecision {
                     outcome: wire::TapOutcome::Forwarded,
-                    direction: wire::TapDirection::Inbound,
+                    direction: Some(wire::TapDirection::Inbound),
                     generation: 0,
                     flow: None,
                     rule: None,
