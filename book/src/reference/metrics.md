@@ -58,8 +58,8 @@ in the *next* one.
 
 ## Metric inventory
 
-93 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 343 counter and gauge series from the nine shards, plus
+94 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 345 counter and gauge series from the nine shards, plus
 one info series per configured interface and one hit counter per rule the running policy declares,
 and the document they render into is bounded at 79 496 bytes — a worst case computed from these
 tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -92,7 +92,7 @@ avoiding: it looks exactly like a healthy node.
 | `librefirewall_flow_lifecycle_total` | counter | `forwarder` | `event`&nbsp;(`closed`, `evicted`, `expired`, `revoked`, `withdrawn`) | Flows that left the table, by what ended them. `expired` reached their state's idle timeout, `evicted` were taken back under pressure and are never assured ones, `closed` were ended by their own endpoints, `withdrawn` were opened by a packet the filter then refused, and `revoked` were admitted by a policy a commit has replaced with one that no longer admits them. There is no `created`: a flow is created by exactly the packet counted as `new` above. |
 | `librefirewall_flow_table_entries` | gauge | `forwarder` | `state`&nbsp;(`close_wait`, `closed`, `closing`, `established`, `fin_wait`, `icmp_replied`, `icmp_unreplied`, `syn_received`, `syn_sent`, `time_wait`, `udp_assured`, `udp_unreplied`, `vacant`) | Slots of the connection table, by the state of the flow in each. `vacant` is how much room is left, so the values sum to the table's capacity and a flood is watched as `vacant` falling rather than as an occupancy needing a capacity nothing publishes. |
 | `librefirewall_flow_probe_collisions_total` | counter | `forwarder` | — | Chain steps that reached an entry which was not the one looked up. Not a refusal — the walk simply continued — and exposed because the ratio against `librefirewall_flow_packets_seen_total` is what says whether the index is doing its job. |
-| `librefirewall_policy_sweep_total` | counter | `forwarder` | `outcome`&nbsp;(`completed`, `restarted`) | Passes over the connection table re-deciding it against a newly committed policy. `completed` reached the last bucket, so every flow has been judged against the running policy; `restarted` was abandoned part-way because a newer generation arrived. |
+| `librefirewall_policy_sweep_total` | counter | `forwarder` | `outcome`&nbsp;(`completed`, `deferred`) | Passes over the connection table re-deciding it against a newly committed policy. `completed` reached the last bucket, so every flow has been judged against the running policy; `deferred` arrived while a pass was running and queued a fresh pass behind it. |
 | `librefirewall_policy_sweep_running` | gauge | `forwarder` | — | 1 while a pass over the connection table is still owed, 0 once it has finished. The window a commit opens: while it reads 1, a conversation the new policy forbids may still be forwarding. |
 | `librefirewall_policy_sweep_progress_total` | counter | `forwarder` | `walked`&nbsp;(`buckets`, `flows`) | What the re-deciding passes have walked: `buckets` of the connection index, and `flows` that were live enough to be judged. Read against the table's capacity, they say how far a pass gets per wakeup. |
 | `librefirewall_tap_observations_total` | counter | `forwarder` | — | Frame observations the forwarder published to the recorder. |
@@ -184,11 +184,12 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 |---|---|---|---|---|
 | `librefirewall_http_bodies_refused_total` | counter | `management` | — | Response bodies a renderer would not fit in the staging buffer, whichever target asked; ours, expected to stay zero. |
 | `librefirewall_http_bodies_taken_total` | counter | `management` | — | Request bodies accumulated whole and handed to the domain that decides on them. |
+| `librefirewall_http_bodies_timed_out_total` | counter | `management` | — | Request bodies given up on for not arriving whole in time, answered 408 and reset; each one is a stretch in which the other body-bearing surfaces answered 503. |
 | `librefirewall_http_body_overruns_total` | counter | `management` | — | Request-body bytes a client sent past the length it declared, dropped unread. |
 | `librefirewall_http_requests_overflowed_total` | counter | `management` | — | Requests that outgrew the bounded request buffer before their head ended. |
 | `librefirewall_http_requests_total` | counter | `management` | — | Requests the server read to their end and decided on. |
 | `librefirewall_http_response_bytes_total` | counter | `management` | — | Response bytes handed to the transport, headers included. |
-| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `413`, `414`, `431`, `503`, `505`) | Responses composed, by status code. |
+| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `408`, `413`, `414`, `431`, `503`, `505`) | Responses composed, by status code. |
 | `librefirewall_http_retransmits_unavailable_total` | counter | `management` | — | Ranges the transport asked for again that no response buffer held; ours, expected to stay zero. |
 | `librefirewall_http_slots_exhausted_total` | counter | `management` | — | Connections the server had no slot for; ours, the tables being one size, expected to stay zero. |
 

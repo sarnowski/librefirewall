@@ -13,9 +13,11 @@ use wire::{
 
 use crate::{
     entity::{NeighbourEntry, RuleEntry},
-    hash::content_hash,
     model::Model,
-    rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction},
+    rule::{
+        AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+        TrackingMatch,
+    },
     store::Generation,
 };
 
@@ -36,12 +38,15 @@ pub enum BuildError {
 
 /// Build the handover image a consumer reads a configuration out of.
 ///
+/// The image is sealed before it is handed back: it carries the digest of its own
+/// bytes, which is what lets the consumer tell one publication from a copy taken
+/// across two.
+///
 /// # Errors
 /// [`BuildError`], for an interface reference validation refuses.
 pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, BuildError> {
     let mut image = ConfigImage {
         generation: generation.to_bits(),
-        content_hash: content_hash(model).to_bits(),
         management: match model.management() {
             Some(entry) => ManagementImage {
                 enabled: u8::from(entry.enabled),
@@ -94,6 +99,10 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
     }
     image.rule_count = count;
 
+    // Last, over every field the loops above filled: the digest is what makes
+    // the image self-describing on the other side of the region, so a field set
+    // after this one would be a field no reader's check covers.
+    image.seal();
     Ok(image)
 }
 
@@ -139,6 +148,11 @@ fn rule_image(model: &Model, entry: &RuleEntry) -> Result<RuleImage, BuildError>
         IcmpTypeMatch::Any => (0, 0),
         IcmpTypeMatch::Only(message_type) => (1, message_type),
     };
+    let (tracking_stated, tracking) = match entry.tracking {
+        TrackingMatch::Any => (0, 0),
+        TrackingMatch::Opening => (1, 0),
+        TrackingMatch::Related => (1, 1),
+    };
 
     Ok(RuleImage {
         action: match entry.action {
@@ -161,6 +175,8 @@ fn rule_image(model: &Model, entry: &RuleEntry) -> Result<RuleImage, BuildError>
         icmp_type,
         source_port_stated,
         destination_port_stated,
+        tracking_stated,
+        tracking,
         _pad: [0; 1],
         source_port_low,
         source_port_high,
@@ -304,13 +320,39 @@ mod tests {
     }
 
     #[test]
-    fn an_image_carries_the_generation_and_the_content_hash_it_was_built_under() {
+    fn an_image_carries_the_generation_it_was_built_under_and_is_sealed() {
         let model = model();
         let image = image_from(&model, Generation::from_bits(7)).expect("it builds");
         assert_eq!(image.generation, 7);
-        assert_eq!(image.content_hash, content_hash(&model).to_bits());
         assert_eq!(image.interface_count, 2);
         assert_eq!(image.neighbour_count, 1);
+        image
+            .check(PORT_COUNT)
+            .expect("a sealed image is one its own reader takes");
+    }
+
+    /// The seal is the last act of building, so a field the builder writes after
+    /// it would be one no reader's check covers. Held by editing every field kind
+    /// the image carries and watching the reader refuse each.
+    #[test]
+    fn an_image_edited_after_it_was_built_is_refused_by_its_own_reader() {
+        let edits: [fn(&mut wire::ConfigImage); 4] = [
+            |image| image.generation = 9,
+            |image| image.interface_count = 1,
+            |image| image.interfaces[0].port = 1,
+            |image| image.rule_count = 1,
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            let mut image = image_from(&model(), Generation::from_bits(7)).expect("it builds");
+            edit(&mut image);
+            assert!(
+                matches!(
+                    image.check(PORT_COUNT),
+                    Err(wire::ConfigImageError::DigestMismatch { .. })
+                ),
+                "edit {index}"
+            );
+        }
     }
 
     #[test]
@@ -628,7 +670,6 @@ mod tests {
                 .expect("a validated model builds");
             let checked = image.check(PORT_COUNT).expect("its own reader accepts it");
             prop_assert_eq!(checked.generation(), generation);
-            prop_assert_eq!(checked.content_hash(), content_hash(&model).to_bits());
             prop_assert_eq!(checked.interfaces().count(), model.interface_count());
         }
 

@@ -45,17 +45,23 @@
 //! # The one stage that is two halves
 //!
 //! [`ConnectionStage`] brackets the filter rather than preceding it, and both
-//! halves are load-bearing. In front, a frame an existing flow already accounts
-//! for is forwarded without the filter being consulted at all — which is what
-//! carries a reply no rule names, and what keeps an edit to the policy from
+//! halves are load-bearing. In front, a frame an *established* flow already
+//! accounts for is forwarded without the filter being consulted at all — which is
+//! what carries a reply no rule names, and what keeps an edit to the policy from
 //! cutting a conversation that is already running. Behind, a flow the
 //! classification *opened* is withdrawn where the filter then refused the packet
 //! that opened it, because a slot held by a connection the policy rejected is
 //! how default deny turns into a state-exhaustion amplifier.
 //!
-//! So a [`Ruleset`] decides which conversations may **start** and nothing else:
-//! every frame the filter sees has just opened a flow. That is what a rule is
-//! about here, and it is why no criterion names a connection's state.
+//! Two things reach the filter, therefore, and a [`Rule`] can name which: a
+//! conversation **opening**, and traffic an existing conversation is the reason
+//! for without belonging to it — today an ICMP error quoting one of its
+//! datagrams. The second is composed by whoever sent it, with a source address of
+//! its choosing, so relating it to a flow settles where it would go and never
+//! whether it may: the filter decides it too, and a document that says nothing
+//! about related traffic denies it. Traffic *within* a tracked conversation is the
+//! one thing the filter never sees, which is why [`Tracked`] offers two values and
+//! not three.
 //!
 //! # What closes the hole that leaves
 //!
@@ -808,8 +814,8 @@ impl ConnectionStage {
                 // An error never moves the flow it reports on, so the state is
                 // the table's current one. The lookup cannot miss — the same
                 // call resolved the slot — and where it did the frame is still
-                // forwarded under a record that names no flow, which is a
-                // weaker record rather than a wrong one.
+                // decided under a record that names no flow, which is a weaker
+                // record rather than a wrong one.
                 if let Some(state) = tracking.table().flow(flow).map(FlowEntry::state) {
                     inspection.attach_flow(FlowObservation {
                         id: flow,
@@ -818,7 +824,13 @@ impl ConnectionStage {
                         transition: FlowTransition::Held,
                     });
                 }
-                Self::forward(inspection)
+                // Deferred, not settled. The frame is one the sender composed
+                // with a source address of its choosing, and it is delivered to
+                // an endpoint of a conversation somebody else opened — so the
+                // one thing that must not follow from "a flow accounts for it"
+                // is that it crosses. The filter decides, and a document that
+                // says nothing about related traffic denies it.
+                Step::Continue
             }
             Outcome::Refused(refusal) => {
                 inspection.attach_refusal(refusal.kind());
@@ -921,6 +933,23 @@ pub enum RuleAction {
 /// against a value standing in for "do not compare". It carries no id: what
 /// identifies a rule on this side is its position, which is also its precedence
 /// and the slot its counter occupies.
+/// Which of the two things that reach the filter a rule is about.
+///
+/// Two values because two reach it. A frame belonging to a conversation the
+/// tracker already accounts for is settled in front of the filter and never
+/// arrives, so there is no value for it and a rule cannot name one: the
+/// criterion offers exactly what a rule can decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tracked {
+    /// The frame opens a conversation, which is what the filter is mostly about.
+    Opening,
+    /// The frame is one an existing conversation is the reason for without
+    /// belonging to it: an ICMP error quoting one of its datagrams. Its source
+    /// address is whatever the sender chose, so a rule that does not name this
+    /// does not admit it.
+    Related,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub ingress: Option<PortId>,
@@ -931,6 +960,7 @@ pub struct Rule {
     pub source_port: Option<PortRange>,
     pub destination_port: Option<PortRange>,
     pub icmp_type: Option<u8>,
+    pub tracking: Option<Tracked>,
     pub action: RuleAction,
 }
 
@@ -982,6 +1012,12 @@ impl Rule {
         {
             return false;
         }
+        if self
+            .tracking
+            .is_some_and(|wanted| wanted != selector.tracking)
+        {
+            return false;
+        }
         true
     }
 }
@@ -1017,13 +1053,19 @@ pub struct FlowSelector {
     /// The ICMP message type, absent for anything that is not a readable ICMP
     /// header.
     pub icmp_type: Option<u8>,
+    /// Which of the two things that reach the filter this is. Never absent: the
+    /// tracker has already classified the frame by the time the filter is asked,
+    /// so there is no case where this is unknown — and a criterion that could be
+    /// unsatisfiable by absence would let related traffic through a rule written
+    /// for an opening.
+    pub tracking: Tracked,
 }
 
 impl FlowSelector {
     /// What a rule compares about one frame, under the forwarding decision the
     /// routing stage reached for it.
     #[must_use]
-    pub fn of_frame(ingress: PortId, egress: PortId, frame: &Frame<'_>) -> Self {
+    pub fn of_frame(ingress: PortId, egress: PortId, frame: &Frame<'_>, tracking: Tracked) -> Self {
         let header = frame.ipv4();
         let transport = frame.transport();
         Self {
@@ -1037,6 +1079,7 @@ impl FlowSelector {
                 Transport::Icmp(icmp) => Some(icmp.message_type),
                 _ => None,
             },
+            tracking,
         }
     }
 }
@@ -1277,10 +1320,21 @@ impl PolicyStage {
         // what a byte total an operator compares against a link's throughput
         // has to be stated in.
         let bytes = u64::from(inspection.frame().ipv4().total_length);
+        // Whatever the tracker said about this frame, in the only two shapes
+        // that reach here: a conversation opening, or traffic an existing one is
+        // the reason for. An absent observation is an opening — the stage in
+        // front attaches one to every frame it defers, and deciding an
+        // unclassified frame as related would be admitting it under a rule
+        // written for something else.
+        let tracking = match inspection.flow().map(|flow| flow.classification) {
+            Some(Classification::Related) => Tracked::Related,
+            Some(Classification::New | Classification::Established) | None => Tracked::Opening,
+        };
         let matched = configuration.rules().first_match(&FlowSelector::of_frame(
             inspection.ingress(),
             forwarding.egress,
             inspection.frame(),
+            tracking,
         ));
         match matched {
             Some((position, rule)) => {
@@ -1358,6 +1412,11 @@ fn admits_opening<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
         // An echo request is the only ICMP message that opens a flow, so the type
         // the opening packet carried is recovered exactly rather than guessed.
         icmp_type: (protocol == Protocol::ICMP).then_some(IcmpHeader::ECHO_REQUEST),
+        // The question a re-decision asks is whether a packet *opening* this
+        // conversation would be admitted now, so it is asked under the opening
+        // criterion. Related traffic opens nothing and holds no slot of its own,
+        // so there is no flow for this pass to re-decide under that value.
+        tracking: Tracked::Opening,
     };
     match configuration.rules().first_match(&selector) {
         Some((position, rule)) if matches!(rule.action, RuleAction::Accept) => Some(position),
@@ -1381,25 +1440,71 @@ pub const WAKEUP_FRAME_BUDGET: usize = 128;
 /// not a promise: both move together on faster hardware.
 pub const FRAMES_PER_WINDOW: usize = 40;
 
-/// How many windows a wakeup that drained `forwarded` frames works off.
+/// Windows per wakeup at full occupancy, and the factor the occupancy budget
+/// scales by.
 ///
-/// A wakeup's own work is bounded by [`WAKEUP_FRAME_BUDGET`] frames, and the
-/// re-decision spends what that bound leaves unspent: a saturated wakeup pays one
-/// window and a quiet one pays the slack. Two things follow, and both are the
-/// point. A wakeup never spends more on re-deciding than a full drain costs, so no
-/// traffic pattern can make the pass the expensive part of a wakeup. And a pass
-/// finishes in a quarter of the wakeups when there is little traffic, which is
-/// when a commit usually lands.
+/// Derived rather than chosen: a window walks [`lfw_flow::REVISIT_BUCKETS`]
+/// buckets *or* stops at [`lfw_flow::REVISIT_FLOWS`] flows, whichever comes first,
+/// so a table with a flow in every bucket needs that ratio more windows to cross
+/// the same span of index than an empty one does. Paying the ratio is exactly what
+/// makes the two take the same number of wakeups.
+pub const OCCUPANCY_SCALE: usize = lfw_flow::REVISIT_BUCKETS / lfw_flow::REVISIT_FLOWS;
+
+/// How many windows a wakeup works off: the greater of what the frame budget left
+/// unspent and what the table's own occupancy needs.
+///
+/// Two budgets, because they answer different questions. The **slack** budget is
+/// the original one: a wakeup's own work is bounded by [`WAKEUP_FRAME_BUDGET`]
+/// frames and a quiet wakeup spends what that leaves, so a pass finishes in a
+/// quarter of the wakeups when there is little traffic — which is when a commit
+/// usually lands.
+///
+/// The **occupancy** budget is what stops a pass getting longer the more flows
+/// there are to re-decide. A window stops at [`lfw_flow::REVISIT_FLOWS`] flows, so
+/// a full table crosses [`OCCUPANCY_SCALE`] times less index per window than an
+/// empty one — and against the slack budget alone a saturated wakeup pays one
+/// window either way, so the pass over a full table took that factor more wakeups
+/// than the pass over an empty one. That is the wrong direction on a security
+/// device: the state is the attacker's to create, and the flows a narrowed policy
+/// forbids would go on forwarding longest exactly when there are most of them.
+/// Scaling by occupancy makes the pass length a property of the table's *width*,
+/// which is a build constant, rather than of how much of it an attacker has
+/// filled.
+///
+/// **What that costs is that a wakeup can now spend more on re-deciding than a
+/// full drain costs** — up to [`OCCUPANCY_SCALE`] windows against a saturated
+/// drain's one. It is bounded by a constant either way, `capacity` being fixed at
+/// compile time, and it is the deliberate trade: a revocation an operator has
+/// asked for completes in a bounded number of wakeups, at the price of those
+/// wakeups being more expensive while it does.
 ///
 /// At least one window always, so a pass cannot stall on a domain that is busy.
 #[must_use]
-pub const fn windows_for(forwarded: usize) -> usize {
+pub const fn windows_for(forwarded: usize, occupied: usize, capacity: usize) -> usize {
     let spent = if forwarded > WAKEUP_FRAME_BUDGET {
         WAKEUP_FRAME_BUDGET
     } else {
         forwarded
     };
-    1 + (WAKEUP_FRAME_BUDGET - spent) / FRAMES_PER_WINDOW
+    let slack = 1 + (WAKEUP_FRAME_BUDGET - spent) / FRAMES_PER_WINDOW;
+    let occupancy = windows_for_occupancy(occupied, capacity);
+    if occupancy > slack { occupancy } else { slack }
+}
+
+/// The occupancy half of [`windows_for`]: the load factor times
+/// [`OCCUPANCY_SCALE`], rounded up, and at least one.
+///
+/// Saturating, and the saturation is unreachable on any table this workspace
+/// builds: `occupied` never exceeds `capacity`, so the product is twenty-four bits
+/// for the appliance's own. A nonsense pair buys a larger budget, which is bounded
+/// work and never a wider walk — `FlowTable::revisit` bounds itself.
+const fn windows_for_occupancy(occupied: usize, capacity: usize) -> usize {
+    if capacity == 0 {
+        return 1;
+    }
+    let scaled = occupied.saturating_mul(OCCUPANCY_SCALE);
+    let windows = scaled.div_ceil(capacity);
+    if windows > 1 { windows } else { 1 }
 }
 
 /// What the re-decision has done, which is otherwise invisible: an operator who
@@ -1412,9 +1517,11 @@ pub struct PolicySweepCounters {
     /// Passes that reached the last bucket, which is what says the window a commit
     /// opens has closed.
     pub completed: u64,
-    /// Passes abandoned part-way because a newer generation arrived. A number that
-    /// climbs is commits arriving faster than the table is swept.
-    pub restarted: u64,
+    /// Commits that arrived while a pass was already running, so a fresh pass over
+    /// the whole table was queued behind it rather than the running one being
+    /// abandoned. A number that climbs is commits arriving faster than the table is
+    /// swept.
+    pub deferred: u64,
     pub buckets: u64,
     pub examined: u64,
 }
@@ -1483,11 +1590,31 @@ pub struct Swept {
 /// one re-deciding exists to fix. So a pass is carried across wakeups, and a
 /// wakeup works off as many windows as [`windows_for`] gives it.
 ///
-/// A flow the new policy forbids therefore keeps forwarding for up to as many
-/// wakeups as a pass takes. What bounds that is the flow itself: a conversation
-/// forwards only when its packets arrive, every arriving frame wakes the domain,
-/// and every wakeup advances the pass — so a forbidden flow that is *doing*
-/// anything is generating the wakeups that end it.
+/// **How many wakeups a pass takes does not depend on how many flows there are.**
+/// A window crosses `REVISIT_BUCKETS` of index or stops at
+/// [`lfw_flow::REVISIT_FLOWS`] flows, so a full table needs
+/// [`OCCUPANCY_SCALE`] times more windows to cross the same span than an empty one
+/// — and the budget is scaled by occupancy to match, which is what keeps the
+/// number of wakeups a property of the table's compile-time width rather than of
+/// how much of it an attacker has filled. Two terms bound a pass: the index walk,
+/// `CAPACITY / REVISIT_BUCKETS` windows, and the flows,
+/// `occupied / REVISIT_FLOWS` windows; each window is limited by one or the other,
+/// so the pass is their sum, and dividing by the scaled budget leaves each term at
+/// most `CAPACITY / REVISIT_BUCKETS` wakeups whatever the occupancy. For the
+/// appliance's own million-slot table that is at most 513 wakeups at any
+/// occupancy — 272 at a table entirely full — where before the scaling a full
+/// table took 4096.
+///
+/// A commit arriving mid-pass adds one more pass rather than restarting the one
+/// running ([`arm`](Self::arm)), so **every flow the policy in force forbids is
+/// gone within at most two passes** — 1026 wakeups on that table — however fast
+/// documents are submitted.
+///
+/// A flow the new policy forbids therefore keeps forwarding for up to that many
+/// wakeups. What bounds *that* is the flow itself: a conversation forwards only
+/// when its packets arrive, every arriving frame wakes the domain, and every
+/// wakeup advances the pass — so a forbidden flow that is *doing* anything is
+/// generating the wakeups that end it.
 ///
 /// What that argument does **not** give is a bound in wall-clock time. A node
 /// forwarding nothing receives no wakeups and does not finish its pass; it is also
@@ -1498,9 +1625,17 @@ pub struct Swept {
 pub struct PolicySweep {
     /// The bucket the next call resumes at, or `None` while no pass is running.
     cursor: Option<usize>,
-    /// The generation the running pass was armed by, kept so a [`Swept`] names
-    /// what its flows were judged against.
+    /// The generation flows are judged against, which is always the newest one
+    /// committed — a pass that went on judging against a document already replaced
+    /// could take back a conversation the policy in force still admits.
     generation: u32,
+    /// Set where a commit arrived while a pass was already running: that pass runs
+    /// on to the last bucket and a fresh one over the whole table follows it.
+    ///
+    /// One flag and not a queue, because a second commit while one is already
+    /// deferred needs nothing more: what is owed either way is one walk of the whole
+    /// table against the newest generation, and that is what the flag buys.
+    deferred: bool,
     counters: PolicySweepCounters,
 }
 
@@ -1512,9 +1647,10 @@ impl PolicySweep {
         Self {
             cursor: None,
             generation: 0,
+            deferred: false,
             counters: PolicySweepCounters {
                 completed: 0,
-                restarted: 0,
+                deferred: 0,
                 buckets: 0,
                 examined: 0,
             },
@@ -1537,16 +1673,36 @@ impl PolicySweep {
     ///
     /// Called on every commit, including one that changed no rule: what a commit
     /// replaces is both tables at once, and a routing change moves which egress a
-    /// rule is about. Arming while a pass is already running restarts it from the
-    /// first bucket rather than continuing — the flows already re-decided were
-    /// judged against the policy this one replaces, so continuing would leave a
-    /// prefix of the table judged by a superseded document.
+    /// rule is about.
+    ///
+    /// # Why arming a running pass queues rather than restarts
+    ///
+    /// A pass already running cannot simply continue under the new generation: the
+    /// buckets behind its cursor were judged against the document this one replaces,
+    /// so a flow the new policy forbids sitting behind the cursor would never be
+    /// re-decided at all. Keeping the cursor is therefore not available — it is the
+    /// one direction that can leave a forbidden conversation forwarding forever.
+    ///
+    /// Restarting from the first bucket is sound and was what this did, and it is
+    /// what a submission storm turns into starvation: the party that submits
+    /// documents is unauthenticated, so a pass could be restarted faster than it
+    /// completes and never finish — again leaving the forbidden flows forwarding
+    /// while the storm lasts. So the running pass is left to finish and a fresh one
+    /// over the whole table is queued behind it, which bounds the delay at two
+    /// passes however fast commits arrive.
+    ///
+    /// The generation itself moves at once, whichever of the two happens. A pass
+    /// judging against a superseded document could take back a conversation the
+    /// policy in force still admits, and the queued pass covers the prefix that
+    /// was judged before the commit landed.
     pub fn arm(&mut self, generation: u32) {
+        self.generation = generation;
         if self.cursor.is_some() {
-            self.counters.restarted = self.counters.restarted.saturating_add(1);
+            self.counters.deferred = self.counters.deferred.saturating_add(1);
+            self.deferred = true;
+            return;
         }
         self.cursor = Some(0);
-        self.generation = generation;
     }
 
     /// Re-decide on one bounded window of the table, taking back the flows the
@@ -1577,7 +1733,8 @@ impl PolicySweep {
             revoked: 0,
             complete: false,
         };
-        for _ in 0..windows_for(forwarded) {
+        let occupied = tracking.table.occupancy().occupied() as usize;
+        for _ in 0..windows_for(forwarded, occupied, FLOWS) {
             let revisited = tracking.table.revisit(cursor, |flow| {
                 if admits_opening(configuration, &flow.opening).is_some() {
                     return lfw_flow::Disposition::Keep;
@@ -1597,8 +1754,12 @@ impl PolicySweep {
         self.counters.buckets = self.counters.buckets.saturating_add(swept.buckets as u64);
         self.counters.examined = self.counters.examined.saturating_add(swept.examined as u64);
         if swept.complete {
-            self.cursor = None;
             self.counters.completed = self.counters.completed.saturating_add(1);
+            // A commit that landed mid-pass queued a walk of the whole table, and
+            // this is where it begins: at the first bucket, under the generation
+            // `arm` already moved to.
+            self.cursor = self.deferred.then_some(0);
+            self.deferred = false;
         } else {
             self.cursor = Some(cursor);
         }

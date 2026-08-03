@@ -206,15 +206,16 @@ pub const FLOW_LIFECYCLE: Metric = metric(
 ///
 /// The window a commit opens is what an operator watches here: a conversation the
 /// new policy forbids goes on forwarding until the pass reaches it, so `completed`
-/// rising past the commit is what says every flow has been re-decided. `restarted`
-/// is a commit that arrived while a pass was still running, which sends the cursor
-/// back to the start.
+/// rising past the commit is what says every flow has been re-decided. `deferred`
+/// is a commit that arrived while a pass was still running: the running pass is not
+/// abandoned, and a fresh one over the whole table follows it — so the window such a
+/// commit opens closes one `completed` later than the pass it queued behind.
 pub const POLICY_SWEEP: Metric = metric(
     "librefirewall_policy_sweep_total",
     Kind::Counter,
     "Passes over the connection table re-deciding it against a newly committed policy. `completed` \
      reached the last bucket, so every flow has been judged against the running policy; \
-     `restarted` was abandoned part-way because a newer generation arrived.",
+     `deferred` arrived while a pass was running and queued a fresh pass behind it.",
 );
 
 pub const POLICY_SWEEP_RUNNING: Metric = metric(
@@ -590,6 +591,13 @@ pub const HTTP_BODIES_TAKEN: Metric = metric(
     "Request bodies accumulated whole and handed to the domain that decides on them.",
 );
 
+pub const HTTP_BODIES_TIMED_OUT: Metric = metric(
+    "librefirewall_http_bodies_timed_out_total",
+    Kind::Counter,
+    "Request bodies given up on for not arriving whole in time, answered 408 and reset; each one \
+     is a stretch in which the other body-bearing surfaces answered 503.",
+);
+
 pub const HTTP_BODY_OVERRUNS: Metric = metric(
     "librefirewall_http_body_overruns_total",
     Kind::Counter,
@@ -830,6 +838,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &HTTP_REQUESTS_OVERFLOWED,
     &HTTP_BODIES_REFUSED,
     &HTTP_BODIES_TAKEN,
+    &HTTP_BODIES_TIMED_OUT,
     &HTTP_BODY_OVERRUNS,
     &HTTP_RETRANSMITS_UNAVAILABLE,
     &HTTP_SLOTS_EXHAUSTED,

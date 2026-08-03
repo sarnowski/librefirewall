@@ -1376,6 +1376,7 @@ mod tests {
             source_port: None,
             destination_port: None,
             icmp_type: None,
+            tracking: None,
             action: pipeline::RuleAction::Accept,
         }))
         .expect("one rule is inside any capacity")
@@ -1394,6 +1395,7 @@ mod tests {
             source_port: None,
             destination_port: None,
             icmp_type: None,
+            tracking: None,
             action: pipeline::RuleAction::Drop,
         }))
         .expect("one rule is inside any capacity")
@@ -1609,10 +1611,10 @@ mod tests {
         /// An ICMP message of `message_type`: an echo request opens a flow, an
         /// echo reply names one, an error quotes one, and anything else is a type
         /// the tracker neither tracks nor relates. `quote` is the datagram an
-        /// error carries, empty for the echo types.
+        /// error carries, absent for the echo types.
         Icmp {
             message_type: u8,
-            quote: bool,
+            quote: Quote,
         },
         /// A protocol byte the parser does not break down.
         Unparsed(u8),
@@ -1622,6 +1624,61 @@ mod tests {
         /// The second piece of a fragmented datagram, which carries no transport
         /// header at its offset.
         Fragment,
+    }
+
+    /// What an ICMP error's quoted datagram is, which is what decides whether the
+    /// error names a flow at all.
+    ///
+    /// A quote is bytes the *sender* chose, so the two failing shapes are as much
+    /// part of the fixture as the working one: `lfw_flow::icmp` corroborates a quote
+    /// against the table rather than reading it, and a test that could only build a
+    /// well-formed quote would exercise none of that.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Quote {
+        /// None at all, which is what the echo types carry.
+        Absent,
+        /// An IPv4 header claiming a version nothing reads, so the quote refuses
+        /// itself rather than naming a flow.
+        Unreadable,
+        /// A UDP datagram from `source` to `destination` on those ports — a real
+        /// one, so an error carrying it names the flow that datagram opened.
+        Datagram {
+            source: Ipv4Address,
+            destination: Ipv4Address,
+            source_port: u16,
+            destination_port: u16,
+        },
+    }
+
+    impl Quote {
+        fn bytes(self) -> Vec<u8> {
+            match self {
+                Self::Absent => Vec::new(),
+                Self::Unreadable => std::vec![0x65; IPV4_HEADER_LEN],
+                Self::Datagram {
+                    source,
+                    destination,
+                    source_port,
+                    destination_port,
+                } => {
+                    // The IPv4 header of the quoted datagram, then the four bytes
+                    // of UDP header a five-tuple is read from. A real error quotes
+                    // at least this much, and nothing behind it is examined.
+                    let mut out = Vec::with_capacity(IPV4_HEADER_LEN + 4);
+                    let mut ip = [0u8; IPV4_HEADER_LEN];
+                    ip[0] = 0x45;
+                    ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + 8) as u16).to_be_bytes());
+                    ip[8] = 64;
+                    ip[9] = Protocol::UDP.0;
+                    ip[12..16].copy_from_slice(&source.octets());
+                    ip[16..20].copy_from_slice(&destination.octets());
+                    out.extend_from_slice(&ip);
+                    out.extend_from_slice(&source_port.to_be_bytes());
+                    out.extend_from_slice(&destination_port.to_be_bytes());
+                    out
+                }
+            }
+        }
     }
 
     impl FrameSpec {
@@ -1711,11 +1768,7 @@ mod tests {
                     quote,
                 } => {
                     out.extend_from_slice(&[message_type, 0, 0, 0, 0, 9, 0, 1]);
-                    if quote {
-                        // An IPv4 header claiming a version nothing reads, so
-                        // the quote refuses itself rather than naming a flow.
-                        out.extend_from_slice(&[0x65; 20]);
-                    }
+                    out.extend_from_slice(&quote.bytes());
                     (Protocol::ICMP.0, out)
                 }
                 Transport_::Unparsed(protocol) => {
@@ -2478,7 +2531,7 @@ mod tests {
                 // An echo reply answering a request that never travelled.
                 FrameSpec::carrying(Transport_::Icmp {
                     message_type: 0,
-                    quote: false,
+                    quote: Quote::Absent,
                 }),
             ),
             (
@@ -2488,7 +2541,7 @@ mod tests {
                 // An unreachable error quoting bytes that are not IPv4.
                 FrameSpec::carrying(Transport_::Icmp {
                     message_type: 3,
-                    quote: true,
+                    quote: Quote::Unreadable,
                 }),
             ),
             (
@@ -2498,7 +2551,7 @@ mod tests {
                 // Redirect: excluded outright, being a routing instruction.
                 FrameSpec::carrying(Transport_::Icmp {
                     message_type: 5,
-                    quote: false,
+                    quote: Quote::Absent,
                 }),
             ),
         ];
@@ -2989,6 +3042,160 @@ mod tests {
         }
     }
 
+    /// A ruleset that admits an opening UDP conversation and, second, the ICMP
+    /// errors an existing conversation is the reason for.
+    ///
+    /// Two rules rather than one `tracking="any"`, because that is what the
+    /// document an operator writes looks like: admission and related traffic are
+    /// separate decisions, and a policy that meant to allow one and not the other
+    /// must be able to say so.
+    static ALLOW_OPENING_AND_RELATED: LazyLock<pipeline::Ruleset> = LazyLock::new(|| {
+        let opening = pipeline::Rule {
+            ingress: None,
+            egress: None,
+            source: None,
+            destination: None,
+            protocol: Some(Protocol::UDP),
+            source_port: None,
+            destination_port: None,
+            icmp_type: None,
+            tracking: Some(pipeline::Tracked::Opening),
+            action: pipeline::RuleAction::Accept,
+        };
+        let related = pipeline::Rule {
+            protocol: Some(Protocol::ICMP),
+            tracking: Some(pipeline::Tracked::Related),
+            ..opening
+        };
+        pipeline::Ruleset::build([opening, related].into_iter())
+            .expect("two rules are inside any capacity")
+    });
+
+    /// The same, without the related rule: a document that admits conversations and
+    /// says nothing about the errors reporting on them.
+    static ALLOW_OPENING_ONLY: LazyLock<pipeline::Ruleset> = LazyLock::new(|| {
+        pipeline::Ruleset::build(core::iter::once(pipeline::Rule {
+            ingress: None,
+            egress: None,
+            source: None,
+            destination: None,
+            protocol: Some(Protocol::UDP),
+            source_port: None,
+            destination_port: None,
+            icmp_type: None,
+            tracking: Some(pipeline::Tracked::Opening),
+            action: pipeline::RuleAction::Accept,
+        }))
+        .expect("one rule is inside any capacity")
+    });
+
+    /// **A genuinely related ICMP error is the filter's to decide, and the record
+    /// says which way it went.**
+    ///
+    /// The error quotes a real datagram of a conversation the table holds, so the
+    /// tracker's own corroboration accepts it — which settles where it would go and
+    /// must not settle whether it may. Under a document with no rule about related
+    /// traffic it is refused by the default deny; under one that admits it, it is
+    /// forwarded.
+    ///
+    /// The denial is the half that has to reach the **connection history**: an error
+    /// opens no conversation, so its transition is `Held`, and a filter decision on a
+    /// `Held` frame produced no event at all until the arm that names one was
+    /// written. A refusal nothing records is a refusal an operator cannot see.
+    ///
+    /// **Two stages, one table**, which is the forwarder's own arrangement and the
+    /// only one this can be driven through: an error travels from a router back to
+    /// the sender of the datagram it quotes, so it arrives on the port that
+    /// datagram left by.
+    #[test]
+    fn a_related_icmp_error_is_decided_by_the_filter_and_the_record_names_the_decision() {
+        let opening = FrameSpec::a_to_b();
+        // Addressed to A and quoting the datagram A sent to B, which is the
+        // agreement `lfw_flow::icmp` refuses a forged quote by: an error is only
+        // about a datagram that was travelling away from the party being told.
+        let error = opening.reversed().with(Transport_::Icmp {
+            message_type: 3,
+            quote: Quote::Datagram {
+                source: HOST_A,
+                destination: HOST_B,
+                source_port: opening.source_port,
+                destination_port: opening.destination_port,
+            },
+        });
+
+        for (rules, forwarded, event) in [
+            (
+                &*ALLOW_OPENING_ONLY,
+                false,
+                Some(wire::TapEvent::PolicyNoMatch),
+            ),
+            (&*ALLOW_OPENING_AND_RELATED, true, None),
+        ] {
+            let regions = [Regions::new(), Regions::new()];
+            let ring = TapRing::new();
+            let mut tap = Tap::attach(&ring.records, &ring.consume);
+            let mut owners = [
+                PoolOwner::attach(&regions[0].returns),
+                PoolOwner::attach(&regions[1].returns),
+            ];
+            let mut producers = [
+                regions[0].rings.rx.producer(),
+                regions[1].rings.rx.producer(),
+            ];
+            let mut stages = [
+                RouteStage::attach(&regions[0].rings, &regions[0].pool, PORT0, PORT1),
+                RouteStage::attach(&regions[1].rings, &regions[1].pool, PORT1, PORT0),
+            ];
+            let mut pipeline = Pipeline::new();
+            let mut flows = Box::new(ApplianceTestFlows::new());
+
+            // The conversation first, on port 0, so the error has a flow to be
+            // related to; then the error itself, on port 1, which is where a
+            // report about that datagram comes back from.
+            for (which, spec) in [(0usize, &opening), (1, &error)] {
+                let bytes = spec.build();
+                receive(
+                    &regions[which].pool,
+                    &mut owners[which],
+                    &mut producers[which],
+                    &bytes,
+                )
+                .expect("a full pool has buffers");
+                assert_eq!(
+                    stages[which].poll(
+                        &mut pipeline,
+                        Configuration::new(1, &*ROUTER, rules),
+                        &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                        Some(&mut tap),
+                    ),
+                    1
+                );
+            }
+
+            let read = ring.drain();
+            let (opened, related) = (&read[0].0, &read[1].0);
+            assert_eq!(
+                opened.event,
+                Some(wire::TapEvent::FlowOpened),
+                "the conversation the error reports on was not opened"
+            );
+            assert_eq!(
+                related.flow.and_then(|flow| flow.classification),
+                Some(wire::TapClassification::Related),
+                "the quote did not name the flow, so this proves nothing about policy"
+            );
+            assert_eq!(
+                related.outcome == wire::TapOutcome::Forwarded,
+                forwarded,
+                "the error's verdict is not the one the policy states"
+            );
+            assert_eq!(
+                related.event, event,
+                "the record does not name what the filter decided"
+            );
+        }
+    }
+
     /// The two filter refusals as the tap records them: a rule that says drop,
     /// and no rule at all.
     #[test]
@@ -3099,6 +3306,7 @@ mod tests {
                     high: port,
                 }),
                 icmp_type: None,
+                tracking: None,
                 action,
             }
         }

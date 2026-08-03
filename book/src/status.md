@@ -135,10 +135,24 @@ packet.** The moment a configuration commits, the appliance sweeps its own flow 
 policy and takes back every conversation that policy would no longer admit — once per commit rather
 than once per packet, so the ruleset stays off the hot path and every flow the new policy still allows
 is left exactly as it was. A host found to be compromised can therefore be cut off by an edit to the
-document, which is what the model owed and did not previously deliver. What a revocation costs and how
-long it takes is [in the detail](developers/status-detail.md#connection-tracking). There is deliberately **no state criterion**: every frame a rule is asked about has just opened a
-flow, so such a criterion would have one reachable value and would read as a choice an operator did
-not have.
+document, which is what the model owed and did not previously deliver.
+
+**How long that takes does not depend on how many conversations there are.** A pass is carried across
+wakeups, and how much of it a wakeup works off scales with how full the table is — so a million-flow
+table an attacker filled is swept in the same number of wakeups an empty one is, rather than sixteen
+times as many. On the million-slot table this appliance builds that is at most 513 wakeups per pass at
+any occupancy, and a commit arriving mid-pass queues one fresh pass behind the running one rather than
+restarting it — so at most two passes, however fast documents are submitted. What that costs and the
+arithmetic behind it is [in the detail](developers/status-detail.md#connection-tracking).
+
+**Two things reach the filter, and a rule names which.** One is a conversation opening. The other is
+traffic an existing conversation is the *reason* for without belonging to it — today an ICMP error
+quoting one of its datagrams — which whoever sent it composed, with a source address of their
+choosing. Recognising it decides where it would go and never whether it may, so it is put to the
+filter like anything else and a document that admits no such traffic denies it. A rule writes
+`tracking="opening"`, `tracking="related"`, or `tracking="any"`. There is deliberately no
+`established` value: traffic inside a tracked conversation never reaches the filter, so the word
+would name a choice an operator does not have, and it is refused rather than accepted and ignored.
 
 It costs something, and the cost is in two places. A packet the tracker cannot keep state for is
 refused *before* the filter, so no rule can permit a non-initial fragment, a protocol the appliance
@@ -166,7 +180,7 @@ revocation nothing emits one.
 | Capability | Status | Notes |
 |---|---|---|
 | Stateful L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; a ruleset decides which flows may open, and a commit re-decides the flow table so removing a rule **does** end the conversations it admitted. There is no `reject` and no zones — [detail](developers/status-detail.md#stateful-filtering) |
-| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. A configuration commit re-decides the whole table against the new policy and takes back the flows it no longer admits, a bounded window of the table per wakeup — [detail](developers/status-detail.md#connection-tracking) |
+| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. A configuration commit re-decides the whole table against the new policy and takes back the flows it no longer admits, a bounded window of the table per wakeup whose size scales with occupancy so a pass takes the same number of wakeups however full the table is — [detail](developers/status-detail.md#connection-tracking) |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |

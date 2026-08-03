@@ -37,6 +37,8 @@ pub const ANY: Identifier = token(b"any");
 const TCP: Identifier = token(b"tcp");
 const UDP: Identifier = token(b"udp");
 const ICMP: Identifier = token(b"icmp");
+const OPENING: Identifier = token(b"opening");
+const RELATED: Identifier = token(b"related");
 const ACCEPT: Identifier = token(b"accept");
 const DROP: Identifier = token(b"drop");
 
@@ -86,6 +88,25 @@ pub enum PortMatch {
 pub enum IcmpTypeMatch {
     Any,
     Only(u8),
+}
+
+/// Which of the two things that reach the filter a rule is about.
+///
+/// Two stated values and no third, because two are what reach the filter: a
+/// conversation opening, and traffic an existing conversation is the reason for
+/// without belonging to it. A frame *within* a conversation the appliance already
+/// tracks is carried in front of the filter and never asked about, so there is no
+/// `established` token — a criterion that offered one would offer a choice an
+/// operator does not have, and `validate` refuses the word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackingMatch {
+    Any,
+    /// A conversation the appliance has not seen before.
+    Opening,
+    /// Traffic an existing conversation is the reason for without belonging to
+    /// it: an ICMP error quoting one of its datagrams, whose source address is
+    /// whatever the sender chose.
+    Related,
 }
 
 /// What a rule does with a frame that matches it.
@@ -212,6 +233,28 @@ impl IcmpTypeMatch {
             Self::Any => crate::hash::fold(hash, &[0]),
             Self::Only(message_type) => crate::hash::fold(hash, &[1, message_type]),
         }
+    }
+}
+
+impl TrackingMatch {
+    #[must_use]
+    pub const fn record(self) -> Value {
+        Value::Selector(match self {
+            Self::Any => ANY,
+            Self::Opening => OPENING,
+            Self::Related => RELATED,
+        })
+    }
+
+    pub(crate) fn fold(self, hash: u32) -> u32 {
+        crate::hash::fold(
+            hash,
+            &[match self {
+                Self::Any => 0,
+                Self::Opening => 1,
+                Self::Related => 2,
+            }],
+        )
     }
 }
 

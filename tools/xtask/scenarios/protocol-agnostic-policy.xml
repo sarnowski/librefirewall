@@ -37,10 +37,10 @@
     <rules>
         <rule id="lifecycle-deny" ingress="any" egress="any"
               source="any" destination="any" protocol="any"
-              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+              source-port="any" destination-port="5001" icmp-type="any" tracking="any" action="drop"/>
         <rule id="lifecycle-pass" ingress="any" egress="any"
               source="any" destination="any" protocol="any"
-              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+              source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
     </rules>
     <management mac="52:54:00:12:34:52" address="10.0.2.15"
                 prefix-length="24" enabled="true"/>

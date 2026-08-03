@@ -45,10 +45,10 @@
     <rules>
         <rule id="probe-blocked" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5001" icmp-type="any" action="accept"/>
+              source-port="any" destination-port="5001" icmp-type="any" tracking="opening" action="accept"/>
         <rule id="probe-forward" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5000" icmp-type="any" action="drop"/>
+              source-port="any" destination-port="5000" icmp-type="any" tracking="any" action="drop"/>
     </rules>
     <management mac="52:54:00:12:34:52" address="10.0.2.15"
                 prefix-length="24" enabled="true"/>

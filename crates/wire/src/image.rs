@@ -41,6 +41,7 @@ macro_rules! image_type {
     (byte)                                    => { u8 };
     (half)                                    => { u16 };
     (word)                                    => { u32 };
+    (digest)                                  => { u32 };
     (bytes($len:expr))                        => { [u8; $len] };
     (padding($len:expr))                      => { [u8; $len] };
     (identifier)                              => { $crate::log_record::IdentifierImage };
@@ -57,6 +58,7 @@ macro_rules! slot_type {
     (byte)                                    => { ::core::sync::atomic::AtomicU8 };
     (half)                                    => { ::core::sync::atomic::AtomicU16 };
     (word)                                    => { ::core::sync::atomic::AtomicU32 };
+    (digest)                                  => { ::core::sync::atomic::AtomicU32 };
     (bytes($len:expr))                        => { [::core::sync::atomic::AtomicU8; $len] };
     (padding($len:expr))                      => { [::core::sync::atomic::AtomicU8; $len] };
     (identifier)                              => {
@@ -73,6 +75,7 @@ macro_rules! image_zero {
     (byte)                                    => { 0 };
     (half)                                    => { 0 };
     (word)                                    => { 0 };
+    (digest)                                  => { 0 };
     (bytes($len:expr))                        => { [0; $len] };
     (padding($len:expr))                      => { [0; $len] };
     (identifier)                              => { $crate::log_record::IdentifierImage::ZERO };
@@ -88,6 +91,7 @@ macro_rules! slot_zero {
     (byte)                                    => { ::core::sync::atomic::AtomicU8::new(0) };
     (half)                                    => { ::core::sync::atomic::AtomicU16::new(0) };
     (word)                                    => { ::core::sync::atomic::AtomicU32::new(0) };
+    (digest)                                  => { ::core::sync::atomic::AtomicU32::new(0) };
     (bytes($len:expr))                        => { [const { ::core::sync::atomic::AtomicU8::new(0) }; $len] };
     (padding($len:expr))                      => { [const { ::core::sync::atomic::AtomicU8::new(0) }; $len] };
     (identifier)                              => { $crate::log_slot::TextSlot::zero() };
@@ -103,6 +107,7 @@ macro_rules! slot_store {
     (byte, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
     (half, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
     (word, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
+    (digest, $cell:expr, $value:expr)         => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
     (bytes($len:expr), $cell:expr, $value:expr)   => { $crate::store_bytes(&$cell, $value) };
     (padding($len:expr), $cell:expr, $value:expr) => { $crate::store_bytes(&$cell, $value) };
     (identifier, $cell:expr, $value:expr)     => { $cell.store(&$value) };
@@ -120,6 +125,7 @@ macro_rules! slot_load {
     (byte, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
     (half, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
     (word, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
+    (digest, $cell:expr)                      => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
     (bytes($len:expr), $cell:expr)            => { $crate::load_bytes(&$cell) };
     (padding($len:expr), $cell:expr)          => { $crate::load_bytes(&$cell) };
     (identifier, $cell:expr)                  => { $cell.load() };
@@ -131,6 +137,44 @@ macro_rules! slot_load {
         }
         entries
     }};
+}
+
+/// Folding one field into the running digest, in the byte order the region
+/// carries it. Every kind folds — padding with everything else, for
+/// [`slot_store`]'s reason — except `digest`, which is the word the fold is
+/// compared against and so cannot be part of what it covers.
+#[rustfmt::skip]
+macro_rules! image_fold {
+    (byte, $hash:ident, $value:expr)          => { $hash = $crate::image::fold_bytes($hash, &[$value]); };
+    (half, $hash:ident, $value:expr)          => { $hash = $crate::image::fold_bytes($hash, &$value.to_le_bytes()); };
+    (word, $hash:ident, $value:expr)          => { $hash = $crate::image::fold_bytes($hash, &$value.to_le_bytes()); };
+    (digest, $hash:ident, $value:expr)        => {};
+    (bytes($len:expr), $hash:ident, $value:expr)   => { $hash = $crate::image::fold_bytes($hash, &$value); };
+    (padding($len:expr), $hash:ident, $value:expr) => { $hash = $crate::image::fold_bytes($hash, &$value); };
+    (identifier, $hash:ident, $value:expr)    => { $hash = $value.fold($hash); };
+    (nested($image:ident, $slot:ident), $hash:ident, $value:expr) => { $hash = $value.fold($hash); };
+    (array($image:ident, $slot:ident, $len:expr), $hash:ident, $value:expr) => {
+        for entry in &$value {
+            $hash = entry.fold($hash);
+        }
+    };
+}
+
+/// The multiplier of the FNV-1a fold the digests here are.
+///
+/// A basis of zero rather than FNV's own, which is the one deviation and is
+/// load-bearing: folding a zero byte into a zero hash leaves it zero, so an
+/// all-zero image digests to zero and a zeroed region is a coherent image
+/// rather than one every reader refuses.
+const DIGEST_PRIME: u32 = 0x0100_0193;
+
+/// Fold `bytes` into a running digest.
+pub(crate) fn fold_bytes(hash: u32, bytes: &[u8]) -> u32 {
+    let mut hash = hash;
+    for byte in bytes {
+        hash = (hash ^ u32::from(*byte)).wrapping_mul(DIGEST_PRIME);
+    }
+    hash
 }
 
 /// Declare a shared-memory image, its atomic mirror, and the assertions that
@@ -203,6 +247,20 @@ macro_rules! shared_image {
             }
         }
 
+        impl $image {
+            /// Fold every byte this image carries into `hash`, in region order.
+            ///
+            /// Emitted from the same declaration the layout is, so a field added
+            /// to the byte map joins the fold with it: a digest that could be
+            /// left short of a field would be a digest an image can differ
+            /// outside.
+            pub(crate) fn fold(&self, hash: u32) -> u32 {
+                let mut hash = hash;
+                $( $crate::image::image_fold!($kind $(($($arg)*))?, hash, self.$field); )+
+                hash
+            }
+        }
+
         // The declaration is the authority on the layout and this is what
         // refuses one that lies: a field reordered, a width changed or a
         // padding byte miscounted is a compile error here rather than a silent
@@ -259,6 +317,6 @@ macro_rules! checked_value {
 }
 
 pub(crate) use {
-    checked_value, image_type, image_zero, shared_image, slot_load, slot_store, slot_type,
-    slot_zero,
+    checked_value, image_fold, image_type, image_zero, shared_image, slot_load, slot_store,
+    slot_type, slot_zero,
 };

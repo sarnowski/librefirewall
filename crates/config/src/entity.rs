@@ -29,7 +29,10 @@ use lfw_log::{Field, Identifier, ObjectKind, Value};
 use net_headers::{Ipv4Address, MacAddress};
 
 use crate::{
-    rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction},
+    rule::{
+        AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+        TrackingMatch,
+    },
     value,
     xml::{Attribute, DocumentError, DocumentFault, Element},
 };
@@ -53,6 +56,7 @@ macro_rules! value_type {
     (protocol_match)  => { ProtocolMatch };
     (port_match)      => { PortMatch };
     (icmp_type_match) => { IcmpTypeMatch };
+    (tracking_match)  => { TrackingMatch };
     (action)          => { RuleAction };
 }
 
@@ -72,6 +76,7 @@ macro_rules! value_record {
     (protocol_match, $value:expr)  => { $value.record() };
     (port_match, $value:expr)      => { $value.record() };
     (icmp_type_match, $value:expr) => { $value.record() };
+    (tracking_match, $value:expr)  => { $value.record() };
     (action, $value:expr)          => { $value.record() };
 }
 
@@ -92,6 +97,7 @@ macro_rules! value_fold {
     (protocol_match, $hash:expr, $value:expr)  => { $value.fold($hash) };
     (port_match, $hash:expr, $value:expr)      => { $value.fold($hash) };
     (icmp_type_match, $hash:expr, $value:expr) => { $value.fold($hash) };
+    (tracking_match, $hash:expr, $value:expr)  => { $value.fold($hash) };
     (action, $hash:expr, $value:expr)          => { $value.fold($hash) };
 }
 
@@ -300,6 +306,7 @@ configuration_entity! {
         @field(SourcePort) source_port: port_match,
         @field(DestinationPort) destination_port: port_match,
         @field(IcmpType) icmp_type: icmp_type_match,
+        @field(Tracking) tracking: tracking_match,
         @field(Action) action: action,
     }
 }

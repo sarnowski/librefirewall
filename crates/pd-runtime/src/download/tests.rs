@@ -6,6 +6,17 @@ use std::{vec, vec::Vec};
 use lfw_ip_endpoint::http::WINDOW_LEN;
 use wire::{DownloadReply, DownloadRequest, DownloadResponder};
 
+/// A reading of the clock, as a pass hands one to the module under test — built
+/// the way a domain builds one, a `Monotonic` being reachable only through a
+/// `Calibration`. Every exchange below completes inside one instant, so a test
+/// that names zero is one whose deadline is armed and nowhere near reached.
+fn at(nanos: u64) -> Option<Monotonic> {
+    use core::num::NonZeroU64;
+    use lfw_clock::{Calibration, Ticks};
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Some(Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(nanos)))
+}
+
 /// The endpoint as a download sees it, with every state a real transport can
 /// present and two a hostile or broken one can.
 ///
@@ -145,7 +156,7 @@ fn a_get_of_a_recording_asks_the_recorder_for_its_first_window() {
         ..FakeStream::default()
     };
 
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     assert_eq!(
         asked(&channel),
@@ -164,10 +175,10 @@ fn the_first_reply_begins_the_stream_at_the_length_the_recorder_stated() {
         ..FakeStream::default()
     };
 
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     let body = vec![0xAB; 128];
     answer(&channel, &body, 4096);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     let (total, content_type) = stream.begun.expect("the stream was begun");
     assert_eq!(total, 4096);
@@ -192,12 +203,12 @@ fn a_later_window_is_asked_for_at_the_offset_the_transport_named() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     answer(&channel, &[1u8; 64], 4096);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     stream.wanted = Some((64, WINDOW_LEN));
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     assert_eq!(
         asked(&channel),
         Some((DownloadSink::Log, 64, WINDOW_LEN)),
@@ -217,12 +228,12 @@ fn a_partly_filled_window_is_asked_for_at_the_length_it_can_still_take() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     answer(&channel, &[1u8; 64], 4_096);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     stream.wanted = Some((64, 300));
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     assert_eq!(
         asked(&channel),
         Some((DownloadSink::Log, 64, 300)),
@@ -238,9 +249,9 @@ fn the_end_of_a_body_supplies_nothing_and_abandons_nothing() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     answer(&channel, &[], 0);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     assert_eq!(stream.begun.map(|(total, _)| total), Some(0));
     assert!(stream.supplied.is_empty());
@@ -262,13 +273,13 @@ fn every_refusal_ends_the_response_rather_than_retrying_it() {
             pending: Some(LOG_TARGET),
             ..FakeStream::default()
         };
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
         {
             let mut responder = channel.responder();
             let demand = responder.take().expect("a request is out");
             responder.refuse(demand, reason, 0);
         }
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
 
         assert_eq!(stream.abandoned, 1, "{reason:?} must end the response");
         assert!(stream.begun.is_none());
@@ -285,9 +296,9 @@ fn an_endpoint_that_will_not_begin_the_stream_ends_it() {
         refuse_begin: true,
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     answer(&channel, &[1u8; 16], 16);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     assert_eq!(stream.abandoned, 1);
     assert!(stream.supplied.is_empty());
@@ -302,9 +313,9 @@ fn an_endpoint_that_refuses_the_window_it_asked_for_ends_the_stream() {
         refuse_window: true,
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     answer(&channel, &[1u8; 16], 4096);
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     assert_eq!(stream.abandoned, 1);
     assert!(stream.supplied.is_empty());
@@ -318,7 +329,7 @@ fn a_window_wanted_for_a_stream_this_domain_never_began_is_ended() {
         wanted: Some((512, WINDOW_LEN)),
         ..FakeStream::default()
     };
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
 
     assert_eq!(stream.abandoned, 1);
     assert!(
@@ -333,7 +344,7 @@ fn a_pass_with_nothing_to_do_does_nothing_and_asks_nothing() {
     let mut downloads = channel.downloads();
     let mut stream = FakeStream::default();
     for _ in 0..8 {
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
     }
     assert_eq!(stream.abandoned, 0);
     assert!(asked(&channel).is_none());
@@ -354,7 +365,7 @@ fn only_one_request_is_ever_outstanding() {
     // Several passes with no answer: the recorder must see one request, not one
     // per pass, or a slow medium would be a request storm.
     for _ in 0..8 {
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
     }
     let demand = responder.take().expect("one request is outstanding");
     responder.deliver(demand, &[1u8; 8], 64);
@@ -362,7 +373,7 @@ fn only_one_request_is_ever_outstanding() {
         responder.take().is_none(),
         "the sequence never moved while the first was unanswered"
     );
-    downloads.poll(&mut stream);
+    downloads.poll(at(0), &mut stream);
     assert_eq!(stream.supplied.len(), 1);
     assert!(
         responder.take().is_none(),
@@ -393,7 +404,7 @@ fn a_recording_several_windows_long_is_delivered_whole() {
 
     let mut delivered = 0u64;
     for _ in 0..4096 {
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
         // The recorder answers whatever is outstanding, stopping at the extent
         // boundary and at the end of the snapshot.
         {
@@ -409,7 +420,7 @@ fn a_recording_several_windows_long_is_delivered_whole() {
                 responder.deliver(demand, &bytes, TOTAL);
             }
         }
-        downloads.poll(&mut stream);
+        downloads.poll(at(0), &mut stream);
         // The transport sends what arrived and asks for the rest, which is what
         // the peer's acknowledgement makes it do.
         let taken: u64 = stream
@@ -454,5 +465,108 @@ fn a_recording_several_windows_long_is_delivered_whole() {
     assert!(
         stream.supplied.len() as u64 > TOTAL / WINDOW_LEN as u64,
         "every window was served whole, so no short one was exercised"
+    );
+}
+
+/// A recorder that never answers does not hold this module's one outstanding slot
+/// forever: the window is given up on at its deadline and the download abandoned.
+///
+/// Without the deadline the stream stays committed, the endpoint's staging array
+/// stays claimed, and every body-bearing surface answers 503 for the life of the
+/// domain — a download being the *other* way that array is held.
+#[test]
+fn a_recorder_that_never_answers_is_given_up_on() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(LOG_TARGET),
+        ..FakeStream::default()
+    };
+
+    downloads.poll(at(0), &mut stream);
+    {
+        // Taken and never answered, which is a recorder that has stopped.
+        let mut responder = channel.responder();
+        let demand = responder.take().expect("a request is outstanding");
+        drop(demand);
+    }
+
+    let deadline = REPLY_TIMEOUT.as_nanos();
+    downloads.poll(at(deadline - 1), &mut stream);
+    assert_eq!(stream.abandoned, 0, "given up on early");
+
+    downloads.poll(at(deadline), &mut stream);
+    assert_eq!(stream.abandoned, 1, "the download was never given up on");
+    assert_eq!(downloads.counters().abandoned, 1);
+
+    // And the slot is free again, so the next `GET` of a recording is asked for
+    // rather than being the one this domain never serves.
+    stream.pending = Some(CAPTURE_TARGET);
+    downloads.poll(at(deadline), &mut stream);
+    assert_eq!(
+        asked(&channel),
+        Some((DownloadSink::Capture, 0, WINDOW_LEN)),
+        "the outstanding slot was never given back"
+    );
+}
+
+/// A window that lands after the deadline cannot be taken for the next request's.
+/// The abandoned request left a sequence number behind, and a reply to it answers a
+/// number no pending request is held against.
+#[test]
+fn a_window_that_arrives_after_the_deadline_supplies_nothing() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(LOG_TARGET),
+        ..FakeStream::default()
+    };
+
+    downloads.poll(at(0), &mut stream);
+    let stale = channel
+        .responder()
+        .take()
+        .expect("a request is outstanding");
+    let deadline = REPLY_TIMEOUT.as_nanos();
+    downloads.poll(at(deadline), &mut stream);
+    assert_eq!(stream.abandoned, 1);
+
+    // A fresh download is outstanding by the time the recorder answers the old one.
+    stream.pending = Some(CAPTURE_TARGET);
+    downloads.poll(at(deadline), &mut stream);
+    channel.responder().deliver(stale, b"stale bytes", 11);
+    downloads.poll(at(deadline), &mut stream);
+    assert!(
+        stream.begun.is_none() && stream.supplied.is_empty(),
+        "a reply to an abandoned request was taken for the new one's"
+    );
+}
+
+/// A node whose clock has not been published arms no deadline, and a pass with no
+/// reading of the clock judges none. Both mean *not yet*, which is the direction
+/// that cannot truncate a download that was going to complete.
+#[test]
+fn an_unclocked_pass_gives_up_on_nothing() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(LOG_TARGET),
+        ..FakeStream::default()
+    };
+
+    downloads.poll(None, &mut stream);
+    let _outstanding = channel
+        .responder()
+        .take()
+        .expect("a request is outstanding");
+    for _ in 0..4 {
+        downloads.poll(None, &mut stream);
+    }
+    assert_eq!(stream.abandoned, 0);
+
+    downloads.poll(at(REPLY_TIMEOUT.as_nanos() * 4), &mut stream);
+    assert_eq!(
+        stream.abandoned, 0,
+        "a request parked unarmed was given up on"
     );
 }

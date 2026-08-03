@@ -160,10 +160,23 @@ them:
 | `flow-opened` | 1 | a conversation was opened and the filter admitted the packet that opened it. The rule that admitted it is named |
 | `flow-advanced` | 2 | an existing conversation changed state without ending |
 | `flow-closed` | 3 | it reached a state it does not leave. The state says how: `time_wait` for a completed close, `closed` for a reset |
-| `policy-denied` | 4 | a rule matched the opening packet and its action is to drop. The flow it had just opened was withdrawn |
-| `policy-no-match` | 5 | no rule was about the opening packet, so the default deny refused it. The flow it had just opened was withdrawn |
+| `policy-denied` | 4 | a rule matched the packet the filter was asked about and its action is to drop. Where that packet opened a conversation, the flow it had just opened was withdrawn |
+| `policy-no-match` | 5 | no rule was about the packet the filter was asked about, so the default deny refused it. Where that packet opened a conversation, the flow it had just opened was withdrawn |
 | `flow-refused` | 6 | the connection tracker refused the packet outright, so it never reached the filter. The drop reason says which refusal |
 | `flow-revoked` | 7 | a policy commit no longer admits a conversation it had admitted, so the appliance ended it. **The one record that is about no frame** — see below |
+
+**The two policy records are not only about openings.** Two things reach the filter: a conversation
+opening, and traffic an existing conversation is the reason for without belonging to it — today an
+ICMP error quoting one of its datagrams. Both are refused under the same two records, so a
+`policy-no-match` may be a conversation the policy would not start *or* an error it will not carry.
+The record's classification tells them apart: `new` for the first, `related` for the second. An
+error opens no conversation, so nothing is withdrawn when one is refused and the conversation it
+reported on is untouched.
+
+A related packet the policy **admits** is a different matter: it changes no conversation, so the
+connection history holds no record of it at all and the capture is where it appears — with its
+`related` classification and its forwarded verdict, and the rule that admitted it named in
+`librefirewall_rule_hits_total`.
 
 Three things the vocabulary does not say, and an operator will otherwise infer wrongly.
 

@@ -725,6 +725,7 @@ mod tests {
                 source_port: PortMatch::Any,
                 destination_port: PortMatch::Any,
                 icmp_type: IcmpTypeMatch::Any,
+                tracking: crate::rule::TrackingMatch::Any,
                 action: crate::rule::RuleAction::Accept,
             })
             .expect("capacity");
@@ -1561,6 +1562,7 @@ mod tests {
                     high: 65_535,
                 },
                 icmp_type: IcmpTypeMatch::Any,
+                tracking: crate::rule::TrackingMatch::Any,
                 action: RuleAction::Accept,
             };
             if candidate.push_rule(widest).is_err() {

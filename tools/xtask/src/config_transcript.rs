@@ -506,12 +506,12 @@ mod tests {
     fn the_shipped_document_produces_a_record_for_every_value_it_names() {
         let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
         // Two interfaces of five fields, two neighbours of three, two rules of
-        // ten, and the management interface's four: the document's own content,
-        // counted rather than restated. A rule reports its own `id` as a field
-        // because a rule's records are keyed by its position rather than by its
-        // name, so a ten-attribute rule is ten records.
-        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 2 * 10 + 4);
-        assert!(contract.summary().contains("40"));
+        // eleven, and the management interface's four: the document's own
+        // content, counted rather than restated. A rule reports its own `id` as a
+        // field because a rule's records are keyed by its position rather than by
+        // its name, so an eleven-attribute rule is eleven records.
+        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 2 * 11 + 4);
+        assert!(contract.summary().contains("42"));
         for record in &contract.changes {
             assert!(record.starts_with("LFW-CFG generation=1 seq="), "{record}");
             assert!(record.contains("change=added"), "{record}");
@@ -595,7 +595,7 @@ mod tests {
                 .filter(|record| record.contains(&marker))
                 .count()
         };
-        let rule_criteria = 2 * (10 - 1);
+        let rule_criteria = 2 * (11 - 1);
         assert_eq!(
             [
                 about("interface"),

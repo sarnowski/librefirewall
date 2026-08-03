@@ -84,6 +84,10 @@ pub const SUBMITTED: &[u8] = include_bytes!("../scenarios/reconfiguration-swap.x
 /// `image::NARROWED_DOCUMENT` names the same file for the fast gate.
 pub const NARROWED: &[u8] = include_bytes!("../scenarios/revocation-narrow.xml");
 
+/// The shipped policy with one rule added, admitting the ICMP errors a live
+/// conversation is the reason for. Submitted by the related-traffic scenario.
+pub const RELATED: &[u8] = include_bytes!("../scenarios/related-icmp.xml");
+
 /// The gauge the connection table publishes its occupancy under, one series per
 /// state.
 const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
@@ -431,9 +435,11 @@ pub fn await_revocation(
     mut drive: impl FnMut(),
 ) -> Result<Revoked, String> {
     /// How many wakeups the harness will manufacture before calling the pass
-    /// stalled. A pass takes at most `FLOW_CAPACITY / REVISIT_BUCKETS` windows and
-    /// a quiet wakeup works off several, so this is generous by a wide margin — and
-    /// bounded, so a pass that is not advancing is a finding rather than a hang.
+    /// stalled. A pass takes at most `FLOW_CAPACITY / REVISIT_BUCKETS` wakeups at
+    /// any occupancy, a commit mid-pass queues at most one more pass behind the one
+    /// running, and a quiet wakeup works off several windows — so this is generous
+    /// by a wide margin, and bounded, so a pass that is not advancing is a finding
+    /// rather than a hang.
     const WAKEUPS: usize = 4_096;
     /// How often the pass's own progress is read back. Every wakeup would spend
     /// the whole budget on HTTP round trips.
@@ -459,16 +465,21 @@ pub fn await_revocation(
         if passes == 0 {
             continue;
         }
-        // The pass has finished, so every number below is final.
+        // **The gauge and not the counter is what closes the window**, and the two
+        // are deliberately different facts. A commit arriving while a pass is
+        // running does not abandon it: that pass runs on to the last bucket and a
+        // fresh pass over the whole table is queued behind it, so a `completed` may
+        // belong to a pass armed by an *earlier* generation — the one the node
+        // committed at boot — while the submitted document's own pass is still
+        // owed. Reading the counter alone would state the window closed one whole
+        // pass early, which is exactly the window a conversation the new policy
+        // forbids is still being forwarded in.
         let running = plain(&exposition, POLICY_SWEEP_RUNNING)
             .ok_or_else(|| format!("{POLICY_SWEEP_RUNNING} is not in the exposition"))?;
         if running != 0 {
-            return Err(format!(
-                "{POLICY_SWEEP} reports {passes} completed pass(es) and {POLICY_SWEEP_RUNNING} \
-                 still reads {running}: the window a commit opens is stated by both, and they \
-                 disagree about whether it is closed"
-            ));
+            continue;
         }
+        // Every number below is final: no pass is owed.
         let revoked = labelled(&exposition, FLOW_LIFECYCLE, "event", "revoked").ok_or_else(|| {
             format!(
                 "{FLOW_LIFECYCLE}{{event=\"revoked\"}} is not in the exposition, so nothing says \

@@ -164,15 +164,15 @@ pub fn flow_sample(counters: &FlowCounters, occupancy: Occupancy) -> FlowSample 
 pub fn policy_sweep_sample(sweep: &PolicySweep) -> PolicySweepSample {
     let PolicySweepCounters {
         completed,
-        restarted,
+        deferred,
         buckets,
         examined,
     } = sweep.counters();
     PolicySweepSample {
         // In `lfw_metrics::POLICY_SWEEP_OUTCOMES` order, which is the ABI: the
-        // pair swapped here would report every restart as a completed pass, and
-        // so report a window as closed while it is open.
-        outcomes: [completed, restarted],
+        // pair swapped here would report every deferred commit as a completed pass,
+        // and so report a window as closed while it is open.
+        outcomes: [completed, deferred],
         running: u64::from(sweep.running()),
         // In `lfw_metrics::POLICY_SWEEP_PROGRESS_KINDS` order.
         progress: [buckets, examined],
@@ -289,6 +289,7 @@ pub fn management_sample(
                     overflowed: served.overflowed,
                     bodies_refused: served.bodies_refused,
                     bodies_taken: served.bodies_taken,
+                    bodies_timed_out: served.bodies_timed_out,
                     bodies_overrun: served.bodies_overrun,
                     retransmits_unavailable: served.retransmits_unavailable,
                     slots_exhausted: served.slots_exhausted,

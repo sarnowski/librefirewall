@@ -39,10 +39,10 @@
     <rules>
         <rule id="north-blocked" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+              source-port="any" destination-port="5001" icmp-type="any" tracking="any" action="drop"/>
         <rule id="north-forward" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+              source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
     </rules>
     <management mac="52:54:00:ab:cd:e2" address="172.20.7.20"
                 prefix-length="25" enabled="true"/>

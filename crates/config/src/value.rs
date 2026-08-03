@@ -12,6 +12,7 @@ use net_headers::{Ipv4Address, MacAddress, Protocol};
 
 use crate::rule::{
     AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+    TrackingMatch,
 };
 
 /// Why a value is not the thing its attribute names.
@@ -180,6 +181,20 @@ pub fn icmp_type_match(bytes: &[u8]) -> Result<IcmpTypeMatch, ValueError> {
 }
 
 /// # Errors
+/// [`ValueError::Malformed`] for anything but `any`, `opening` or `related`.
+/// `established` is refused with everything else: traffic inside a conversation
+/// the appliance tracks never reaches the filter, so a rule about it would decide
+/// nothing while reading as though it did.
+pub fn tracking_match(bytes: &[u8]) -> Result<TrackingMatch, ValueError> {
+    match bytes {
+        ANY => Ok(TrackingMatch::Any),
+        b"opening" => Ok(TrackingMatch::Opening),
+        b"related" => Ok(TrackingMatch::Related),
+        _ => Err(ValueError::Malformed),
+    }
+}
+
+/// # Errors
 /// [`ValueError::Malformed`] for anything but `accept` or `drop`. There is no
 /// `allow`, no `deny` and no `permit`: one spelling each, so two documents
 /// cannot say the same thing two ways.
@@ -248,6 +263,37 @@ fn hex_digit(byte: Option<&u8>) -> Result<u8, ValueError> {
 
 #[cfg(test)]
 mod tests {
+    /// The criterion offers exactly the two values that reach the filter. In
+    /// particular `established` is refused: traffic inside a conversation the
+    /// appliance tracks is carried in front of the filter, so a rule naming it
+    /// would decide nothing while reading as though it did.
+    #[test]
+    fn the_tracking_criterion_names_only_what_reaches_the_filter() {
+        assert_eq!(super::tracking_match(b"any"), Ok(super::TrackingMatch::Any));
+        assert_eq!(
+            super::tracking_match(b"opening"),
+            Ok(super::TrackingMatch::Opening)
+        );
+        assert_eq!(
+            super::tracking_match(b"related"),
+            Ok(super::TrackingMatch::Related)
+        );
+        for refused in [
+            &b"established"[..],
+            b"new",
+            b"invalid",
+            b"",
+            b"OPENING",
+            b"related ",
+        ] {
+            assert_eq!(
+                super::tracking_match(refused),
+                Err(super::ValueError::Malformed),
+                "{refused:?}"
+            );
+        }
+    }
+
     use super::*;
     use proptest::prelude::*;
 

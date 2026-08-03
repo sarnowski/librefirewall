@@ -127,6 +127,7 @@ static ALLOW_ALL: LazyLock<Ruleset> = LazyLock::new(|| {
         source_port: None,
         destination_port: None,
         icmp_type: None,
+        tracking: None,
         action: RuleAction::Accept,
     }))
     .expect("one rule is inside any capacity")

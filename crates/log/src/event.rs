@@ -113,6 +113,8 @@ closed_vocabulary! {
         SourcePort => "source-port",
         DestinationPort => "destination-port",
         IcmpType => "icmp-type",
+        /// Which of the two things that reach the filter a rule is about.
+        Tracking => "tracking",
         Action => "action",
     }
 }
@@ -191,6 +193,19 @@ closed_vocabulary! {
         /// bound: this one is about what the appliance would answer, and a
         /// document well inside the bound can provoke it.
         RenderingTooLarge => "rendering-too-large",
+        /// The bytes offered in the handover region do not fold to the digest they
+        /// carry, so they are not one publication: either the domain that sealed
+        /// them sealed them wrongly, or the reader's copy was taken across two
+        /// publications. **The operator's document may be perfectly correct.**
+        ///
+        /// Its own reason rather than `malformed-value`, and the distinction is a
+        /// decision about what a console line instructs. Every other
+        /// `malformed-value` is a statement about a document somebody wrote, whose
+        /// next action is to edit it; this one is a statement about what the node
+        /// published, whose next action is to suspect the node. A vocabulary may be
+        /// coarser than the fault tree it summarises — it may not point away from
+        /// the thing at fault.
+        HandoverNotOnePublication => "handover-not-one-publication",
     }
 }
 

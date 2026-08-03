@@ -171,6 +171,7 @@ const fn wildcard(action: RuleAction) -> Rule {
         source_port: None,
         destination_port: None,
         icmp_type: None,
+        tracking: None,
         action,
     }
 }

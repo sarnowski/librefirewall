@@ -4,6 +4,17 @@ use std::boxed::Box;
 use std::{string::String, vec::Vec};
 use wire::{ConfigAnswer, ConfigOperation, ConfigResponder};
 
+/// A reading of the clock, as a pass hands one to the module under test — built
+/// the way a domain builds one, a `Monotonic` being reachable only through a
+/// `Calibration`. Every exchange below completes inside one instant, so a test
+/// that names zero is one whose deadline is armed and nowhere near reached.
+fn at(nanos: u64) -> Option<Monotonic> {
+    use core::num::NonZeroU64;
+    use lfw_clock::{Calibration, Ticks};
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Some(Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(nanos)))
+}
+
 /// The two regions one channel is, on the heap: 128 KiB of region is more than
 /// belongs on a test stack, and a test drives both ends.
 struct Channel {
@@ -103,11 +114,11 @@ fn exchange(endpoint: &mut Endpoint, answer: ConfigAnswer) {
     let mut management = channel.management();
     let mut deciding = channel.deciding();
 
-    assert!(management.poll(endpoint), "no request was issued");
+    assert!(management.poll(at(0), endpoint), "no request was issued");
     let demand = deciding.take().expect("a request was issued");
     assert_eq!(demand.operation(), Some(ConfigOperation::Submit));
     deciding.answer(demand, answer);
-    management.poll(endpoint);
+    management.poll(at(0), endpoint);
 }
 
 #[test]
@@ -117,7 +128,7 @@ fn a_submitted_document_crosses_unread_and_its_answer_comes_back() {
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::submitting(b"<configuration/>");
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     assert_eq!(demand.operation(), Some(ConfigOperation::Submit));
     let mut scratch = Box::new([0u8; MAX_DOCUMENT_BYTES]);
@@ -137,7 +148,7 @@ fn a_submitted_document_crosses_unread_and_its_answer_comes_back() {
             changes: 3,
         },
     );
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(
         endpoint.answer(),
         (Status::Ok, "generation=2 outcome=applied changes=3\n")
@@ -227,13 +238,13 @@ fn a_read_answers_with_the_running_document() {
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::reading();
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     assert_eq!(demand.operation(), Some(ConfigOperation::Read));
     assert!(demand.is_empty(), "a read carries no document out");
     deciding.deliver(demand, 3, b"<configuration><rules/></configuration>");
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(
         endpoint.documents,
         [b"<configuration><rules/></configuration>".to_vec()]
@@ -253,19 +264,19 @@ fn a_document_the_size_of_the_region_crosses_both_ways() {
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::submitting(&long);
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     let mut scratch = Box::new([0u8; MAX_DOCUMENT_BYTES]);
     assert_eq!(deciding.document(&demand, &mut scratch), long.as_slice());
     deciding.answer(demand, ConfigAnswer::Unchanged { generation: 1 });
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.answer().0, Status::Ok);
 
     let mut endpoint = Endpoint::reading();
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a read");
     deciding.deliver(demand, 1, &long);
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.documents, [long]);
 }
 
@@ -280,7 +291,7 @@ fn a_pass_with_nothing_waiting_issues_nothing() {
 
     for _ in 0..4 {
         assert!(
-            !management.poll(&mut endpoint),
+            !management.poll(at(0), &mut endpoint),
             "a pass with nothing waiting issued a request"
         );
     }
@@ -298,7 +309,7 @@ fn a_second_request_waits_for_the_first_to_be_answered() {
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::submitting(b"<configuration/>");
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let first = deciding.take().expect("a request");
     assert_eq!(first.sequence(), 1);
     // A read arrives while the submission is out. Nothing new is issued for it:
@@ -307,7 +318,7 @@ fn a_second_request_waits_for_the_first_to_be_answered() {
     endpoint.wants_document = true;
     for _ in 0..4 {
         assert!(
-            !management.poll(&mut endpoint),
+            !management.poll(at(0), &mut endpoint),
             "a second request was issued while the first was outstanding"
         );
     }
@@ -318,13 +329,13 @@ fn a_second_request_waits_for_the_first_to_be_answered() {
     );
 
     deciding.answer(first, ConfigAnswer::Unchanged { generation: 1 });
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.answer().0, Status::Ok);
     // And now the read goes out.
     let second = deciding.take().expect("the read");
     assert_eq!(second.operation(), Some(ConfigOperation::Read));
     deciding.deliver(second, 1, b"<configuration/>");
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.documents.len(), 1);
 }
 
@@ -338,7 +349,7 @@ fn a_submission_is_asked_before_a_read() {
     let mut endpoint = Endpoint::submitting(b"<configuration/>");
     endpoint.wants_document = true;
 
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     assert_eq!(demand.operation(), Some(ConfigOperation::Submit));
 }
@@ -359,10 +370,10 @@ fn an_answer_that_cannot_be_believed_is_a_service_failure_and_not_a_verdict() {
     let mut management = channel.management();
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::submitting(b"<configuration/>");
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     deciding.deliver(demand, 1, b"<configuration/>");
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.answer(), (Status::ServiceUnavailable, ""));
     assert_eq!(management.faults(), 1);
     assert!(
@@ -375,7 +386,7 @@ fn an_answer_that_cannot_be_believed_is_a_service_failure_and_not_a_verdict() {
     let mut management = channel.management();
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::reading();
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a read");
     deciding.answer(
         demand,
@@ -384,7 +395,7 @@ fn an_answer_that_cannot_be_believed_is_a_service_failure_and_not_a_verdict() {
             changes: 1,
         },
     );
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.answer(), (Status::ServiceUnavailable, ""));
     assert_eq!(management.faults(), 1);
 }
@@ -397,10 +408,10 @@ fn an_unrecognised_operation_is_answered_and_is_not_a_fault() {
     let mut management = channel.management();
     let mut deciding = channel.deciding();
     let mut endpoint = Endpoint::submitting(b"<configuration/>");
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     let demand = deciding.take().expect("a request");
     deciding.answer(demand, ConfigAnswer::NoSuchOperation);
-    management.poll(&mut endpoint);
+    management.poll(at(0), &mut endpoint);
     assert_eq!(endpoint.answer(), (Status::ServiceUnavailable, ""));
     assert_eq!(management.faults(), 0);
 }
@@ -500,7 +511,7 @@ proptest! {
         } else {
             Endpoint::submitting(b"<configuration/>")
         };
-        management.poll(&mut endpoint);
+        management.poll(at(0), &mut endpoint);
         let demand = deciding.take().expect("a request");
         if document {
             deciding.deliver(demand, generation, b"<configuration/>");
@@ -511,7 +522,7 @@ proptest! {
                 detail: changes,
             });
         }
-        management.poll(&mut endpoint);
+        management.poll(at(0), &mut endpoint);
         for (status, line) in &endpoint.answered {
             prop_assert!(line.len() <= MAX_ANSWER_LEN);
             prop_assert!(Status::ALL.contains(status));
@@ -523,4 +534,105 @@ proptest! {
         // submission was answered. Never both, and never neither.
         prop_assert_eq!(endpoint.answered.len() + endpoint.documents.len(), 1);
     }
+}
+
+/// A deciding domain that never answers does not hold this module's one
+/// outstanding slot forever: the request is given up on at its deadline and the
+/// client told the node could not answer.
+///
+/// Without the deadline the submission stays waiting, the endpoint's staging array
+/// stays claimed, and every body-bearing surface answers 503 for the life of the
+/// domain.
+#[test]
+fn a_deciding_domain_that_never_answers_is_given_up_on() {
+    let channel = Channel::zero();
+    let mut management = channel.management();
+    let mut deciding = channel.deciding();
+    let mut endpoint = Endpoint::submitting(b"<configuration/>");
+
+    assert!(
+        management.poll(at(0), &mut endpoint),
+        "the request went out"
+    );
+    let demand = deciding.take().expect("a request was issued");
+    assert_eq!(demand.operation(), Some(ConfigOperation::Submit));
+    // And is never answered: `demand` is dropped without a reply.
+    drop(demand);
+
+    let deadline = ANSWER_TIMEOUT.as_nanos();
+    management.poll(at(deadline - 1), &mut endpoint);
+    assert!(endpoint.answered.is_empty(), "given up on early");
+
+    management.poll(at(deadline), &mut endpoint);
+    assert_eq!(
+        endpoint.answer(),
+        (Status::ServiceUnavailable, ""),
+        "the client was not told the node could not answer"
+    );
+
+    // And the slot is free again, so the *next* submission is issued rather than
+    // being the one this domain never gets to.
+    let mut next = Endpoint::submitting(b"<configuration/>");
+    assert!(
+        management.poll(at(deadline), &mut next),
+        "the outstanding slot was never given back"
+    );
+}
+
+/// A late answer cannot be mistaken for the next request's. The abandoned request
+/// left a sequence number behind, and the reply to it answers a number no pending
+/// request is held against — which the requester reads as no answer at all.
+#[test]
+fn an_answer_that_arrives_after_the_deadline_answers_nothing() {
+    let channel = Channel::zero();
+    let mut management = channel.management();
+    let mut deciding = channel.deciding();
+    let mut endpoint = Endpoint::submitting(b"<configuration/>");
+
+    assert!(management.poll(at(0), &mut endpoint));
+    let stale = deciding.take().expect("a request was issued");
+    let deadline = ANSWER_TIMEOUT.as_nanos();
+    management.poll(at(deadline), &mut endpoint);
+    assert_eq!(endpoint.answer().0, Status::ServiceUnavailable);
+
+    // The deciding domain answers the request that was abandoned, and a fresh
+    // submission is outstanding by now.
+    let mut next = Endpoint::submitting(b"<configuration/>");
+    assert!(management.poll(at(deadline), &mut next));
+    deciding.answer(
+        stale,
+        ConfigAnswer::Applied {
+            generation: 7,
+            changes: 3,
+        },
+    );
+    management.poll(at(deadline), &mut next);
+    assert!(
+        next.answered.is_empty(),
+        "a reply to an abandoned request was taken for the new one's: {:?}",
+        next.answered
+    );
+}
+
+/// A node whose clock has not been published arms no deadline, and a pass with no
+/// reading of the clock judges none. Both mean *not yet*, which is the direction
+/// that cannot refuse an operator's submission for nothing.
+#[test]
+fn an_unclocked_pass_gives_up_on_nothing() {
+    let channel = Channel::zero();
+    let mut management = channel.management();
+    let mut deciding = channel.deciding();
+    let mut endpoint = Endpoint::submitting(b"<configuration/>");
+
+    assert!(management.poll(None, &mut endpoint), "the request went out");
+    let _demand = deciding.take().expect("a request was issued");
+    for _ in 0..4 {
+        management.poll(None, &mut endpoint);
+    }
+    assert!(endpoint.answered.is_empty());
+
+    // A clock arriving afterwards arms nothing retroactively — the request was
+    // parked without a deadline — so it is the *next* request that is bounded.
+    management.poll(at(ANSWER_TIMEOUT.as_nanos() * 4), &mut endpoint);
+    assert!(endpoint.answered.is_empty());
 }

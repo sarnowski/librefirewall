@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::http::{
-    HttpCounters, MAX_BODY_LEN, MAX_BODY_TARGETS, MAX_STREAM_LEN, MAX_STREAM_TARGETS,
+    BODY_TIMEOUT, HttpCounters, MAX_BODY_LEN, MAX_BODY_TARGETS, MAX_STREAM_LEN, MAX_STREAM_TARGETS,
     METRICS_TARGET, REQUEST_CAPACITY, RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
 };
 use net_headers::{
@@ -1784,10 +1784,10 @@ fn a_server_with_no_slot_left_counts_the_refusal() {
         .collect();
 
     for id in ids.iter().take(2) {
-        server.take(*id, b"GET / HTT");
+        server.take(at(0), *id, b"GET / HTT");
     }
     assert_eq!(server.counters().slots_exhausted, 0);
-    server.take(ids[2], b"nowhere to go");
+    server.take(at(0), ids[2], b"nowhere to go");
     assert_eq!(server.counters().slots_exhausted, 1);
 
     // Nothing to drive on a connection with no slot, and nothing to serve.
@@ -1843,7 +1843,7 @@ fn a_server_with_no_slot_left_counts_the_refusal() {
         None
     );
     // Both slots are free again, so the third connection now has one.
-    server.take(ids[2], b"GET / HTT");
+    server.take(at(0), ids[2], b"GET / HTT");
     assert_eq!(server.counters().slots_exhausted, 1);
     assert_eq!(Server::<2>::default().counters(), HttpCounters::default());
     // A peer that closes a connection the server never saw changes nothing.
@@ -1863,7 +1863,7 @@ fn a_refused_send_or_close_leaves_the_server_holding() {
 
     // A connection still in `SYN_RECEIVED` can neither send nor close, so both
     // arms of `drive` are refused and nothing is counted as having gone out.
-    server.take(id, b"GET /metrics HTTP/1.1\r\n\r\n");
+    server.take(at(0), id, b"GET /metrics HTTP/1.1\r\n\r\n");
     server.supply(Status::Ok, Some(ContentType::Metrics), |out| {
         Body(8).render(out)
     });
@@ -1874,7 +1874,7 @@ fn a_refused_send_or_close_leaves_the_server_holding() {
     // A peer that closed with no request on a connection that cannot close: the
     // close arm is reached and refused.
     let other = open(&mut stack, 40001, &mut out);
-    server.take(other, b"");
+    server.take(at(0), other, b"");
     server.note_peer_closed(other);
     assert_eq!(server.drive(&mut stack, at(0), other, &mut out), None);
 }
@@ -3151,6 +3151,7 @@ fn a_posted_body_arrives_whole_and_is_handed_to_the_caller() {
     let body = document(64);
 
     server.take(
+        at(0),
         id,
         &[post_head(DOCUMENT_TARGET, body.len()), body.clone()].concat(),
     );
@@ -3187,7 +3188,7 @@ fn a_body_split_across_segments_is_reassembled_and_the_window_asks_for_the_rest(
     let id = open(&mut stack, 40000, &mut out);
     let body = document(4096);
 
-    server.take(id, &post_head(DOCUMENT_TARGET, body.len()));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, body.len()));
     assert_eq!(server.submission(), None, "nothing is complete yet");
     // The window the peer is offered is the whole body it still owes, which is
     // more than a request buffer holds: composing a segment sets the window from
@@ -3201,7 +3202,7 @@ fn a_body_split_across_segments_is_reassembled_and_the_window_asks_for_the_rest(
     );
 
     for chunk in body.chunks(500) {
-        server.take(id, chunk);
+        server.take(at(0), id, chunk);
     }
     assert_eq!(server.submission(), Some(body.as_slice()));
     assert_eq!(server.counters().bodies_taken, 1);
@@ -3217,7 +3218,7 @@ fn a_body_at_the_bound_is_taken_and_one_past_it_is_refused_unread() {
     let mut out = vec![0u8; ROOMY];
 
     let id = open(&mut stack, 40000, &mut out);
-    server.take(id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
     assert_eq!(
         server.pending_submission(),
         None,
@@ -3230,7 +3231,7 @@ fn a_body_at_the_bound_is_taken_and_one_past_it_is_refused_unread() {
     server.release(id);
 
     let id = open(&mut stack, 40001, &mut out);
-    server.take(id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN + 1));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN + 1));
     assert_eq!(
         server.counters().responses[Status::ContentTooLarge.slot()],
         1
@@ -3249,8 +3250,8 @@ fn bytes_past_the_declared_length_are_counted_and_dropped() {
     let id = open(&mut stack, 40000, &mut out);
     let body = document(32);
 
-    server.take(id, &post_head(DOCUMENT_TARGET, body.len()));
-    server.take(id, &[body.clone(), document(16)].concat());
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, body.len()));
+    server.take(at(0), id, &[body.clone(), document(16)].concat());
     assert_eq!(server.submission(), Some(body.as_slice()));
     assert_eq!(server.counters().bodies_overrun, 16);
 }
@@ -3265,7 +3266,7 @@ fn a_post_with_no_body_is_a_submission_of_nothing() {
     let mut out = vec![0u8; ROOMY];
     let id = open(&mut stack, 40000, &mut out);
 
-    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, 0));
     assert_eq!(server.submission(), Some(b"".as_slice()));
     assert_eq!(server.counters().bodies_taken, 1);
 }
@@ -3281,7 +3282,7 @@ fn a_method_the_target_does_not_answer_is_405_and_an_absent_target_is_404() {
 
     // `POST` to a target answered only on `GET`.
     let id = open(&mut stack, 40000, &mut out);
-    server.take(id, &post_head(METRICS_TARGET, 4));
+    server.take(at(0), id, &post_head(METRICS_TARGET, 4));
     assert_eq!(
         server.counters().responses[Status::MethodNotAllowed.slot()],
         1
@@ -3289,7 +3290,7 @@ fn a_method_the_target_does_not_answer_is_405_and_an_absent_target_is_404() {
 
     // `POST` to a streamed target, which is also `GET`-only.
     let id = open(&mut stack, 40001, &mut out);
-    server.take(id, &post_head(RECORDING_TARGET, 4));
+    server.take(at(0), id, &post_head(RECORDING_TARGET, 4));
     assert_eq!(
         server.counters().responses[Status::MethodNotAllowed.slot()],
         2
@@ -3297,12 +3298,12 @@ fn a_method_the_target_does_not_answer_is_405_and_an_absent_target_is_404() {
 
     // `POST` to nothing at all.
     let id = open(&mut stack, 40002, &mut out);
-    server.take(id, &post_head("/nowhere", 4));
+    server.take(at(0), id, &post_head("/nowhere", 4));
     assert_eq!(server.counters().responses[Status::NotFound.slot()], 1);
 
     // And a method that is neither.
     let id = open(&mut stack, 40003, &mut out);
-    server.take(id, b"DELETE /config HTTP/1.1\r\n\r\n");
+    server.take(at(0), id, b"DELETE /config HTTP/1.1\r\n\r\n");
     assert_eq!(
         server.counters().responses[Status::MethodNotAllowed.slot()],
         3
@@ -3319,7 +3320,7 @@ fn a_get_of_a_post_only_target_is_405() {
     assert!(server.serve_body_at("/submit-only"));
 
     let id = open(&mut stack, 40000, &mut out);
-    server.take(id, b"GET /submit-only HTTP/1.1\r\n\r\n");
+    server.take(at(0), id, b"GET /submit-only HTTP/1.1\r\n\r\n");
     assert_eq!(
         server.counters().responses[Status::MethodNotAllowed.slot()],
         1
@@ -3369,7 +3370,7 @@ fn a_rendered_target_names_itself_so_its_owner_can_tell() {
     let mut out = vec![0u8; ROOMY];
 
     let id = open(&mut stack, 40000, &mut out);
-    server.take(id, b"GET /config HTTP/1.1\r\n\r\n");
+    server.take(at(0), id, b"GET /config HTTP/1.1\r\n\r\n");
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
         Some(DOCUMENT_TARGET)
@@ -3384,7 +3385,7 @@ fn a_rendered_target_names_itself_so_its_owner_can_tell() {
     server.release(id);
 
     let id = open(&mut stack, 40001, &mut out);
-    server.take(id, SCRAPE);
+    server.take(at(0), id, SCRAPE);
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
         Some(METRICS_TARGET)
@@ -3402,8 +3403,8 @@ fn a_submission_in_progress_refuses_a_concurrent_scrape() {
     let posting = open(&mut stack, 40000, &mut out);
     let scraping = open(&mut stack, 40001, &mut out);
 
-    server.take(posting, &post_head(DOCUMENT_TARGET, 64));
-    server.take(scraping, SCRAPE);
+    server.take(at(0), posting, &post_head(DOCUMENT_TARGET, 64));
+    server.take(at(0), scraping, SCRAPE);
     assert_eq!(
         server.counters().responses[Status::ServiceUnavailable.slot()],
         1
@@ -3420,7 +3421,7 @@ fn an_answer_that_will_not_fit_is_refused_and_counted() {
     let mut out = vec![0u8; ROOMY];
     let id = open(&mut stack, 40000, &mut out);
 
-    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, 0));
     server.supply(Status::Ok, None, |_| None);
     assert_eq!(server.counters().bodies_refused, 1);
     assert_eq!(
@@ -3438,8 +3439,8 @@ fn a_peer_that_closes_mid_body_submits_nothing() {
     let mut out = vec![0u8; ROOMY];
     let id = open(&mut stack, 40000, &mut out);
 
-    server.take(id, &post_head(DOCUMENT_TARGET, 4096));
-    server.take(id, &document(100));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, 4096));
+    server.take(at(0), id, &document(100));
     assert_eq!(server.submission(), None);
     server.note_peer_closed(id);
     assert_eq!(server.submission(), None, "a half-sent document is not one");
@@ -3455,16 +3456,189 @@ fn a_submission_nobody_answers_is_released_with_its_connection() {
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     let id = open(&mut stack, 40000, &mut out);
-    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, 0));
     assert!(server.submission().is_some());
 
     server.release(id);
     assert_eq!(server.submission(), None);
     let next = open(&mut stack, 40001, &mut out);
-    server.take(next, SCRAPE);
+    server.take(at(0), next, SCRAPE);
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
         Some(METRICS_TARGET),
         "the array was not released"
     );
+}
+
+/// A body that stops arriving is given up on at its deadline, rather than holding
+/// the one staging array until the transport's idle timer eventually reaps the
+/// connection — which it never does while a peer keeps trickling bytes.
+#[test]
+fn a_body_that_stalls_past_its_deadline_is_answered_408() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    // A head declaring far more than arrives, which is the whole of the attack:
+    // the declaration is honest and the delivery never completes.
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
+    server.take(at(0), id, &document(1));
+    assert_eq!(server.submission(), None, "the body is incomplete");
+    server.expire(at(BODY_TIMEOUT.as_nanos() - 1));
+    assert_eq!(server.counters().bodies_timed_out, 0, "not yet");
+
+    server.expire(at(BODY_TIMEOUT.as_nanos()));
+    assert_eq!(server.counters().bodies_timed_out, 1);
+    assert_eq!(
+        server.counters().responses[Status::RequestTimeout.slot()],
+        1
+    );
+    // Nothing is waiting on a decision any more, and a second pass finds nothing
+    // left to give up on.
+    assert_eq!(server.pending_submission(), None);
+    server.expire(at(BODY_TIMEOUT.as_nanos() * 2));
+    assert_eq!(server.counters().bodies_timed_out, 1, "given up on twice");
+}
+
+/// The point of the deadline: the surfaces that share the array answer again. A
+/// scrape refused `503` while the body was accumulating is answered `200` once it
+/// has been given up on, without the stalled peer doing anything at all.
+#[test]
+fn a_stalled_body_stops_refusing_the_surfaces_that_share_the_array() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let poster = open(&mut stack, 40000, &mut out);
+    let scraper = open(&mut stack, 40001, &mut out);
+
+    server.take(at(0), poster, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
+    // While the body is accumulating the array is claimed, and this is the denial
+    // the deadline exists to end.
+    server.take(at(0), scraper, SCRAPE);
+    assert_eq!(
+        server.counters().responses[Status::ServiceUnavailable.slot()],
+        1
+    );
+    assert_eq!(server.pending_render(), None);
+    server.release(scraper);
+
+    server.expire(at(BODY_TIMEOUT.as_nanos()));
+
+    let scraper = open(&mut stack, 40002, &mut out);
+    server.take(at(BODY_TIMEOUT.as_nanos()), scraper, SCRAPE);
+    assert_eq!(
+        server.pending_render().map(|(_, target)| target),
+        Some(METRICS_TARGET),
+        "the array was not handed back"
+    );
+    assert_eq!(
+        server.counters().responses[Status::ServiceUnavailable.slot()],
+        1,
+        "the second scrape was refused as well"
+    );
+}
+
+/// A clock that has stopped, and one that has gone backwards, never end a body
+/// early: the deadline is an instant and the comparison is one-sided, so the
+/// direction a broken clock fails in is "not yet" — an operator's submission is
+/// never refused for nothing.
+#[test]
+fn a_clock_that_stalls_or_reverses_does_not_expire_a_body_early() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    let armed = BODY_TIMEOUT.as_nanos();
+    server.take(at(armed), id, &post_head(DOCUMENT_TARGET, 64));
+    // Stalled: every later pass reads the same instant the body was taken at.
+    for _ in 0..8 {
+        server.expire(at(armed));
+    }
+    // Reversed: an instant before the body began. `Monotonic` saturates rather
+    // than wrapping, so the deadline stays where it was armed.
+    server.expire(at(0));
+    assert_eq!(server.counters().bodies_timed_out, 0);
+
+    // And the body still completes normally afterwards, so nothing about the
+    // deadline has broken the ordinary path.
+    server.take(at(armed), id, &document(64));
+    assert_eq!(server.submission(), Some(document(64).as_slice()));
+}
+
+/// An arriving byte does **not** move the deadline. That is the whole difference
+/// between this bound and the transport's idle timeout, which one byte every few
+/// minutes defeats: a peer that keeps trickling is given up on at the deadline the
+/// head set, however recently it last sent.
+#[test]
+fn a_trickle_does_not_move_the_deadline() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    server.take(at(0), id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
+    // A byte at a time, each later than the last, right up to the deadline.
+    let step = BODY_TIMEOUT.as_nanos() / 8;
+    for tick in 1..8 {
+        server.take(at(step * tick), id, &document(1));
+        server.expire(at(step * tick));
+    }
+    assert_eq!(server.counters().bodies_timed_out, 0);
+    server.expire(at(BODY_TIMEOUT.as_nanos()));
+    assert_eq!(
+        server.counters().bodies_timed_out,
+        1,
+        "a trickling peer moved a deadline it must not reach"
+    );
+}
+
+/// The connection is **reset** rather than closed. A `FIN` would leave the peer's
+/// own half open, and each byte it went on sending would refresh the transport's
+/// idle timer — so a close would give the array back and hold the connection slot
+/// instead, which is the same denial one table along.
+#[test]
+fn an_expired_body_ends_the_connection_with_a_reset() {
+    let mut endpoint = endpoint();
+    assert!(endpoint.serve_body_at(DOCUMENT_TARGET));
+    let mut station = Station::new(40000, 0x7373);
+    let mut out = vec![0u8; ROOMY];
+    handshake(&mut endpoint, &mut station, &mut out);
+
+    let head = station.frame(
+        lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH),
+        &post_head(DOCUMENT_TARGET, MAX_BODY_LEN),
+    );
+    endpoint.handle(Some(at(0)), &head, &mut out);
+    assert_eq!(endpoint.submission_wanted(), None);
+
+    // The 408 goes out first, then the reset: a client that is still listening is
+    // told why, and the connection is gone either way.
+    let late = at(BODY_TIMEOUT.as_nanos());
+    let mut statuses = Vec::new();
+    let mut reset = false;
+    for _ in 0..8 {
+        let Polled::Frame { len } = endpoint.poll_output(late, &mut out) else {
+            break;
+        };
+        let (flags, _, payload) = station.read(&out[..len]);
+        if !payload.is_empty() {
+            statuses.push(payload);
+        }
+        reset |= flags.contains(lfw_tcp::Flags::RST);
+        assert!(
+            !flags.contains(lfw_tcp::Flags::FIN),
+            "a close would leave the peer's half open to keep refreshing the idle timer"
+        );
+    }
+    let answered = statuses.concat();
+    assert!(
+        std::str::from_utf8(&answered)
+            .is_ok_and(|text| text.starts_with("HTTP/1.1 408 Request Timeout")),
+        "the client was not told why: {:?}",
+        std::str::from_utf8(&answered)
+    );
+    assert!(reset, "the connection was not reset");
+    assert_eq!(endpoint.http_counters().bodies_timed_out, 1);
 }

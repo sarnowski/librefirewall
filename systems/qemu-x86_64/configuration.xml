@@ -42,13 +42,23 @@
      outcomes are distinguishable by drop reason and by per-rule counter, which
      is what `tools/xtask/src/forward_harness.rs` asserts.
 
-     THESE RULES ARE ABOUT WHICH FLOWS MAY OPEN, and nothing else. A packet an
-     existing flow already accounts for is forwarded before the filter is
-     consulted at all, so `probe-forward` decides the *first* packet of a
-     conversation and the rest of it travels on the flow that packet opened.
-     That is why there is no rule here about established traffic and no criterion
-     to write one with: a reply comes back because the appliance recognises the
-     conversation, not because a line of this document permits it.
+     THESE RULES ARE MOSTLY ABOUT WHICH FLOWS MAY OPEN. A packet an established
+     flow already accounts for is forwarded before the filter is consulted at all,
+     so `probe-forward` decides the *first* packet of a conversation and the rest
+     of it travels on the flow that packet opened. That is why there is no rule
+     here about established traffic and no criterion to write one with: a reply
+     comes back because the appliance recognises the conversation, not because a
+     line of this document permits it.
+
+     The `tracking` criterion is where the other thing that reaches the filter is
+     named: traffic an existing conversation is the *reason* for without belonging
+     to it, which today means an ICMP error quoting one of its datagrams. Such an
+     error is composed by whoever sent it, with a source address of its choosing,
+     so it is decided by these rules like anything else — and this document names
+     no rule admitting it, so it is denied. `probe-forward` says `opening` rather
+     than `any` for exactly that reason: an `accept` written for a conversation's
+     first packet must not quietly also admit an error somebody else composed
+     about it.
 
      What it costs is stated where it is paid: a packet the connection tracker
      cannot keep state for — a fragment, a protocol it does not decode, a TCP
@@ -80,10 +90,10 @@
     <rules>
         <rule id="probe-blocked" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+              source-port="any" destination-port="5001" icmp-type="any" tracking="any" action="drop"/>
         <rule id="probe-forward" ingress="any" egress="any"
               source="any" destination="any" protocol="udp"
-              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+              source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
     </rules>
     <management mac="52:54:00:12:34:52" address="10.0.2.15"
                 prefix-length="24" enabled="true"/>

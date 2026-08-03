@@ -61,13 +61,13 @@ pub const LOG_CHANGE_KIND_COUNT: u8 = 3;
 pub const LOG_OBJECT_KIND_COUNT: u8 = 4;
 
 /// `lfw_log::Field::ALL`.
-pub const LOG_FIELD_COUNT: u8 = 16;
+pub const LOG_FIELD_COUNT: u8 = 17;
 
 /// `lfw_log::GenerationOutcome::ALL`.
 pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
 
 /// `lfw_log::RejectReason::ALL`.
-pub const LOG_REJECT_REASON_COUNT: u8 = 35;
+pub const LOG_REJECT_REASON_COUNT: u8 = 36;
 
 /// Whether a record's instant is one or is the absence of one.
 ///
@@ -300,6 +300,14 @@ impl<const N: usize> TextImage<N> {
         }
         image.len = u8::try_from(text.len()).unwrap_or(u8::MAX);
         image
+    }
+
+    /// Fold every byte of this image into `hash`, for the digest a declared
+    /// image carries an `identifier` field into.
+    pub(crate) fn fold(&self, hash: u32) -> u32 {
+        let hash = crate::image::fold_bytes(hash, &self.bytes);
+        let hash = crate::image::fold_bytes(hash, &[self.len]);
+        crate::image::fold_bytes(hash, &self._pad)
     }
 }
 

@@ -38,15 +38,26 @@ not, and the difference is a design decision rather than an accident of the file
 - **A rule carries an identity of its own.** An id is what an operator edits a rule by and what the
   appliance reports its matches under, so a rule's counters survive the rules above it being edited.
   Position is precedence; identity is not positional.
-- **A rule decides which conversations may open, and there is no state criterion.** A tracked flow
-  bypasses the ruleset: a packet an existing flow already accounts for is forwarded before the filter
-  is consulted at all, so every frame a rule is ever asked about has just opened a flow. A policy is
-  therefore a statement about *admission* — which conversations may start — and the traffic that
-  follows one is carried by the flow rather than by a line of the document. There is deliberately no
-  criterion for a rule to name a connection's state with, because under this model such a criterion
-  would have exactly one reachable value: an operator could write `established`, watch the document
-  be accepted, and watch the rule sit at zero forever. A writable token that can never mean anything
-  is worse on a security device than no token at all.
+- **A rule decides which conversations may open, and names related traffic where it means to admit
+  it.** An *established* flow bypasses the ruleset: a packet it already accounts for is forwarded
+  before the filter is consulted at all, so the traffic following an admitted conversation is carried
+  by the flow rather than by a line of the document. A policy is therefore mostly a statement about
+  *admission* — which conversations may start.
+
+  Two things reach the filter all the same, and the `tracking` criterion is what tells them apart:
+  `tracking="opening"`, a conversation the appliance has not seen, and `tracking="related"`, traffic
+  an existing conversation is the *reason* for without belonging to it — today an ICMP error quoting
+  one of its datagrams. `tracking="any"` matches either. The second value exists because such an
+  error is composed by whoever sent it, with a source address of its choosing, and delivered to an
+  endpoint of a conversation somebody else opened: recognising it settles where it would go and must
+  not settle whether it may. So the filter decides it too, and a document that admits no related
+  traffic denies it, which is the same default deny everything else here is under.
+
+  There is deliberately no third value. Traffic inside a tracked conversation never reaches the
+  filter, so `established` would have no reachable meaning: an operator could write it, watch the
+  document be accepted, and watch the rule sit at zero forever. A writable token that can never mean
+  anything is worse on a security device than no token at all — so the word is **refused** at commit
+  rather than accepted and ignored.
 
   **This is pf's model, and netfilter's was considered and rejected.** Under netfilter the acceptance
   of established traffic is a rule the operator writes — `--ctstate ESTABLISHED,RELATED -j ACCEPT` —
@@ -61,6 +72,16 @@ not, and the difference is a design decision rather than an accident of the file
   fragment, a protocol it does not decode, a segment from the middle of a conversation it never saw
   begin — is refused before the filter, so no rule can permit one. And editing the policy changes
   which conversations may *start*, so on the packet path it does not reach one already running.
+
+  **A revocation completes in a bounded number of wakeups, and the bound does not grow with the
+  attacker's own state.** How much of a pass a wakeup works off scales with how full the flow table
+  is, because a window of the pass stops at a fixed number of flows and so crosses less index the
+  fuller the table gets. Without that scaling the conversations a narrowed policy forbids would go on
+  forwarding longest exactly when there were most of them — which is the wrong direction, the state
+  being the attacker's to create. A commit arriving while a pass is running queues one fresh pass
+  behind it rather than restarting it, so a storm of submissions from the same unauthenticated party
+  cannot stop a pass ever finishing. The figures are [in the
+  detail](../developers/status-detail.md#connection-tracking).
 
   **What reaches one is the commit, and it reaches it by re-deciding the flow table rather than by
   consulting the policy per packet.** A commit sweeps the table against the new policy and takes back

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bf5791d3883100ac4f410634bdef1512e1ecef3b67b9167fe7028cb59d9e50ad # shrinks to interface_count = 9, neighbour_count = 33

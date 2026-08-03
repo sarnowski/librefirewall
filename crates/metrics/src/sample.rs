@@ -30,10 +30,10 @@ use crate::catalog::{
     ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED,
     ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN,
     FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HTTP_BODIES_REFUSED,
-    HTTP_BODIES_TAKEN, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
-    HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
-    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
-    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
+    HTTP_BODIES_TAKEN, HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS,
+    HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE,
+    HTTP_SLOTS_EXHAUSTED, INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED,
+    Label, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
     POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
     RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
     RECORDING_RECORDS_DROPPED, RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN,
@@ -111,7 +111,7 @@ pub const FLOW_LIFECYCLE_EVENTS: [&str; 5] =
     ["expired", "evicted", "closed", "withdrawn", "revoked"];
 
 /// The two outcomes a re-deciding pass over the connection table can reach.
-pub const POLICY_SWEEP_OUTCOMES: [&str; 2] = ["completed", "restarted"];
+pub const POLICY_SWEEP_OUTCOMES: [&str; 2] = ["completed", "deferred"];
 
 /// What such a pass walks, one label per kind of thing counted.
 pub const POLICY_SWEEP_PROGRESS_KINDS: [&str; 2] = ["buckets", "flows"];
@@ -156,8 +156,8 @@ pub const ROUTE_STAGE_DROP_REASONS: [&str; 9] = [
 /// Status codes the management server can answer with, in the order
 /// [`HttpSample::responses`] holds them; `lfw_http::Status::ALL` is the same set
 /// and a test in `lfw_ip_endpoint` holds the two together.
-pub const HTTP_STATUSES: [&str; 9] = [
-    "200", "400", "404", "405", "413", "414", "431", "503", "505",
+pub const HTTP_STATUSES: [&str; 10] = [
+    "200", "400", "404", "405", "408", "413", "414", "431", "503", "505",
 ];
 
 /// Every writing domain's own account of its log ring.
@@ -860,7 +860,7 @@ impl ForwarderSample {
             &[Label::new("fault", "flow_slot_desync")],
         ),
         s(&POLICY_SWEEP, &[Label::new("outcome", "completed")]),
-        s(&POLICY_SWEEP, &[Label::new("outcome", "restarted")]),
+        s(&POLICY_SWEEP, &[Label::new("outcome", "deferred")]),
         plain(&POLICY_SWEEP_RUNNING),
         s(&POLICY_SWEEP_PROGRESS, &[Label::new("walked", "buckets")]),
         s(&POLICY_SWEEP_PROGRESS, &[Label::new("walked", "flows")]),
@@ -1105,6 +1105,7 @@ pub struct HttpSample {
     pub overflowed: u64,
     pub bodies_refused: u64,
     pub bodies_taken: u64,
+    pub bodies_timed_out: u64,
     pub bodies_overrun: u64,
     pub retransmits_unavailable: u64,
     pub slots_exhausted: u64,
@@ -1112,7 +1113,7 @@ pub struct HttpSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 83;
+pub const MANAGEMENT_SLOTS: usize = 85;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1256,6 +1257,7 @@ impl ManagementSample {
         s(&HTTP_RESPONSES, &[Label::new("status", "400")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "404")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "405")]),
+        s(&HTTP_RESPONSES, &[Label::new("status", "408")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "413")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "414")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "431")]),
@@ -1265,6 +1267,7 @@ impl ManagementSample {
         plain(&HTTP_REQUESTS_OVERFLOWED),
         plain(&HTTP_BODIES_REFUSED),
         plain(&HTTP_BODIES_TAKEN),
+        plain(&HTTP_BODIES_TIMED_OUT),
         plain(&HTTP_BODY_OVERRUNS),
         plain(&HTTP_RETRANSMITS_UNAVAILABLE),
         plain(&HTTP_SLOTS_EXHAUSTED),
@@ -1339,6 +1342,7 @@ impl ManagementSample {
         put(&mut values, &mut at, http.overflowed);
         put(&mut values, &mut at, http.bodies_refused);
         put(&mut values, &mut at, http.bodies_taken);
+        put(&mut values, &mut at, http.bodies_timed_out);
         put(&mut values, &mut at, http.bodies_overrun);
         put(&mut values, &mut at, http.retransmits_unavailable);
         put(&mut values, &mut at, http.slots_exhausted);

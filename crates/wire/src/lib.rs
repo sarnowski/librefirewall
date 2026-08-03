@@ -36,6 +36,15 @@
 //! about a *pair* of them are decidable here — and what is not is named on the
 //! function.
 //!
+//! Holding every rule is still not enough on its own, and that is the sharp
+//! part: a copy taken while the writer publishes again can be *two* images, one
+//! field from each, and every field-level rule holds of such a copy because
+//! every field of it is a field some publisher wrote. What refuses one is the
+//! whole-image machinery around the fields — a counter the publisher raises
+//! before the bytes move and a reader compares across its copy, and a digest of
+//! the image's own bytes that a blend does not match. The counter is what makes
+//! a blend unreachable; the digest is what makes one visible if it ever is.
+//!
 //! The domain that writes the handover only ever holds a shared reference to
 //! the region, because no attach path mints a `&mut` to memory a second domain
 //! maps. So the image in it is expressed as atomics rather than plain fields:
@@ -62,9 +71,10 @@
 //! given back nothing — so nothing here validates a value, and every semantic
 //! rule about a region stays hand-written below where it can be read as a rule.
 //! [`ConfigImage`] stays that plain value — what a writer composes and a reader
-//! copies out. Its words move `Relaxed` under the generation that publishes
-//! them `Release`, and nothing stops the writer rewriting them afterwards,
-//! which is why a [`CheckedConfig`] owns decoded values rather than borrowing.
+//! copies out. Its words move `Relaxed` under the counter that brackets a
+//! publication, and nothing stops the writer publishing again the moment a
+//! reader is done, which is why a [`CheckedConfig`] owns decoded values rather
+//! than borrowing.
 //!
 //! Four more objects of the same kind follow, all here because a region's
 //! layout cannot be expressed in terms of the crate that reads it: the log
@@ -90,7 +100,7 @@ mod tap;
 use core::{
     fmt,
     mem::{align_of, offset_of, size_of},
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicU8, AtomicU32, Ordering, fence},
 };
 
 pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, LOAD_ATTEMPTS};
@@ -308,7 +318,7 @@ shared_image! {
     /// as a [`NeighbourImage`]'s does and for the same reason: what a rule
     /// decides against on the packet path is a port, and resolving the name
     /// twice would be two answers to one question.
-    RuleImage mirrored by RuleSlot, 52 bytes aligned 2 {
+    RuleImage mirrored by RuleSlot, 54 bytes aligned 2 {
         /// 0 accepts and 1 drops, as raw bits.
         @0 action: byte,
         @1 ingress_stated: byte,
@@ -330,16 +340,21 @@ shared_image! {
         @20 icmp_type: byte,
         @21 source_port_stated: byte,
         @22 destination_port_stated: byte,
-        @23 _pad: padding(1),
+        @23 tracking_stated: byte,
+        /// Which of the two things that reach the filter a rule is about: 0 a
+        /// conversation opening, 1 traffic an existing conversation is the reason
+        /// for. A closed pair rather than a wildcard number, on the terms above.
+        @24 tracking: byte,
+        @25 _pad: padding(1),
         /// Inclusive, and equal for a single port: one shape rather than two,
         /// so nothing downstream branches on which of them the document wrote.
-        @24 source_port_low: half,
-        @26 source_port_high: half,
-        @28 destination_port_low: half,
-        @30 destination_port_high: half,
+        @26 source_port_low: half,
+        @28 source_port_high: half,
+        @30 destination_port_low: half,
+        @32 destination_port_high: half,
         /// The `id` of the document's `<rule>`, which is what a per-rule metric
         /// is labelled by and what a refusal names.
-        @32 id: identifier,
+        @34 id: identifier,
     }
 }
 
@@ -353,15 +368,18 @@ shared_image! {
     /// neighbours — so a zeroed region is already the fail-closed
     /// configuration, which is what lets a domain come up before anything has
     /// been written to it.
-    ConfigImage mirrored by ConfigSlot, 14148 bytes aligned 4 {
+    ConfigImage mirrored by ConfigSlot, 14660 bytes aligned 4 {
         @0 generation: word,
         /// How many of `interfaces` the writer filled, as raw bits:
         /// peer-written, so it may name more than the array holds.
         @4 interface_count: word,
         @8 neighbour_count: word,
-        /// Over the validated model, so re-offering an unchanged document is
-        /// recognisable without comparing every field.
-        @12 content_hash: word,
+        /// The fold of every other byte of this image, which
+        /// [`ConfigImage::check`] refuses a mismatch of. It is what makes the
+        /// image self-describing: a copy assembled from two publications differs
+        /// from both in some interior byte, so it does not fold to the word
+        /// either of them wrote.
+        @12 digest: digest,
         @16 management: nested(ManagementImage, ManagementSlot),
         @32 interfaces: array(InterfaceImage, InterfaceSlot, MAX_INTERFACES),
         @320 neighbours: array(NeighbourImage, NeighbourSlot, MAX_NEIGHBOURS),
@@ -373,7 +391,31 @@ shared_image! {
     }
 }
 
+/// What the image digest's fold starts from.
+///
+/// Zero and not FNV's own basis, so an all-zero image folds to zero and matches
+/// the zero its own digest field holds: a zeroed region is the fail-closed
+/// generation and has to stay a coherent image.
+const DIGEST_BASIS: u32 = 0;
+
 impl ConfigImage {
+    /// The digest of this image's own bytes — every field but the one that
+    /// carries it, which cannot be part of what it covers.
+    #[must_use]
+    pub fn computed_digest(&self) -> u32 {
+        self.fold(DIGEST_BASIS)
+    }
+
+    /// Write the digest of this image's own bytes into it, which is what makes
+    /// it one a reader will take.
+    ///
+    /// The publisher's last act on an image, after every other field is final:
+    /// a field set afterwards is a field the digest does not cover, and
+    /// [`Self::check`] refuses the result.
+    pub fn seal(&mut self) {
+        self.digest = self.computed_digest();
+    }
+
     /// Decodes every field the counts cover, refusing the image on the first
     /// value that cannot be one.
     ///
@@ -407,6 +449,16 @@ impl ConfigImage {
     /// # Errors
     /// [`ConfigImageError`], naming the field and the value that refused it.
     pub fn check(&self, port_count: u8) -> Result<CheckedConfig<'_>, ConfigImageError> {
+        // First, because every rule below is a rule about *one* image and this is
+        // what establishes that these bytes are one. A copy the writer changed
+        // under is well-formed field by field — that is what makes it dangerous:
+        // the counts come from one publication and the entries from another, so
+        // each entry passes and the policy is one nobody wrote.
+        let declared = self.digest;
+        let folded = self.computed_digest();
+        if folded != declared {
+            return Err(ConfigImageError::DigestMismatch { declared, folded });
+        }
         let raw_interfaces = self.interfaces.get(..self.interface_count as usize).ok_or(
             ConfigImageError::InterfaceCountExceedsCapacity {
                 count: self.interface_count,
@@ -457,7 +509,6 @@ impl ConfigImage {
 
         Ok(CheckedConfig {
             generation: self.generation,
-            content_hash: self.content_hash,
             management: check_management(&self.management, &interfaces)?,
             interfaces,
             neighbours,
@@ -497,6 +548,13 @@ pub(crate) fn load_bytes<const N: usize>(cells: &[AtomicU8; N]) -> [u8; N] {
 pub struct ConfigHandover {
     offered: AtomicU32,
     committed: AtomicU32,
+    /// Odd while a publication is in progress and even between them, so a reader
+    /// can tell a settled region from one being rewritten under it. Bumped
+    /// before the bytes move and settled after, as
+    /// [`ClockCalibration`](crate::ClockCalibration)'s counter is and for the
+    /// same reason — the generation word cannot carry it, being an identity a
+    /// commit is keyed on rather than a progress marker.
+    publishing: AtomicU32,
     image: ConfigSlot,
 }
 
@@ -509,6 +567,7 @@ impl ConfigHandover {
         Self {
             offered: AtomicU32::new(0),
             committed: AtomicU32::new(0),
+            publishing: AtomicU32::new(0),
             image: ConfigSlot::zero(),
         }
     }
@@ -516,9 +575,23 @@ impl ConfigHandover {
     /// Writes `image` and then releases its generation, in that order and as
     /// one call: a generation whose bytes are not yet in the region names
     /// nothing, so there is no way here to offer one that has not been written.
+    ///
+    /// The whole of it happens under an odd `publishing`, and this call is the
+    /// only writer of the bytes — so a reader that saw the counter even before
+    /// its copy and unchanged after it copied bytes no publication was moving.
     pub fn publish(&self, image: &ConfigImage) {
+        // `| 1` rather than `+ 1`, so a region left odd by a writer that faulted
+        // mid-publish is published into correctly rather than left permanently
+        // unreadable.
+        let writing = self.publishing.load(Ordering::Relaxed) | 1;
+        self.publishing.store(writing, Ordering::Relaxed);
+        // The odd counter must be visible before the bytes move; the `Release`
+        // on the settling store below is what orders the bytes before it.
+        fence(Ordering::Release);
         self.image.store(image);
         self.offered.store(image.generation, Ordering::Release);
+        self.publishing
+            .store(writing.wrapping_add(1), Ordering::Release);
     }
 
     #[must_use]
@@ -539,21 +612,54 @@ impl ConfigHandover {
     /// measured in tens of kilobytes and the hot one has sixteen, so the image
     /// lives in a field of the reader and this fills it.
     ///
-    /// **It still copies exactly once**, which is the whole of the argument
-    /// below and is not weakened by where the bytes land. The copy is made
-    /// through `Relaxed` accesses, and the property that buys is narrow: the
-    /// release/acquire pair on the generation orders the writes of *one*
-    /// publication against a reader that then sees that generation. It orders
-    /// nothing against a publisher that writes again, which is the publisher
-    /// this side is written against — so what comes back here can be a blend of
-    /// two images, one field from each. That is not made safe by ordering and
-    /// is not claimed to be: [`ConfigImage::check`] rules on the copy as one
-    /// value, and a blend is admitted only if every rule holds of the blend.
-    /// What each access buys, therefore, is a read that cannot tear *within a
-    /// field* — which is what keeps a MAC from being half of one address and
-    /// half of another — and nothing more.
-    pub fn load_image_into(&self, image: &mut ConfigImage) {
-        *image = self.image.load();
+    /// **It still copies exactly once**, and the `Relaxed` accesses of the copy
+    /// itself buy only a read that cannot tear *within a field* — which keeps a
+    /// MAC from being half of one address and half of another. What makes the
+    /// copy one *image* is the counter around it: without it a copy could be a
+    /// blend of two publications, one field from each, and no rule about a field
+    /// refuses a blend — every field of it is a field some publisher wrote.
+    ///
+    /// Bounded at [`LOAD_ATTEMPTS`] attempts, on
+    /// [`ClockCalibration`](crate::ClockCalibration)'s terms: a peer that holds
+    /// the counter odd must not be able to spin a reader, and a caller told
+    /// "nothing right now" has lost nothing it cannot ask for again. One known
+    /// bound beyond that: `publishing` wraps, so a publisher completing 2^32
+    /// publications inside one reader's copy would land it back on the value that
+    /// reader took — tens of terabytes of stores inside one 14-kilobyte copy.
+    fn load_settled(&self, image: &mut ConfigImage, word: &AtomicU32) -> Option<u32> {
+        for _ in 0..LOAD_ATTEMPTS {
+            let before = self.publishing.load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                continue;
+            }
+            let generation = word.load(Ordering::Relaxed);
+            *image = self.image.load();
+            // The bytes must be read before the counter is read again; without
+            // this the second load could be hoisted above them and a blended
+            // copy would compare equal.
+            fence(Ordering::Acquire);
+            if self.publishing.load(Ordering::Relaxed) == before {
+                return Some(generation);
+            }
+        }
+        None
+    }
+
+    /// Copy the offered image out of the region and answer the generation it was
+    /// offered under, or `None` where the publisher was rewriting it throughout.
+    pub fn load_offer(&self, image: &mut ConfigImage) -> Option<u32> {
+        self.load_settled(image, &self.offered)
+    }
+
+    /// As [`Self::load_offer`], for the committed generation.
+    ///
+    /// The word and the bytes are two claims of one publisher and are read
+    /// together, but they are not made together: a commit releases a generation
+    /// whose bytes a *later* offer may already have replaced, so the word this
+    /// answers can name a generation the bytes are not. What tells the two apart
+    /// is the image's own `generation` field, which the caller compares.
+    pub fn load_committed(&self, image: &mut ConfigImage) -> Option<u32> {
+        self.load_settled(image, &self.committed)
     }
 
     pub fn publish_committed(&self, generation: u32) {
@@ -643,10 +749,38 @@ pub const CONFIG_REGION_SIZE: usize = {
 /// As [`CONFIG_REGION_SIZE`], for one consumer's acknowledgement region.
 pub const CONFIG_ACK_REGION_SIZE: usize = size_of::<ConfigAck>().next_multiple_of(MAPPING_ALIGN);
 
+/// Which of the two things that reach the filter a rule is about.
+///
+/// Two values and no third, because two are what can reach it: a conversation
+/// opening, and traffic an existing conversation is the reason for. Traffic
+/// *within* an established conversation never reaches the filter at all — the
+/// tracker settles it — so there is no token for it and a document naming one
+/// would be naming a choice it does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedTracking {
+    /// A conversation the appliance has not seen before.
+    Opening,
+    /// Traffic an existing conversation accounts for without belonging to it —
+    /// today an ICMP error quoting one of its datagrams.
+    Related,
+}
+
 /// Why a [`ConfigImage`] was refused. Every variant carries the value that made
 /// it one, so a refusal is attributable to a field rather than to a category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigImageError {
+    /// The image does not fold to the digest it carries, so these bytes are not
+    /// one publication: either the writer sealed them wrongly, or the copy was
+    /// taken across two of them.
+    DigestMismatch {
+        declared: u32,
+        folded: u32,
+    },
+    /// A `tracking` byte that is neither of the two the criterion has.
+    RuleTrackingUnknown {
+        index: usize,
+        tracking: u8,
+    },
     InterfaceCountExceedsCapacity {
         count: u32,
     },
@@ -860,6 +994,7 @@ pub enum RuleCriterion {
     SourcePort,
     DestinationPort,
     IcmpType,
+    Tracking,
 }
 
 impl RuleCriterion {
@@ -874,6 +1009,7 @@ impl RuleCriterion {
             Self::SourcePort => "source-port",
             Self::DestinationPort => "destination-port",
             Self::IcmpType => "icmp-type",
+            Self::Tracking => "tracking",
         }
     }
 }
@@ -887,6 +1023,14 @@ impl fmt::Display for RuleCriterion {
 impl fmt::Display for ConfigImageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DigestMismatch { declared, folded } => write!(
+                f,
+                "the image folds to {folded:#010x} and declares {declared:#010x}"
+            ),
+            Self::RuleTrackingUnknown { index, tracking } => write!(
+                f,
+                "rule {index} tracking byte {tracking} names neither an opening nor related traffic"
+            ),
             Self::InterfaceCountExceedsCapacity { count } => write!(
                 f,
                 "interface count {count} exceeds the {MAX_INTERFACES} slots the image holds"
@@ -1433,6 +1577,8 @@ fn check_rule(
         icmp_type,
         source_port_stated,
         destination_port_stated,
+        tracking_stated,
+        tracking,
         source_port_low,
         source_port_high,
         destination_port_low,
@@ -1502,6 +1648,12 @@ fn check_rule(
         RuleCriterion::DestinationPort,
     )?;
     let icmp_type = stated(icmp_type_stated, RuleCriterion::IcmpType)?.then_some(icmp_type);
+    let tracking = match (stated(tracking_stated, RuleCriterion::Tracking)?, tracking) {
+        (false, _) => None,
+        (true, 0) => Some(CheckedTracking::Opening),
+        (true, 1) => Some(CheckedTracking::Related),
+        (true, tracking) => return Err(ConfigImageError::RuleTrackingUnknown { index, tracking }),
+    };
 
     if protocol == Some(ICMP_PROTOCOL) {
         for criterion in [RuleCriterion::SourcePort, RuleCriterion::DestinationPort] {
@@ -1534,6 +1686,7 @@ fn check_rule(
         source_port,
         destination_port,
         icmp_type,
+        tracking,
         action,
     })
 }
@@ -1689,6 +1842,9 @@ checked_value! {
         source_port: Option<CheckedPorts>,
         destination_port: Option<CheckedPorts>,
         icmp_type: Option<u8>,
+        /// Which of the two things that reach the filter this rule is about, or
+        /// `None` for either of them.
+        tracking: Option<CheckedTracking>,
         action: CheckedAction,
     }
 }
@@ -1703,7 +1859,6 @@ checked_value! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckedConfig<'image> {
     generation: u32,
-    content_hash: u32,
     management: Option<CheckedManagement>,
     interfaces: [Option<CheckedInterface>; MAX_INTERFACES],
     neighbours: [Option<CheckedNeighbour>; MAX_NEIGHBOURS],
@@ -1715,8 +1870,9 @@ pub struct CheckedConfig<'image> {
     /// read a configuration are exactly the ones whose stacks cannot hold one.
     /// The borrow is sound where the owned copies were needed for the opposite
     /// reason: what the reader holds is *its own* copy of the image, taken once
-    /// by [`ConfigHandover::load_image_into`], so these bytes are not the
-    /// shared region and no writer can move them under a decision.
+    /// by [`ConfigHandover::load_offer`] or [`ConfigHandover::load_committed`],
+    /// so these bytes are not the shared region and no writer can move them
+    /// under a decision.
     rules: &'image [RuleImage],
     /// Kept so a rule can be decoded on demand by the very function that
     /// checked it, rather than by a second one that could come to disagree.
@@ -1727,11 +1883,6 @@ impl<'image> CheckedConfig<'image> {
     #[must_use]
     pub const fn generation(&self) -> u32 {
         self.generation
-    }
-
-    #[must_use]
-    pub const fn content_hash(&self) -> u32 {
-        self.content_hash
     }
 
     /// The addressing of the management port, or `None` where it has none.
@@ -1789,15 +1940,16 @@ impl<'image> CheckedConfig<'image> {
     }
 }
 
-// The two words that publish an image cross protection domains as the image
+// The three words that publish an image cross protection domains as the image
 // does, and no declaration above covers them: `ConfigHandover` is the image
 // plus a header rather than an image of its own.
 const _: () = {
-    assert!(size_of::<ConfigHandover>() == 14_156);
+    assert!(size_of::<ConfigHandover>() == 14_672);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
     assert!(offset_of!(ConfigHandover, committed) == 4);
-    assert!(offset_of!(ConfigHandover, image) == 8);
+    assert!(offset_of!(ConfigHandover, publishing) == 8);
+    assert!(offset_of!(ConfigHandover, image) == 12);
 
     assert!(size_of::<ConfigAck>() == 8);
     assert!(align_of::<ConfigAck>() == 4);
@@ -1816,13 +1968,16 @@ const _: () = {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::{sync::atomic::AtomicBool, thread};
 
-    /// The image a handover holds, by value. The domains take it into storage
-    /// they own, for the reason `load_image_into` gives; a host test has a
+    /// The offered image a handover holds, by value. The domains take it into
+    /// storage they own, for the reason `load_offer` gives; a host test has a
     /// stack that does not care, and reads better for it.
     fn loaded(handover: &ConfigHandover) -> ConfigImage {
         let mut image = ConfigImage::ZERO;
-        handover.load_image_into(&mut image);
+        handover
+            .load_offer(&mut image)
+            .expect("no publisher is writing");
         image
     }
 
@@ -1951,7 +2106,6 @@ mod tests {
     fn image(interfaces: usize, neighbours: usize) -> ConfigImage {
         let mut image = ConfigImage::ZERO;
         image.generation = 7;
-        image.content_hash = 0xdead_beef;
         image.interface_count = interfaces as u32;
         image.neighbour_count = neighbours as u32;
         for (index, slot) in image.interfaces.iter_mut().enumerate() {
@@ -1960,14 +2114,23 @@ mod tests {
         for (index, slot) in image.neighbours.iter_mut().enumerate() {
             *slot = neighbour(index);
         }
+        image.seal();
         image
+    }
+
+    /// `raw` with its digest re-taken. Every test below edits a field of a valid
+    /// image, and an edit leaves the digest naming the bytes before it — so
+    /// without this the refusal under test is never reached and every one of
+    /// them asserts the digest instead.
+    fn resealed(raw: &mut ConfigImage) -> &ConfigImage {
+        raw.seal();
+        raw
     }
 
     #[test]
     fn a_zeroed_region_is_the_fail_closed_configuration() {
         let checked = ConfigImage::ZERO.check(PORTS).expect("zero is valid");
         assert_eq!(checked.generation(), 0);
-        assert_eq!(checked.content_hash(), 0);
         assert_eq!(checked.interface_count(), 0);
         assert_eq!(checked.neighbour_count(), 0);
         assert_eq!(
@@ -1979,12 +2142,94 @@ mod tests {
         assert_eq!(checked.neighbours().next(), None);
     }
 
+    /// The digest covers every byte of the image, so no single-byte edit
+    /// survives it. Field by field rather than one edit, because a fold that had
+    /// dropped a field would still pass every other one.
     #[test]
-    fn a_checked_image_carries_its_generation_and_hash_and_every_decoded_field() {
-        let raw = image(2, 3);
-        let checked = raw.check(PORTS).expect("valid");
+    fn no_byte_of_a_sealed_image_can_be_changed_without_the_digest_refusing_it() {
+        let edits: [fn(&mut ConfigImage); 9] = [
+            |raw| raw.generation ^= 1,
+            |raw| raw.interface_count = 1,
+            |raw| raw.neighbour_count = 0,
+            |raw| raw.rule_count = 1,
+            |raw| raw.interfaces[0].port ^= 1,
+            |raw| raw.interfaces[0]._pad = [0xaa; 1],
+            |raw| raw.interfaces[0].id = IdentifierImage::from_text(b"other"),
+            |raw| raw.neighbours[1].address = [10, 0, 1, 9],
+            |raw| raw.management.enabled = 1,
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            let mut torn = image(2, 2);
+            edit(&mut torn);
+            let declared = torn.digest;
+            assert_eq!(
+                torn.check(PORTS),
+                Err(ConfigImageError::DigestMismatch {
+                    declared,
+                    folded: torn.computed_digest(),
+                }),
+                "edit {index}"
+            );
+        }
+    }
+
+    /// The rules array is a quarter of a million bytes past the last field a
+    /// four-page image ever reached, so it gets its own case: a fold that
+    /// stopped at `rule_count` would pass every test above.
+    #[test]
+    fn a_rule_body_no_count_covers_is_still_covered_by_the_digest() {
+        let mut torn = image(2, 2);
+        torn.rules[MAX_RULES - 1].icmp_type ^= 0xff;
+        assert!(matches!(
+            torn.check(PORTS),
+            Err(ConfigImageError::DigestMismatch { .. })
+        ));
+    }
+
+    /// The one image whose digest is not a computation: a region the kernel
+    /// zeroed is generation 0, and a reader that refused it would refuse the
+    /// fail-closed configuration every domain starts under.
+    #[test]
+    fn the_zeroed_region_is_its_own_digest() {
+        assert_eq!(ConfigImage::ZERO.digest, 0);
+        assert_eq!(ConfigImage::ZERO.computed_digest(), 0);
+        let mut sealed = ConfigImage::ZERO;
+        sealed.seal();
+        assert_eq!(sealed, ConfigImage::ZERO);
+    }
+
+    /// The blend the digest exists to refuse, assembled by hand: the counts of
+    /// one publication over the entries of another. Every entry of it is
+    /// well-formed and every field-level rule holds of it, which is exactly why
+    /// no field-level rule can catch it.
+    #[test]
+    fn a_copy_assembled_from_two_publications_is_refused_as_one_image() {
+        let wide = image(2, 2);
+        let narrow = {
+            let mut narrow = image(2, 2);
+            narrow.interfaces[1] = interface(1);
+            narrow.interfaces[1].address = [10, 0, 1, 9];
+            narrow.seal();
+            narrow
+        };
+        wide.check(PORTS).expect("one publication checks");
+        narrow.check(PORTS).expect("the other checks too");
+
+        let blend = ConfigImage {
+            interfaces: narrow.interfaces,
+            ..wide
+        };
+        assert!(matches!(
+            blend.check(PORTS),
+            Err(ConfigImageError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_checked_image_carries_its_generation_and_every_decoded_field() {
+        let mut raw = image(2, 3);
+        let checked = resealed(&mut raw).check(PORTS).expect("valid");
         assert_eq!(checked.generation(), 7);
-        assert_eq!(checked.content_hash(), 0xdead_beef);
         assert_eq!(checked.interface_count(), 2);
         assert_eq!(checked.neighbour_count(), 3);
 
@@ -2012,15 +2257,17 @@ mod tests {
         for slot in raw.neighbours.iter_mut().skip(1) {
             slot.mac = [0; 6];
         }
-        let checked = raw.check(PORTS).expect("the garbage is beyond the counts");
+        let checked = resealed(&mut raw)
+            .check(PORTS)
+            .expect("the garbage is beyond the counts");
         assert_eq!(checked.interface_count(), 1);
         assert_eq!(checked.neighbour_count(), 1);
     }
 
     #[test]
     fn an_interface_count_at_capacity_is_accepted() {
-        let raw = image(MAX_INTERFACES, 0);
-        let checked = raw.check(WIDE).expect("valid");
+        let mut raw = image(MAX_INTERFACES, 0);
+        let checked = resealed(&mut raw).check(WIDE).expect("valid");
         assert_eq!(checked.interface_count(), MAX_INTERFACES);
     }
 
@@ -2039,7 +2286,7 @@ mod tests {
         let mut raw = image(MAX_INTERFACES, 0);
         raw.interface_count = MAX_INTERFACES as u32 + 1;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::InterfaceCountExceedsCapacity { count: 9 })
         );
     }
@@ -2049,15 +2296,15 @@ mod tests {
         let mut raw = image(0, 0);
         raw.interface_count = u32::MAX;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::InterfaceCountExceedsCapacity { count: u32::MAX })
         );
     }
 
     #[test]
     fn a_neighbour_count_at_capacity_is_accepted() {
-        let raw = image(2, MAX_NEIGHBOURS);
-        let checked = raw.check(PORTS).expect("valid");
+        let mut raw = image(2, MAX_NEIGHBOURS);
+        let checked = resealed(&mut raw).check(PORTS).expect("valid");
         assert_eq!(checked.neighbour_count(), MAX_NEIGHBOURS);
     }
 
@@ -2066,7 +2313,7 @@ mod tests {
         let mut raw = image(0, MAX_NEIGHBOURS);
         raw.neighbour_count = MAX_NEIGHBOURS as u32 + 1;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::NeighbourCountExceedsCapacity { count: 33 })
         );
     }
@@ -2076,7 +2323,9 @@ mod tests {
         for (bits, expected) in [(0u8, false), (1, true)] {
             let mut raw = image(1, 0);
             raw.interfaces[0].enabled = bits;
-            let checked = raw.check(PORTS).expect("0 and 1 are the decodable values");
+            let checked = resealed(&mut raw)
+                .check(PORTS)
+                .expect("0 and 1 are the decodable values");
             assert_eq!(
                 checked.interfaces().next().map(|i| i.enabled()),
                 Some(expected)
@@ -2090,7 +2339,7 @@ mod tests {
             let mut raw = image(2, 0);
             raw.interfaces[1].enabled = bits;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::InterfaceEnabledNotBoolean {
                     index: 1,
                     enabled: bits
@@ -2104,7 +2353,7 @@ mod tests {
         let mut raw = image(1, 0);
         raw.interfaces[0].port = PORTS;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::InterfacePortUnknown { index: 0, port: 2 })
         );
     }
@@ -2114,7 +2363,7 @@ mod tests {
         let mut raw = image(2, 2);
         raw.neighbours[1].port = 200;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::NeighbourPortUnknown {
                 index: 1,
                 port: 200
@@ -2138,7 +2387,9 @@ mod tests {
     fn a_prefix_length_of_thirty_two_is_accepted() {
         let mut raw = image(1, 0);
         raw.interfaces[0].prefix_length = MAX_PREFIX_LENGTH;
-        let checked = raw.check(PORTS).expect("a host route is a prefix");
+        let checked = resealed(&mut raw)
+            .check(PORTS)
+            .expect("a host route is a prefix");
         assert_eq!(
             checked.interfaces().next().map(|i| i.prefix_length()),
             Some(32)
@@ -2151,7 +2402,7 @@ mod tests {
             let mut raw = image(1, 0);
             raw.interfaces[0].prefix_length = length;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::InterfacePrefixLengthTooLong {
                     index: 0,
                     prefix_length: length
@@ -2166,7 +2417,7 @@ mod tests {
             let mut raw = image(1, 0);
             raw.interfaces[0].mac = mac;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::InterfaceMacNotUnicast { index: 0, mac })
             );
         }
@@ -2178,7 +2429,7 @@ mod tests {
             let mut raw = image(2, 1);
             raw.neighbours[0].mac = mac;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::NeighbourMacNotUnicast { index: 0, mac })
             );
         }
@@ -2190,7 +2441,7 @@ mod tests {
             let mut raw = image(1, 0);
             raw.interfaces[0].address = address;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::InterfaceAddressNotUnicast { index: 0, address }),
                 "{address:?}"
             );
@@ -2203,7 +2454,7 @@ mod tests {
             let mut raw = image(1, 0);
             raw.interfaces[0].address = address;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::InterfaceAddressNotAHostAddress { index: 0, address }),
                 "{address:?}"
             );
@@ -2213,7 +2464,9 @@ mod tests {
             let mut raw = image(1, 0);
             raw.interfaces[0].prefix_length = prefix_length;
             raw.interfaces[0].address = address;
-            raw.check(PORTS).expect("neither reserves an address");
+            resealed(&mut raw)
+                .check(PORTS)
+                .expect("neither reserves an address");
         }
     }
 
@@ -2224,7 +2477,7 @@ mod tests {
         let clash = |change: fn(&mut InterfaceImage)| {
             let mut raw = image(2, 0);
             change(&mut raw.interfaces[1]);
-            raw.check(PORTS).map(|_| ())
+            resealed(&mut raw).check(PORTS).map(|_| ())
         };
 
         assert_eq!(
@@ -2268,14 +2521,14 @@ mod tests {
         let with = |change: fn(&mut NeighbourImage)| {
             let mut raw = image(2, 1);
             change(&mut raw.neighbours[0]);
-            raw.check(PORTS).map(|_| ())
+            resealed(&mut raw).check(PORTS).map(|_| ())
         };
 
         for address in [[224, 0, 0, 1], [0, 0, 0, 0], [255; 4]] {
             let mut raw = image(2, 1);
             raw.neighbours[0].address = address;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::NeighbourAddressNotUnicast { index: 0, address }),
                 "{address:?}"
             );
@@ -2300,7 +2553,7 @@ mod tests {
             let mut raw = image(2, 1);
             raw.neighbours[0].address = address;
             assert_eq!(
-                raw.check(PORTS),
+                resealed(&mut raw).check(PORTS),
                 Err(ConfigImageError::NeighbourAddressNotAHostAddress { index: 0, address }),
                 "{address:?}"
             );
@@ -2315,7 +2568,7 @@ mod tests {
         raw.neighbours[0].port = 0;
         raw.neighbours[1].port = 1;
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::NeighbourPortUnconfigured { index: 1, port: 1 })
         );
     }
@@ -2325,7 +2578,7 @@ mod tests {
         let mut raw = image(2, 3);
         raw.neighbours[2] = raw.neighbours[0];
         assert_eq!(
-            raw.check(PORTS),
+            resealed(&mut raw).check(PORTS),
             Err(ConfigImageError::NeighbourAddressDuplicated { index: 2, other: 0 })
         );
 
@@ -2349,7 +2602,7 @@ mod tests {
             address: [10, 0, 2, 15],
             ..ManagementImage::ZERO
         };
-        let management = raw
+        let management = resealed(&mut raw)
             .check(PORTS)
             .expect("an enabled entry")
             .management()
@@ -2365,7 +2618,7 @@ mod tests {
         disabled.management.prefix_length = 99;
         disabled.management.mac = [0xff; 6];
         assert_eq!(
-            disabled
+            resealed(&mut disabled)
                 .check(PORTS)
                 .expect("a disabled entry")
                 .management(),
@@ -2385,7 +2638,7 @@ mod tests {
         let with = |management: ManagementImage| {
             let mut raw = image(1, 1);
             raw.management = management;
-            raw.check(PORTS).map(|_| ())
+            resealed(&mut raw).check(PORTS).map(|_| ())
         };
 
         for byte in [2u8, 3, 0xff] {
@@ -2437,7 +2690,7 @@ mod tests {
         let with = |management: ManagementImage| {
             let mut raw = image(2, 1);
             raw.management = management;
-            raw.check(PORTS).map(|_| ())
+            resealed(&mut raw).check(PORTS).map(|_| ())
         };
         let enabled = ManagementImage {
             enabled: 1,
@@ -2485,7 +2738,7 @@ mod tests {
         raw.neighbours[0]._pad2 = [0xdd; 2];
         raw.management._pad = [0xee; 2];
         raw.management._pad2 = [0xff; 2];
-        assert_eq!(raw.check(PORTS), image(1, 1).check(PORTS));
+        assert_eq!(resealed(&mut raw).check(PORTS), image(1, 1).check(PORTS));
     }
 
     #[test]
@@ -2493,16 +2746,17 @@ mod tests {
         assert_eq!(size_of::<InterfaceImage>(), 36);
         assert_eq!(size_of::<NeighbourImage>(), 16);
         assert_eq!(size_of::<ManagementImage>(), 16);
-        assert_eq!(size_of::<RuleImage>(), 52);
-        assert_eq!(size_of::<ConfigImage>(), 14_148);
-        assert_eq!(size_of::<ConfigHandover>(), 14_156);
+        assert_eq!(size_of::<RuleImage>(), 54);
+        assert_eq!(size_of::<ConfigImage>(), 14_660);
+        assert_eq!(size_of::<ConfigHandover>(), 14_672);
         assert_eq!(size_of::<ConfigAck>(), 8);
         assert_eq!(offset_of!(ConfigImage, management), 16);
         assert_eq!(offset_of!(ConfigImage, interfaces), 32);
         assert_eq!(offset_of!(ConfigImage, neighbours), 320);
         assert_eq!(offset_of!(ConfigImage, rule_count), 832);
         assert_eq!(offset_of!(ConfigImage, rules), 836);
-        assert_eq!(offset_of!(ConfigHandover, image), 8);
+        assert_eq!(offset_of!(ConfigHandover, publishing), 8);
+        assert_eq!(offset_of!(ConfigHandover, image), 12);
         // The handover region is reserved past what it holds, so its size is
         // the reservation rather than the one page the image would round to.
         assert_eq!(CONFIG_REGION_SIZE, 0x8000);
@@ -2521,7 +2775,7 @@ mod tests {
                 offset_of!(ConfigSlot, generation),
                 offset_of!(ConfigSlot, interface_count),
                 offset_of!(ConfigSlot, neighbour_count),
-                offset_of!(ConfigSlot, content_hash),
+                offset_of!(ConfigSlot, digest),
                 offset_of!(ConfigSlot, management),
                 offset_of!(ConfigSlot, interfaces),
                 offset_of!(ConfigSlot, neighbours),
@@ -2530,7 +2784,7 @@ mod tests {
                 offset_of!(ConfigImage, generation),
                 offset_of!(ConfigImage, interface_count),
                 offset_of!(ConfigImage, neighbour_count),
-                offset_of!(ConfigImage, content_hash),
+                offset_of!(ConfigImage, digest),
                 offset_of!(ConfigImage, management),
                 offset_of!(ConfigImage, interfaces),
                 offset_of!(ConfigImage, neighbours),
@@ -2658,6 +2912,140 @@ mod tests {
         ack.publish_running(2);
         assert_eq!(ack.staged_generation(), 4);
         assert_eq!(ack.running_generation(), 2);
+    }
+
+    /// The counter is what a reader keys a settled region on, so it has to end
+    /// even and differ from what a reader could have taken across every publish.
+    #[test]
+    fn publishing_leaves_the_counter_even_and_moved() {
+        let handover = ConfigHandover::zero();
+        let mut seen = handover.publishing.load(Ordering::Relaxed);
+        assert_eq!(seen, 0, "a zeroed region is settled");
+        for generation in 1..5u32 {
+            let mut offered = image(1, 1);
+            offered.generation = generation;
+            offered.seal();
+            handover.publish(&offered);
+            let now = handover.publishing.load(Ordering::Relaxed);
+            assert!(now.is_multiple_of(2), "settled after a publish");
+            assert_ne!(now, seen, "a reader cannot mistake this for the last one");
+            seen = now;
+        }
+        // A region a writer left mid-publish is published into correctly rather
+        // than being left permanently unreadable.
+        handover.publishing.store(7, Ordering::Relaxed);
+        let mut offered = image(1, 1);
+        offered.generation = 9;
+        offered.seal();
+        handover.publish(&offered);
+        assert_eq!(handover.publishing.load(Ordering::Relaxed), 8);
+        assert_eq!(loaded(&handover), offered);
+    }
+
+    /// A reader that meets an odd counter through every attempt answers nothing,
+    /// which is what keeps a peer holding it odd from spinning one.
+    #[test]
+    fn a_region_left_mid_publish_is_read_as_nothing_rather_than_waited_on() {
+        let handover = ConfigHandover::zero();
+        let mut offered = image(1, 1);
+        offered.generation = 3;
+        offered.seal();
+        handover.publish(&offered);
+        handover.publishing.store(1, Ordering::Relaxed);
+
+        let mut into = ConfigImage::ZERO;
+        assert_eq!(handover.load_offer(&mut into), None);
+        assert_eq!(handover.load_committed(&mut into), None);
+        assert_eq!(
+            into,
+            ConfigImage::ZERO,
+            "a discarded copy leaves the caller's storage alone"
+        );
+
+        handover.publishing.store(2, Ordering::Relaxed);
+        assert_eq!(handover.load_offer(&mut into), Some(3));
+        assert_eq!(into, offered);
+    }
+
+    /// The whole of C1, over a shared region and two threads: a reader copying
+    /// while a publisher rewrites underneath it must come away with one
+    /// publication or with nothing, never with a blend of two.
+    ///
+    /// It is a race, so what it proves is one-sided — a pass is evidence and the
+    /// hand-assembled blend above is the proof. What makes it evidence rather
+    /// than decoration is that the reader is held to discarding *something*: a
+    /// reader that never met the publisher would satisfy the property vacuously,
+    /// and a reader whose copies were blends would satisfy nothing at all.
+    #[test]
+    fn a_reader_copying_under_a_publisher_never_takes_a_blend_of_two_images() {
+        /// Publications the writer makes. A copy is fourteen kilobytes and so is
+        /// a publication, so the two threads contend for the whole of this.
+        const PUBLICATIONS: u32 = 2_000;
+        /// Reads after the publisher has stopped, over a region nothing is
+        /// moving: this is what makes at least one copy certain, whatever the
+        /// race did.
+        const SETTLED_READS: u32 = 64;
+
+        let handover = ConfigHandover::zero();
+        let publishing_done = AtomicBool::new(false);
+        // Two publications differing in every entry and in the rule bodies, so a
+        // blend of them differs from both in a field a comparison can name.
+        let mut first = image(2, 2);
+        first.generation = 1;
+        first.seal();
+        let mut second = image(1, 1);
+        second.generation = 2;
+        second.rules[0].icmp_type = 8;
+        second.rules[MAX_RULES - 1].protocol = 6;
+        second.seal();
+        handover.publish(&first);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..PUBLICATIONS {
+                    handover.publish(if round.is_multiple_of(2) {
+                        &first
+                    } else {
+                        &second
+                    });
+                }
+                publishing_done.store(true, Ordering::Release);
+            });
+            let reader = scope.spawn(|| {
+                let mut taken = 0u32;
+                let mut discarded = 0u32;
+                let mut tail = SETTLED_READS;
+                let mut into = ConfigImage::ZERO;
+                loop {
+                    match handover.load_offer(&mut into) {
+                        Some(generation) => {
+                            taken += 1;
+                            assert!(
+                                into == first || into == second,
+                                "a copy is one publication or the other"
+                            );
+                            assert_eq!(into.digest, into.computed_digest());
+                            assert_eq!(generation, into.generation);
+                            into.check(PORTS).expect("a whole publication checks");
+                        }
+                        None => discarded += 1,
+                    }
+                    if publishing_done.load(Ordering::Acquire) {
+                        tail -= 1;
+                        if tail == 0 {
+                            break;
+                        }
+                    }
+                }
+                (taken, discarded)
+            });
+            let (taken, discarded) = reader.join().expect("the reader finished");
+            assert!(taken > 0, "a settled region is readable");
+            assert!(
+                discarded > 0,
+                "the reader met the publisher at least once, so the race happened"
+            );
+        });
     }
 
     #[test]
@@ -2795,7 +3183,7 @@ mod tests {
         let with = |id: IdentifierImage| {
             let mut raw = image(1, 0);
             raw.interfaces[0].id = id;
-            raw.check(PORTS).map(|checked| {
+            resealed(&mut raw).check(PORTS).map(|checked| {
                 checked
                     .interfaces()
                     .next()
@@ -2854,7 +3242,7 @@ mod tests {
     fn the_longest_admissible_id_crosses_and_one_byte_more_does_not() {
         let mut raw = image(1, 0);
         raw.interfaces[0].id = IdentifierImage::from_text(&[b'a'; LOG_IDENTIFIER_BYTES]);
-        let checked = raw.check(PORTS).expect("sixteen bytes fit");
+        let checked = resealed(&mut raw).check(PORTS).expect("sixteen bytes fit");
         assert_eq!(
             checked.interfaces().next().expect("one").id().len(),
             LOG_IDENTIFIER_BYTES
@@ -2862,7 +3250,7 @@ mod tests {
 
         raw.interfaces[0].id = IdentifierImage::from_text(&[b'a'; LOG_IDENTIFIER_BYTES + 1]);
         assert!(
-            raw.check(PORTS).is_err(),
+            resealed(&mut raw).check(PORTS).is_err(),
             "`from_text` truncates the bytes and keeps the stated length, so the reader refuses it"
         );
     }
@@ -3071,15 +3459,13 @@ mod tests {
     ) -> impl Strategy<Value = ConfigImage> {
         (
             any::<u32>(),
-            any::<u32>(),
             proptest::array::uniform8(interfaces),
             proptest::array::uniform32(neighbours),
             management,
         )
             .prop_map(
-                |(generation, content_hash, interfaces, neighbours, management)| ConfigImage {
+                |(generation, interfaces, neighbours, management)| ConfigImage {
                     generation,
-                    content_hash,
                     interfaces,
                     neighbours,
                     management,
@@ -3361,13 +3747,24 @@ mod tests {
             interface_count in any_plausible_count(),
             neighbour_count in any_plausible_count(),
             port_count in any::<u8>(),
+            // A writer that seals what it wrote and one that does not: the
+            // second is the byzantine case the digest exists for, and excluding
+            // it would drop the whole adversarial half of this property.
+            seal in any::<bool>(),
         ) {
             image.interface_count = interface_count;
             image.neighbour_count = neighbour_count;
+            if seal {
+                image.seal();
+            }
 
             let Ok(checked) = image.check(port_count) else {
                 return Ok(());
             };
+            // An unsealed region reaches here only where the arbitrary digest
+            // happened to be the right one, which is the whole of what the check
+            // claims: nothing is accepted whose bytes it does not cover.
+            prop_assert_eq!(image.digest, image.computed_digest());
             prop_assert!(checked.interface_count() <= MAX_INTERFACES);
             prop_assert!(checked.neighbour_count() <= MAX_NEIGHBOURS);
             prop_assert_eq!(checked.interface_count(), interface_count as usize);
@@ -3406,6 +3803,9 @@ mod tests {
         ) {
             image.interface_count = interface_count;
             image.neighbour_count = neighbour_count;
+            // Sealed last, so the property is about the fields it varies rather
+            // than about the digest refusing every one of them.
+            image.seal();
 
             let outcome = image.check(port_count);
             prop_assert_eq!(outcome.err(), expected_refusal(&image, port_count));
@@ -3418,7 +3818,6 @@ mod tests {
             prop_assert_eq!(checked.interface_count(), interface_count as usize);
             prop_assert_eq!(checked.neighbour_count(), neighbour_count as usize);
             prop_assert_eq!(checked.generation(), image.generation);
-            prop_assert_eq!(checked.content_hash(), image.content_hash);
 
             for entry in checked.interfaces() {
                 prop_assert!(entry.port() < port_count);
@@ -3509,14 +3908,14 @@ mod tests {
             let mut inflated = image(MAX_INTERFACES, MAX_NEIGHBOURS);
             inflated.interface_count = interface_count;
             prop_assert_eq!(
-                inflated.check(PORTS),
+                resealed(&mut inflated).check(PORTS),
                 Err(ConfigImageError::InterfaceCountExceedsCapacity { count: interface_count })
             );
 
             let mut inflated = image(MAX_INTERFACES, MAX_NEIGHBOURS);
             inflated.neighbour_count = neighbour_count;
             prop_assert_eq!(
-                inflated.check(PORTS),
+                resealed(&mut inflated).check(PORTS),
                 Err(ConfigImageError::NeighbourCountExceedsCapacity { count: neighbour_count })
             );
         }

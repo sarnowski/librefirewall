@@ -8,8 +8,15 @@
 //! relating the error to a flow means reading a five-tuple *out of bytes the
 //! sender chose*. A tracker that believed that copy would let anyone who can
 //! send one packet have it classified as belonging to an established flow — which
-//! is a filter bypass, not a misclassification, because `Related` is what a
-//! ruleset permits without naming the traffic.
+//! is a misclassification with real consequence: `Related` is what decides where
+//! the error *goes*, and a rule that names related traffic decides it against a
+//! flow the sender merely guessed at rather than against the one it belongs to.
+//!
+//! It is not, and must not become, a way past the filter. Relating an error to a
+//! flow does not admit it: the filter is still asked, and a policy that says
+//! nothing about related traffic denies it — which is why the agreements below
+//! bound what a sender can have *attributed* to a conversation rather than what it
+//! can have carried.
 //!
 //! So the quoted datagram is treated as a claim to be corroborated, never as a
 //! header to be read. Four things have to agree before it names a flow at all:

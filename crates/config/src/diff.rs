@@ -307,6 +307,7 @@ mod tests {
     use super::*;
     use crate::rule::{
         AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+        TrackingMatch,
     };
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
@@ -865,6 +866,7 @@ mod tests {
             source_port: PortMatch::Any,
             destination_port: PortMatch::Any,
             icmp_type: IcmpTypeMatch::Any,
+            tracking: TrackingMatch::Any,
             action: RuleAction::Drop,
         }
     }
@@ -895,6 +897,10 @@ mod tests {
             (Field::DestinationPort, Value::Selector(token)) => {
                 entry.destination_port =
                     crate::value::port_match(token.as_bytes()).expect("a token this crate minted");
+            }
+            (Field::Tracking, Value::Selector(token)) => {
+                entry.tracking = crate::value::tracking_match(token.as_bytes())
+                    .expect("a token this crate minted");
             }
             (Field::IcmpType, Value::Selector(token)) => {
                 entry.icmp_type = crate::value::icmp_type_match(token.as_bytes())

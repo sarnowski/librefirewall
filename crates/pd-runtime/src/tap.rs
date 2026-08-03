@@ -171,14 +171,19 @@ pub fn tap_decision(
         // The tracker refused it, so it never reached the filter and the drop
         // reason is the refusal.
         (Verdict::Drop(_), _) if inspection.refusal().is_some() => Some(TapEvent::FlowRefused),
-        // Every frame the filter sees has just opened a flow, so a drop with one
-        // attached is the filter's — with a rule where one matched, and the
-        // default deny where none did. The flow it opened has been withdrawn by
-        // the half of the tracker behind the filter.
-        (Verdict::Drop(_), Some(FlowTransition::Opened)) => Some(match rule {
-            Some(_) => TapEvent::PolicyDenied,
-            None => TapEvent::PolicyNoMatch,
-        }),
+        // A frame the tracker passed to the filter, which the filter then refused.
+        // Two transitions reach it and both are the filter's decision: `Opened`, a
+        // conversation the filter would not admit — whose flow the half of the
+        // tracker behind the filter has withdrawn — and `Held`, a related frame,
+        // which opens no conversation because it reports on one somebody else
+        // opened. Either way the pair is the same: a rule refused it, or none named
+        // it and the default deny did.
+        (Verdict::Drop(_), Some(FlowTransition::Opened | FlowTransition::Held)) => {
+            Some(match rule {
+                Some(_) => TapEvent::PolicyDenied,
+                None => TapEvent::PolicyNoMatch,
+            })
+        }
         // Admission or routing refused it in front of the tracker: no
         // conversation was involved and no policy was consulted.
         (Verdict::Drop(_), _) => None,

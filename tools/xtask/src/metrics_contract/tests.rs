@@ -305,6 +305,9 @@ fn witness() -> PolicyWitness {
         // TCP segment: the filter probe set injects three datagrams.
         probed_an_established_flow: false,
         probed_mid_stream: false,
+        // The shipped document's own rules, read from it rather than restated: a
+        // rule added to it moves the fixture body and this together.
+        rules: topology().rule_ids().len(),
         reconfigured: false,
     }
 }

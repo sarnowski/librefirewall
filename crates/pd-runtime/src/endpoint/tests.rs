@@ -131,7 +131,12 @@ impl Fixture {
 
     /// Publish and release one generation, as the configuration domain does once
     /// the forwarder has acknowledged it, and let the stage take it.
-    fn commit(&mut self, image: ConfigImage) -> Option<ConfigRefused> {
+    ///
+    /// The image is sealed here rather than by each caller, this standing in for
+    /// the publisher: a test that varies a field is then about that field and not
+    /// about the digest the variation invalidated.
+    fn commit(&mut self, mut image: ConfigImage) -> Option<ConfigRefused> {
+        image.seal();
         let mut publisher = ConfigPublisher::new();
         let generation = publisher
             .offer(self.handover, &image)
@@ -243,7 +248,7 @@ fn management_image(
     address: Ipv4Address,
     prefix_length: u8,
 ) -> ConfigImage {
-    ConfigImage {
+    let mut image = ConfigImage {
         generation,
         management: ManagementImage {
             enabled: 1,
@@ -253,7 +258,12 @@ fn management_image(
             ..ManagementImage::ZERO
         },
         ..ConfigImage::ZERO
-    }
+    };
+    // Sealed as a publisher hands one over: the reader refuses an image whose
+    // digest does not cover its bytes, so a fixture that skipped this would be
+    // refused before it reached the addressing under test.
+    image.seal();
+    image
 }
 
 /// An ARP request for `target`, as the station on the wire puts one there.

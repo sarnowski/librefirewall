@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, and the third document in this tree that is never built into an
+     image: it is SUBMITTED over the management API to a node already running
+     `systems/qemu-x86_64/configuration.xml`, and what it proves is that a POLICY
+     decides whether an ICMP error related to a live conversation may cross.
+
+     IT DIFFERS FROM THE SHIPPED DOCUMENT BY ONE RULE. `probe-related` is added;
+     every attribute of every other element, both existing rule ids, both actions
+     and both destination ports are the shipped document's, so nothing about
+     admission, the denying rule or the fallthrough moves under this submission.
+     That one rule is the whole of the experiment.
+
+     WHY THE EXPERIMENT NEEDS TWO DOCUMENTS. An ICMP error carries a copy of the
+     datagram that provoked it, and the tracker relates it to a flow by
+     corroborating that copy — the quoted source must be the party the error is
+     addressed to, the five-tuple must name a flow the table holds, and the
+     direction it implies must be one that flow has carried traffic in. What
+     corroboration settles is where the error would GO. It must not settle whether
+     it MAY, because the error is composed by whoever sent it, with a source
+     address of their choosing, and delivered to an endpoint of a conversation
+     somebody else opened.
+
+     So the same error, on the same flow, is put to the filter under both
+     documents:
+
+       * under the shipped one, whose rules are both `protocol="udp"`, no rule is
+         about it and the default deny refuses it — which is the posture
+         everything else here is under;
+       * under this one, `probe-related` admits it and it crosses.
+
+     A document that named related traffic in neither case would leave "the policy
+     denied it" and "the tracker never related it" looking alike, which is why the
+     denial and the admission are one scenario and not two.
+
+     `tracking="related"` IS THE WHOLE CRITERION. The rule states no ports —
+     stating one on ICMP is refused before a document commits, an echo's
+     identifier standing where a port would — and no `icmp-type`, because the
+     three error types that relate are one class of thing to an operator and
+     naming one of them would make the rule about a code rather than about the
+     relationship. The management addressing is the shipped document's, because
+     the client that submits this reaches the node at that address and would
+     otherwise be cut off by its own submission. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+    <rules>
+        <rule id="probe-blocked" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" tracking="any" action="drop"/>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
+        <rule id="probe-related" ingress="any" egress="any"
+              source="any" destination="any" protocol="icmp"
+              source-port="any" destination-port="any" icmp-type="any" tracking="related" action="accept"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

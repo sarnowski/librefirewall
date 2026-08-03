@@ -466,7 +466,7 @@ fn the_flow_vocabularies_are_the_trackers_own() {
     );
     // And the two the re-decision publishes, whose order is the slot order a
     // transposed pair would report a restart as a completed pass under.
-    assert_eq!(POLICY_SWEEP_OUTCOMES, ["completed", "restarted"]);
+    assert_eq!(POLICY_SWEEP_OUTCOMES, ["completed", "deferred"]);
     assert_eq!(POLICY_SWEEP_PROGRESS_KINDS, ["buckets", "flows"]);
 }
 
@@ -563,8 +563,9 @@ fn a_swept_pass_reaches_the_slots_its_series_name() {
         "one window of buckets walked and no live flow judged"
     );
 
-    // A commit mid-pass, then the pass run out: the two outcomes then read one
-    // each, which is the pair a transposition would swap.
+    // A commit mid-pass, then the passes run out: the two outcomes then read one
+    // deferral and — because a deferral queues a second walk of the whole table
+    // rather than abandoning the running one — two completions.
     sweep.arm(2);
     while sweep.running() {
         sweep
@@ -578,11 +579,11 @@ fn a_swept_pass_reaches_the_slots_its_series_name() {
     }
     let done = policy_sweep_sample(&sweep);
     assert_eq!(done.running, 0, "and closed once the pass finished");
-    assert_eq!(done.outcomes, [1, 1], "one completed, one restarted");
+    assert_eq!(done.outcomes, [2, 1], "two completed, one deferred");
     assert_eq!(
         done.progress[0],
-        3 * lfw_flow::REVISIT_BUCKETS as u64,
-        "the abandoned window plus the two the restarted pass took"
+        4 * lfw_flow::REVISIT_BUCKETS as u64,
+        "the first pass's two windows and the queued pass's two"
     );
 }
 

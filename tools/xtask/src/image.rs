@@ -104,6 +104,7 @@ pub(crate) const EVERY_CONFIGURATION_DOCUMENT: &[&str] = &[
     LIFECYCLE_DOCUMENT,
     SUBMITTED_DOCUMENT,
     NARROWED_DOCUMENT,
+    RELATED_DOCUMENT,
 ];
 
 /// The one document in this tree that is never built into an image: it is
@@ -122,6 +123,12 @@ pub(crate) const SUBMITTED_DOCUMENT: &str = "tools/xtask/scenarios/reconfigurati
 /// attribute, so a commit ends the conversations it no longer admits and leaves the
 /// others running. In the list above for [`SUBMITTED_DOCUMENT`]'s reason.
 pub(crate) const NARROWED_DOCUMENT: &str = "tools/xtask/scenarios/revocation-narrow.xml";
+
+/// The third document that is only ever submitted, and the one a **related-traffic**
+/// scenario hands over: the shipped policy with one rule added that admits the ICMP
+/// errors a live conversation is the reason for. In the list above for
+/// [`SUBMITTED_DOCUMENT`]'s reason.
+pub(crate) const RELATED_DOCUMENT: &str = "tools/xtask/scenarios/related-icmp.xml";
 /// The environment variable that carries [`CONFIGURATION_DOCUMENT`] to
 /// `pds/config`.
 ///

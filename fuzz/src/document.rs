@@ -157,7 +157,7 @@ pub fn document_harness(document: &[u8]) {
         records.len()
     );
 
-    assert_artifacts_agree(&model, hash.to_bits());
+    assert_artifacts_agree(&model);
 }
 
 /// Drive the reader itself, so the bounds it declares are checked against what
@@ -325,18 +325,20 @@ fn assert_model_fits_the_handover_image(model: &Model) {
 /// already refused everything — so it is asserted over arbitrary *images*
 /// instead, by `config`'s own
 /// `every_image_the_consumer_accepts_is_one_validation_would_have_accepted`.
-fn assert_artifacts_agree(model: &Model, hash: u32) {
+fn assert_artifacts_agree(model: &Model) {
     for generation in GENERATIONS {
         let image = image_from(model, Generation::from_bits(generation))
             .expect("a validated model builds a handover image");
         assert_eq!(image.generation, generation);
-        assert_eq!(image.content_hash, hash);
+        // Built sealed, which is what the consumer's own digest check is against:
+        // a builder that left the image unsealed would have every generation
+        // refused on the far side of the region.
+        assert_eq!(image.digest, image.computed_digest());
 
         let checked = image
             .check(PORT_COUNT)
             .expect("the consuming domain refused an image this crate produced");
         assert_eq!(checked.generation(), generation);
-        assert_eq!(checked.content_hash(), hash);
         assert_eq!(checked.interface_count(), model.interface_count());
         assert_eq!(checked.neighbour_count(), model.neighbour_count());
 

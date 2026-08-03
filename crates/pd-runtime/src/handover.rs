@@ -30,11 +30,11 @@ use lfw_ip_endpoint::{Endpoint, EndpointError, IsnSecret};
 use lfw_log::{Event, RejectReason};
 use lfw_metrics::{InterfaceInfo, InterfaceInventory, RuleInventory};
 use net_headers::{Ipv4Address, MacAddress, Protocol};
-use pipeline::{PortRange, Prefix, Rule, RuleAction, Ruleset, RulesetFull};
+use pipeline::{PortRange, Prefix, Rule, RuleAction, Ruleset, RulesetFull, Tracked};
 use routing::{CapacityError, Interface, Neighbour, PortId, Router};
 use wire::{
-    CheckedAction, CheckedConfig, ConfigAck, ConfigHandover, ConfigImage, ConfigImageError,
-    MAX_INTERFACES, MAX_NEIGHBOURS,
+    CheckedAction, CheckedConfig, CheckedTracking, ConfigAck, ConfigHandover, ConfigImage,
+    ConfigImageError, MAX_INTERFACES, MAX_NEIGHBOURS,
 };
 
 use crate::Configuration;
@@ -119,6 +119,10 @@ pub fn ruleset_from(checked: &CheckedConfig<'_>) -> Result<Ruleset, RulesetFull>
             high: ports.high,
         }),
         icmp_type: entry.icmp_type(),
+        tracking: entry.tracking().map(|tracking| match tracking {
+            CheckedTracking::Opening => Tracked::Opening,
+            CheckedTracking::Related => Tracked::Related,
+        }),
         action: match entry.action() {
             CheckedAction::Accept => RuleAction::Accept,
             CheckedAction::Drop => RuleAction::Drop,
@@ -231,6 +235,15 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
     // over a value bounded by this build rather than by the writer of the
     // region; a `count` is already `u32`.
     match error {
+        // A region whose bytes do not fold to the word they carry: not one
+        // publication, so nothing about it is a field to send a reader to — and
+        // nothing about the operator's document is known to be wrong either, which
+        // is why this is its own reason and not `malformed-value`. The number is
+        // the digest it declared, which is what a reader comparing two domains'
+        // views of the region has to go on.
+        ConfigImageError::DigestMismatch { declared, .. } => {
+            (RejectReason::HandoverNotOnePublication, declared)
+        }
         ConfigImageError::InterfaceCountExceedsCapacity { count }
         | ConfigImageError::NeighbourCountExceedsCapacity { count }
         | ConfigImageError::RuleCountExceedsCapacity { count } => {
@@ -242,7 +255,8 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         // opens the document at.
         ConfigImageError::RuleCriterionNotBoolean { index, .. }
         | ConfigImageError::RuleActionUnknown { index, .. }
-        | ConfigImageError::RuleIdNotAnIdentifier { index, .. } => {
+        | ConfigImageError::RuleIdNotAnIdentifier { index, .. }
+        | ConfigImageError::RuleTrackingUnknown { index, .. } => {
             (RejectReason::MalformedValue, index as u32)
         }
         ConfigImageError::RulePortUnknown { index, .. } => {
@@ -588,25 +602,39 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     /// Take whatever the publisher is offering that this domain has not already
     /// taken or already judged, acknowledging it on success.
     ///
-    /// The image is copied out of the region before a field of it is looked at:
-    /// a decision made on bytes the publisher may rewrite underneath it is no
-    /// decision at all. One offer costs one read and yields one outcome however
-    /// often this is called, which is what puts a refusal on the publisher's
-    /// rate and not on the caller's polling rate — the console, which carries
-    /// system state only, rests on that. A re-write under the word already on offer is therefore not an
-    /// offer this side can read.
+    /// The image is copied out of the region before a field of it is looked at,
+    /// and the copy is taken **as one publication or not at all**: a copy
+    /// assembled across two rewrites is one every field-level rule holds of —
+    /// each field being a field some publisher wrote — while naming a
+    /// configuration nobody composed. An attempt that took none consumes
+    /// nothing: the offer is still there to take on the next pass.
+    ///
+    /// One offer costs one read and yields one outcome however often this is
+    /// called, which is what puts a refusal on the publisher's rate and not on
+    /// the caller's polling rate — the console, which carries system state only,
+    /// rests on that. A re-write under the word already on offer is therefore
+    /// not an offer this side can read.
     ///
     /// The generation acknowledged is the *offered* word and never the label
-    /// inside the image, the two being separate claims of the same publisher: a
-    /// commit is keyed on the word, so acknowledging anything else would leave
-    /// the publisher waiting for an acknowledgement that never arrives.
+    /// inside the image: a commit is keyed on the word, so acknowledging anything
+    /// else would leave the publisher waiting for an acknowledgement that never
+    /// arrives. The two cannot disagree in any case —
+    /// [`ConfigHandover::publish`] writes the word *from* the label, in the one
+    /// call that writes either — which is why nothing here compares them.
     pub fn take_offer(&mut self, handover: &ConfigHandover, ack: &ConfigAck) -> Option<Offer> {
-        let offered = handover.offered_generation();
+        // Read before the copy, because a copy costs pages and most passes have
+        // nothing to take. What the copy answers is read again below: the word
+        // may have moved between the two, and it is the one the copy was taken
+        // under that this pass is about.
+        let looks_new = handover.offered_generation();
+        if looks_new <= self.highest_taken() || looks_new == self.considered {
+            return None;
+        }
+        let offered = handover.load_offer(&mut self.image)?;
         if offered <= self.highest_taken() || offered == self.considered {
             return None;
         }
         self.considered = offered;
-        handover.load_image_into(&mut self.image);
         let refuse = |reason, detail| {
             Some(Offer::Refused {
                 generation: offered,
@@ -736,23 +764,35 @@ impl CommittedReader {
     /// Take the committed generation, once, if it is newer than the last one
     /// taken.
     ///
-    /// The image is copied out of the region before a field of it is looked at,
-    /// on [`ConfigurationSwitch::take_offer`]'s terms: the publisher may rewrite
-    /// the bytes at any moment, so a decision made on them in place is no
-    /// decision. One commit yields one outcome however often this is called,
-    /// which is what puts a refusal on the publisher's rate rather than on the
-    /// caller's polling rate.
+    /// The image is copied out of the region as one publication or not at all,
+    /// on [`ConfigurationSwitch::take_offer`]'s terms. One commit yields one
+    /// outcome however often this is called, which is what puts a refusal on the
+    /// publisher's rate rather than on the caller's polling rate.
+    ///
+    /// # A commit whose bytes have already been replaced
+    ///
+    /// This reader sits outside the acknowledgement handshake — that is what
+    /// makes it unable to delay a commit — so the region may already hold a
+    /// *newer* offer by the time it looks: the committed word names one
+    /// generation and the bytes label themselves another, both truthfully. What
+    /// this reader wanted has been superseded, so it takes nothing and leaves its
+    /// cursor where it was; the newer generation is read when it is committed in
+    /// turn, and until then the port goes on under the addressing it has. The
+    /// cost is a copy re-taken on each pass through that window, which is one
+    /// publisher's commit wide.
     ///
     /// `ports` is the caller's own port count, so an image naming a port this
     /// build has no driver for is refused by a bound the publisher does not
     /// choose.
     pub fn take(&mut self, handover: &ConfigHandover, ports: u8) -> Option<Committed<'_>> {
-        let generation = handover.committed_generation();
-        if generation <= self.taken {
+        if handover.committed_generation() <= self.taken {
+            return None;
+        }
+        let generation = handover.load_committed(&mut self.image)?;
+        if generation <= self.taken || self.image.generation != generation {
             return None;
         }
         self.taken = generation;
-        handover.load_image_into(&mut self.image);
         match self.image.check(ports) {
             Ok(checked) => Some(Committed::Image {
                 generation,
@@ -826,20 +866,80 @@ mod tests {
         }
     }
 
-    /// A two-port image of the shape the appliance actually runs.
+    /// A two-port image of the shape the appliance actually runs, sealed as a
+    /// publisher hands one over.
     fn image(generation: u32) -> ConfigImage {
         let mut image = ConfigImage {
             generation,
             interface_count: 2,
             neighbour_count: 2,
-            content_hash: 7,
             ..ConfigImage::ZERO
         };
         image.interfaces[0] = interface(0, 1);
         image.interfaces[1] = interface(1, 1);
         image.neighbours[0] = neighbour(0);
         image.neighbours[1] = neighbour(1);
+        image.seal();
         image
+    }
+
+    /// `image(generation)` with `edit` applied and the digest re-taken. Every
+    /// test that varies a field needs it: an edit leaves the digest naming the
+    /// bytes before it, and the reader would then refuse the image for that
+    /// rather than for the field under test.
+    fn edited(generation: u32, edit: impl FnOnce(&mut ConfigImage)) -> ConfigImage {
+        let mut image = image(generation);
+        edit(&mut image);
+        image.seal();
+        image
+    }
+
+    /// **A digest mismatch is its own reason and not `malformed-value`.**
+    ///
+    /// The two say different things to an operator and prescribe different next
+    /// actions: every `malformed-value` is a statement about a document somebody
+    /// wrote, whose fix is to edit it, while this one is a statement about what the
+    /// node published — the submitted document may be perfectly correct. A
+    /// vocabulary may be coarser than the fault tree it summarises; it may not
+    /// point away from the thing at fault, and this test is what keeps the two from
+    /// being folded back together.
+    ///
+    /// The number is the digest the image declared, there being no entry to point
+    /// at in bytes that are not one publication.
+    #[test]
+    fn an_image_that_is_not_one_publication_is_not_reported_as_a_bad_document() {
+        // Sealed, then edited: the digest names the bytes before the edit, which is
+        // exactly the state a copy taken across two publications is in.
+        let mut torn = image(1);
+        torn.generation = torn.generation.wrapping_add(1);
+        let declared = torn.digest;
+        assert_ne!(
+            declared,
+            torn.computed_digest(),
+            "the fixture must not fold to the digest it carries"
+        );
+
+        let error = torn
+            .check(PORTS)
+            .expect_err("bytes that are not one publication are refused");
+        assert!(matches!(error, ConfigImageError::DigestMismatch { .. }));
+        assert_eq!(
+            refusal(error),
+            (RejectReason::HandoverNotOnePublication, declared)
+        );
+        assert_ne!(
+            refusal(error).0,
+            RejectReason::MalformedValue,
+            "a node that published incoherent bytes must not be reported as a bad document"
+        );
+
+        // And a genuinely bad *value* in an image that IS one publication still is
+        // `malformed-value`, so the distinction is between the two rather than a
+        // reason nothing reaches.
+        let bad_value = edited(1, |image| image.interfaces[0].enabled = 0xff)
+            .check(PORTS)
+            .expect_err("an enabled byte that is neither 0 nor 1 is refused");
+        assert_eq!(refusal(bad_value).0, RejectReason::MalformedValue);
     }
 
     /// The two regions a consumer sits between.
@@ -870,8 +970,7 @@ mod tests {
     /// domain, which no configuration carries.
     #[test]
     fn the_inventory_reports_each_configured_interface_under_its_ports_driver() {
-        let mut raw = image(1);
-        raw.management = management_image();
+        let raw = edited(1, |raw| raw.management = management_image());
         let inventory = interfaces_from(&checked(&raw));
 
         let entries: Vec<_> = inventory.entries().copied().collect();
@@ -923,9 +1022,10 @@ mod tests {
     /// half of what the QEMU gate asserts against a real scrape.
     #[test]
     fn a_renamed_interface_is_reported_under_its_new_name() {
-        let mut raw = image(1);
-        raw.interfaces[0].id = IdentifierImage::from_text(b"uplink");
-        raw.interfaces[1].id = IdentifierImage::from_text(b"downlink");
+        let raw = edited(1, |raw| {
+            raw.interfaces[0].id = IdentifierImage::from_text(b"uplink");
+            raw.interfaces[1].id = IdentifierImage::from_text(b"downlink");
+        });
         let inventory = interfaces_from(&checked(&raw));
         let names: Vec<String> = inventory
             .entries()
@@ -957,6 +1057,7 @@ mod tests {
             if management {
                 raw.management = management_image();
             }
+            raw.seal();
             let inventory = interfaces_from(&checked(&raw));
             prop_assert_eq!(inventory.len(), count + usize::from(management));
             prop_assert!(inventory.len() <= lfw_metrics::MAX_INTERFACE_SERIES);
@@ -1040,12 +1141,13 @@ mod tests {
         handover.publish_committed(1);
         switch.take_commit(&handover, &ack);
 
-        let mut second = image(2);
-        second.interface_count = 1;
         // The neighbour on port 1 goes with the interface that addressed it: a
         // next hop on a port no interface claims is a link with no prefix to be
         // a neighbour of, and is refused.
-        second.neighbour_count = 1;
+        let second = edited(2, |second| {
+            second.interface_count = 1;
+            second.neighbour_count = 1;
+        });
         handover.publish(&second);
         assert_eq!(
             switch.take_offer(&handover, &ack),
@@ -1073,8 +1175,7 @@ mod tests {
     fn a_refused_image_changes_nothing_and_is_never_acknowledged() {
         let (handover, ack) = regions();
         let mut switch = Switch::new(PORTS);
-        let mut bad = image(1);
-        bad.interfaces[1].port = PORTS;
+        let bad = edited(1, |bad| bad.interfaces[1].port = PORTS);
         handover.publish(&bad);
 
         assert_eq!(
@@ -1101,8 +1202,7 @@ mod tests {
     fn a_generation_refused_once_can_be_offered_again() {
         let (handover, ack) = regions();
         let mut switch = Switch::new(PORTS);
-        let mut bad = image(1);
-        bad.interfaces[0].enabled = 3;
+        let bad = edited(1, |bad| bad.interfaces[0].enabled = 3);
         handover.publish(&bad);
         assert!(matches!(
             switch.take_offer(&handover, &ack),
@@ -1112,8 +1212,7 @@ mod tests {
             })
         ));
 
-        let mut also_bad = image(2);
-        also_bad.interfaces[0].enabled = 3;
+        let also_bad = edited(2, |also_bad| also_bad.interfaces[0].enabled = 3);
         handover.publish(&also_bad);
         assert!(matches!(
             switch.take_offer(&handover, &ack),
@@ -1136,8 +1235,7 @@ mod tests {
     fn one_unchanged_refused_offer_is_one_refusal_however_many_passes_follow() {
         let (handover, ack) = regions();
         let mut switch = Switch::new(PORTS);
-        let mut bad = image(1);
-        bad.interfaces[1].port = PORTS;
+        let bad = edited(1, |bad| bad.interfaces[1].port = PORTS);
         handover.publish(&bad);
 
         let mut records = 0usize;
@@ -1150,6 +1248,42 @@ mod tests {
         assert_eq!(switch.counters().refused, 1);
         assert_eq!(switch.generation(), 0);
         assert_eq!(ack.staged_generation(), 0);
+    }
+
+    /// A commit whose bytes a later offer has already replaced. Both words are
+    /// true and they are about different generations, so this reader takes
+    /// nothing rather than reporting one generation's number over another's
+    /// document — and takes the newer one when it is committed in turn.
+    #[test]
+    fn a_commit_whose_bytes_a_newer_offer_replaced_is_not_taken_under_the_old_number() {
+        let (handover, _ack) = regions();
+        let mut reader = CommittedReader::new();
+        handover.publish(&image(1));
+        handover.publish_committed(1);
+        // The forwarder has not staged generation 2 yet, so `committed` still
+        // names 1 while the bytes are already 2's.
+        handover.publish(&edited(2, |raw| raw.interfaces[0].address = [10, 0, 0, 9]));
+
+        assert_eq!(reader.take(&handover, PORTS), None);
+        assert_eq!(reader.generation(), 0, "nothing was consumed");
+
+        handover.publish_committed(2);
+        let Some(Committed::Image {
+            generation,
+            checked,
+        }) = reader.take(&handover, PORTS)
+        else {
+            panic!("the newer commit is taken");
+        };
+        assert_eq!(generation, 2);
+        assert_eq!(
+            checked
+                .interfaces()
+                .next()
+                .expect("one interface")
+                .address(),
+            [10, 0, 0, 9]
+        );
     }
 
     /// A domain with less room than the image ABI allows refuses rather than
@@ -1301,7 +1435,7 @@ mod tests {
         assert_eq!(publisher.offered(), 5, "the offer did not move");
         assert_eq!(handover.offered_generation(), 5);
         let mut region = ConfigImage::ZERO;
-        handover.load_image_into(&mut region);
+        assert_eq!(handover.load_offer(&mut region), Some(5));
         assert_eq!(region.generation, 5, "nor did the region");
 
         // And the acknowledgement still releases the generation it named.
@@ -1343,8 +1477,7 @@ mod tests {
         let (handover, ack) = regions();
         let mut publisher = ConfigPublisher::new();
         let mut consumer = Switch::new(PORTS);
-        let mut bad = image(1);
-        bad.interfaces[0].mac = [0xff; 6];
+        let bad = edited(1, |bad| bad.interfaces[0].mac = [0xff; 6]);
         publisher
             .offer(&handover, &bad)
             .expect("the first generation");
@@ -1426,8 +1559,7 @@ mod tests {
     /// an administratively down port back up on the far side of the handover.
     #[test]
     fn a_disabled_interface_stays_disabled_across_the_image() {
-        let mut raw = image(1);
-        raw.interfaces[1].enabled = 0;
+        let raw = edited(1, |raw| raw.interfaces[1].enabled = 0);
         let checked = raw.check(PORTS).expect("zero is a boolean");
         let built: Router<MAX_INTERFACES, MAX_NEIGHBOURS> = router_from(&checked).expect("it fits");
         assert_ne!(
@@ -1469,8 +1601,9 @@ mod tests {
             "the fixture addresses no management port"
         );
 
-        let mut addressed = image(1);
-        addressed.management = management(1, MGMT_MAC, MGMT_ADDRESS);
+        let addressed = edited(1, |raw| {
+            raw.management = management(1, MGMT_MAC, MGMT_ADDRESS)
+        });
         let checked = addressed.check(PORTS).expect("an enabled entry");
         let endpoint = endpoint_from(&checked, secret())
             .expect("a unicast pair")
@@ -1482,6 +1615,7 @@ mod tests {
         // A disabled entry addresses nothing, whatever its other fields say.
         let mut disabled = addressed;
         disabled.management.enabled = 0;
+        disabled.seal();
         assert!(
             endpoint_from(&disabled.check(PORTS).expect("still valid"), secret())
                 .expect("no entry is not an error")
@@ -1504,16 +1638,16 @@ mod tests {
     #[test]
     fn every_management_entry_a_checked_image_carries_builds_an_endpoint() {
         for address in [[224, 0, 0, 1], [10, 0, 2, 0], [0, 0, 0, 0]] {
-            let mut raw = image(1);
-            raw.management = management(1, MGMT_MAC, address);
+            let raw = edited(1, |raw| raw.management = management(1, MGMT_MAC, address));
             assert!(
                 raw.check(PORTS).is_err(),
                 "the image reader admitted {address:?}, which no endpoint answers under"
             );
         }
 
-        let mut addressed = image(1);
-        addressed.management = management(1, MGMT_MAC, MGMT_ADDRESS);
+        let addressed = edited(1, |raw| {
+            raw.management = management(1, MGMT_MAC, MGMT_ADDRESS)
+        });
         let checked = addressed.check(PORTS).expect("an enabled entry");
         endpoint_from(&checked, secret())
             .expect("a checked entry is one an endpoint answers under")
@@ -1577,8 +1711,7 @@ mod tests {
     fn a_committed_image_that_cannot_be_read_is_refused_once() {
         let (handover, _ack) = regions();
         let mut reader = CommittedReader::new();
-        let mut bad = image(1);
-        bad.interfaces[0].port = PORTS;
+        let bad = edited(1, |bad| bad.interfaces[0].port = PORTS);
         handover.publish(&bad);
         handover.publish_committed(1);
         assert_eq!(
@@ -1696,7 +1829,6 @@ mod tests {
                 generation,
                 interface_count,
                 neighbour_count,
-                content_hash: 0,
                 ..ConfigImage::ZERO
             };
             for slot in &mut raw.interfaces {
@@ -1720,6 +1852,7 @@ mod tests {
                     address: [10, 0, 0, 2],
                 };
             }
+            raw.seal();
             handover.publish(&raw);
 
             match switch.take_offer(&handover, &ack) {
@@ -1754,10 +1887,7 @@ mod tests {
         ) {
             let (handover, ack) = regions();
             let mut switch = Switch::new(PORTS);
-            handover.publish(&ConfigImage {
-                interface_count,
-                ..image(1)
-            });
+            handover.publish(&edited(1, |raw| raw.interface_count = interface_count));
             prop_assert_eq!(
                 switch.take_offer(&handover, &ack),
                 Some(Offer::Refused {

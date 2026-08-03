@@ -28,6 +28,22 @@
 //! writes into, which the borrow checker enforces at the call site rather than
 //! this paragraph enforcing by asking.
 //!
+//! # A body that never finishes, and why it needs a deadline of its own
+//!
+//! Because that refusal is what one connection can do to every other, the
+//! accumulation is bounded in *time* as well as in bytes. A peer that declares a
+//! body and then trickles it holds the array while it does, and the transport's
+//! idle timeout cannot end that: the timer is refreshed by each arriving byte, so
+//! one byte every few minutes keeps a connection alive indefinitely and the array
+//! with it. [`BODY_TIMEOUT`] is the bound that closes it —
+//! [`Server::expire`] answers a body that misses it `408`, gives the array back,
+//! and **resets** the connection rather than closing it, a close leaving the
+//! peer's half open for it to go on refreshing that same timer from.
+//!
+//! An operator tool killed mid-`POST` reaches this too, which is why it is not
+//! only an attacker's concern: without it, the surfaces an operator would use to
+//! find out what happened are the ones that stop answering.
+//!
 //! # Adversary
 //!
 //! The **management-plane attacker**, one layer above `lfw_http`.
@@ -125,7 +141,7 @@
 //! [`Status::HeadersTooLarge`] — the same answer a head that long gets in any
 //! case, so no legitimate request loses a byte.
 
-use lfw_clock::Monotonic;
+use lfw_clock::{Duration, Monotonic};
 use lfw_http::{ContentType, MAX_HEAD_LEN, MAX_REQUEST_BYTES, Parsed, Status, parse, write_head};
 use lfw_tcp::{Connection, ConnectionId, MAX_UNACKED, SendError, SeqNumber, TcpStack, Timeout};
 
@@ -205,6 +221,17 @@ pub const MAX_RENDERED_TARGETS: usize = 4;
 /// somewhere else.
 pub const MAX_BODY_TARGETS: usize = 2;
 
+/// How long a request body may take to arrive whole before the request is
+/// answered [`Status::RequestTimeout`] and the connection reset.
+///
+/// Deliberately not derived from anything the peer states: a span computed from a
+/// declared `Content-Length` would let the peer choose how long it may hold the
+/// array by declaring a larger body. Thirty seconds is the whole of
+/// [`MAX_BODY_LEN`] at about 2 KiB/s — two orders below what a management link
+/// carries — and a tenth of `lfw_tcp::IDLE_TIMEOUT`, so this is the deadline that
+/// binds rather than a second copy of that one.
+pub const BODY_TIMEOUT: Duration = Duration::from_millis(30_000);
+
 // The bound the whole streaming design rests on, stated where both halves are
 // visible: the worst-case exposition and the head in front of it fit the buffer
 // they are composed into, so a scrape is never answered short. Both are
@@ -214,9 +241,9 @@ const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + MAX_BODY_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 79_496);
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 79_943);
     assert!(MAX_BODY_LEN == 65_536);
-    assert!(RESPONSE_CAPACITY == 79_657);
+    assert!(RESPONSE_CAPACITY == 80_104);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own
@@ -252,6 +279,10 @@ pub struct HttpCounters {
     pub bodies_overrun: u64,
     /// Request bodies accumulated whole and handed to the caller.
     pub bodies_taken: u64,
+    /// Request bodies given up on for taking longer than [`BODY_TIMEOUT`] to
+    /// arrive, answered 408 and reset. The peer's, and every one of them is a
+    /// stretch in which the other body-bearing surfaces answered 503.
+    pub bodies_timed_out: u64,
     /// Ranges the transport asked for again that no response buffer held. A
     /// caller and a transport disagreeing about what is outstanding, which is
     /// **ours**.
@@ -304,10 +335,16 @@ enum Phase {
     /// connection's to accumulate that body into. `received` counts body bytes and
     /// is what the advertised window is derived from, so a peer is told to send
     /// exactly what is still owed.
+    ///
+    /// `deadline` is when the accumulation gives up. Fixed when the phase is
+    /// entered and never moved by an arriving byte: a deadline each byte refreshed
+    /// would be the transport's idle timer again, which a peer sending one byte a
+    /// minute already defeats.
     Receiving {
         target: &'static str,
         total: usize,
         received: usize,
+        deadline: Monotonic,
     },
     /// The head is read and the staging buffer is this connection's; the caller
     /// owes what [`Want`] names. Deliberately not [`Phase::Responding`]: nothing
@@ -431,6 +468,23 @@ enum Body {
     Abandoned,
 }
 
+/// How this end finishes with a connection once its response is out.
+///
+/// A value rather than a `bool`, because the two differ in what they say to the
+/// peer rather than in degree, and the difference is the whole reason the second
+/// exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// A `FIN`: the exchange finished and the peer owes nothing more.
+    Close,
+    /// A `RST`: this end gave up on a message the peer is still sending. A `FIN`
+    /// would leave the peer's own half open, and each byte it went on sending
+    /// would refresh the transport's idle timer — holding the connection's slot
+    /// for as long as the peer kept sending, which is the thing the deadline
+    /// above it exists to bound.
+    Reset,
+}
+
 /// One connection's state.
 struct Slot {
     connection: Option<ConnectionId>,
@@ -449,6 +503,8 @@ struct Slot {
     /// Where response byte 0 sits in this connection's send sequence space,
     /// learned from the transport when the first range went out.
     base: Option<SeqNumber>,
+    /// How the connection is finished with once its response is out.
+    ending: Ending,
 }
 
 impl Slot {
@@ -463,6 +519,7 @@ impl Slot {
             len: 0,
             sent: 0,
             base: None,
+            ending: Ending::Close,
         }
     }
 
@@ -597,6 +654,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 bodies_refused: 0,
                 bodies_overrun: 0,
                 bodies_taken: 0,
+                bodies_timed_out: 0,
                 retransmits_unavailable: 0,
                 slots_exhausted: 0,
                 streams_started: 0,
@@ -683,7 +741,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// Bounded by the slot, which the advertised window is kept equal to: a peer
     /// that honours the window cannot overrun it, and one that does not has the
     /// excess counted and dropped rather than written past the array.
-    pub fn take(&mut self, connection: ConnectionId, data: &[u8]) {
+    pub fn take(&mut self, now: Monotonic, connection: ConnectionId, data: &[u8]) {
         let Some(index) = self.slot_for(connection) else {
             bump(&mut self.counters.slots_exhausted);
             return;
@@ -729,7 +787,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
             self.respond_without_body(index, Status::HeadersTooLarge);
             return;
         }
-        self.decide(index, connection);
+        self.decide(now, index, connection);
     }
 
     /// Take body bytes for a connection whose head declared a length, appending
@@ -749,6 +807,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 target,
                 total,
                 received,
+                deadline,
             } = slot.phase
             else {
                 return;
@@ -768,6 +827,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 target,
                 total,
                 received,
+                deadline,
             };
             if received >= total {
                 slot.phase = Phase::AwaitingBody(Want::Submitted(target));
@@ -792,7 +852,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
     }
 
     /// Parse whatever has accumulated and answer if the head is whole.
-    fn decide(&mut self, index: usize, connection: ConnectionId) {
+    fn decide(&mut self, now: Monotonic, index: usize, connection: ConnectionId) {
         // Copied out before the slot is borrowed: three small tables against a
         // borrow of the whole server across the parse.
         let rendered = self.rendered;
@@ -863,7 +923,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 target,
                 total,
                 head_len,
-            } => self.begin_receiving(index, connection, target, total, head_len),
+            } => self.begin_receiving(now, index, connection, target, total, head_len),
         }
     }
 
@@ -875,6 +935,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// waiting for a byte that will never come.
     fn begin_receiving(
         &mut self,
+        now: Monotonic,
         index: usize,
         connection: ConnectionId,
         target: &'static str,
@@ -892,6 +953,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 target,
                 total,
                 received: 0,
+                deadline: now.saturating_add(BODY_TIMEOUT),
             };
             slot.body = Body::Own;
             slot.len = 0;
@@ -1292,6 +1354,36 @@ impl<const SLOTS: usize> Server<SLOTS> {
         }
     }
 
+    /// Give up on any body whose deadline has passed, releasing the staging array
+    /// so the surfaces that share it answer again.
+    ///
+    /// Answered [`Status::RequestTimeout`] out of the slot's own buffer, so the
+    /// array is handed back before a byte of the answer is composed and the next
+    /// request for it is served rather than refused.
+    ///
+    /// There is no timer to run this on: a wakeup is the only thing that happens,
+    /// so a deadline is only ever *checked* on one. That is sufficient rather than
+    /// a compromise — a held array denies only the requests that arrive, and each
+    /// arrival is a wakeup — so what a quiet stretch delays is the reclamation of
+    /// an array nothing is asking for.
+    ///
+    pub fn expire(&mut self, now: Monotonic) {
+        let expired = (0..SLOTS).find(|index| {
+            self.slots.get(*index).is_some_and(
+                |slot| matches!(slot.phase, Phase::Receiving { deadline, .. } if now >= deadline),
+            )
+        });
+        let Some(index) = expired else {
+            return;
+        };
+        bump(&mut self.counters.bodies_timed_out);
+        self.release_shared(index);
+        self.respond_without_body(index, Status::RequestTimeout);
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.ending = Ending::Reset;
+        }
+    }
+
     /// Note that the peer has closed its half.
     ///
     /// A connection that closed before its request head ended will never send
@@ -1379,9 +1471,12 @@ impl<const SLOTS: usize> Server<SLOTS> {
         // announced, so it ends with a `RST`: a `FIN` would say the message
         // ended where it ended, and every intermediary on the path would read a
         // truncated recording as a complete one.
-        let ended = match self.slots.get(index)?.body {
-            Body::Abandoned => stack.abort(connection, out),
-            Body::Own | Body::Staged | Body::Windowed(_) => stack.close(now, connection, out),
+        let slot = self.slots.get(index)?;
+        let ended = match (slot.body, slot.ending) {
+            (Body::Abandoned, _) | (_, Ending::Reset) => stack.abort(connection, out),
+            (Body::Own | Body::Staged | Body::Windowed(_), Ending::Close) => {
+                stack.close(now, connection, out)
+            }
         };
         match ended {
             Ok(written) => {
@@ -1651,6 +1746,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
             slot.len = 0;
             slot.sent = 0;
             slot.base = None;
+            slot.ending = Ending::Close;
         }
     }
 
@@ -1671,6 +1767,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
         slot.len = 0;
         slot.sent = 0;
         slot.base = None;
+        slot.ending = Ending::Close;
         Some(index)
     }
 

@@ -631,6 +631,27 @@ fn header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
     !(sum as u16)
 }
 
+/// The ones'-complement sum RFC 1071 defines, over an arbitrary run of bytes.
+///
+/// Separate from [`header_checksum`], which zeroes the IPv4 header's own field
+/// before summing: an ICMP message carries its checksum inside the bytes it covers,
+/// so the caller zeroes it and this sums what it is given.
+fn ones_complement(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for pair in bytes.chunks(2) {
+        let value = match pair {
+            [high, low] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            _ => 0,
+        };
+        sum += u32::from(value);
+    }
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// What must become of one injected packet.
 #[derive(Debug)]
 enum Expectation {
@@ -1288,6 +1309,21 @@ pub enum Traffic {
     /// **The fourth probe is the one that proves this is a re-decision and not a
     /// flush**: a commit that emptied the table would refuse it too.
     Revocation,
+    /// The set that spans a configuration change and states that **relating an ICMP
+    /// error to a conversation decides where it would go and never whether it may.**
+    ///
+    /// A conversation opens, and an error quoting one of its datagrams arrives from
+    /// the far side — a quote the tracker's own corroboration accepts, so the frame
+    /// really is related and not merely refused as unreadable. Under the shipped
+    /// policy, whose rules are both about UDP, no rule is about it and the default
+    /// deny refuses it. A document is then submitted that adds one rule admitting
+    /// related traffic, and the same error on the same flow crosses.
+    ///
+    /// **Both halves are needed and neither is enough.** A denial alone would leave
+    /// "the policy refused it" and "the tracker never related it" looking alike; an
+    /// admission alone would say nothing about the default. Together they are the
+    /// policy deciding.
+    Related,
 }
 
 impl Traffic {
@@ -1302,7 +1338,26 @@ impl Traffic {
         match self {
             Self::Reconfiguration => Some(crate::config_submission_contract::SUBMITTED),
             Self::Revocation => Some(crate::config_submission_contract::NARROWED),
+            Self::Related => Some(crate::config_submission_contract::RELATED),
             Self::Routed | Self::Policy | Self::Lifecycle | Self::Stateful => None,
+        }
+    }
+
+    /// How many rules this set's submitted document adds to the booted one's, which
+    /// is what the per-rule counter family's cardinality moves by.
+    ///
+    /// Stated here rather than parsed out of the submitted bytes: it is a property
+    /// of the experiment each set is, and a set whose document grew a rule without
+    /// this moving fails the cardinality check with the numbers in the verdict.
+    const fn rules_added(self) -> usize {
+        match self {
+            Self::Related => 1,
+            Self::Routed
+            | Self::Policy
+            | Self::Lifecycle
+            | Self::Stateful
+            | Self::Reconfiguration
+            | Self::Revocation => 0,
         }
     }
 
@@ -1353,6 +1408,14 @@ pub struct PolicyWitness {
     /// in any set is a TCP segment at all, so a refusal on a boot that injected
     /// none is a frame nobody put on the wire.
     pub probed_mid_stream: bool,
+    /// How many rules the policy **in force when the scrape is taken** declares,
+    /// which is the whole cardinality of the per-rule counter family.
+    ///
+    /// Not always the booted document's. A scenario that submits one is scraped
+    /// under the submitted policy, and a submission may add a rule the booted
+    /// document never had — so a count taken from the built-around document alone
+    /// would refuse a scrape that is exactly right.
+    pub rules: usize,
     /// Whether the boot ran **two** policies: one it booted with and one submitted
     /// over the management API while it ran.
     ///
@@ -1411,6 +1474,10 @@ fn injected_probes(
         // falls past every rule once its flow is gone, and no probe here is
         // addressed to the port the dropping rule names.
         Traffic::Revocation => (revocation_probes(topology, policy), false, true, false),
+        // The fallthrough and nothing else: the shipped policy has no rule about
+        // related traffic, so the error falls past every rule, and no probe here is
+        // addressed to the port the dropping rule names.
+        Traffic::Related => (related_probes(topology, policy), false, true, false),
     };
     Ok((
         probes,
@@ -1424,7 +1491,12 @@ fn injected_probes(
             // direction.
             probed_an_established_flow: stateful || matches!(traffic, Traffic::Revocation),
             probed_mid_stream: stateful,
-            reconfigured: matches!(traffic, Traffic::Reconfiguration | Traffic::Revocation),
+            // The booted document's rules, plus whatever the submitted one adds.
+            rules: topology.rule_ids().len() + traffic.rules_added(),
+            reconfigured: matches!(
+                traffic,
+                Traffic::Reconfiguration | Traffic::Revocation | Traffic::Related
+            ),
         },
     ))
 }
@@ -1623,6 +1695,202 @@ fn revocation_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
             ),
         )),
     ]
+}
+
+/// An ICMP error, quoting a datagram of a conversation the appliance holds — the
+/// only frame in this harness whose classification is decided by bytes the *sender*
+/// chose, and the reason those bytes are built here field by field.
+///
+/// The four agreements `lfw_flow::icmp` corroborates a quote against are all
+/// properties of these fields, so a quote built carelessly is refused as
+/// `QuotedInvalid` and proves nothing about policy. Two of them are visible in this
+/// signature: the quoted `source` must be the error's own `destination` — an error
+/// travels from a router back to the sender of the datagram it quotes — and the
+/// quoted five-tuple must name a flow the table holds in a direction that flow has
+/// carried traffic in.
+///
+/// The `marker` sits behind the quote. RFC 792 requires the original header and
+/// eight bytes of it; carrying more is what every real implementation does, and it
+/// is what gives this harness bytes to attribute a delivery by that the quote's own
+/// header does not already carry.
+struct IcmpErrorPacket {
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    source: [u8; 4],
+    destination: [u8; 4],
+    /// The error type. One of destination-unreachable, time-exceeded and
+    /// parameter-problem, which are the three that relate to a flow; anything else
+    /// is refused as a type the tracker neither tracks nor relates.
+    message_type: u8,
+    code: u8,
+    ttl: u8,
+    /// The datagram this error reports on: a UDP one, whose source must be the
+    /// party the error is addressed to.
+    quoted_source: [u8; 4],
+    quoted_destination: [u8; 4],
+    quoted_source_port: u16,
+    quoted_destination_port: u16,
+    marker: Vec<u8>,
+}
+
+impl IcmpErrorPacket {
+    fn build(&self) -> Vec<u8> {
+        let mut quoted = Vec::with_capacity(IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        let mut inner = [0u8; IPV4_HEADER_LEN];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&((IPV4_HEADER_LEN + UDP_HEADER_LEN) as u16).to_be_bytes());
+        inner[8] = INJECTED_TTL;
+        inner[9] = UDP_PROTOCOL;
+        inner[12..16].copy_from_slice(&self.quoted_source);
+        inner[16..20].copy_from_slice(&self.quoted_destination);
+        let inner_checksum = header_checksum(&inner);
+        inner[10..12].copy_from_slice(&inner_checksum.to_be_bytes());
+        quoted.extend_from_slice(&inner);
+        quoted.extend_from_slice(&self.quoted_source_port.to_be_bytes());
+        quoted.extend_from_slice(&self.quoted_destination_port.to_be_bytes());
+        quoted.extend_from_slice(&(UDP_HEADER_LEN as u16).to_be_bytes());
+        quoted.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut message = Vec::with_capacity(ICMP_HEADER_LEN + quoted.len());
+        message.push(self.message_type);
+        message.push(self.code);
+        // The checksum, filled in below.
+        message.extend_from_slice(&[0, 0]);
+        // The four unused bytes an error's header carries.
+        message.extend_from_slice(&[0, 0, 0, 0]);
+        message.extend_from_slice(&quoted);
+        message.extend_from_slice(&self.marker);
+        let checksum = ones_complement(&message);
+        message[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::with_capacity(MIN_ETHERNET_FRAME + message.len());
+        frame.extend_from_slice(&self.destination_mac);
+        frame.extend_from_slice(&self.source_mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + message.len()) as u16).to_be_bytes());
+        ip[8] = self.ttl;
+        ip[9] = ICMP_PROTOCOL;
+        ip[12..16].copy_from_slice(&self.source);
+        ip[16..20].copy_from_slice(&self.destination);
+        let checksum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&message);
+        if frame.len() < MIN_ETHERNET_FRAME {
+            frame.resize(MIN_ETHERNET_FRAME, 0);
+        }
+        frame
+    }
+
+    /// The same error as it must arrive at the far endpoint: the three changes a
+    /// hop makes, and nothing else. The ICMP checksum is unaffected — a router
+    /// rewrites no byte the message covers.
+    fn delivered(&self, to: Endpoint) -> Vec<u8> {
+        Self {
+            destination_mac: to.mac,
+            source_mac: to.gateway_mac,
+            ttl: self.ttl - 1,
+            marker: self.marker.clone(),
+            ..*self
+        }
+        .build()
+    }
+}
+
+/// A conversation, an ICMP error about it the shipped policy refuses, and the same
+/// error under a document that admits related traffic.
+///
+/// **The two errors quote the same conversation and differ only in the marker
+/// behind the quote**, which is what makes them the same experiment run twice: a
+/// second five-tuple would be a second flow, and the difference between the two
+/// verdicts would be about the flow rather than about the policy.
+fn related_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let permitted = policy.accepted.destination_port;
+    /// Destination unreachable, port unreachable: what a host answers a datagram
+    /// no socket is listening for, and the commonest related error there is.
+    const UNREACHABLE: u8 = 3;
+    const PORT_UNREACHABLE: u8 = 3;
+
+    let request = |marker: &'static [u8]| UdpPacket {
+        source_port: SOURCE_PORT,
+        destination_port: permitted,
+        payload: marker.to_vec(),
+        ..datagram(a, b, INJECTED_TTL, marker)
+    };
+    // Addressed to A, quoting the datagram A sent to B: the agreement that stops an
+    // attacker quoting a conversation it merely knows about.
+    let error = |marker: &'static [u8]| IcmpErrorPacket {
+        destination_mac: b.gateway_mac,
+        source_mac: b.mac,
+        source: b.address,
+        destination: a.address,
+        message_type: UNREACHABLE,
+        code: PORT_UNREACHABLE,
+        ttl: INJECTED_TTL,
+        quoted_source: a.address,
+        quoted_destination: b.address,
+        quoted_source_port: SOURCE_PORT,
+        quoted_destination_port: permitted,
+        marker: marker.to_vec(),
+    };
+    let denied = error(b"LFW-PROBE/related-denied");
+    let allowed = error(b"LFW-PROBE/related-allowed");
+
+    vec![
+        routed(
+            "related-open",
+            b"LFW-PROBE/related-open",
+            a,
+            b,
+            request(b"LFW-PROBE/related-open"),
+        ),
+        // Refused by the default deny, and that refusal is the whole of the first
+        // half: the quote is corroborated, so the tracker relates the frame — and
+        // relating it still does not admit it.
+        deferred_probe(refused_by_policy(
+            recording_contract::EVENT_POLICY_NO_MATCH,
+            dropped_frame(
+                "related-denied",
+                b"LFW-PROBE/related-denied",
+                b,
+                "the shipped policy has no rule about related traffic, so an ICMP error the                  tracker relates to a live conversation still falls to the default deny",
+                denied.build(),
+            ),
+        )),
+        // And after the commit, the same error on the same flow. It opens no
+        // conversation — an error reports on one somebody else opened — so its
+        // record names no lifecycle event and the whole of what it proves is the
+        // delivery and the rule that admitted it.
+        after_the_commit(carried_by_its_flow(Probe {
+            name: "related-allowed",
+            marker: b"LFW-PROBE/related-allowed",
+            from: b,
+            frame: allowed.build(),
+            expectation: Expectation::Routed {
+                to: a,
+                delivered: allowed.delivered(a),
+                // Not a datagram this harness models field by field, so a delivery
+                // that departs from the contract is reported as bytes.
+                datagram: None,
+            },
+            observed: true,
+            deferred: false,
+            once: false,
+            event: None,
+            wave: Wave::Shipped,
+        })),
+    ]
+}
+
+/// A probe that must wait for the conversation it belongs to.
+fn deferred_probe(probe: Probe) -> Probe {
+    Probe {
+        deferred: true,
+        ..probe
+    }
 }
 
 /// A probe that must wait for the conversation it belongs to and that moves that

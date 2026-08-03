@@ -483,10 +483,12 @@ fn judge_one_interface<'a>(
 /// zero, which is as strong as a rise and only a set that provokes neither can
 /// state. The filter set provokes one of each and both must have risen.
 ///
-/// **The cardinality is the document's.** One series per rule the document
-/// declares and not one more, each labelled with the id the document gave it. A
-/// scrape from an image built around the *other* policy is judged against its own
-/// document and cannot pass on this one's rule names.
+/// **The cardinality is the document's** — the one in force when the scrape was
+/// taken. One series per rule it declares and not one more, each labelled with the
+/// id that document gave it. A scrape from an image built around the *other* policy
+/// is judged against its own document and cannot pass on this one's rule names, and
+/// a scenario that submitted a document adding a rule is judged against the count
+/// the submission left behind.
 ///
 /// # Errors
 /// The verdict, naming the rule and the two numbers.
@@ -496,13 +498,14 @@ fn judge_policy(
     witness: PolicyWitness,
 ) -> Result<Vec<&Sample>, String> {
     let series = exposition.select(RULE_HITS, &[]);
-    if series.len() != 2 {
+    if series.len() != witness.rules {
         return Err(format!(
-            "the exposition carries {} {RULE_HITS} series and the document declares two rules. \
-             One series per declared rule is the whole cardinality of this family — a position no \
-             rule occupies is a counter under no operator's name and must reach no series\n  \
-             found: {}",
+            "the exposition carries {} {RULE_HITS} series and the policy in force declares {} \
+             rule(s). One series per declared rule is the whole cardinality of this family — a \
+             position no rule occupies is a counter under no operator's name and must reach no \
+             series\n  found: {}",
             series.len(),
+            witness.rules,
             render(&series)
         ));
     }
@@ -526,17 +529,22 @@ fn judge_policy(
     asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "policy_denied")]));
     asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "no_policy_match")]));
 
-    // What the tracker carried without the filter, summed as a reader must: the
-    // node publishes no total, and these two are the whole of what reaches a
-    // dataplane egress under a decision no rule made.
+    // What the tracker carried **without the filter**, which is one outcome and not
+    // two. An established packet is settled in front of the filter and reaches a
+    // dataplane egress under a decision no rule made; a related one is put to the
+    // filter like an opening — recognising it settles where it would go and never
+    // whether it may — so it is counted with the openings below and never here. A
+    // related packet is therefore not even evidence of a delivery: the policy may
+    // have refused it, and `flow_packets_total{outcome="related"}` counts it either
+    // way.
     let classified = |outcome: &str| -> Result<u64, String> {
         Ok(one(exposition, FLOW_PACKETS, &[("outcome", outcome)])?.value)
     };
-    let established = classified("established")?;
-    let related = classified("related")?;
-    let carried_by_state = established.saturating_add(related);
+    let carried_by_state = classified("established")?;
     asserted.extend(exposition.select(FLOW_PACKETS, &[("outcome", "established")]));
     asserted.extend(exposition.select(FLOW_PACKETS, &[("outcome", "related")]));
+    // Frames the filter admitted: every frame that came back either belonged to an
+    // established flow or was admitted by a rule.
     let opened = forwarded_frames.checked_sub(carried_by_state).ok_or_else(|| {
         format!(
             "the tracker reports {carried_by_state} packets carried by an existing flow and the \
@@ -551,23 +559,24 @@ fn judge_policy(
     // submitted while the node ran — the same two ids exchange their actions, so
     // each accrues hits under both generations and what stays exact is the sum.
     if witness.reconfigured {
-        let mut total = 0u64;
-        for rule in [witness.policy.accepted, witness.policy.denied] {
-            let id = rule.id.as_str();
-            let sample = one(exposition, RULE_HITS, &[("rule", id)])?;
-            total = total.saturating_add(sample.value);
-            asserted.push(sample);
-        }
+        // Every rule the policy in force declares, and not the two port rules
+        // alone: a submitted document may add one, and a frame it admitted is a
+        // frame the filter decided. Summing the family is what keeps this an
+        // equality over the filter's whole work rather than over a chosen pair.
+        let total = series
+            .iter()
+            .fold(0u64, |total, sample| total.saturating_add(sample.value));
+        asserted.extend(series.iter().copied());
         let expected = opened.saturating_add(denied);
         if total != expected {
             return Err(format!(
-                "the two rules report {total} matches between them and the contract is {expected}: \
-                 the {opened} packets that OPENED a flow ({forwarded_frames} frames observed less \
-                 the {carried_by_state} an existing flow carried) plus the {denied} the filter \
-                 denied. This boot ran two policies — one it booted with and one submitted over \
-                 the management API — and the two rules kept their ids while exchanging their \
-                 actions, so neither count is attributable on its own and the sum is what a filter \
-                 that decided every packet exactly once must report"
+                "the rules report {total} matches between them and the contract is {expected}: \
+                 the {opened} packets the FILTER ADMITTED ({forwarded_frames} frames observed \
+                 less the {carried_by_state} an established flow carried) plus the {denied} the \
+                 filter denied. This boot ran two policies — one it booted with and one submitted \
+                 over the management API — so a rule's own count is not attributable across the \
+                 commit and the sum over the family is what a filter that decided every packet \
+                 exactly once must report"
             ));
         }
         // And the labels, on each of them, for the reason the single-policy path
@@ -596,10 +605,10 @@ fn judge_policy(
                 format!(
                     "frames the harness observed coming back on its two dataplane sockets \
                  ({forwarded_frames}), less the {carried_by_state} the connection tracker carried \
-                 without consulting the filter at all ({established} established, {related} \
-                 related). What is left is the packets that OPENED a flow, and every one of those \
-                 passed this rule — which is the whole of what makes a stateful policy different \
-                 from a stateless one: a reply is forwarded under no rule's name"
+                 without consulting the filter at all. What is left is the frames the FILTER \
+                 ADMITTED, and every one of those passed this rule — which is the whole of what \
+                 makes a stateful policy different from a stateless one: a reply is forwarded \
+                 under no rule's name"
                 ),
             ),
             (

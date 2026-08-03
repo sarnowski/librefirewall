@@ -143,23 +143,48 @@ through both sides; and by two QEMU scenarios that inject three probes differing
 port and hold the three outcomes apart on the wire, by drop reason, and by per-rule counter — one
 against each of the two documents, whose policies name different ports under different ids.
 
-**A ruleset decides which conversations may open, and there is no state criterion.** The connection
-tracker settles an established or related packet *before* the filter is consulted, so **every frame a
-rule is ever asked about has just opened a flow**. A criterion naming a connection's state would
-therefore have exactly one reachable value, which on a security device is worse than no criterion:
-an operator could write `established`, watch the document be accepted, and watch the rule sit at zero
-forever. The [configuration design](../design/configuration.md) records the model this follows — pf's,
-where a tracked flow bypasses the ruleset — and names netfilter's, where the established-accept is a
-rule the operator writes, as the alternative that was rejected.
+**A ruleset decides which conversations may open, and names related traffic where it admits it.** The
+connection tracker settles an *established* packet before the filter is consulted, so the traffic
+following an admitted conversation is carried by its flow. Two things do reach the filter, and the
+`tracking` criterion tells them apart: `opening`, and `related` — traffic an existing conversation is
+the reason for without belonging to it, which today means an ICMP error quoting one of its datagrams.
+Such an error is composed by whoever sent it, with a source address of its choosing, so relating it to
+a flow decides where it would go and never whether it may; the filter is asked, and a document
+admitting no related traffic denies it. There is no third value: traffic inside a tracked conversation
+never reaches the filter, so `established` would have no reachable meaning — an operator could write
+it, watch the document be accepted, and watch the rule sit at zero forever — and it is refused at
+commit rather than accepted and ignored. The
+[configuration design](../design/configuration.md) records the model this follows — pf's, where a
+tracked flow bypasses the ruleset — and names netfilter's, where the established-accept is a rule the
+operator writes, as the alternative that was rejected. The one thing netfilter's model does buy is
+made structural here instead: a `RELATED` accept an operator can forget is, on this appliance, a
+`related` rule they must write to permit at all.
 
 Held by unit and property tests in `crates/pipeline` covering every criterion against a matching and
 a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
 prefix length names, and all five unreadable transport shapes against all four port and type
 criteria; by the differential configuration tests that put an image breaking each of the twelve rules
-through both sides; and by four QEMU scenarios — two that inject three probes differing only in
+through both sides; and by five QEMU scenarios — two that inject three probes differing only in
 destination port and hold the three filter outcomes apart on the wire, by drop reason and by per-rule
-counter, and two that inject a request and its reply and hold the reply's arrival to the tracker
-rather than to any rule.
+counter, two that inject a request and its reply and hold the reply's arrival to the tracker rather
+than to any rule, and one that puts the `related` criterion itself on a booted node.
+
+**The related decision is observed on a running node and not only tested.** The `related-icmp`
+scenario opens a conversation on the release image and then injects an ICMP destination-unreachable
+from the far side quoting one of that conversation's datagrams — a quote built to satisfy every
+agreement the tracker corroborates one by, so the frame really is related and is not merely refused
+as unreadable. Under the shipped policy, whose rules are both about UDP, it falls to the default deny:
+`librefirewall_route_drops_total{reason="no_policy_match"}` rises and the connection history carries
+the refusal as a `policy-no-match` record on the packet that caused it. A document adding one
+`tracking="related"` rule is then submitted over `POST /config`, and the same error on the same flow
+crosses — attributed to that rule in `librefirewall_rule_hits_total{rule="probe-related"}`, with
+`librefirewall_flow_packets_total{outcome="related"}` counting all three classifications. Both halves
+are needed: a denial alone would leave "the policy refused it" and "the tracker never related it"
+looking alike, and an admission alone would say nothing about the default.
+
+An admitted related packet changes no conversation, so it has no connection-history record of its
+own; it appears in the capture with its `related` classification and its forwarded verdict, and the
+rule counter is what names the rule that let it through.
 
 **A commit ends the conversations the new policy no longer admits.** Removing a rule used to leave
 every connection it had already admitted running, which was a security gap rather than a rough edge —
@@ -284,18 +309,50 @@ it — and it is the safe direction either way.
 
 **It is bounded per wakeup, and that is measured rather than assumed.** One window of the pass —
 4096 bucket heads, which is exactly the bytes the timeout sweep's 256 entries already cost every
-wakeup — is about 3.4 µs on the development machine, against about 85 ns for a forwarded frame
-(`pd-runtime`'s `policy_sweep_window` and `route_forwarded` benchmarks). A whole pass over the
-million-slot index is therefore nearly a millisecond, and a commit that stalled forwarding for that
-long would be a worse defect than the one this closes. So a wakeup works off what its own frame budget
-left unspent: a saturated wakeup pays one window and a quiet one pays four, which bounds a wakeup's
-re-deciding at about what a full drain costs and finishes a pass in a quarter of the wakeups when
-traffic is light. The pass walks the *index* and not the entries — four mebibytes rather than
-sixty-four — and so reaches exactly the flows a packet can reach: one it cannot get to is one no lookup
-can get to either, which can classify nothing and forward nothing.
+wakeup — is about 3.4 µs on the development machine, and about 6.7 µs where the window also has 256
+live flows to re-decide, against about 110 ns for a forwarded frame (`pd-runtime`'s
+`policy_sweep_window` and `route_forwarded` benchmarks). A whole pass over the million-slot index is
+therefore several milliseconds, and a commit that stalled forwarding for that long would be a worse
+defect than the one this closes. So a pass is carried across wakeups, and a wakeup works off the
+greater of two budgets: what its own frame budget left unspent — a quiet wakeup pays four windows —
+and what the table's occupancy needs. The pass walks the *index* and not the entries — four mebibytes
+rather than sixty-four — and so reaches exactly the flows a packet can reach: one it cannot get to is
+one no lookup can get to either, which can classify nothing and forward nothing.
+
+**How long a pass takes does not depend on how many flows there are, and that is deliberate.** A
+window crosses 4096 buckets *or* stops at 256 flows, whichever comes first, so a table with a flow in
+every bucket crosses sixteen times less index per window than an empty one. Against the frame budget
+alone a saturated wakeup bought one window either way, so a full million-flow table took sixteen times
+as many wakeups as an empty one — the wrong direction on a security device, because the state is the
+attacker's to create and the flows a narrowed policy forbids would go on forwarding longest exactly
+when there are most of them. The budget is therefore scaled by occupancy: sixteen windows per wakeup
+at a table entirely full, one at a sixteenth of it or less, in proportion in between. The arithmetic,
+for the million-slot table this appliance builds: the index walk is 1048576 / 4096 = **256 windows**,
+the flows are at most 1048576 / 256 = **4096 windows**, each window is limited by one bound or the
+other so a pass is their sum, and dividing by the scaled budget leaves **at most 513 wakeups per pass
+at any occupancy — 272 at a table entirely full**, where before the scaling a full table took 4096.
+
+What that costs is that a wakeup can now spend more on re-deciding than a full drain costs: sixteen
+windows is about 54 µs against a saturated drain's 14 µs, so forwarding runs about four times slower
+while a pass over a full table is being worked off. It is bounded by a constant either way, the
+table's width being fixed at compile time, and it is the trade: a revocation an operator asked for
+finishes in a bounded number of wakeups, at the price of those wakeups being more expensive while it
+does.
+
+**A commit arriving mid-pass adds a pass rather than restarting one.** Continuing under the new
+generation without going back is not available — the buckets behind the cursor were judged against the
+document the commit replaces, so a flow the new policy forbids sitting behind the cursor would never be
+re-decided at all. Restarting from the first bucket is sound, and is what a submission storm turns into
+starvation: the party submitting documents is unauthenticated, so a pass could be restarted faster than
+it completes and never finish. So the running pass is left to reach the last bucket and one fresh pass
+over the whole table is queued behind it — one, however many commits arrive, since what is owed either
+way is a single walk against the newest generation. Flows are judged against that newest generation
+from the moment it commits, so nothing is ever taken back under a document already replaced. The delay
+is therefore **at most two passes, 1026 wakeups on that table**, however fast documents are submitted.
+`librefirewall_policy_sweep_total{outcome="deferred"}` counts the commits that queued one.
 
 **What the window costs, stated plainly.** A flow the new policy forbids keeps forwarding until the
-pass reaches it, which is up to as many wakeups as a pass takes. What bounds that is the flow itself:
+pass reaches it, which is up to that many wakeups. What bounds that is the flow itself:
 a conversation forwards only when its packets arrive, every arriving frame wakes the domain, and every
 wakeup advances the pass — so a forbidden flow that is *doing* anything is generating the wakeups that
 end it. What that does not give is a bound in wall-clock time: a node forwarding nothing receives no
@@ -309,7 +366,10 @@ in both orientations; one window is bounded in both of its two ways) and in `cra
 narrowing commit takes back exactly one of two conversations and leaves the other carrying traffic no
 rule names; a widening or unchanged commit takes back nothing; a rule that matches with `drop` is not
 an admission; each of five table changes the pass cannot place a flow under; an ICMP flow re-decided as
-an echo request and under no port criterion; a commit mid-pass restarting it), by a property that a
+an echo request and under no port criterion; a commit mid-pass queuing a second pass rather than
+abandoning the one running; a commit before every window unable to starve a pass; the window budget
+scaling with occupancy so a full table is swept in no more wakeups than an empty one), by a property
+that a
 pass revokes exactly the flows a fresh opening packet would be denied under the committed policy, and
 by the `policy-revocation` QEMU scenario, which opens two conversations differing in their source port
 alone, submits a document narrowing the accept rule by that one attribute, works the pass off to
@@ -582,7 +642,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — ten of the thirteen —
+**What the gate proves.** Every scenario whose management port is reachable — eleven of the fourteen —
 boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`tools/xtask/src/surface_contract.rs`): every record
@@ -842,7 +902,7 @@ Held by the tests in `crates/config` and `crates/log`, by the handover's own tes
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the thirteen QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the fourteen QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -856,6 +916,48 @@ which is why a submission in progress answers a concurrent scrape `503` and why 
 second buffer anywhere. It then copies the body into a shared region and hands it on. **It never
 parses it.** It holds two frame pipelines, so it is the domain an attacker reaches first and the last
 that should be reading an attacker's XML.
+
+**A body that never finishes has a deadline of its own, because that `503` is what one connection
+can do to every other.** A peer may declare a body and then trickle it, and the transport's idle
+timeout cannot end that: it is refreshed by each arriving byte, so one byte every few minutes keeps
+the connection alive indefinitely and the staging array with it — and `/metrics`, `/config` and both
+recording downloads answer `503` for as long as it does. **It is reachable with no adversary at all**:
+an operator tool that dies mid-`POST` takes the management plane down, including the surfaces they
+would use to find out why. So an accumulation that has not completed within thirty seconds is
+answered `408`, the array is handed back before a byte of the answer is composed, and the connection
+is **reset** rather than closed — a close would leave the peer's half open for it to go on refreshing
+that same idle timer from, holding the connection slot instead of the array, which is the same denial
+one table along. The span is a constant no peer chooses; a span derived from the declared
+`Content-Length` would let a peer buy time by declaring a larger body. Thirty seconds is the whole
+64 KiB at about 2 KiB/s and a tenth of the transport's own idle timeout, so this is the deadline that
+binds rather than a second copy of that one. `librefirewall_http_bodies_timed_out_total` counts them,
+and each one is a stretch in which the other body-bearing surfaces were refusing.
+
+The two channels behind the endpoint carry the same bound for the same reason, because the array is
+also held while a *neighbouring domain* decides. A configuration request unanswered for five seconds
+is given up on with `503` — nothing about the document is known to be wrong, and what failed is the
+node's own ability to decide about it — and a recording window unanswered for ten seconds abandons
+the download. Both matter twice over: each domain holds one outstanding-request slot, so without a
+deadline a single unanswered request would be the last configuration exchange or the last download
+that domain ever completed. A reply arriving after either deadline answers a sequence number no
+pending request is held against, which both requesters read as no answer at all, so a late answer
+cannot be mistaken for the next request's.
+
+**A deadline is checked on a wakeup, and there is no timer to run it on.** That is sufficient rather
+than a compromise: a held array denies only the requests that arrive, and every arrival is a wakeup —
+so what a quiet stretch delays is the reclamation of an array nothing is asking for. A stalled or
+reversed clock fails in the direction that waits, never the one that fires early, so an operator's
+submission is never refused for nothing.
+
+**This is the one behaviour here that is tested and not observed on a running node, and that is a
+decision rather than an oversight.** Four host tests pin it exactly — a body given up on at its
+deadline and not before, the scrape that was refused being answered once it is, an arriving byte
+unable to move the deadline, and the ending being a reset and not a close — and the endpoint-level
+one drives a real transport and reads the `408` and the `RST` off the wire it composes. A QEMU
+scenario would add thirty seconds of wall clock to every run of the full gate to re-prove what those
+four already state, and a scenario that shortened the span to fit would be proving a different
+constant from the one that ships. So the gap is recorded here: the deadline is not exercised on a
+booted appliance, and a reader who wants it observed is choosing to pay that half-minute.
 
 The **configuration** domain copies the bytes out of that region before looking at a field of them —
 the region is peer-written, so a decision taken in place is a decision taken on bytes that may no
@@ -886,9 +988,14 @@ policy an operator can read and cannot resubmit is one they cannot edit.
 **Held by** the host tests in `crates/config` (the renderer round-trips the shipped document and both
 sides of the statable bound), `crates/http` (the body framing: one `Content-Length`, decimal, `POST`
 only, no `Transfer-Encoding`, refused past the caller's bound), `crates/ip-endpoint` (a body split
-across segments, a peer that overruns its declared length, the method/target routing, and a submission
-holding the staging array), `crates/pd-runtime` (the channel driven from both ends, every answer shape,
-and a commit that does not move the addressing keeping the connections open on the port), a fuzz target
+across segments, a peer that overruns its declared length, the method/target routing, a submission
+holding the staging array, and the five that hold the body deadline — expiry at the deadline and not
+before, the refused scrape answered once the array is back, a trickle unable to move the deadline, a
+reset rather than a close, and a stalled or reversed clock expiring nothing), `crates/pd-runtime`
+(the channel driven from both ends, every answer shape, a commit that does not move the addressing
+keeping the connections open on the port, both channel deadlines with a late answer that must not be
+taken for the next request's, and a digest mismatch reported as a node that published incoherent
+bytes rather than as a bad document), a fuzz target
 over the whole path from the `POST` body to the commit, and the `configuration-submission` QEMU
 scenario, which is the evidence that matters: it boots the release image, injects traffic the shipped
 policy forwards and traffic it drops, submits a document that exchanges those two verdicts, reads the

@@ -325,11 +325,11 @@ the volume of a commit is the size of its diff.
 - `field=` is spelled as the document's own attribute, and is one of **`port`**, **`enabled`**,
   **`mac`**, **`address`**, **`prefix-length`**, **`interface`**, **`id`**, **`ingress`**,
   **`egress`**, **`source`**, **`destination`**, **`protocol`**, **`source-port`**,
-  **`destination-port`**, **`icmp-type`** or **`action`**. Not every field belongs to every object:
-  an `interface` carries `port`, `enabled`, `mac`, `address`, `prefix-length`; a `neighbour` carries
-  `mac`, `address`, `interface`; `management` carries `enabled`, `mac`, `address`, `prefix-length` —
-  it has no `port`, being no part of the router's port set; and a `rule` carries the remaining ten,
-  which are its `id` and its nine criteria. A pairing outside those is not written.
+  **`destination-port`**, **`icmp-type`**, **`tracking`** or **`action`**. Not every field belongs to
+  every object: an `interface` carries `port`, `enabled`, `mac`, `address`, `prefix-length`; a
+  `neighbour` carries `mac`, `address`, `interface`; `management` carries `enabled`, `mac`, `address`,
+  `prefix-length` — it has no `port`, being no part of the router's port set; and a `rule` carries the
+  remaining eleven, which are its `id` and its ten criteria. A pairing outside those is not written.
 - **A `rule` reports its own `id` as a field**, which no other object does. Its records are filed
   under its position, because a policy is an ordered list and position is precedence — so the id is
   something a rule *says* rather than what it is, and renaming one is a change to report like any
@@ -350,7 +350,7 @@ nothing was staged, or the counter is exhausted). `refused` carries no reason to
 about the configuration is wrong; a *document* that is wrong is the third shape.
 
 **Rejection** — a document or an offered image was refused, naming where and why and never the
-bytes. `rejected=` is one of 35 reasons:
+bytes. `rejected=` is one of 36 reasons:
 
 | group | reasons |
 |---|---|
@@ -358,6 +358,7 @@ bytes. `rejected=` is one of 35 reasons:
 | semantic validation over the parsed model (13) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `capacity-exceeded` |
 | a filter rule that would match nothing (4) | `prefix-not-canonical`, `port-range-reversed`, `port-criterion-on-icmp`, `icmp-type-on-non-icmp` |
 | a configuration the appliance could not state back (1) | `rendering-too-large` |
+| an offered image that is not one publication (1) | `handover-not-one-publication` |
 
 `capacity-exceeded` sits in the second group and not the first, which is where a reader expects a
 bound to be: a document naming more interfaces, neighbours or rules than the handover image holds
@@ -369,6 +370,15 @@ ICMP, an ICMP type on a rule that names TCP, a block written `10.0.0.5/24` when 
 `10.0.0.0/24` — each is a line an operator wrote believing it was in force. On an appliance that
 denies what no rule matched, the dangerous half of that belief is the `accept` that quietly matches
 nothing, so the document is refused rather than committed with a rule that cannot fire.
+
+**The fifth group is the one reason that is not about the operator's document at all**, and it is
+its own group for that reason rather than for its size. `handover-not-one-publication` says the bytes
+offered in the handover region do not fold to the digest they carry — so they are not one
+publication: either the domain that sealed them sealed them wrongly, or the reader's copy was taken
+across two of them. The document that was submitted may be perfectly correct, and editing it will not
+help. Every other reason on this page is something to go and fix in a document; this one is something
+to suspect in the node, and a console vocabulary that filed it under `malformed-value` would be
+issuing the wrong instruction rather than merely a coarse one.
 
 The fourth group has one reason and is about neither a value nor a rule but the configuration as a
 whole. Reading the running configuration is the first step of changing it, so a configuration whose
@@ -433,9 +443,12 @@ that is depends on which reader refused:
 | semantic validation over the parsed model | always **0** — the refusal names an object, not a position, and a byte offset for it would point at the XML declaration |
 | the forwarding domain, over an offered handover image | the **entry index** within the image; for `capacity-exceeded`, either the count the image claimed or the generation number itself, depending on which capacity was exceeded |
 
-Only five reasons can come from the third row — `capacity-exceeded`, `malformed-value`,
-`port-out-of-range`, `prefix-length-out-of-range`, `mac-not-unicast` — the image being an
-already-validated model rather than text. There is no field distinguishing the rows; what
+Only six reasons can come from the third row — `capacity-exceeded`, `malformed-value`,
+`port-out-of-range`, `prefix-length-out-of-range`, `mac-not-unicast`,
+`handover-not-one-publication` — the image being an already-validated model rather than text. For
+`handover-not-one-publication` the number is neither an entry index nor a count but **the digest the
+image declared**, there being no entry to point at in bytes that are not one publication: it is what
+a reader comparing two domains' views of the same region has to go on. There is no field distinguishing the rows; what
 distinguishes them is that a document refusal is emitted before any generation is offered.
 
 ## Reading records off the wire

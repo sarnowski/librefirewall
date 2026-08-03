@@ -504,6 +504,36 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             management: ManagementRole::Client,
             traffic: Traffic::Revocation,
         },
+        // The scenario that proves an ICMP error the tracker RELATES to a live
+        // conversation is still the filter's to decide — which is what keeps
+        // recognising related traffic from being a way past the policy.
+        //
+        // It boots the published disk and opens a conversation under the shipped
+        // policy, then injects an error from the far side quoting one of that
+        // conversation's datagrams. The quote is built to satisfy every agreement
+        // `lfw_flow::icmp` corroborates one by, so the frame really is related and
+        // is not merely refused as unreadable — and the shipped policy, whose rules
+        // are both about UDP, has no rule about it, so it falls to the default deny.
+        // A document adding one `tracking="related"` rule is then submitted, and the
+        // same error on the same flow crosses.
+        //
+        // BOTH HALVES ARE THE EXPERIMENT and neither alone is. A denial on its own
+        // would leave "the policy refused it" and "the tracker never related it"
+        // looking alike; an admission on its own would say nothing about the
+        // default. And the denial is what the connection history carries: an error
+        // opens no conversation, so a filter decision on it names no lifecycle event
+        // unless the record says which policy outcome it was.
+        //
+        // A `Client` scenario necessarily: the document goes over HTTP with a real
+        // client, and the classification is a metric.
+        Scenario {
+            name: "related-icmp",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Related,
+        },
         Scenario {
             name: "connection-lifecycle",
             document: LIFECYCLE_DOCUMENT,

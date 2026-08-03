@@ -1020,10 +1020,10 @@ mod tests {
                 "<rules>",
                 "<rule id=\"blocked\" ingress=\"any\" egress=\"any\" source=\"any\" ",
                 "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
-                "destination-port=\"{drop}\" icmp-type=\"any\" action=\"drop\"/>",
+                "destination-port=\"{drop}\" icmp-type=\"any\" tracking=\"any\" action=\"drop\"/>",
                 "<rule id=\"allowed\" ingress=\"any\" egress=\"any\" source=\"any\" ",
                 "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
-                "destination-port=\"{accept}\" icmp-type=\"any\" action=\"accept\"/>",
+                "destination-port=\"{accept}\" icmp-type=\"any\" tracking=\"opening\" action=\"accept\"/>",
                 "</rules>"
             ),
             accept = accept,
@@ -1079,7 +1079,7 @@ mod tests {
                     concat!(
                         "<rule id=\"third\" ingress=\"any\" egress=\"any\" source=\"any\" ",
                         "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
-                        "destination-port=\"5002\" icmp-type=\"any\" action=\"drop\"/>",
+                        "destination-port=\"5002\" icmp-type=\"any\" tracking=\"any\" action=\"drop\"/>",
                         "</rules>"
                     )
                 ),
@@ -1142,6 +1142,7 @@ mod tests {
                 ("source-port", "any"),
                 ("destination-port", "5000"),
                 ("icmp-type", "any"),
+                ("tracking", "any"),
             ];
             for (name, value) in narrowed {
                 for attribute in &mut attributes {

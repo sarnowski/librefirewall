@@ -153,7 +153,10 @@ fn assert_one_submission(
     let before = store.running();
     let before_model = *store.running_model();
 
-    assert!(management.poll(&mut endpoint), "no request was issued");
+    assert!(
+        management.poll(Some(instant()), &mut endpoint),
+        "no request was issued"
+    );
     let demand = deciding.take().expect("a submission was issued");
     assert_eq!(demand.operation(), Some(ConfigOperation::Submit));
     let crossed = deciding.document(&demand, scratch).to_vec();
@@ -168,7 +171,7 @@ fn assert_one_submission(
     let report = config::commit_and_report(store, &crossed, &sink);
     let answer = answer_of(report, store.running());
     deciding.answer(demand, answer);
-    management.poll(&mut endpoint);
+    management.poll(Some(instant()), &mut endpoint);
 
     assert_report(report, store, before, &before_model, &crossed);
     assert_answer(&endpoint, answer, store.running());
@@ -223,6 +226,16 @@ fn assert_report(
             assert!(
                 image.check(config::PORT_COUNT).is_ok(),
                 "a published image the consumer would refuse"
+            );
+            // And it is sealed, which is the half of that check no field of the
+            // document can reach: the consumer refuses an image whose bytes do
+            // not fold to the digest it carries, so a commit path that published
+            // an unsealed image would reach the dataplane as a refusal on every
+            // generation rather than as a defect anything else here can see.
+            assert_eq!(
+                image.digest,
+                image.computed_digest(),
+                "a published image was not sealed"
             );
         }
         CommitReport::Unchanged => {
@@ -350,9 +363,9 @@ impl Endpoint {
             "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: {declared}\r\n\r\n",
             pd_runtime::CONFIG_TARGET
         );
-        server.take(connection, head.as_bytes());
+        server.take(instant(), connection, head.as_bytes());
         for chunk in body.chunks(512.max(1)) {
-            server.take(connection, chunk);
+            server.take(instant(), connection, chunk);
         }
         Self {
             server,
@@ -391,6 +404,15 @@ impl Submissions for Endpoint {
 /// The server's own state is keyed by the handle, so a harness that could not
 /// produce one could not reach the body path at all — and this is the shortest
 /// honest way to one: the transport issues it, exactly as it does on an appliance.
+/// The instant every pass in this target reads, built the way a domain builds one.
+/// Fixed, and deliberately so: this target is about what an attacker's *bytes* can
+/// do, and a deadline reached mid-exchange would answer a submission before the
+/// deciding half ever saw it — testing the clock rather than the parser.
+fn instant() -> Monotonic {
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(0))
+}
+
 fn open_connection() -> ConnectionId {
     let mut stack = lfw_tcp::TcpStack::<1>::new(
         APPLIANCE,
@@ -400,8 +422,7 @@ fn open_connection() -> ConnectionId {
         IsnSecret::from_bytes(SECRET),
     );
     let mut out = vec![0u8; 256];
-    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
-    let now: Monotonic = Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(0));
+    let now: Monotonic = instant();
     let mut syn = vec![0u8; 256];
     let len = Outgoing {
         source_port: 40000,

@@ -88,10 +88,10 @@ const INTERFACE_BYTES: usize = 36;
 /// Bytes of one neighbour entry in the region.
 const NEIGHBOUR_BYTES: usize = 16;
 
-/// Bytes of one rule entry: the action and the seven stated flags interleaved
+/// Bytes of one rule entry: the action and the eight stated flags interleaved
 /// with their one-byte values, the two networks, a pad, the four port halves,
 /// and the identifier's twenty.
-const RULE_BYTES: usize = 52;
+const RULE_BYTES: usize = 54;
 
 /// Bytes of the count word the rules array follows.
 const RULE_COUNT_BYTES: usize = 4;
@@ -140,7 +140,62 @@ pub fn handover_harness(data: &[u8]) {
         check_one(&narrowed, port_count);
     }
 
-    assert_region_round_trips(&image);
+    // And the same bytes *sealed*, which is what a publisher hands over. Without
+    // it almost every input would stop at the digest and the whole per-entry half
+    // of this harness would go unreached — while dropping the two unsealed checks
+    // above would give up the adversary's authority to write any bytes at all, so
+    // both are driven and neither replaces the other.
+    let mut sealed = narrowed;
+    sealed.seal();
+    for port_count in PORT_COUNTS {
+        check_one(&sealed, port_count);
+    }
+
+    assert_no_blend_is_taken_for_an_image(&sealed, &image);
+    assert_region_round_trips(&sealed);
+}
+
+/// A copy assembled from two publications is refused, unless the fields taken
+/// happen to make it one of them again.
+///
+/// This is the shape no per-field rule can catch: every entry of a blend is an
+/// entry some publisher wrote, so each passes on its own. What refuses it is the
+/// digest over the whole image, and this is where that claim is exercised on
+/// arbitrary bytes rather than on a fixture.
+fn assert_no_blend_is_taken_for_an_image(one: &ConfigImage, other: &ConfigImage) {
+    let blends = [
+        ConfigImage {
+            interfaces: other.interfaces,
+            ..*one
+        },
+        ConfigImage {
+            rule_count: other.rule_count,
+            ..*one
+        },
+        ConfigImage {
+            rules: other.rules,
+            ..*one
+        },
+        ConfigImage {
+            management: other.management,
+            ..*one
+        },
+    ];
+    for blend in blends {
+        if blend == *one || blend == *other {
+            continue;
+        }
+        for port_count in PORT_COUNTS {
+            assert_eq!(
+                blend.check(port_count).err(),
+                Some(ConfigImageError::DigestMismatch {
+                    declared: blend.digest,
+                    folded: blend.computed_digest(),
+                }),
+                "a copy assembled from two publications was taken for one image"
+            );
+        }
+    }
 }
 
 /// Check one image under one port count, against the model.
@@ -183,7 +238,6 @@ fn check_one(image: &ConfigImage, port_count: u8) {
         "an accepted image yielded a different number of neighbours than it declared"
     );
     assert_eq!(checked.generation(), image.generation);
-    assert_eq!(checked.content_hash(), image.content_hash);
 
     for (index, interface) in checked.interfaces().enumerate() {
         let raw = image
@@ -252,6 +306,12 @@ fn assert_slots_past_the_counts_are_not_read(
     for slot in scribbled.rules.iter_mut().skip(image.rule_count as usize) {
         *slot = SCRIBBLED_RULE;
     }
+    // Re-sealed, because the digest covers every byte of the image and a rewrite
+    // past the counts is therefore a *different* image — refused for being one,
+    // which is that check working rather than this claim failing. Sealing again
+    // is what leaves the claim under test on its own: the reader stops where the
+    // counts told it to, and the bytes beyond them decode nothing.
+    scribbled.seal();
     assert_eq!(
         scribbled.check(port_count).as_ref(),
         Ok(checked),
@@ -298,6 +358,8 @@ const SCRIBBLED_RULE: RuleImage = RuleImage {
     protocol: 0xAA,
     icmp_type_stated: 0xAA,
     icmp_type: 0xAA,
+    tracking_stated: 0xAA,
+    tracking: 0xAA,
     source_port_stated: 0xAA,
     destination_port_stated: 0xAA,
     _pad: [0xAA; 1],
@@ -331,6 +393,15 @@ const SCRIBBLED_NEIGHBOUR: NeighbourImage = NeighbourImage {
 /// A reader that refused a different field first would still be refusing, and
 /// an operator would be sent to the wrong line.
 fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
+    // First, and before every count: an image that does not fold to the word it
+    // carries is not one publication, so nothing else about it is a fact.
+    let folded = image.computed_digest();
+    if folded != image.digest {
+        return Some(ConfigImageError::DigestMismatch {
+            declared: image.digest,
+            folded,
+        });
+    }
     let interfaces = usize::try_from(image.interface_count).ok()?;
     if interfaces > MAX_INTERFACES {
         return Some(ConfigImageError::InterfaceCountExceedsCapacity {
@@ -813,7 +884,11 @@ fn assert_region_round_trips(image: &ConfigImage) {
     // stacks cannot hold a second copy of it.
     let mut read = ConfigImage::ZERO;
     assert_eq!(region.offered_generation(), 0);
-    region.load_image_into(&mut read);
+    assert_eq!(
+        region.load_offer(&mut read),
+        Some(0),
+        "a settled region is one nothing is publishing into"
+    );
     assert_eq!(
         read,
         ConfigImage::ZERO,
@@ -826,14 +901,18 @@ fn assert_region_round_trips(image: &ConfigImage) {
         image.generation,
         "the region offered a generation other than the one written into it"
     );
-    region.load_image_into(&mut read);
+    assert_eq!(
+        region.load_offer(&mut read),
+        Some(image.generation),
+        "a settled region did not answer the generation it offers"
+    );
     assert_eq!(
         read, *image,
         "the image did not survive the region it crosses domains through"
     );
 
-    region.publish_committed(image.content_hash);
-    assert_eq!(region.committed_generation(), image.content_hash);
+    region.publish_committed(image.digest);
+    assert_eq!(region.committed_generation(), image.digest);
     assert_eq!(
         region.offered_generation(),
         image.generation,
@@ -857,7 +936,7 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
         generation: word(&mut unstructured),
         interface_count: word(&mut unstructured),
         neighbour_count: word(&mut unstructured),
-        content_hash: word(&mut unstructured),
+        digest: word(&mut unstructured),
         // Read in the position the ABI puts it, between the header and the
         // interfaces, and every byte of it the peer's: the management entry
         // carries the address the appliance answers management traffic at and
@@ -930,6 +1009,8 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
             icmp_type: byte(&mut unstructured),
             source_port_stated: byte(&mut unstructured),
             destination_port_stated: byte(&mut unstructured),
+            tracking_stated: byte(&mut unstructured),
+            tracking: byte(&mut unstructured),
             _pad: [byte(&mut unstructured); 1],
             source_port_low: half(&mut unstructured),
             source_port_high: half(&mut unstructured),

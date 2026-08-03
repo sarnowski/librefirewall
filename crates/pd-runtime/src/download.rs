@@ -22,6 +22,7 @@
 //! window. Nothing here holds a second copy of the body, and nothing holds any
 //! of it between passes.
 
+use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ContentType, http::WINDOW_LEN};
 use wire::{
     DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply,
@@ -134,6 +135,18 @@ pub fn sink_for(target: &str) -> Option<DownloadSink> {
     }
 }
 
+/// How long the recorder may take to answer one window before the download is
+/// given up on.
+///
+/// The same shape of bound the configuration exchange carries: a response committed
+/// to by length holds the endpoint's staging array until it completes, and the slot
+/// for an outstanding request here is single.
+///
+/// Ten seconds rather than the configuration's five, because the work behind it is
+/// a block device rather than a table build: a window is a read of up to
+/// [`WINDOW_LEN`] bytes off storage that may be retrying.
+const REPLY_TIMEOUT: Duration = Duration::from_millis(10_000);
+
 /// A request out to the recorder, and what its answer is for.
 struct Outstanding {
     pending: PendingDownload,
@@ -142,6 +155,11 @@ struct Outstanding {
     /// carries the length the response commits to, so it is the only one that
     /// may begin the stream.
     opening: bool,
+    /// When this request is given up on, or `None` on a node whose clock has not
+    /// been published yet — a state no client can reach, the endpoint refusing
+    /// every TCP segment until a calibration has arrived, and carried rather than
+    /// asserted away.
+    deadline: Option<Monotonic>,
 }
 
 /// The download half of the management endpoint.
@@ -201,28 +219,41 @@ impl<'chan> Downloads<'chan> {
     /// Never blocks and never spins. A pass with nothing to do returns having
     /// done nothing, which is the whole of the contract with the event loop:
     /// the recorder notifies this domain when a reply lands.
-    pub fn poll(&mut self, stage: &mut impl Stream) {
-        self.claim(stage);
-        self.ask(stage);
+    pub fn poll(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
+        self.claim(now, stage);
+        self.ask(now, stage);
         stage.note_downloads(self.counters);
     }
 
-    /// Look once for the answer to the outstanding request.
-    fn claim(&mut self, stage: &mut impl Stream) {
+    /// Look once for the answer to the outstanding request, giving up on one that
+    /// has outlived [`REPLY_TIMEOUT`].
+    fn claim(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
         let Some(Outstanding {
             pending,
             offset,
             opening,
+            deadline,
         }) = self.outstanding.take()
         else {
             return;
         };
         match self.requester.poll(pending, &mut self.window) {
             DownloadPoll::Outstanding(pending) => {
+                if expired(now, deadline) {
+                    // Given up on exactly as a refusal is: the handle is dropped
+                    // rather than re-parked, which frees this module's one slot,
+                    // and a reply landing afterwards answers a sequence no request
+                    // is held against — which `DownloadRequester::poll` reads as no
+                    // answer at all. A client sees a truncated body rather than a
+                    // stalled one.
+                    self.abandon(stage);
+                    return;
+                }
                 self.outstanding = Some(Outstanding {
                     pending,
                     offset,
                     opening,
+                    deadline,
                 });
             }
             DownloadPoll::Delivered { bytes, total_len } => {
@@ -269,7 +300,7 @@ impl<'chan> Downloads<'chan> {
     }
 
     /// Ask for whatever the transport is waiting on, if nothing is out.
-    fn ask(&mut self, stage: &mut impl Stream) {
+    fn ask(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
         if self.outstanding.is_some() {
             return;
         }
@@ -285,7 +316,7 @@ impl<'chan> Downloads<'chan> {
             // The opening request is made before the endpoint has committed to
             // anything, so there is no window to ask against yet: a whole one,
             // which is the most the endpoint will ever take.
-            self.request(sink, 0, WINDOW_LEN, true);
+            self.request(now, sink, 0, WINDOW_LEN, true);
             return;
         }
         let Some((offset, len)) = stage.stream_wanted() else {
@@ -297,7 +328,7 @@ impl<'chan> Downloads<'chan> {
             self.abandon(stage);
             return;
         };
-        self.request(sink, offset, len, false);
+        self.request(now, sink, offset, len, false);
     }
 
     /// Ask for at most `len` bytes at `offset`.
@@ -307,7 +338,14 @@ impl<'chan> Downloads<'chan> {
     /// have the reply refused and the download abandoned; asking for more than
     /// the channel's is clamped by the requester in any case, and the assertion
     /// at the top of this module keeps the two from drifting apart silently.
-    fn request(&mut self, sink: DownloadSink, offset: u64, len: usize, opening: bool) {
+    fn request(
+        &mut self,
+        now: Option<Monotonic>,
+        sink: DownloadSink,
+        offset: u64,
+        len: usize,
+        opening: bool,
+    ) {
         let pending = self
             .requester
             .request(sink, offset, len.min(DOWNLOAD_WINDOW_LEN));
@@ -315,6 +353,7 @@ impl<'chan> Downloads<'chan> {
             pending,
             offset,
             opening,
+            deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
         });
     }
 
@@ -323,6 +362,19 @@ impl<'chan> Downloads<'chan> {
         self.serving = None;
         self.outstanding = None;
         stage.abandon_stream();
+    }
+}
+
+/// Whether a deadline has passed at `now`.
+///
+/// False for either absence, and the two are different facts rather than one
+/// default: an unarmed request has no deadline to miss, and a pass with no reading
+/// of the clock cannot judge one. Both mean *not yet*, which is the direction that
+/// cannot truncate a download that was going to complete.
+fn expired(now: Option<Monotonic>, deadline: Option<Monotonic>) -> bool {
+    match (now, deadline) {
+        (Some(now), Some(deadline)) => now >= deadline,
+        _ => false,
     }
 }
 

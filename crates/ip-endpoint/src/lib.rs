@@ -587,6 +587,12 @@ impl Endpoint {
     /// regardless, and a TCP segment is refused as [`Outcome::Unclocked`]. `out`
     /// may be shorter than the reply, and the outcome then says so.
     pub fn handle(&mut self, now: Option<Monotonic>, frame: &[u8], out: &mut [u8]) -> Outcome {
+        // Before the frame is looked at, so a request for a shared-array surface
+        // arriving in this very frame is answered rather than refused by a body
+        // whose deadline had already passed.
+        if let Some(now) = now {
+            self.http.expire(now);
+        }
         let outcome = self.decide(now, frame, out);
         self.counters.record(outcome);
         outcome
@@ -723,6 +729,10 @@ impl Endpoint {
     /// a pass. Cleanup runs either way, which is why the drive's answer is not
     /// short-circuited.
     pub fn poll_output(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        // And here, so a wakeup that carried no frame at all — a neighbouring
+        // domain's notification — still reclaims the array and puts the 408 that
+        // says so on the wire.
+        self.http.expire(now);
         self.http.sweep(&self.tcp);
         let Some(connection) = self.http.pending() else {
             return Polled::Idle;
@@ -899,7 +909,7 @@ impl Endpoint {
         self.remember(connection, peer_mac, source);
 
         if !received.data.is_empty() {
-            self.http.take(connection, received.data);
+            self.http.take(now, connection, received.data);
         }
         if received.peer_closed {
             self.http.note_peer_closed(connection);

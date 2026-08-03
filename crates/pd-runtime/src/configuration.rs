@@ -40,6 +40,7 @@
 //! that machinery exists for a recording, which is megabytes, and a configuration
 //! is not.
 
+use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ContentType, Status};
 use lfw_log::RejectReason;
 use wire::{
@@ -138,9 +139,27 @@ impl Submissions for EndpointStage<'_> {
     }
 }
 
+/// How long the deciding domain may take to answer before the request is given up
+/// on and the client told the node could not answer.
+///
+/// It exists because the endpoint's staging array is claimed for the whole of an
+/// exchange, and because the slot for an outstanding request here is single: one
+/// unanswered request would otherwise be the last configuration exchange this
+/// domain completes.
+///
+/// Five seconds, which is four orders above the work: the deciding domain runs at
+/// the highest priority in the system and a commit is a parse and two table
+/// builds. A bound on a domain that has stopped answering, not a latency target.
+const ANSWER_TIMEOUT: Duration = Duration::from_millis(5_000);
+
 /// A request out to the deciding domain, and what its answer is for.
 struct Outstanding {
     pending: PendingConfigRequest,
+    /// When this request is given up on, or `None` on a node whose clock has not
+    /// been published yet — a state no client can reach, the endpoint refusing every
+    /// TCP segment until a calibration has arrived, and carried rather than asserted
+    /// away.
+    deadline: Option<Monotonic>,
 }
 
 /// The configuration half of the management endpoint.
@@ -203,14 +222,15 @@ impl<'chan> Configurations<'chan> {
     ///
     /// Never blocks and never spins. A pass with nothing to do returns `false`
     /// having done nothing, which is the whole of the contract with the event loop.
-    pub fn poll(&mut self, stage: &mut impl Submissions) -> bool {
-        self.claim(stage);
-        self.ask(stage)
+    pub fn poll(&mut self, now: Option<Monotonic>, stage: &mut impl Submissions) -> bool {
+        self.claim(now, stage);
+        self.ask(now, stage)
     }
 
-    /// Look once for the answer to the outstanding request.
-    fn claim(&mut self, stage: &mut impl Submissions) {
-        let Some(Outstanding { pending }) = self.outstanding.take() else {
+    /// Look once for the answer to the outstanding request, giving up on one that
+    /// has outlived [`ANSWER_TIMEOUT`].
+    fn claim(&mut self, now: Option<Monotonic>, stage: &mut impl Submissions) {
+        let Some(Outstanding { pending, deadline }) = self.outstanding.take() else {
             return;
         };
         let Self {
@@ -221,7 +241,21 @@ impl<'chan> Configurations<'chan> {
         } = self;
         match requester.poll(pending, document) {
             ConfigPoll::Outstanding(pending) => {
-                self.outstanding = Some(Outstanding { pending });
+                if expired(now, deadline) {
+                    // The handle is dropped rather than re-parked, which is what
+                    // frees this domain's one slot. A reply that lands afterwards
+                    // answers a sequence no request is held against, and
+                    // `ConfigRequester::poll` reads such a reply as no answer at
+                    // all — so a late answer cannot be mistaken for the next
+                    // request's.
+                    //
+                    // `503`, on `NoSuchOperation`'s terms exactly: nothing about
+                    // the document is known to be wrong, and what failed is the
+                    // node's own ability to decide about it.
+                    stage.refuse(Status::ServiceUnavailable);
+                    return;
+                }
+                self.outstanding = Some(Outstanding { pending, deadline });
             }
             ConfigPoll::Document { bytes, .. } => stage.supply_document(bytes),
             ConfigPoll::Applied {
@@ -279,21 +313,36 @@ impl<'chan> Configurations<'chan> {
     /// be waiting in any case, the endpoint holding one staging array.
     ///
     /// Answers whether anything went out, which is what the caller notifies on.
-    fn ask(&mut self, stage: &mut impl Submissions) -> bool {
+    fn ask(&mut self, now: Option<Monotonic>, stage: &mut impl Submissions) -> bool {
         if self.outstanding.is_some() {
             return false;
         }
+        let deadline = now.map(|now| now.saturating_add(ANSWER_TIMEOUT));
         if let Some(document) = stage.submission() {
             let pending = self.requester.submit(document);
-            self.outstanding = Some(Outstanding { pending });
+            self.outstanding = Some(Outstanding { pending, deadline });
             return true;
         }
         if stage.document_wanted() {
             let pending = self.requester.read();
-            self.outstanding = Some(Outstanding { pending });
+            self.outstanding = Some(Outstanding { pending, deadline });
             return true;
         }
         false
+    }
+}
+
+/// Whether a deadline has passed at `now`.
+///
+/// False for either absence, and the two are different facts rather than one
+/// default: an unarmed request has no deadline to miss, and a pass with no reading
+/// of the clock cannot judge one. Both mean *not yet*, which is the direction that
+/// cannot end an exchange early — a request given up on wrongly is an operator's
+/// submission refused for nothing.
+fn expired(now: Option<Monotonic>, deadline: Option<Monotonic>) -> bool {
+    match (now, deadline) {
+        (Some(now), Some(deadline)) => now >= deadline,
+        _ => false,
     }
 }
 

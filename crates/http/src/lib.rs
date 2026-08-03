@@ -152,6 +152,7 @@ pub enum Status {
     BadRequest,
     NotFound,
     MethodNotAllowed,
+    RequestTimeout,
     ContentTooLarge,
     UriTooLong,
     HeadersTooLarge,
@@ -162,11 +163,12 @@ pub enum Status {
 impl Status {
     /// Every variant, so a counter table and a bound are built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Ok,
         Self::BadRequest,
         Self::NotFound,
         Self::MethodNotAllowed,
+        Self::RequestTimeout,
         Self::ContentTooLarge,
         Self::UriTooLong,
         Self::HeadersTooLarge,
@@ -181,6 +183,7 @@ impl Status {
             Self::BadRequest => 400,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::RequestTimeout => 408,
             Self::ContentTooLarge => 413,
             Self::UriTooLong => 414,
             Self::HeadersTooLarge => 431,
@@ -198,6 +201,7 @@ impl Status {
             Self::BadRequest => "Bad Request",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
+            Self::RequestTimeout => "Request Timeout",
             Self::ContentTooLarge => "Content Too Large",
             Self::UriTooLong => "URI Too Long",
             Self::HeadersTooLarge => "Request Header Fields Too Large",
@@ -214,6 +218,7 @@ impl Status {
             Self::BadRequest => "400",
             Self::NotFound => "404",
             Self::MethodNotAllowed => "405",
+            Self::RequestTimeout => "408",
             Self::ContentTooLarge => "413",
             Self::UriTooLong => "414",
             Self::HeadersTooLarge => "431",

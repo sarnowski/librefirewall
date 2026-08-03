@@ -120,6 +120,7 @@ fn ruleset(action: RuleAction) -> Ruleset {
             source_port: None,
             destination_port: None,
             icmp_type: None,
+            tracking: None,
             action,
         }]
         .into_iter(),
@@ -431,9 +432,11 @@ fn populate(table: &mut ApplianceFlowTable, count: usize) {
 /// because they are the two costs: an empty table pays the index walk alone, and a
 /// populated one pays a routing lookup and a rule walk per live flow on top.
 ///
-/// Each measurement is **one `advance`** — one wakeup's window — so the reported
-/// time is what a commit adds to a wakeup. A whole pass is
-/// `FLOW_CAPACITY / REVISIT_BUCKETS` of them.
+/// Each measurement is **one `advance`** — one wakeup's work — so the reported time
+/// is what a commit adds to a wakeup. The budget scales with occupancy
+/// (`pipeline::windows_for`), so the populated case is deliberately *not* one
+/// window: it is what a wakeup at that occupancy actually pays, which is the number
+/// the pass-length bound is traded against.
 fn policy_sweep(c: &mut Criterion) {
     let policy = ruleset(RuleAction::Accept);
     let configuration = Configuration::new(GENERATION, &ROUTER, &policy);
@@ -450,9 +453,11 @@ fn policy_sweep(c: &mut Criterion) {
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
-                    // Armed per iteration and timed for one window only: a
-                    // saturated drain is what buys exactly one, and a whole pass is
-                    // `FLOW_CAPACITY / REVISIT_BUCKETS` of them.
+                    // Armed per iteration and timed for one wakeup: a saturated
+                    // drain leaves no slack, so what is paid here is the occupancy
+                    // budget alone, and a whole pass is
+                    // `FLOW_CAPACITY / REVISIT_BUCKETS` such wakeups whatever the
+                    // table holds.
                     sweep.arm(GENERATION);
                     let mut tracking = Tracking::new(&mut table, Monotonic::BOOT);
                     let started = Instant::now();
@@ -470,9 +475,11 @@ fn policy_sweep(c: &mut Criterion) {
         });
         group.finish();
     }
-    // Stated rather than left to a reader's arithmetic: the pass length is what
-    // the window is traded against.
+    // Stated rather than left to a reader's arithmetic: the pass length is what the
+    // wakeup's work is traded against, and it is that figure at every occupancy
+    // because the budget scales.
     assert_eq!(FLOW_CAPACITY / REVISIT_BUCKETS, 256);
+    assert_eq!(pipeline::OCCUPANCY_SCALE, 16);
 }
 
 criterion_group!(

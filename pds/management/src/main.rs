@@ -370,27 +370,33 @@ impl Handler for Management {
         }
         // Read once per wakeup and used for the whole pass: every frame in one
         // drain is answered at one instant, which is what makes a retransmission
-        // deadline a property of the pass rather than of a frame's position in it.
+        // deadline a property of the pass rather than of a frame's position in it —
+        // and what makes the two channel deadlines below judged against the same
+        // instant the endpoint's own are.
         //
+        // `None` until the clock domain has published, which is a state that arms
+        // no deadline and refuses every segment in any case.
+        let ticks = read_timestamp_counter();
+        let now = running.stage.monotonic(ticks);
         // The log ring's own counts travel in with it, because the shard the
         // pass publishes carries them and this domain is the only thing that can
         // read them.
         // Before the frames, so a window the recorder answered between wakeups
         // is in the transport's hands by the time this pass composes a segment.
         // It never blocks: a pass with no reply yet does nothing.
-        running.downloads.poll(&mut running.stage);
+        running.downloads.poll(now, &mut running.stage);
         // And the configuration channel, on the download channel's terms exactly:
         // an answer that landed between wakeups is in the endpoint's hands by the
         // time this pass composes a segment.
-        if running.configurations.poll(&mut running.stage) {
+        if running.configurations.poll(now, &mut running.stage) {
             CONFIG.notify();
         }
         let log = log_sample(running.sink.dropped(), running.sink.refused());
-        let moved = running.stage.poll(read_timestamp_counter(), log);
+        let moved = running.stage.poll(ticks, log);
         // And after them, because a request parsed in this very pass is what puts
         // a stream in `pending_stream` or a document in `submission`.
-        running.downloads.poll(&mut running.stage);
-        if running.configurations.poll(&mut running.stage) {
+        running.downloads.poll(now, &mut running.stage);
+        if running.configurations.poll(now, &mut running.stage) {
             CONFIG.notify();
         }
         if moved > 0 {

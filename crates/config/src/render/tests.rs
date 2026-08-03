@@ -84,6 +84,7 @@ fn a_wildcard_criterion_is_written_rather_than_omitted() {
         "destination=\"any\"",
         "source-port=\"any\"",
         "icmp-type=\"any\"",
+        "tracking=\"any\"",
     ] {
         assert!(
             stated.contains(wildcard),
@@ -208,7 +209,7 @@ mod widest {
             "<rule id=\"rrrrrrrrrrrrr{index:03}\" ingress=\"{STEM}0\" egress=\"{STEM}1\" \
              source=\"255.255.255.254/31\" destination=\"255.255.255.252/30\" protocol=\"6\" \
              source-port=\"10000-65535\" destination-port=\"10000-65535\" icmp-type=\"any\" \
-             action=\"accept\"/>"
+             tracking=\"opening\" action=\"accept\"/>"
         )
     }
 
@@ -234,7 +235,7 @@ mod widest {
 /// validation rule is worse than none, reading as a check that is not one.
 #[test]
 fn a_configuration_the_appliance_could_not_state_back_is_refused() {
-    let document = widest::document(248);
+    let document = widest::document(232);
     assert!(
         document.len() <= MAX_DOCUMENT_BYTES,
         "the fixture is {} bytes, so it is refused for its own length rather than for \
@@ -269,14 +270,14 @@ fn a_configuration_the_appliance_could_not_state_back_is_refused() {
     );
 }
 
-/// And the boundary from the other side: a policy of the same objects, four rules
-/// shorter, commits and states itself back. So the refusal above is a bound on
-/// what can be stated rather than a ban on large policies.
+/// And the boundary from the other side: a policy of the same objects, eight
+/// rules shorter, commits and states itself back. So the refusal above is a bound
+/// on what can be stated rather than a ban on large policies.
 #[test]
 fn a_policy_just_inside_the_bound_commits_and_states_itself_back() {
-    let document = widest::document(240);
+    let document = widest::document(224);
     let model = load(document.as_bytes()).expect("inside the bound");
-    assert_eq!(model.rule_count(), 240);
+    assert_eq!(model.rule_count(), 224);
     let len = rendered_len(&model);
     assert!(len <= MAX_DOCUMENT_BYTES, "{len} bytes");
     assert!(
