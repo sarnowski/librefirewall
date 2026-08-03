@@ -74,6 +74,172 @@ fn expectation() -> Expectation {
     }
 }
 
+/// One Enhanced Packet Block carrying the two options a decision travels in: the
+/// standard verdict, and the PEN-tagged annotation.
+fn annotated_packet(captured: usize, verdict: u8, annotation: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&(captured as u32).to_le_bytes());
+    body.extend_from_slice(&(captured as u32).to_le_bytes());
+    body.resize(body.len() + captured.next_multiple_of(4), 0);
+    // `epb_packetid`, so the block is one a reader can relate.
+    body.extend_from_slice(&EPB_PACKETID.to_le_bytes());
+    body.extend_from_slice(&8u16.to_le_bytes());
+    body.extend_from_slice(&7u64.to_le_bytes());
+    // `epb_verdict`: the kind octet, then what that kind means.
+    body.extend_from_slice(&EPB_VERDICT.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&[VERDICT_KIND, verdict, 0, 0]);
+    // The custom option: the enterprise number, then the annotation.
+    body.extend_from_slice(&CUSTOM_BINARY_COPYABLE.to_le_bytes());
+    body.extend_from_slice(&((4 + annotation.len()) as u16).to_le_bytes());
+    body.extend_from_slice(&UNREGISTERED_PEN.to_le_bytes());
+    body.extend_from_slice(annotation);
+    body.extend_from_slice(&OPT_END_OF_OPT.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    block(ENHANCED_PACKET_BLOCK, &body)
+}
+
+/// The 24 octets of a sound annotation, written out here rather than composed
+/// through the encoder's own constants: this walk is a *reader*, and one that
+/// shared the writer's layout could not tell a shifted field from a correct file.
+fn annotation_bytes() -> Vec<u8> {
+    let mut bytes = vec![
+        ANNOTATION_VERSION,
+        VERDICT_FORWARDED,
+        0,
+        1,
+        0,
+        CLASSIFICATION_ESTABLISHED,
+        EVENT_FLOW_CLOSED,
+        STATE_TIME_WAIT,
+    ];
+    bytes.extend_from_slice(&9u32.to_le_bytes());
+    bytes.extend_from_slice(&4_321u32.to_le_bytes());
+    bytes.extend_from_slice(&17u32.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes
+}
+
+/// **Every field of the decision, read back off the bytes.** This is the whole of
+/// what makes a record say why rather than only what, so it is read at the
+/// offsets a reader outside the appliance navigates by.
+#[test]
+fn a_decision_is_read_back_out_of_the_block_it_rides_in() {
+    let annotation = annotation_bytes();
+    assert_eq!(annotation.len(), ANNOTATION_LEN);
+    let mut body = section_header();
+    body.extend_from_slice(&interface_description());
+    body.extend_from_slice(&annotated_packet(64, VERDICT_FORWARDED, &annotation));
+
+    let parsed = parse(&body).expect("a well-formed file");
+    assert_eq!(parsed.consumed, body.len());
+    let packet = parsed.packets.first().expect("one packet block");
+    assert_eq!(
+        packet.verdict.as_deref(),
+        Some([VERDICT_KIND, 0].as_slice())
+    );
+    let found = packet.annotation.expect("the annotation option");
+    assert_eq!(found.version, ANNOTATION_VERSION);
+    assert_eq!(found.verdict, VERDICT_FORWARDED);
+    assert_eq!(found.drop_reason, 0);
+    assert_eq!(found.interface_id, 1);
+    assert_eq!(found.direction, 0);
+    assert_eq!(found.classification, CLASSIFICATION_ESTABLISHED);
+    assert_eq!(found.event, EVENT_FLOW_CLOSED);
+    assert_eq!(found.flow_state, STATE_TIME_WAIT);
+    assert_eq!(found.configuration_generation, 9);
+    assert_eq!(found.identity(), (4_321, 17));
+    assert!(found.names_a_flow());
+    assert_eq!(found.rule_position(), None, "zero names no rule");
+    assert_eq!(event_name(found.event), "flow-closed");
+    assert_eq!(classification_name(found.classification), "established");
+}
+
+/// A rule is carried one higher than its position, so the first rule of a
+/// generation is distinguishable from no rule at all.
+#[test]
+fn a_rule_is_read_back_as_its_position_and_zero_as_no_rule() {
+    for (encoded, position) in [(0u16, None), (1, Some(0)), (2, Some(1)), (256, Some(255))] {
+        let mut annotation = annotation_bytes();
+        annotation[20..22].copy_from_slice(&encoded.to_le_bytes());
+        let mut body = section_header();
+        body.extend_from_slice(&interface_description());
+        body.extend_from_slice(&annotated_packet(64, VERDICT_FORWARDED, &annotation));
+        let parsed = parse(&body).expect("a well-formed file");
+        let found = parsed.packets[0].annotation.expect("the annotation");
+        assert_eq!(found.rule_position(), position);
+    }
+}
+
+/// An annotation under somebody else's enterprise number is not this layout, and
+/// reading it as one would decode another organisation's bytes as a verdict.
+#[test]
+fn a_custom_option_under_another_enterprise_number_is_not_read() {
+    let annotation = annotation_bytes();
+    let mut body = section_header();
+    body.extend_from_slice(&interface_description());
+    let mut packet = annotated_packet(64, VERDICT_FORWARDED, &annotation);
+    // The PEN sits at the option's own first four octets; find it and change it.
+    let at = packet
+        .windows(4)
+        .position(|window| window == UNREGISTERED_PEN.to_le_bytes())
+        .expect("the option carries the enterprise number");
+    packet[at..at + 4].copy_from_slice(&32_473u32.to_le_bytes());
+    body.extend_from_slice(&packet);
+
+    let parsed = parse(&body).expect("a well-formed file");
+    assert_eq!(parsed.packets[0].annotation, None);
+}
+
+/// An annotation of a length this layout version does not carry, which is what a
+/// reader must refuse rather than pad or truncate into a plausible decision.
+#[test]
+fn an_annotation_of_the_wrong_length_is_not_read_as_this_layout() {
+    for len in [ANNOTATION_LEN - 4, ANNOTATION_LEN + 4] {
+        let mut annotation = annotation_bytes();
+        annotation.resize(len, 0);
+        let mut body = section_header();
+        body.extend_from_slice(&interface_description());
+        body.extend_from_slice(&annotated_packet(64, VERDICT_FORWARDED, &annotation));
+        let parsed = parse(&body).expect("a well-formed file");
+        assert_eq!(parsed.packets[0].annotation, None, "at {len} octets");
+    }
+}
+
+/// **The connection history's snap length is derived, not chosen.** It holds the
+/// largest L2–L4 header chain this appliance ever reaches a decision on and
+/// nothing of the payload, and this is where that number is held to the widths it
+/// is derived from.
+#[test]
+fn the_connection_historys_snap_length_holds_the_longest_header_chain_whole() {
+    // An Ethernet header, an 802.1Q tag, an IPv4 header with no options — the
+    // parser refuses one that carries them — and a TCP header with a full option
+    // area, which is the most a data offset of fifteen words can name.
+    let longest = net_headers::ETHERNET_HEADER_LEN
+        + net_headers::VLAN_TAG_LEN
+        + net_headers::IPV4_HEADER_LEN
+        + 15 * 4;
+    assert_eq!(longest, 98);
+    assert!(
+        lfw_recorder::deck::LOG_SNAP_LEN as usize >= longest,
+        "the connection history keeps {} bytes and the longest header chain the appliance \
+         decides on is {longest}, so a record could carry a decision taken on bytes it does not \
+         hold",
+        lfw_recorder::deck::LOG_SNAP_LEN
+    );
+    // And it holds nothing of a payload: the capture is what carries traffic, and
+    // widening the payload exception past it is a design change. A `const` block
+    // rather than an assertion, both being build-time constants.
+    const _: () = assert!(
+        lfw_recorder::deck::LOG_SNAP_LEN < lfw_recorder::deck::CAPTURE_SNAP_LEN,
+        "the two recordings would keep the same bytes"
+    );
+}
+
 #[test]
 fn a_whole_recording_is_walked_to_its_last_byte() {
     let body = recording(4, 64);

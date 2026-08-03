@@ -6,8 +6,9 @@ traffic itself.
 
 **Endpoints:** `GET /logs.pcapng` and `GET /capture.pcapng` on the management port. Each returns one
 of the two recording sinks (see the [recording design](../design/recording.md)) — the same encoder,
-the same ring machinery, the same download path, differing in two things only: the extent each
-occupies on the medium, and the snap length.
+the same ring machinery, the same download path. What differs is **what each one records**:
+`/logs.pcapng` is a connection history, holding a record where the appliance reached a connection
+lifecycle or policy event, and `/capture.pcapng` holds every observation with the verdict on it.
 
 > **These bodies carry packet payloads.** They are the single named exception to the no-payload rule
 > stated under the conventions in [Observability surfaces](observability.md), and nothing else on
@@ -91,8 +92,8 @@ below that it does not know.
 - **One Interface Description Block per interface**, link type `LINKTYPE_ETHERNET`, `if_tsresol` = 6
   (microsecond timestamps). `if_name` is the **port**, `port0` and `port1` — not the interface id the
   configuration document names (`dataplane-0`). `if_snaplen` is the sink's snap length: **128 bytes**
-  on the log recording, **2048** on the capture recording.
-- **One Enhanced Packet Block per observation**, carrying the frame **as it arrived** — the tap is
+  on the connection history, **2048** on the capture.
+- **One Enhanced Packet Block per record**, carrying the frame **as it arrived** — the tap is
   taken between the router's decision and the forwarding rewrite, so a recorded frame is what the
   wire delivered, not what the appliance sent on. Captured length is the snap length or the frame,
   whichever is smaller; original length is always the frame's true length, so a truncated record
@@ -102,9 +103,76 @@ below that it does not know.
   |---|---|
   | `epb_flags` | direction; every record reads *inbound* — see below |
   | `epb_dropcount` | tap-ring observations lost before this record, and any `u64`. The recorder differences the forwarder's own tap-drop count on every pass and holds the rise as a debt until there is a record to carry it, so the number belongs to the gap before this block and not to the packet in it. It accounts for the tap ring **and nothing else**: what a sink could not encode, or could not write, is on `/metrics` and not in the file |
-  | `epb_packetid` | the appliance-wide packet identity |
+  | `epb_packetid` | the appliance-wide packet identity. It is the same number on the connection history's record of an event and on the capture's record of the packet that caused it, so the two files relate to each other by it |
   | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped |
-  | custom option, PEN-tagged | 16 bytes: layout version, verdict, drop reason, interface id, direction, and the **configuration generation** the decision was made under |
+  | custom option, PEN-tagged | 24 bytes carrying the whole decision — see below |
+
+### The annotation: what the appliance decided
+
+The PEN-tagged custom option is where the firewall's own state rides, pcapng having no standard
+field for it. It is 24 bytes, little-endian, at these offsets:
+
+| at | width | what it holds |
+|---|---|---|
+| 0 | 1 | **layout version**, currently `2`. A reader keys on this and not on the length it happens to see |
+| 1 | 1 | verdict: `0` forwarded, `1` dropped — the same value `epb_verdict` carries |
+| 2 | 1 | drop reason, or `0` on a forwarded frame. The numbering is the [`reason` label's](metrics.md) order, counting from one |
+| 3 | 1 | interface id, the same value the block's own `interface_id` names |
+| 4 | 1 | direction: `0` inbound, `1` outbound |
+| 5 | 1 | flow classification: `0` no flow, `1` new, `2` established, `3` related |
+| 6 | 1 | the event, `0` for none — the vocabulary below |
+| 7 | 1 | the flow's state after the packet, `0` where there is no flow. The numbering is the [`state` label's](metrics.md), counting from one |
+| 8 | 4 | the **configuration generation** the decision was made under |
+| 12 | 4 | the flow's slot |
+| 16 | 4 | which occupant of that slot |
+| 20 | 2 | the matched rule's **position** plus one, or `0` for no rule matched |
+| 22 | 2 | zero |
+
+**A flow is named by the pair, never by the slot alone.** Slots are reused as connections come and
+go, so across a recording holding hours of history a bare index would silently merge two unrelated
+conversations that happened to occupy one slot at different times — and the merged record would look
+ordinary and be wrong. Fold records by the pair.
+
+**The rule is a position, not the id you wrote.** Position is what the dataplane has: it is the
+rule's precedence and the slot its counter occupies. `librefirewall_rule_hits_total` is labelled with
+the id from the configuration document, and the document's own order is what joins the two — the
+rule at position 0 is the first rule the document declares.
+
+**Which combinations occur, and which cannot.** These hold on every record, and a reader may rely on
+them:
+
+- a forwarded record carries no drop reason, and a dropped one always carries one;
+- an open, an advance and a close always name a flow; a refusal and a policy decision may not;
+- a **close always names a state a conversation does not leave** — `time_wait` or `closed` — so a
+  close always says *how* it closed;
+- an open is classified `new`; an advance and a close are classified `established`;
+- **a rule appears on exactly two events**, an open and a policy deny, because the filter is
+  consulted once per conversation — on the packet that opens it. An advance, a close and a refusal
+  all happened with no rule involved, and a rule on one of them would credit a hit to a rule that
+  never ran.
+
+### The event vocabulary
+
+| event | value | what it means |
+|---|---|---|
+| — | 0 | no event; the record belongs to the capture alone |
+| `flow-opened` | 1 | a conversation was opened and the filter admitted the packet that opened it. The rule that admitted it is named |
+| `flow-advanced` | 2 | an existing conversation changed state without ending |
+| `flow-closed` | 3 | it reached a state it does not leave. The state says how: `time_wait` for a completed close, `closed` for a reset |
+| `policy-denied` | 4 | a rule matched the opening packet and its action is to drop. The flow it had just opened was withdrawn |
+| `policy-no-match` | 5 | no rule was about the opening packet, so the default deny refused it. The flow it had just opened was withdrawn |
+| `flow-refused` | 6 | the connection tracker refused the packet outright, so it never reached the filter. The drop reason says which refusal |
+
+Two things the vocabulary does not say, and an operator will otherwise infer wrongly.
+
+**A refusal names no flow.** A packet the tracker refused is one it keeps no state for, so there is
+no conversation to name — including for the two refusals that are *about* an existing flow, a
+segment outside its window and one its state does not admit. What locates such a record is the
+five-tuple in the causing packet's own headers, which the record carries.
+
+**A conversation that times out produces no close.** Every record is anchored to the packet that
+caused it, and a flow reclaimed by its idle timeout has no such packet. What states a timeout is
+`librefirewall_flow_expired_total` on [`/metrics`](metrics.md).
 
 - **A Custom Block of padding** fills whatever the encoder must leave empty to keep every write to
   the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
@@ -123,22 +191,42 @@ below that it does not know.
 
 ## What the two recordings hold
 
-**The same observations.** Neither sink selects: **both hold every dataplane observation**, one
-keeping the first 128 bytes of each frame and the other up to 2048. That is the whole of the
-difference in their contents, and it is why `/logs.pcapng` reads as the capture truncated to headers
-rather than as an event log — it is not one, and nothing in it is a connection event. The annotation
-carries a version byte, which is what a reader keys on rather than the layout it happens to see.
+**`/capture.pcapng` holds every observation, with its verdict.** Every frame the appliance reached a
+decision about is a record, and every record carries the annotation above: allow or deny, the reason,
+the rule where one matched, and the conversation it belongs to. It keeps up to 2048 bytes of each
+frame, which is the whole of every frame a dataplane link carries at a standard MTU.
 
-Three further limits an operator will otherwise infer wrongly:
+**`/logs.pcapng` holds a record only where the appliance reached a lifecycle or policy event** — a
+conversation opened, advanced or closed, a policy refusal, a tracker refusal. Its records are
+therefore a subset of the capture's, relatable to them one for one by `epb_packetid`, and it holds
+**no record for a packet that caused no event**: traffic on a conversation already accounted for, and
+frames refused by admission or routing, are in the capture alone.
+
+That selection is the point of there being two files, and the reason is a rate. A record per
+connection admitted is three to four orders of magnitude below a record per packet, so a connection
+history stays usable under exactly the conditions it is wanted in — a flood that produced a record
+per packet would evict the whole history in seconds and blind the file at the moment of the attack.
+
+**It keeps 128 bytes of each causing packet, and that number is derived.** It is the whole L2–L4
+header chain and nothing of the payload: the longest chain this appliance ever decides on is an
+Ethernet header, an 802.1Q tag, an IPv4 header (options are refused, not skipped) and a TCP header
+with a full option area — 98 bytes. A record is evidence about a *decision*, and carrying traffic is
+the capture's job.
+
+Four further limits an operator will otherwise infer wrongly:
 
 - **Only the dataplane is recorded.** The management port is not tapped, so nothing on it — including
   the download itself — appears in either file.
 - **One observation per frame.** A forwarded frame is recorded once and not once per direction, so
   every `epb_flags` reads inbound. `epb_packetid` is minted and monotone, and there is never a
-  second record to relate one to.
-- **Some frames are counted and deliberately absent.** A frame no routing decision was reached about,
-  one routed out of a port the stage is not wired to, and one recorded as forwarded that a later
-  refusal lost are all counted on the dataplane families and encoded in no recording, because the tap
-  ABI mirrors the router's drop reasons exactly and has none for them. See
+  second record of one frame to relate within a file — the pairing it serves is between the two files.
+- **Some frames are counted and deliberately absent from both.** A frame no routing decision was
+  reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
+  that a later refusal lost are all counted on the dataplane families and encoded in no recording,
+  because the tap ABI mirrors the router's drop reasons exactly and has none for them. See
   [the two recordings, and the downloads served out of
   them](metrics.md#the-two-recordings-and-the-downloads-served-out-of-them) for the reconciliation.
+- **A connection's history reduces from its events, and a reader performs that fold.** The rings are
+  append-only, so the appliance keeps no one-row-per-connection table; every record carries the flow
+  identity and the state as then known, so a conversation whose earlier records have already been
+  evicted still reduces to a usable one.

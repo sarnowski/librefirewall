@@ -23,10 +23,11 @@
 //! not depend on `pipeline`, and `pipeline` reaches a verdict without knowing
 //! it is recorded. This crate is where both are visible.
 
-use pipeline::DropReason;
+use lfw_flow::{Classification, FlowState};
+use pipeline::{DropReason, FlowObservation, FlowTransition, Inspection, Verdict};
 use wire::{
-    TapAnnotation, TapConsume, TapDirection, TapDropReason, TapOutcome, TapRecords, TapWriteError,
-    TapWriter,
+    TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
+    TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule, TapWriteError, TapWriter,
 };
 
 /// One drop reason as the tap ABI encodes it.
@@ -63,6 +64,127 @@ pub const fn tap_drop_reason(reason: DropReason) -> TapDropReason {
         DropReason::FlowBucketFull => TapDropReason::FlowBucketFull,
         DropReason::PolicyDenied => TapDropReason::PolicyDenied,
         DropReason::NoPolicyMatch => TapDropReason::NoPolicyMatch,
+    }
+}
+
+/// One classification as the tap ABI encodes it, exhaustive on
+/// [`tap_drop_reason`]'s terms.
+#[must_use]
+pub const fn tap_classification(classification: Classification) -> TapClassification {
+    match classification {
+        Classification::New => TapClassification::New,
+        Classification::Established => TapClassification::Established,
+        Classification::Related => TapClassification::Related,
+    }
+}
+
+/// One flow state as the tap ABI encodes it, or `None` for the vacant slot the
+/// ABI deliberately has no encoding for — a classification is never reached
+/// against one, so the absence is a state no observation carries rather than one
+/// this conversion loses.
+#[must_use]
+pub const fn tap_flow_state(state: FlowState) -> Option<TapFlowState> {
+    match state {
+        FlowState::Vacant => None,
+        FlowState::SynSent => Some(TapFlowState::SynSent),
+        FlowState::SynReceived => Some(TapFlowState::SynReceived),
+        FlowState::Established => Some(TapFlowState::Established),
+        FlowState::FinWait => Some(TapFlowState::FinWait),
+        FlowState::CloseWait => Some(TapFlowState::CloseWait),
+        FlowState::Closing => Some(TapFlowState::Closing),
+        FlowState::TimeWait => Some(TapFlowState::TimeWait),
+        FlowState::Closed => Some(TapFlowState::Closed),
+        FlowState::UdpUnreplied => Some(TapFlowState::UdpUnreplied),
+        FlowState::UdpAssured => Some(TapFlowState::UdpAssured),
+        FlowState::IcmpUnreplied => Some(TapFlowState::IcmpUnreplied),
+        FlowState::IcmpReplied => Some(TapFlowState::IcmpReplied),
+    }
+}
+
+/// One flow observation as the tap ABI carries it, or `None` where the state has
+/// no encoding.
+#[must_use]
+pub const fn tap_flow(observation: FlowObservation) -> Option<TapFlow> {
+    match tap_flow_state(observation.state) {
+        Some(state) => Some(TapFlow {
+            slot: observation.id.slot(),
+            generation: observation.id.generation(),
+            classification: tap_classification(observation.classification),
+            state,
+        }),
+        None => None,
+    }
+}
+
+/// Everything the tap records about one evaluation, composed out of the verdict
+/// and the facts the chain attached to the [`Inspection`].
+///
+/// This is where the two vocabularies meet, which is why it is here rather than
+/// in either endpoint: `wire` may not depend on `pipeline`, and `pipeline`
+/// reaches a verdict without knowing it is recorded.
+///
+/// The event is derived from the *facts* and never from the drop reason, and the
+/// difference matters: an admission or routing refusal and a tracker refusal both
+/// leave no flow, and only [`Inspection::refusal`] says the tracker was reached
+/// and answered. Deriving it from the reason instead would put a fact about which
+/// stage refused into the operator-facing vocabulary, which is flat on purpose.
+#[must_use]
+pub fn tap_decision(
+    inspection: &Inspection<'_>,
+    verdict: Verdict,
+    direction: TapDirection,
+    generation: u32,
+) -> TapDecision {
+    let flow = inspection.flow();
+    let rule = inspection.matched().and_then(TapRule::new);
+    let event = match (verdict, flow.map(|flow| flow.transition)) {
+        // A conversation was admitted, and the rule that admitted it is the one
+        // the filter matched — the filter's only accepting outcome.
+        (Verdict::Forward { .. }, Some(FlowTransition::Opened)) => Some(TapEvent::FlowOpened),
+        (Verdict::Forward { .. }, Some(FlowTransition::Advanced)) => {
+            match flow.map(|flow| flow.state) {
+                Some(FlowState::TimeWait | FlowState::Closed) => Some(TapEvent::FlowClosed),
+                _ => Some(TapEvent::FlowAdvanced),
+            }
+        }
+        // Traffic on a conversation already accounted for: no transition, so
+        // nothing the connection history is about.
+        (Verdict::Forward { .. }, Some(FlowTransition::Held) | None) => None,
+        // The tracker refused it, so it never reached the filter and the drop
+        // reason is the refusal.
+        (Verdict::Drop(_), _) if inspection.refusal().is_some() => Some(TapEvent::FlowRefused),
+        // Every frame the filter sees has just opened a flow, so a drop with one
+        // attached is the filter's — with a rule where one matched, and the
+        // default deny where none did. The flow it opened has been withdrawn by
+        // the half of the tracker behind the filter.
+        (Verdict::Drop(_), Some(FlowTransition::Opened)) => Some(match rule {
+            Some(_) => TapEvent::PolicyDenied,
+            None => TapEvent::PolicyNoMatch,
+        }),
+        // Admission or routing refused it in front of the tracker: no
+        // conversation was involved and no policy was consulted.
+        (Verdict::Drop(_), _) => None,
+    };
+    TapDecision {
+        outcome: tap_outcome(verdict),
+        direction,
+        generation,
+        flow: flow.and_then(tap_flow),
+        // Only the two filter decisions may carry one, which is what the ring
+        // refuses an annotation for — so a rule reaching a record it does not
+        // belong on would be a record the recorder never writes rather than one
+        // it writes wrongly.
+        rule: event.filter(|event| event.names_a_rule()).and(rule),
+        event,
+    }
+}
+
+/// The verdict as the tap ABI encodes it.
+#[must_use]
+pub const fn tap_outcome(verdict: Verdict) -> TapOutcome {
+    match verdict {
+        Verdict::Forward { .. } => TapOutcome::Forwarded,
+        Verdict::Drop(reason) => TapOutcome::Dropped(tap_drop_reason(reason)),
     }
 }
 
@@ -127,9 +249,7 @@ impl<'ring> Tap<'ring> {
         let Observation {
             timestamp,
             interface_id,
-            outcome,
-            direction,
-            generation,
+            decision,
             frame,
         } = observation;
         // Saturating: a `u64` of packets at the 10 Gbit/s target line rate outlives the
@@ -141,14 +261,7 @@ impl<'ring> Tap<'ring> {
         // snapshot, bounded by `BUFFER_SIZE`, so the clamp is unreachable and
         // is written as a value so no path here can panic.
         let original_len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
-        let annotation = TapAnnotation::new(
-            packet_id,
-            timestamp,
-            interface_id,
-            outcome,
-            direction,
-            generation,
-        );
+        let annotation = TapAnnotation::new(packet_id, timestamp, interface_id, decision);
         match self.writer.write(&annotation, original_len, frame) {
             Ok(_) => self.observed = self.observed.saturating_add(1),
             // Already counted by the writer, and read back through
@@ -163,9 +276,9 @@ impl<'ring> Tap<'ring> {
 
 /// One frame observation, as the stage that made it describes it.
 ///
-/// A struct rather than six arguments because five of the six are integers and
-/// an argument order slipped between two of them would put one port's traffic
-/// under another's interface, in an artifact meant to be evidence.
+/// A struct rather than four arguments because two of them are integers and an
+/// argument order slipped between them would put one port's traffic under
+/// another's interface, in an artifact meant to be evidence.
 pub struct Observation<'frame> {
     /// The raw timestamp-counter reading. The recorder converts it, holding the
     /// calibration; converting here would put the read of another domain's
@@ -173,10 +286,8 @@ pub struct Observation<'frame> {
     pub timestamp: u64,
     /// The interface the observation belongs to, which is the ingress port.
     pub interface_id: u8,
-    pub outcome: TapOutcome,
-    pub direction: TapDirection,
-    /// The configuration generation the decision was taken under.
-    pub generation: u32,
+    /// What the appliance concluded, composed by [`tap_decision`].
+    pub decision: TapDecision,
     /// The frame as the stage snapshotted it, before any rewrite.
     pub frame: &'frame [u8],
 }

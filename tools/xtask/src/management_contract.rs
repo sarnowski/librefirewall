@@ -91,6 +91,27 @@ pub fn ports_are_ready(serial: &[u8]) -> bool {
     ready_records(Domain::NicDriver) >= DRIVER_INSTANCES && ready_records(Domain::Management) >= 1
 }
 
+/// The running total the management domain has most recently reported, or zero
+/// where it has reported none.
+///
+/// The domain writes its total on every drain that moved a frame, so this is what
+/// the port is known to have received *so far* — which is what lets the harness
+/// inject a burst the pipeline can actually hold and wait for it before sending
+/// more. Zero and "nothing reported yet" are the same answer on purpose: both
+/// mean no frame is known to have arrived, which is what a caller about to send
+/// the first chunk needs.
+#[must_use]
+pub fn frames_reported(serial: &[u8]) -> u64 {
+    let text = String::from_utf8_lossy(serial);
+    lifecycle_records(&text)
+        .into_iter()
+        .filter(|record| record.contains(&field("domain", Domain::Management.name())))
+        .filter_map(|record| value(record, "frames"))
+        .filter_map(|frames| frames.parse::<u64>().ok())
+        .next_back()
+        .unwrap_or(0)
+}
+
 /// Judge the management domain's records in one boot's serial capture against
 /// what was injected into its port.
 ///

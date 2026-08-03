@@ -75,7 +75,8 @@ use lfw_recorder::{
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReply, DownloadRequest, DownloadSink, TAP_SNAP_LEN,
-    TapAnnotation, TapConsume, TapDirection, TapDropReason, TapOutcome, TapRecords,
+    TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
+    TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
 };
 
 use crate::guard::Guarded;
@@ -96,14 +97,13 @@ const MAX_STEPS: usize = 64;
 /// *authority* each adversary has is expressed rather than merely its data.
 enum Step {
     /// The forwarder publishes an observation. Every annotation field is the
-    /// adversary's, including an interface no table has a row for.
+    /// adversary's, including an interface no table has a row for and a decision
+    /// whose flow, rule and event stand in no relation to each other.
     Observe {
         packet_id: u64,
         timestamp: u64,
         interface_id: u8,
-        outcome: TapOutcome,
-        direction: TapDirection,
-        generation: u32,
+        decision: TapDecision,
         frame: Vec<u8>,
     },
     /// The management domain asks for a window, at any offset and any length.
@@ -136,16 +136,7 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             packet_id: u64::arbitrary(unstructured).ok()?,
             timestamp: u64::arbitrary(unstructured).ok()?,
             interface_id: u8::arbitrary(unstructured).ok()?,
-            outcome: match u8::arbitrary(unstructured).ok()? {
-                0 => TapOutcome::Forwarded,
-                bits => TapOutcome::Dropped(drop_reason(bits)),
-            },
-            direction: if bool::arbitrary(unstructured).ok()? {
-                TapDirection::Outbound
-            } else {
-                TapDirection::Inbound
-            },
-            generation: u32::arbitrary(unstructured).ok()?,
+            decision: arbitrary_decision(unstructured)?,
             frame: {
                 let len = u16::arbitrary(unstructured).ok()? as usize % (TAP_SNAP_LEN + 64);
                 let byte = u8::arbitrary(unstructured).ok()?;
@@ -357,6 +348,73 @@ impl Medium for Disk {
     }
 }
 
+/// Everything the forwarder concluded, every field the adversary's.
+///
+/// The combinations are **not** reduced to the coherent ones. `wire`'s reader
+/// refuses an incoherent annotation, so a sink only ever sees a coherent one —
+/// and a harness that generated only those would be asserting that the sink is
+/// total over exactly the inputs something else already guarantees. The same
+/// argument the interface id is left unreduced under.
+fn arbitrary_decision(unstructured: &mut Unstructured<'_>) -> Option<TapDecision> {
+    Some(TapDecision {
+        outcome: match u8::arbitrary(unstructured).ok()? {
+            0 => TapOutcome::Forwarded,
+            bits => TapOutcome::Dropped(drop_reason(bits)),
+        },
+        direction: if bool::arbitrary(unstructured).ok()? {
+            TapDirection::Outbound
+        } else {
+            TapDirection::Inbound
+        },
+        generation: u32::arbitrary(unstructured).ok()?,
+        flow: arbitrary_flow(unstructured)?,
+        rule: TapRule::new(usize::from(u8::arbitrary(unstructured).ok()?)),
+        event: arbitrary_event(u8::arbitrary(unstructured).ok()?),
+    })
+}
+
+/// A flow the observation may name, or none. Indexed rather than matched, on
+/// [`drop_reason`]'s terms.
+fn arbitrary_flow(unstructured: &mut Unstructured<'_>) -> Option<Option<TapFlow>> {
+    let tag = u8::arbitrary(unstructured).ok()?;
+    if tag == 0 {
+        return Some(None);
+    }
+    let classifications = [
+        TapClassification::New,
+        TapClassification::Established,
+        TapClassification::Related,
+    ];
+    let states = [
+        TapFlowState::SynSent,
+        TapFlowState::SynReceived,
+        TapFlowState::Established,
+        TapFlowState::FinWait,
+        TapFlowState::CloseWait,
+        TapFlowState::Closing,
+        TapFlowState::TimeWait,
+        TapFlowState::Closed,
+        TapFlowState::UdpUnreplied,
+        TapFlowState::UdpAssured,
+        TapFlowState::IcmpUnreplied,
+        TapFlowState::IcmpReplied,
+    ];
+    Some(Some(TapFlow {
+        slot: u32::arbitrary(unstructured).ok()?,
+        generation: u32::arbitrary(unstructured).ok()?,
+        classification: classifications[usize::from(tag) % classifications.len()],
+        state: states[usize::from(u8::arbitrary(unstructured).ok()?) % states.len()],
+    }))
+}
+
+/// An event the observation may carry, or none.
+fn arbitrary_event(bits: u8) -> Option<TapEvent> {
+    if bits == 0 {
+        return None;
+    }
+    Some(TapEvent::ALL[usize::from(bits) % TapEvent::ALL.len()])
+}
+
 fn drop_reason(bits: u8) -> TapDropReason {
     // Every reason, indexed rather than matched: a reason added upstream is
     // then generated here without this harness needing an entry.
@@ -410,19 +468,11 @@ pub fn recording_pass(data: &[u8]) {
                 packet_id,
                 timestamp,
                 interface_id,
-                outcome,
-                direction,
-                generation,
+                decision,
                 frame,
             } => {
-                let annotation = TapAnnotation::new(
-                    packet_id,
-                    timestamp,
-                    interface_id,
-                    outcome,
-                    direction,
-                    generation,
-                );
+                let annotation =
+                    TapAnnotation::new(packet_id, timestamp, interface_id, decision);
                 // The wire length is the frame's own, which is the one field a
                 // first-party producer cannot get wrong; every other field
                 // above is the adversary's.
@@ -1598,6 +1648,12 @@ fn arbitrary_tap(unstructured: &mut Unstructured<'_>) -> CheckedTap {
             TapDirection::Inbound
         },
         generation: any_u32(unstructured),
+        // Unreduced, on `arbitrary_decision`'s terms: the sink must be total over
+        // a decision whose parts contradict each other, not only over the ones
+        // `wire`'s reader admits.
+        flow: arbitrary_flow(unstructured).unwrap_or(None),
+        rule: TapRule::new(usize::from(u8::arbitrary(unstructured).unwrap_or(0))),
+        event: arbitrary_event(u8::arbitrary(unstructured).unwrap_or(0)),
     }
 }
 

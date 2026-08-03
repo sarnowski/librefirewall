@@ -6,8 +6,8 @@ use std::{vec, vec::Vec};
 
 use lfw_pcapng::BYTE_ORDER_MAGIC;
 use wire::{
-    DownloadReply, DownloadRequest, TapAnnotation, TapConsume, TapDirection, TapOutcome,
-    TapRecords, TapWriter,
+    DownloadReply, DownloadRequest, TapAnnotation, TapClassification, TapConsume, TapDecision,
+    TapDirection, TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule, TapWriter,
 };
 
 /// A device of 64 MiB — the size the QEMU harness attaches.
@@ -181,14 +181,50 @@ impl Ring {
     }
 }
 
+/// An observation carrying a decision the log recording selects: a conversation
+/// opened, admitted by a rule. Every deck test that asserts on both recordings
+/// needs one, the log holding only observations that carry an event.
 fn annotation(packet_id: u64, interface_id: u8) -> TapAnnotation {
     TapAnnotation::new(
         packet_id,
         1_000 + packet_id,
         interface_id,
-        TapOutcome::Forwarded,
-        TapDirection::Inbound,
-        1,
+        TapDecision {
+            outcome: TapOutcome::Forwarded,
+            direction: TapDirection::Inbound,
+            generation: 1,
+            flow: Some(TapFlow {
+                slot: 11,
+                generation: 3,
+                classification: TapClassification::New,
+                state: TapFlowState::UdpUnreplied,
+            }),
+            rule: TapRule::new(0),
+            event: Some(TapEvent::FlowOpened),
+        },
+    )
+}
+
+/// One the log recording does not select: traffic on a conversation already
+/// accounted for, which the capture holds alone.
+fn unremarkable(packet_id: u64, interface_id: u8) -> TapAnnotation {
+    TapAnnotation::new(
+        packet_id,
+        1_000 + packet_id,
+        interface_id,
+        TapDecision {
+            outcome: TapOutcome::Forwarded,
+            direction: TapDirection::Inbound,
+            generation: 1,
+            flow: Some(TapFlow {
+                slot: 11,
+                generation: 3,
+                classification: TapClassification::Established,
+                state: TapFlowState::UdpAssured,
+            }),
+            rule: None,
+            event: None,
+        },
     )
 }
 
@@ -857,6 +893,47 @@ fn a_stale_superblock_of_an_older_ring_cannot_outrank_a_fresh_recording() {
     );
 }
 
+/// The two recordings differ by **what they hold**: the log takes an observation
+/// carrying a lifecycle or policy event and the capture takes every one.
+///
+/// This is the landing's headline property and it is stated on the counters
+/// rather than on the medium, because it is a property of the selection: the
+/// capture's record count is the number offered and the log's is the number that
+/// carried an event, and the two are different numbers for the same traffic.
+#[test]
+fn the_log_recording_holds_only_the_observations_that_carry_an_event() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    let frame = [0x5au8; 200];
+    let mut writer = ring.writer();
+    // Five observations, of which two carry an event: the connection history
+    // holds those two and the capture holds all five.
+    let events = 2;
+    for (index, carries_an_event) in [true, false, false, true, false].into_iter().enumerate() {
+        let annotation = if carries_an_event {
+            annotation(index as u64, 0)
+        } else {
+            unremarkable(index as u64, 0)
+        };
+        writer
+            .write(&annotation, frame.len() as u32, &frame)
+            .expect("the ring is empty");
+    }
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+
+    let counters = deck.counters();
+    assert_eq!(counters.tap_records, 5, "every observation was drained");
+    assert_eq!(counters.sinks[0].records, events);
+    assert_eq!(counters.sinks[1].records, 5);
+    // And the log skipping one is never a reason the tap stops draining: nothing
+    // is held, and no record was deferred for want of staging.
+    assert_eq!(counters.sinks[0].staging_deferrals, 0);
+    assert_eq!(counters.sinks[1].staging_deferrals, 0);
+}
+
 #[test]
 fn a_recording_under_sustained_traffic_rolls_segments_and_stays_consistent() {
     // Enough frames to close several segments of the log ring, which is the
@@ -868,21 +945,23 @@ fn a_recording_under_sustained_traffic_rolls_segments_and_stays_consistent() {
     let mut scratch = [0u8; TAP_SNAP_LEN];
     let frame = [0x77u8; 1500];
     let mut published = 0u64;
+    // Taken once and kept, which is the ring's protocol: a second writer
+    // restarts at slot zero, so the reader would be handed slots nothing ever
+    // wrote and the traffic this test claims to sustain would be zeroed slots.
+    let mut writer = ring.writer();
     for _ in 0..600 {
-        {
-            let mut writer = ring.writer();
-            for _ in 0..8 {
-                if writer
-                    .write(&annotation(published, 0), 1500, &frame)
-                    .is_ok()
-                {
-                    published += 1;
-                }
+        for _ in 0..8 {
+            if writer
+                .write(&annotation(published, 0), 1500, &frame)
+                .is_ok()
+            {
+                published += 1;
             }
         }
         deck.poll(&mut medium, &mut reader, &mut scratch, clock());
     }
     let counters = deck.counters();
+    assert_eq!(counters.tap_records, published);
     assert!(published > 0);
     assert!(
         counters.sinks[0].segments_closed > 0,

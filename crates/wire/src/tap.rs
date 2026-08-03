@@ -52,6 +52,18 @@
 //! is returned by value, while a tap record is an annotation plus a payload the
 //! reader must copy out of a slot the producer may reuse.
 //!
+//! # An observation carries the decision, not only the bytes
+//!
+//! A record is a frame *and* what the appliance concluded about it: the verdict
+//! and its reason, the flow it belongs to as an (index, generation) pair with the
+//! classification and state that go with it, the rule that decided it, and the
+//! lifecycle or policy event it caused. That is what lets the recorder write a
+//! connection history rather than a second copy of the traffic, and it is why
+//! [`TapDecision`] exists as one value: the combinations that mean nothing — a
+//! flow with no classification, a close with no terminal state, a rule on a
+//! decision the filter never took — are unrepresentable in what a first-party
+//! producer builds, and refused by name in what a peer writes.
+//!
 //! # A full ring refuses the newest record, and never the producer
 //!
 //! **A tap that backpressured the forwarder would be a traffic-generator denial
@@ -111,6 +123,30 @@ pub const TAP_SLOTS: usize = 64;
 /// takes one of them instead of moving every offset behind it — and with them
 /// the struct size, the region size and the system description's reservation.
 pub const TAP_RESERVED_WORDS: usize = 3;
+
+/// Flow classifications this ABI encodes, which is
+/// `lfw_flow::Classification::ALL.len()`.
+///
+/// Restated here on [`TAP_DROP_REASON_COUNT`]'s terms: `wire` is the crate every
+/// region's layout is expressed in, and a dependency on `lfw_flow` would forbid
+/// the reverse edge for good.
+pub const TAP_CLASSIFICATION_COUNT: u32 = 3;
+
+/// Flow states this ABI encodes, which is `lfw_flow::FlowState::ALL.len()` less
+/// its vacant state — a slot holding no flow is what *absent* already means
+/// here, so encoding it as a state would give one fact two representations.
+pub const TAP_FLOW_STATE_COUNT: u32 = 12;
+
+/// Lifecycle and policy events this ABI encodes, which is
+/// [`TapEvent::ALL`]'s length.
+pub const TAP_EVENT_COUNT: u32 = 6;
+
+/// Rules one generation may carry, which is `pipeline::MAX_RULES`.
+///
+/// Restated here on [`TAP_DROP_REASON_COUNT`]'s terms. It is what bounds the
+/// rule word, so a recorder narrowing it to the two octets its annotation
+/// carries is narrowing a value already proved to fit.
+pub const TAP_RULE_COUNT: u32 = 256;
 
 /// Set in [`TapAnnotation`]'s flags word for a frame observed on its way out.
 pub const TAP_FLAG_OUTBOUND: u32 = 1;
@@ -304,6 +340,326 @@ impl TapDropReason {
     }
 }
 
+/// What the appliance's connection tracker made of the frame — `lfw_flow`'s
+/// classification vocabulary as integers, in that enum's declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapClassification {
+    New,
+    Established,
+    Related,
+}
+
+impl TapClassification {
+    /// One higher than the mirrored enum's index, so zero is free to mean *no
+    /// flow* and a zeroed slot names none.
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::New => 1,
+            Self::Established => 2,
+            Self::Related => 3,
+        }
+    }
+
+    /// `None` for zero — which names no flow rather than a classification this
+    /// side failed to decode — and for every value above
+    /// [`TAP_CLASSIFICATION_COUNT`].
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            1 => Some(Self::New),
+            2 => Some(Self::Established),
+            3 => Some(Self::Related),
+            _ => None,
+        }
+    }
+}
+
+/// Where a flow stands after the frame — `lfw_flow::FlowState` as integers, in
+/// that enum's declaration order, with its vacant state absent.
+///
+/// Vacant is left out rather than mapped to zero because zero already means
+/// *this observation names no flow*: a slot holding nothing and an observation
+/// about no slot are the same fact, and giving it two encodings would let a
+/// reader see a flow whose state says there is none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapFlowState {
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait,
+    CloseWait,
+    Closing,
+    TimeWait,
+    Closed,
+    UdpUnreplied,
+    UdpAssured,
+    IcmpUnreplied,
+    IcmpReplied,
+}
+
+impl TapFlowState {
+    /// The mirrored enum's discriminant, which already reserves zero for its
+    /// vacant state — so no offset is applied here and the two numberings agree
+    /// value for value.
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::SynSent => 1,
+            Self::SynReceived => 2,
+            Self::Established => 3,
+            Self::FinWait => 4,
+            Self::CloseWait => 5,
+            Self::Closing => 6,
+            Self::TimeWait => 7,
+            Self::Closed => 8,
+            Self::UdpUnreplied => 9,
+            Self::UdpAssured => 10,
+            Self::IcmpUnreplied => 11,
+            Self::IcmpReplied => 12,
+        }
+    }
+
+    /// `None` for zero — the vacant state, which names no flow — and for every
+    /// value above [`TAP_FLOW_STATE_COUNT`].
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            1 => Some(Self::SynSent),
+            2 => Some(Self::SynReceived),
+            3 => Some(Self::Established),
+            4 => Some(Self::FinWait),
+            5 => Some(Self::CloseWait),
+            6 => Some(Self::Closing),
+            7 => Some(Self::TimeWait),
+            8 => Some(Self::Closed),
+            9 => Some(Self::UdpUnreplied),
+            10 => Some(Self::UdpAssured),
+            11 => Some(Self::IcmpUnreplied),
+            12 => Some(Self::IcmpReplied),
+            _ => None,
+        }
+    }
+
+    /// Whether a flow in this state is over: both closes acknowledged, or a
+    /// reset. These are the two ways a conversation ends on a packet, and so
+    /// the two a [`TapEvent::FlowClosed`] may carry.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::TimeWait | Self::Closed)
+    }
+}
+
+/// Which flow the observation is about, as the tracker resolved it.
+///
+/// The identity is the **(slot, generation) pair** the tracker issues and never
+/// the bare slot: slots are reused as connections come and go, so across a ring
+/// holding hours of history a bare index would silently merge two unrelated
+/// conversations that happened to occupy one slot at different times — and the
+/// merge would look ordinary and be wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapFlow {
+    pub slot: u32,
+    pub generation: u32,
+    pub classification: TapClassification,
+    pub state: TapFlowState,
+}
+
+/// The lifecycle or policy event the frame caused.
+///
+/// This is what the log recording selects on: an observation carrying one is an
+/// event worth a place in the connection history, and one carrying none is a
+/// packet the capture holds alone. The vocabulary is deliberately small — every
+/// member is a *transition* the appliance made, so the rate is bounded by how
+/// fast connections are admitted rather than by the packet rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapEvent {
+    /// A flow was opened and the filter admitted the packet that opened it.
+    FlowOpened,
+    /// An existing flow changed state without ending.
+    FlowAdvanced,
+    /// A flow reached a state it does not leave. Which one says how it closed.
+    FlowClosed,
+    /// A rule matched the opening packet and its action is to drop, so the flow
+    /// it had just opened was withdrawn.
+    PolicyDenied,
+    /// No rule was about the opening packet, so the default deny refused it and
+    /// the flow it had just opened was withdrawn.
+    PolicyNoMatch,
+    /// The tracker refused the packet outright, and it never reached the filter.
+    /// The drop reason says which refusal.
+    FlowRefused,
+}
+
+impl TapEvent {
+    /// Every event, so a reader's table and this ABI's own bound are built by
+    /// iteration rather than by a list that drifts from the enum.
+    pub const ALL: [Self; 6] = [
+        Self::FlowOpened,
+        Self::FlowAdvanced,
+        Self::FlowClosed,
+        Self::PolicyDenied,
+        Self::PolicyNoMatch,
+        Self::FlowRefused,
+    ];
+
+    /// One higher than this enum's index, so zero is free to mean *no event*.
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::FlowOpened => 1,
+            Self::FlowAdvanced => 2,
+            Self::FlowClosed => 3,
+            Self::PolicyDenied => 4,
+            Self::PolicyNoMatch => 5,
+            Self::FlowRefused => 6,
+        }
+    }
+
+    /// `None` for zero — which names no event — and for every value above
+    /// [`TAP_EVENT_COUNT`].
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            1 => Some(Self::FlowOpened),
+            2 => Some(Self::FlowAdvanced),
+            3 => Some(Self::FlowClosed),
+            4 => Some(Self::PolicyDenied),
+            5 => Some(Self::PolicyNoMatch),
+            6 => Some(Self::FlowRefused),
+            _ => None,
+        }
+    }
+
+    /// Whether this event is about a flow the observation must also name.
+    #[must_use]
+    pub const fn names_a_flow(self) -> bool {
+        matches!(
+            self,
+            Self::FlowOpened | Self::FlowAdvanced | Self::FlowClosed
+        )
+    }
+
+    /// Whether the filter reached a decision naming one of the operator's rules.
+    ///
+    /// True for exactly the two outcomes a matching rule has. The filter is
+    /// consulted once per conversation, on the packet that opens it, so every
+    /// other event happened with no rule involved — which is why this is also
+    /// the whole of when a rule may appear.
+    #[must_use]
+    pub const fn names_a_rule(self) -> bool {
+        matches!(self, Self::FlowOpened | Self::PolicyDenied)
+    }
+}
+
+/// Which of the operator's rules decided the frame, identified the way the
+/// dataplane identifies one: by its **position** in the running generation.
+///
+/// Position rather than the document's own id, because position is what the
+/// dataplane has — it is the precedence order and the slot the rule's hit
+/// counter occupies, and the management domain is what joins it to the id an
+/// operator wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapRule(u16);
+
+impl TapRule {
+    /// `None` for a position no generation can declare, so a rule that reaches
+    /// the region is one the annotation's two octets hold.
+    #[must_use]
+    pub const fn new(position: usize) -> Option<Self> {
+        if position < TAP_RULE_COUNT as usize {
+            // Lossless: the bound above is below `u16::MAX`, which the assertion
+            // block holds it to.
+            Some(Self(position as u16))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn position(self) -> u16 {
+        self.0
+    }
+
+    /// One higher than the position, so zero is free to mean *no rule matched*.
+    const fn to_bits(self) -> u32 {
+        self.0 as u32 + 1
+    }
+
+    /// `None` for zero — no rule matched — and for every value above
+    /// [`TAP_RULE_COUNT`].
+    const fn from_bits(bits: u32) -> Option<Self> {
+        match bits.checked_sub(1) {
+            Some(position) if position < TAP_RULE_COUNT => Some(Self(position as u16)),
+            _ => None,
+        }
+    }
+}
+
+/// Everything the appliance decided about one frame, as one value.
+///
+/// A struct rather than six arguments to [`TapAnnotation::new`] because four of
+/// them would be integers, and an argument order slipped between two would put
+/// one flow's identity on another's packet in an artifact meant to be evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapDecision {
+    pub outcome: TapOutcome,
+    pub direction: TapDirection,
+    /// The configuration generation the decision was taken under.
+    pub generation: u32,
+    /// The flow the frame belongs to, absent where the tracker resolved none.
+    pub flow: Option<TapFlow>,
+    /// The rule that decided it, absent where the filter matched none or was
+    /// never consulted.
+    pub rule: Option<TapRule>,
+    /// The lifecycle or policy event it caused, absent where it caused none.
+    pub event: Option<TapEvent>,
+}
+
+impl TapDecision {
+    const fn flow_slot(&self) -> u32 {
+        match self.flow {
+            Some(flow) => flow.slot,
+            None => 0,
+        }
+    }
+
+    const fn flow_generation(&self) -> u32 {
+        match self.flow {
+            Some(flow) => flow.generation,
+            None => 0,
+        }
+    }
+
+    const fn classification(&self) -> u32 {
+        match self.flow {
+            Some(flow) => flow.classification.to_bits(),
+            None => 0,
+        }
+    }
+
+    const fn flow_state(&self) -> u32 {
+        match self.flow {
+            Some(flow) => flow.state.to_bits(),
+            None => 0,
+        }
+    }
+
+    const fn event(&self) -> u32 {
+        match self.event {
+            Some(event) => event.to_bits(),
+            None => 0,
+        }
+    }
+
+    const fn rule(&self) -> u32 {
+        match self.rule {
+            Some(rule) => rule.to_bits(),
+            None => 0,
+        }
+    }
+}
+
 /// The verdict and its reason as one value, so the combinations that mean
 /// nothing cannot be built.
 ///
@@ -353,6 +709,12 @@ pub struct TapAnnotation {
     drop_reason: u32,
     flags: u32,
     generation: u32,
+    flow_slot: u32,
+    flow_generation: u32,
+    classification: u32,
+    event: u32,
+    flow_state: u32,
+    rule: u32,
     _reserved: [u32; TAP_RESERVED_WORDS],
 }
 
@@ -367,14 +729,17 @@ impl TapAnnotation {
     /// [`crate::ClockCalibration`] publishes, and that is the recorder's job,
     /// because a reading converted here would be converted on the dataplane
     /// against a calibration the forwarder would have to re-read per frame.
+    ///
+    /// Every field a [`TapDecision`] carries is written from that value alone, so
+    /// no first-party producer can emit a combination the checks in
+    /// [`TapReader::read`] name — a flow's identity without its classification, a
+    /// close with no terminal state, a rule on a decision the filter never took.
     #[must_use]
     pub const fn new(
         packet_id: u64,
         timestamp: u64,
         interface_id: u8,
-        outcome: TapOutcome,
-        direction: TapDirection,
-        generation: u32,
+        decision: TapDecision,
     ) -> Self {
         Self {
             packet_id,
@@ -382,10 +747,16 @@ impl TapAnnotation {
             interface_id: interface_id as u32,
             original_len: 0,
             captured_len: 0,
-            verdict: outcome.verdict().to_bits(),
-            drop_reason: outcome.drop_reason(),
-            flags: direction.to_bits(),
-            generation,
+            verdict: decision.outcome.verdict().to_bits(),
+            drop_reason: decision.outcome.drop_reason(),
+            flags: decision.direction.to_bits(),
+            generation: decision.generation,
+            flow_slot: decision.flow_slot(),
+            flow_generation: decision.flow_generation(),
+            classification: decision.classification(),
+            event: decision.event(),
+            flow_state: decision.flow_state(),
+            rule: decision.rule(),
             _reserved: [0; TAP_RESERVED_WORDS],
         }
     }
@@ -410,6 +781,13 @@ pub struct CheckedTap {
     pub direction: TapDirection,
     /// The configuration generation in force when the frame was observed.
     pub generation: u32,
+    /// The flow the frame belongs to, absent where the tracker resolved none.
+    pub flow: Option<TapFlow>,
+    /// The rule that decided it, absent where the filter matched none or was
+    /// never consulted.
+    pub rule: Option<TapRule>,
+    /// The lifecycle or policy event it caused, absent where it caused none.
+    pub event: Option<TapEvent>,
 }
 
 /// An annotation the producer's bytes cannot be.
@@ -461,6 +839,59 @@ pub enum TapFault {
     },
     /// A dropped frame naming no reason, which no routing decision produces.
     DropReasonMissingOnDropped,
+    ClassificationUnknown {
+        classification: u32,
+    },
+    FlowStateUnknown {
+        flow_state: u32,
+    },
+    EventUnknown {
+        event: u32,
+    },
+    /// A rule position no generation can declare.
+    RuleUnknown {
+        rule: u32,
+    },
+    /// A flow's identity or state with no classification to say what the frame
+    /// was to it. Refused rather than read as an unclassified flow, because a
+    /// classification is what makes the identity mean anything: without one there
+    /// is no statement about whether the slot was opened, advanced or reported
+    /// on, and a reader folding events by flow would merge it into whichever
+    /// conversation last held the slot.
+    FlowWithoutClassification {
+        flow_slot: u32,
+        flow_generation: u32,
+        flow_state: u32,
+    },
+    /// A classified flow in no state, which is the vacant slot a classification
+    /// cannot have been reached against.
+    FlowStateMissingOnClassified {
+        classification: u32,
+    },
+    /// A lifecycle event about no flow.
+    FlowEventWithoutFlow {
+        event: u32,
+    },
+    /// A close whose state is one a flow leaves, so the record says a
+    /// conversation ended and does not say how.
+    CloseEventWithoutTerminalState {
+        flow_state: u32,
+    },
+    /// A rule on an event the filter took no part in. The filter is consulted
+    /// once per conversation, on the packet that opens it, so an advance, a
+    /// close, a tracker refusal and an unmatched policy all happened with no rule
+    /// involved — and a rule on one of them would credit a hit to a rule that
+    /// never ran.
+    RuleOnEventWithoutFilterDecision {
+        rule: u32,
+        event: u32,
+    },
+    /// A filter decision naming no rule, which neither of its two outcomes
+    /// produces: an admission is a rule whose action is to accept, and a denial
+    /// is one whose action is to drop.
+    RuleMissingOnFilterDecision {
+        event: u32,
+    },
 }
 
 /// A frame already cut to what a slot holds, carrying its own length as the
@@ -516,6 +947,12 @@ struct TapSlot {
     drop_reason: AtomicU32,
     flags: AtomicU32,
     generation: AtomicU32,
+    flow_slot: AtomicU32,
+    flow_generation: AtomicU32,
+    classification: AtomicU32,
+    event: AtomicU32,
+    flow_state: AtomicU32,
+    rule: AtomicU32,
     _reserved: [AtomicU32; TAP_RESERVED_WORDS],
     payload: [AtomicU8; TAP_SNAP_LEN],
 }
@@ -534,6 +971,12 @@ impl TapSlot {
             drop_reason: AtomicU32::new(0),
             flags: AtomicU32::new(0),
             generation: AtomicU32::new(0),
+            flow_slot: AtomicU32::new(0),
+            flow_generation: AtomicU32::new(0),
+            classification: AtomicU32::new(0),
+            event: AtomicU32::new(0),
+            flow_state: AtomicU32::new(0),
+            rule: AtomicU32::new(0),
             _reserved: [const { AtomicU32::new(0) }; TAP_RESERVED_WORDS],
             payload: [const { AtomicU8::new(0) }; TAP_SNAP_LEN],
         }
@@ -557,6 +1000,16 @@ impl TapSlot {
         self.flags.store(annotation.flags, Ordering::Relaxed);
         self.generation
             .store(annotation.generation, Ordering::Relaxed);
+        self.flow_slot
+            .store(annotation.flow_slot, Ordering::Relaxed);
+        self.flow_generation
+            .store(annotation.flow_generation, Ordering::Relaxed);
+        self.classification
+            .store(annotation.classification, Ordering::Relaxed);
+        self.event.store(annotation.event, Ordering::Relaxed);
+        self.flow_state
+            .store(annotation.flow_state, Ordering::Relaxed);
+        self.rule.store(annotation.rule, Ordering::Relaxed);
         for (cell, word) in self._reserved.iter().zip(annotation._reserved) {
             cell.store(word, Ordering::Relaxed);
         }
@@ -586,6 +1039,12 @@ impl TapSlot {
             drop_reason: self.drop_reason.load(Ordering::Relaxed),
             flags: self.flags.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
+            flow_slot: self.flow_slot.load(Ordering::Relaxed),
+            flow_generation: self.flow_generation.load(Ordering::Relaxed),
+            classification: self.classification.load(Ordering::Relaxed),
+            event: self.event.load(Ordering::Relaxed),
+            flow_state: self.flow_state.load(Ordering::Relaxed),
+            rule: self.rule.load(Ordering::Relaxed),
             _reserved: reserved,
         }
     }
@@ -665,6 +1124,8 @@ impl TapSlot {
             (TapVerdict::Dropped, None) => return Err(TapFault::DropReasonMissingOnDropped),
         };
 
+        let decoded = decode_decision(&raw)?;
+
         for (byte, cell) in target.iter_mut().zip(&self.payload) {
             *byte = cell.load(Ordering::Relaxed);
         }
@@ -678,10 +1139,119 @@ impl TapSlot {
                 outcome,
                 direction,
                 generation: raw.generation,
+                flow: decoded.flow,
+                rule: decoded.rule,
+                event: decoded.event,
             },
             target,
         ))
     }
+}
+
+/// The flow, the rule and the event a slot's words name, or the first way they
+/// cannot be a decision this appliance took.
+///
+/// Split out of [`TapSlot::read_into`] because it is where most of the checking
+/// now lives and none of it touches the payload: the copy out is bounded by a
+/// length already established, and every refusal here is about the relations
+/// between six words rather than about a bound.
+struct Decoded {
+    flow: Option<TapFlow>,
+    rule: Option<TapRule>,
+    event: Option<TapEvent>,
+}
+
+fn decode_decision(raw: &TapAnnotation) -> Result<Decoded, TapFault> {
+    let classification = match raw.classification {
+        0 => None,
+        bits => match TapClassification::from_bits(bits) {
+            Some(classification) => Some(classification),
+            None => {
+                return Err(TapFault::ClassificationUnknown {
+                    classification: bits,
+                });
+            }
+        },
+    };
+    let state = match raw.flow_state {
+        0 => None,
+        bits => match TapFlowState::from_bits(bits) {
+            Some(state) => Some(state),
+            None => return Err(TapFault::FlowStateUnknown { flow_state: bits }),
+        },
+    };
+    let flow = match (classification, state) {
+        (Some(classification), Some(state)) => Some(TapFlow {
+            slot: raw.flow_slot,
+            generation: raw.flow_generation,
+            classification,
+            state,
+        }),
+        (None, None) => {
+            if raw.flow_slot != 0 || raw.flow_generation != 0 {
+                return Err(TapFault::FlowWithoutClassification {
+                    flow_slot: raw.flow_slot,
+                    flow_generation: raw.flow_generation,
+                    flow_state: raw.flow_state,
+                });
+            }
+            None
+        }
+        (None, Some(_)) => {
+            return Err(TapFault::FlowWithoutClassification {
+                flow_slot: raw.flow_slot,
+                flow_generation: raw.flow_generation,
+                flow_state: raw.flow_state,
+            });
+        }
+        (Some(_), None) => {
+            return Err(TapFault::FlowStateMissingOnClassified {
+                classification: raw.classification,
+            });
+        }
+    };
+
+    let event = match raw.event {
+        0 => None,
+        bits => match TapEvent::from_bits(bits) {
+            Some(event) => Some(event),
+            None => return Err(TapFault::EventUnknown { event: bits }),
+        },
+    };
+    let rule = match raw.rule {
+        0 => None,
+        bits => match TapRule::from_bits(bits) {
+            Some(rule) => Some(rule),
+            None => return Err(TapFault::RuleUnknown { rule: bits }),
+        },
+    };
+
+    if let Some(event) = event {
+        if event.names_a_flow() && flow.is_none() {
+            return Err(TapFault::FlowEventWithoutFlow { event: raw.event });
+        }
+        if event == TapEvent::FlowClosed && !flow.is_some_and(|flow| flow.state.is_terminal()) {
+            return Err(TapFault::CloseEventWithoutTerminalState {
+                flow_state: raw.flow_state,
+            });
+        }
+        if event.names_a_rule() != rule.is_some() {
+            return Err(if rule.is_some() {
+                TapFault::RuleOnEventWithoutFilterDecision {
+                    rule: raw.rule,
+                    event: raw.event,
+                }
+            } else {
+                TapFault::RuleMissingOnFilterDecision { event: raw.event }
+            });
+        }
+    } else if rule.is_some() {
+        return Err(TapFault::RuleOnEventWithoutFilterDecision {
+            rule: raw.rule,
+            event: raw.event,
+        });
+    }
+    Ok(Decoded { flow, rule, event })
 }
 
 /// The records half of the ring: the slots, the cursor that publishes them and
@@ -1094,8 +1664,32 @@ const _: () = {
     assert!(TapDropReason::NoPolicyMatch.to_bits() == TAP_DROP_REASON_COUNT);
     assert!(TapDropReason::from_bits(TAP_DROP_REASON_COUNT).is_some());
     assert!(TapDropReason::from_bits(TAP_DROP_REASON_COUNT + 1).is_none());
+    // The four vocabularies the decision words carry, each held to its own
+    // width the same way: a member added to the mirrored enum without a slot
+    // here is caught by the count rather than by a reader.
+    assert!(TapClassification::Related.to_bits() == TAP_CLASSIFICATION_COUNT);
+    assert!(TapClassification::from_bits(TAP_CLASSIFICATION_COUNT).is_some());
+    assert!(TapClassification::from_bits(TAP_CLASSIFICATION_COUNT + 1).is_none());
+    assert!(TapFlowState::IcmpReplied.to_bits() == TAP_FLOW_STATE_COUNT);
+    assert!(TapFlowState::from_bits(TAP_FLOW_STATE_COUNT).is_some());
+    assert!(TapFlowState::from_bits(TAP_FLOW_STATE_COUNT + 1).is_none());
+    assert!(TapEvent::FlowRefused.to_bits() == TAP_EVENT_COUNT);
+    assert!(TapEvent::ALL.len() == TAP_EVENT_COUNT as usize);
+    assert!(TapEvent::from_bits(TAP_EVENT_COUNT).is_some());
+    assert!(TapEvent::from_bits(TAP_EVENT_COUNT + 1).is_none());
+    assert!(TapClassification::from_bits(0).is_none());
+    assert!(TapFlowState::from_bits(0).is_none());
+    assert!(TapEvent::from_bits(0).is_none());
+    // A rule position is encoded one higher than itself, so the last declarable
+    // position and nothing above it decodes — and the encoded form stays inside
+    // the two octets a recorder's annotation holds it in.
+    assert!(TapRule::new(TAP_RULE_COUNT as usize).is_none());
+    assert!(TapRule::from_bits(0).is_none());
+    assert!(TapRule::from_bits(TAP_RULE_COUNT).is_some());
+    assert!(TapRule::from_bits(TAP_RULE_COUNT + 1).is_none());
+    assert!(TAP_RULE_COUNT <= u16::MAX as u32);
 
-    assert!(size_of::<TapAnnotation>() == 56);
+    assert!(size_of::<TapAnnotation>() == 80);
     assert!(align_of::<TapAnnotation>() == 8);
     assert!(offset_of!(TapAnnotation, packet_id) == 0);
     assert!(offset_of!(TapAnnotation, timestamp) == 8);
@@ -1106,7 +1700,13 @@ const _: () = {
     assert!(offset_of!(TapAnnotation, drop_reason) == 32);
     assert!(offset_of!(TapAnnotation, flags) == 36);
     assert!(offset_of!(TapAnnotation, generation) == 40);
-    assert!(offset_of!(TapAnnotation, _reserved) == 44);
+    assert!(offset_of!(TapAnnotation, flow_slot) == 44);
+    assert!(offset_of!(TapAnnotation, flow_generation) == 48);
+    assert!(offset_of!(TapAnnotation, classification) == 52);
+    assert!(offset_of!(TapAnnotation, event) == 56);
+    assert!(offset_of!(TapAnnotation, flow_state) == 60);
+    assert!(offset_of!(TapAnnotation, rule) == 64);
+    assert!(offset_of!(TapAnnotation, _reserved) == 68);
 
     // Expressing the annotation as atomics must leave the region the recorder
     // maps byte-identical to the plain image: same size, same alignment, every
@@ -1120,6 +1720,12 @@ const _: () = {
     assert!(offset_of!(TapSlot, drop_reason) == offset_of!(TapAnnotation, drop_reason));
     assert!(offset_of!(TapSlot, flags) == offset_of!(TapAnnotation, flags));
     assert!(offset_of!(TapSlot, generation) == offset_of!(TapAnnotation, generation));
+    assert!(offset_of!(TapSlot, flow_slot) == offset_of!(TapAnnotation, flow_slot));
+    assert!(offset_of!(TapSlot, flow_generation) == offset_of!(TapAnnotation, flow_generation));
+    assert!(offset_of!(TapSlot, classification) == offset_of!(TapAnnotation, classification));
+    assert!(offset_of!(TapSlot, event) == offset_of!(TapAnnotation, event));
+    assert!(offset_of!(TapSlot, flow_state) == offset_of!(TapAnnotation, flow_state));
+    assert!(offset_of!(TapSlot, rule) == offset_of!(TapAnnotation, rule));
     assert!(offset_of!(TapSlot, _reserved) == offset_of!(TapAnnotation, _reserved));
     // The payload begins exactly where the annotation ends, so a slot is the
     // annotation followed by the frame with nothing between them.

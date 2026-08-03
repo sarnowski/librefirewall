@@ -1,8 +1,11 @@
 //! One recording sink: pcapng encoding onto a segmented ring, and the placement
 //! of whole sectors for the protection domain that owns the block device.
 //!
-//! The appliance keeps two of these — one recording headers, one recording
-//! frames — differing only in snap length and extent. Both are this type.
+//! The appliance keeps two of these and they differ in **what they record**: a
+//! connection history of the observations that carried a lifecycle or policy
+//! event, and a capture of every observation with its verdict. The selection is
+//! the caller's ([`crate::deck::Which::records`]); what this type carries of it is
+//! the extent, the snap length, and the annotation naming the event.
 //!
 //! # The adversary
 //!
@@ -59,13 +62,33 @@ pub const MAX_INTERFACE_NAME: usize = 16;
 pub const TAIL_RESERVE: usize = 2 * SECTOR_SIZE;
 
 /// The version byte leading [`ANNOTATION_LEN`]'s layout.
-pub const ANNOTATION_VERSION: u8 = 1;
+///
+/// A reader keys on this rather than on the length it happens to see, which is
+/// what lets the layout grow: version 1 carried the verdict, its reason and the
+/// configuration generation, and version 2 adds the flow the observation is
+/// about, what the packet did to it, and the rule that decided it.
+pub const ANNOTATION_VERSION: u8 = 2;
 
 /// Bytes of firewall annotation carried in each record's Custom Option.
-pub const ANNOTATION_LEN: usize = 16;
+pub const ANNOTATION_LEN: usize = 24;
 
 const ANNOTATION_VERDICT_FORWARDED: u8 = 0;
 const ANNOTATION_VERDICT_DROPPED: u8 = 1;
+
+/// Where each field of the annotation begins: the offsets a reader outside this
+/// workspace navigates by, so a shifted one is a field read as another.
+const ANNOTATION_AT_VERSION: usize = 0;
+const ANNOTATION_AT_VERDICT: usize = 1;
+const ANNOTATION_AT_DROP_REASON: usize = 2;
+const ANNOTATION_AT_INTERFACE: usize = 3;
+const ANNOTATION_AT_DIRECTION: usize = 4;
+const ANNOTATION_AT_CLASSIFICATION: usize = 5;
+const ANNOTATION_AT_EVENT: usize = 6;
+const ANNOTATION_AT_FLOW_STATE: usize = 7;
+const ANNOTATION_AT_GENERATION: usize = 8;
+const ANNOTATION_AT_FLOW_SLOT: usize = 12;
+const ANNOTATION_AT_FLOW_GENERATION: usize = 16;
+const ANNOTATION_AT_RULE: usize = 20;
 
 /// pcapng `epb_flags`: bits 0-1 are the direction, 1 inbound and 2 outbound.
 const FLAGS_INBOUND: u32 = 1;
@@ -80,6 +103,18 @@ const _: () = {
     assert!(TAIL_RESERVE >= 2 * SECTOR_SIZE);
     assert!(TAIL_RESERVE > SECTOR_SIZE + MIN_CUSTOM_BLOCK_LEN);
     assert!(ANNOTATION_LEN.is_multiple_of(4));
+    // The rule is the last field and takes two octets, so the layout ends
+    // exactly where the length says it does.
+    assert!(ANNOTATION_AT_RULE + 2 <= ANNOTATION_LEN);
+    // Every value the annotation narrows to one octet must fit one, which the
+    // tap ABI's own bounds already guarantee — restated here because this is
+    // where the narrowing happens.
+    assert!(wire::TAP_DROP_REASON_COUNT <= u8::MAX as u32);
+    assert!(wire::TAP_CLASSIFICATION_COUNT <= u8::MAX as u32);
+    assert!(wire::TAP_FLOW_STATE_COUNT <= u8::MAX as u32);
+    assert!(wire::TAP_EVENT_COUNT <= u8::MAX as u32);
+    // And the rule position, which takes two.
+    assert!(wire::TAP_RULE_COUNT <= u16::MAX as u32);
 };
 
 /// One interface a recording describes, as one pcapng Interface Description
@@ -130,7 +165,8 @@ impl InterfaceName {
 #[derive(Clone, Copy, Debug)]
 pub struct SinkConfig {
     pub geometry: Geometry,
-    /// Bytes of each frame recorded, the one thing the two sinks differ by.
+    /// Bytes of each frame recorded — a consequence of what a recording is for
+    /// rather than what distinguishes the two.
     pub snap_len: u32,
     pub interfaces: [InterfaceName; MAX_INTERFACES],
     pub interface_count: usize,
@@ -682,28 +718,80 @@ impl Sink {
         }
     }
 
+    /// The firewall state pcapng has no standard field for, as the bytes the
+    /// record's Custom Option carries.
+    ///
+    /// Every narrowing here is of a value the tap ABI already bounded, so none can
+    /// truncate; the assertion block states the bounds it relies on. A zero names
+    /// *absent* rather than a member, as it does in that ABI.
     fn annotation(&self, tap: &CheckedTap) -> [u8; ANNOTATION_LEN] {
         let mut annotation = [0u8; ANNOTATION_LEN];
         let drop_reason = match tap.outcome {
             TapOutcome::Forwarded => 0,
             TapOutcome::Dropped(reason) => reason.to_bits() as u8,
         };
-        let fields = [
-            ANNOTATION_VERSION,
-            annotation_verdict(tap),
-            drop_reason,
-            tap.interface_id,
-            match tap.direction {
-                TapDirection::Inbound => 0,
-                TapDirection::Outbound => 1,
-            },
+        let octets = [
+            (ANNOTATION_AT_VERSION, ANNOTATION_VERSION),
+            (ANNOTATION_AT_VERDICT, annotation_verdict(tap)),
+            (ANNOTATION_AT_DROP_REASON, drop_reason),
+            (ANNOTATION_AT_INTERFACE, tap.interface_id),
+            (
+                ANNOTATION_AT_DIRECTION,
+                match tap.direction {
+                    TapDirection::Inbound => 0,
+                    TapDirection::Outbound => 1,
+                },
+            ),
+            (
+                ANNOTATION_AT_CLASSIFICATION,
+                match tap.flow {
+                    Some(flow) => flow.classification.to_bits() as u8,
+                    None => 0,
+                },
+            ),
+            (
+                ANNOTATION_AT_EVENT,
+                match tap.event {
+                    Some(event) => event.to_bits() as u8,
+                    None => 0,
+                },
+            ),
+            (
+                ANNOTATION_AT_FLOW_STATE,
+                match tap.flow {
+                    Some(flow) => flow.state.to_bits() as u8,
+                    None => 0,
+                },
+            ),
         ];
-        for (slot, value) in annotation.iter_mut().zip(fields) {
-            *slot = value;
+        for (at, value) in octets {
+            if let Some(slot) = annotation.get_mut(at) {
+                *slot = value;
+            }
         }
-        let generation = tap.generation.to_le_bytes();
-        if let Some(target) = annotation.get_mut(8..12) {
-            target.copy_from_slice(&generation);
+        let words = [
+            (ANNOTATION_AT_GENERATION, tap.generation),
+            (
+                ANNOTATION_AT_FLOW_SLOT,
+                tap.flow.map_or(0, |flow| flow.slot),
+            ),
+            (
+                ANNOTATION_AT_FLOW_GENERATION,
+                tap.flow.map_or(0, |flow| flow.generation),
+            ),
+        ];
+        for (at, value) in words {
+            if let Some(target) = annotation.get_mut(at..at.saturating_add(4)) {
+                target.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        // One higher than the position, so zero names *no rule matched* rather
+        // than the first rule of the generation.
+        let rule = tap.rule.map_or(0, |rule| rule.position().saturating_add(1));
+        if let Some(target) =
+            annotation.get_mut(ANNOTATION_AT_RULE..ANNOTATION_AT_RULE.saturating_add(2))
+        {
+            target.copy_from_slice(&rule.to_le_bytes());
         }
         annotation
     }

@@ -235,6 +235,14 @@ medium: bytes become durable one whole sector at a time, so the tail of a record
 until a seal — which a download performs — pushes it out. Compare it against
 `librefirewall_recording_sectors_written_total` for what the device has acknowledged.
 
+**The two sinks' counts are meant to differ, and by a lot.** They record different things (see
+[Recording downloads](recordings.md)): the capture's count is every observation the recorder drained,
+which is `librefirewall_recording_tap_records_total`, while the log's is the subset that carried a
+connection lifecycle or policy event. A log count close to the capture's is a node whose traffic is
+almost all connection openings and refusals; one far below it is the ordinary case, and the ratio
+between them is the cheapest reading of how much of the traffic is new conversations rather than
+packets on established ones.
+
 `librefirewall_recording_tap_dropped_by_writer_total` is the **forwarder's** claim about itself,
 read out of the shared ring and republished here beside this domain's own counts rather than
 instead of them. It is the same number as

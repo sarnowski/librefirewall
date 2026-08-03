@@ -84,7 +84,7 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_flow::{FlowId, FlowTable, Outcome, RefusalKind};
+use lfw_flow::{Classification, FlowEntry, FlowId, FlowState, FlowTable, Outcome, RefusalKind};
 use net_headers::{Frame, Ipv4Address, MacAddress, Protocol, Transport};
 use routing::{PortId, Router};
 
@@ -358,14 +358,57 @@ pub enum Step {
 /// Threaded through the chain by mutable reference so a stage can *attach* what
 /// it derived rather than return it: a later stage reads a fact the earlier one
 /// established without re-deriving it from the bytes, and adding such a fact
-/// costs a field here instead of a parameter on every stage's signature. Today
-/// that is the ingress port and the parsed frame; a flow handle and a matched
-/// rule are the next two, and neither changes a signature to arrive.
+/// costs a field here instead of a parameter on every stage's signature.
+///
+/// It is also what an evaluation leaves behind for a caller outside the chain.
+/// A [`Verdict`] says what to do with the frame and cannot say *why*: which
+/// conversation it belongs to, what this packet did to that conversation, which
+/// of the operator's rules decided it, and whether the tracker refused it before
+/// the filter was reached. Those four are here, attached by the stages that
+/// established them, and they are what lets an observer record a connection
+/// history rather than a second copy of the traffic.
 pub struct Inspection<'frame> {
     ingress: PortId,
     frame: Frame<'frame>,
     forwarding: Option<Forwarding>,
-    opened: Option<FlowId>,
+    flow: Option<FlowObservation>,
+    refusal: Option<RefusalKind>,
+    matched: Option<usize>,
+}
+
+/// What one packet did to the flow it belongs to.
+///
+/// Three values rather than a `previous`/`state` pair, because what a reader of
+/// a recording asks is whether the connection *moved*: a packet that left the
+/// state where it was is traffic on a conversation already accounted for, and a
+/// history carrying one record per such packet would be the packet log the whole
+/// point is not to keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowTransition {
+    /// The packet opened the flow. It is the one packet the filter is consulted
+    /// about, so it is also the only transition a rule is named on.
+    Opened,
+    /// It moved the flow from one state to another.
+    Advanced,
+    /// It belonged to the flow and left its state where it was.
+    Held,
+}
+
+/// What [`ConnectionStage`] worked out about the frame's place in a conversation.
+///
+/// Attached rather than returned, as [`Forwarding`] is: the tracker settles an
+/// established frame in the middle of the chain, so the facts have to survive
+/// past the stage that established them for anything behind — or outside — the
+/// chain to read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowObservation {
+    /// The (slot, generation) handle, which is the only identity that does not
+    /// silently merge two conversations that held one slot at different times.
+    pub id: FlowId,
+    pub classification: Classification,
+    /// Where the flow stands *after* the frame.
+    pub state: FlowState,
+    pub transition: FlowTransition,
 }
 
 /// What [`RoutingStage`] worked out about a frame it did not settle: where the
@@ -391,7 +434,9 @@ impl<'frame> Inspection<'frame> {
             ingress,
             frame,
             forwarding: None,
-            opened: None,
+            flow: None,
+            refusal: None,
+            matched: None,
         }
     }
 
@@ -425,21 +470,51 @@ impl<'frame> Inspection<'frame> {
         self.forwarding = Some(forwarding);
     }
 
-    /// The flow this evaluation *opened*, if it opened one.
+    /// The frame's place in a conversation, once the tracker has classified it.
     ///
-    /// A handle rather than a fact, because the only thing that reads it is the
-    /// withdrawal behind the filter: a slot committed by a classification whose
-    /// packet is then refused has to be given back, and nothing else in the
-    /// chain has any business naming a flow.
+    /// `None` before [`ConnectionStage::classify`] has run, and after it for a
+    /// frame the tracker refused — a refusal is a statement that the packet
+    /// belongs to no flow, which is why the two are separate answers rather than
+    /// one enum: [`refusal`](Self::refusal) is what distinguishes it from a frame
+    /// the tracker never saw.
     #[must_use]
-    pub const fn opened(&self) -> Option<FlowId> {
-        self.opened
+    pub const fn flow(&self) -> Option<FlowObservation> {
+        self.flow
     }
 
-    /// Attach the flow this evaluation opened, so the half behind the filter can
-    /// give its slot back if the packet that opened it is refused.
-    pub const fn attach_opened(&mut self, flow: FlowId) {
-        self.opened = Some(flow);
+    /// Attach what the tracker resolved. Taken by the stage that resolved it, so
+    /// the fact and its derivation stay in one place.
+    pub const fn attach_flow(&mut self, flow: FlowObservation) {
+        self.flow = Some(flow);
+    }
+
+    /// Why the tracker would keep no state for the frame, where it refused it.
+    ///
+    /// The one fact that tells a tracker refusal from an admission or routing
+    /// drop: both leave no flow, and only this says the tracker was reached and
+    /// answered.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<RefusalKind> {
+        self.refusal
+    }
+
+    pub const fn attach_refusal(&mut self, refusal: RefusalKind) {
+        self.refusal = Some(refusal);
+    }
+
+    /// The position of the rule the filter matched, which is that rule's
+    /// precedence and the slot its hit counter occupies.
+    ///
+    /// `None` where no rule was about the frame, and where the filter was never
+    /// consulted at all — the two are told apart by whether the frame opened a
+    /// flow, since the filter sees exactly the packets that do.
+    #[must_use]
+    pub const fn matched(&self) -> Option<usize> {
+        self.matched
+    }
+
+    pub const fn attach_match(&mut self, position: usize) {
+        self.matched = Some(position);
     }
 }
 
@@ -686,30 +761,72 @@ impl ConnectionStage {
         );
         match outcome {
             // Deferred so the filter decides, which is what an unrecognised
-            // conversation is for; the handle is what the half behind it needs
-            // if the filter then says no.
-            Outcome::New { flow, .. } => {
-                inspection.attach_opened(flow);
+            // conversation is for; the observation is what the half behind it
+            // needs if the filter then says no.
+            Outcome::New { flow, state } => {
+                inspection.attach_flow(FlowObservation {
+                    id: flow,
+                    classification: Classification::New,
+                    state,
+                    transition: FlowTransition::Opened,
+                });
                 Step::Continue
             }
-            Outcome::Established { .. } | Outcome::Related { .. } => {
-                match inspection.forwarding() {
-                    Some(forwarding) => Step::Settled(Verdict::Forward {
-                        egress: forwarding.egress,
-                        source: forwarding.source,
-                        destination: forwarding.destination,
-                    }),
-                    // Unreachable: the stage in front settles every frame it
-                    // cannot resolve a next hop for. Deferred rather than
-                    // asserted, and the filter's own answer to the same absence
-                    // is to deny — so the one path that cannot tell where a
-                    // frame would go does not forward it.
-                    None => Step::Continue,
+            Outcome::Established {
+                flow,
+                previous,
+                state,
+                ..
+            } => {
+                inspection.attach_flow(FlowObservation {
+                    id: flow,
+                    classification: Classification::Established,
+                    state,
+                    transition: if previous == state {
+                        FlowTransition::Held
+                    } else {
+                        FlowTransition::Advanced
+                    },
+                });
+                Self::forward(inspection)
+            }
+            Outcome::Related { flow, .. } => {
+                // An error never moves the flow it reports on, so the state is
+                // the table's current one. The lookup cannot miss — the same
+                // call resolved the slot — and where it did the frame is still
+                // forwarded under a record that names no flow, which is a
+                // weaker record rather than a wrong one.
+                if let Some(state) = tracking.table().flow(flow).map(FlowEntry::state) {
+                    inspection.attach_flow(FlowObservation {
+                        id: flow,
+                        classification: Classification::Related,
+                        state,
+                        transition: FlowTransition::Held,
+                    });
                 }
+                Self::forward(inspection)
             }
             Outcome::Refused(refusal) => {
+                inspection.attach_refusal(refusal.kind());
                 Step::Settled(Verdict::Drop(DropReason::of_refusal(refusal.kind())))
             }
+        }
+    }
+
+    /// Forward the frame under the facts [`RoutingStage`] attached, which is what
+    /// a flow the tracker already accounts for is carried by.
+    fn forward(inspection: &Inspection<'_>) -> Step {
+        match inspection.forwarding() {
+            Some(forwarding) => Step::Settled(Verdict::Forward {
+                egress: forwarding.egress,
+                source: forwarding.source,
+                destination: forwarding.destination,
+            }),
+            // Unreachable: the stage in front settles every frame it cannot
+            // resolve a next hop for. Deferred rather than asserted, and the
+            // filter's own answer to the same absence is to deny — so the one
+            // path that cannot tell where a frame would go does not forward it.
+            None => Step::Continue,
         }
     }
 
@@ -724,8 +841,11 @@ impl ConnectionStage {
         tracking: &mut Tracking<'_, FLOWS>,
         verdict: Verdict,
     ) {
-        if let (Verdict::Drop(_), Some(flow)) = (verdict, inspection.opened()) {
-            tracking.table.withdraw(flow);
+        let opened = inspection
+            .flow()
+            .filter(|flow| flow.transition == FlowTransition::Opened);
+        if let (Verdict::Drop(_), Some(flow)) = (verdict, opened) {
+            tracking.table.withdraw(flow.id);
         }
     }
 }
@@ -1111,6 +1231,7 @@ impl PolicyStage {
         match matched {
             Some((position, rule)) => {
                 self.counters.record(Some(position), rule.action, bytes);
+                inspection.attach_match(position);
                 match rule.action {
                     RuleAction::Accept => Verdict::Forward {
                         egress: forwarding.egress,

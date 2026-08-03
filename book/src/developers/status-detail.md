@@ -260,9 +260,16 @@ by two QEMU scenarios that hold a reply's arrival to the tracker rather than to 
   the flows the new policy would not admit. The table already has everything that needs — a bounded
   set of flows, each with its key and its handle — so what is missing is the pass over it, not the
   mechanism.
-- **No connection events in the recordings.** The lifecycle reaches `/metrics` and stops there; the
-  log sink the recording design intends is still the capture truncated to headers. See
-  *[Recording and download](#recording-and-download)*.
+- **A conversation reclaimed by its idle timeout produces no close event.** Every record of the
+  connection history is anchored to the packet that caused it, and a flow the sweep collected has no
+  such packet, so its end is visible on `librefirewall_flow_expired_total` and in no recording. The
+  design's answer is the periodic state event that re-anchors long-lived connections, and nothing
+  emits one. See *[Recording and download](#recording-and-download)*.
+- **A refusal names no flow.** The two refusals that are *about* an existing flow — a segment outside
+  its window, and one its state does not admit — are recorded with their reason and not with the
+  conversation they were refused against, because `lfw_flow::Refusal` carries the value that refused
+  the packet and not the slot it resolved. A reader locates such a record by the five-tuple in the
+  causing packet's own headers.
 - **No NAT, so no translation state.** The table carries a flow's identity and its state, and nothing
   it would need to rewrite an address.
 - **The hash is unkeyed.** An attacker who computes colliding tuples can fill one bucket's chain and
@@ -441,12 +448,18 @@ recorder differences the writer's drop count on every pass and carries the rise 
 record it places, so `epb_dropcount` is fed rather than written as a zero.
 
 The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` over
-`lfw_capture_ring`, differing only in extent and snap length:
+`lfw_capture_ring`. They differ by **what each records** — the selection is
+`lfw_recorder::deck::Which::records` — and the extent and snap length follow from that:
 
-| Recording | Extent | Segment | Snap length |
-|---|---|---|---|
-| log (`/logs.pcapng`) | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
-| capture (`/capture.pcapng`) | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+| Recording | Records | Extent | Segment | Snap length |
+|---|---|---|---|---|
+| connection history (`/logs.pcapng`) | an observation carrying a lifecycle or policy event | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
+| capture (`/capture.pcapng`) | every observation | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+
+The history's 128 bytes are derived rather than chosen: the longest L2–L4 header chain this appliance
+reaches a decision on is 98 bytes — an Ethernet header, an 802.1Q tag, an IPv4 header whose options
+the parser refuses rather than skips, and a TCP header with a full option area — and a record of a
+decision carries the headers it was taken on and nothing of the payload.
 
 Sectors 0–2047 are reserved and belong to neither, which is where the harness's seed and the smoke
 proof's witness pattern live. Within each extent the **first segment holds the superblock** — the
@@ -506,14 +519,21 @@ LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 **What the gate proves.** Every scenario whose management port is reachable — three of the six —
 boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
-three to **each other** as well as to the wire: the packet blocks in the two recordings pair 1:1 by
-`epb_packetid`, neither exceeds the record count the recorder publishes for that sink, every
-injected probe appears in the capture byte-identically, and no block carries bytes the harness never
-injected (`tools/xtask/src/surface_contract.rs`). A fault that hides inside any one surface shows up
-as a disagreement between two. The harness walks the downloaded bytes block by block *by the lengths
-the file states* — the discipline a reader actually depends on — and holds each to carrying at least
-as many packet blocks as frames the harness put across the appliance, and to no captured length past
-the sink's snap length. Afterwards it reads the two extents straight off the disk image and requires
+three to **each other** as well as to the wire (`tools/xtask/src/surface_contract.rs`): every record
+of the connection history pairs into the capture by `epb_packetid` and none of it names no event,
+neither recording exceeds the record count the recorder publishes for that sink, every injected probe
+appears in the capture byte-identically, and no block carries bytes the harness never injected. On top
+of that the decision each record carries is judged as bytes: every record carries the PEN-tagged
+annotation at the layout version this build writes; the verdict it states agrees with what the harness
+independently watched that probe do on the wire; a rule it names is one the exposition credits with a
+hit under the id the document gave it; a refusal it names is one the exposition counted at least as
+often; a close names a state a conversation does not leave and an earlier record opens the same
+conversation; and the lifecycle or policy event each probe had to cause is in the history, on the
+packet that caused it. A fault that hides inside any one surface shows up as a disagreement between
+two. The harness walks the downloaded bytes block by block *by the lengths the file states* — the
+discipline a reader actually depends on — and holds the capture to carrying at least as many packet
+blocks as frames the harness put across the appliance, the history to at least as many as the events
+its probes owe, and neither to a captured length past its sink's snap length. Afterwards it reads the two extents straight off the disk image and requires
 each to carry a decodable superblock and a walkable recording. Two paths to one artifact, neither of
 them the appliance's own account of itself.
 
@@ -542,13 +562,16 @@ and wall-clock times. An independent parse of the two files established:
 
 **Missing.**
 
-- **The tracker's lifecycle reaches no recording, so no connection logs — the sinks differ only in snap length.**
-  The log sink of the [recording design](../design/recording.md) records connection lifecycle and
-  policy decisions — an open, each refinement of protocol and application identity, notable events,
-  the close — each anchored to the packet that caused it. None of that exists. There are no
-  connection events, no flow identity, no application stack and no deny coalescing, so both
-  recordings hold every dataplane observation and one merely keeps less of each frame. The
-  annotation carries a version byte precisely so the record can grow when they land.
+- **The connection history exists; three of the design's event kinds do not.** The
+  [recording design](../design/recording.md)'s log sink records a conversation's open, each refinement
+  of its protocol and application identity, notable events on it, and its close, each anchored to the
+  causing packet. The open, the state advances, the close and both policy refusals are written, with
+  the flow identity as the (slot, generation) pair the design requires. What is absent is what has no
+  producer yet: **no protocol or application-identity refinement**, because nothing above L4 is
+  parsed; **no deny coalescing**, so a port scan costs one record per probe rather than a counted
+  per-bucket event; and **no periodic state event**, so a reader's reconstruction window grows with a
+  long-lived conversation's age instead of being bounded. The annotation carries a version byte
+  precisely so the record can grow when they land — it reads 2 today.
 - **No recording selector.** The capture sink of the [recording design](../design/recording.md)
   records the flows a selector picks out; this one records everything the dataplane decided on, which
   is development state rather than a shipping posture: a deployed node would record every packet
@@ -1391,8 +1414,9 @@ can be handed it either. The recorder is the mirror of that argument in the othe
 the only domain that reaches the block device — its ECAM page, BAR, DMA region and staging window
 are mapped by nothing else — and it maps no pool, no ring, no NIC region and no port, so the
 domain that owns the disk reaches no frame and the domains that move frames reach no medium. What
-crosses between them is a tap ring carrying annotations rather than packets, mirrored in perms so
-neither end can forge the other's half. The configuration domain's entire grant is six mappings —
+crosses between them is the tap ring, carrying the forwarder's own bounded copy of each frame it
+decided on and its decision about it — never a descriptor, a buffer index or any other way to reach
+a frame still in flight — mirrored in perms so neither end can forge the other's half. The configuration domain's entire grant is six mappings —
 `cfg` read-write, `cfgack` read-only, the calibration read-only, its own log ring's two halves and
 its counter shard — and the negative half is what matters: no device, no pool, no ring, so the
 domain that parses attacker-supplied XML cannot reach a frame or a NIC. The two handover regions

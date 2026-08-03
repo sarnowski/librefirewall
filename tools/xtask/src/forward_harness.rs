@@ -78,6 +78,7 @@
 //! question a failure raises.
 
 use std::{
+    collections::VecDeque,
     fmt, fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -122,6 +123,17 @@ const REINJECT_INTERVAL: Duration = Duration::from_millis(500);
 /// progress — it is the round trip a delivery would need, and the two
 /// deliveries already observed within one [`REINJECT_INTERVAL`] bound that.
 const SETTLE_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a run waits for the console to report the last frame the management
+/// port received before giving up on it.
+///
+/// The console's total is an equality and the appliance writes it on the drain
+/// that moved the frame, so the record can still be in the log ring when the
+/// exchange closes. Waiting on the *observable* removes that race; this bounds the
+/// wait, so a frame that really was lost is reported as the count verdict rather
+/// than as a timeout. Generous against a settle window of two seconds: a report
+/// that has not arrived by now is a report that is not coming.
+const MANAGEMENT_REPORT_GRACE: Duration = Duration::from_secs(10);
 
 /// Minimum Ethernet frame size on the wire without FCS.
 const MIN_ETHERNET_FRAME: usize = 60;
@@ -244,6 +256,17 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP_HEADER_LEN: usize = 8;
 
+/// How many management frames go onto the wire at once.
+///
+/// An eighth of the buffers the management pipeline holds. The bound is the
+/// pool's rather than a delay that happens to be long enough, and it is a small
+/// fraction of it rather than half because what has to have room is not the pool
+/// but the *receive descriptors the driver has posted at that instant*, which is
+/// as many as it has been able to refill since the last chunk. An eighth leaves
+/// that margin under any scheduling; the frames still go out exactly once each,
+/// and what is chunked is *when*, not *whether*.
+const MANAGEMENT_BURST: usize = pd_runtime::POOL_BUFFERS / 8;
+
 /// The lengths of the frames injected into the management port, and the whole of
 /// what the console's byte total is judged against.
 ///
@@ -293,6 +316,13 @@ struct TcpPacket {
     /// The eight flag bits as they sit in the header. A bare `ACK` is 0x10, which
     /// is the shape a segment from mid-conversation has.
     flags: u8,
+    /// Where in its own sequence space this segment sits. It decides nothing for
+    /// a segment on an unknown five-tuple — refused for its flags before any
+    /// window is consulted — and it decides everything for one on a flow the
+    /// appliance holds: a tracker admits a segment only inside the window its
+    /// peer authorised.
+    sequence: u32,
+    acknowledgement: u32,
     ttl: u8,
     payload: Vec<u8>,
 }
@@ -304,11 +334,8 @@ impl TcpPacket {
         let mut segment = Vec::with_capacity(TCP_HEADER_LEN + self.payload.len());
         segment.extend_from_slice(&self.source_port.to_be_bytes());
         segment.extend_from_slice(&self.destination_port.to_be_bytes());
-        // A plausible sequence and acknowledgement. Their values decide nothing
-        // here: an unknown five-tuple is refused for its *flags* before any
-        // window is consulted, which is the whole point of the probe.
-        segment.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-        segment.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        segment.extend_from_slice(&self.sequence.to_be_bytes());
+        segment.extend_from_slice(&self.acknowledgement.to_be_bytes());
         // Five words of header and no options.
         segment.push(5 << 4);
         segment.push(self.flags);
@@ -607,18 +634,50 @@ fn header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
 /// What must become of one injected packet.
 #[derive(Debug)]
 enum Expectation {
-    /// It must arrive at endpoint `to`, and be exactly `delivered`. `sent` is
-    /// the same packet as it went in, kept so the report can put the TTL the
-    /// appliance produced beside the one it was handed.
+    /// It must arrive at endpoint `to` as exactly `delivered` — the frame it went
+    /// in as, with exactly the three changes a hop makes.
+    ///
+    /// `datagram` holds the same two frames decoded, where the probe *is* a
+    /// datagram this harness models field by field: a delivery that departs from
+    /// the contract is then reported as the field it departs in rather than as an
+    /// offset. It is `None` for a probe built as raw bytes — a TCP segment, whose
+    /// fields this harness does not model — and such a delivery is judged and
+    /// reported as bytes. Byte equality is the contract either way; the decoded
+    /// view only decides how a failure reads.
     Routed {
         to: Endpoint,
-        sent: UdpPacket,
-        delivered: UdpPacket,
+        delivered: Vec<u8>,
+        datagram: Option<Datagrams>,
     },
     /// It must never arrive anywhere; `because` names the rule that forbids it,
     /// so a wrongly delivered packet says which one the guest broke — and the
     /// report says which one each refusal demonstrates.
     Dropped { because: &'static str },
+}
+
+/// One probe as it went in and as it must come out, decoded.
+#[derive(Debug)]
+struct Datagrams {
+    /// Kept so the report can put the TTL the appliance produced beside the one
+    /// it was handed.
+    sent: UdpPacket,
+    delivered: UdpPacket,
+}
+
+impl Expectation {
+    /// The endpoint this probe must reach, or `None` for one that must reach
+    /// none.
+    const fn destination(&self) -> Option<&Endpoint> {
+        match self {
+            Self::Routed { to, .. } => Some(to),
+            Self::Dropped { .. } => None,
+        }
+    }
+
+    /// Whether the appliance must put this probe on a wire.
+    const fn is_routed(&self) -> bool {
+        matches!(self, Self::Routed { .. })
+    }
 }
 
 /// One injected packet and the single thing it proves.
@@ -658,9 +717,32 @@ struct Probe {
     /// a statement about what was on the wire rather than about whichever frame
     /// QEMU happened to deliver first.
     deferred: bool,
+    /// Whether this probe is injected exactly once and never retransmitted.
+    ///
+    /// The one thing a probe whose *refusal* depends on a flow's state needs.
+    /// Retransmission is otherwise free — a refused probe is refused the same way
+    /// however often it arrives — but a segment that is out of a flow's window
+    /// while the flow is open is a segment for a flow that no longer exists once
+    /// it has closed, and the second refusal is a different one. A probe like that
+    /// goes out once, into the state its phase established, and its refusal is the
+    /// one that state produces — which means it waits, as a deferred probe does.
+    once: bool,
+    /// The lifecycle or policy event a record of this probe must carry, where it
+    /// must carry one. `None` for a probe the connection history is not about.
+    event: Option<u8>,
 }
 
 impl Probe {
+    /// Whether this probe may only go out once every *immediate* probe that must
+    /// be delivered has arrived.
+    ///
+    /// True for a deferred probe and for a `once` probe alike: both are about a
+    /// flow another probe opened, and injecting either alongside the opening
+    /// would race it into a refusal about no flow at all.
+    const fn waits(&self) -> bool {
+        self.deferred || self.once
+    }
+
     /// Judge one frame that carried this probe's marker back to the harness.
     ///
     /// # Errors
@@ -670,14 +752,18 @@ impl Probe {
     /// failed to decrement, or corrupted the payload.
     fn judge(&self, egress: usize, frame: &[u8]) -> Result<Delivery, String> {
         let name = self.name;
-        let (expected_egress, expected) = match &self.expectation {
+        let (expected_egress, expected_bytes, datagram) = match &self.expectation {
             Expectation::Dropped { because } => {
                 return Err(format!(
                     "probe {name} came back on port{egress}, but {because}, so the appliance \
                      must never put it on a wire"
                 ));
             }
-            Expectation::Routed { to, delivered, .. } => (to.port, delivered),
+            Expectation::Routed {
+                to,
+                delivered,
+                datagram,
+            } => (to.port, delivered, datagram.as_ref()),
         };
         if egress != expected_egress {
             return Err(format!(
@@ -685,6 +771,25 @@ impl Probe {
                  port{expected_egress}"
             ));
         }
+        // A probe this harness does not model field by field: byte equality is the
+        // whole contract, and a difference is reported as the offset it falls at.
+        let Some(Datagrams {
+            delivered: expected,
+            ..
+        }) = datagram
+        else {
+            if frame != expected_bytes.as_slice() {
+                return Err(format!(
+                    "probe {name}: the frame delivered on port{egress} is not the frame the \
+                     routed contract names: {}",
+                    byte_difference(expected_bytes, frame)
+                ));
+            }
+            return Ok(Delivery {
+                packet: None,
+                bytes: frame.len(),
+            });
+        };
 
         // Decoded before the whole-frame comparison rather than after it, so an
         // accepted delivery is described by fields read back off the wire; a
@@ -707,29 +812,29 @@ impl Probe {
                 fields.join("; ")
             ));
         }
-        let expected_bytes = expected.build();
-        if frame != expected_bytes {
+        if frame != expected_bytes.as_slice() {
             // Every field the contract is written in agrees, so what differs is
             // a byte the field view does not model — Ethernet padding, an IPv4
             // identification or flag the router must carry through untouched.
             return Err(format!(
                 "probe {name}: the frame delivered on port{egress} carries every field of the \
                  routed contract but differs outside them: {}",
-                byte_difference(&expected_bytes, frame)
+                byte_difference(expected_bytes, frame)
             ));
         }
         Ok(Delivery {
-            packet: observed,
+            packet: Some(observed),
             bytes: frame.len(),
         })
     }
 }
 
-/// One accepted delivery as it arrived: the frame's own fields, and its length
-/// on the wire including any padding the field view disclaims.
+/// One accepted delivery as it arrived: the frame's own fields where this harness
+/// models them, and its length on the wire including any padding the field view
+/// disclaims.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Delivery {
-    packet: UdpPacket,
+    packet: Option<UdpPacket>,
     bytes: usize,
 }
 
@@ -790,21 +895,18 @@ impl TrafficReport {
             .zip(deliveries)
             .enumerate()
             .map(|(index, (probe, delivery))| {
-                let routed = match &probe.expectation {
-                    Expectation::Routed { to, sent, .. } => Some((to, sent)),
-                    Expectation::Dropped { .. } => None,
-                };
-                let path = match routed {
-                    Some((to, _)) => format!("{}->{}", probe.from.name(), to.name()),
+                let path = match probe.expectation.destination() {
+                    Some(to) => format!("{}->{}", probe.from.name(), to.name()),
                     // Nothing left the appliance, so naming a far end would
                     // claim a journey the packet never made.
                     None => format!("{}->.", probe.from.name()),
                 };
                 let (seen, detail) = match (broke == Some(index), delivery, &probe.expectation) {
                     (true, _, _) => (Seen::Broke, "see the verdict below".to_owned()),
-                    (false, Some(delivery), Expectation::Routed { sent, .. }) => {
-                        (Seen::Delivered, describe(delivery, sent.ttl))
-                    }
+                    (false, Some(delivery), Expectation::Routed { datagram, .. }) => (
+                        Seen::Delivered,
+                        describe(delivery, datagram.as_ref().map(|both| both.sent.ttl)),
+                    ),
                     // A refused probe that arrived is the `broke` case above,
                     // so a delivery here can only belong to a routed probe.
                     (false, Some(delivery), Expectation::Dropped { because }) => (
@@ -896,8 +998,13 @@ impl TrafficReport {
 
 /// Render one delivery as the frame that arrived, beside the TTL it was handed.
 /// Every other number is the wire's own.
-fn describe(delivery: &Delivery, sent_ttl: u8) -> String {
-    let packet = &delivery.packet;
+///
+/// A probe this harness does not model field by field yields its length alone: a
+/// row that invented fields for it would report numbers nothing read.
+fn describe(delivery: &Delivery, sent_ttl: Option<u8>) -> String {
+    let (Some(packet), Some(sent_ttl)) = (&delivery.packet, sent_ttl) else {
+        return format!("{} bytes, byte-identical to the contract", delivery.bytes);
+    };
     format!(
         "{}:{} -> {}:{}  ttl {sent_ttl}->{}  mac {}->{}  {} bytes",
         ipv4(packet.source),
@@ -1093,6 +1200,8 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
             // discarded before a decision the tap could record.
             observed: false,
             deferred: false,
+            once: false,
+            event: None,
         },
     ])
 }
@@ -1117,6 +1226,15 @@ pub enum Traffic {
     /// by a rule, and denied by the fallthrough. Every one of them is perfectly
     /// routable, so the only thing that separates their fates is the policy.
     Policy,
+    /// The set a **connection lifecycle** needs: a TCP conversation that opens,
+    /// is refused a segment outside its window, and closes.
+    ///
+    /// It is TCP because only TCP has a close, and it needs a document whose
+    /// rules are not UDP-only — a TCP segment matches neither of the other two
+    /// documents' rules and falls to the default deny, which is correct and
+    /// leaves a lifecycle unreachable. What it produces that no other set can is
+    /// an open event and a close event that says *how* the conversation ended.
+    Lifecycle,
     /// The set only a *stateful* appliance can pass, and the one no rule of the
     /// shipped policy permits more than half of.
     ///
@@ -1193,6 +1311,12 @@ fn injected_probes(
         // falls past every rule, and nothing in this set is addressed to the port
         // the dropping rule names.
         Traffic::Stateful => (stateful_probes(topology, policy), false, true),
+        // Neither of the filter's refusals: every segment is addressed to the
+        // port the accepting rule names, and the one that is refused is refused
+        // by the tracker before the filter is consulted. So this set obliges both
+        // filter refusal counters to still read zero, which is as strong a
+        // statement as a rise.
+        Traffic::Lifecycle => (lifecycle_probes(topology, policy), false, false),
     };
     Ok((
         probes,
@@ -1259,18 +1383,21 @@ fn stateful_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
             a,
             reply(b"LFW-PROBE/stateful-reply", SOURCE_PORT),
         ),
-        dropped(
-            "stateful-unsolicited",
-            b"LFW-PROBE/stateful-unsolicited",
-            b,
-            "it is the reply direction with no request in front of it, so it opens a flow no rule \
-             permits and falls to the default deny",
-            reply(
+        refused_by_policy(
+            recording_contract::EVENT_POLICY_NO_MATCH,
+            dropped(
+                "stateful-unsolicited",
                 b"LFW-PROBE/stateful-unsolicited",
-                SOURCE_PORT.saturating_add(1),
+                b,
+                "it is the reply direction with no request in front of it, so it opens a flow no \
+                 rule permits and falls to the default deny",
+                reply(
+                    b"LFW-PROBE/stateful-unsolicited",
+                    SOURCE_PORT.saturating_add(1),
+                ),
             ),
         ),
-        dropped_frame(
+        refused_by_tracker(dropped_frame(
             "stateful-mid-stream",
             b"LFW-PROBE/stateful-mid-stream",
             a,
@@ -1284,13 +1411,114 @@ fn stateful_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
                 source_port: SOURCE_PORT,
                 destination_port: permitted,
                 // A bare `ACK`: the shape of a segment from the middle of a
-                // conversation.
+                // conversation. The two sequence numbers decide nothing — a
+                // segment on an unknown five-tuple is refused for its flags
+                // before any window is consulted.
                 flags: 0x10,
+                sequence: 0x0001_0000,
+                acknowledgement: 0x0002_0000,
                 ttl: INJECTED_TTL,
                 payload: b"LFW-PROBE/stateful-mid-stream".to_vec(),
             }
             .build(),
+        )),
+    ]
+}
+
+/// A TCP conversation that opens, is refused a segment outside its window, and
+/// closes — the whole of a connection lifecycle in three frames.
+///
+/// **The close is a reset, and that is the shortest honest one.** A graceful close
+/// needs four more segments and every one of them a sequence number this harness
+/// would have to keep in step with the appliance's own window arithmetic; a reset
+/// is admissible from the state a `SYN` leaves and moves the flow straight to the
+/// state a conversation does not leave. So the recording carries an open and a
+/// close, and the close names *how* — which is what a reader asks of a connection
+/// history.
+///
+/// **The refusal is between them, and goes out once.** A segment a million bytes
+/// past anything the peer authorised is outside the window of a flow that is open;
+/// once the reset has closed the flow, the same segment is one no state admits at
+/// all, which is a different refusal. So it is injected exactly once, into the
+/// state the opening established, and its reason is the one that state produces.
+///
+/// Both segments carry the accepting rule's destination port, so the difference
+/// between the reset's fate and the out-of-window segment's is the connection
+/// table and nothing else. The port comes from `policy` rather than from a
+/// literal, so a document that renamed its ports is asserted against its own text.
+fn lifecycle_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let permitted = policy.accepted.destination_port;
+    /// The sequence space the conversation opens on. Its value decides nothing;
+    /// what matters is that the two segments below are stated against it.
+    const CLIENT_ISN: u32 = 0x0051_0000;
+    /// How far past the window the refused segment sits — far beyond the 65535
+    /// bytes a `SYN` can advertise, so no window this exchange establishes
+    /// reaches it.
+    const PAST_THE_WINDOW: u32 = 1_000_000;
+    let segment = |flags: u8, sequence: u32, marker: &[u8]| {
+        TcpPacket {
+            destination_mac: a.gateway_mac,
+            source_mac: a.mac,
+            source: a.address,
+            destination: b.address,
+            source_port: SOURCE_PORT,
+            destination_port: permitted,
+            flags,
+            sequence,
+            // Neither segment carries an `ACK` flag, so the field is read by
+            // nothing and is left at zero rather than given a plausible value
+            // nothing would check.
+            acknowledgement: 0,
+            ttl: INJECTED_TTL,
+            payload: marker.to_vec(),
+        }
+        .build()
+    };
+    vec![
+        // `SYN`, which is the only thing that opens a TCP flow here.
+        routed_frame(
+            "lifecycle-open",
+            b"LFW-PROBE/lifecycle-open",
+            a,
+            b,
+            recording_contract::EVENT_FLOW_OPENED,
+            segment(0x02, CLIENT_ISN, b"LFW-PROBE/lifecycle-open"),
         ),
+        // `RST` well past the window the `SYN` opened. Refused, so it moves no
+        // state, refreshes no timeout and closes nothing.
+        only_once(refused_by_tracker(dropped_frame(
+            "lifecycle-out-of-window",
+            b"LFW-PROBE/lifecycle-out-of-window",
+            a,
+            "its sequence number is a million bytes past anything the peer authorised, so the \
+             tracker refuses it rather than letting it move the flow",
+            segment(
+                0x04,
+                CLIENT_ISN.wrapping_add(PAST_THE_WINDOW),
+                b"LFW-PROBE/lifecycle-out-of-window",
+            ),
+        ))),
+        // `RST` inside the window, which ends the conversation. Deferred, so the
+        // flow it closes is one the opening above has been observed to create.
+        Probe {
+            deferred: true,
+            event: Some(recording_contract::EVENT_FLOW_CLOSED),
+            ..routed_frame(
+                "lifecycle-close",
+                b"LFW-PROBE/lifecycle-close",
+                a,
+                b,
+                recording_contract::EVENT_FLOW_CLOSED,
+                // One past the `SYN`, which occupies a byte of sequence space of
+                // its own: the reset is the next thing this side sends.
+                segment(
+                    0x04,
+                    CLIENT_ISN.wrapping_add(1),
+                    b"LFW-PROBE/lifecycle-close",
+                ),
+            )
+        },
     ]
 }
 
@@ -1320,19 +1548,25 @@ fn policy_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
                 b"LFW-PROBE/policy-accepted",
             ),
         ),
-        dropped(
-            "policy-denied",
-            b"LFW-PROBE/policy-denied",
-            a,
-            "a rule matched it and says drop; it is routable in every other respect",
-            to_port(policy.denied.destination_port, b"LFW-PROBE/policy-denied"),
+        refused_by_policy(
+            recording_contract::EVENT_POLICY_DENIED,
+            dropped(
+                "policy-denied",
+                b"LFW-PROBE/policy-denied",
+                a,
+                "a rule matched it and says drop; it is routable in every other respect",
+                to_port(policy.denied.destination_port, b"LFW-PROBE/policy-denied"),
+            ),
         ),
-        dropped(
-            "policy-unmatched",
-            b"LFW-PROBE/policy-unmatched",
-            a,
-            "no rule is about it, so it falls past the last one to the default deny",
-            to_port(policy.unmatched, b"LFW-PROBE/policy-unmatched"),
+        refused_by_policy(
+            recording_contract::EVENT_POLICY_NO_MATCH,
+            dropped(
+                "policy-unmatched",
+                b"LFW-PROBE/policy-unmatched",
+                a,
+                "no rule is about it, so it falls past the last one to the default deny",
+                to_port(policy.unmatched, b"LFW-PROBE/policy-unmatched"),
+            ),
         ),
     ]
 }
@@ -1377,17 +1611,27 @@ fn routed(
         frame: sent.build(),
         expectation: Expectation::Routed {
             to,
-            sent,
-            delivered,
+            delivered: delivered.build(),
+            datagram: Some(Datagrams { sent, delivered }),
         },
         // Built from a [`UdpPacket`], so the router parses it and reaches a
         // decision on it — which is what the tap records.
         observed: true,
         deferred: false,
+        once: false,
+        // A datagram to a port a rule accepts opens a conversation, and the
+        // record of that is the open event. A re-injected one is a
+        // retransmission that moves nothing, so it carries no event and the
+        // contract is stated as "at least one record of this probe names an
+        // opening" rather than as a count.
+        event: Some(recording_contract::EVENT_FLOW_OPENED),
     }
 }
 
 /// A routed probe that may only go out once the immediate ones have arrived.
+///
+/// A probe that has to wait is one whose flow another probe opened, so what its
+/// record names is an *advance* of that conversation and never an opening.
 fn routed_after(
     name: &'static str,
     marker: &'static [u8],
@@ -1397,7 +1641,94 @@ fn routed_after(
 ) -> Probe {
     Probe {
         deferred: true,
+        event: Some(recording_contract::EVENT_FLOW_ADVANCED),
         ..routed(name, marker, from, to, sent)
+    }
+}
+
+/// A probe the appliance must forward, carrying a frame this harness built itself
+/// rather than a [`UdpPacket`].
+///
+/// The delivery is derived from the injection by applying exactly the three
+/// changes a hop makes — the far endpoint's MAC, the far interface's MAC, and one
+/// less TTL, with the IPv4 header checksum recomputed over the result. Derived
+/// rather than written out for [`routed`]'s reason: "every other byte unchanged"
+/// stays the default the contract has to break.
+fn routed_frame(
+    name: &'static str,
+    marker: &'static [u8],
+    from: Endpoint,
+    to: Endpoint,
+    event: u8,
+    frame: Vec<u8>,
+) -> Probe {
+    let delivered = hopped(&frame, to);
+    Probe {
+        name,
+        marker,
+        from,
+        frame,
+        expectation: Expectation::Routed {
+            to,
+            delivered,
+            // Not a datagram this harness models, so its delivery is judged and
+            // reported as bytes.
+            datagram: None,
+        },
+        observed: true,
+        deferred: false,
+        once: false,
+        event: Some(event),
+    }
+}
+
+/// The frame the appliance must put on the wire for `frame`, routed towards `to`.
+///
+/// Written against the offsets rather than through a decoder, because the point
+/// is to change *only* what a hop changes: a decoder would rebuild the frame and
+/// silently normalise whatever it did not model.
+fn hopped(frame: &[u8], to: Endpoint) -> Vec<u8> {
+    let mut out = frame.to_vec();
+    if let Some(target) = out.get_mut(..MAC_PAIR_LEN) {
+        target[..6].copy_from_slice(&to.mac);
+        target[6..].copy_from_slice(&to.gateway_mac);
+    }
+    let at = ETHERNET_HEADER_LEN;
+    if let Some(header) = out
+        .get_mut(at..at.saturating_add(IPV4_HEADER_LEN))
+        .and_then(|slice| <&mut [u8; IPV4_HEADER_LEN]>::try_from(slice).ok())
+    {
+        header[8] = header[8].saturating_sub(1);
+        header[10..12].copy_from_slice(&[0, 0]);
+        let checksum = header_checksum(header);
+        header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    }
+    out
+}
+
+/// A probe whose refusal the **filter** reached, under whichever of its two
+/// outcomes `event` names.
+fn refused_by_policy(event: u8, probe: Probe) -> Probe {
+    Probe {
+        event: Some(event),
+        ..probe
+    }
+}
+
+/// A probe the **tracker** refused, so it never reached the filter at all and the
+/// record names the refusal rather than a policy decision.
+fn refused_by_tracker(probe: Probe) -> Probe {
+    Probe {
+        event: Some(recording_contract::EVENT_FLOW_REFUSED),
+        ..probe
+    }
+}
+
+/// A probe injected exactly once, into the flow state its phase established.
+fn only_once(probe: Probe) -> Probe {
+    Probe {
+        once: true,
+        ..probe
     }
 }
 
@@ -1419,6 +1750,10 @@ fn dropped(
         // probe built from a [`UdpPacket`] parses.
         observed: true,
         deferred: false,
+        once: false,
+        // Which of the refusals it is depends on which stage refused it, so a
+        // caller that knows says so; the default claims nothing.
+        event: None,
     }
 }
 
@@ -1441,6 +1776,8 @@ fn dropped_frame(
         // decision on it and the tap records that decision with its reason.
         observed: true,
         deferred: false,
+        once: false,
+        event: None,
     }
 }
 
@@ -3167,8 +3504,17 @@ fn run_boot(
         // Whether the deferred probes have gone out yet. They are what a stateful
         // contract needs and a stateless one has none of, so on every other
         // scenario this is true from the start and the arm below never fires.
-        let mut deferred_injected = !probes.iter().any(|probe| probe.deferred);
-        inject_probes(&mut endpoints, &probes, |probe| !probe.deferred);
+        let mut deferred_injected = !probes.iter().any(Probe::waits);
+        // The refusal probes go out once, and the branch that sends them now runs
+        // on several passes while the management burst is chunked out.
+        let mut refusals_injected = false;
+        // How many of the management frames have gone out.
+        let mut management_sent = 0usize;
+        // What the harness's own TCP client owes the management port, waiting for
+        // the port to have acknowledged everything ahead of it.
+        let mut client_pending: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut last_management_inject = Instant::now();
+        inject_probes(&mut endpoints, &probes, |probe| !probe.waits());
 
         // Phase 2: watch both ports and the serial channel, re-injecting
         // periodically, until the contract is decided.
@@ -3228,8 +3574,17 @@ fn run_boot(
                                         if let Some(next) =
                                             management_probe.advance(&mut management.client)
                                         {
-                                            management.inject(&next);
-                                            injected = management.injected;
+                                            // Queued, not injected. The appliance
+                                            // can answer several segments in a row
+                                            // and this client acknowledges each as
+                                            // it reads it, so injecting inline puts
+                                            // frames on the wire back to back —
+                                            // faster than the port's driver refills
+                                            // receive buffers, and a frame with none
+                                            // posted is lost. The queue is drained
+                                            // one frame at a time against what the
+                                            // console says arrived.
+                                            client_pending.push_back(next);
                                         }
                                         if management.client.step == TcpStep::Closed {
                                             answered
@@ -3328,29 +3683,62 @@ fn run_boot(
                     // side. Before the refusals below, so the settle window still
                     // starts after everything has been injected.
                     None if !deferred_injected
-                        && all_routed_among(&probes, &deliveries, |probe| !probe.deferred) =>
+                        && all_routed_among(&probes, &deliveries, |probe| !probe.waits()) =>
                     {
                         deferred_injected = true;
                         last_injection = Instant::now();
-                        inject_probes(&mut endpoints, &probes, |probe| probe.deferred);
+                        inject_probes(&mut endpoints, &probes, Probe::waits);
                     }
                     None if all_routed(&probes, &deliveries)
                         && management_contract::ports_are_ready(&output) =>
                     {
-                        inject_probes(&mut endpoints, &probes, |probe| {
-                            matches!(probe.expectation, Expectation::Dropped { .. })
-                        });
-                        // Once, and never retransmitted: a retransmission is a
-                        // second frame, and both halves of this contract are
-                        // equalities — the console's count, and one reply per
-                        // request.
-                        if let Some(management) = management.as_mut() {
-                            for frame in &management_probe.frames {
-                                management.inject(frame);
-                            }
-                            injected = management.injected;
+                        if !refusals_injected {
+                            refusals_injected = true;
+                            inject_probes(&mut endpoints, &probes, |probe| {
+                                !probe.once && !probe.expectation.is_routed()
+                            });
                         }
-                        settling_since = Some(Instant::now());
+                        // Each frame goes out **once** and is never retransmitted:
+                        // a retransmission is a second frame, and both halves of
+                        // this contract are equalities — the console's count, and
+                        // one reply per request.
+                        //
+                        // But they do not all go out at once, and the reason is
+                        // structural rather than a tuning choice. A frame put on a
+                        // wire with no receive buffer posted for it is lost, and
+                        // the whole management pipeline holds [`POOL_BUFFERS`]
+                        // buffers — so a burst larger than that can only be
+                        // received if the guest recycles buffers faster than QEMU
+                        // delivers, which is a race an *exact* count cannot be
+                        // stated against. So the burst is cut into chunks the
+                        // pipeline provably holds, and each waits for the console
+                        // to report every frame ahead of it received.
+                        let owed = management_probe.frames.len();
+                        if let Some(wire) = management.as_mut()
+                            && management_sent < owed
+                        {
+                            let acknowledged = management_contract::frames_reported(&output);
+                            if acknowledged >= management_sent as u64 {
+                                last_injection = Instant::now();
+                                let end =
+                                    management_sent.saturating_add(MANAGEMENT_BURST).min(owed);
+                                for frame in management_probe
+                                    .frames
+                                    .get(management_sent..end)
+                                    .unwrap_or_default()
+                                {
+                                    wire.inject(frame);
+                                }
+                                management_sent = end;
+                                injected = wire.injected;
+                                last_management_inject = Instant::now();
+                            }
+                        } else {
+                            // Every chunk is out — or there is no management wire
+                            // to put one on — so the dataplane is quiet and the
+                            // settle window may start.
+                            settling_since = Some(Instant::now());
+                        }
                     }
                     // The window is what a refusal needs to have come back in;
                     // the replies are what the management port owes. A run that
@@ -3369,12 +3757,28 @@ fn run_boot(
                         if let Some(wire) = management.as_mut()
                             && let Some(syn) = management_probe.advance(&mut wire.client)
                         {
-                            wire.inject(&syn);
+                            client_pending.push_back(syn);
                         }
                     }
+                    // Everything the port owes has arrived, and the console has
+                    // caught up with what was put on the wire.
+                    //
+                    // The second half is what the settle window alone cannot give.
+                    // The console's total is an **equality**, and the appliance
+                    // reports it on the drain that moved the frame — so a run that
+                    // stopped the instant the exchange closed could kill QEMU with
+                    // the last record still in the log ring or the UART, and read a
+                    // total one frame short of a port that received every one. So
+                    // the wait is on the observable rather than on a duration, and
+                    // [`MANAGEMENT_REPORT_GRACE`] bounds it: past that the run ends
+                    // anyway, so a frame that was *genuinely* lost is reported as
+                    // the count it is rather than as a timeout that says nothing.
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
-                            && management.as_ref().is_some_and(ManagementWire::answered) =>
+                            && management.as_ref().is_some_and(ManagementWire::answered)
+                            && (management_contract::frames_reported(&output)
+                                >= injected.frames as u64
+                                || since.elapsed() >= MANAGEMENT_REPORT_GRACE) =>
                     {
                         break 'run Ok(());
                     }
@@ -3504,10 +3908,28 @@ fn run_boot(
                     ),
                 });
             }
+            // One queued client frame per pass, and only once the port has
+            // reported every frame ahead of it — the burst gate applied to the
+            // exchange, so no two frames are ever in flight to a driver that may
+            // not have refilled. [`MANAGEMENT_REPORT_GRACE`] bounds the wait for
+            // the same reason it bounds the one at the end of the run: a frame
+            // that really was lost must be reported as the count it is rather
+            // than as a queue that never drains.
+            if let Some(wire) = management.as_mut()
+                && let Some(next) = client_pending.front()
+                && (management_contract::frames_reported(&output) >= injected.frames as u64
+                    || last_management_inject.elapsed() >= MANAGEMENT_REPORT_GRACE)
+            {
+                wire.inject(next);
+                injected = wire.injected;
+                last_management_inject = Instant::now();
+                client_pending.pop_front();
+            }
             if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 inject_probes(&mut endpoints, &probes, |probe| {
-                    (deferred_injected || !probe.deferred)
+                    !probe.once
+                        && (deferred_injected || !probe.waits())
                         && !is_delivered(&probes, &deliveries, probe)
                 });
             }
@@ -3579,6 +4001,14 @@ fn run_boot(
                 name: probe.name,
                 frame: probe.frame.clone(),
                 observed: probe.observed,
+                // What the harness watched happen on the wire, turned into the
+                // verdict a record of this probe must state.
+                verdict: if probe.expectation.is_routed() {
+                    recording_contract::VERDICT_FORWARDED
+                } else {
+                    recording_contract::VERDICT_DROPPED
+                },
+                event: probe.event,
             })
             .collect(),
     })
@@ -3602,9 +4032,7 @@ fn all_routed_among(
     probes
         .iter()
         .zip(deliveries)
-        .filter(|(probe, _)| {
-            matches!(probe.expectation, Expectation::Routed { .. }) && admits(probe)
-        })
+        .filter(|(probe, _)| probe.expectation.is_routed() && admits(probe))
         .all(|(_, seen)| seen.is_some())
 }
 
@@ -3623,7 +4051,7 @@ fn describe_pending(probes: &[Probe], deliveries: &[Option<Delivery>]) -> String
     let mut arrived = Vec::new();
     let mut missing = Vec::new();
     for (probe, seen) in probes.iter().zip(deliveries) {
-        if !matches!(probe.expectation, Expectation::Routed { .. }) {
+        if !probe.expectation.is_routed() {
             continue;
         }
         if seen.is_some() {
@@ -4078,6 +4506,128 @@ mod tests {
             witness.policy,
             topology.port_policy().expect("the shipped policy")
         );
+
+        let (lifecycle, witness) =
+            injected_probes(&topology, Traffic::Lifecycle).expect("the shipped bench");
+        assert_eq!(lifecycle.len(), 3);
+        // Neither of the filter's refusals: every segment carries the accepting
+        // rule's port, and the one that is refused is refused by the tracker
+        // before the filter is consulted.
+        assert!(!witness.probed_the_denying_rule);
+        assert!(!witness.probed_the_fallthrough);
+    }
+
+    /// **The lifecycle set, as the events it obliges.** Three segments, one
+    /// conversation: an opening, a refusal that must not move it, and a close.
+    ///
+    /// Every claim here is what the recording contract then holds the appliance
+    /// to, so a probe set that stopped obliging an event would weaken that
+    /// contract silently rather than fail here.
+    #[test]
+    fn the_lifecycle_set_obliges_an_open_a_refusal_and_a_close() {
+        let topology = bench();
+        let policy = topology.port_policy().expect("the shipped policy");
+        let probes = lifecycle_probes(&topology, policy);
+        let named = |name: &str| {
+            probes
+                .iter()
+                .find(|probe| probe.name == name)
+                .unwrap_or_else(|| panic!("the set names {name}"))
+        };
+
+        let open = named("lifecycle-open");
+        assert_eq!(open.event, Some(recording_contract::EVENT_FLOW_OPENED));
+        assert!(open.expectation.is_routed(), "an opening is forwarded");
+        assert!(!open.deferred, "nothing precedes the opening");
+
+        let refused = named("lifecycle-out-of-window");
+        assert_eq!(refused.event, Some(recording_contract::EVENT_FLOW_REFUSED));
+        assert!(!refused.expectation.is_routed());
+        assert!(
+            refused.once,
+            "a segment outside an open flow's window is a different refusal once the flow has \
+             closed, so it goes out once"
+        );
+
+        let close = named("lifecycle-close");
+        assert_eq!(close.event, Some(recording_contract::EVENT_FLOW_CLOSED));
+        assert!(close.expectation.is_routed(), "a reset is forwarded");
+        assert!(
+            close.deferred,
+            "a close must follow the opening it closes onto the wire"
+        );
+
+        // All three are the same five-tuple, so they are one conversation: the
+        // difference between their fates is the connection table and nothing else.
+        for probe in &probes {
+            let segment = &probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..];
+            assert_eq!(
+                u16::from_be_bytes([segment[2], segment[3]]),
+                policy.accepted.destination_port,
+                "probe {} does not carry the accepting rule's port",
+                probe.name
+            );
+        }
+        // And the refused segment is the one whose sequence number is outside
+        // anything the opening could have authorised.
+        let sequence = |probe: &Probe| {
+            let segment = &probe.frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..];
+            u32::from_be_bytes([segment[4], segment[5], segment[6], segment[7]])
+        };
+        assert!(sequence(refused) > sequence(open).wrapping_add(u32::from(u16::MAX)));
+        assert_eq!(sequence(close), sequence(open).wrapping_add(1));
+    }
+
+    /// A frame this harness does not model field by field is still judged as
+    /// bytes, and the hop it must have taken is derived from the injection.
+    #[test]
+    fn a_routed_frame_is_judged_against_the_hop_it_must_have_taken() {
+        let topology = bench();
+        let [a, b] = topology.endpoints();
+        let probe = &lifecycle_probes(&topology, topology.port_policy().expect("a policy"))[0];
+        let Expectation::Routed {
+            delivered,
+            datagram,
+            ..
+        } = &probe.expectation
+        else {
+            panic!("the opening must be routed");
+        };
+        assert!(
+            datagram.is_none(),
+            "a TCP segment is not a datagram this harness models"
+        );
+        // Exactly the three changes a hop makes, and nothing else.
+        assert_eq!(delivered.len(), probe.frame.len());
+        assert_eq!(&delivered[..6], &b.mac);
+        assert_eq!(&delivered[6..12], &b.gateway_mac);
+        let at = ETHERNET_HEADER_LEN;
+        assert_eq!(delivered[at + 8], probe.frame[at + 8] - 1, "the TTL");
+        assert_eq!(
+            &delivered[at + 12..at + 20],
+            &probe.frame[at + 12..at + 20],
+            "the addresses are untouched"
+        );
+        assert_eq!(
+            &delivered[at + IPV4_HEADER_LEN..],
+            &probe.frame[at + IPV4_HEADER_LEN..],
+            "and so is everything behind the IPv4 header"
+        );
+        // The delivery the matcher accepts is the one the contract names.
+        assert_eq!(probe.from, a);
+        probe
+            .judge(b.port, delivered)
+            .expect("the frame a hop produces is the one the matcher accepts");
+        // And one byte off it is not.
+        let mut spoiled = delivered.clone();
+        spoiled[at + IPV4_HEADER_LEN + 4] ^= 0xff;
+        let error = probe
+            .judge(b.port, &spoiled)
+            .expect_err("a changed sequence number is not the frame a hop produces");
+        assert!(
+            error.contains("is not the frame the routed contract names"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4529,7 +5079,7 @@ mod tests {
             panic!("probe {} is not one that routes", probe.name);
         };
         probe
-            .judge(to.port, &delivered.build())
+            .judge(to.port, delivered)
             .expect("the delivery a route produces is the one the matcher accepts")
     }
 

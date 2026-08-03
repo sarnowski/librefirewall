@@ -1457,9 +1457,159 @@ impl Bench {
         )
     }
 
+    /// The same, keeping the facts the chain attached rather than the verdict
+    /// alone — which is what an observer outside the chain reads.
+    fn decide(&mut self, rules: &Ruleset, spec: &FrameSpec, ingress: PortId) -> Decided {
+        self.nanos += 1_000;
+        let mut bytes = spec.build();
+        let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
+        let mut inspection = Inspection::new(ingress, frame);
+        let verdict = self.pipeline.evaluate(
+            &mut inspection,
+            &Configuration::new(GENERATION, &self.table, rules),
+            &mut Tracking::new(&mut self.flows, at(self.nanos)),
+        );
+        Decided {
+            verdict,
+            flow: inspection.flow(),
+            refusal: inspection.refusal(),
+            matched: inspection.matched(),
+        }
+    }
+
     fn counters(&self) -> &lfw_flow::FlowCounters {
         self.flows.counters()
     }
+}
+
+/// What one evaluation left behind.
+#[derive(Debug)]
+struct Decided {
+    verdict: Verdict,
+    flow: Option<FlowObservation>,
+    refusal: Option<lfw_flow::RefusalKind>,
+    matched: Option<usize>,
+}
+
+/// **An evaluation says why, not only what.** A [`Verdict`] cannot carry which
+/// conversation a frame belonged to, what the packet did to it, or which rule
+/// decided it, and those three are the whole of what makes a recording a
+/// connection history rather than a second copy of the traffic.
+///
+/// One request and its reply, which is the smallest exchange that reaches two
+/// different transitions and shows the rule appearing on exactly one of them.
+#[test]
+fn an_evaluation_leaves_the_flow_the_transition_and_the_rule_behind_it() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+
+    let opening = bench.decide(&rules, &request(5000), PORT0);
+    assert_eq!(opening.verdict, forwarded());
+    let flow = opening.flow.expect("the request opened a conversation");
+    assert_eq!(flow.classification, Classification::New);
+    assert_eq!(flow.state, FlowState::UdpUnreplied);
+    assert_eq!(flow.transition, FlowTransition::Opened);
+    assert_eq!(opening.refusal, None);
+    // The filter is consulted on the packet that opens a conversation, and this
+    // is the rule it matched.
+    assert_eq!(opening.matched, Some(0));
+
+    let answered = bench.decide(&rules, &reply(5000), PORT1);
+    assert_eq!(answered.verdict, forwarded_back());
+    let advanced = answered
+        .flow
+        .expect("the reply belongs to the conversation");
+    assert_eq!(advanced.id, flow.id, "the same conversation, by identity");
+    assert_eq!(advanced.classification, Classification::Established);
+    assert_eq!(advanced.state, FlowState::UdpAssured);
+    assert_eq!(advanced.transition, FlowTransition::Advanced);
+    // And no rule: the tracker settled it in front of the filter.
+    assert_eq!(answered.matched, None);
+
+    // A second reply moves nothing, which is the transition that keeps a
+    // connection history from becoming a packet log.
+    let again = bench.decide(&rules, &reply(5000), PORT1);
+    assert_eq!(
+        again.flow.map(|flow| flow.transition),
+        Some(FlowTransition::Held)
+    );
+    assert_eq!(again.matched, None);
+}
+
+/// A tracker refusal and a routing refusal both leave no conversation, and the
+/// refusal is what tells them apart — which is what an observer needs, the two
+/// being different things to go and do.
+#[test]
+fn a_tracker_refusal_is_distinguishable_from_a_routing_refusal() {
+    let rules = allow_all();
+    let mut bench = Bench::new();
+
+    // A protocol the tracker holds no state for: refused before the filter, so
+    // there is no conversation to name.
+    let unsupported = bench.decide(
+        &rules,
+        &FrameSpec::carrying(TransportSpec::Unparsed(Protocol(89))),
+        PORT0,
+    );
+    assert_eq!(
+        unsupported.verdict,
+        Verdict::Drop(DropReason::FlowUnsupportedProtocol)
+    );
+    assert_eq!(unsupported.flow, None);
+    assert_eq!(
+        unsupported.refusal,
+        Some(lfw_flow::RefusalKind::UnsupportedProtocol)
+    );
+
+    let expiring = bench.decide(
+        &rules,
+        &FrameSpec {
+            ttl: 1,
+            ..request(5000)
+        },
+        PORT0,
+    );
+    assert_eq!(expiring.verdict, Verdict::Drop(DropReason::TtlExpired));
+    assert_eq!(expiring.flow, None);
+    assert_eq!(
+        expiring.refusal, None,
+        "the tracker was never reached, so it answered nothing"
+    );
+    assert_eq!(expiring.matched, None);
+}
+
+/// A denied opening still names the conversation it opened and the rule that
+/// denied it, although the flow has been withdrawn — so a reader sees the slot
+/// was given back rather than held by traffic the policy refused.
+#[test]
+fn a_denied_opening_names_the_flow_it_withdrew_and_the_rule_that_denied_it() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Drop)
+    }]);
+    let mut bench = Bench::new();
+
+    let denied = bench.decide(&rules, &request(5000), PORT0);
+    assert_eq!(denied.verdict, Verdict::Drop(DropReason::PolicyDenied));
+    assert_eq!(
+        denied.flow.map(|flow| flow.transition),
+        Some(FlowTransition::Opened)
+    );
+    assert_eq!(denied.matched, Some(0));
+    assert_eq!(bench.counters().flows_withdrawn, 1);
+
+    // And the fallthrough, which names no rule at all.
+    let unmatched = bench.decide(&Ruleset::EMPTY, &request(5000), PORT0);
+    assert_eq!(unmatched.verdict, Verdict::Drop(DropReason::NoPolicyMatch));
+    assert_eq!(
+        unmatched.flow.map(|flow| flow.transition),
+        Some(FlowTransition::Opened)
+    );
+    assert_eq!(unmatched.matched, None);
+    assert_eq!(bench.counters().flows_withdrawn, 2);
 }
 
 /// A request from A to B on `destination_port`, and the reply B sends back to

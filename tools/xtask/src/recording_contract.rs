@@ -43,6 +43,80 @@ const OPTION_HEADER_LEN: usize = 4;
 const OPT_END_OF_OPT: u16 = 0;
 const IF_NAME: u16 = 2;
 const EPB_PACKETID: u16 = 5;
+const EPB_VERDICT: u16 = 7;
+
+/// The custom option the firewall annotation rides in: binary data, copyable.
+const CUSTOM_BINARY_COPYABLE: u16 = 2989;
+
+/// The Private Enterprise Number the annotation is tagged with. Nobody's, and
+/// restated here as a number for the reason every other constant in this module
+/// is: a harness that shared the encoder's constant could not tell a renamed
+/// constant from a correct file.
+const UNREGISTERED_PEN: u32 = 0xFFFF_FFFF;
+
+/// The layout version the annotation must declare. A reader keys on this rather
+/// than on the length it happens to see, so a file that grew a field without
+/// saying so is a finding here.
+pub const ANNOTATION_VERSION: u8 = 2;
+
+/// Bytes of annotation this layout version carries.
+pub const ANNOTATION_LEN: usize = 24;
+
+/// The verdict kind octet a firewall's own verdict travels under: none of the
+/// three registered kinds names one.
+pub const VERDICT_KIND: u8 = 0xFF;
+
+/// What the annotation's verdict octet says, and what `epb_verdict` says beside
+/// it.
+pub const VERDICT_FORWARDED: u8 = 0;
+pub const VERDICT_DROPPED: u8 = 1;
+
+/// The events an annotation may name, as the numbers the tap ABI encodes them
+/// as. A vocabulary, restated as numbers, on the block types' terms.
+pub const EVENT_FLOW_OPENED: u8 = 1;
+pub const EVENT_FLOW_ADVANCED: u8 = 2;
+pub const EVENT_FLOW_CLOSED: u8 = 3;
+pub const EVENT_POLICY_DENIED: u8 = 4;
+pub const EVENT_POLICY_NO_MATCH: u8 = 5;
+pub const EVENT_FLOW_REFUSED: u8 = 6;
+
+/// The classifications an annotation may name.
+pub const CLASSIFICATION_NEW: u8 = 1;
+pub const CLASSIFICATION_ESTABLISHED: u8 = 2;
+pub const CLASSIFICATION_RELATED: u8 = 3;
+
+/// A stable short name for a classification, on [`event_name`]'s terms.
+#[must_use]
+pub fn classification_name(classification: u8) -> &'static str {
+    match classification {
+        0 => "no flow",
+        CLASSIFICATION_NEW => "new",
+        CLASSIFICATION_ESTABLISHED => "established",
+        CLASSIFICATION_RELATED => "related",
+        _ => "a classification this walk does not know",
+    }
+}
+
+/// The two flow states a conversation does not leave, which are the two a close
+/// may name.
+pub const STATE_TIME_WAIT: u8 = 7;
+pub const STATE_CLOSED: u8 = 8;
+
+/// A stable short name for an event, so a verdict names what it saw rather than
+/// a number a reader has to look up.
+#[must_use]
+pub fn event_name(event: u8) -> &'static str {
+    match event {
+        0 => "no event",
+        EVENT_FLOW_OPENED => "flow-opened",
+        EVENT_FLOW_ADVANCED => "flow-advanced",
+        EVENT_FLOW_CLOSED => "flow-closed",
+        EVENT_POLICY_DENIED => "policy-denied",
+        EVENT_POLICY_NO_MATCH => "policy-no-match",
+        EVENT_FLOW_REFUSED => "flow-refused",
+        _ => "an event this walk does not know",
+    }
+}
 
 /// Where an Interface Description Block's options begin: type, total length,
 /// link type, a reserved half-word, and the snap length.
@@ -98,6 +172,108 @@ pub struct Interface {
     pub link_type: u16,
 }
 
+/// The firewall's own annotation, read back out of the PEN-tagged custom option
+/// at the offsets a reader outside the appliance navigates by.
+///
+/// Fields rather than the raw octets, because what the contract is stated over is
+/// *what the appliance decided*: a verdict, the flow it was about, what the
+/// packet did to that flow, and which rule reached the decision. The offsets are
+/// written out here and nowhere else in the harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Annotation {
+    pub version: u8,
+    pub verdict: u8,
+    /// Why the frame was not forwarded; zero on a forwarded one.
+    pub drop_reason: u8,
+    pub interface_id: u8,
+    pub direction: u8,
+    /// What the tracker made of the frame; zero where it named no flow.
+    pub classification: u8,
+    /// The lifecycle or policy event it caused; zero where it caused none.
+    pub event: u8,
+    /// Where the flow stood after it; zero where there is no flow.
+    pub flow_state: u8,
+    pub configuration_generation: u32,
+    pub flow_slot: u32,
+    pub flow_generation: u32,
+    /// One higher than the rule's position, so zero names *no rule matched*.
+    pub rule: u16,
+}
+
+impl Annotation {
+    /// The bytes of a custom option, read as this layout, or `None` where the
+    /// option is not one — too short, or a length this version does not carry.
+    fn read(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != ANNOTATION_LEN {
+            return None;
+        }
+        let octet = |at: usize| bytes.get(at).copied().unwrap_or(0);
+        let word = |at: usize| {
+            bytes
+                .get(at..)
+                .and_then(<[u8; 4]>::try_from_slice_prefix)
+                .map_or(0, u32::from_le_bytes)
+        };
+        Some(Self {
+            version: octet(0),
+            verdict: octet(1),
+            drop_reason: octet(2),
+            interface_id: octet(3),
+            direction: octet(4),
+            classification: octet(5),
+            event: octet(6),
+            flow_state: octet(7),
+            configuration_generation: word(8),
+            flow_slot: word(12),
+            flow_generation: word(16),
+            rule: bytes
+                .get(20..)
+                .and_then(<[u8; 2]>::try_from_slice_prefix)
+                .map_or(0, u16::from_le_bytes),
+        })
+    }
+
+    /// The flow's identity as a reader folds events by it: the pair, never the
+    /// bare slot.
+    #[must_use]
+    pub const fn identity(&self) -> (u32, u32) {
+        (self.flow_slot, self.flow_generation)
+    }
+
+    /// Whether the annotation names a flow at all.
+    #[must_use]
+    pub const fn names_a_flow(&self) -> bool {
+        self.classification != 0
+    }
+
+    /// The rule's position, or `None` where none matched.
+    #[must_use]
+    pub const fn rule_position(&self) -> Option<u16> {
+        match self.rule.checked_sub(1) {
+            Some(position) => Some(position),
+            None => None,
+        }
+    }
+}
+
+/// Taking a fixed-width prefix of a slice without an index, so a short option
+/// yields nothing rather than panicking on a length the file chose.
+trait TryFromSlicePrefix: Sized {
+    fn try_from_slice_prefix(bytes: &[u8]) -> Option<Self>;
+}
+
+impl TryFromSlicePrefix for [u8; 2] {
+    fn try_from_slice_prefix(bytes: &[u8]) -> Option<Self> {
+        bytes.first_chunk::<2>().copied()
+    }
+}
+
+impl TryFromSlicePrefix for [u8; 4] {
+    fn try_from_slice_prefix(bytes: &[u8]) -> Option<Self> {
+        bytes.first_chunk::<4>().copied()
+    }
+}
+
 /// One Enhanced Packet Block, read back into the fields the cross-surface
 /// contract is stated over.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +289,13 @@ pub struct Packet {
     pub original_len: u32,
     /// The bytes the block retained.
     pub captured: Vec<u8>,
+    /// The `epb_verdict` option's octets, or `None` where the block declares
+    /// none. The first is the kind and the rest are what that kind means.
+    pub verdict: Option<Vec<u8>>,
+    /// The firewall's own annotation, or `None` where the block carries no
+    /// custom option this walk recognises — which is itself a finding for
+    /// whoever asserts on it.
+    pub annotation: Option<Annotation>,
 }
 
 /// What one recording's bytes were found to be.
@@ -315,6 +498,16 @@ fn packet(block: &[u8]) -> Packet {
         packet_id: option(block, options_at, EPB_PACKETID).and_then(long),
         original_len: word(block, 24).unwrap_or(0),
         captured,
+        verdict: option(block, options_at, EPB_VERDICT).map(<[u8]>::to_vec),
+        // The PEN is the option's own first four octets and the annotation
+        // follows it. An option under another enterprise number is somebody
+        // else's and is read as absent rather than as this layout.
+        annotation: option(block, options_at, CUSTOM_BINARY_COPYABLE).and_then(|value| {
+            let (pen, rest) = value.split_at_checked(4)?;
+            (u32::from_le_bytes(*pen.first_chunk::<4>()?) == UNREGISTERED_PEN)
+                .then(|| Annotation::read(rest))
+                .flatten()
+        }),
     }
 }
 

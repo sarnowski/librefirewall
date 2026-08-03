@@ -167,6 +167,11 @@ pub(crate) struct Topology {
     /// against reads as the wrong number of rules rather than as a rule that
     /// quietly decides something else.
     rules: Vec<(RuleAction, PortRule)>,
+    /// Every rule's id in document order, which is the numbering the dataplane
+    /// identifies a rule by. Held separately from `rules` because that vector
+    /// drops the rules a port contract cannot be stated against, and a dropped
+    /// rule would shift every position behind it.
+    rule_ids: Vec<Identifier>,
 }
 
 impl Topology {
@@ -270,12 +275,14 @@ impl Topology {
         }
         let management = management_port(model)?;
         let rules = model.rules().filter_map(port_rule).collect();
+        let rule_ids = model.rules().map(|entry| entry.id).collect();
         match (claimed.try_into(), stations.try_into()) {
             (Ok(ports), Ok(endpoints)) => Ok(Self {
                 ports,
                 endpoints,
                 management,
                 rules,
+                rule_ids,
             }),
             // Unreachable by the loop above, which pushes exactly `PORTS` of
             // each; the conversion is fallible and this is what that costs.
@@ -344,6 +351,22 @@ impl Topology {
     ///
     /// # Errors
     /// [`TopologyError`] for a policy of any other shape.
+    /// Every rule the document declares, in document order.
+    ///
+    /// Order is the whole content: the dataplane identifies a rule by its
+    /// **position**, which is its precedence and the slot its hit counter
+    /// occupies, and a recording carries that position rather than the id an
+    /// operator wrote. This is what joins the two, so a rule named in an
+    /// annotation can be held to the counter published under its own id.
+    ///
+    /// Read from the document rather than from [`Self::port_policy`]'s pair,
+    /// which drops any rule that is about more than one UDP destination port and
+    /// so cannot be indexed by position.
+    #[must_use]
+    pub(crate) fn rule_ids(&self) -> &[Identifier] {
+        &self.rule_ids
+    }
+
     pub(crate) fn port_policy(&self) -> Result<PortPolicy, TopologyError> {
         let [(first_action, first), (second_action, second)] = self.rules.as_slice() else {
             return Err(TopologyError::PolicyIsNotTwoPortRules {

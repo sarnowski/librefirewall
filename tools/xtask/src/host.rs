@@ -198,12 +198,20 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // every stage of this gate green. It reads two Markdown files and two
     // in-process catalogues, so it costs milliseconds here rather than a boot.
     reference_contract::check(root)?;
-    // And for the third time the same argument: the configuration document is
+    // And for the third time the same argument: a configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost
     // of reading one file. Without this the fast gate accepts a document that
     // only fails at `make image`, minutes later and behind a compile.
-    image::check_configuration(root, Path::new(image::CONFIGURATION_DOCUMENT))?;
+    //
+    // *Every* document, not only the shipped one. A scenario's document is built
+    // into a disk of its own and refused at that scenario's boot — a dozen minutes
+    // into `make ci`, after every host stage and every earlier scenario has
+    // passed — so leaving them out put the cheapest possible finding behind the
+    // most expensive gate there is.
+    for document in image::EVERY_CONFIGURATION_DOCUMENT {
+        image::check_configuration(root, Path::new(document))?;
+    }
     run_command(
         Command::new("cargo")
             .current_dir(root)

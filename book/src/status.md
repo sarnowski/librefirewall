@@ -74,11 +74,14 @@ is **not** a trusted time source — see the status table below and its
 
 A recorder domain owns the appliance's **block device** and turns the traffic into a durable
 record. It brings a virtio-blk device up, proves the path to the medium by reading a sector and
-writing a recognisable one back, and then writes **two pcapng recordings** onto that device: a
-*log* recording snapped to 128 bytes per frame and a *capture* recording snapped to 2048. What it
-records is what the forwarder taps: one observation of every frame the pipeline reached a verdict
-about, lifted while the frame is still the one that arrived rather than the one this appliance will
-send on — which is what makes a recording evidence about the wire and not about the appliance's own
+writing a recognisable one back, and then writes **two pcapng recordings** onto that device, and
+they differ by *what they record*. The **capture** holds every frame the pipeline reached a verdict
+about, with that verdict on it: allow or deny, the reason, the rule where one matched, and the
+conversation it belongs to. The **connection history** holds a record only where the appliance
+reached a lifecycle or policy event — a conversation opened, advanced or closed, a policy refusal, a
+tracker refusal — anchored to the packet that caused it and carrying that packet's L2–L4 headers.
+Both are lifted while the frame is still the one that arrived rather than the one this appliance will
+send on, which is what makes a recording evidence about the wire and not about the appliance's own
 output. Either recording is downloadable whole over the management port — `GET /logs.pcapng`,
 `GET /capture.pcapng` — and `tcpdump -r` opens both natively. Each recording is a ring across a
 fixed extent of the disk, and the first sectors of that extent are its **superblock**: a doubled,
@@ -120,15 +123,15 @@ admitted** — see the gap recorded below. There is no NAT. The ARP and ICMP tha
 management port alone — the dataplane resolves a next hop from a static neighbour table and answers
 nothing for itself.
 
-State reaches the recordings only as far as the packets. The
-[recording design](design/recording.md) splits the two sinks by *what* they record — the log sink
-connection lifecycle and policy events anchored to their causing packet, the capture sink full
-content for the flows a **recording** selector picks out. Neither exists yet: the tracker's
-lifecycle is visible on `/metrics` and reaches no recording, and there is no recording selector, so
-the capture sink records everything the dataplane decided on. (The filter rules above decide what
-the appliance *forwards*; they select nothing for recording, and a dropped packet is recorded with
-its refusal exactly as a forwarded one is.) **Today the two recordings differ only in their snap
-length**, and `/logs.pcapng` is the capture truncated to headers rather than an event log.
+**The tracker's lifecycle reaches the recordings.** `/logs.pcapng` is a connection history: a
+conversation opening names the rule that admitted it, an advance names what the packet moved, a close
+names *how* it closed, a policy refusal names the rule or the default deny that refused it, and a
+tracker refusal names its reason. Every record is anchored to the packet that caused it, so the file
+opens in a pcapng reader as a packet list with real addresses and ports. What is still missing is a
+**recording selector**: the capture sink records every frame the dataplane decided on rather than the
+flows a policy picks out, and the filter rules above decide what the appliance *forwards* and select
+nothing for recording. A conversation reclaimed by its idle timeout also produces no close event —
+every record is anchored to a causing packet and a timeout has none.
 
 ## Traffic inspection and enforcement
 
@@ -174,7 +177,7 @@ length**, and `/logs.pcapng` is the capture truncated to headers rather than an 
 |---|---|---|
 | First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
 | pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — described with the [recordings](developers/status-detail.md#recording-and-download) |
-| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — the connection tracker's lifecycle reaches `/metrics` and no recording, so there are no connection events, and there is no recording selector, so the capture sink records every frame the dataplane decided on — [detail](developers/status-detail.md#recording-and-download) |
+| Two pcapng recording sinks (a connection history and a capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium, and **they differ by what they record**: the history holds a record where the appliance reached a lifecycle or policy event, the capture holds every observation with its verdict, and each record carries the flow, the rule and the event as a PEN-tagged annotation. There is still no recording selector, so the capture records every frame the dataplane decided on rather than the flows a policy picks out, and a conversation reclaimed by its idle timeout produces no close event — [detail](developers/status-detail.md#recording-and-download) |
 | Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for the *time range* the [management design](design/management.md) does ask for, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
 | A recording that states its own loss in-band | **partial** | `epb_dropcount` is fed: the recorder differences the forwarder's tap-drop counter on every pass and carries the rise as a debt onto the next record placed, so a file does state the observations the tap ring lost ahead of each block. It states **only** those — what a sink could not encode and what the medium refused reach `/metrics` and never the file, and no Interface Statistics Block is emitted — see the [recording design](design/recording.md) |
 | Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
@@ -208,7 +211,7 @@ length**, and `/logs.pcapng` is the capture truncated to headers rather than an 
 | Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
 | OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the design's **System** category alone — Audit, Traffic and Subsystem have none. No transport, exporter or receiver exists, so the OpenTelemetry inventory in the [observability reference](reference/observability.md) is empty, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
 | Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane; the connection table publishes its own occupancy, lifecycle and every refusal, and the rest of the occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
-| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. `GET /config` does not exist either, so of the debug dump the [observability reference](reference/observability.md) describes, the state half and the recordings are what a node can be asked for; the retained records and the running document cannot be, and the reference's local-buffer inventory is empty |
+| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *connection history* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. `GET /config` does not exist either, so of the debug dump the [observability reference](reference/observability.md) describes, the state half and the recordings are what a node can be asked for; the retained records and the running document cannot be, and the reference's local-buffer inventory is empty |
 
 ## Lifecycle, boot and trust
 

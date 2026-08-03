@@ -35,9 +35,14 @@ fn observation(frame: &[u8], outcome: TapOutcome) -> Observation<'_> {
     Observation {
         timestamp: 7,
         interface_id: 1,
-        outcome,
-        direction: TapDirection::Inbound,
-        generation: 3,
+        decision: TapDecision {
+            outcome,
+            direction: TapDirection::Inbound,
+            generation: 3,
+            flow: None,
+            rule: None,
+            event: None,
+        },
         frame,
     }
 }

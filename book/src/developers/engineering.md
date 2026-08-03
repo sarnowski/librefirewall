@@ -275,7 +275,7 @@ through them rather than about it from the source:
 |---|---|---|
 | `GET /metrics` | **that** something is wrong, and where — which counter moved, in which domain | `curl` through the port forward |
 | `GET /capture.pcapng` | **which packet** — the frames themselves, with the firewall's verdict on each | `curl`, then `tcpdump -r` or Wireshark |
-| `GET /logs.pcapng` | **which observations**, at header fidelity and far more of them per byte | the same |
+| `GET /logs.pcapng` | **which conversations, and what happened to them** — an open with the rule that admitted it, an advance, a close with how it closed, a refusal with its reason, each on the packet that caused it | the same |
 | the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `build/image/` |
 
 A counter is a summary and a capture is evidence. When a dataplane question is open — is the frame

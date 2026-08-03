@@ -434,6 +434,58 @@ fn a_flow_and_its_reply_resolve_to_one_entry() {
     assert_eq!(table.len(), 1);
 }
 
+/// **Every advance says where the flow stood before it**, which is what tells a
+/// packet that moved the connection from one that only refreshed its timer.
+///
+/// Without that distinction an observer has to keep a second copy of the table
+/// to know whether anything happened, or record one event per packet — and the
+/// second is the packet log a connection history exists not to be.
+#[test]
+fn an_advance_carries_the_state_it_moved_the_flow_out_of() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+    let syn = exchange.syn();
+    let Outcome::New { flow, state } = syn.classify(&mut table, at(0)) else {
+        panic!("a SYN did not open a flow");
+    };
+    assert_eq!(state, FlowState::SynSent);
+
+    let syn_ack = exchange.syn_ack();
+    let Outcome::Established {
+        previous, state, ..
+    } = syn_ack.classify(&mut table, at(1_000))
+    else {
+        panic!("the SYN-ACK was refused");
+    };
+    assert_eq!(previous, FlowState::SynSent);
+    assert_eq!(state, FlowState::SynReceived);
+
+    let ack = exchange.ack(true);
+    let Outcome::Established {
+        previous, state, ..
+    } = ack.classify(&mut table, at(2_000))
+    else {
+        panic!("the third segment was refused");
+    };
+    assert_eq!(previous, FlowState::SynReceived);
+    assert_eq!(state, FlowState::Established);
+
+    // Data on an established flow moves nothing, so the two agree — which is the
+    // shape an observer reads as "no transition".
+    let data = exchange.data(true, b"request");
+    let Outcome::Established {
+        previous, state, ..
+    } = data.classify(&mut table, at(3_000))
+    else {
+        panic!("data on an established flow was refused");
+    };
+    assert_eq!(previous, state);
+    assert_eq!(state, FlowState::Established);
+    // And the handle names one slot with one occupant throughout.
+    assert_eq!(flow.slot(), 0);
+    assert_eq!(flow.generation(), 1, "the first occupant of that slot");
+}
+
 /// A retransmitted `SYN` is the same flow, not a second one.
 #[test]
 fn a_retransmitted_syn_does_not_open_a_second_flow() {
@@ -782,6 +834,7 @@ fn a_udp_datagram_opens_a_pseudo_flow_and_a_reply_assures_it() {
     let reply = udp(SERVER, CLIENT, 53, 50_000);
     let Outcome::Established {
         flow: seen,
+        previous,
         state,
         direction,
     } = reply.classify(&mut table, at(2_000))
@@ -789,6 +842,7 @@ fn a_udp_datagram_opens_a_pseudo_flow_and_a_reply_assures_it() {
         panic!("a UDP reply was refused");
     };
     assert_eq!(seen, flow);
+    assert_eq!(previous, FlowState::UdpUnreplied);
     assert_eq!(state, FlowState::UdpAssured);
     assert_eq!(direction, Direction::Reply);
     assert_eq!(table.len(), 1);

@@ -35,7 +35,7 @@
 //! interface in that document claims.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -55,14 +55,10 @@ use crate::{
     util::{copy_file, locate, require_file, run_command},
 };
 
-/// The configuration document the different-configuration scenario builds its
-/// own image from — a second bench that shares no address and no MAC with the
-/// appliance's own document.
-///
-/// It is the harness's input rather than the appliance's, so it lives beside
-/// the harness. `systems/` holds what the appliance runs, and a second document
-/// there would read as a second shippable configuration.
-const ALTERNATE_DOCUMENT: &str = "tools/xtask/scenarios/alternate-addressing.xml";
+/// The two documents a scenario may build its own image from, named through
+/// [`crate::image`] so the fast gate's list of documents to validate and the
+/// scenarios' own choice of one cannot drift apart.
+use image::{ALTERNATE_DOCUMENT, LIFECYCLE_DOCUMENT};
 
 // UEFI firmware for the OVMF boot path; the first existing candidate is used.
 const OVMF_CODE_CANDIDATES: &[&str] = &[
@@ -426,6 +422,26 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             management: ManagementRole::Client,
             traffic: Traffic::Stateful,
         },
+        // The one thing a connection history needs that no other scenario can
+        // produce: a conversation that **opens and closes**.
+        //
+        // It boots its own document because a close needs TCP and both other
+        // documents' rules name `protocol="udp"`, so a TCP segment matches
+        // neither and falls to the default deny — correct behaviour that leaves a
+        // lifecycle unreachable. This one's rules are the shipped document's with
+        // the protocol criterion widened, and nothing else changed.
+        //
+        // A `Client` scenario, because the whole of what it proves is on the two
+        // recordings: on the wire an opening and a close are two frames that were
+        // forwarded, and nothing about either says a conversation began or ended.
+        Scenario {
+            name: "connection-lifecycle",
+            document: LIFECYCLE_DOCUMENT,
+            image: ImageUnderTest::BuiltForTheScenario,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Lifecycle,
+        },
     ];
 
     let judged = scenarios
@@ -714,19 +730,28 @@ fn judge_recordings(
     topology: &Topology,
     log: &Path,
 ) -> Result<String, String> {
+    // The events the probes oblige the connection history to hold, which is what
+    // bounds it from below. Not the frame count: the log holds a record where the
+    // appliance reached a lifecycle or policy event and nowhere else, so holding
+    // one per frame would be the defect rather than the contract.
+    let owed_events = booted
+        .injected
+        .iter()
+        .filter(|injected| injected.event.is_some())
+        .count();
     let expectations = [
         recording_contract::Expectation {
             target: pd_runtime::LOG_TARGET,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN as usize,
-            // The frames the harness itself put across the appliance, which is
-            // the number of observations the router must have decided on. At
-            // least, not exactly: the management port's own frames and any
-            // re-injection are decided on too.
-            least_packets: booted.dataplane_frames as usize,
+            least_packets: owed_events,
         },
         recording_contract::Expectation {
             target: pd_runtime::CAPTURE_TARGET,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN as usize,
+            // The frames the harness itself put across the appliance, which is
+            // the number of observations the router must have decided on. At
+            // least, not exactly: the management port's own frames and any
+            // re-injection are decided on too.
             least_packets: booted.dataplane_frames as usize,
         },
     ];
@@ -766,6 +791,28 @@ fn judge_recordings(
             parsed.len()
         ));
     };
+    // What the appliance's own exposition says about the decisions the recordings
+    // describe. Read here rather than inside the judgement so that
+    // `surface_contract::judge` stays a pure function of parsed inputs.
+    let mut drop_reasons = BTreeMap::new();
+    for reason in surface_contract::DROP_REASONS {
+        drop_reasons.insert(
+            reason.to_owned(),
+            metrics_contract::drop_reason_total(&exposition.body, reason)?,
+        );
+    }
+    let mut rules = Vec::new();
+    for id in topology.rule_ids() {
+        rules.push(surface_contract::DeclaredRule {
+            id: id.as_str().to_owned(),
+            hits: metrics_contract::rule_hits(&exposition.body, id.as_str())?,
+        });
+    }
+    let published = surface_contract::Published {
+        forwarded_frames: metrics_contract::forwarded_frames_total(&exposition.body)?,
+        drop_reasons,
+        rules,
+    };
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
             target: pd_runtime::LOG_TARGET,
@@ -783,6 +830,7 @@ fn judge_recordings(
             injected: &booted.injected,
             ports: topology.interfaces().len(),
         },
+        &published,
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
     evidence.push('\n');

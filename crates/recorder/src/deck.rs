@@ -26,9 +26,11 @@
 //!
 //! `wire::TapReader` consumes a slot irrevocably, so a record one recording
 //! refused for want of staging has nowhere else to live. [`Pending`] holds it
-//! and the pass stops draining until both have taken it; dropping it would be
-//! silent omission from an artifact whose whole value is that it states its own
-//! losses in-band.
+//! and the pass stops draining until every recording that selected it has taken
+//! it; dropping it would be silent omission from an artifact whose whole value is
+//! that it states its own losses in-band. A recording that did not *select* the
+//! record is owed nothing by it, so the log skipping a packet is never a reason
+//! the tap stops draining.
 
 use lfw_clock::{Calibration, Ticks};
 
@@ -60,11 +62,23 @@ pub const RESERVED_SECTORS: u64 = 2048;
 /// extent's going to the superblock.
 pub const SEGMENT_BYTES: usize = 1024 * 1024;
 
-/// Where the header recording lives: 16 MiB starting at the reserved front.
+/// Where the event recording lives: 16 MiB starting at the reserved front.
 pub const LOG_START_SECTOR: u64 = RESERVED_SECTORS;
 pub const LOG_SECTORS: u64 = 32768;
-/// Bytes of each frame it keeps — Ethernet, IPv4 and the transport ports, with
-/// room over.
+/// Bytes of each causing frame an event record keeps.
+///
+/// The whole L2–L4 header chain and nothing of the payload. That bound is not a
+/// round number: the largest chain this appliance ever reaches a decision on is
+/// an Ethernet header (14), an 802.1Q tag (4), an IPv4 header with no options
+/// (20) and a TCP header with a full option area (60) — 98 bytes. A frame that
+/// is not IPv4 produces no decision and so no observation at all, and one whose
+/// IPv4 header carries options is refused by the parser rather than decided on,
+/// so nothing longer can reach a record. `xtask::recording_contract` holds this
+/// number to those constants.
+///
+/// The payload stays out because an event record is evidence about a *decision*.
+/// Carrying traffic is the capture recording's job, and widening the payload
+/// exception past it would be a design change rather than a constant.
 pub const LOG_SNAP_LEN: u32 = 128;
 
 /// Where the full-content recording lives: 32 MiB starting at the log's end.
@@ -200,6 +214,21 @@ impl Which {
             Self::Capture => CAPTURE_SNAP_LEN,
         }
     }
+
+    /// Whether this recording takes the observation at all — **what the two
+    /// recordings differ by**, the snap length being a consequence of it.
+    ///
+    /// The log takes an observation carrying a lifecycle or policy event and
+    /// nothing else, so its rate is bounded by how fast conversations are
+    /// admitted and refused rather than by the packet rate. That is what keeps a
+    /// connection history usable under the conditions it is wanted in: a flood
+    /// recorded per packet evicts the whole history in seconds.
+    const fn records(self, tap: &CheckedTap) -> bool {
+        match self {
+            Self::Log => tap.event.is_some(),
+            Self::Capture => true,
+        }
+    }
 }
 
 /// What one submitted transfer is for, so a completion is attributed to a
@@ -302,7 +331,7 @@ pub const TAP_BUDGET: usize = 16;
 pub struct RecorderCounters {
     /// Per recording, in [`Which::ALL`] order.
     pub sinks: [SinkCounters; 2],
-    /// Tap records drained and offered to both recordings.
+    /// Tap records drained and offered to the recordings that select them.
     pub tap_records: u64,
     /// Tap annotations the reader would not decode.
     pub tap_refused: u64,
@@ -770,12 +799,16 @@ impl Deck {
         tap
     }
 
-    /// Offer one record to both recordings, holding it where either could not
-    /// take it.
+    /// Offer one record to the recordings that take it, holding it where one
+    /// could not.
+    ///
+    /// A recording that does not select the observation is owed nothing by it, so
+    /// a record the log does not carry never becomes a reason to stop draining
+    /// the tap.
     fn offer(&mut self, tap: CheckedTap, bytes: &[u8], medium: &mut impl Medium) {
         let mut owed = [false; 2];
         let mut any = false;
-        for which in Which::ALL {
+        for which in Which::ALL.into_iter().filter(|which| which.records(&tap)) {
             if !place(&mut self.recordings, which, &tap, bytes, medium) {
                 if let Some(slot) = owed.get_mut(which.index()) {
                     *slot = true;

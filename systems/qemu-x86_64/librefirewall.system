@@ -459,11 +459,10 @@
          are.
 
          `tap` carries what the forwarder has to say about the frames it decided
-         on — an annotation per record and nothing else — and `tap_consume`
-         carries how far the recorder has read. Two regions rather than one for
-         the reason `cfg`/`cfgack` are two and each log ring is two: a region is
-         the unit of grant, so only two can give each domain write access to
-         exactly the direction it speaks in.
+         on, and `tap_consume` carries how far the recorder has read. Two regions
+         rather than one for the reason `cfg`/`cfgack` are two and each log ring
+         is two: a region is the unit of grant, so only two can give each domain
+         write access to exactly the direction it speaks in.
 
          THE PERMS ARE THE WHOLE ARGUMENT, and they are the log ring's, mirrored
          onto a different pair of domains. The FORWARDER maps `tap` READ-WRITE
@@ -484,16 +483,26 @@
          into it; and the console does not, which keeps the two output channels
          disjoint.
 
-         AND THE TAP CARRIES NO FRAME. It is annotations — lengths, verdicts,
-         interface indices, an instant — never packet bytes, which is what makes
-         it a region the recorder can be given without the forwarder handing over
-         a pool. `wire::tap` is where the record's shape and its checking live.
+         WHAT A SLOT HOLDS is an annotation and a bounded copy of the frame. The
+         annotation is the appliance's decision — the verdict and its reason, the
+         flow the frame belongs to as a slot-and-generation pair with its
+         classification and state, the rule that decided it, the lifecycle or
+         policy event it caused, an interface index, two lengths and an instant.
+         Behind it sit up to `wire::TAP_SNAP_LEN` bytes of the frame as it
+         arrived, which is what a recording is *for* and why the payload
+         exception the design confines to the two recording sinks reaches this
+         region as well. It is still not a pool: the copy is the forwarder's own
+         and the recorder gets no descriptor, no buffer index and no way to reach
+         a frame in flight, so nothing here lets the recorder touch traffic the
+         appliance is still forwarding. `wire::tap` is where the record's shape
+         and its checking live.
 
          Sizes are `wire::TAP_RECORDS_REGION_SIZE` and
          `wire::TAP_CONSUME_REGION_SIZE`, each its type's `size_of` rounded up to
          the mapping granularity, on the same footing as every constant above and
-         held to it the same way. `TapRecords` is 132 KiB of slots plus its two
-         cursors, so it rounds to thirty-three pages; `TapConsume` is one word
+         held to it the same way. `TapRecords` is sixty-four slots of an
+         eighty-byte annotation and a two-kilobyte frame copy, plus its two
+         cursors, so it rounds to thirty-four pages; `TapConsume` is one word
          and costs the page a region costs, exactly as `cfgack` does.
 
          Neither carries phys_addr: no device DMAs into either, so no domain
@@ -501,7 +510,7 @@
          general-purpose untyped memory — precisely the retyping seL4 zeroes, so
          `attach_region!`'s zero-initialisation precondition holds by
          construction and a zeroed pair is a valid empty ring. -->
-    <memory_region name="tap" size="0x21000" />
+    <memory_region name="tap" size="0x22000" />
     <memory_region name="tap_consume" size="0x1000" />
 
     <!-- THE DOWNLOAD HANDOVER, one region per direction, and it runs the

@@ -71,6 +71,38 @@ pub(crate) const SYSTEM_DESCRIPTION: &str = "systems/qemu-x86_64/librefirewall.s
 /// compiles the domain against: a lint of a domain built from a different
 /// document is a lint of a different binary.
 pub(crate) const CONFIGURATION_DOCUMENT: &str = "systems/qemu-x86_64/configuration.xml";
+
+/// The document the different-configuration scenarios build their own image
+/// from — a second bench that shares no address and no MAC with the appliance's
+/// own document.
+///
+/// It is the harness's input rather than the appliance's, so it lives beside the
+/// harness. `systems/` holds what the appliance runs, and a second document there
+/// would read as a second shippable configuration.
+pub(crate) const ALTERNATE_DOCUMENT: &str = "tools/xtask/scenarios/alternate-addressing.xml";
+
+/// The document the connection-lifecycle scenario builds its own image from: the
+/// shipped bench, under rules whose protocol criterion is not UDP-only.
+///
+/// A connection that closes has to be TCP, and a TCP segment matches neither of
+/// the other two documents' rules — so it falls to the default deny and no
+/// conversation is ever admitted to have a lifecycle. Beside the harness for
+/// [`ALTERNATE_DOCUMENT`]'s reason.
+pub(crate) const LIFECYCLE_DOCUMENT: &str = "tools/xtask/scenarios/protocol-agnostic-policy.xml";
+
+/// Every configuration document in the tree: the one that ships, and the
+/// harness's own, each of which an end-to-end scenario builds a disk from.
+///
+/// The scenarios name these same constants, so a document a scenario boots is one
+/// this list holds by construction rather than by somebody remembering. That is
+/// what lets the fast gate hold *all* of them to `config::load`: a scenario
+/// document is otherwise refused at that scenario's boot, a dozen minutes into the
+/// full gate, for a finding that costs milliseconds to read.
+pub(crate) const EVERY_CONFIGURATION_DOCUMENT: &[&str] = &[
+    CONFIGURATION_DOCUMENT,
+    ALTERNATE_DOCUMENT,
+    LIFECYCLE_DOCUMENT,
+];
 /// The environment variable that carries [`CONFIGURATION_DOCUMENT`] to
 /// `pds/config`.
 ///

@@ -102,7 +102,7 @@ use packet_buffer::{BufferPool, CopyOutError, FreeList, ReturnError, WriteOutsid
 use pipeline::{DropCounters, DropReason, Inspection, Pipeline};
 use queue::SpscRing;
 use routing::PortId;
-use wire::{TapDirection, TapOutcome};
+use wire::{TapDecision, TapDirection};
 
 pub use packet_buffer::{BUFFER_SIZE, OwnedBuffer};
 pub use queue::{RingConsumer, RingProducer};
@@ -543,7 +543,10 @@ pub use stats::{
     BlockCounters, StatsRegions, config_sample, flow_sample, forwarder_sample, log_sample,
     management_sample, pipeline_sample, policy_sample, recorder_sample,
 };
-pub use tap::{Observation, Tap, TapCounters, tap_drop_reason};
+pub use tap::{
+    Observation, Tap, TapCounters, tap_classification, tap_decision, tap_drop_reason, tap_flow,
+    tap_flow_state, tap_outcome,
+};
 pub use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
     ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS,
@@ -921,14 +924,12 @@ impl<'ring> RouteStage<'ring> {
             // Before the rewrite below, which is what makes the recorded bytes
             // the frame as it arrived rather than as it leaves.
             if let Some(tap) = tap.as_deref_mut()
-                && let Some(outcome) = routed.observed()
+                && let Some(decision) = routed.observed()
             {
                 tap.observe(Observation {
                     timestamp: read_timestamp_counter().0,
                     interface_id: ingress.0,
-                    outcome,
-                    direction: TapDirection::Inbound,
-                    generation: configuration.generation(),
+                    decision,
                     // The snapshot's own length, so the slice is the frame; the
                     // fallback records nothing rather than branching on a span
                     // `snapshot` cannot produce.
@@ -939,6 +940,7 @@ impl<'ring> RouteStage<'ring> {
                 Routed::Forward {
                     source,
                     destination,
+                    ..
                 } => forward(
                     pool,
                     &descriptor,
@@ -1041,20 +1043,24 @@ enum Routed {
     Forward {
         source: MacAddress,
         destination: MacAddress,
+        decision: TapDecision,
     },
-    Dropped(DropReason),
+    Dropped(TapDecision),
     /// Discarded for something `routing` does not name; see [`RouteStage`] on
     /// why no tap records it.
     Discarded,
 }
 
 impl Routed {
-    /// This resolution as a tap outcome, or `None` where the ABI has no honest
-    /// encoding for it.
-    const fn observed(&self) -> Option<TapOutcome> {
+    /// What the tap records about this resolution, or `None` where the ABI has no
+    /// honest encoding for it.
+    ///
+    /// The decision is composed in [`decide`] rather than here, because it is
+    /// built out of the facts the chain attached to an [`Inspection`] and that
+    /// value cannot outlive the borrow of the frame it inspected.
+    const fn observed(&self) -> Option<TapDecision> {
         match self {
-            Self::Forward { .. } => Some(TapOutcome::Forwarded),
-            Self::Dropped(reason) => Some(TapOutcome::Dropped(tap_drop_reason(*reason))),
+            Self::Forward { decision, .. } | Self::Dropped(decision) => Some(*decision),
             Self::Discarded => None,
         }
     }
@@ -1078,10 +1084,24 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS:
         }
     };
     let mut inspection = Inspection::new(ingress, frame);
-    match pipeline.evaluate(&mut inspection, configuration, tracking) {
+    let verdict = pipeline.evaluate(&mut inspection, configuration, tracking);
+    // Composed while the inspection still exists, which is the whole reason the
+    // decision travels out on [`Routed`]: the facts the chain attached — the
+    // flow, the rule, the tracker's refusal — are gone the moment the borrow of
+    // the frame ends, and the tap is offered the frame after that.
+    //
+    // Inbound on every record: a forwarded frame is observed once, on the port it
+    // arrived on, so there is never a second observation to relate one to.
+    let decision = tap_decision(
+        &inspection,
+        verdict,
+        TapDirection::Inbound,
+        configuration.generation(),
+    );
+    match verdict {
         pipeline::Verdict::Drop(reason) => {
             counters.drops.record(reason);
-            Routed::Dropped(reason)
+            Routed::Dropped(decision)
         }
         pipeline::Verdict::Forward {
             egress: decided, ..
@@ -1096,6 +1116,7 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS:
         } => Routed::Forward {
             source,
             destination,
+            decision,
         },
     }
 }
@@ -2695,6 +2716,332 @@ mod tests {
         }
     }
 
+    /// **The connection history, end to end.** One TCP conversation opened,
+    /// advanced, refused mid-window and closed, with the tap attached — so what a
+    /// recorder is handed is asserted against the traffic that produced it rather
+    /// than against a composition this test performed.
+    ///
+    /// Two stages and one table, as the refusal test above: a handshake cannot be
+    /// driven any other way, a reply being routed out of the port its request
+    /// arrived on. The events are the whole point, and each is a *transition* —
+    /// the third `ACK` moves the flow to `Established` and the last one moves it
+    /// to `TimeWait`, while a retransmission that moves nothing carries no event
+    /// at all.
+    #[test]
+    fn a_conversation_opens_advances_and_closes_in_the_events_the_tap_records() {
+        /// The two sequence spaces the handshake opens on.
+        const CLIENT_ISN: u32 = 500_000;
+        const SERVER_ISN: u32 = 700_000;
+
+        let forward = Regions::new();
+        let back = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owners = [
+            PoolOwner::attach(&forward.returns),
+            PoolOwner::attach(&back.returns),
+        ];
+        let mut producers = [forward.rings.rx.producer(), back.rings.rx.producer()];
+        let mut stages = [
+            RouteStage::attach(&forward.rings, &forward.pool, PORT0, PORT1),
+            RouteStage::attach(&back.rings, &back.pool, PORT1, PORT0),
+        ];
+        let mut pipeline = Pipeline::new();
+        let mut flows = Box::new(ApplianceTestFlows::new());
+
+        let base = FrameSpec::a_to_b();
+        let segment = |flags: u8, sequence: u32, acknowledgement: u32| Transport_::Tcp {
+            flags,
+            sequence,
+            acknowledgement,
+        };
+        // A TCP frame this spec builds carries a bare header, so the only
+        // sequence space a segment occupies is the phantom byte each of `SYN` and
+        // `FIN` takes.
+        let client_after_syn = CLIENT_ISN.wrapping_add(1);
+        let server_after_syn = SERVER_ISN.wrapping_add(1);
+        let client_after_fin = client_after_syn.wrapping_add(1);
+        let server_after_fin = server_after_syn.wrapping_add(1);
+        // Each step: the direction, the frame, the event the record must carry,
+        // and the state it must name — absent on the refusal, a refused packet
+        // being one the tracker keeps no state for and so names no flow of.
+        let script = [
+            (
+                0usize,
+                base.with(segment(0x02, CLIENT_ISN, 0)),
+                (
+                    wire::TapEvent::FlowOpened,
+                    Some(wire::TapFlowState::SynSent),
+                ),
+            ),
+            (
+                1,
+                base.reversed()
+                    .with(segment(0x12, SERVER_ISN, client_after_syn)),
+                (
+                    wire::TapEvent::FlowAdvanced,
+                    Some(wire::TapFlowState::SynReceived),
+                ),
+            ),
+            (
+                0,
+                base.with(segment(0x10, client_after_syn, server_after_syn)),
+                (
+                    wire::TapEvent::FlowAdvanced,
+                    Some(wire::TapFlowState::Established),
+                ),
+            ),
+            // A segment a gibibyte past anything the peer authorised: the tracker
+            // refuses it, so it never reaches the filter and no rule is named.
+            (
+                0,
+                base.with(segment(
+                    0x10,
+                    client_after_syn.wrapping_add(1 << 30),
+                    server_after_syn,
+                )),
+                (wire::TapEvent::FlowRefused, None),
+            ),
+            // The close, both halves and its acknowledgement.
+            (
+                0,
+                base.with(segment(0x11, client_after_syn, server_after_syn)),
+                (
+                    wire::TapEvent::FlowAdvanced,
+                    Some(wire::TapFlowState::FinWait),
+                ),
+            ),
+            (
+                1,
+                base.reversed()
+                    .with(segment(0x11, server_after_syn, client_after_fin)),
+                (
+                    wire::TapEvent::FlowAdvanced,
+                    Some(wire::TapFlowState::Closing),
+                ),
+            ),
+            (
+                0,
+                base.with(segment(0x10, client_after_fin, server_after_fin)),
+                (
+                    wire::TapEvent::FlowClosed,
+                    Some(wire::TapFlowState::TimeWait),
+                ),
+            ),
+        ];
+
+        for (step, (which, spec, _)) in script.iter().enumerate() {
+            let regions = if *which == 0 { &forward } else { &back };
+            let bytes = spec.build();
+            receive(
+                &regions.pool,
+                &mut owners[*which],
+                &mut producers[*which],
+                &bytes,
+            )
+            .expect("a full pool has buffers");
+            assert_eq!(
+                stages[*which].poll(
+                    &mut pipeline,
+                    Configuration::new(1, &*ROUTER, &ALLOW_ALL),
+                    &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    Some(&mut tap),
+                ),
+                1,
+                "step {step}: the descriptor must travel on"
+            );
+        }
+
+        let read = ring.drain();
+        assert_eq!(
+            read.len(),
+            script.len(),
+            "one observation per decided frame"
+        );
+        // One conversation, so one identity: every record names the same slot and
+        // the same occupant of it, which is what lets a reader fold the events
+        // into a single connection.
+        let identity = read
+            .first()
+            .and_then(|(checked, _)| checked.flow)
+            .map(|flow| (flow.slot, flow.generation))
+            .expect("the opening record names the flow it opened");
+        for (step, ((checked, _), (_, _, (event, state)))) in read.iter().zip(&script).enumerate() {
+            assert_eq!(checked.event, Some(*event), "step {step}: the event");
+            assert_eq!(
+                checked.flow.map(|flow| flow.state),
+                *state,
+                "step {step}: the state"
+            );
+            if let Some(flow) = checked.flow {
+                assert_eq!(
+                    (flow.slot, flow.generation),
+                    identity,
+                    "step {step}: a different conversation"
+                );
+            }
+            // Under a rule that accepts everything, the opening is the one packet
+            // the filter was consulted about — every other step was decided by the
+            // tracker, and a rule on one of those would credit a hit to a rule
+            // that never ran.
+            assert_eq!(
+                checked.rule.map(wire::TapRule::position),
+                (*event == wire::TapEvent::FlowOpened).then_some(0),
+                "step {step}: the rule"
+            );
+        }
+        // The refused segment is the one record whose verdict is a drop, and the
+        // reason is the tracker's own.
+        let refused: Vec<_> = read
+            .iter()
+            .filter(|(checked, _)| checked.event == Some(wire::TapEvent::FlowRefused))
+            .map(|(checked, _)| checked.outcome)
+            .collect();
+        assert_eq!(
+            refused,
+            std::vec![wire::TapOutcome::Dropped(
+                wire::TapDropReason::FlowOutOfWindow
+            )]
+        );
+        assert_eq!(flows.len(), 1, "the script left more than one conversation");
+    }
+
+    /// A packet on a conversation already accounted for carries no event, and a
+    /// packet the *filter* refused carries the event that says which of its two
+    /// refusals it was.
+    ///
+    /// The first is what keeps the connection history's rate bounded by
+    /// admissions rather than by traffic; the second is what makes a deny
+    /// attributable to a rule, and a fallthrough distinguishable from it.
+    #[test]
+    fn traffic_on_a_known_flow_carries_no_event_and_a_denied_opening_names_its_rule() {
+        let regions = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owner = PoolOwner::attach(&regions.returns);
+        let mut rx_in = regions.rings.rx.producer();
+        let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
+        let mut pipeline = Pipeline::new();
+        let mut flows = Box::new(ApplianceTestFlows::new());
+
+        // The same datagram twice under a rule that accepts it: the first opens
+        // the conversation, and the second is a retransmission that moves
+        // nothing, so it belongs to the capture alone.
+        let spec = FrameSpec::a_to_b();
+        for rules in [&*ALLOW_ALL, &*ALLOW_ALL, &*DROP_ALL, &*ALLOW_ALL] {
+            let bytes = spec.build();
+            receive(&regions.pool, &mut owner, &mut rx_in, &bytes)
+                .expect("a full pool has buffers");
+            assert_eq!(
+                stage.poll(
+                    &mut pipeline,
+                    Configuration::new(1, &*ROUTER, rules),
+                    &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    Some(&mut tap),
+                ),
+                1
+            );
+        }
+
+        let read = ring.drain();
+        let events: Vec<_> = read.iter().map(|(checked, _)| checked.event).collect();
+        assert_eq!(
+            events,
+            std::vec![
+                Some(wire::TapEvent::FlowOpened),
+                // Held: the datagram is the same one, in the same direction, so
+                // the flow stays one-way and its state does not move.
+                None,
+                // The dropping ruleset never sees a new conversation — the flow
+                // is already open, so the tracker settles it in front of the
+                // filter and the rule is not consulted.
+                None,
+                None,
+            ]
+        );
+        // Every record still carries the conversation and its verdict, which is
+        // what the capture is for.
+        for (checked, _) in &read {
+            assert!(checked.flow.is_some());
+            assert_eq!(checked.outcome, wire::TapOutcome::Forwarded);
+        }
+    }
+
+    /// The two filter refusals as the tap records them: a rule that says drop,
+    /// and no rule at all.
+    #[test]
+    fn the_filters_two_refusals_are_distinguishable_in_the_record() {
+        for (rules, expected, rule) in [
+            (&*DROP_ALL, wire::TapEvent::PolicyDenied, Some(0u16)),
+            (
+                &pipeline::Ruleset::EMPTY,
+                wire::TapEvent::PolicyNoMatch,
+                None,
+            ),
+        ] {
+            let regions = Regions::new();
+            let ring = TapRing::new();
+            let mut tap = Tap::attach(&ring.records, &ring.consume);
+            let mut owner = PoolOwner::attach(&regions.returns);
+            let mut rx_in = regions.rings.rx.producer();
+            let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
+            let mut pipeline = Pipeline::new();
+
+            let bytes = FrameSpec::a_to_b().build();
+            receive(&regions.pool, &mut owner, &mut rx_in, &bytes)
+                .expect("a full pool has buffers");
+            assert_eq!(
+                poll!(
+                    stage,
+                    &mut pipeline,
+                    Configuration::new(1, &*ROUTER, rules),
+                    Some(&mut tap)
+                ),
+                1
+            );
+
+            let read = ring.drain();
+            let (checked, _) = read.first().expect("the frame was decided on");
+            assert_eq!(checked.event, Some(expected));
+            assert_eq!(checked.rule.map(wire::TapRule::position), rule);
+            // The flow the opening packet took is named even though it has been
+            // withdrawn, so a reader can see the slot was given back rather than
+            // held by a conversation the policy refused.
+            assert!(checked.flow.is_some());
+        }
+    }
+
+    /// An admission or routing refusal carries no event: no conversation was
+    /// involved and no policy was consulted, so it belongs to the capture alone.
+    #[test]
+    fn a_routing_refusal_carries_a_verdict_and_no_event() {
+        let regions = Regions::new();
+        let ring = TapRing::new();
+        let mut tap = Tap::attach(&ring.records, &ring.consume);
+        let mut owner = PoolOwner::attach(&regions.returns);
+        let mut rx_in = regions.rings.rx.producer();
+        let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
+        let mut pipeline = Pipeline::new();
+
+        let bytes = FrameSpec {
+            ttl: 1,
+            ..FrameSpec::a_to_b()
+        }
+        .build();
+        receive(&regions.pool, &mut owner, &mut rx_in, &bytes).expect("a full pool has buffers");
+        assert_eq!(poll!(stage, &mut pipeline, running(), Some(&mut tap)), 1);
+
+        let read = ring.drain();
+        let (checked, _) = read.first().expect("the frame was decided on");
+        assert_eq!(checked.event, None);
+        assert_eq!(checked.flow, None);
+        assert_eq!(checked.rule, None);
+        assert_eq!(
+            checked.outcome,
+            wire::TapOutcome::Dropped(wire::TapDropReason::TtlExpired)
+        );
+    }
+
     /// The three outcomes a filtering appliance owes an operator, driven through
     /// the same poll the domain runs and read back off the shard it publishes:
     /// a packet a rule allowed, a packet a rule denied, and a packet no rule was
@@ -3032,9 +3379,14 @@ mod tests {
             tap.observe(Observation {
                 timestamp: 0,
                 interface_id: 0,
-                outcome: wire::TapOutcome::Forwarded,
-                direction: wire::TapDirection::Inbound,
-                generation: 0,
+                decision: wire::TapDecision {
+                    outcome: wire::TapOutcome::Forwarded,
+                    direction: wire::TapDirection::Inbound,
+                    generation: 0,
+                    flow: None,
+                    rule: None,
+                    event: None,
+                },
                 frame: &filler,
             });
         }

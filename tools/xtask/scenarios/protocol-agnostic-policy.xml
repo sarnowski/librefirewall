@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, not a shipping configuration.
+
+     This document exists for one reason: a **TCP conversation has to be able to
+     open**. Both other documents' rules name `protocol="udp"`, so a TCP segment
+     matches neither and falls to the default deny — which is correct behaviour
+     and makes a connection lifecycle unreachable. A flow that opens, advances
+     and closes is what produces the open and close events the connection
+     history is judged on, and only TCP has a close at all.
+
+     So the two rules here are the shipped document's, one port apart, with the
+     protocol criterion widened to `any` and nothing else changed. Everything the
+     other scenarios establish about the policy still holds against it: two rules
+     taking opposite actions, one accepted destination port and one denied, a
+     third port neither is about, and one hit counter per declared rule under the
+     id this file gives it.
+
+     The addressing is the shipped document's, deliberately. What the alternate
+     document proves — that the table comes from the file rather than from the
+     build — is proved there, and repeating it here would only make a lifecycle
+     failure ambiguous between the two claims. The rule ids differ, because a
+     per-rule counter is labelled with the id its document gave it and a scrape
+     that agreed with two files would be reporting a label the build carried. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+    <rules>
+        <rule id="lifecycle-deny" ingress="any" egress="any"
+              source="any" destination="any" protocol="any"
+              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+        <rule id="lifecycle-pass" ingress="any" egress="any"
+              source="any" destination="any" protocol="any"
+              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

@@ -214,6 +214,23 @@ pub struct FlowId {
     generation: u32,
 }
 
+impl FlowId {
+    /// The slot this handle names. Readable because a recording has to carry the
+    /// identity out to an analyst, and useful to one only as the pair below: on
+    /// its own it is the number that silently merges two conversations which
+    /// occupied one slot at different times.
+    #[must_use]
+    pub const fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// Which occupant of that slot, which is what makes the merge impossible.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
 /// One packet, as the tracker reads it.
 ///
 /// The transport header is the one the frame parser already decoded, rather than
@@ -245,6 +262,13 @@ pub enum Outcome {
     Established {
         flow: FlowId,
         direction: Direction,
+        /// Where the flow stood before this packet, so a caller can tell an
+        /// advance that *moved* the connection from one that only refreshed its
+        /// timer. Carried rather than left to be recovered: the state before is
+        /// gone by the time a caller could look, and a caller comparing against
+        /// its own memory of the flow would be keeping a second copy of the
+        /// table.
+        previous: FlowState,
         state: FlowState,
     },
     /// An ICMP error reporting on a flow the table holds. `quoted` is the
@@ -812,6 +836,7 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
         Outcome::Established {
             flow: self.id_of(slot),
             direction,
+            previous: state,
             state: next,
         }
     }
@@ -869,6 +894,7 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
         Outcome::Established {
             flow: self.id_of(slot),
             direction,
+            previous: state,
             state: next,
         }
     }
@@ -959,6 +985,7 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
         Outcome::Established {
             flow: self.id_of(slot),
             direction,
+            previous: state,
             state: next,
         }
     }

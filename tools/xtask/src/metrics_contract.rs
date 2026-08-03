@@ -79,6 +79,9 @@ const POLICY_PACKETS: &str = "librefirewall_policy_packets_total";
 /// no counter, so the reason is the only place the default deny appears.
 const ROUTE_DROPS: &str = "librefirewall_route_drops_total";
 
+/// What each pipeline put on its egress ring under a forwarding verdict.
+const FORWARDED_FRAMES: &str = "librefirewall_forwarded_frames_total";
+
 /// What the connection tracker made of the packets it was offered.
 const FLOW_PACKETS: &str = "librefirewall_flow_packets_total";
 
@@ -926,7 +929,7 @@ fn judge_one(
 
     // The cross-check. Summed *here*, over the two labelled series, because the
     // node publishes no total on purpose.
-    let per_pipeline = exposition.select("librefirewall_forwarded_frames_total", &[]);
+    let per_pipeline = exposition.select(FORWARDED_FRAMES, &[]);
     if per_pipeline.len() != 2 {
         return Err(format!(
             "the exposition carries {} forwarded-frame series and the appliance has two \
@@ -1031,6 +1034,58 @@ pub fn sink_records(body: &str, sink: &str) -> Result<u64, String> {
         &[("sink", sink)],
     )
     .map(|sample| sample.value)
+}
+
+/// What `librefirewall_route_drops_total` reports for `reason`, summed over the
+/// pipelines as a reader must — the node publishes no total, so a check that read
+/// one pipeline would pass a node that counted the refusal on the other.
+///
+/// `None` where the family carries no series under that reason at all, which is a
+/// reason the exposition does not know rather than one that has stayed at zero.
+///
+/// Exported for [`crate::surface_contract`], where the recordings' own account of
+/// a refusal is held to this one. The exposition parser lives here.
+///
+/// # Errors
+/// A body that is not an exposition.
+pub fn drop_reason_total(body: &str, reason: &str) -> Result<Option<u64>, String> {
+    let exposition = parse(body)?;
+    let series = exposition.select(ROUTE_DROPS, &[("reason", reason)]);
+    if series.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(series.iter().map(|sample| sample.value).sum()))
+}
+
+/// What `librefirewall_rule_hits_total` reports for the rule the document calls
+/// `id`, or `None` where no series carries that id.
+///
+/// # Errors
+/// A body that is not an exposition.
+pub fn rule_hits(body: &str, id: &str) -> Result<Option<u64>, String> {
+    let exposition = parse(body)?;
+    let series = exposition.select(RULE_HITS, &[("rule", id)]);
+    match series.as_slice() {
+        [] => Ok(None),
+        samples => Ok(Some(samples.iter().map(|sample| sample.value).sum())),
+    }
+}
+
+/// What `librefirewall_forwarded_frames_total` reports, summed over the
+/// pipelines.
+///
+/// # Errors
+/// A body that is not an exposition, or one carrying no such family.
+pub fn forwarded_frames_total(body: &str) -> Result<u64, String> {
+    let exposition = parse(body)?;
+    let series = exposition.select(FORWARDED_FRAMES, &[]);
+    if series.is_empty() {
+        return Err(format!(
+            "the exposition carries no {FORWARDED_FRAMES}, so the recordings' own count of \
+             forwarded observations has nothing to be held to"
+        ));
+    }
+    Ok(series.iter().map(|sample| sample.value).sum())
 }
 
 /// The one sample of `name` matching `labels`, or a verdict naming what was

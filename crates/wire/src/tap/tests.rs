@@ -40,14 +40,31 @@ fn buffer() -> Box<[u8; TAP_SNAP_LEN]> {
 
 /// A forwarded inbound observation identifiable on the way out by `packet_id`.
 fn tagged(packet_id: u64) -> TapAnnotation {
-    TapAnnotation::new(
-        packet_id,
-        0,
-        0,
-        TapOutcome::Forwarded,
-        TapDirection::Inbound,
-        0,
-    )
+    TapAnnotation::new(packet_id, 0, 0, forwarded())
+}
+
+/// The decision a plainly forwarded frame carries: no flow, no rule, no event.
+fn forwarded() -> TapDecision {
+    TapDecision {
+        outcome: TapOutcome::Forwarded,
+        direction: TapDirection::Inbound,
+        generation: 0,
+        flow: None,
+        rule: None,
+        event: None,
+    }
+}
+
+/// A flow in `state`, classified as `classification`, at a fixed identity — so
+/// a test asserting on the identity is asserting on what crossed rather than on
+/// a number it also chose per case.
+fn flow(classification: TapClassification, state: TapFlowState) -> TapFlow {
+    TapFlow {
+        slot: 4_321,
+        generation: 17,
+        classification,
+        state,
+    }
 }
 
 /// A frame whose every byte is derived from `tag`, so a payload delivered under
@@ -71,6 +88,14 @@ fn forge(ring: &Ring, at: u32, raw: &TapAnnotation) {
     slot.drop_reason.store(raw.drop_reason, Ordering::Relaxed);
     slot.flags.store(raw.flags, Ordering::Relaxed);
     slot.generation.store(raw.generation, Ordering::Relaxed);
+    slot.flow_slot.store(raw.flow_slot, Ordering::Relaxed);
+    slot.flow_generation
+        .store(raw.flow_generation, Ordering::Relaxed);
+    slot.classification
+        .store(raw.classification, Ordering::Relaxed);
+    slot.event.store(raw.event, Ordering::Relaxed);
+    slot.flow_state.store(raw.flow_state, Ordering::Relaxed);
+    slot.rule.store(raw.rule, Ordering::Relaxed);
     for (cell, word) in slot._reserved.iter().zip(raw._reserved) {
         cell.store(word, Ordering::Relaxed);
     }
@@ -88,7 +113,23 @@ fn sound_raw() -> TapAnnotation {
         drop_reason: 0,
         flags: TapDirection::Inbound.to_bits(),
         generation: 3,
+        flow_slot: 0,
+        flow_generation: 0,
+        classification: 0,
+        event: 0,
+        flow_state: 0,
+        rule: 0,
         _reserved: [0; TAP_RESERVED_WORDS],
+    }
+}
+
+/// A forwarded inbound decision carrying whatever a case is about.
+fn decision(flow: Option<TapFlow>, rule: Option<TapRule>, event: Option<TapEvent>) -> TapDecision {
+    TapDecision {
+        flow,
+        rule,
+        event,
+        ..forwarded()
     }
 }
 
@@ -110,11 +151,11 @@ fn read_forged(raw: &TapAnnotation) -> Result<CheckedTap, TapFault> {
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(TAP_SNAP_LEN, 2048);
     assert_eq!(TAP_SLOTS, 64);
-    assert_eq!(size_of::<TapAnnotation>(), 56);
-    assert_eq!(size_of::<TapSlot>(), 2104);
-    assert_eq!(size_of::<TapRecords>(), 8 + 64 * 2104);
-    assert_eq!(size_of::<TapRecords>(), 134_664);
-    assert_eq!(TAP_RECORDS_REGION_SIZE, 135_168);
+    assert_eq!(size_of::<TapAnnotation>(), 80);
+    assert_eq!(size_of::<TapSlot>(), 2128);
+    assert_eq!(size_of::<TapRecords>(), 8 + 64 * 2128);
+    assert_eq!(size_of::<TapRecords>(), 136_200);
+    assert_eq!(TAP_RECORDS_REGION_SIZE, 139_264);
     assert!(TAP_RECORDS_REGION_SIZE >= size_of::<TapRecords>());
     assert!(TAP_RECORDS_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
 
@@ -139,7 +180,13 @@ fn the_annotation_occupies_the_bytes_the_recorded_layout_names() {
     assert_eq!(offset_of!(TapAnnotation, drop_reason), 32);
     assert_eq!(offset_of!(TapAnnotation, flags), 36);
     assert_eq!(offset_of!(TapAnnotation, generation), 40);
-    assert_eq!(offset_of!(TapAnnotation, _reserved), 44);
+    assert_eq!(offset_of!(TapAnnotation, flow_slot), 44);
+    assert_eq!(offset_of!(TapAnnotation, flow_generation), 48);
+    assert_eq!(offset_of!(TapAnnotation, classification), 52);
+    assert_eq!(offset_of!(TapAnnotation, event), 56);
+    assert_eq!(offset_of!(TapAnnotation, flow_state), 60);
+    assert_eq!(offset_of!(TapAnnotation, rule), 64);
+    assert_eq!(offset_of!(TapAnnotation, _reserved), 68);
     assert_eq!(TAP_RESERVED_WORDS, 3);
     assert_eq!(align_of::<TapAnnotation>(), 8);
 
@@ -153,8 +200,14 @@ fn the_annotation_occupies_the_bytes_the_recorded_layout_names() {
     assert_eq!(offset_of!(TapSlot, drop_reason), 32);
     assert_eq!(offset_of!(TapSlot, flags), 36);
     assert_eq!(offset_of!(TapSlot, generation), 40);
-    assert_eq!(offset_of!(TapSlot, _reserved), 44);
-    assert_eq!(offset_of!(TapSlot, payload), 56);
+    assert_eq!(offset_of!(TapSlot, flow_slot), 44);
+    assert_eq!(offset_of!(TapSlot, flow_generation), 48);
+    assert_eq!(offset_of!(TapSlot, classification), 52);
+    assert_eq!(offset_of!(TapSlot, event), 56);
+    assert_eq!(offset_of!(TapSlot, flow_state), 60);
+    assert_eq!(offset_of!(TapSlot, rule), 64);
+    assert_eq!(offset_of!(TapSlot, _reserved), 68);
+    assert_eq!(offset_of!(TapSlot, payload), 80);
 }
 
 #[test]
@@ -199,6 +252,9 @@ fn a_zeroed_slot_decodes_to_an_empty_forwarded_observation() {
             outcome: TapOutcome::Forwarded,
             direction: TapDirection::Inbound,
             generation: 0,
+            flow: None,
+            rule: None,
+            event: None,
         }
     );
     assert!(payload.is_empty());
@@ -222,6 +278,12 @@ fn an_untouched_slot_holds_a_zeroed_annotation_and_a_zeroed_payload() {
             drop_reason: 0,
             flags: 0,
             generation: 0,
+            flow_slot: 0,
+            flow_generation: 0,
+            classification: 0,
+            event: 0,
+            flow_state: 0,
+            rule: 0,
             _reserved: [0; TAP_RESERVED_WORDS],
         }
     );
@@ -253,9 +315,14 @@ fn every_field_and_every_payload_byte_survives_the_region() {
         0xdead_beef_0000_0001,
         0x0123_4567_89ab_cdef,
         (MAX_INTERFACES - 1) as u8,
-        TapOutcome::Dropped(TapDropReason::TtlExpired),
-        TapDirection::Outbound,
-        42,
+        TapDecision {
+            outcome: TapOutcome::Dropped(TapDropReason::TtlExpired),
+            direction: TapDirection::Outbound,
+            generation: 42,
+            flow: Some(flow(TapClassification::New, TapFlowState::SynSent)),
+            rule: TapRule::new(9),
+            event: Some(TapEvent::PolicyDenied),
+        },
     );
     assert_eq!(writer.write(&annotation, 1500, &bytes), Ok(1500));
 
@@ -273,6 +340,9 @@ fn every_field_and_every_payload_byte_survives_the_region() {
             outcome: TapOutcome::Dropped(TapDropReason::TtlExpired),
             direction: TapDirection::Outbound,
             generation: 42,
+            flow: Some(flow(TapClassification::New, TapFlowState::SynSent)),
+            rule: TapRule::new(9),
+            event: Some(TapEvent::PolicyDenied),
         }
     );
     assert_eq!(payload, &bytes[..]);
@@ -757,6 +827,239 @@ fn every_drop_reason_round_trips_through_the_region() {
     assert_eq!(TapDropReason::from_bits(0), None);
 }
 
+/// Every classification, state, event and rule position survives the region,
+/// which is what pins this ABI's four decision encodings to the enums they
+/// mirror.
+#[test]
+fn every_decision_value_round_trips_through_the_region() {
+    let classifications = [
+        TapClassification::New,
+        TapClassification::Established,
+        TapClassification::Related,
+    ];
+    assert_eq!(classifications.len() as u32, TAP_CLASSIFICATION_COUNT);
+    let states = [
+        TapFlowState::SynSent,
+        TapFlowState::SynReceived,
+        TapFlowState::Established,
+        TapFlowState::FinWait,
+        TapFlowState::CloseWait,
+        TapFlowState::Closing,
+        TapFlowState::TimeWait,
+        TapFlowState::Closed,
+        TapFlowState::UdpUnreplied,
+        TapFlowState::UdpAssured,
+        TapFlowState::IcmpUnreplied,
+        TapFlowState::IcmpReplied,
+    ];
+    assert_eq!(states.len() as u32, TAP_FLOW_STATE_COUNT);
+    for (index, classification) in classifications.iter().enumerate() {
+        assert_eq!(classification.to_bits(), index as u32 + 1);
+        for (position, state) in states.iter().enumerate() {
+            assert_eq!(state.to_bits(), position as u32 + 1);
+            let expected = TapFlow {
+                slot: 4_321,
+                generation: 17,
+                classification: *classification,
+                state: *state,
+            };
+            let raw = TapAnnotation::new(0, 0, 1, decision(Some(expected), None, None));
+            assert_eq!(
+                read_forged(&raw).map(|checked| checked.flow),
+                Ok(Some(expected))
+            );
+        }
+    }
+    for (index, event) in TapEvent::ALL.iter().enumerate() {
+        assert_eq!(event.to_bits(), index as u32 + 1);
+        let state = if *event == TapEvent::FlowClosed {
+            TapFlowState::TimeWait
+        } else {
+            TapFlowState::Established
+        };
+        let raw = TapAnnotation::new(
+            0,
+            0,
+            1,
+            decision(
+                Some(flow(TapClassification::Established, state)),
+                event
+                    .names_a_rule()
+                    .then(|| TapRule::new(0).expect("a position")),
+                Some(*event),
+            ),
+        );
+        assert_eq!(
+            read_forged(&raw).map(|checked| checked.event),
+            Ok(Some(*event))
+        );
+    }
+    for position in [0, 1, TAP_RULE_COUNT as usize - 1] {
+        let rule = TapRule::new(position).expect("a declarable position");
+        assert_eq!(usize::from(rule.position()), position);
+        let raw = TapAnnotation::new(
+            0,
+            0,
+            1,
+            decision(
+                Some(flow(TapClassification::New, TapFlowState::SynSent)),
+                Some(rule),
+                Some(TapEvent::FlowOpened),
+            ),
+        );
+        assert_eq!(
+            read_forged(&raw).map(|checked| checked.rule),
+            Ok(Some(rule))
+        );
+    }
+}
+
+/// The relations the six decision words must stand in, each broken on its own.
+///
+/// These are the refusals that make a log record's promises checkable rather
+/// than conventional: a reader that folds events by flow identity, or reads a
+/// close for how it closed, is relying on exactly these.
+#[test]
+fn a_decision_the_appliance_could_not_have_taken_is_refused() {
+    let cases: [(TapAnnotation, TapFault); 10] = [
+        (
+            TapAnnotation {
+                classification: TAP_CLASSIFICATION_COUNT + 1,
+                flow_state: TapFlowState::SynSent.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::ClassificationUnknown {
+                classification: TAP_CLASSIFICATION_COUNT + 1,
+            },
+        ),
+        (
+            TapAnnotation {
+                classification: TapClassification::New.to_bits(),
+                flow_state: TAP_FLOW_STATE_COUNT + 1,
+                ..sound_raw()
+            },
+            TapFault::FlowStateUnknown {
+                flow_state: TAP_FLOW_STATE_COUNT + 1,
+            },
+        ),
+        (
+            TapAnnotation {
+                event: TAP_EVENT_COUNT + 1,
+                ..sound_raw()
+            },
+            TapFault::EventUnknown {
+                event: TAP_EVENT_COUNT + 1,
+            },
+        ),
+        (
+            TapAnnotation {
+                rule: TAP_RULE_COUNT + 1,
+                ..sound_raw()
+            },
+            TapFault::RuleUnknown {
+                rule: TAP_RULE_COUNT + 1,
+            },
+        ),
+        // A flow's identity with nothing to say what the frame was to it.
+        (
+            TapAnnotation {
+                flow_slot: 12,
+                flow_generation: 5,
+                ..sound_raw()
+            },
+            TapFault::FlowWithoutClassification {
+                flow_slot: 12,
+                flow_generation: 5,
+                flow_state: 0,
+            },
+        ),
+        // A state with no classification, which is the same fault reported
+        // against the word that was set.
+        (
+            TapAnnotation {
+                flow_state: TapFlowState::Established.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::FlowWithoutClassification {
+                flow_slot: 0,
+                flow_generation: 0,
+                flow_state: TapFlowState::Established.to_bits(),
+            },
+        ),
+        (
+            TapAnnotation {
+                classification: TapClassification::Related.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::FlowStateMissingOnClassified {
+                classification: TapClassification::Related.to_bits(),
+            },
+        ),
+        (
+            TapAnnotation {
+                event: TapEvent::FlowAdvanced.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::FlowEventWithoutFlow {
+                event: TapEvent::FlowAdvanced.to_bits(),
+            },
+        ),
+        // A close whose state is one a flow leaves, so the record says a
+        // conversation ended and does not say how.
+        (
+            TapAnnotation {
+                classification: TapClassification::Established.to_bits(),
+                flow_state: TapFlowState::Established.to_bits(),
+                event: TapEvent::FlowClosed.to_bits(),
+                ..sound_raw()
+            },
+            TapFault::CloseEventWithoutTerminalState {
+                flow_state: TapFlowState::Established.to_bits(),
+            },
+        ),
+        (
+            TapAnnotation {
+                event: TapEvent::PolicyDenied.to_bits(),
+                rule: 0,
+                ..sound_raw()
+            },
+            TapFault::RuleMissingOnFilterDecision {
+                event: TapEvent::PolicyDenied.to_bits(),
+            },
+        ),
+    ];
+    for (raw, expected) in cases {
+        assert_eq!(read_forged(&raw), Err(expected));
+    }
+}
+
+/// A rule on any decision the filter took no part in, including on no decision
+/// at all — the direction that would credit a hit to a rule that never ran.
+#[test]
+fn a_rule_on_a_decision_the_filter_did_not_take_is_refused() {
+    let rule = TapRule::new(3).expect("a declarable position");
+    for event in [
+        None,
+        Some(TapEvent::FlowAdvanced),
+        Some(TapEvent::PolicyNoMatch),
+    ] {
+        let raw = TapAnnotation {
+            classification: TapClassification::Established.to_bits(),
+            flow_state: TapFlowState::Established.to_bits(),
+            event: event.map_or(0, TapEvent::to_bits),
+            rule: rule.to_bits(),
+            ..sound_raw()
+        };
+        assert_eq!(
+            read_forged(&raw),
+            Err(TapFault::RuleOnEventWithoutFilterDecision {
+                rule: rule.to_bits(),
+                event: event.map_or(0, TapEvent::to_bits),
+            })
+        );
+    }
+}
+
 #[test]
 fn the_closed_sets_refuse_every_value_outside_them() {
     assert_eq!(TapVerdict::from_bits(0), Some(TapVerdict::Forwarded));
@@ -1103,6 +1406,10 @@ fn a_thread_scribbling_both_regions_cannot_break_either_side() {
 
 // --- properties ------------------------------------------------------------
 
+/// The `u32` words of [`TapAnnotation`] the byzantine-producer property drives,
+/// which is every field but the two `u64`s and the reserved array.
+const ANNOTATION_WORDS: usize = 13;
+
 /// Everything a checked observation is allowed to be, restated here rather than
 /// reached through the decode, so the property pins what is yielded and not
 /// merely that something was.
@@ -1119,6 +1426,32 @@ fn assert_yield_is_recordable(checked: &CheckedTap, payload: &[u8]) -> Result<()
             prop_assert!(reason.to_bits() <= TAP_DROP_REASON_COUNT);
         }
     }
+    // Every relation the decision words must stand in, so the property pins the
+    // coherence a reader of the recording relies on and not merely that four
+    // more words decoded.
+    if let Some(flow) = checked.flow {
+        prop_assert!(flow.classification.to_bits() >= 1);
+        prop_assert!(flow.classification.to_bits() <= TAP_CLASSIFICATION_COUNT);
+        prop_assert!(flow.state.to_bits() >= 1);
+        prop_assert!(flow.state.to_bits() <= TAP_FLOW_STATE_COUNT);
+    }
+    if let Some(rule) = checked.rule {
+        prop_assert!(u32::from(rule.position()) < TAP_RULE_COUNT);
+    }
+    match checked.event {
+        None => prop_assert!(checked.rule.is_none()),
+        Some(event) => {
+            prop_assert!(event.to_bits() >= 1);
+            prop_assert!(event.to_bits() <= TAP_EVENT_COUNT);
+            prop_assert_eq!(event.names_a_rule(), checked.rule.is_some());
+            if event.names_a_flow() {
+                prop_assert!(checked.flow.is_some());
+            }
+            if event == TapEvent::FlowClosed {
+                prop_assert!(checked.flow.is_some_and(|flow| flow.state.is_terminal()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1133,8 +1466,8 @@ proptest! {
     #[test]
     fn an_arbitrary_records_region_is_drained_safely(
         annotations in proptest::collection::vec(
-            (any::<u64>(), any::<u64>(), any::<u32>(), any::<u32>(), any::<u32>(),
-             any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<[u32; TAP_RESERVED_WORDS]>()),
+            (any::<u64>(), any::<u64>(), any::<[u32; ANNOTATION_WORDS]>(),
+             any::<[u32; TAP_RESERVED_WORDS]>()),
             1..=8,
         ),
         tails in proptest::collection::vec(any::<u32>(), 1..=8),
@@ -1145,11 +1478,13 @@ proptest! {
         let mut into = buffer();
 
         for (index, words) in annotations.iter().enumerate() {
-            let (packet_id, timestamp, interface_id, original_len, captured_len,
-                 verdict, drop_reason, flags, generation, reserved) = *words;
+            let (packet_id, timestamp, [interface_id, original_len, captured_len,
+                 verdict, drop_reason, flags, generation, flow_slot, flow_generation,
+                 classification, event, flow_state, rule], reserved) = *words;
             forge(&ring, index as u32, &TapAnnotation {
                 packet_id, timestamp, interface_id, original_len, captured_len,
-                verdict, drop_reason, flags, generation, _reserved: reserved,
+                verdict, drop_reason, flags, generation, flow_slot, flow_generation,
+                classification, event, flow_state, rule, _reserved: reserved,
             });
         }
 

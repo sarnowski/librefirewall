@@ -6,6 +6,7 @@
 use super::*;
 
 use lfw_capture_ring::SUPERBLOCK_COPY_BYTES;
+use wire::{TapClassification, TapEvent, TapFlow, TapFlowState, TapRule};
 
 const SEGMENT: usize = 8 * 1024;
 const STAGING: usize = 16 * 1024;
@@ -86,6 +87,25 @@ fn tap(packet_id: u64, interface_id: u8, original_len: u32) -> CheckedTap {
         outcome: TapOutcome::Forwarded,
         direction: TapDirection::Inbound,
         generation: 7,
+        flow: None,
+        rule: None,
+        event: None,
+    }
+}
+
+/// The same observation carrying the decision that opened a conversation: the
+/// shape every field of the annotation is actually populated by.
+fn tap_opening(packet_id: u64, interface_id: u8, original_len: u32) -> CheckedTap {
+    CheckedTap {
+        flow: Some(TapFlow {
+            slot: 0x0002_2222,
+            generation: 0x0033_3333,
+            classification: TapClassification::New,
+            state: TapFlowState::SynSent,
+        }),
+        rule: TapRule::new(5),
+        event: Some(TapEvent::FlowOpened),
+        ..tap(packet_id, interface_id, original_len)
     }
 }
 
@@ -383,6 +403,89 @@ fn a_recording_round_trips_through_the_device_and_an_independent_reader() {
         assert_eq!(annotation[4], 0, "inbound");
         assert_eq!(u32::from_le_bytes(annotation[8..12].try_into().unwrap()), 7);
     }
+}
+
+/// Every field the annotation gained, read back off the medium at the offsets a
+/// reader outside this workspace navigates by.
+///
+/// This is the whole of what makes a record say *why*: the conversation it is
+/// about, what the packet did to it, and which of the operator's rules decided
+/// it. Asserted field by field at literal offsets rather than through the
+/// constants that wrote them, so a field that moves is caught here and not
+/// silently read as its neighbour.
+#[test]
+fn an_annotation_carries_the_flow_the_event_and_the_rule() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(96, 4);
+    let observation = tap_opening(3, 1, bytes.len() as u32);
+    assert!(matches!(
+        harness.record(&observation, &bytes),
+        Recorded::Placed { .. }
+    ));
+    harness.seal();
+
+    let file = parse(&harness.download());
+    let packet = &file.packets[0];
+    let annotation = packet.annotation.as_ref().expect("an annotation");
+    assert_eq!(annotation.len(), 24);
+    assert_eq!(annotation[0], ANNOTATION_VERSION);
+    assert_eq!(annotation[0], 2, "the layout a reader keys on");
+    assert_eq!(annotation[1], ANNOTATION_VERDICT_FORWARDED);
+    assert_eq!(annotation[2], 0, "no drop reason on a forwarded frame");
+    assert_eq!(annotation[3], 1, "the interface");
+    assert_eq!(annotation[4], 0, "inbound");
+    assert_eq!(
+        annotation[5] as u32,
+        TapClassification::New.to_bits(),
+        "the packet opened the conversation"
+    );
+    assert_eq!(annotation[6] as u32, TapEvent::FlowOpened.to_bits());
+    assert_eq!(annotation[7] as u32, TapFlowState::SynSent.to_bits());
+    assert_eq!(
+        u32::from_le_bytes(annotation[8..12].try_into().expect("four octets")),
+        7,
+        "the configuration generation"
+    );
+    assert_eq!(
+        u32::from_le_bytes(annotation[12..16].try_into().expect("four octets")),
+        0x0002_2222,
+        "the flow's slot"
+    );
+    assert_eq!(
+        u32::from_le_bytes(annotation[16..20].try_into().expect("four octets")),
+        0x0033_3333,
+        "and which occupant of it"
+    );
+    assert_eq!(
+        u16::from_le_bytes(annotation[20..22].try_into().expect("two octets")),
+        6,
+        "the rule at position five, one higher so zero can mean none"
+    );
+    assert_eq!(&annotation[22..], &[0, 0], "the layout ends where it says");
+}
+
+/// An observation naming no conversation leaves every one of those fields zero,
+/// which is what makes *absent* a value a reader can read rather than a shape it
+/// has to infer from a length.
+#[test]
+fn an_observation_with_no_flow_leaves_the_decision_fields_zero() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(64, 0);
+    harness.record(&tap(1, 0, 64), &bytes);
+    harness.seal();
+
+    let file = parse(&harness.download());
+    let annotation = file.packets[0]
+        .annotation
+        .as_ref()
+        .expect("an annotation")
+        .clone();
+    assert_eq!(
+        &annotation[5..8],
+        &[0, 0, 0],
+        "classification, event, state"
+    );
+    assert_eq!(&annotation[12..22], &[0; 10], "identity and rule");
 }
 
 #[test]

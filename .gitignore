@@ -5,6 +5,12 @@
 /target/
 /book/book/
 
+# The pinned nightly ICEs on a stale incremental cache, and drops its crash dump
+# in the working directory rather than under target/. Five of them reached a
+# commit before this pattern existed; they are a compiler artifact of one
+# machine's build and belong in no tree.
+/rustc-ice-*.txt
+
 # Key material must never reach a commit, whatever path it is dropped at: the
 # development signing keys under build/dev-keys, and any TLS-inspection CA or
 # private key an operator points the build at. These are catch-all patterns

@@ -112,10 +112,12 @@ pub use log_ring::{
     LogReader, LogRecords, LogRingFull, LogWriter,
 };
 pub use tap::{
-    CheckedTap, TAP_CONSUME_REGION_SIZE, TAP_DROP_REASON_COUNT, TAP_FLAG_OUTBOUND, TAP_FLAGS_KNOWN,
-    TAP_RECORDS_REGION_SIZE, TAP_RESERVED_WORDS, TAP_SLOTS, TAP_SNAP_LEN, TapAnnotation,
-    TapConsume, TapDirection, TapDropReason, TapFault, TapOutcome, TapReader, TapRecords,
-    TapRingFull, TapVerdict, TapWriteError, TapWriter,
+    CheckedTap, TAP_CLASSIFICATION_COUNT, TAP_CONSUME_REGION_SIZE, TAP_DROP_REASON_COUNT,
+    TAP_EVENT_COUNT, TAP_FLAG_OUTBOUND, TAP_FLAGS_KNOWN, TAP_FLOW_STATE_COUNT,
+    TAP_RECORDS_REGION_SIZE, TAP_RESERVED_WORDS, TAP_RULE_COUNT, TAP_SLOTS, TAP_SNAP_LEN,
+    TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
+    TapEvent, TapFault, TapFlow, TapFlowState, TapOutcome, TapReader, TapRecords, TapRingFull,
+    TapRule, TapVerdict, TapWriteError, TapWriter,
 };
 
 use image::{checked_value, shared_image};

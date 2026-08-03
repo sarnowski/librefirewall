@@ -34,7 +34,9 @@ and this reference does not carry guesses.
 - **Configuration read** — the `GET /config` endpoint, returning the exact running configuration as
   the document that produced it.
 - **Recording download** — `GET /logs.pcapng` and `GET /capture.pcapng`, the two pcapng recording
-  sinks (see the [recording design](../design/recording.md)). This surface carries **evidence rather
+  sinks (see the [recording design](../design/recording.md)). The first is a **connection history**,
+  holding a record where the appliance reached a connection lifecycle or policy event; the second
+  holds **every observation with the verdict on it**. This surface carries **evidence rather
   than state**: nothing on it is summarised, a reader is a packet analyser rather than a dashboard,
   and it is the only one of the six that carries the traffic itself, at a volume the medium under it
   bounds rather than memory. It is HTTP on the management port, like `GET /metrics`, `GET /logs` and
