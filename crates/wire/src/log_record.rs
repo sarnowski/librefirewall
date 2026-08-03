@@ -67,7 +67,7 @@ pub const LOG_FIELD_COUNT: u8 = 16;
 pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
 
 /// `lfw_log::RejectReason::ALL`.
-pub const LOG_REJECT_REASON_COUNT: u8 = 34;
+pub const LOG_REJECT_REASON_COUNT: u8 = 35;
 
 /// Whether a record's instant is one or is the absence of one.
 ///

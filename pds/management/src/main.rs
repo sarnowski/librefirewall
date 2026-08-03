@@ -50,8 +50,12 @@
 //! `pd_runtime::CommittedReader` is that weaker role, and it holds the whole of
 //! it.
 //!
-//! What it costs: this domain holds no channel to the configuration domain, so
-//! it learns of a commit only when the next frame wakes it.
+//! What that costs is smaller than it was and is still real. This domain now holds
+//! a channel to the configuration domain — it has to, being the only party that
+//! knows a submitted document has arrived — but the channel carries *submissions*
+//! and not the commit protocol: this domain still reads the committed generation
+//! from `cfg` and takes no part in releasing one. So a commit somebody else
+//! provoked still reaches it only when the next frame or the next answer wakes it.
 //!
 //! # Two instructions, and why they are here rather than in a crate
 //!
@@ -94,15 +98,25 @@
 //! the renderer walks one uniform array rather than seven regions plus a live
 //! read of its own counters.
 //!
-//! # Deviation from the design: the endpoint is plain HTTP
+//! # Deviation from the design: the endpoint is plain HTTP, and it now takes writes
 //!
-//! The design requires the management API to carry encryption, authentication
-//! and read/write authorization through an mTLS certificate pair. **None of it
-//! exists.** There is no TLS in this appliance, this domain authenticates
-//! nobody, and anything that can reach the management port can read every metric
-//! this node exposes. `GET /config` and `GET /logs` are absent too and answer 404
-//! rather than being stubbed. Until the required TLS termination
-//! exists the port belongs on an isolated network.
+//! The design requires the management API to carry encryption, authentication and
+//! read/write authorization through an mTLS certificate pair. **None of it exists.**
+//! There is no TLS in this appliance and this domain authenticates nobody, so
+//! **anything that can reach the management port can read every metric this node
+//! exposes, download every packet it has recorded, read its configuration, and
+//! replace that configuration** — which is to say, decide what this firewall
+//! forwards. The port must not be exposed to an untrusted network until the
+//! required TLS termination and certificate handling exist. `GET /logs` is still
+//! absent and answers 404 rather than being stubbed.
+//!
+//! # It carries a document and decides nothing about it
+//!
+//! A submitted document is copied into a region the configuration domain reads and
+//! is never parsed here: that domain holds no frame buffer and this one holds two
+//! pipelines, which is the whole of why the split exists. What comes back is a
+//! status from a closed set and a byte range this domain hands to the transport
+//! unread (`pd_runtime::configuration`).
 //!
 //! # What a console record says, and why not one per frame
 //!
@@ -118,11 +132,11 @@ use entropy::EntropyError;
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    CalibrationRefused, ClockCalibration, ConfigHandover, Downloads, EndpointRegions,
-    EndpointStage, ForwardRings, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region,
-    log_sample, read_timestamp_counter,
+    CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
+    Configurations, Downloads, EndpointRegions, EndpointStage, ForwardRings, IsnSecret, PdClock,
+    Pool, ReturnRing, StatsRegions, attach_region, log_sample, read_timestamp_counter,
 };
-use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
 
 /// How many dataplane ports the build has, and so the bound a committed image's
@@ -134,6 +148,11 @@ use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
 /// would put an XML parser inside the domain that faces the management-plane
 /// attacker, and this domain has no document to read.
 const PORTS: u8 = 2;
+
+/// The configuration domain, and the one send capability this domain holds in this
+/// system. It blocks in the Microkit event loop and never polls, so a document
+/// written into the submission region is invisible to it until it is woken.
+const CONFIG: Channel = Channel::new(2);
 
 /// This domain's lifecycle record.
 fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
@@ -245,10 +264,14 @@ fn init() -> Management {
     let request: &'static DownloadRequest = attach_region!(dl_request_vaddr: DownloadRequest);
     let reply: &'static DownloadReply = attach_region!(dl_reply_vaddr: DownloadReply);
     let downloads = Downloads::attach(request, reply);
+    let cfg_request: &'static ConfigRequest = attach_region!(cfg_request_vaddr: ConfigRequest);
+    let cfg_reply: &'static ConfigReply = attach_region!(cfg_reply_vaddr: ConfigReply);
+    let configurations = Configurations::attach(cfg_request, cfg_reply);
     let mut stage = stage;
-    // Both recordings, before the first frame: a target registered late would
-    // answer `404` to a client that asked at exactly the wrong moment.
-    let registered = downloads.register(&mut stage);
+    // Both recordings and the configuration surface, before the first frame: a
+    // target registered late would answer `404` to a client that asked at exactly
+    // the wrong moment.
+    let registered = downloads.register(&mut stage) && configurations.register(&mut stage);
     // The port is unaddressed until a generation is committed and unclocked until
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
@@ -271,6 +294,7 @@ fn init() -> Management {
     Management::Running(Running {
         stage,
         downloads,
+        configurations,
         handover,
         clock,
         sink,
@@ -305,6 +329,9 @@ struct Running {
     /// The recording downloads this port serves. Kept for the same reason: it
     /// holds this domain's position in the request channel's sequence.
     downloads: Downloads<'static>,
+    /// The configuration surface this port serves, holding this domain's position
+    /// in the submission channel's sequence for the same reason.
+    configurations: Configurations<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
     sink: RingSink<'static, PdClock<'static>>,
@@ -352,11 +379,20 @@ impl Handler for Management {
         // is in the transport's hands by the time this pass composes a segment.
         // It never blocks: a pass with no reply yet does nothing.
         running.downloads.poll(&mut running.stage);
+        // And the configuration channel, on the download channel's terms exactly:
+        // an answer that landed between wakeups is in the endpoint's hands by the
+        // time this pass composes a segment.
+        if running.configurations.poll(&mut running.stage) {
+            CONFIG.notify();
+        }
         let log = log_sample(running.sink.dropped(), running.sink.refused());
         let moved = running.stage.poll(read_timestamp_counter(), log);
-        // And after them, because a request parsed in this very pass is what
-        // puts a stream in `pending_stream`.
+        // And after them, because a request parsed in this very pass is what puts
+        // a stream in `pending_stream` or a document in `submission`.
         running.downloads.poll(&mut running.stage);
+        if running.configurations.poll(&mut running.stage) {
+            CONFIG.notify();
+        }
         if moved > 0 {
             let counters = running.stage.counters();
             announce(

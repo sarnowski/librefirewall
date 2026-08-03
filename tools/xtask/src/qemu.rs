@@ -434,6 +434,38 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
         // A `Client` scenario, because the whole of what it proves is on the two
         // recordings: on the wire an opening and a close are two frames that were
         // forwarded, and nothing about either says a conversation began or ended.
+        // The one scenario that CHANGES what the appliance is doing, and the only
+        // evidence there is that this node is configurable at all.
+        //
+        // It boots the published disk, so the policy in force is the shipped
+        // document's, and injects the two probes that document decides: the
+        // accepted port is forwarded and the denied one is dropped by a rule. It
+        // then hands the node, over HTTP and with `curl`, a document that is the
+        // shipped one with those two rules' ACTIONS SWAPPED and nothing else
+        // changed — reads the running document back, holds the answer to naming the
+        // generation it assigned, submits a malformed document and holds *that* to
+        // being refused with a reason and moving nothing, waits for the forwarding
+        // domain to report the committed generation, and only then injects the same
+        // two ports again. Both verdicts must have reversed.
+        //
+        // Both directions, and that is the point: a document that only tightened
+        // the policy would leave "the new rules are in force" and "the dataplane
+        // has stopped" looking alike. Here the traffic the shipped policy dropped
+        // is FORWARDED after the commit, so the dataplane is demonstrably still
+        // deciding — and the forwarded totals it publishes rise across the swap
+        // rather than resetting, which is what says no domain restarted under it.
+        //
+        // A `Client` scenario necessarily: the document is submitted with a real
+        // client through QEMU's own user-mode stack, and the generation the
+        // dataplane switched to is a metric.
+        Scenario {
+            name: "configuration-submission",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Reconfiguration,
+        },
         Scenario {
             name: "connection-lifecycle",
             document: LIFECYCLE_DOCUMENT,
@@ -630,6 +662,18 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
                 &evidence,
             )
             .map_err(|error| format!("scenario {name}: {error}"))?;
+            if let Some(applied) = &booted.applied {
+                // Ahead of the recordings, because it is the whole of what this
+                // scenario proves and a reader looks for it first.
+                let transcript = applied.render();
+                println!("{transcript}");
+                append_evidence(
+                    &log,
+                    "the configuration this boot submitted, and what the node said about it",
+                    &transcript,
+                )
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            }
             let judged = judge_recordings(root, name, &booted, &topology, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             println!("{judged}");
@@ -640,10 +684,18 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
                 &judged,
             )
             .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!(
-                "; {} scrapes and both recordings judged together",
-                booted.scrapes.len()
-            )
+            match &booted.applied {
+                Some(applied) => format!(
+                    "; {} scrapes and both recordings judged together; generation {} submitted \
+                     over HTTP and in force on the dataplane",
+                    booted.scrapes.len(),
+                    applied.generation
+                ),
+                None => format!(
+                    "; {} scrapes and both recordings judged together",
+                    booted.scrapes.len()
+                ),
+            }
         }
     };
     let judged = match scenario.console {

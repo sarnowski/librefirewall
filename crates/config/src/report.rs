@@ -23,10 +23,18 @@ use crate::{
 
 /// What committing a document did.
 ///
-/// Three outcomes rather than the two an `Option` carries: a commit whose
-/// content was already running assigned nothing and refused nothing, and folding
-/// the two together had a domain announce `state=refused` for a document it had
-/// accepted — a console must carry the system's true state.
+/// Four outcomes rather than the two an `Option` carries: a commit whose content
+/// was already running assigned nothing and refused nothing, and folding the two
+/// together had a domain announce `state=refused` for a document it had accepted
+/// — a console must carry the system's true state. The refusals are two because
+/// the vocabularies are two: a refused *document* names the rule it broke, while
+/// a commit that could not proceed has no reason token, nothing about the
+/// configuration being wrong.
+///
+/// Every variant carries what a caller answering a submitter needs, so the
+/// records this type's producer wrote to the console are not the only account of
+/// what happened: a domain that must also answer the party that submitted the
+/// document reads it off the report rather than out of its own log ring.
 #[expect(
     clippy::large_enum_variant,
     reason = "boxing needs an allocator; the value is a temporary destructured at once"
@@ -34,19 +42,27 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitReport {
     /// The configuration moved, and this is the image the consumer is handed.
-    Published(ConfigImage),
+    Published { image: ConfigImage, changes: u32 },
     /// Committed, and already running — a commit is keyed by content: nothing to publish.
     Unchanged,
-    /// Nothing is in force from this document.
-    Refused,
+    /// The document broke a rule. Nothing is in force from it.
+    Rejected {
+        reason: RejectReason,
+        /// The number `reason` names: a byte position in the document, where the
+        /// refusal has one, and zero where it names an object instead.
+        detail: u32,
+    },
+    /// Every rule passed and the generation counter has no successor to assign,
+    /// so nothing is in force from this document either.
+    Exhausted,
 }
 
 impl CommitReport {
     #[must_use]
     pub const fn image(self) -> Option<ConfigImage> {
         match self {
-            Self::Published(image) => Some(image),
-            Self::Unchanged | Self::Refused => None,
+            Self::Published { image, .. } => Some(image),
+            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted => None,
         }
     }
 
@@ -56,8 +72,8 @@ impl CommitReport {
     #[must_use]
     pub const fn generation(self) -> u32 {
         match self {
-            Self::Published(image) => image.generation,
-            Self::Unchanged | Self::Refused => 0,
+            Self::Published { image, .. } => image.generation,
+            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted => 0,
         }
     }
 
@@ -68,8 +84,8 @@ impl CommitReport {
     #[must_use]
     pub const fn state(self) -> DomainState {
         match self {
-            Self::Published(_) | Self::Unchanged => DomainState::Ready,
-            Self::Refused => DomainState::Refused,
+            Self::Published { .. } | Self::Unchanged => DomainState::Ready,
+            Self::Rejected { .. } | Self::Exhausted => DomainState::Refused,
         }
     }
 }
@@ -108,7 +124,7 @@ pub fn commit_and_report(store: &mut Datastore, document: &[u8], sink: &dyn Sink
                 outcome: GenerationOutcome::Refused,
                 changes: 0,
             });
-            return CommitReport::Refused;
+            return CommitReport::Exhausted;
         }
     };
 
@@ -123,12 +139,13 @@ pub fn commit_and_report(store: &mut Datastore, document: &[u8], sink: &dyn Sink
             CommitReport::Unchanged
         }
         CommitOutcome::Applied { changes, .. } => {
+            let changes = saturating(changes);
             sink.emit(&Event::ConfigGeneration {
                 generation,
                 outcome: GenerationOutcome::Applied,
-                changes: saturating(changes),
+                changes,
             });
-            CommitReport::Published(image)
+            CommitReport::Published { image, changes }
         }
     }
 }
@@ -167,7 +184,10 @@ fn refuse(running: Generation, reason: RejectReason, offset: u32, sink: &dyn Sin
         reason,
         offset,
     });
-    CommitReport::Refused
+    CommitReport::Rejected {
+        reason,
+        detail: offset,
+    }
 }
 
 const fn rejection(error: ConfigError) -> RejectReason {
@@ -314,7 +334,13 @@ mod tests {
     #[test]
     fn a_refused_document_publishes_nothing_and_names_where_it_broke() {
         let (report, events) = run("<?xml version=\"1.0\"?><!DOCTYPE evil><configuration/>");
-        assert_eq!(report, CommitReport::Refused);
+        assert_eq!(
+            report,
+            CommitReport::Rejected {
+                reason: RejectReason::Doctype,
+                detail: 21,
+            }
+        );
         assert_eq!(events.len(), 1, "a refusal is one record");
         match events[0] {
             Event::ConfigRejected {
@@ -334,7 +360,13 @@ mod tests {
     fn a_semantically_refused_document_reports_its_rule_and_no_position() {
         let dangling = ONE_PORT.replacen("interface=\"wan\"", "interface=\"dmz\"", 1);
         let (report, events) = run(&dangling);
-        assert_eq!(report, CommitReport::Refused);
+        assert_eq!(
+            report,
+            CommitReport::Rejected {
+                reason: RejectReason::UnknownInterfaceReference,
+                detail: 0,
+            }
+        );
         assert_eq!(
             events,
             [Event::ConfigRejected {
@@ -364,7 +396,13 @@ mod tests {
             let (report, events) = run_on(&mut store, document);
             assert_eq!(
                 report,
-                CommitReport::Refused,
+                CommitReport::Rejected {
+                    reason,
+                    detail: match report {
+                        CommitReport::Rejected { detail, .. } => detail,
+                        ref other => panic!("{other:?} published something for {document}"),
+                    },
+                },
                 "{document} published something"
             );
             assert_eq!(store.running(), running, "{document} moved the generation");
@@ -414,7 +452,7 @@ mod tests {
         let mut store = Datastore::new();
         let (first, _) = run_on(&mut store, EMPTY);
         assert!(
-            matches!(first, CommitReport::Published(_)),
+            matches!(first, CommitReport::Published { .. }),
             "a disabled management port is still something a document says"
         );
 
@@ -438,7 +476,7 @@ mod tests {
     #[test]
     fn each_outcome_announces_the_state_it_actually_is() {
         let published = run(ONE_PORT).0;
-        assert!(matches!(published, CommitReport::Published(_)));
+        assert!(matches!(published, CommitReport::Published { .. }));
         assert_eq!(published.state(), DomainState::Ready);
 
         let mut store = Datastore::new();
@@ -449,9 +487,22 @@ mod tests {
         assert_eq!(unchanged.image(), None, "there is nothing to publish");
 
         let refused = run("<!DOCTYPE x><configuration/>").0;
-        assert_eq!(refused, CommitReport::Refused);
+        assert_eq!(
+            refused,
+            CommitReport::Rejected {
+                reason: RejectReason::Doctype,
+                detail: 0,
+            }
+        );
         assert_eq!(refused.state(), DomainState::Refused);
         assert_eq!(refused.image(), None);
+        assert_eq!(refused.generation(), 0);
+        // The other refusal, whose vocabulary has no reason token at all: it is
+        // still a refusal, still publishes nothing, and still leaves the domain
+        // announcing the state it is in.
+        assert_eq!(CommitReport::Exhausted.state(), DomainState::Refused);
+        assert_eq!(CommitReport::Exhausted.image(), None);
+        assert_eq!(CommitReport::Exhausted.generation(), 0);
     }
 
     #[test]

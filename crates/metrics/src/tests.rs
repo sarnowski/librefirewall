@@ -576,7 +576,7 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
             ..TcpSample::default()
         },
         http: HttpSample {
-            expositions_refused: 4,
+            bodies_refused: 4,
             ..HttpSample::default()
         },
         log: LogSample {
@@ -590,6 +590,21 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     assert_eq!(values[1], 2);
     assert_eq!(values[MANAGEMENT_SLOTS - 1], 5);
     assert_eq!(values.iter().filter(|value| **value != 0).count(), 5);
+
+    // The configuration domain's, whose per-outcome block is the one set here
+    // published by position: a value in the wrong slot would attribute a refusal
+    // to a generation that applied.
+    let config = ConfigSample {
+        generation: 7,
+        submissions: [11, 13, 17],
+        reads: 19,
+        log: LogSample {
+            dropped: 23,
+            refused: 29,
+        },
+    };
+    assert_eq!(config.values(), [7, 11, 13, 17, 19, 23, 29]);
+    assert_eq!(config.values().len(), CONFIG_SLOTS);
 }
 
 /// The table constructors, exercised at run time. They are `const fn`s the
@@ -1119,5 +1134,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 76_407);
+    assert_eq!(MAX_EXPOSITION_LEN, 77_922);
 }

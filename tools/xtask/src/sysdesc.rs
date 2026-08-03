@@ -77,7 +77,8 @@ use lfw_metrics::{MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, STATS_REGION_SIZE};
 use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
 use pd_runtime::{
-    FLOW_TABLE_REGION_SIZE, FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE,
+    CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, FLOW_TABLE_REGION_SIZE,
+    FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE,
 };
 use uart_16550::{COM1_BASE, PORT_COUNT as COM1_PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
@@ -365,6 +366,14 @@ const DOWNLOAD_WITHHELD: &str = "the forwarder maps NEITHER download region, in 
 
 /// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
 /// the finding on the management domain gaining the acknowledgement region.
+/// What the submission channel's two rows withhold, in both directions at once.
+const CONFIG_SUBMISSION_WITHHELD: &str = "the FORWARDER maps NEITHER submission region, in \
+     either direction, and neither does any driver or the recorder: a document on its way to \
+     being decided is not something a dataplane domain has any use for, and a forwarder able to \
+     write `cfg_reply` could answer an operator's `GET /config` with a policy the appliance is \
+     not running. The two mappers are the two ends of one conversation and the perms carry which \
+     end speaks in which direction";
+
 const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `cfgack` NOT AT \
      ALL, which is what makes it a weaker consumer of the handover than the forwarder rather than \
      a second one. The forwarder is the consumer of the two-phase commit: it reads the OFFERED \
@@ -800,6 +809,41 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("forwarder"), read_write("recorder")],
         withheld: Some(TAP_WITHHELD),
+    },
+    // The configuration submission channel: the same two-region mirror, and the
+    // pair whose direction carries the most. `cfg_request` is management's to write
+    // because a document arrives on a TCP connection it terminates; `cfg_reply` is
+    // the config domain's, because it holds the datastore and is the only domain
+    // that can say what is running. Crossing either is the finding: a config domain
+    // able to write the request would decide on bytes nobody submitted, and a
+    // management domain able to write the reply would answer `GET /config` with a
+    // document the appliance is not running — which an operator would then edit and
+    // submit, so a fabricated statement about the policy in force is worse than a
+    // wrong one.
+    //
+    // The direction of *parsing* is what the exclusion below claims, and it is the
+    // whole reason the config domain exists: the domain that reads an attacker's
+    // XML holds no frame buffer, and the domain that holds two frame pipelines
+    // reads none of it.
+    RegionRule {
+        name: "cfg_request",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_REQUEST_REGION_SIZE",
+            bytes: CONFIG_REQUEST_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("management"), read_only("config")],
+        withheld: Some(CONFIG_SUBMISSION_WITHHELD),
+    },
+    RegionRule {
+        name: "cfg_reply",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_REPLY_REGION_SIZE",
+            bytes: CONFIG_REPLY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("management"), read_write("config")],
+        withheld: Some(CONFIG_SUBMISSION_WITHHELD),
     },
     RegionRule {
         name: "dl_request",
@@ -1269,7 +1313,7 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
 /// the same thing: the forwarder's two ends are about a domain that holds one
 /// send capability and must hold no more, and this end is about a domain that
 /// holds none at all.
-const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds NO send capability on      anything, in this system or on this channel, and this is the end that says so. It is a      notified-driven consumer: it is woken, it drains, it returns. A send capability here would be      one on a driver that never leaves `init` and so could never observe it — authority for      nothing — and it would make pds/nic-driver's claim that its `notified` entrypoint is      unreachable by *capability* false for the third instance while staying true for the other two";
+const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY ONE send      capability in this system — on the configuration domain, where a submitted document is      otherwise invisible to a peer that never polls — and this is an end that says it is not      this one. It is a notified-driven consumer here: it is woken, it drains, it returns. A send      capability on this end would be one on a driver that never leaves `init` and so could never      observe it — authority for nothing — and it would make pds/nic-driver's claim that its      `notified` entrypoint is unreachable by *capability* false for the third instance while      staying true for the other two";
 
 /// Every `<end>` the description may declare, and the direction that one
 /// channel is granted in. An end absent from this table fails the gate, and so
@@ -1350,6 +1394,29 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         notification: Notification::MayNotSend {
             claim: MANAGEMENT_CHANNEL_ONE_WAY,
         },
+    },
+    // The configuration submission channel, granted in BOTH directions, and the
+    // one place the management domain holds a send capability at all. It must: the
+    // config domain has no polling loop — it blocks in the Microkit event loop,
+    // which is why it costs nothing at the highest priority in the system — so a
+    // document copied into `cfg_request` is invisible to it until it is woken, and
+    // the only party that knows one arrived is the domain that copied it. What the
+    // capability is worth to an attacker is a wakeup at a rate they choose, on a
+    // domain whose answer to one is bounded and which holds no device, no pool and
+    // no ring; the same party provokes exactly that by submitting a document,
+    // which is the request this appliance is now built to accept. The reverse
+    // direction is the recorder channel's argument: a management domain that
+    // learned of a decision only when the next frame woke it would stall a client
+    // holding a connection open.
+    ChannelEnd {
+        domain: "config",
+        id: "1",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "management",
+        id: "2",
+        notification: Notification::MaySend,
     },
 ];
 

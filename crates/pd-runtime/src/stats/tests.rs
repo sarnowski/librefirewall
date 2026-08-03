@@ -289,8 +289,40 @@ fn a_log_sample_widens_rather_than_truncates() {
     assert_eq!(sample.dropped, u64::from(u32::MAX));
     assert_eq!(sample.refused, u64::from(u32::MAX - 1));
     assert_eq!(
-        config_sample(u32::MAX, sample).generation,
+        config_sample(u32::MAX, SubmissionCounters::default(), sample).generation,
         u64::from(u32::MAX)
+    );
+}
+
+/// The deciding domain's per-outcome block is published by position, so a pair
+/// swapped between this crate and the metric vocabulary would attribute every
+/// refusal to a generation that applied. The two are held together by name here.
+#[test]
+fn the_submission_counters_land_under_the_outcomes_they_name() {
+    let sample = config_sample(
+        3,
+        SubmissionCounters {
+            applied: 11,
+            refused: 13,
+            unchanged: 17,
+            reads: 19,
+        },
+        log_sample(0, 0),
+    );
+    assert_eq!(sample.generation, 3);
+    assert_eq!(sample.reads, 19);
+    let named: Vec<(&str, u64)> = lfw_metrics::GENERATION_OUTCOME_NAMES
+        .iter()
+        .copied()
+        .zip(sample.submissions)
+        .collect();
+    assert_eq!(named, [("applied", 11), ("refused", 13), ("unchanged", 17)]);
+    // And the console's own vocabulary is that list, in that order: an operator
+    // reading `outcome=refused` on a serial line and graphing the refused series
+    // must be reading one thing.
+    assert_eq!(
+        lfw_log::GenerationOutcome::ALL.map(|outcome| outcome.name()),
+        lfw_metrics::GENERATION_OUTCOME_NAMES
     );
 }
 

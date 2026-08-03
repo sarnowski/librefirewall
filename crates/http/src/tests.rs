@@ -3,6 +3,16 @@ use proptest::prelude::*;
 use super::*;
 use crate::response::HeadDoesNotFit;
 
+/// The body bound every head below is read against, unless a test states its
+/// own: the same 64 KiB the management server offers, so the two agree.
+const BODY_LIMIT: usize = 64 * 1024;
+
+/// [`crate::parse`] under that bound, shadowing it so a test about a *head* says
+/// nothing about a body and one about a body states the limit it means.
+fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
+    crate::parse(bytes, BODY_LIMIT)
+}
+
 fn complete(bytes: &[u8]) -> (Request<'_>, usize) {
     match parse(bytes).expect("a well-formed head") {
         Parsed::Complete { request, consumed } => (request, consumed),
@@ -149,7 +159,32 @@ fn every_refusal_names_the_status_the_client_is_owed() {
             Status::BadRequest,
         ),
         (
-            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            RequestError::BodyNotAccepted,
+            Status::BadRequest,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+            RequestError::BodyNotAccepted,
+            Status::BadRequest,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n",
+            RequestError::BodyNotAccepted,
+            Status::BadRequest,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: 5x\r\n\r\n",
+            RequestError::BodyNotAccepted,
+            Status::BadRequest,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: 12345678901\r\n\r\n",
+            RequestError::BodyNotAccepted,
+            Status::BadRequest,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: \r\n\r\n",
             RequestError::BodyNotAccepted,
             Status::BadRequest,
         ),
@@ -162,11 +197,74 @@ fn every_refusal_names_the_status_the_client_is_owed() {
 }
 
 /// `Content-Length: 0` announces no body, so it is not a smuggling risk and is
-/// accepted — a scraper behind a proxy may add one.
+/// accepted — a scraper behind a proxy may add one. On any method, because a
+/// declared body of nothing is no body at all.
 #[test]
 fn a_zero_content_length_is_accepted() {
     let (request, _) = complete(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(request.header("content-length"), Some("0"));
+    assert_eq!(request.body_len(), 0);
+    assert!(!request.is_post());
+
+    let (request, _) = complete(b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(request.body_len(), 0);
+    assert!(request.is_post());
+}
+
+/// A body under the one framing this parser admits: the declared length is
+/// reported and the head's own length is what was consumed, so a caller knows
+/// exactly where the body begins in its buffer.
+#[test]
+fn a_post_body_is_reported_as_a_length_and_the_head_ends_where_it_says() {
+    const HEAD: &[u8] = b"POST /config HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\n";
+    let stream = [HEAD, b"hello world"].concat();
+    let (request, consumed) = complete(&stream);
+    assert!(request.is_post());
+    assert!(!request.is_get());
+    assert_eq!(request.target(), "/config");
+    assert_eq!(request.body_len(), 11);
+    assert_eq!(consumed, HEAD.len());
+    assert_eq!(
+        stream.get(consumed..consumed + request.body_len()),
+        Some(b"hello world".as_slice())
+    );
+    // A leading zero is `1*DIGIT` and is admitted rather than read as far as it
+    // parses, which is where a second party on the path would disagree.
+    let (padded, _) = complete(b"POST / HTTP/1.1\r\nContent-Length: 0011\r\n\r\n");
+    assert_eq!(padded.body_len(), 11);
+}
+
+/// The bound belongs to the caller, so it is the caller's number a head is
+/// refused against — and the refusal is at the head, before a body byte is
+/// accumulated.
+#[test]
+fn a_body_past_the_callers_bound_is_refused_at_the_head() {
+    let head = |len: usize| -> Vec<u8> {
+        std::format!("POST / HTTP/1.1\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+    };
+    for limit in [0usize, 1, 16, BODY_LIMIT] {
+        let exact = head(limit);
+        match crate::parse(&exact, limit).expect("exactly the bound") {
+            Parsed::Complete { request, .. } => assert_eq!(request.body_len(), limit),
+            Parsed::NeedMore => panic!("the head is whole"),
+        }
+        let over = head(limit + 1);
+        let refused = crate::parse(&over, limit).expect_err("past the bound");
+        assert_eq!(
+            refused,
+            RequestError::BodyTooLarge {
+                declared: limit as u64 + 1
+            },
+            "limit {limit}"
+        );
+        assert_eq!(refused.status(), Status::ContentTooLarge);
+    }
+    // A caller that takes no body at all passes zero, and every declared body is
+    // then past its bound.
+    assert_eq!(
+        crate::parse(b"POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\n", 0),
+        Err(RequestError::BodyTooLarge { declared: 1 })
+    );
 }
 
 /// Every bound is enforced at its own edge: one byte under passes, one byte over

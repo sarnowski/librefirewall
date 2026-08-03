@@ -305,6 +305,7 @@ fn witness() -> PolicyWitness {
         // TCP segment: the filter probe set injects three datagrams.
         probed_an_established_flow: false,
         probed_mid_stream: false,
+        reconfigured: false,
     }
 }
 
@@ -952,4 +953,70 @@ fn a_refusal_counted_on_the_other_pipeline_still_sums() {
         );
     judge(&only(text), 9, witness(), &topology())
         .expect("the same two refusals, counted on the other direction of the same dataplane");
+}
+
+/// The witness of a boot that ran two policies: one it booted with and one
+/// submitted over the management API while it ran.
+fn reconfigured_witness() -> PolicyWitness {
+    PolicyWitness {
+        reconfigured: true,
+        ..witness()
+    }
+}
+
+/// A boot that changed its policy is judged on the **sum** of the two rules'
+/// matches, and that is a weaker statement made deliberately rather than a check
+/// dropped: the two ids keep their names and exchange their actions, so each
+/// accrues hits under both generations and neither count is attributable on its
+/// own. What stays exact is that every packet the filter decided is an opening or
+/// a denial.
+#[test]
+fn a_boot_that_changed_its_policy_is_judged_on_the_sum_of_its_rules() {
+    // The base fixture already satisfies the sum: nine openings and two denials
+    // against nine plus two matches.
+    let judged = judge(
+        &only(body((5, 4), (4, 5))),
+        9,
+        reconfigured_witness(),
+        &topology(),
+    )
+    .expect("the sum agrees");
+    assert!(!judged.is_empty());
+
+    // The same counts moved *between* the two rules — which is exactly what a
+    // reversal looks like — still satisfy it, and would fail the per-rule
+    // statement the single-policy path makes.
+    let swapped = body((5, 4), (4, 5))
+        .replacen(
+            &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-blocked\"}} {DENIED_PROBES}"),
+            &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-blocked\"}} 5"),
+            1,
+        )
+        .replacen(
+            &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 9"),
+            &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 6"),
+            1,
+        );
+    judge(
+        &only(swapped.clone()),
+        9,
+        reconfigured_witness(),
+        &topology(),
+    )
+    .expect("the sum is unchanged by which rule matched");
+    let verdict = judge(&only(swapped), 9, witness(), &topology())
+        .expect_err("the per-rule statement is not available across a policy change");
+    assert!(verdict.contains("probe-forward"), "{verdict}");
+
+    // And a sum that does not add up is refused: a filter that decided a packet
+    // twice, or not at all.
+    let short = body((5, 4), (4, 5)).replacen(
+        &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 9"),
+        &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 7"),
+        1,
+    );
+    let verdict = judge(&only(short), 9, reconfigured_witness(), &topology())
+        .expect_err("nine matches short of eleven");
+    assert!(verdict.contains("matches between them"), "{verdict}");
+    assert!(verdict.contains("two policies"), "{verdict}");
 }

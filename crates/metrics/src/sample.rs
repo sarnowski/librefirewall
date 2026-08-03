@@ -24,12 +24,13 @@
 use crate::catalog::{
     BLOCK_BYTES, BLOCK_CAPACITY_SECTORS, BLOCK_REQUESTS, BLOCK_STATUS_UNDECODABLE,
     CLOCK_CALIBRATIONS_REFUSED, CLOCK_FREQUENCY_HERTZ, CLOCK_GENERATION, CONFIGURATION_GENERATION,
-    CONFIGURATION_IMAGES, CONSOLE_RECORDS, DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES,
-    ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US, ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST,
-    ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED, ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS,
-    ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS,
-    FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN, FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES,
-    FORWARDED_FRAMES, HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
+    CONFIGURATION_IMAGES, CONFIGURATION_READS, CONFIGURATION_SUBMISSIONS, CONSOLE_RECORDS,
+    DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES, ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US,
+    ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED,
+    ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED,
+    ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN,
+    FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HTTP_BODIES_REFUSED,
+    HTTP_BODIES_TAKEN, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
     HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
     INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
     POLICY_PACKETS, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
@@ -148,7 +149,9 @@ pub const ROUTE_STAGE_DROP_REASONS: [&str; 9] = [
 /// Status codes the management server can answer with, in the order
 /// [`HttpSample::responses`] holds them; `lfw_http::Status::ALL` is the same set
 /// and a test in `lfw_ip_endpoint` holds the two together.
-pub const HTTP_STATUSES: [&str; 8] = ["200", "400", "404", "405", "414", "431", "503", "505"];
+pub const HTTP_STATUSES: [&str; 9] = [
+    "200", "400", "404", "405", "413", "414", "431", "503", "505",
+];
 
 /// Every writing domain's own account of its log ring.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1063,14 +1066,16 @@ pub struct HttpSample {
     pub responses: [u64; HTTP_STATUSES.len()],
     pub response_bytes: u64,
     pub overflowed: u64,
-    pub expositions_refused: u64,
+    pub bodies_refused: u64,
+    pub bodies_taken: u64,
+    pub bodies_overrun: u64,
     pub retransmits_unavailable: u64,
     pub slots_exhausted: u64,
 }
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 80;
+pub const MANAGEMENT_SLOTS: usize = 83;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1214,13 +1219,16 @@ impl ManagementSample {
         s(&HTTP_RESPONSES, &[Label::new("status", "400")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "404")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "405")]),
+        s(&HTTP_RESPONSES, &[Label::new("status", "413")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "414")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "431")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "503")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "505")]),
         plain(&HTTP_RESPONSE_BYTES),
         plain(&HTTP_REQUESTS_OVERFLOWED),
-        plain(&HTTP_EXPOSITIONS_REFUSED),
+        plain(&HTTP_BODIES_REFUSED),
+        plain(&HTTP_BODIES_TAKEN),
+        plain(&HTTP_BODY_OVERRUNS),
         plain(&HTTP_RETRANSMITS_UNAVAILABLE),
         plain(&HTTP_SLOTS_EXHAUSTED),
         s(&RECORDING_STREAMS, &[Label::new("outcome", "started")]),
@@ -1292,7 +1300,9 @@ impl ManagementSample {
         put_all(&mut values, &mut at, &http.responses);
         put(&mut values, &mut at, http.response_bytes);
         put(&mut values, &mut at, http.overflowed);
-        put(&mut values, &mut at, http.expositions_refused);
+        put(&mut values, &mut at, http.bodies_refused);
+        put(&mut values, &mut at, http.bodies_taken);
+        put(&mut values, &mut at, http.bodies_overrun);
         put(&mut values, &mut at, http.retransmits_unavailable);
         put(&mut values, &mut at, http.slots_exhausted);
 
@@ -1354,24 +1364,59 @@ impl ConsoleSample {
 }
 
 /// Slots [`ConfigSample`] occupies.
-pub const CONFIG_SLOTS: usize = 3;
+pub const CONFIG_SLOTS: usize = 4 + GENERATION_OUTCOMES;
+
+/// What the deciding domain can have decided about a submitted document, in
+/// [`ConfigSample::submissions`]' order.
+///
+/// The console's own `GenerationOutcome` vocabulary, name for name, which a test
+/// in `pd_runtime` holds this array to as it does the transport's: an operator
+/// reading a refusal on the console and graphing the refusal rate must be reading
+/// one thing.
+pub const GENERATION_OUTCOMES: usize = 3;
+pub const GENERATION_OUTCOME_NAMES: [&str; GENERATION_OUTCOMES] =
+    ["applied", "refused", "unchanged"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfigSample {
     pub generation: u64,
+    /// One slot per [`GENERATION_OUTCOME_NAMES`] entry.
+    pub submissions: [u64; GENERATION_OUTCOMES],
+    pub reads: u64,
     pub log: LogSample,
 }
 
 impl ConfigSample {
     pub const SERIES: &'static [Series] = &[
         plain(&CONFIGURATION_GENERATION),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[0])],
+        ),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[1])],
+        ),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[2])],
+        ),
+        plain(&CONFIGURATION_READS),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
 
     #[must_use]
     pub fn values(&self) -> [u64; CONFIG_SLOTS] {
-        [self.generation, self.log.dropped, self.log.refused]
+        [
+            self.generation,
+            self.submissions[0],
+            self.submissions[1],
+            self.submissions[2],
+            self.reads,
+            self.log.dropped,
+            self.log.refused,
+        ]
     }
 }
 

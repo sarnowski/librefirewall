@@ -310,9 +310,12 @@
          domain that answers the management-plane attacker the word that releases
          a generation.
 
-         What that costs is stated at pds/management: with no channel to the
-         config domain, that port picks up its address on the next frame that
-         wakes it rather than at the commit.
+         What that costs is stated at pds/management, and it is smaller than it was
+         and still real: that domain now holds a channel to the config domain, but
+         it carries SUBMISSIONS rather than the commit protocol — the management
+         domain still reads the committed generation out of `cfg` and takes no part
+         in releasing one. So a commit somebody else provoked still reaches it on
+         the next frame or the next answer that wakes it, rather than at the commit.
 
          Sizes are `wire::CONFIG_REGION_SIZE` and `wire::CONFIG_ACK_REGION_SIZE`,
          on the same footing as the pipeline constants above and held to them
@@ -339,6 +342,52 @@
          is the stronger position for a region no device is told about. -->
     <memory_region name="cfg" size="0x8000" />
     <memory_region name="cfgack" size="0x1000" />
+
+    <!-- The configuration SUBMISSION channel, one region per direction, and the
+         path by which a document reaches this appliance at all.
+
+         `cfg_request` carries what the management domain is asking — an operation
+         word, a length, and up to `wire::MAX_DOCUMENT_BYTES` of document — and
+         `cfg_reply` carries the answer: a status from a closed set, the generation
+         now in force, a reject reason and the number that locates it, and, for a
+         read, the document the appliance is running. MANAGEMENT maps `cfg_request`
+         READ-WRITE and `cfg_reply` READ-ONLY; the CONFIG domain maps
+         `cfg_request` READ-ONLY and `cfg_reply` READ-WRITE. Each writes exactly
+         the direction it speaks in, which is `dl_request`/`dl_reply`'s split and
+         is here for a sharper reason than there.
+
+         WHY THE DIRECTION OF TRUST RUNS THIS WAY. The management domain is the
+         one an attacker reaches first and it holds two frame pipelines; the
+         config domain holds no device, no pool and no dataplane ring. So the
+         domain that PARSES an operator's — or an attacker's — XML must be the
+         config domain, and the management domain's whole part is to copy bytes
+         from a TCP connection into `cfg_request` and hand on. It never parses
+         them. A parser in the management domain would put the reader of a hostile
+         document in the same domain as a frame buffer and leave this split with
+         nothing to withhold.
+
+         AND WHY MANAGEMENT MAY NOT WRITE `cfg_reply`. That region carries the
+         document `GET /config` answers with. A management domain that could write
+         it could serve an operator a configuration the appliance is not running —
+         a fabricated statement about the policy in force, which is worse than a
+         wrong answer because an operator would edit and resubmit it. The read
+         grant it does hold lets it copy that document to a client and nothing
+         else.
+
+         Sizes are `wire::CONFIG_REQUEST_REGION_SIZE` and
+         `wire::CONFIG_REPLY_REGION_SIZE`, on the same footing as every constant
+         above and held to them the same way: `xtask::sysdesc` carries a rule for
+         each and compares it. Both are 64 KiB of document plus a header, so
+         seventeen pages each; they are placed at 0x3_100_000 and 0x3_200_000,
+         clear of the eight-page `cfg` window this file's address-map block
+         describes, so neither can grow into it.
+
+         Neither carries phys_addr, for cfg's reason exactly: no device is told
+         where they are, so an unplaced region — which Microkit allocates from
+         general-purpose untyped memory, and which seL4 therefore zeroes — is the
+         stronger position. -->
+    <memory_region name="cfg_request" size="0x11000" />
+    <memory_region name="cfg_reply" size="0x11000" />
 
     <!-- THE CONNECTION TABLE, and by two orders of magnitude the largest region
          in this system: 68 MiB and one page, `pd_runtime::FLOW_TABLE_REGION_SIZE`
@@ -836,11 +885,26 @@
          `the_configuration_domains_state_fits_the_stack_it_is_declared_with`
          holds the number below to those four types, so the next entity added to a
          configuration fails a host test rather than a boot. Memory rather than
-         authority: nothing this domain may reach changes. -->
-    <protection_domain name="config" priority="3" stack_size="0x40000">
+         authority: nothing this domain may reach changes.
+
+         IT GREW AGAIN WHEN THE DATASTORE STOPPED BEING A LOCAL. Until a document
+         could be submitted there was no path to a second commit, so the store was
+         dropped at the end of `init` and only a call frame held it; now it is a
+         field, and beside it a 64 KiB scratch buffer — one document copied out of
+         the peer-written request region, or one rendered into it for a read, never
+         both at once. Those two are resident for the domain's life and the three
+         models a commit still needs are on top of them, which took the peak past
+         the previous 0x40000's twofold headroom. The same host test holds this
+         number to the same types, so the next thing added to a configuration
+         fails on a developer's machine rather than as a domain that faults on the
+         first submission. Memory rather than authority again: what this domain may
+         reach is the two rows below and nothing else. -->
+    <protection_domain name="config" priority="3" stack_size="0x80000">
         <program_image path="config-pd.elf" />
         <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_008_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="cfg_request" vaddr="0x3_100_000" perms="r" cached="true" setvar_vaddr="cfg_request_vaddr" />
+        <map mr="cfg_reply" vaddr="0x3_200_000" perms="rw" cached="true" setvar_vaddr="cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
@@ -1101,6 +1165,8 @@
         <map mr="dl_request" vaddr="0x2_600_000" perms="rw" cached="true" setvar_vaddr="dl_request_vaddr" />
         <map mr="dl_reply" vaddr="0x2_700_000" perms="r" cached="true" setvar_vaddr="dl_reply_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
+        <map mr="cfg_request" vaddr="0x3_100_000" perms="rw" cached="true" setvar_vaddr="cfg_request_vaddr" />
+        <map mr="cfg_reply" vaddr="0x3_200_000" perms="r" cached="true" setvar_vaddr="cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
@@ -1541,6 +1607,47 @@
     <channel>
         <end pd="recorder" id="0" notify="true" />
         <end pd="management" id="1" notify="false" />
+    </channel>
+
+    <!-- The configuration submission channel, and the SECOND channel in this
+         system granted in BOTH directions. It is also the change that ends
+         MANAGEMENT_CHANNEL_ONE_WAY: until this landing the management domain held
+         no send capability at all, on any channel, and it now holds exactly one —
+         on the config domain and on nothing else.
+
+         WHY MANAGEMENT MUST BE ABLE TO SIGNAL. The config domain has no polling
+         loop: it runs `init` to completion and then blocks in the Microkit event
+         loop, which is the whole reason it costs nothing at the highest priority
+         in the system. A submitted document in `cfg_request` is therefore
+         invisible to it until something wakes it, and the only party that knows a
+         document has arrived is the domain that copied it in. Making the config
+         domain poll instead would burn a core forever to catch an operator action
+         that happens once a month.
+
+         WHAT THAT SEND CAPABILITY IS WORTH TO AN ATTACKER, stated plainly because
+         it is the one authority this landing hands to the domain an attacker
+         reaches first: a wakeup, at whatever rate they choose. What the config
+         domain does on a wakeup is bounded — it takes at most one demand per
+         change of the requester's sequence and answers it — and the same party
+         could provoke exactly that by `POST`ing a document, which is a request
+         this appliance is now built to accept. So the capability adds no reach
+         beyond what the feature itself grants, and it grants nothing on the
+         dataplane: this channel's other end is a domain holding no device, no pool
+         and no ring.
+
+         AND WHY CONFIG MUST BE ABLE TO SIGNAL BACK. The management domain is
+         `notified`-driven too — it is woken, it drains, it returns — so without
+         the reverse direction it would learn that its submission had been decided
+         only when the next frame happened to wake it, which for a client holding a
+         connection open is a stall of unbounded length. The recorder's channel is
+         granted for exactly that reason in exactly that direction.
+
+         Both ends state `notify` rather than leaning on Microkit's default of
+         true, as the config/forwarder pair does: a direction that matters is a
+         direction written down. -->
+    <channel>
+        <end pd="config" id="1" notify="true" />
+        <end pd="management" id="2" notify="true" />
     </channel>
 
     <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS

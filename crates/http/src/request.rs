@@ -14,8 +14,8 @@
 //! would either refuse a legitimate client or wait on a broken one.
 
 use crate::{
-    MAX_HEADER_NAME_LEN, MAX_HEADER_VALUE_LEN, MAX_HEADERS, MAX_METHOD_LEN, MAX_TARGET_LEN, Status,
-    VERSION,
+    MAX_CONTENT_LENGTH_DIGITS, MAX_HEADER_NAME_LEN, MAX_HEADER_VALUE_LEN, MAX_HEADERS,
+    MAX_METHOD_LEN, MAX_TARGET_LEN, Status, VERSION,
 };
 
 /// One header field, borrowed out of the caller's buffer.
@@ -34,6 +34,9 @@ pub struct Request<'a> {
     target: &'a str,
     headers: [Option<Header<'a>>; MAX_HEADERS],
     count: usize,
+    /// Bytes of body the head declares, already held to the caller's
+    /// `body_limit` and to the one framing this parser admits.
+    body_len: usize,
 }
 
 impl<'a> Request<'a> {
@@ -53,6 +56,24 @@ impl<'a> Request<'a> {
     #[must_use]
     pub fn is_get(&self) -> bool {
         self.method == "GET"
+    }
+
+    /// The one method that may carry a body here, which is why it has an accessor
+    /// of its own rather than a caller comparing the string.
+    #[must_use]
+    pub fn is_post(&self) -> bool {
+        self.method == "POST"
+    }
+
+    /// Bytes of body that follow this head, and zero where none do.
+    ///
+    /// A *declared* length rather than a delivered one: what arrives is the
+    /// caller's to accumulate, and a peer that sends fewer bytes than it announced
+    /// leaves a request nothing completes — which is the fail-closed outcome, not
+    /// a case this parser can decide.
+    #[must_use]
+    pub const fn body_len(&self) -> usize {
+        self.body_len
     }
 
     /// Every header, in the order they arrived.
@@ -123,8 +144,14 @@ pub enum RequestError {
     /// A continuation line: RFC 9112 section 5.2 deprecates obs-fold and requires a
     /// server that does not support it to refuse the message.
     ObsoleteLineFolding,
-    /// A request announcing a body. See the crate header.
+    /// A body framed in a way this parser will not read: any `Transfer-Encoding`,
+    /// a repeated or non-decimal `Content-Length`, or a body on a method other
+    /// than `POST`. See the crate header on why each is refused rather than
+    /// interpreted.
     BodyNotAccepted,
+    /// A `Content-Length` above the caller's `body_limit`. Refused at the head, so
+    /// no byte of the body is accumulated on the way to finding out.
+    BodyTooLarge { declared: u64 },
     /// The bytes are not UTF-8, which is what is checked: a head is ASCII, and
     /// every ASCII string is UTF-8, so this refuses the bytes no `&str` can
     /// hold rather than every byte above 0x7F. The fields that must be ASCII
@@ -145,6 +172,7 @@ impl RequestError {
                 // ill-formed being refused by the same variant.
                 Status::HeadersTooLarge
             }
+            Self::BodyTooLarge { .. } => Status::ContentTooLarge,
             Self::UnsupportedVersion => Status::VersionNotSupported,
             Self::BareLineFeed
             | Self::StrayCarriageReturn
@@ -164,10 +192,16 @@ const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 /// Read whatever has arrived.
 ///
+/// `body_limit` is the most body the caller can hold, and a head declaring more
+/// is refused here rather than accumulated: the bound belongs to the caller
+/// because the storage does, and passing it in is what keeps this crate from
+/// choosing a buffer size for a protection domain it knows nothing about. A
+/// caller that takes no body at all passes zero.
+///
 /// # Errors
 /// [`RequestError`] for a head this server will not read; each names the status
 /// the client is owed.
-pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
+pub fn parse(bytes: &[u8], body_limit: usize) -> Result<Parsed<'_>, RequestError> {
     let terminator = find(bytes, HEAD_TERMINATOR);
     // The head's own bytes and no others: a verdict on *this* head that
     // depended on what follows it is the disagreement about where a message
@@ -204,13 +238,14 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed<'_>, RequestError> {
         count = count.saturating_add(1);
     }
 
-    let request = Request {
+    let mut request = Request {
         method,
         target,
         headers,
         count,
+        body_len: 0,
     };
-    refuse_a_body(&request)?;
+    request.body_len = body_length(&request, body_limit)?;
     Ok(Parsed::Complete { request, consumed })
 }
 
@@ -309,18 +344,66 @@ fn parse_header(line: &str) -> Result<Header<'_>, RequestError> {
     Ok(Header { name, value })
 }
 
-/// No request this server answers carries a body, and a parser that guessed the
-/// framing would be the second opinion request smuggling needs.
-fn refuse_a_body(request: &Request<'_>) -> Result<(), RequestError> {
+/// How many body bytes follow this head, under the one framing this parser
+/// admits.
+///
+/// Every rejection here is a framing this parser refuses to hold a second opinion
+/// about; the crate header states each and why. The order matters in one place: a
+/// length is refused for being *unreadable* before it is refused for being *too
+/// large*, so a client is told which of the two it did.
+fn body_length(request: &Request<'_>, body_limit: usize) -> Result<usize, RequestError> {
+    let mut declared: Option<u64> = None;
     for header in request.headers() {
         if equals_ignoring_case(header.name, "transfer-encoding") {
             return Err(RequestError::BodyNotAccepted);
         }
-        if equals_ignoring_case(header.name, "content-length") && header.value != "0" {
-            return Err(RequestError::BodyNotAccepted);
+        if equals_ignoring_case(header.name, "content-length") {
+            if declared.is_some() {
+                return Err(RequestError::BodyNotAccepted);
+            }
+            declared = Some(content_length(header.value)?);
         }
     }
-    Ok(())
+    let Some(declared) = declared else {
+        return Ok(0);
+    };
+    if declared == 0 {
+        return Ok(0);
+    }
+    if !request.is_post() {
+        return Err(RequestError::BodyNotAccepted);
+    }
+    // Lossless: the comparison is what makes the narrowing exact, and a
+    // `body_limit` is a `usize` the caller can hold.
+    if declared > body_limit as u64 {
+        return Err(RequestError::BodyTooLarge { declared });
+    }
+    Ok(declared as usize)
+}
+
+/// A `Content-Length` value: decimal digits and nothing else, no sign, no
+/// whitespace inside, and at most [`MAX_CONTENT_LENGTH_DIGITS`] of them.
+///
+/// A leading zero is admitted, RFC 9110 section 8.6 stating the field as `1*DIGIT`
+/// with no such prohibition; anything the grammar does not admit is refused
+/// rather than read as far as it parses, which is where a second party would
+/// disagree.
+fn content_length(value: &str) -> Result<u64, RequestError> {
+    if value.is_empty() || value.len() > MAX_CONTENT_LENGTH_DIGITS {
+        return Err(RequestError::BodyNotAccepted);
+    }
+    let mut declared = 0u64;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(RequestError::BodyNotAccepted);
+        }
+        // Cannot overflow: ten digits is at most 9_999_999_999, far inside a
+        // `u64`, and the length above is what holds it to ten.
+        declared = declared
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    Ok(declared)
 }
 
 /// RFC 9110 section 5.6.2's `tchar`.

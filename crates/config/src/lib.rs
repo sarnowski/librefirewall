@@ -13,12 +13,13 @@
 //!
 //! # Adversary
 //!
-//! The management-plane attacker. Today the document arrives
-//! compiled into the image, which makes the threat theoretical; it is written
-//! against a fully attacker-controlled byte string anyway, because the whole
-//! reason this crate is separate from the domain that applies its output is
-//! that the document will one day arrive over a network, and a parser hardened
-//! afterwards is a parser rewritten.
+//! The management-plane attacker, and no longer theoretically: a document arrives
+//! over the network, so every byte the reader below sees is that party's choice.
+//! Nothing about the reader changed to meet that — it was written against a fully
+//! attacker-controlled byte string from the start, because the whole reason this
+//! crate is separate from the domain that applies its output is that the document
+//! would one day arrive that way, and a parser hardened afterwards is a parser
+//! rewritten.
 //!
 //! # Constraints, and what was given up to meet them
 //!
@@ -49,6 +50,7 @@ pub mod diff;
 pub mod entity;
 pub mod hash;
 pub mod model;
+pub mod render;
 pub mod report;
 pub mod rule;
 pub mod runtime;
@@ -65,6 +67,7 @@ pub use entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
 pub use hash::{ContentHash, content_hash};
 pub use lfw_log::Identifier;
 pub use model::{Full, Model};
+pub use render::{DocumentDoesNotFit, fits_the_document_bound, render, rendered_len};
 pub use report::{CommitReport, commit_and_report};
 pub use rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction};
 pub use runtime::{BuildError, image_from};

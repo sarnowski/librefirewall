@@ -249,6 +249,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "config_submission"
+path = "fuzz_targets/config_submission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "log_record"
 path = "fuzz_targets/log_record.rs"
 test = false

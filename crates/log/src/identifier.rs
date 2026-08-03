@@ -55,6 +55,16 @@ impl Identifier {
         len: 10,
     };
 
+    /// The name a refusal about the configuration *as a whole* carries: a
+    /// document may be sound in every object and still be one the appliance
+    /// cannot state, and that fault names no object. A second reserved name
+    /// rather than reusing the one above, because an operator reading
+    /// `management` would go and look at the wrong element.
+    pub const CONFIGURATION: Self = Self {
+        bytes: *b"configuration\0\0\0",
+        len: 13,
+    };
+
     /// `const` so a vocabulary's own words can be checked where they are
     /// written: a literal that is not an identifier is then a build failure
     /// rather than a refusal on a path nothing exercises.
@@ -171,7 +181,12 @@ const fn write_decimal(stored: &mut [u8; MAX_IDENTIFIER_LEN], at: u8, value: u16
 /// What [`Identifier::new`] would have checked, checked at build time instead:
 /// a wrong literal is a compile error rather than an unrenderable line.
 const _: () = {
-    let Identifier { bytes, len } = Identifier::MANAGEMENT;
+    admissible(Identifier::MANAGEMENT);
+    admissible(Identifier::CONFIGURATION);
+};
+
+const fn admissible(reserved: Identifier) {
+    let Identifier { bytes, len } = reserved;
     let len = len as usize;
     assert!(len > 0 && len <= MAX_IDENTIFIER_LEN);
     let mut offset = 0;
@@ -184,7 +199,7 @@ const _: () = {
         }
         offset += 1;
     }
-};
+}
 
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

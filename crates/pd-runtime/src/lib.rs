@@ -517,6 +517,7 @@ macro_rules! attach_flow_table {
 }
 
 pub mod clock;
+pub mod configuration;
 pub mod download;
 pub mod endpoint;
 pub mod handover;
@@ -524,6 +525,7 @@ pub mod stats;
 pub mod tap;
 
 pub use clock::{PdClock, read_timestamp_counter};
+pub use configuration::{CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Submissions};
 pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
@@ -540,16 +542,17 @@ pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
 pub use pipeline::{Configuration, Tracking};
 pub use stats::{
-    BlockCounters, StatsRegions, config_sample, flow_sample, forwarder_sample, log_sample,
-    management_sample, pipeline_sample, policy_sample, recorder_sample,
+    BlockCounters, StatsRegions, SubmissionCounters, config_sample, flow_sample, forwarder_sample,
+    log_sample, management_sample, pipeline_sample, policy_sample, recorder_sample,
 };
 pub use tap::{
     Observation, Tap, TapCounters, tap_classification, tap_decision, tap_drop_reason, tap_flow,
     tap_flow_state, tap_outcome,
 };
 pub use wire::{
-    CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
-    ConfigImage, MAX_INTERFACES, MAX_NEIGHBOURS,
+    CLOCK_CALIBRATION_REGION_SIZE, CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE,
+    CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover, ConfigImage, ConfigReply,
+    ConfigRequest, MAX_DOCUMENT_BYTES, MAX_INTERFACES, MAX_NEIGHBOURS,
 };
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
@@ -1275,35 +1278,42 @@ mod tests {
         );
     }
 
-    /// The same for the configuration domain, whose stack is the one this
-    /// landing overflowed.
+    /// The same for the configuration domain, whose stack this landing overflowed
+    /// once and has now grown twice.
     ///
-    /// Nothing here is a *field* of that domain's handler: a commit's whole
-    /// working set lives in one call frame and is gone by the time `init`
-    /// returns. Three models are live at once — the datastore's running and
-    /// candidate pair, and the one `stage` hands back — plus the byte image
-    /// built from the third, and each of them grew by the 256 rule slots the
-    /// filter added. Measured here rather than in `pds/config` because that
-    /// domain is not host-testable and because the types are this crate's
-    /// dependency to see.
+    /// Two things live here that did not. The **datastore is a field** rather than
+    /// a local: until a document could be submitted there was no path to a second
+    /// commit, so the store was dropped at the end of `init`; now every later
+    /// document is staged against it and it is resident for the domain's life.
+    /// Beside it is **one document of scratch**, 64 KiB, which a submission is
+    /// copied out of the peer-written request region into and a read is rendered
+    /// into — one field because a demand is one or the other and never both.
+    ///
+    /// On top of those sits a commit's own call frame, which is unchanged: three
+    /// models live at once — the datastore's running and candidate pair, and the
+    /// one `stage` hands back — plus the byte image built from the third.
+    /// Measured here rather than in `pds/config` because that domain is not
+    /// host-testable and because the types are this crate's dependency to see.
     #[test]
     fn the_configuration_domains_state_fits_the_stack_it_is_declared_with() {
-        /// `<protection_domain name="config" stack_size="0x40000">`.
-        const CONFIG_STACK: usize = 0x40000;
-        /// Six `&'static` region references, a `RingSink`, a `ConfigPublisher`
-        /// and the frames' own alignment slack, rounded up.
+        /// `<protection_domain name="config" stack_size="0x80000">`.
+        const CONFIG_STACK: usize = 0x80000;
+        /// Eight `&'static` region references, a `RingSink`, a `ConfigPublisher`,
+        /// a `ConfigResponder`, the submission counters and the frames' own
+        /// alignment slack, rounded up.
         const REFERENCES: usize = 512;
 
-        let state = size_of::<config::Datastore>()
-            + size_of::<config::Staged>()
+        let resident = size_of::<config::Datastore>() + wire::MAX_DOCUMENT_BYTES + REFERENCES;
+        let commit = size_of::<config::Staged>()
             + size_of::<config::CommitReport>()
-            + size_of::<wire::ConfigImage>()
-            + REFERENCES;
+            + size_of::<wire::ConfigImage>();
+        let state = resident + commit;
 
         assert!(
             state <= CONFIG_STACK / 2,
-            "a configuration commit occupies {state} bytes against a {CONFIG_STACK}-byte stack, \
-             which leaves under the twofold headroom its call frames are sized by"
+            "a configuration commit occupies {state} bytes ({resident} resident, {commit} in the \
+             commit's own frame) against a {CONFIG_STACK}-byte stack, which leaves under the \
+             twofold headroom its call frames are sized by"
         );
     }
 

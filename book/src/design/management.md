@@ -7,17 +7,55 @@
   |---|---|
   | `GET /metrics` | Metrics in Prometheus format |
   | `GET /config` | Read the current running configuration (XML) |
+  | `POST /config` | Submit a document: it becomes the candidate, is validated, and is committed |
   | `GET /logs` | Read the most recent structured log records held in the node's local buffer |
   | Recording download | Retrieve a time range of either [recording sink](recording.md) as a pcapng file |
   | Configuration change | The [candidate/commit-confirmed workflow](configuration.md): submit a candidate, validate, commit (with commit-confirmed), confirm, and roll back to a previous version |
 
   Configuration is never changed by a single unqualified write; every change goes through the
   candidate/commit-confirmed workflow (see [Configuration](configuration.md)), so the API exposes
-  the stage, validate, commit, confirm, and rollback operations that workflow requires.
+  the stage, validate, commit, confirm, and rollback operations that workflow requires. `POST /config`
+  is the first of those to exist: it stages, validates and commits in one request. Confirm and
+  rollback do not exist yet, so a change that validates and then breaks management connectivity is
+  not undone by anything — the [development status](../status.md) records it.
+
+  **A submission is answered when the configuration is committed, and the dataplane switches
+  immediately afterwards rather than inside the request.** The two-phase offer/acknowledge handover
+  to the forwarding domain is what makes that switch happen between two frames instead of part-way
+  through one, so a node is never deciding a packet under half a policy. What says a change is in
+  force on the dataplane is that domain's own reported generation, which is why every generation is
+  published per domain rather than once for the node.
 - **Security:** the API provides encryption, authentication, and read/write authorization using an
   **mTLS certificate pair issued during onboarding** (the design of the onboarding process is
   still open — see [development status](../status.md)). The management API runs in an isolated PD,
   on a dedicated management interface, and bounds the rate of requests it accepts.
+
+  ## None of that security exists yet, and what that means in plain words
+
+  **Anything that can reach the management port can reconfigure this firewall.** There is no TLS
+  anywhere in the appliance, the endpoint authenticates nobody, there is no read/write split, and
+  there is no rate limit. Every operation above is served over plain HTTP to whoever asks: a
+  `GET /config` hands out the policy, and a `POST /config` **replaces** it — which is the authority to
+  decide what this appliance forwards, to whom, and what it drops. Downloading the recordings is on
+  the same footing and hands out every packet the node has captured.
+
+  So the port must be on a physically or logically isolated management network, reachable only by
+  the operator, and **must not be exposed to an untrusted network** — not to the internet, not to a
+  general-purpose office LAN, not to a network segment the appliance itself is filtering. An
+  appliance whose management port is reachable from a network it protects is one an attacker
+  reconfigures instead of attacking.
+
+  This is a recorded, deliberate stage of development rather than an oversight: the design above is
+  the target, the [development status](../status.md) records the gap, and the crates that serve the
+  surface state it in their own headers. It is written out here at length because a reader who
+  skimmed the paragraph above it would otherwise have every reason to believe the API is
+  authenticated.
+
+  What the isolation the API *does* have still buys, and it is not nothing: the domain that answers
+  the port holds no dataplane memory, and the domain that parses a submitted document holds no
+  device, no buffer pool and no dataplane ring. So an attacker who reaches the port can change the
+  policy — which is the whole of the authority the port carries — and cannot reach a frame in flight
+  or the memory one travels through.
 - **Metrics:** exposed in **Prometheus exposition format** via `GET /metrics` — the *only* metrics
   interface — with disciplined, bounded cardinality (aggregate metrics, never per-flow labels).
   Every moving part (queues, buffer pools, per-NIC and per-core counters) is observable there

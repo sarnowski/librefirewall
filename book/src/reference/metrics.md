@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-86 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 330 counter and gauge series from the nine shards, plus
+90 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 337 counter and gauge series from the nine shards, plus
 one info series per configured interface and one hit counter per rule the running policy declares,
-and the document they render into is bounded at 76 407 bytes — a worst case computed from these
+and the document they render into is bounded at 77 922 bytes — a worst case computed from these
 tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -179,11 +179,13 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_http_expositions_refused_total` | counter | `management` | — | Expositions the renderer would not fit in the staging buffer; ours, expected to stay zero. |
+| `librefirewall_http_bodies_refused_total` | counter | `management` | — | Response bodies a renderer would not fit in the staging buffer, whichever target asked; ours, expected to stay zero. |
+| `librefirewall_http_bodies_taken_total` | counter | `management` | — | Request bodies accumulated whole and handed to the domain that decides on them. |
+| `librefirewall_http_body_overruns_total` | counter | `management` | — | Request-body bytes a client sent past the length it declared, dropped unread. |
 | `librefirewall_http_requests_overflowed_total` | counter | `management` | — | Requests that outgrew the bounded request buffer before their head ended. |
 | `librefirewall_http_requests_total` | counter | `management` | — | Requests the server read to their end and decided on. |
 | `librefirewall_http_response_bytes_total` | counter | `management` | — | Response bytes handed to the transport, headers included. |
-| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `414`, `431`, `503`, `505`) | Responses composed, by status code. |
+| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `413`, `414`, `431`, `503`, `505`) | Responses composed, by status code. |
 | `librefirewall_http_retransmits_unavailable_total` | counter | `management` | — | Ranges the transport asked for again that no response buffer held; ours, expected to stay zero. |
 | `librefirewall_http_slots_exhausted_total` | counter | `management` | — | Connections the server had no slot for; ours, the tables being one size, expected to stay zero. |
 
@@ -387,6 +389,8 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 | `librefirewall_clock_generation` | gauge | `management` | — | The calibration generation this domain converts counter readings with; 0 is none. |
 | `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
 | `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. **Only the forwarder carries `applied`**: the management port's endpoint reads a committed image for its own address and never applies one, so it reports `refused` alone. |
+| `librefirewall_configuration_reads_total` | counter | `config` | — | Times the running configuration document was read out of this node. |
+| `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`) | Documents submitted to this node over the management API, by what the configuration domain decided: `applied` moved the generation, `unchanged` was the configuration already running, `refused` broke a rule and changed nothing. |
 
 **No series counts unsynchronized records, and that is deliberate.** Whether a domain has a
 calibration is visible on each record it emits — `time=unsynchronized` against an instant — so such

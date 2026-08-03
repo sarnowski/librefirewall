@@ -33,10 +33,12 @@
 
 use lfw_log::RejectReason;
 
-/// The largest document the reader will look at. Held here rather than at the
-/// caller because a bound the caller may forget is a bound the reader does not
-/// have.
-pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+/// The largest document the reader will look at. Enforced here rather than left
+/// to the caller because a bound the caller may forget is a bound the reader does
+/// not have; the number itself is [`wire`]'s, because it is what sizes the two
+/// regions a submitted document crosses and a bound two protection domains and a
+/// system description agree on is an ABI.
+pub use wire::MAX_DOCUMENT_BYTES;
 
 /// How deeply elements may nest. The schema uses three levels; the slack is
 /// there so a depth rejection reads as an attack rather than as a schema

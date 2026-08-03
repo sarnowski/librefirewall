@@ -545,29 +545,74 @@ fn judge_policy(
         )
     })?;
 
-    for (rule, expected, measured) in [
-        (
-            witness.policy.accepted,
-            opened,
-            format!(
-                "frames the harness observed coming back on its two dataplane sockets \
+    // Which per-rule statement is available depends on whether the boot ran one
+    // policy or two. Under one, each rule's count is attributable and the two
+    // statements below are the strongest available. Under two — a document
+    // submitted while the node ran — the same two ids exchange their actions, so
+    // each accrues hits under both generations and what stays exact is the sum.
+    if witness.reconfigured {
+        let mut total = 0u64;
+        for rule in [witness.policy.accepted, witness.policy.denied] {
+            let id = rule.id.as_str();
+            let sample = one(exposition, RULE_HITS, &[("rule", id)])?;
+            total = total.saturating_add(sample.value);
+            asserted.push(sample);
+        }
+        let expected = opened.saturating_add(denied);
+        if total != expected {
+            return Err(format!(
+                "the two rules report {total} matches between them and the contract is {expected}: \
+                 the {opened} packets that OPENED a flow ({forwarded_frames} frames observed less \
+                 the {carried_by_state} an existing flow carried) plus the {denied} the filter \
+                 denied. This boot ran two policies — one it booted with and one submitted over \
+                 the management API — and the two rules kept their ids while exchanging their \
+                 actions, so neither count is attributable on its own and the sum is what a filter \
+                 that decided every packet exactly once must report"
+            ));
+        }
+        // And the labels, on each of them, for the reason the single-policy path
+        // states below: this family's cardinality is an operator's to set.
+        for rule in [witness.policy.accepted, witness.policy.denied] {
+            let id = rule.id.as_str();
+            let sample = one(exposition, RULE_HITS, &[("rule", id)])?;
+            let mut names: Vec<&str> = sample.labels.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            if names != ["domain", "rule"] {
+                return Err(format!(
+                    "{RULE_HITS}{{rule={id:?}}} carries labels {names:?} and the contract is \
+                     [\"domain\", \"rule\"]"
+                ));
+            }
+        }
+    }
+
+    for (rule, expected, measured) in if witness.reconfigured {
+        Vec::new()
+    } else {
+        Vec::from([
+            (
+                witness.policy.accepted,
+                opened,
+                format!(
+                    "frames the harness observed coming back on its two dataplane sockets \
                  ({forwarded_frames}), less the {carried_by_state} the connection tracker carried \
                  without consulting the filter at all ({established} established, {related} \
                  related). What is left is the packets that OPENED a flow, and every one of those \
                  passed this rule — which is the whole of what makes a stateful policy different \
                  from a stateless one: a reply is forwarded under no rule's name"
+                ),
             ),
-        ),
-        (
-            witness.policy.denied,
-            denied,
-            format!(
-                "policy denials the routing stage counted across its two pipelines, which is the \
+            (
+                witness.policy.denied,
+                denied,
+                format!(
+                    "policy denials the routing stage counted across its two pipelines, which is the \
                  same set of decisions this rule's matches are — {ROUTE_DROPS} and {RULE_HITS} \
                  count them in two places"
+                ),
             ),
-        ),
-    ] {
+        ])
+    } {
         let id = rule.id.as_str();
         let sample = one(exposition, RULE_HITS, &[("rule", id)])?;
         if sample.value != expected {

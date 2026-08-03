@@ -650,9 +650,10 @@ and wall-clock times. An independent parse of the two files established:
 
 ## Configuration management
 
-**What exists.** One schema-validated XML document, `systems/qemu-x86_64/configuration.xml`, is
-the whole of the appliance's addressing, and it reaches the dataplane through four stages that
-never mix.
+**What exists.** A schema-validated XML document is the whole of the appliance's addressing, and it
+reaches the dataplane through four stages that never mix. `systems/qemu-x86_64/configuration.xml` is
+the one a build embeds and it is the **first** generation rather than the only one: a document can be
+submitted to a running node over the management API, and every later generation arrives that way.
 
 `crates/config` reads it. The reader is `no_std`, allocator-free and hardened against a
 management-plane adversary rather than against a typo: `<!DOCTYPE`, entity declarations, CDATA,
@@ -666,7 +667,7 @@ model — so a syntax rule cannot come to depend on an address and a topology ru
 depend on where in the file something was written. Each configurable object is declared once —
 its value, the attributes a reader accepts for it, the change records it produces and the bytes it
 folds into a content hash all come from that one list, so an attribute cannot be added to the
-reader and forgotten by the hash. Forty-one semantic rules then run over the
+reader and forgotten by the hash. Forty-two semantic rules then run over the
 model: a duplicate interface id, neighbour id, port or interface MAC; a port the build does not
 have; a prefix length past 32; an address that is its own prefix's network or broadcast address, on
 an interface or on a neighbour; a non-unicast address or MAC on either object; overlapping
@@ -678,7 +679,10 @@ because one address reachable both by routing and by local termination is not so
 can express; and twelve over the `<rules>` section, which are described with
 *[Stateful filtering](#stateful-filtering)*. A document naming more objects than the handover ABI can carry is refused by the reader
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
-bytes, so attacker-supplied content never reaches an observability surface.
+bytes, so attacker-supplied content never reaches an observability surface. A forty-second rule sits
+beside them and is about the appliance rather than the document: a configuration whose canonical form
+outgrows the document bound is refused, because the appliance must be able to state back what it is
+running.
 
 Those rules are decided **twice** — here over the model, and again over the byte image by the
 domain that will forward under it — and which rules there are is now one list rather than two.
@@ -686,9 +690,12 @@ domain that will forward under it — and which rules there are is now one list 
 a rule added to that list does not compile until each side has said whether it refuses a
 configuration breaking it, cannot express one, or cannot decide it. The compiler holds the pairing;
 that each answer is true of the code beneath it is held by a test that builds a configuration
-breaking each rule in turn and puts it through both sides. Exactly one rule is undecidable on the
-image side — two neighbours under one id, the image carrying no neighbour identity — and that count
-is itself a compile-time assertion.
+breaking each rule in turn and puts it through both sides. Exactly two rules are undecidable on the
+image side — two neighbours under one id, the image carrying no neighbour identity, and whether the
+configuration can be stated back, which is a question about a document form the image is not one
+of — and that count is itself a compile-time assertion. Both are admissible for the one reason that
+ever makes an asymmetry admissible here: the consumer has no stake in either, so neither is a rule a
+compromise of the reader could use to reach a frame.
 
 `config::Datastore` versions what passed. A candidate is staged without touching what is running,
 `validate_document` takes `&self` so "an operation that changes nothing" is carried by the signature
@@ -771,31 +778,89 @@ boundary, and that payloads arrive in order under those rewritten headers. Two o
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
+**Submitting a document.** `POST /config` on the management port takes an XML document and commits it;
+`GET /config` states the one in force. The path is four steps and the trust runs one way through it.
+
+The **management** domain terminates the connection, refuses a `Content-Length` above the 64 KiB the
+reader enforces with `413` before a byte of the body is accumulated, and accumulates what it does
+accept into the endpoint's one staging array — the same array a `/metrics` exposition is composed in,
+which is why a submission in progress answers a concurrent scrape `503` and why a `POST` costs no
+second buffer anywhere. It then copies the body into a shared region and hands it on. **It never
+parses it.** It holds two frame pipelines, so it is the domain an attacker reaches first and the last
+that should be reading an attacker's XML.
+
+The **configuration** domain copies the bytes out of that region before looking at a field of them —
+the region is peer-written, so a decision taken in place is a decision taken on bytes that may no
+longer be there — stages them as the candidate, validates them, and commits. It answers with one line
+in the field vocabulary the console's `LFW-CFG` records use: `generation=`, `outcome=`, and for a
+refusal `rejected=` and `offset=`. A refusal is `400` and changes nothing; a commit is `200` and
+publishes the new image to the forwarding domain, which switches tables at its next poll boundary.
+
+The datastore now **outlives `init`**, which is the whole of what made a second generation possible;
+it and one document of scratch are what took the configuration domain's stack from 256 KiB to 512 KiB,
+held to those types by a host test rather than discovered as a boot that faults.
+
+Two regions and one channel carry it, `cfg_request` and `cfg_reply`, mirrored so each domain writes
+only the direction it speaks in. The management domain may not write the reply, because a management
+domain that could would be able to answer `GET /config` with a policy the appliance is not running —
+an operator would edit and resubmit that, so a fabricated statement about the policy in force is worse
+than a wrong one. The channel is granted in **both** directions and it is the only send capability the
+management domain holds in this system: the configuration domain has no polling loop, so a document
+written into the region is invisible to it until it is woken.
+
+`GET /config` answers a **rendering of the model in force** rather than the bytes that were
+submitted — the bytes are not kept, and the rendering is the stronger answer, being the only one
+available for the generation a node commits at boot. It follows that the appliance must be able to
+state every configuration it accepts, which is a semantic rule: a document whose canonical form would
+outgrow the document bound is refused with `rendering-too-large` rather than committed, because a
+policy an operator can read and cannot resubmit is one they cannot edit.
+
+**Held by** the host tests in `crates/config` (the renderer round-trips the shipped document and both
+sides of the statable bound), `crates/http` (the body framing: one `Content-Length`, decimal, `POST`
+only, no `Transfer-Encoding`, refused past the caller's bound), `crates/ip-endpoint` (a body split
+across segments, a peer that overruns its declared length, the method/target routing, and a submission
+holding the staging array), `crates/pd-runtime` (the channel driven from both ends, every answer shape,
+and a commit that does not move the addressing keeping the connections open on the port), a fuzz target
+over the whole path from the `POST` body to the commit, and the `configuration-submission` QEMU
+scenario, which is the evidence that matters: it boots the release image, injects traffic the shipped
+policy forwards and traffic it drops, submits a document that exchanges those two verdicts, reads the
+running document back, submits a malformed one and holds it to being refused with the generation
+unmoved, waits for the forwarding domain to report the committed generation, and injects again — both
+verdicts reversed, with the totals rising across the swap rather than resetting.
+
 **Missing.**
 
-- **No management API and no way to submit a document.** The XML is `include_bytes!`d into the
-  configuration domain at build time, so a configuration change requires a new image and a reboot.
-  That is a **deviation from the [configuration design](../design/configuration.md)**, which draws
-  the static/dynamic line at hardware and holds that a configuration change never requires a reboot;
-  the mechanism that would honour it — everything from the document reader to the poll-boundary
-  switch — exists and is exercised on every boot, and what is missing is only a channel to deliver a
-  second document over. Everything above therefore runs exactly once, at boot, and
-  `validate_document` — the "check this without committing it" half of a management API — is
-  implemented, tested, and called by nothing at run time.
+- **No authentication, no TLS, no authorization and no rate limit on any of it.** Anything that can
+  reach the management port can read this appliance's policy and **replace** it, which is the
+  authority to decide what it forwards. That is a recorded deviation from the
+  [management design](../design/management.md), it is the largest gap in this document, and the port
+  must not be exposed to an untrusted network until the intended mTLS pair exists.
 - **No rollback.** The [configuration design](../design/configuration.md)'s return to an earlier
-  version does not exist. The datastore holds the running configuration and at most one candidate,
-  so there is no version history to roll back *to*; with no persisted configuration and no channel
-  to submit a second document over there could not be one worth holding, every generation but the
-  single one each boot commits being unreachable by construction. What is implemented of the
-  design's versioning is the part that is reachable: monotonic generations, and the content
-  comparison beside them that makes re-committing what is already running an `unchanged` outcome
-  rather than a new version.
-- **No commit-confirm.** The candidate/commit half of the
-  [configuration design](../design/configuration.md)'s transaction model exists; the confirm half
-  does not, and it cannot be built here: an automatic revert needs a deadline, and there is no
-  timer, no interrupt and no trusted time source anywhere in this system. It also needs a management
-  channel to be *protecting* — the failure commit-confirm exists to survive is a commit that severs
-  the operator's own access — and there is no such channel to sever.
+  version does not exist. The datastore holds the running configuration and at most one candidate, so
+  there is no version history to roll back *to*, and with no persistence there is none worth holding:
+  a generation cannot outlive a reboot. What is implemented of the design's versioning is monotonic
+  generations and the content comparison beside them that makes re-committing what is already running
+  an `unchanged` outcome rather than a new version.
+- **No commit-confirm, and now it is a real gap rather than an unreachable one.** The
+  candidate/commit half of the [configuration design](../design/configuration.md)'s transaction model
+  exists; the confirm half does not, and it cannot be built here yet: an automatic revert needs a
+  deadline, and the configuration domain holds no timer and no interrupt — the clock domain publishes
+  an instant, not a wakeup. What has changed is the stakes. Until a document could be submitted there
+  was no management channel to sever, so commit-confirm protected nothing; now a document that
+  validates and moves the management address is a document that locks an operator out of the node it
+  was committed on, with nothing to undo it.
+- **A submission is not re-evaluated against the flow table.** Editing the policy changes which
+  conversations may *start*: a packet an existing flow accounts for is forwarded before the filter is
+  consulted, so traffic admitted under the previous policy goes on flowing until its flow expires. The
+  [configuration design](../design/configuration.md) records the intent and the QEMU scenario is
+  written around it — its second wave opens its own conversations, because a second packet on the
+  first wave's five-tuple would be carried by that flow and would say nothing about the new policy.
+- **A submission is answered when it is committed, not when the dataplane has switched.** The
+  configuration domain holds no timer, so it cannot bound a wait on the forwarding domain's
+  acknowledgement — and a refusal by that domain is the *absence* of one, so waiting would hang a
+  client. What an operator confirms a change with is
+  `librefirewall_configuration_generation{domain="forwarder"}`, which is why every generation is
+  published per domain.
 - **No persistence.** A block driver now exists and one domain holds a disk capability
   ([detail](#virtio-blk-driver)) — but it is the recorder, it writes recordings and nothing else, and
   it reaches a second data-only device rather than any partition of the boot disk. The configuration
@@ -811,9 +876,11 @@ document that shares no address and no MAC with the first.
   are deliberately *not* runtime configuration: they are memory-region extents fixed in the system
   description, which is where the [configuration design](../design/configuration.md) draws the line
   at hardware, and moving one would move a capability grant.
-- **Refusal is only visible on the console.** A node that rejected its own document comes up
-  forwarding nothing and says so once, on a serial line, and nothing else can be asked. There is no
-  `GET /config`, no health signal, and no metric.
+- **A refused *boot* document is still only visible on the console.** A node that rejected the
+  document its image carries comes up forwarding nothing and says so on a serial line; its
+  `librefirewall_configuration_submissions_total{outcome="refused"}` reads 1 and its generation reads
+  0, which is a signal — but it has no address, so nothing can ask it for either. A submitted
+  document's refusal is answered to the client that submitted it and counted in the same family.
 
 ## Console device and log transport
 
@@ -1020,7 +1087,9 @@ That domain answers three protocols and counts everything: an **ARP request** fo
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
 identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
 is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), over which an
-HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)). Everything else is refused
+HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)), `GET /config`, both recording
+downloads ([detail](#recording-and-download)) and `POST /config`
+([detail](#configuration-management)). Everything else is refused
 by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it
 does not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
@@ -1102,14 +1171,17 @@ not satisfy it.
 
 **Missing.**
 
-- **No TLS.** HTTP answers `GET /metrics` ([detail](#prometheus-metrics)) and both recordings
-  ([detail](#recording-and-download)), but in the clear: the
-  [management design](../design/management.md) requires mutual TLS on the management port and
-  there is none, so anyone who can reach the port can scrape it — and now download every packet the
-  appliance recorded. `/config` and `/logs` do not exist, so of the debug dump the
-  [observability reference](../reference/observability.md) describes, the state half and the two
-  recordings are what a node can be asked for and the running document and the retained records
-  cannot be.
+- **No TLS, and now that gap carries a write.** HTTP answers `GET /metrics`
+  ([detail](#prometheus-metrics)), `GET /config`, both recordings
+  ([detail](#recording-and-download)) and `POST /config` ([detail](#configuration-management)) — all
+  in the clear, with no authentication and no authorization split. The
+  [management design](../design/management.md) requires mutual TLS on the management port and there is
+  none, so **anything that can reach the port can scrape it, download every packet the appliance
+  recorded, read its policy, and replace that policy** — which is the authority to decide what this
+  firewall forwards. Until the mTLS pair exists the port belongs on an isolated network. `/logs` does
+  not exist, so of the debug dump the
+  [observability reference](../reference/observability.md) describes, the state half, the running
+  document and the two recordings are what a node can be asked for and the retained records cannot be.
 - **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
   there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this

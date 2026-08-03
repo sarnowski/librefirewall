@@ -31,8 +31,9 @@ and this reference does not carry guesses.
   node is doing right now.
 - **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
   measurable moving part at bounded cardinality and no measurable dataplane cost.
-- **Configuration read** — the `GET /config` endpoint, returning the exact running configuration as
-  the document that produced it.
+- **Configuration** — the `GET /config` endpoint, returning the configuration in force as a document,
+  and `POST /config`, which replaces it. The only surface of the six that **changes** anything, and
+  the only one whose reach is the authority to decide what the appliance forwards.
 - **Recording download** — `GET /logs.pcapng` and `GET /capture.pcapng`, the two pcapng recording
   sinks (see the [recording design](../design/recording.md)). The first is a **connection history**,
   holding a record where the appliance reached a connection lifecycle or policy event; the second
@@ -45,7 +46,7 @@ and this reference does not carry guesses.
   specification, not this reference, is the contract for the bytes inside the file.
 
 **Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, tailing `GET /logs`,
-and downloading the two recordings **once** yields the entire observable state of a node: the exact
+and downloading the two recordings **once** yields the entire observable state of a node: the
 configuration in force, every metric around it, what it has just been doing, and the recorded
 evidence of what it did to traffic. That *is* the debug dump — there is deliberately no other
 mechanism to extract state, so those endpoints together are designed to be sufficient to diagnose the
@@ -300,9 +301,54 @@ structured form as the OTEL stream.
 **Record and retention inventory:** the buffer size, the retention bound and the query semantics are
 not named here, under the rule at the head of this chapter.
 
-## Configuration read endpoint
+## Configuration endpoint: reading the policy and replacing it
 
-`GET /config` returns the exact running configuration (XML; see the
+`GET /config` returns the running configuration as XML (see the
 [configuration design](../design/configuration.md)). It supplies the intent half of the debug dump:
 paired with a `/metrics` scrape and a `/logs` read it gives the complete picture of *what the node
 is configured to do* alongside *what it is doing* and *what it has just done*.
+
+**What comes back is a rendering of the configuration in force, not the bytes that were submitted.**
+The node keeps no copy of the document — 64 KiB of text has nowhere to live in a domain with no
+allocator — so the answer is produced from the model the appliance is actually deciding under. Three
+consequences, and each is the reason it is the stronger answer:
+
+- Reformat a document, submit it, and read it back: what returns is the canonical form, not the
+  whitespace and attribute order that were sent. Two documents that are one configuration state one
+  document, which is the same property that makes re-submitting an unchanged configuration commit
+  nothing.
+- A value the schema admits in more than one spelling comes back in one of them — `protocol="6"`
+  reads back as `protocol="tcp"`, a port range whose ends are equal as the single port.
+- The generation a node committed **at boot** is stateable, which an echo of submitted bytes could
+  never be: no other domain ever saw that document.
+
+**What comes back is always a document the appliance would itself accept.** A configuration whose
+canonical form would not fit the document bound is refused at submission with
+`rejected=rendering-too-large` rather than committed, precisely so the read stays the first step of a
+change: a policy an operator can read and not resubmit is one they cannot edit.
+
+`POST /config` submits a replacement. The body is an XML document bounded by the same 64 KiB the
+reader enforces; a longer one is refused `413 Content Too Large` at the request head, before a byte of
+it is accumulated. The document becomes the candidate, is validated, and is committed under the next
+generation; the answer is one line in the field vocabulary `LFW-CFG` uses on the console:
+
+```text
+generation=<n> outcome=applied changes=<n>
+generation=<n> outcome=unchanged changes=0
+generation=<n> outcome=refused rejected=<reason> offset=<n>
+```
+
+`200` for the first two, `400` for a refusal — the document is the client's and the node is
+working — and the `rejected=` token is one of the reasons the [console chapter](console.md) lists.
+A refusal changes nothing: the generation named is the one still running.
+
+The generation the answer names is the one the **configuration domain** committed. The forwarding
+domain switches tables at its next poll boundary, which is what the two-phase handover exists to make
+happen between two frames rather than inside one — so what says a change is in force on the dataplane
+is `librefirewall_configuration_generation{domain="forwarder"}` reaching that number.
+
+**Editing the policy changes which conversations may start, and does not end one already running.** A
+packet an existing flow accounts for is forwarded before the filter is consulted at all, so traffic
+that was flowing under the previous policy goes on flowing until its flow expires. Re-evaluating the
+flow table on commit is what would close that, and it does not exist — the
+[development status](../status.md) records it as missing.

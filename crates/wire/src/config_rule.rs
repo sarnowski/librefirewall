@@ -127,6 +127,18 @@ config_rules! {
         RuleNoPortCriterionOnIcmp,
         /// An ICMP type criterion on a rule that names another protocol.
         RuleNoIcmpTypeOnAnotherProtocol,
+
+        /// The appliance can state the configuration back as a document it would
+        /// itself accept.
+        ///
+        /// The one rule here about the configuration as a whole rather than about
+        /// an object in it, and the one whose subject is the *appliance* rather
+        /// than the document: a configuration whose canonical form outgrows the
+        /// document bound is one a node could commit and then be unable to answer
+        /// `GET /config` with. Reading the running configuration is the first step
+        /// of changing it, so a policy an operator can read and cannot resubmit is
+        /// one they cannot edit.
+        ConfigurationIsStatable,
     }
 }
 
@@ -191,7 +203,16 @@ impl ConfigRule {
             // one id are indistinguishable here. Nothing downstream of the
             // image consumes such an id, so nothing downstream can be misled by
             // one; it is a handle for editing the document.
-            Self::NeighbourIdIsUnique => Enforcement::CannotDecide,
+            //
+            // And whether the configuration can be *stated back* is a question
+            // about the document form, which is the reading domain's business and
+            // not this one's: the image is the model as POD and carries no
+            // rendering. The asymmetry costs the consumer nothing, and that is the
+            // test of whether an asymmetry is admissible here — a rule the image
+            // cannot decide is one a compromise of the reader lifts, so it may only
+            // ever be a rule the *consumer has no stake in*. This one is about
+            // whether an operator can read the policy back, which decides no frame.
+            Self::NeighbourIdIsUnique | Self::ConfigurationIsStatable => Enforcement::CannotDecide,
         }
     }
 }
@@ -212,7 +233,7 @@ const _: () = {
         }
         index += 1;
     }
-    assert!(undecidable == 1);
+    assert!(undecidable == 2);
 };
 
 #[cfg(test)]
@@ -231,15 +252,28 @@ mod tests {
         }
     }
 
-    /// The image cannot invent an enforcement it does not have: exactly one
-    /// rule is undecidable here, and it is the neighbour id.
+    /// The image cannot invent an enforcement it does not have, and the two rules
+    /// it cannot decide are named: a neighbour's identity, which the image does not
+    /// carry, and whether the configuration can be stated back, which is a question
+    /// about a document form the image is not one of.
+    ///
+    /// Both are admissible for the same reason and it is the only reason that ever
+    /// makes one admissible: the consumer has no stake in either. A rule the image
+    /// cannot re-decide is a rule a compromise of the reading domain lifts, so it
+    /// may only ever be a rule about something that decides no frame.
     #[test]
-    fn the_one_rule_the_image_cannot_decide_is_the_neighbours_identity() {
+    fn the_rules_the_image_cannot_decide_are_the_two_the_consumer_has_no_stake_in() {
         let undecidable: Vec<ConfigRule> = ConfigRule::ALL
             .into_iter()
             .filter(|rule| rule.image_enforcement() == Enforcement::CannotDecide)
             .collect();
-        assert_eq!(undecidable, [ConfigRule::NeighbourIdIsUnique]);
+        assert_eq!(
+            undecidable,
+            [
+                ConfigRule::NeighbourIdIsUnique,
+                ConfigRule::ConfigurationIsStatable
+            ]
+        );
     }
 
     /// Only the management entry's rules are conditional on an enable flag,

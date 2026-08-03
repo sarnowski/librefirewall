@@ -22,21 +22,38 @@ That configuration is a schema-validated XML document, read and committed by a p
 of its own that holds no device and no dataplane memory, and handed to the forwarder through a
 shared region under an offer/acknowledge protocol. The forwarder boots **fail-closed** — an empty
 table, forwarding nothing — and switches to a configuration only after re-deciding, itself, every
-one of the 41 rules the validating domain applied — at that domain's own strength on all but one,
-which is named where it is declared and is about a value the image does not carry — so a
-compromised parser cannot hand it a table those rules refuse. Every boot therefore performs a live
-configuration swap on a running dataplane. There is still no way to *submit* a document to a
-running node: the configuration is embedded into the image at build time, so a configuration change
-requires a new image and a reboot.
+one of the 42 rules the validating domain applied — at that domain's own strength on all but two,
+each named where it is declared and each about something the image cannot see or has no stake in — so
+a compromised parser cannot hand it a table those rules refuse. Every boot therefore performs a live
+configuration swap on a running dataplane.
+
+A document can now be **submitted to a running node** over the management API: `POST /config` takes
+an XML document, `GET /config` states the one in force, and a submission that passes every rule is
+committed under the next generation and picked up by the dataplane at its next poll boundary. The
+end-to-end gate proves the whole of that on the release image — it boots a node, injects traffic the
+shipped policy forwards, `POST`s a document that reverses that policy, waits for the forwarding
+domain to report the new generation, and injects again: the traffic that was forwarded is now dropped
+and the traffic that was dropped is now forwarded, with no domain having restarted in between. A
+malformed document submitted after it is refused with a reason and leaves the generation where it
+was. The document a build embeds is now the *first* generation rather than the only one; a
+**hardware** change still requires a new image, which is the line the design draws.
+
+**Anyone who can reach the management port can replace this appliance's policy.** There is no
+authentication and no TLS in front of it — see the paragraph below — so the port must not be exposed
+to an untrusted network.
 
 A **dedicated management port** is the third NIC, and it is an addressed IPv4 endpoint that
 answers for itself and forwards nothing. It answers ARP requests for its own address, ICMP echo
 requests to it, and HTTP over a first-party TCP stack: `GET /metrics` returns a Prometheus
 exposition, and `GET /logs.pcapng` and `GET /capture.pcapng` return the two traffic recordings
-whole. All of it is plain HTTP — **there is no TLS and no authentication in front of any of it
-yet**, so anyone who can reach the port can scrape the metrics and download every packet the
-appliance recorded. The port's MAC, address and prefix come from the configuration document like
-every other address on the appliance, so the port is configured rather than compiled in.
+whole; `GET /config` states the running configuration and `POST /config` replaces it. All of it is
+plain HTTP — **there is no TLS and no authentication in front of any of it yet**, so anyone who can
+reach the port can scrape the metrics, download every packet the appliance recorded, read the policy,
+and *replace* it. That last one is not a lesser gap than the others: it is the authority to decide
+what this firewall forwards. Until the intended mTLS termination and certificate handling exist, the
+management port belongs on an isolated network and nowhere else. The port's MAC, address and prefix
+come from the configuration document like every other address on the appliance, so the port is
+configured rather than compiled in.
 
 The isolation between management and dataplane is a property of what each domain is granted, not a
 rule anybody has to remember: the management domain holds no dataplane memory and the forwarder
@@ -203,15 +220,15 @@ every record is anchored to a causing packet and a timeout has none.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Management HTTP API over mTLS | **open** | |
+| Management HTTP API over mTLS | **partial** | the API exists and carries the whole surface — `GET /metrics`, `GET /config`, `POST /config` and both recording downloads — over **plain HTTP with no authentication at all**. Anyone who can reach the port can read the policy and replace it, so the port must not be exposed to an untrusted network; the mTLS pair, the authorization split and the request-rate bound the [management design](design/management.md) requires are all absent — [detail](developers/status-detail.md#management-http-api) |
 | Schema-validated XML configuration, hardened validator PD | **partial** | [detail](developers/status-detail.md#configuration-management) |
-| Candidate/commit-confirm transactions, versioning, rollback | **partial** | the candidate/running split and monotonic generations exist; neither rollback nor commit-confirm does — [detail](developers/status-detail.md#configuration-management) |
+| Candidate/commit-confirm transactions, versioning, rollback | **partial** | a document is submitted with `POST /config`, staged as the candidate, validated and committed under the next generation, and refusing one changes nothing; the candidate/running split and monotonic generations are what carry it. Neither **rollback** nor **commit-confirm** exists, so a change that validates and then breaks management connectivity is not undone by anything — [detail](developers/status-detail.md#configuration-management) |
 | Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](developers/status-detail.md#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
 | OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the design's **System** category alone — Audit, Traffic and Subsystem have none. No transport, exporter or receiver exists, so the OpenTelemetry inventory in the [observability reference](reference/observability.md) is empty, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
 | Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane; the connection table publishes its own occupancy, lifecycle and every refusal, and the rest of the occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
-| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *connection history* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. `GET /config` does not exist either, so of the debug dump the [observability reference](reference/observability.md) describes, the state half and the recordings are what a node can be asked for; the retained records and the running document cannot be, and the reference's local-buffer inventory is empty |
+| Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *connection history* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. Of the debug dump the [observability reference](reference/observability.md) describes, the state half, the running document and the recordings are what a node can be asked for; the retained records cannot be, and the reference's local-buffer inventory is empty |
 
 ## Lifecycle, boot and trust
 

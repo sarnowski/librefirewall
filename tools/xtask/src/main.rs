@@ -69,6 +69,7 @@ mod ab_test;
 mod artifacts;
 mod budgets;
 mod clock_contract;
+mod config_submission_contract;
 mod config_transcript;
 mod console_records;
 mod data_disk;

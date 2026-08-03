@@ -236,6 +236,28 @@ pub const CONFIGURATION_GENERATION: Metric = metric(
     "The configuration generation this domain is running under; 0 is the fail-closed empty table.",
 );
 
+/// What the domain that decides on a document has decided.
+///
+/// The count no other surface carries: a node that refuses every document an
+/// operator submits looks, on the generation gauge alone, exactly like a node
+/// nobody has submitted one to. Its `outcome` values are the console's own
+/// generation vocabulary, so a line an operator reads and a series they graph name
+/// the same three things.
+pub const CONFIGURATION_SUBMISSIONS: Metric = metric(
+    "librefirewall_configuration_submissions_total",
+    Kind::Counter,
+    "Documents submitted to this node over the management API, by what the \
+     configuration domain decided: `applied` moved the generation, `unchanged` was \
+     the configuration already running, `refused` broke a rule and changed nothing.",
+);
+
+/// Documents the deciding domain was asked for.
+pub const CONFIGURATION_READS: Metric = metric(
+    "librefirewall_configuration_reads_total",
+    Kind::Counter,
+    "Times the running configuration document was read out of this node.",
+);
+
 pub const CONFIGURATION_IMAGES: Metric = metric(
     "librefirewall_configuration_images_total",
     Kind::Counter,
@@ -523,10 +545,23 @@ pub const HTTP_REQUESTS_OVERFLOWED: Metric = metric(
     "Requests that outgrew the bounded request buffer before their head ended.",
 );
 
-pub const HTTP_EXPOSITIONS_REFUSED: Metric = metric(
-    "librefirewall_http_expositions_refused_total",
+pub const HTTP_BODIES_REFUSED: Metric = metric(
+    "librefirewall_http_bodies_refused_total",
     Kind::Counter,
-    "Expositions the renderer would not fit in the staging buffer; ours, expected to stay zero.",
+    "Response bodies a renderer would not fit in the staging buffer, whichever target asked; \
+     ours, expected to stay zero.",
+);
+
+pub const HTTP_BODIES_TAKEN: Metric = metric(
+    "librefirewall_http_bodies_taken_total",
+    Kind::Counter,
+    "Request bodies accumulated whole and handed to the domain that decides on them.",
+);
+
+pub const HTTP_BODY_OVERRUNS: Metric = metric(
+    "librefirewall_http_body_overruns_total",
+    Kind::Counter,
+    "Request-body bytes a client sent past the length it declared, dropped unread.",
 );
 
 pub const HTTP_RETRANSMITS_UNAVAILABLE: Metric = metric(
@@ -758,7 +793,9 @@ pub const ALL_METRICS: &[&Metric] = &[
     &HTTP_RESPONSES,
     &HTTP_RESPONSE_BYTES,
     &HTTP_REQUESTS_OVERFLOWED,
-    &HTTP_EXPOSITIONS_REFUSED,
+    &HTTP_BODIES_REFUSED,
+    &HTTP_BODIES_TAKEN,
+    &HTTP_BODY_OVERRUNS,
     &HTTP_RETRANSMITS_UNAVAILABLE,
     &HTTP_SLOTS_EXHAUSTED,
     &BLOCK_CAPACITY_SECTORS,
@@ -787,6 +824,8 @@ pub const ALL_METRICS: &[&Metric] = &[
     &UART_TRANSMITTER_TIMEOUTS,
     &UART_INIT_FAILURES,
     &CONFIGURATION_GENERATION,
+    &CONFIGURATION_SUBMISSIONS,
+    &CONFIGURATION_READS,
     &CONFIGURATION_IMAGES,
     &INTERFACE_INFO,
     &CLOCK_GENERATION,

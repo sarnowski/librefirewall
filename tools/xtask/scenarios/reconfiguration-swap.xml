@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Harness input, and the only document in this tree that is never built into an
+     image: it is SUBMITTED over the management API to a node already running
+     `systems/qemu-x86_64/configuration.xml`, and the whole of what it proves is
+     that a running appliance changes what it forwards because of it.
+
+     It is the shipped document with the two rules' ACTIONS SWAPPED and nothing
+     else changed. Every address, every MAC, every id and both destination ports
+     are the shipped document's, so a probe that was forwarded before the
+     submission and dropped after it — and one that was dropped before and
+     forwarded after — differ from each other in the policy alone. That is what
+     makes the reversal evidence rather than a coincidence of two documents that
+     happen to disagree in several places at once.
+
+     THE SWAP IS IN BOTH DIRECTIONS ON PURPOSE. A document that only tightened the
+     policy would leave the appliance forwarding nothing afterwards, and "the
+     dataplane stopped forwarding" and "the dataplane applied the new policy"
+     would look alike. Here the traffic the shipped document dropped is forwarded
+     after the commit, so the dataplane is demonstrably still deciding rather than
+     merely silent.
+
+     The rule ids are the shipped document's too, deliberately, and this is the one
+     place that is the stronger choice rather than the weaker one: a per-rule hit
+     counter labelled with an unchanged id is one whose *action* an operator can
+     watch change under a stable label, which is exactly the reversal a scrape has
+     to show. What the other scenario documents prove by differing — that a label
+     is read from the file rather than compiled in — is proved there.
+
+     It is also, and separately, a document the appliance must state back
+     unchanged: the scenario reads `GET /config` after the commit and holds the
+     answer to being one this node would accept again. -->
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+        <neighbour id="endpoint-b" interface="dataplane-1"
+                   address="10.0.1.2" mac="52:54:00:00:00:0b"/>
+    </neighbours>
+    <rules>
+        <rule id="probe-blocked" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" action="accept"/>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5000" icmp-type="any" action="drop"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

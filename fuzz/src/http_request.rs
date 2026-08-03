@@ -26,6 +26,11 @@
 //! * **A head is answered.** Every completed head produces a status the server
 //!   can send, and every refusal produces one too, so no input reaches a
 //!   connection the server has nothing to say on.
+//! * **A declared body is inside the caller's bound and on the one method that
+//!   may carry one.** The declared length is what a caller sizes an accumulation
+//!   from, so a head reporting more than the bound — or a body on a method the
+//!   parser was supposed to refuse one on — is the shape that would have a caller
+//!   write past its own array.
 
 use arbitrary::Unstructured;
 use lfw_http::{
@@ -34,6 +39,10 @@ use lfw_http::{
 };
 
 use crate::{any_index, any_u16};
+
+/// The body bound heads here are read against: the management server's own, so a
+/// declared length this harness accepts is one that server would accept.
+const BODY_LIMIT: usize = lfw_ip_endpoint::http::MAX_BODY_LEN;
 
 /// Segments one input is cut into, at most. A bound on the harness's own work
 /// rather than on the adversary's authority: the cut *points* are arbitrary and
@@ -64,7 +73,7 @@ pub fn http_request_harness(data: &[u8]) {
         // A caller accumulates and re-parses; so does this.
         accumulated = boundary.max(accumulated);
         let buffer = stream.get(..accumulated).unwrap_or(stream);
-        match parse(buffer) {
+        match parse(buffer, BODY_LIMIT) {
             Ok(Parsed::NeedMore) => {
                 assert!(
                     !answered,
@@ -84,6 +93,17 @@ pub fn http_request_harness(data: &[u8]) {
                         .bytes()
                         .all(|byte| (0x21..=0x7E).contains(&byte)),
                     "a target carrying a byte no request target may"
+                );
+                // The two rules the body framing rests on, which a caller sizes
+                // an accumulation from: a declared body is inside the bound it
+                // was read against, and only a `POST` may declare one at all.
+                assert!(
+                    request.body_len() <= BODY_LIMIT,
+                    "a declared body past the bound it was parsed against"
+                );
+                assert!(
+                    request.body_len() == 0 || request.is_post(),
+                    "a body declared on a method that may not carry one"
                 );
                 let headers: Vec<_> = request.headers().collect();
                 assert!(headers.len() <= MAX_HEADERS);
@@ -133,7 +153,7 @@ enum Verdict {
 }
 
 fn verdict(bytes: &[u8]) -> Verdict {
-    match parse(bytes) {
+    match parse(bytes, BODY_LIMIT) {
         Ok(Parsed::NeedMore) => Verdict::NeedMore,
         Ok(Parsed::Complete { consumed, .. }) => Verdict::Complete(consumed),
         Err(error) => Verdict::Refused(error.status()),

@@ -350,13 +350,14 @@ nothing was staged, or the counter is exhausted). `refused` carries no reason to
 about the configuration is wrong; a *document* that is wrong is the third shape.
 
 **Rejection** — a document or an offered image was refused, naming where and why and never the
-bytes. `rejected=` is one of 34 reasons:
+bytes. `rejected=` is one of 35 reasons:
 
 | group | reasons |
 |---|---|
 | document syntax and hardening bounds (17) | `malformed`, `doctype`, `entity-declaration`, `unknown-entity-reference`, `invalid-character-reference`, `document-too-large`, `depth-exceeded`, `too-many-attributes`, `name-too-long`, `value-too-long`, `unexpected-character-data`, `duplicate-attribute`, `unknown-element`, `unknown-attribute`, `missing-element`, `missing-attribute`, `malformed-value` |
 | semantic validation over the parsed model (13) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `capacity-exceeded` |
 | a filter rule that would match nothing (4) | `prefix-not-canonical`, `port-range-reversed`, `port-criterion-on-icmp`, `icmp-type-on-non-icmp` |
+| a configuration the appliance could not state back (1) | `rendering-too-large` |
 
 `capacity-exceeded` sits in the second group and not the first, which is where a reader expects a
 bound to be: a document naming more interfaces, neighbours or rules than the handover image holds
@@ -368,6 +369,13 @@ ICMP, an ICMP type on a rule that names TCP, a block written `10.0.0.5/24` when 
 `10.0.0.0/24` — each is a line an operator wrote believing it was in force. On an appliance that
 denies what no rule matched, the dangerous half of that belief is the `accept` that quietly matches
 nothing, so the document is refused rather than committed with a rule that cannot fire.
+
+The fourth group has one reason and is about neither a value nor a rule but the configuration as a
+whole. Reading the running configuration is the first step of changing it, so a configuration whose
+own canonical form is longer than a document may be would commit and then be unreadable — an
+operator could see it and not edit it. It is therefore refused, and `rendering-too-large` is the one
+refusal whose `offset=` is not a position in the document: the number is the length the canonical form
+would have taken, and the object it names is `configuration` rather than any entry.
 
 The vocabulary is deliberately coarser than the reader's own fault tree: eighteen distinct
 unterminated, mismatched or misplaced constructs all read as `malformed`, because each is one edit
@@ -384,6 +392,21 @@ domain can raise one too, and it is the one refusal that changes nothing anywher
 has already staged and the publisher has already released. The port goes on carrying the addressing
 it had, and `offset=` on such a record is the value that was refused rather than an index into
 anything.
+
+**A submitted document produces the same records as the one a build embeds.** Nothing on this channel
+says where a document came from, and that is deliberate: what the console carries is the system's
+state, and a generation is the same fact however it arrived. So a `POST /config` that commits reads as
+its change records, the publisher's `outcome=applied`, and the consumer's `outcome=applied changes=0`
+when the dataplane switches — the same three shapes a boot produces, under the next generation number.
+A refused submission reads as one `rejected=` record and moves nothing. What distinguishes a submitted
+generation from a booted one is the number: generation 1 is the document the image carries, and every
+higher one arrived over the management API.
+
+**A configuration change does not change a domain's state.** A refused *submission* leaves the
+configuration domain reporting nothing on `LFW-PD`: it is the document that was refused and not the
+domain, which is running perfectly well and has just said so by refusing. `config state=refused`
+belongs to a domain that could not come up under the document its image carries, and reading it as a
+refused submission would be reading a healthy node as a broken one.
 
 ## Two things an operator will otherwise read wrong
 

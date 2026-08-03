@@ -730,6 +730,23 @@ struct Probe {
     /// The lifecycle or policy event a record of this probe must carry, where it
     /// must carry one. `None` for a probe the connection history is not about.
     event: Option<u8>,
+    /// Which side of a configuration change this probe belongs to.
+    ///
+    /// The one thing a reconfiguration contract needs that nothing else does: a
+    /// probe whose verdict is stated against the *submitted* policy must not be
+    /// injected while the shipped one is still in force, or its refusal would be
+    /// the old policy's and would look exactly like the new one working.
+    wave: Wave,
+}
+
+/// Which policy a probe's verdict is stated against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Wave {
+    /// The configuration the image was built around, in force from boot.
+    #[default]
+    Shipped,
+    /// The configuration submitted over the management API during the run.
+    Submitted,
 }
 
 impl Probe {
@@ -1202,6 +1219,7 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
             deferred: false,
             once: false,
             event: None,
+            wave: Wave::Shipped,
         },
     ])
 }
@@ -1245,6 +1263,16 @@ pub enum Traffic {
     /// rather than adopted. Every one of the four is perfectly routable, so what
     /// separates their fates is the connection table and nothing else.
     Stateful,
+    /// The one probe set that spans a **configuration change**: two probes under
+    /// the shipped policy and two more, on the same two ports, under one submitted
+    /// over the management API while the node runs.
+    ///
+    /// The four together are the reversal. The port the shipped policy accepts is
+    /// forwarded before the change and dropped after it; the port it drops is
+    /// dropped before and **forwarded** after. Both directions, because a set that
+    /// only tightened the policy would leave "the dataplane applied the new rules"
+    /// and "the dataplane stopped forwarding" looking alike.
+    Reconfiguration,
 }
 
 /// What the injected probes oblige the appliance's filter to have counted.
@@ -1286,6 +1314,18 @@ pub struct PolicyWitness {
     /// in any set is a TCP segment at all, so a refusal on a boot that injected
     /// none is a frame nobody put on the wire.
     pub probed_mid_stream: bool,
+    /// Whether the boot ran **two** policies: one it booted with and one submitted
+    /// over the management API while it ran.
+    ///
+    /// It changes which per-rule statement is available, and that is worth stating
+    /// rather than working around. On a boot under one policy each rule's hit count
+    /// is attributable — the accepting rule's matches are the openings and the
+    /// denying rule's are the denials — because a rule's action does not move. Here
+    /// the two rules keep their ids and exchange their actions, so each accrues
+    /// hits under both, and what stays exact is the *sum*: every packet that
+    /// reached the filter and matched something is an opening or a denial, whichever
+    /// generation decided it.
+    pub reconfigured: bool,
 }
 
 /// The probes one boot injects, and what they oblige the filter to have counted.
@@ -1297,7 +1337,12 @@ fn injected_probes(
     traffic: Traffic,
 ) -> Result<(Vec<Probe>, PolicyWitness), String> {
     let policy = topology.port_policy().map_err(|error| error.to_string())?;
-    let (probes, touches_the_filter, stateful) = match traffic {
+    // Which of the filter's two refusals each set provokes, and whether it reaches
+    // the tracker deliberately. Three flags rather than two derived from one,
+    // because the reconfiguration set is the first whose answers differ: it
+    // provokes the *dropping rule* under both policies and the fallthrough under
+    // neither, both of its ports being named by both documents.
+    let (probes, denying_rule, fallthrough, stateful) = match traffic {
         // Not one of the six names a port the dropping rule is about, and none of
         // them falls past the last rule: the four refusals are the admission and
         // routing stages', decided before the filter is consulted, and the two
@@ -1305,29 +1350,137 @@ fn injected_probes(
         // both of the filter's refusal counters to still read zero, which is as
         // strong a statement as a rise and is only available from a set that
         // provokes neither.
-        Traffic::Routed => (probes(topology)?, false, false),
-        Traffic::Policy => (policy_probes(topology, policy), true, false),
+        Traffic::Routed => (probes(topology)?, false, false, false),
+        Traffic::Policy => (policy_probes(topology, policy), true, true, false),
         // The fallthrough, but not the dropping rule: the unsolicited packet
         // falls past every rule, and nothing in this set is addressed to the port
         // the dropping rule names.
-        Traffic::Stateful => (stateful_probes(topology, policy), false, true),
+        Traffic::Stateful => (stateful_probes(topology, policy), false, true, true),
         // Neither of the filter's refusals: every segment is addressed to the
         // port the accepting rule names, and the one that is refused is refused
         // by the tracker before the filter is consulted. So this set obliges both
         // filter refusal counters to still read zero, which is as strong a
         // statement as a rise.
-        Traffic::Lifecycle => (lifecycle_probes(topology, policy), false, false),
+        Traffic::Lifecycle => (lifecycle_probes(topology, policy), false, false, false),
+        // The dropping rule under both policies — the shipped one refuses the first
+        // wave's second probe and the submitted one refuses the second wave's — and
+        // the fallthrough under neither: both ports are named by both documents, so
+        // nothing here falls past the last rule. The zero is the stronger half of
+        // the pair, as it is for the routed set.
+        Traffic::Reconfiguration => (reconfiguration_probes(topology, policy), true, false, false),
     };
     Ok((
         probes,
         PolicyWitness {
             policy,
-            probed_the_denying_rule: touches_the_filter,
-            probed_the_fallthrough: touches_the_filter || stateful,
+            probed_the_denying_rule: denying_rule,
+            probed_the_fallthrough: fallthrough || stateful,
             probed_an_established_flow: stateful,
             probed_mid_stream: stateful,
+            reconfigured: matches!(traffic, Traffic::Reconfiguration),
         },
     ))
+}
+
+/// Two probes under the policy the image was built around, and two more under the
+/// policy submitted over HTTP while it runs — the same two destination ports, with
+/// the verdicts exchanged.
+///
+/// Every probe carries its own marker, so a delivery is attributed to the wave that
+/// caused it and a frame left over from the first can never satisfy the second.
+/// That matters more here than anywhere else in this harness: the second wave's
+/// *accepted* probe goes to the port the first wave's *refused* probe went to, so
+/// two probes with one marker would make a stale retransmission read as the
+/// reversal.
+fn reconfiguration_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    /// The source port the second wave opens its conversations from.
+    ///
+    /// **A different one, and this is the interesting constraint of the whole
+    /// scenario rather than a detail.** A policy decides which conversations may
+    /// *start*: a packet an existing flow already accounts for is forwarded before
+    /// the filter is consulted at all, so editing a rule does not end a
+    /// conversation already running. The first wave's accepted probe opened one, so
+    /// a second packet on the same five-tuple would be carried by that flow and
+    /// would come back — correctly, and saying nothing whatever about the new
+    /// policy. Re-evaluating the flow table on commit is what would close it, and
+    /// it does not exist yet; the development status records it as missing.
+    ///
+    /// So the second wave opens its own conversations, and what it proves is
+    /// exactly what the policy is about: which conversations may start under the
+    /// document now in force.
+    const REOPENED_FROM: u16 = SOURCE_PORT + 1;
+
+    let to_port = |port: u16, marker: &'static [u8]| UdpPacket {
+        destination_port: port,
+        payload: marker.to_vec(),
+        ..datagram(a, b, INJECTED_TTL, marker)
+    };
+    let reopened = |port: u16, marker: &'static [u8]| UdpPacket {
+        source_port: REOPENED_FROM,
+        ..to_port(port, marker)
+    };
+    vec![
+        // Under the shipped policy: the accepted port is forwarded and the denied
+        // one is dropped by a rule, which is the baseline the reversal is measured
+        // against.
+        routed(
+            "shipped-accepted",
+            b"LFW-PROBE/shipped-accepted",
+            a,
+            b,
+            to_port(
+                policy.accepted.destination_port,
+                b"LFW-PROBE/shipped-accepted",
+            ),
+        ),
+        refused_by_policy(
+            recording_contract::EVENT_POLICY_DENIED,
+            dropped(
+                "shipped-denied",
+                b"LFW-PROBE/shipped-denied",
+                a,
+                "the shipped policy has a rule matching it that says drop",
+                to_port(policy.denied.destination_port, b"LFW-PROBE/shipped-denied"),
+            ),
+        ),
+        // And under the submitted one, on the same two ports with the verdicts
+        // exchanged. Injected only once the forwarding domain reports the
+        // committed generation, so a refusal here is the new policy's.
+        after_the_commit(routed(
+            "submitted-accepted",
+            b"LFW-PROBE/submitted-accepted",
+            a,
+            b,
+            reopened(
+                policy.denied.destination_port,
+                b"LFW-PROBE/submitted-accepted",
+            ),
+        )),
+        after_the_commit(refused_by_policy(
+            recording_contract::EVENT_POLICY_DENIED,
+            dropped(
+                "submitted-denied",
+                b"LFW-PROBE/submitted-denied",
+                a,
+                "the submitted policy turned the rule that accepted this port into a drop, and \
+                 this conversation is a new one rather than the one the first wave opened",
+                reopened(
+                    policy.accepted.destination_port,
+                    b"LFW-PROBE/submitted-denied",
+                ),
+            ),
+        )),
+    ]
+}
+
+/// A probe whose verdict is the submitted policy's, so it must not go out while the
+/// shipped one is still in force.
+fn after_the_commit(probe: Probe) -> Probe {
+    Probe {
+        wave: Wave::Submitted,
+        ..probe
+    }
 }
 
 /// A request, its reply, an unsolicited packet in the reply direction, and a TCP
@@ -1625,6 +1778,7 @@ fn routed(
         // contract is stated as "at least one record of this probe names an
         // opening" rather than as a count.
         event: Some(recording_contract::EVENT_FLOW_OPENED),
+        wave: Wave::Shipped,
     }
 }
 
@@ -1679,6 +1833,7 @@ fn routed_frame(
         deferred: false,
         once: false,
         event: Some(event),
+        wave: Wave::Shipped,
     }
 }
 
@@ -1754,6 +1909,7 @@ fn dropped(
         // Which of the refusals it is depends on which stage refused it, so a
         // caller that knows says so; the default claims nothing.
         event: None,
+        wave: Wave::Shipped,
     }
 }
 
@@ -1778,6 +1934,7 @@ fn dropped_frame(
         deferred: false,
         once: false,
         event: None,
+        wave: Wave::Shipped,
     }
 }
 
@@ -3293,6 +3450,10 @@ pub struct Booted {
     /// Every frame this boot put on a dataplane port, with the probe that put
     /// it there and whether the appliance's tap must have observed it.
     ///
+    /// What the configuration submission proved, on the one scenario that makes
+    /// one. `None` everywhere else, and a scenario that should have made one and
+    /// did not has already failed above.
+    pub applied: Option<crate::config_submission_contract::Applied>,
     /// Returned so [`crate::surface_contract`] can hold the recordings to the
     /// bytes the harness itself injected rather than to a literal: the probes
     /// are derived from the configuration document, so an image built from the
@@ -3384,6 +3545,10 @@ fn run_boot(
     let mut dataplane_frames: u64 = 0;
     let mut scrapes: Vec<Scrape> = Vec::new();
     let mut recordings: Vec<Download> = Vec::new();
+    // What the configuration submission proved, on the one scenario that makes one.
+    // Outside the run block for the reason the two above are: a boot that reached
+    // the submission and then failed later still observed what it observed.
+    let mut applied: Option<crate::config_submission_contract::Applied> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -3505,6 +3670,9 @@ fn run_boot(
         // contract needs and a stateless one has none of, so on every other
         // scenario this is true from the start and the arm below never fires.
         let mut deferred_injected = !probes.iter().any(Probe::waits);
+        // Which policy the probes now going out are stated against. Every scenario
+        // but the reconfiguration one has a single wave and never leaves this.
+        let mut wave = Wave::Shipped;
         // The refusal probes go out once, and the branch that sends them now runs
         // on several passes while the management burst is chunked out.
         let mut refusals_injected = false;
@@ -3514,7 +3682,9 @@ fn run_boot(
         // the port to have acknowledged everything ahead of it.
         let mut client_pending: VecDeque<Vec<u8>> = VecDeque::new();
         let mut last_management_inject = Instant::now();
-        inject_probes(&mut endpoints, &probes, |probe| !probe.waits());
+        inject_probes(&mut endpoints, &probes, |probe| {
+            probe.wave == wave && !probe.waits()
+        });
 
         // Phase 2: watch both ports and the serial channel, re-injecting
         // periodically, until the contract is decided.
@@ -3683,19 +3853,23 @@ fn run_boot(
                     // side. Before the refusals below, so the settle window still
                     // starts after everything has been injected.
                     None if !deferred_injected
-                        && all_routed_among(&probes, &deliveries, |probe| !probe.waits()) =>
+                        && all_routed_among(&probes, &deliveries, |probe| {
+                            probe.wave == wave && !probe.waits()
+                        }) =>
                     {
                         deferred_injected = true;
                         last_injection = Instant::now();
-                        inject_probes(&mut endpoints, &probes, Probe::waits);
+                        inject_probes(&mut endpoints, &probes, |probe| {
+                            probe.wave == wave && probe.waits()
+                        });
                     }
-                    None if all_routed(&probes, &deliveries)
+                    None if all_routed_among(&probes, &deliveries, |probe| probe.wave == wave)
                         && management_contract::ports_are_ready(&output) =>
                     {
                         if !refusals_injected {
                             refusals_injected = true;
                             inject_probes(&mut endpoints, &probes, |probe| {
-                                !probe.once && !probe.expectation.is_routed()
+                                probe.wave == wave && !probe.once && !probe.expectation.is_routed()
                             });
                         }
                         // Each frame goes out **once** and is never retransmitted:
@@ -3788,6 +3962,50 @@ fn run_boot(
                     // endpoint, and take it again — a number that moved across
                     // the scrape would make the cross-check meaningless rather
                     // than merely wrong, and is reported as its own failure.
+                    // The configuration change, once the shipped policy's own probes
+                    // have been decided and before the second wave goes out. This
+                    // is the only place in the harness that *changes* what the
+                    // appliance is doing, and the ordering is the whole of what
+                    // makes the change evidence: the first wave's verdicts were
+                    // reached under the document the image was built from, the
+                    // submission is answered and waited on until the forwarding
+                    // domain reports the generation, and only then is a probe
+                    // whose verdict is the new policy's put on the wire.
+                    Some(since)
+                        if since.elapsed() >= SETTLE_WINDOW
+                            && management.is_none()
+                            && wave == Wave::Shipped
+                            && probes.iter().any(|probe| probe.wave == Wave::Submitted) =>
+                    {
+                        let ManagementBacking::UserNetwork { host_port } = backends.management
+                        else {
+                            break 'run Err(String::from(
+                                "a reconfiguration scenario must be on the user-mode backing: the \
+                                 document is submitted with a real client",
+                            ));
+                        };
+                        match crate::config_submission_contract::apply(
+                            host_port,
+                            test.topology.document(),
+                        ) {
+                            Ok(proved) => applied = Some(proved),
+                            Err(verdict) => {
+                                break 'run Err(format!("{verdict}; see {}", log_path.display()));
+                            }
+                        }
+                        // The second wave, into a dataplane the scrape above has
+                        // just observed running the submitted generation.
+                        wave = Wave::Submitted;
+                        deferred_injected = !probes
+                            .iter()
+                            .any(|probe| probe.wave == wave && probe.waits());
+                        refusals_injected = false;
+                        settling_since = None;
+                        last_injection = Instant::now();
+                        inject_probes(&mut endpoints, &probes, |probe| {
+                            probe.wave == wave && !probe.waits()
+                        });
+                    }
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.is_none()
@@ -3928,7 +4146,8 @@ fn run_boot(
             if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 inject_probes(&mut endpoints, &probes, |probe| {
-                    !probe.once
+                    probe.wave == wave
+                        && !probe.once
                         && (deferred_injected || !probe.waits())
                         && !is_delivered(&probes, &deliveries, probe)
                 });
@@ -3955,6 +4174,19 @@ fn run_boot(
     // at whatever instant the contract happened to be decided.
     drain(&serial_receiver, &mut output);
 
+    // A reconfiguration scenario that never reached the submission proved nothing
+    // about it, and a boot whose second wave was never injected would otherwise
+    // pass on the first wave's verdicts alone.
+    let outcome = outcome.and_then(|()| {
+        if probes.iter().any(|probe| probe.wave == Wave::Submitted) && applied.is_none() {
+            return Err(format!(
+                "the boot met its routed contract under the document it was built from and no \
+                 configuration was submitted, so nothing was proved about a change; see {}",
+                log_path.display()
+            ));
+        }
+        Ok(())
+    });
     let outcome = decide(outcome, &test.contract, &output, log_path);
     let traffic = TrafficReport::new(stations, &probes, &deliveries, broke);
 
@@ -3995,6 +4227,7 @@ fn run_boot(
         dataplane_frames,
         policy,
         recordings,
+        applied,
         injected: probes
             .iter()
             .map(|probe| Injected {
@@ -4014,16 +4247,14 @@ fn run_boot(
     })
 }
 
-/// Whether every probe that must be routed has arrived and been accepted.
-fn all_routed(probes: &[Probe], deliveries: &[Option<Delivery>]) -> bool {
-    all_routed_among(probes, deliveries, |_| true)
-}
-
 /// Whether every probe the filter admits that must be delivered has been.
 ///
-/// The filtered form [`all_routed`] is the total case of: a stateful set has to
-/// ask the question of its *immediate* probes alone, because the deferred ones
-/// cannot arrive before they have been sent.
+/// Always asked of a *subset*, and there are two reasons for one predicate. A
+/// stateful set has to ask it of its **immediate** probes alone, the deferred ones
+/// being unable to arrive before they have been sent; and a reconfiguration set has
+/// to ask it of the probes belonging to the policy **now in force**, a probe stated
+/// against a document that has not been submitted yet being one nothing could
+/// deliver.
 fn all_routed_among(
     probes: &[Probe],
     deliveries: &[Option<Delivery>],
@@ -5040,11 +5271,11 @@ mod tests {
                 Expectation::Routed { .. } => None,
             })
             .collect();
-        assert!(!all_routed(&probes, &deliveries));
+        assert!(!all_routed_among(&probes, &deliveries, |_| true));
 
         deliveries = vec![None; probes.len()];
         deliveries[at("routed-0-to-1")] = Some(arrived);
-        assert!(!all_routed(&probes, &deliveries));
+        assert!(!all_routed_among(&probes, &deliveries, |_| true));
         let pending = describe_pending(&probes, &deliveries);
         assert!(
             pending.contains("routed: [routed-0-to-1]")
@@ -5067,7 +5298,7 @@ mod tests {
         assert!(!is_delivered(&probes, &deliveries, &probes[at("no-route")]));
 
         deliveries[at("routed-1-to-0")] = Some(arrival(&probes[at("routed-1-to-0")]));
-        assert!(all_routed(&probes, &deliveries));
+        assert!(all_routed_among(&probes, &deliveries, |_| true));
     }
 
     /// The delivery a routed probe's own contract produces, taken by judging

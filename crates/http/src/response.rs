@@ -23,6 +23,11 @@ pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8
 /// Opaque bytes: this crate parses no format and would be claiming to know one.
 pub const OCTET_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 
+/// The configuration document. `application/xml` rather than `text/xml`, RFC 7303
+/// section 9.1 making the latter's default charset US-ASCII where an operator's
+/// document declares UTF-8.
+pub const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
+
 /// A content type this crate can promise a head for.
 ///
 /// A closed set rather than a `&str`, and that is the whole point of the type:
@@ -38,18 +43,21 @@ pub enum ContentType {
     /// [`OCTET_STREAM_CONTENT_TYPE`]: bytes this crate claims to know nothing
     /// about.
     OctetStream,
+    /// [`XML_CONTENT_TYPE`]: the configuration document a node states.
+    Xml,
 }
 
 impl ContentType {
     /// Every variant, so [`MAX_HEAD_LEN`] is derived by iteration rather than
     /// from a list that drifts from the enum.
-    pub const ALL: [Self; 2] = [Self::Metrics, Self::OctetStream];
+    pub const ALL: [Self; 3] = [Self::Metrics, Self::OctetStream, Self::Xml];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Metrics => METRICS_CONTENT_TYPE,
             Self::OctetStream => OCTET_STREAM_CONTENT_TYPE,
+            Self::Xml => XML_CONTENT_TYPE,
         }
     }
 }

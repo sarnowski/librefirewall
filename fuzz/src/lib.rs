@@ -130,6 +130,7 @@
 //! harness over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
 
 pub mod blk;
+pub mod config_submission;
 pub mod document;
 pub mod flow;
 pub mod driver;
@@ -248,6 +249,10 @@ mod tests {
             crate::metrics_render::metrics_render_harness,
         ),
         ("config_document", crate::document::document_harness),
+        (
+            "config_submission",
+            crate::config_submission::config_submission_harness,
+        ),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),
         ("virtqueue_poll", crate::virtqueue::virtqueue_poll_harness),

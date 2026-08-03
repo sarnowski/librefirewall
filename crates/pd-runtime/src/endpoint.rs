@@ -66,8 +66,8 @@ use core::num::NonZeroU64;
 
 use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
 use lfw_ip_endpoint::{
-    ConnectionId, ContentType, Endpoint, IsnSecret,
-    http::{MAX_STREAM_TARGETS, METRICS_TARGET},
+    ConnectionId, ContentType, Endpoint, IsnSecret, Status,
+    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
 };
 use lfw_log::RejectReason;
 use lfw_metrics::{InterfaceInventory, LogSample, RuleInventory};
@@ -277,6 +277,13 @@ pub struct EndpointStage<'ring> {
     /// registration made at start-up would otherwise be lost the first time an
     /// operator published a document, and the target would start answering 404.
     targets: [Option<&'static str>; MAX_STREAM_TARGETS],
+    /// The targets this domain answers with a body it renders whole, and the ones
+    /// it accepts a request body on. Held here for `targets`' reason exactly: a
+    /// commit builds a new endpoint, and a registration this domain did not keep
+    /// would be lost with the old one — which for the configuration target would
+    /// mean an operator's first successful submission made the next one a `404`.
+    rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
+    bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
     /// each pass, and the seven it reads to answer a scrape.
     stats: StatsRegions<'ring>,
@@ -339,6 +346,8 @@ impl<'ring> EndpointStage<'ring> {
             interfaces: InterfaceInventory::EMPTY,
             rules: RuleInventory::EMPTY,
             targets: [None; MAX_STREAM_TARGETS],
+            rendered: [None; MAX_RENDERED_TARGETS],
+            bodies: [None; MAX_BODY_TARGETS],
             stats,
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
@@ -397,7 +406,7 @@ impl<'ring> EndpointStage<'ring> {
         };
         match taken {
             Ok((generation, endpoint, interfaces, rules)) => {
-                self.endpoint = endpoint;
+                self.adopt(endpoint);
                 self.apply_targets();
                 // Replaced wholesale rather than merged: what the metric
                 // surface reports is the generation in force, and an interface
@@ -412,6 +421,37 @@ impl<'ring> EndpointStage<'ring> {
                 bump(&mut self.counters.configs_refused);
                 Some(refused)
             }
+        }
+    }
+
+    /// Take the endpoint a commit produced, **keeping the one in force where the
+    /// addressing has not moved**.
+    ///
+    /// An [`Endpoint`] is not only an address: it holds the connection table, every
+    /// connection's return path and the server's request slots. Replacing it
+    /// therefore drops every connection open on the port — which is correct when
+    /// the address changed, those connections having been to an address this port
+    /// no longer answers at, and is a defect when it did not: a generation
+    /// submitted over one of those connections would kill the connection that
+    /// submitted it, and the client would wait out its timeout on a change that had
+    /// in fact been committed.
+    ///
+    /// So the identity compared is the whole of what makes an endpoint one — its
+    /// MAC, its address and its prefix — and a generation that moves none of them
+    /// leaves the port exactly as it is.
+    fn adopt(&mut self, offered: Option<Endpoint>) {
+        let unchanged = match (self.endpoint.as_ref(), offered.as_ref()) {
+            (Some(running), Some(offered)) => {
+                running.mac() == offered.mac()
+                    && running.address() == offered.address()
+                    && running.prefix_length() == offered.prefix_length()
+            }
+            // A port that had no addressing and now has one, or had one and now has
+            // none, has moved by definition.
+            _ => false,
+        };
+        if !unchanged {
+            self.endpoint = offered;
         }
     }
 
@@ -472,10 +512,46 @@ impl<'ring> EndpointStage<'ring> {
     /// of which are answered rather than asserted so a caller learns of its own
     /// mistake instead of having it swallowed.
     pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
-        if target == METRICS_TARGET || self.targets.iter().flatten().any(|it| *it == target) {
+        if target == METRICS_TARGET
+            || self.targets.iter().flatten().any(|it| *it == target)
+            || self.rendered.iter().flatten().any(|it| *it == target)
+        {
             return false;
         }
         let Some(slot) = self.targets.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(target);
+        self.apply_targets();
+        true
+    }
+
+    /// Register `target` as one this domain answers on `GET` with a body it renders
+    /// whole, on [`serve_stream_at`](Self::serve_stream_at)'s terms.
+    pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
+        if target == METRICS_TARGET
+            || self.rendered.iter().flatten().any(|it| *it == target)
+            || self.targets.iter().flatten().any(|it| *it == target)
+        {
+            return false;
+        }
+        let Some(slot) = self.rendered.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(target);
+        self.apply_targets();
+        true
+    }
+
+    /// Register `target` as one this domain accepts a request body on, on the same
+    /// terms — except that a target already answered on `GET` is *not* refused:
+    /// one path that states a resource and replaces it is what the configuration
+    /// surface is.
+    pub fn serve_body_at(&mut self, target: &'static str) -> bool {
+        if self.bodies.iter().flatten().any(|it| *it == target) {
+            return false;
+        }
+        let Some(slot) = self.bodies.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
         *slot = Some(target);
@@ -491,13 +567,60 @@ impl<'ring> EndpointStage<'ring> {
     /// refuses. Re-registering one it already holds is refused there and changes
     /// nothing here.
     fn apply_targets(&mut self) {
-        let targets = self.targets;
+        let (targets, rendered, bodies) = (self.targets, self.rendered, self.bodies);
         let Some(endpoint) = self.endpoint.as_mut() else {
             return;
         };
         for target in targets.iter().flatten() {
             endpoint.serve_stream_at(target);
         }
+        for target in rendered.iter().flatten() {
+            endpoint.serve_rendered_at(target);
+        }
+        for target in bodies.iter().flatten() {
+            endpoint.serve_body_at(target);
+        }
+    }
+
+    /// The target a request is waiting on a rendered body for, or `None`.
+    #[must_use]
+    pub fn body_wanted(&self) -> Option<&'static str> {
+        self.endpoint.as_ref()?.body_wanted()
+    }
+
+    /// The document a `POST` submitted, waiting on a decision.
+    #[must_use]
+    pub fn submission(&self) -> Option<&[u8]> {
+        self.endpoint.as_ref()?.submission()
+    }
+
+    /// Answer the request waiting on a whole body by copying `bytes` into the
+    /// endpoint's staging array.
+    ///
+    /// Copied rather than borrowed into the array, because the two live in
+    /// different places: the bytes come out of a shared region this domain reads and
+    /// the array is the endpoint's own. The copy is bounded by the array, which the
+    /// server's own reservation is what sizes.
+    pub fn supply_rendered(
+        &mut self,
+        status: Status,
+        content_type: Option<ContentType>,
+        bytes: &[u8],
+    ) {
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return;
+        };
+        endpoint.supply_body(status, content_type, |out| {
+            let mut written = 0usize;
+            for (cell, byte) in out.iter_mut().zip(bytes) {
+                *cell = *byte;
+                written = written.saturating_add(1);
+            }
+            // A body that does not fit is refused rather than truncated: the server
+            // counts it and answers `503`, which is the same answer a renderer that
+            // could not compose one gets.
+            (written == bytes.len()).then_some(written)
+        });
     }
 
     /// The registered target a request is waiting on a decision about, and the
@@ -637,10 +760,13 @@ impl<'ring> EndpointStage<'ring> {
         let Some(endpoint) = self.endpoint.as_mut() else {
             return;
         };
-        if !endpoint.body_wanted() {
+        // The exposition's own target and no other: a rendered body this domain
+        // does not own the source of belongs to whichever half registered it, and
+        // rendering metrics into it would answer one target with another's body.
+        if endpoint.body_wanted() != Some(METRICS_TARGET) {
             return;
         }
-        endpoint.supply_body(|out| {
+        endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
             stats
                 .snapshot()
                 .with_interfaces(interfaces)

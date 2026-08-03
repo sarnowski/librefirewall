@@ -1204,3 +1204,72 @@ fn a_clocked_but_unaddressed_port_drives_no_timers() {
     assert_eq!(fixture.stage.counters().timer_segments, 0);
     assert!(fixture.transmitted().is_empty());
 }
+
+/// A commit that does not move the port's addressing must not move the port.
+///
+/// The connection table, every return path and the server's request slots live in
+/// the `Endpoint`, so replacing one drops every connection open on it. Before a
+/// document could be submitted that was harmless — the only commit happened at
+/// boot, before any connection existed. It is not harmless now: the connection a
+/// document arrives on is one of the connections a commit would drop, so a
+/// generation would be committed and the client that submitted it would never be
+/// answered.
+#[test]
+fn a_commit_that_does_not_move_the_addressing_keeps_the_connections() {
+    let mut fixture = Fixture::new();
+    let before = fixture.stage.endpoint().expect("an addressed port");
+    let identity = (before.mac(), before.address(), before.prefix_length());
+    let held = core::ptr::from_ref(before);
+
+    // A second generation with the same management addressing. Nothing about the
+    // port moved, so nothing about the port may move.
+    assert!(
+        fixture
+            .commit(management_image(2, OUR_MAC, OUR_ADDRESS, 24))
+            .is_none()
+    );
+    let after = fixture.stage.endpoint().expect("still an addressed port");
+    assert_eq!(
+        (after.mac(), after.address(), after.prefix_length()),
+        identity
+    );
+    assert_eq!(
+        fixture.stage.counters().generation,
+        2,
+        "the generation moved"
+    );
+    // The identity of the value itself, which is what carries the connections: a
+    // rebuilt endpoint would be a different one at the same address.
+    assert!(
+        core::ptr::eq(held, core::ptr::from_ref(after)),
+        "a commit that moved no address rebuilt the endpoint, dropping every connection on it"
+    );
+}
+
+/// And the other direction: a generation that *does* move the addressing replaces
+/// the endpoint, because the connections on it were to an address this port no
+/// longer answers at.
+#[test]
+fn a_commit_that_moves_the_addressing_replaces_the_endpoint() {
+    for moved in [
+        management_image(2, OUR_MAC, Ipv4Address::from_octets([10, 0, 3, 15]), 24),
+        management_image(
+            2,
+            MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x5f]),
+            OUR_ADDRESS,
+            24,
+        ),
+        management_image(2, OUR_MAC, OUR_ADDRESS, 25),
+    ] {
+        let mut fixture = Fixture::new();
+        let before = fixture.stage.endpoint().expect("an addressed port");
+        let identity = (before.mac(), before.address(), before.prefix_length());
+        assert!(fixture.commit(moved).is_none());
+        let after = fixture.stage.endpoint().expect("an addressed port");
+        assert_ne!(
+            (after.mac(), after.address(), after.prefix_length()),
+            identity,
+            "the document moved the addressing and the port did not follow"
+        );
+    }
+}

@@ -102,7 +102,19 @@ pub(crate) const EVERY_CONFIGURATION_DOCUMENT: &[&str] = &[
     CONFIGURATION_DOCUMENT,
     ALTERNATE_DOCUMENT,
     LIFECYCLE_DOCUMENT,
+    SUBMITTED_DOCUMENT,
 ];
+
+/// The one document in this tree that is never built into an image: it is
+/// **submitted over the management API** to a node already running
+/// [`CONFIGURATION_DOCUMENT`], and what it proves is that a running appliance
+/// changes what it forwards because of it.
+///
+/// It is in the list above for the same reason the others are — it must be a
+/// document this appliance would accept, and a scenario that discovered otherwise a
+/// dozen minutes into the full gate would be reporting a finding the fast gate can
+/// read in milliseconds.
+pub(crate) const SUBMITTED_DOCUMENT: &str = "tools/xtask/scenarios/reconfiguration-swap.xml";
 /// The environment variable that carries [`CONFIGURATION_DOCUMENT`] to
 /// `pds/config`.
 ///

@@ -34,14 +34,27 @@
 //! composes. A bare LF is [`RequestError::BareLineFeed`] and a 400, reported at
 //! the first line ending rather than by waiting out the byte bound.
 //!
-//! # No request body, and why that is a security decision rather than a gap
+//! # One framing for a body, and every other one refused
 //!
-//! A request carrying `Content-Length` above zero, or any `Transfer-Encoding`,
-//! is refused with a 400. Nothing this server offers takes a body, and a parser
-//! that read one would have to agree with every other party about how long it
-//! was — which is the other half of request smuggling. When a method that takes
-//! a body arrives, it arrives with the framing rules stated and tested rather
-//! than inherited.
+//! A request body is admitted under **exactly one** framing: a single
+//! `Content-Length` whose value is decimal, within the caller's `body_limit`, and
+//! on a `POST`. Everything else is refused before a body byte is looked at, and
+//! each refusal is one half of request smuggling closed:
+//!
+//! * **Any `Transfer-Encoding` is refused.** Chunked framing is a second opinion
+//!   about where a message ends, and this parser deliberately has only one.
+//! * **A repeated `Content-Length` is refused**, whatever the values, so two
+//!   parties on a path cannot pick different ones.
+//! * **A body on any method but `POST` is refused.** RFC 9110 permits one on a
+//!   `GET`; a server that read it and did nothing with it would be a party that
+//!   agreed a length for bytes nothing consumes.
+//! * **A length past `body_limit` is refused with 413**, at the head, so nothing
+//!   is accumulated on the way to discovering it.
+//!
+//! What this crate does *not* do is read the body: [`parse`] reports its declared
+//! length and hands back the head's own length, and the caller — which owns the
+//! storage — decides where those bytes go. A parser that buffered a body would be
+//! choosing a buffer for a domain whose memory it knows nothing about.
 //!
 //! # Built for the proxy, used by the management port
 //!
@@ -58,14 +71,17 @@
 //!
 //! The target design requires the management API to carry encryption, authentication
 //! and read/write authorization through an mTLS certificate pair. **None of that
-//! exists here.** There is no TLS anywhere in this appliance, so this crate
-//! parses cleartext and the server above it authenticates nobody: *anything that
-//! can reach the management port can read every metric the node exposes.* That
-//! is a recorded, deliberate deviation and is why the port belongs on
-//! an isolated management network until the intended TLS termination and
-//! certificate handling exist. Nothing here is a step toward them —
-//! TLS terminates below HTTP and will be a layer under this crate rather than a
-//! change to it.
+//! exists here.** There is no TLS anywhere in this appliance, so this crate parses
+//! cleartext and the server above it authenticates nobody: *anything that can reach
+//! the management port can read every metric the node exposes, read its
+//! configuration, and — through the request bodies this crate now frames —
+//! **replace** that configuration.* The write is the reason the read/write
+//! authorization the design requires is not a refinement to be added later: without
+//! it, reaching the port is the authority to decide what the appliance forwards.
+//! That is a recorded, deliberate deviation and is why the port belongs on an
+//! isolated management network until the intended TLS termination and certificate
+//! handling exist. Nothing here is a step toward them — TLS terminates below HTTP
+//! and will be a layer under this crate rather than a change to it.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -75,7 +91,8 @@ mod response;
 
 pub use request::{Header, Parsed, Request, RequestError, parse};
 pub use response::{
-    ContentType, MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE, write_head,
+    ContentType, MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE, XML_CONTENT_TYPE,
+    write_head,
 };
 
 /// Bytes of request head a caller may accumulate before the head must have
@@ -109,6 +126,15 @@ pub const MAX_HEADER_VALUE_LEN: usize = 256;
 /// space is refused by length rather than compared.
 pub const MAX_METHOD_LEN: usize = 16;
 
+/// Digits a `Content-Length` may carry before it is refused unread.
+///
+/// A bound on the adversary rather than on the protocol: a length is compared
+/// against the caller's `body_limit`, so the only thing an arbitrary run of
+/// digits buys is arithmetic on a number no body can be. Ten digits is past every
+/// `body_limit` this workspace states and short of a `u64`'s width, so the
+/// accumulation below cannot overflow.
+pub const MAX_CONTENT_LENGTH_DIGITS: usize = 10;
+
 /// The one protocol version this server speaks. RFC 9112 keep-alive, pipelining
 /// and chunked framing are all HTTP/1.1 features the server above deliberately
 /// does not use; the version is nevertheless required exactly, because a client
@@ -126,6 +152,7 @@ pub enum Status {
     BadRequest,
     NotFound,
     MethodNotAllowed,
+    ContentTooLarge,
     UriTooLong,
     HeadersTooLarge,
     ServiceUnavailable,
@@ -135,11 +162,12 @@ pub enum Status {
 impl Status {
     /// Every variant, so a counter table and a bound are built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Ok,
         Self::BadRequest,
         Self::NotFound,
         Self::MethodNotAllowed,
+        Self::ContentTooLarge,
         Self::UriTooLong,
         Self::HeadersTooLarge,
         Self::ServiceUnavailable,
@@ -153,6 +181,7 @@ impl Status {
             Self::BadRequest => 400,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::ContentTooLarge => 413,
             Self::UriTooLong => 414,
             Self::HeadersTooLarge => 431,
             Self::ServiceUnavailable => 503,
@@ -169,6 +198,7 @@ impl Status {
             Self::BadRequest => "Bad Request",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
+            Self::ContentTooLarge => "Content Too Large",
             Self::UriTooLong => "URI Too Long",
             Self::HeadersTooLarge => "Request Header Fields Too Large",
             Self::ServiceUnavailable => "Service Unavailable",
@@ -184,6 +214,7 @@ impl Status {
             Self::BadRequest => "400",
             Self::NotFound => "404",
             Self::MethodNotAllowed => "405",
+            Self::ContentTooLarge => "413",
             Self::UriTooLong => "414",
             Self::HeadersTooLarge => "431",
             Self::ServiceUnavailable => "503",

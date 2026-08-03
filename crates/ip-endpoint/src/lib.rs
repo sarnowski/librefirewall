@@ -29,12 +29,15 @@
 //! # The transport, and the service on it
 //!
 //! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
-//! request per connection, answers `GET /metrics` with the Prometheus exposition
-//! its caller renders, answers a target registered through
-//! [`Endpoint::serve_stream_at`] out of a body supplied a window at a time — it
-//! holds the string and knows nothing behind it, so an appliance serves a
-//! recording off a block device through an endpoint aware of neither — and
-//! everything else with a status, then closes. So an
+//! request per connection and answers three shapes: a `GET` of a registered target
+//! with a body its caller renders whole, `/metrics` among them; a `GET` of a target
+//! registered through [`Endpoint::serve_stream_at`] out of a body supplied a window
+//! at a time; and a `POST` to a target registered through
+//! [`Endpoint::serve_body_at`] by accumulating the request body and handing it to
+//! its caller to decide on. It holds the target strings and knows nothing behind
+//! them, so an appliance serves a recording off a block device and commits a
+//! configuration through an endpoint aware of neither. Everything else gets a
+//! status, and then it closes. So an
 //! endpoint carries state between frames and is not `Copy`, and it needs a
 //! clock: with none, a segment is [`Outcome::Unclocked`] and ARP and ICMP go on
 //! as before. A response outgrows one segment by an order of magnitude, so
@@ -44,11 +47,13 @@
 //! # A known, deliberate gap in the target design: the service is plain HTTP
 //!
 //! The target design requires the management API to carry encryption, authentication
-//! and read/write authorization through an mTLS certificate pair. None of it
-//! exists: there is no TLS in this appliance, this endpoint authenticates nobody,
-//! and **anything that can reach the management port can read every metric the
-//! node exposes**, or any registered stream. `GET /config` and `GET /logs` are
-//! absent too and answer 404 rather than being stubbed. The gap is recorded.
+//! and read/write authorization through an mTLS certificate pair. None of it exists:
+//! there is no TLS in this appliance, this endpoint authenticates nobody, and
+//! **anything that can reach the management port can read every metric the node
+//! exposes, read any registered stream, and submit a body to any registered
+//! target** — which for the configuration surface is the authority to decide what
+//! the appliance forwards. `GET /logs` is absent and answers 404 rather than being
+//! stubbed. The gap is recorded.
 //!
 //! # Deliberate narrowness, and what each exclusion costs
 //!
@@ -96,7 +101,7 @@ use http::{HttpCounters, REQUEST_CAPACITY, Server};
 
 /// Re-exported because a caller committing to a streamed body names one, and
 /// the bound behind it is `lfw_http`'s rather than this crate's.
-pub use lfw_http::ContentType;
+pub use lfw_http::{ContentType, Status};
 
 /// Connections one management port holds at once, and so the bound a connection
 /// flood is answered by.
@@ -623,26 +628,57 @@ impl Endpoint {
         }
     }
 
-    /// Whether a completed request is waiting on a body.
+    /// The target a completed request is waiting on a rendered body for.
     ///
     /// A caller answers it by publishing whatever the body is *about* and then
     /// calling [`supply_body`](Self::supply_body): the two steps exist so a
     /// scrape's own request has been counted before the numbers are read. See
-    /// [`http`]'s header.
+    /// [`http`]'s header. The target is answered too, because the owner of one
+    /// rendered target is not the owner of another.
     #[must_use]
-    pub fn body_wanted(&self) -> bool {
-        self.http.pending_body().is_some()
+    pub fn body_wanted(&self) -> Option<&'static str> {
+        self.http.pending_render().map(|(_, target)| target)
     }
 
-    /// Render the pending body with `render`, which writes into the server's
-    /// staging buffer and answers its length.
-    pub fn supply_body(&mut self, render: impl FnOnce(&mut [u8]) -> Option<usize>) {
-        self.http.supply(render);
+    /// Answer the request waiting on a whole body with `status` and whatever
+    /// `render` writes. See [`http::Server::supply`].
+    pub fn supply_body(
+        &mut self,
+        status: Status,
+        content_type: Option<ContentType>,
+        render: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) {
+        self.http.supply(status, content_type, render);
+    }
+
+    /// The target a submitted request body is waiting on a decision about. See
+    /// [`http::Server::pending_submission`].
+    #[must_use]
+    pub fn submission_wanted(&self) -> Option<&'static str> {
+        self.http.pending_submission().map(|(_, target)| target)
+    }
+
+    /// The submitted body itself. See [`http::Server::submission`].
+    #[must_use]
+    pub fn submission(&self) -> Option<&[u8]> {
+        self.http.submission()
     }
 
     /// Register `target` as streamed, not `404`. See [`http::Server::serve_stream_at`].
     pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
         self.http.serve_stream_at(target)
+    }
+
+    /// Register `target` as answered on `GET` with a rendered body. See
+    /// [`http::Server::serve_rendered_at`].
+    pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
+        self.http.serve_rendered_at(target)
+    }
+
+    /// Register `target` as accepting a request body on `POST`. See
+    /// [`http::Server::serve_body_at`].
+    pub fn serve_body_at(&mut self, target: &'static str) -> bool {
+        self.http.serve_body_at(target)
     }
 
     /// The target a request awaits a decision on. See [`http::Server::pending_stream`].

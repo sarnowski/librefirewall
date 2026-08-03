@@ -182,6 +182,15 @@ closed_vocabulary! {
         /// An ICMP type criterion on a rule that names a protocol other than
         /// ICMP, which carries no type.
         IcmpTypeOnNonIcmp => "icmp-type-on-non-icmp",
+        /// Every rule passed, and the configuration's own canonical form is
+        /// longer than a document may be — so the appliance could commit it and
+        /// then be unable to state it back. Refused instead, because reading the
+        /// running configuration is the first step of changing it and a policy an
+        /// operator cannot read back is one they cannot edit. Distinct from
+        /// `document-too-large`, which is the submitted bytes exceeding the same
+        /// bound: this one is about what the appliance would answer, and a
+        /// document well inside the bound can provoke it.
+        RenderingTooLarge => "rendering-too-large",
     }
 }
 

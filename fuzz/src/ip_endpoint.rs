@@ -47,8 +47,8 @@
 
 use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_ip_endpoint::{
-    Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing, SeqNumber, TCP_MSS,
-    TCP_CONNECTIONS, Unhandled,
+    ContentType, Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing,
+    SeqNumber, Status, TCP_CONNECTIONS, TCP_MSS, Unhandled,
 };
 use net_headers::{
     ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Frame,
@@ -111,8 +111,8 @@ fn assert_one_frame_is_answered(data: &[u8]) {
     // harness is about the frame path, and the exposition has a target of its
     // own. Supplied so a request that reached the server does not leave a
     // connection waiting on one for ever.
-    if endpoint.body_wanted() {
-        endpoint.supply_body(|out| {
+    if endpoint.body_wanted().is_some() {
+        endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
             let body = b"# HELP x y\n# TYPE x counter\nx 1\n";
             out.get_mut(..body.len())?.copy_from_slice(body);
             Some(body.len())

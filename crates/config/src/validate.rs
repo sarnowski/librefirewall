@@ -102,7 +102,8 @@ pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
         | ConfigRule::RulePrefixIsCanonical
         | ConfigRule::RulePortRangeIsOrdered
         | ConfigRule::RuleNoPortCriterionOnIcmp
-        | ConfigRule::RuleNoIcmpTypeOnAnotherProtocol => Enforcement::Refuses,
+        | ConfigRule::RuleNoIcmpTypeOnAnotherProtocol
+        | ConfigRule::ConfigurationIsStatable => Enforcement::Refuses,
     }
 }
 
@@ -252,6 +253,14 @@ pub enum SemanticError {
     RuleIcmpTypeOnNonIcmp {
         id: Identifier,
     },
+    /// The configuration is sound and its canonical form is longer than a
+    /// document may be, so the appliance could not state back what it would be
+    /// running. It names no object: the fault is the whole configuration's size
+    /// rather than any one entry's, and the number an operator acts on is the
+    /// length.
+    RenderingTooLarge {
+        len: usize,
+    },
 }
 
 impl SemanticError {
@@ -283,6 +292,9 @@ impl SemanticError {
             | Self::RulePortRangeReversed { id, .. }
             | Self::RulePortCriterionOnIcmp { id, .. }
             | Self::RuleIcmpTypeOnNonIcmp { id } => id,
+            // The whole configuration rather than an object in it, which is the
+            // one place this vocabulary has nothing narrower to name.
+            Self::RenderingTooLarge { .. } => Identifier::CONFIGURATION,
             Self::ManagementPrefixLengthOutOfRange { .. }
             | Self::ManagementAddressNotUnicast
             | Self::ManagementAddressNotAHostAddress
@@ -329,6 +341,7 @@ impl SemanticError {
                 RejectReason::MacNotUnicast
             }
             Self::ManagementPrefixCollidesWithInterface { .. } => RejectReason::OverlappingPrefixes,
+            Self::RenderingTooLarge { .. } => RejectReason::RenderingTooLarge,
         }
     }
 }
@@ -350,6 +363,25 @@ pub fn validate(model: &Model) -> Result<(), SemanticError> {
     management(model)?;
     rule_identities(model)?;
     rules(model)?;
+    // Last, because it is the one rule about the configuration as a whole and
+    // every rule above names something to go and fix: a document with a dangling
+    // reference *and* an unstateable policy is worth reporting as the reference.
+    statable(model)?;
+    Ok(())
+}
+
+/// The appliance must be able to state back what it is running.
+///
+/// A configuration whose canonical form outgrows the document bound would commit
+/// and then answer a read with a document no submission may carry, which breaks
+/// the read/edit/submit loop the read exists for. It is refused here rather than
+/// at the read, because a refusal an operator receives while submitting names
+/// something they can still change.
+fn statable(model: &Model) -> Result<(), SemanticError> {
+    let len = crate::render::rendered_len(model);
+    if len > crate::MAX_DOCUMENT_BYTES {
+        return Err(SemanticError::RenderingTooLarge { len });
+    }
     Ok(())
 }
 
@@ -634,6 +666,7 @@ fn overlaps(left: Ipv4Address, left_len: u8, right: Ipv4Address, right_len: u8) 
 mod tests {
     use super::*;
     use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
+    use crate::rule::RuleAction;
     use net_headers::MacAddress;
     use proptest::prelude::*;
 
@@ -1435,8 +1468,113 @@ mod tests {
                 filter.icmp_type = IcmpTypeMatch::Only(8);
                 with_rule(filter)
             }
+            // A policy whose canonical form outgrows the document bound: the widest
+            // rule the schema admits, repeated until it does. Built by growing
+            // rather than at a chosen count, so the fixture follows the renderer
+            // instead of being a number that goes stale the first time a criterion
+            // is added to a rule.
+            ConfigRule::ConfigurationIsStatable => unstateable(),
         };
         Some(model)
+    }
+
+    /// A sixteen-byte identifier — [`lfw_log::MAX_IDENTIFIER_LEN`], the widest the
+    /// schema admits — distinguished by `index`.
+    fn widest_id(stem: u8, index: usize) -> Identifier {
+        let mut bytes = [stem; 16];
+        for (cell, digit) in bytes
+            .iter_mut()
+            .rev()
+            .zip(std::format!("{index:04}").bytes().rev())
+        {
+            *cell = digit;
+        }
+        Identifier::new(&bytes).expect("the alphabet accepts it")
+    }
+
+    /// A configuration the appliance could not state back: every object at its
+    /// widest, and the widest rule the schema admits repeated until the canonical
+    /// form outgrows the document bound.
+    ///
+    /// **Grown rather than counted.** What makes this reachable at all is that the
+    /// canonical form is *longer* than the shortest document describing the same
+    /// configuration — it indents, it writes a declaration, and it spells
+    /// `protocol="6"` as `tcp` — so the fixture follows the renderer instead of
+    /// being a count that goes stale the first time a criterion is added to a rule.
+    fn unstateable() -> Model {
+        let mut model = Model::EMPTY;
+        for port in 0..PORT_COUNT {
+            model
+                .push_interface(InterfaceEntry {
+                    id: widest_id(b'i', usize::from(port)),
+                    port,
+                    enabled: true,
+                    mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x50 + port]),
+                    address: Ipv4Address::from_octets([10, 0, port, 1]),
+                    prefix_length: 24,
+                })
+                .expect("capacity");
+        }
+        for index in 0..wire::MAX_NEIGHBOURS {
+            let host = 2u8.saturating_add(index as u8);
+            if model
+                .push_neighbour(NeighbourEntry {
+                    id: widest_id(b'n', index),
+                    interface: widest_id(b'i', 0),
+                    address: Ipv4Address::from_octets([10, 0, 0, host]),
+                    mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, host]),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        model
+            .set_management(ManagementEntry {
+                enabled: true,
+                prefix_length: 24,
+                mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x5f]),
+                address: Ipv4Address::from_octets([192, 168, 42, 15]),
+            })
+            .expect("the first");
+        loop {
+            let mut candidate = model;
+            let widest = RuleEntry {
+                id: widest_id(b'r', candidate.rule_count()),
+                ingress: InterfaceMatch::Named(widest_id(b'i', 0)),
+                egress: InterfaceMatch::Named(widest_id(b'i', 1)),
+                source: AddressMatch::Block {
+                    network: Ipv4Address::from_octets([255, 255, 255, 254]),
+                    prefix_length: 31,
+                },
+                destination: AddressMatch::Block {
+                    network: Ipv4Address::from_octets([255, 255, 255, 252]),
+                    prefix_length: 30,
+                },
+                protocol: ProtocolMatch::Only(Protocol::TCP),
+                source_port: PortMatch::Range {
+                    low: 10_000,
+                    high: 65_535,
+                },
+                destination_port: PortMatch::Range {
+                    low: 10_000,
+                    high: 65_535,
+                },
+                icmp_type: IcmpTypeMatch::Any,
+                action: RuleAction::Accept,
+            };
+            if candidate.push_rule(widest).is_err() {
+                // Every slot filled and the canonical form still inside the bound
+                // would make this rule unreachable, which is a finding rather than
+                // a fixture that quietly stops: the test above reports it as a rule
+                // declared refused whose configuration was accepted.
+                break model;
+            }
+            if crate::render::rendered_len(&candidate) > crate::MAX_DOCUMENT_BYTES {
+                break candidate;
+            }
+            model = candidate;
+        }
     }
 
     /// The rule `sound()` carries: every criterion at its widest, accepting.

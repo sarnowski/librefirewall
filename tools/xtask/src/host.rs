@@ -162,6 +162,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "http_request",
     "metrics_render",
     "config_document",
+    "config_submission",
     "spsc_ring_peer",
     "log_ring",
     "virtqueue_poll",

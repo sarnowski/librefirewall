@@ -88,6 +88,41 @@ Configuration uses a **candidate/running datastore** model with **commit-confirm
   against a change that validates but breaks management connectivity at runtime (anti-lockout).
 - Configurations are **versioned**, enabling **rollback**.
 
+### The document travels one way, and the decision is made where a parser is safe
+
+A submitted document crosses **two protection domains** before anything is decided about it, and the
+direction is the whole of why the split exists.
+
+- The **management** domain terminates the connection the document arrives on. It copies the bytes
+  into a region and hands them on. It never parses them, never validates them, and never learns what
+  they say. It holds two frame pipelines, so it is the domain an attacker reaches first — and the last
+  one that should be reading an attacker's XML.
+- The **validator** domain reads them. It holds no device, no buffer pool and no dataplane ring, so a
+  compromise of the reader reaches no frame and no NIC. The worst it can produce is a configuration,
+  and the consumer re-decides every rule about one for itself.
+
+The bytes are **copied out of the shared region before a field of them is looked at**: the region is
+written by a peer, so a decision taken on the bytes in place would be a decision taken on bytes that
+are no longer there. And the answer travels back through a region the management domain may read and
+not write, because a management domain that could write it could answer `GET /config` with a policy
+the appliance is not running — an operator would then edit and resubmit that, which is worse than a
+wrong answer.
+
+### The appliance can state what it is running, and only what it could accept
+
+The bytes of a submitted document are **not kept**: 64 KiB of text has nowhere to live in a domain
+with no allocator, and keeping it would make the running configuration two things that could disagree.
+What a read returns is therefore produced from the model in force — the canonical form of the
+configuration the appliance is actually deciding under.
+
+That makes the read authoritative rather than an echo, and it obliges one rule: **a configuration
+whose canonical form does not fit the document bound is refused rather than committed.** Reading the
+running configuration is the first step of changing it, so a policy an operator can read and cannot
+resubmit is one they cannot edit. The refusal is narrow and reachable only by a policy close to the
+bound in both directions at once; it is a rule about the *appliance's ability to state itself* rather
+than about the configuration's content, and it is the one refusal that names no object in the
+document.
+
 ## Distributed staged rollout
 
 Across the HA pair (and across multiple clusters via central configuration management), rollout is a

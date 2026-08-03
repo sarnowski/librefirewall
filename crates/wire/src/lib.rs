@@ -84,6 +84,7 @@ mod image;
 mod log_record;
 mod log_ring;
 mod log_slot;
+mod submission;
 mod tap;
 
 use core::{
@@ -110,6 +111,11 @@ pub use log_record::{
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
     LogReader, LogRecords, LogRingFull, LogWriter,
+};
+pub use submission::{
+    CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, ConfigAnswer, ConfigDemand, ConfigFault,
+    ConfigOperation, ConfigPoll, ConfigReply, ConfigRequest, ConfigRequester, ConfigResponder,
+    ConfigStatus, MAX_DOCUMENT_BYTES, PendingConfigRequest,
 };
 pub use tap::{
     CheckedTap, TAP_CLASSIFICATION_COUNT, TAP_CONSUME_REGION_SIZE, TAP_DROP_REASON_COUNT,

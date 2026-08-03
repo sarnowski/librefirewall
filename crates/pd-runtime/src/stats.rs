@@ -244,7 +244,9 @@ pub fn management_sample(
                     responses: served.responses,
                     response_bytes: served.response_bytes,
                     overflowed: served.overflowed,
-                    expositions_refused: served.expositions_refused,
+                    bodies_refused: served.bodies_refused,
+                    bodies_taken: served.bodies_taken,
+                    bodies_overrun: served.bodies_overrun,
                     retransmits_unavailable: served.retransmits_unavailable,
                     slots_exhausted: served.slots_exhausted,
                 },
@@ -297,11 +299,37 @@ pub fn management_sample(
     }
 }
 
+/// What the deciding domain has decided, in the console's own outcome order.
+///
+/// A struct rather than three arguments: the array `ConfigSample` publishes is
+/// keyed by position, and three counts handed over out of order would attribute a
+/// refusal to a generation that applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubmissionCounters {
+    pub applied: u64,
+    pub refused: u64,
+    pub unchanged: u64,
+    /// Times the running document was stated out of this node.
+    pub reads: u64,
+}
+
 /// The configuration publisher's shard.
 #[must_use]
-pub const fn config_sample(generation: u32, log: LogSample) -> ConfigSample {
+pub const fn config_sample(
+    generation: u32,
+    submissions: SubmissionCounters,
+    log: LogSample,
+) -> ConfigSample {
     ConfigSample {
         generation: generation as u64,
+        // In `lfw_metrics::GENERATION_OUTCOME_NAMES` order, which is the ABI: a
+        // pair swapped here reports every refusal as an applied generation.
+        submissions: [
+            submissions.applied,
+            submissions.refused,
+            submissions.unchanged,
+        ],
+        reads: submissions.reads,
         log,
     }
 }

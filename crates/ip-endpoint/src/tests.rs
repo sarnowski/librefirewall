@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::http::{
-    HttpCounters, MAX_STREAM_LEN, MAX_STREAM_TARGETS, METRICS_TARGET, REQUEST_CAPACITY,
-    RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
+    HttpCounters, MAX_BODY_LEN, MAX_BODY_TARGETS, MAX_STREAM_LEN, MAX_STREAM_TARGETS,
+    METRICS_TARGET, REQUEST_CAPACITY, RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
 };
 use net_headers::{
     ARP_FRAME_LEN, ARP_PAYLOAD_LEN, ETHERNET_HEADER_LEN, ICMP_HEADER_LEN, IPV4_HEADER_LEN,
@@ -145,8 +145,10 @@ impl Supply {
     fn offer(self, endpoint: &mut Endpoint) {
         match self {
             Self::Rendered(body) => {
-                if endpoint.body_wanted() {
-                    endpoint.supply_body(|out| body.render(out));
+                if endpoint.body_wanted().is_some() {
+                    endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
+                        body.render(out)
+                    });
                 }
             }
             Self::Streamed(recording) => {
@@ -1279,7 +1281,7 @@ fn a_whole_http_exchange_crosses_the_endpoint() {
     assert_eq!(counters.requests, 1);
     assert_eq!(counters.responses[lfw_http::Status::Ok.slot()], 1);
     assert_eq!(counters.response_bytes, answered.bytes.len() as u64);
-    assert_eq!(counters.expositions_refused, 0);
+    assert_eq!(counters.bodies_refused, 0);
     assert_eq!(counters.retransmits_unavailable, 0);
 
     // The station closes its own half, and the connection's whole state goes
@@ -1498,7 +1500,7 @@ fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
         1
     );
     assert_eq!(
-        endpoint.http_counters().expositions_refused,
+        endpoint.http_counters().bodies_refused,
         0,
         "a busy buffer is not a renderer that refused"
     );
@@ -1521,7 +1523,7 @@ fn an_exposition_that_will_not_render_is_counted_as_ours() {
         SCRAPE,
     );
     assert_eq!(answered.status_line(), "HTTP/1.1 503 Service Unavailable");
-    assert_eq!(endpoint.http_counters().expositions_refused, 1);
+    assert_eq!(endpoint.http_counters().bodies_refused, 1);
 }
 
 /// The window this endpoint advertises is the request buffer's free space, so a
@@ -1862,7 +1864,9 @@ fn a_refused_send_or_close_leaves_the_server_holding() {
     // A connection still in `SYN_RECEIVED` can neither send nor close, so both
     // arms of `drive` are refused and nothing is counted as having gone out.
     server.take(id, b"GET /metrics HTTP/1.1\r\n\r\n");
-    server.supply(|out| Body(8).render(out));
+    server.supply(Status::Ok, Some(ContentType::Metrics), |out| {
+        Body(8).render(out)
+    });
     assert_eq!(server.counters().requests, 1);
     assert_eq!(server.drive(&mut stack, at(0), id, &mut out), None);
     assert_eq!(server.counters().response_bytes, 0);
@@ -3110,4 +3114,357 @@ fn a_retransmission_of_an_abandoned_recording_is_refused_and_counted() {
     assert_eq!(endpoint.poll_timeouts(due, &mut out), Polled::Handled);
     assert_eq!(endpoint.http_counters().retransmits_unavailable, 1);
     assert_eq!(endpoint.http_counters().streams_abandoned, 1);
+}
+
+// ── The request-body path: `POST` to a registered target ─────────────────────
+
+/// The target the tests below register as body-taking and as rendered, which is
+/// what the configuration surface is: one path stated by `GET` and replaced by
+/// `POST`.
+const DOCUMENT_TARGET: &str = "/config";
+
+/// A server with the configuration surface's two registrations on it.
+fn document_server<const SLOTS: usize>() -> Server<SLOTS> {
+    let mut server: Server<SLOTS> = Server::new();
+    assert!(server.serve_rendered_at(DOCUMENT_TARGET));
+    assert!(server.serve_body_at(DOCUMENT_TARGET));
+    server
+}
+
+/// A `POST` head declaring `len` body bytes to `target`.
+fn post_head(target: &str, len: usize) -> Vec<u8> {
+    format!("POST {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+}
+
+/// A document of `len` deterministic bytes, so a body delivered wrongly is
+/// visible rather than plausible.
+fn document(len: usize) -> Vec<u8> {
+    (0..len).map(|index| b'a' + (index % 26) as u8).collect()
+}
+
+#[test]
+fn a_posted_body_arrives_whole_and_is_handed_to_the_caller() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+    let body = document(64);
+
+    server.take(
+        id,
+        &[post_head(DOCUMENT_TARGET, body.len()), body.clone()].concat(),
+    );
+    assert_eq!(server.counters().requests, 1);
+    assert_eq!(server.counters().bodies_taken, 1);
+    assert_eq!(
+        server.pending_submission().map(|(_, target)| target),
+        Some(DOCUMENT_TARGET)
+    );
+    assert_eq!(server.submission(), Some(body.as_slice()));
+    // Neither of the other two shapes is waiting: a submission is not a scrape.
+    assert_eq!(server.pending_render(), None);
+    assert_eq!(server.pending_stream(), None);
+
+    // Answering releases it and composes a response in the same array.
+    server.supply(Status::Ok, None, |out| {
+        out.get_mut(..2).map(|slot| {
+            slot.copy_from_slice(b"ok");
+            2
+        })
+    });
+    assert_eq!(server.pending_submission(), None);
+    assert_eq!(server.counters().responses[Status::Ok.slot()], 1);
+}
+
+/// The body arrives in whatever pieces the network chose, and the window the peer
+/// is offered is what the body still owes — not the room left in a request buffer
+/// the head already filled, which would stall every document longer than one.
+#[test]
+fn a_body_split_across_segments_is_reassembled_and_the_window_asks_for_the_rest() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+    let body = document(4096);
+
+    server.take(id, &post_head(DOCUMENT_TARGET, body.len()));
+    assert_eq!(server.submission(), None, "nothing is complete yet");
+    // The window the peer is offered is the whole body it still owes, which is
+    // more than a request buffer holds: composing a segment sets the window from
+    // the slot's own room, and that room is now the body's remainder.
+    let _ = server.drive(&mut stack, at(0), id, &mut out);
+    assert!(
+        stack
+            .connection(id)
+            .is_some_and(|_| REQUEST_CAPACITY < body.len()),
+        "the fixture body must outgrow a request buffer for this to be about anything"
+    );
+
+    for chunk in body.chunks(500) {
+        server.take(id, chunk);
+    }
+    assert_eq!(server.submission(), Some(body.as_slice()));
+    assert_eq!(server.counters().bodies_taken, 1);
+    assert_eq!(server.counters().bodies_overrun, 0);
+}
+
+/// A body at the bound exactly, and one byte past it. The first is taken; the
+/// second is refused at the head with `413`, before a byte of it is accumulated.
+#[test]
+fn a_body_at_the_bound_is_taken_and_one_past_it_is_refused_unread() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+
+    let id = open(&mut stack, 40000, &mut out);
+    server.take(id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
+    assert_eq!(
+        server.pending_submission(),
+        None,
+        "a body that has not arrived is not a submission"
+    );
+    assert_eq!(
+        server.counters().responses[Status::ContentTooLarge.slot()],
+        0
+    );
+    server.release(id);
+
+    let id = open(&mut stack, 40001, &mut out);
+    server.take(id, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN + 1));
+    assert_eq!(
+        server.counters().responses[Status::ContentTooLarge.slot()],
+        1
+    );
+    assert_eq!(server.counters().bodies_taken, 0);
+    assert_eq!(server.submission(), None);
+}
+
+/// A peer that sends more than it declared: the excess is counted and dropped,
+/// and the submission is exactly what was announced.
+#[test]
+fn bytes_past_the_declared_length_are_counted_and_dropped() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+    let body = document(32);
+
+    server.take(id, &post_head(DOCUMENT_TARGET, body.len()));
+    server.take(id, &[body.clone(), document(16)].concat());
+    assert_eq!(server.submission(), Some(body.as_slice()));
+    assert_eq!(server.counters().bodies_overrun, 16);
+}
+
+/// A `POST` with no body at all is a complete submission the moment its head is:
+/// nothing more is coming, and waiting for a byte that will never arrive would
+/// hold the staging array until the connection was reaped.
+#[test]
+fn a_post_with_no_body_is_a_submission_of_nothing() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    assert_eq!(server.submission(), Some(b"".as_slice()));
+    assert_eq!(server.counters().bodies_taken, 1);
+}
+
+/// The routing key is the method and the target together, and every crossing is
+/// `405` rather than `404`: the resource exists and does not answer that method.
+#[test]
+fn a_method_the_target_does_not_answer_is_405_and_an_absent_target_is_404() {
+    let mut server: Server<4> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    assert!(server.serve_stream_at(RECORDING_TARGET));
+
+    // `POST` to a target answered only on `GET`.
+    let id = open(&mut stack, 40000, &mut out);
+    server.take(id, &post_head(METRICS_TARGET, 4));
+    assert_eq!(
+        server.counters().responses[Status::MethodNotAllowed.slot()],
+        1
+    );
+
+    // `POST` to a streamed target, which is also `GET`-only.
+    let id = open(&mut stack, 40001, &mut out);
+    server.take(id, &post_head(RECORDING_TARGET, 4));
+    assert_eq!(
+        server.counters().responses[Status::MethodNotAllowed.slot()],
+        2
+    );
+
+    // `POST` to nothing at all.
+    let id = open(&mut stack, 40002, &mut out);
+    server.take(id, &post_head("/nowhere", 4));
+    assert_eq!(server.counters().responses[Status::NotFound.slot()], 1);
+
+    // And a method that is neither.
+    let id = open(&mut stack, 40003, &mut out);
+    server.take(id, b"DELETE /config HTTP/1.1\r\n\r\n");
+    assert_eq!(
+        server.counters().responses[Status::MethodNotAllowed.slot()],
+        3
+    );
+}
+
+/// A `GET` of a body-taking target that answers no `GET` is `405`: the resource
+/// exists, and saying `404` would tell an operator to look for a typo.
+#[test]
+fn a_get_of_a_post_only_target_is_405() {
+    let mut server: Server<2> = Server::new();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    assert!(server.serve_body_at("/submit-only"));
+
+    let id = open(&mut stack, 40000, &mut out);
+    server.take(id, b"GET /submit-only HTTP/1.1\r\n\r\n");
+    assert_eq!(
+        server.counters().responses[Status::MethodNotAllowed.slot()],
+        1
+    );
+}
+
+/// The two `GET` tables are one namespace and the `POST` table is its own: a
+/// target may be rendered *or* streamed and may be both a `GET` answer and a
+/// `POST` sink, which is what one editable resource is.
+#[test]
+fn registration_refuses_a_second_get_answer_and_admits_both_methods() {
+    let mut server: Server<2> = Server::new();
+    assert!(
+        !server.serve_rendered_at(METRICS_TARGET),
+        "already answered"
+    );
+    assert!(!server.serve_stream_at(METRICS_TARGET));
+    assert!(server.serve_rendered_at(DOCUMENT_TARGET));
+    assert!(!server.serve_rendered_at(DOCUMENT_TARGET), "twice");
+    assert!(
+        !server.serve_stream_at(DOCUMENT_TARGET),
+        "a second GET answer"
+    );
+    assert!(
+        server.serve_body_at(DOCUMENT_TARGET),
+        "a POST sink is not one"
+    );
+    assert!(!server.serve_body_at(DOCUMENT_TARGET), "twice");
+
+    // Both tables fill, and a registration past them is refused rather than
+    // silently dropped.
+    for index in 0..MAX_BODY_TARGETS {
+        let target: &'static str = ["/a", "/b", "/c", "/d"][index];
+        let _ = server.serve_body_at(target);
+    }
+    assert!(!server.serve_body_at("/one-too-many"));
+}
+
+/// A `GET` of the configuration is a rendered body like a scrape, and the target
+/// it names is what tells the two owners apart: the domain that renders metrics
+/// and the one that states a document are different halves of one protection
+/// domain.
+#[test]
+fn a_rendered_target_names_itself_so_its_owner_can_tell() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+
+    let id = open(&mut stack, 40000, &mut out);
+    server.take(id, b"GET /config HTTP/1.1\r\n\r\n");
+    assert_eq!(
+        server.pending_render().map(|(_, target)| target),
+        Some(DOCUMENT_TARGET)
+    );
+    server.supply(Status::Ok, Some(ContentType::Xml), |out| {
+        out.get_mut(..3).map(|slot| {
+            slot.copy_from_slice(b"<x/>".get(..3).expect("in range"));
+            3
+        })
+    });
+    assert_eq!(server.pending_render(), None);
+    server.release(id);
+
+    let id = open(&mut stack, 40001, &mut out);
+    server.take(id, SCRAPE);
+    assert_eq!(
+        server.pending_render().map(|(_, target)| target),
+        Some(METRICS_TARGET)
+    );
+}
+
+/// A submission holds the one staging array, so a scrape arriving meanwhile is
+/// `503` — the same answer two concurrent scrapes already give each other, and
+/// stated rather than hidden.
+#[test]
+fn a_submission_in_progress_refuses_a_concurrent_scrape() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let posting = open(&mut stack, 40000, &mut out);
+    let scraping = open(&mut stack, 40001, &mut out);
+
+    server.take(posting, &post_head(DOCUMENT_TARGET, 64));
+    server.take(scraping, SCRAPE);
+    assert_eq!(
+        server.counters().responses[Status::ServiceUnavailable.slot()],
+        1
+    );
+    assert_eq!(server.pending_render(), None, "the scrape was refused");
+}
+
+/// A body whose answer will not fit is refused rather than truncated, on the same
+/// terms an exposition that will not fit is.
+#[test]
+fn an_answer_that_will_not_fit_is_refused_and_counted() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    server.supply(Status::Ok, None, |_| None);
+    assert_eq!(server.counters().bodies_refused, 1);
+    assert_eq!(
+        server.counters().responses[Status::ServiceUnavailable.slot()],
+        1
+    );
+}
+
+/// A peer that closes half way through sending a body leaves nothing committed
+/// and the slot released: a partially received document is not a submission.
+#[test]
+fn a_peer_that_closes_mid_body_submits_nothing() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+
+    server.take(id, &post_head(DOCUMENT_TARGET, 4096));
+    server.take(id, &document(100));
+    assert_eq!(server.submission(), None);
+    server.note_peer_closed(id);
+    assert_eq!(server.submission(), None, "a half-sent document is not one");
+    assert_eq!(server.counters().bodies_taken, 0);
+}
+
+/// A submission the caller never answers holds the array until the connection is
+/// gone, and then releases it: the same shape an unsupplied exposition already
+/// has, so a caller that forgets one does not deny the port for ever.
+#[test]
+fn a_submission_nobody_answers_is_released_with_its_connection() {
+    let mut server: Server<2> = document_server();
+    let mut stack = tcp_stack();
+    let mut out = vec![0u8; ROOMY];
+    let id = open(&mut stack, 40000, &mut out);
+    server.take(id, &post_head(DOCUMENT_TARGET, 0));
+    assert!(server.submission().is_some());
+
+    server.release(id);
+    assert_eq!(server.submission(), None);
+    let next = open(&mut stack, 40001, &mut out);
+    server.take(next, SCRAPE);
+    assert_eq!(
+        server.pending_render().map(|(_, target)| target),
+        Some(METRICS_TARGET),
+        "the array was not released"
+    );
 }

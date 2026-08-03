@@ -1,11 +1,32 @@
 //! The management HTTP server: what an established connection on the management
 //! port now does.
 //!
-//! It answers `GET /metrics` with the Prometheus exposition its caller renders,
-//! a target its owner registered through [`Server::serve_stream_at`] by
-//! streaming a body that owner produces a window at a time, and everything else
-//! with a status. It replaced the byte echo wholesale rather than being layered
-//! on it: nothing of that stand-in survives.
+//! It answers three shapes of request and everything else with a status:
+//!
+//! * a `GET` of a target registered through [`Server::serve_rendered_at`] —
+//!   `/metrics` among them — with a body its owner renders into the one staging
+//!   array;
+//! * a `GET` of a target registered through [`Server::serve_stream_at`] by
+//!   streaming a body that owner produces a window at a time;
+//! * a `POST` to a target registered through [`Server::serve_body_at`] by
+//!   **accumulating** the request body into that same staging array and handing it
+//!   to the owner to decide on.
+//!
+//! # The request body lives in the response buffer, and that is the whole design
+//!
+//! There is one staging array ([`RESPONSE_CAPACITY`]) and it is claimed by one
+//! connection at a time. A submitted body claims it exactly as an exposition
+//! does, is accumulated in it, and is then overwritten by the response composed
+//! for the same connection — so a `POST` costs no second buffer anywhere, which
+//! matters because the alternative is [`MAX_BODY_LEN`] per connection slot in a
+//! protection domain's own memory.
+//!
+//! Two consequences, both stated rather than hidden. A `POST` in progress makes a
+//! concurrent scrape `503`, on exactly the terms two concurrent scrapes already
+//! refuse each other. And the owner **must read the body before it answers**:
+//! [`Server::submission`] borrows out of the array that [`Server::supply`] then
+//! writes into, which the borrow checker enforces at the call site rather than
+//! this paragraph enforcing by asking.
 //!
 //! # Adversary
 //!
@@ -14,7 +35,13 @@
 //! gets, and holds the state a connection accumulates while it does. Both
 //! dimensions of that state are fixed arrays: [`REQUEST_CAPACITY`] per
 //! connection for the head being read, and one [`RESPONSE_CAPACITY`] buffer for
-//! the one exposition that may be in flight.
+//! the one body — response or request — that may be in flight.
+//!
+//! This server authenticates nobody and there is no TLS below it, so **a `POST` to
+//! a body-taking target is an unauthenticated write from whoever reached the
+//! port.** Nothing here can close that; what it does instead is bound it — one
+//! framing for a body, a length refused at the head, an accumulation the array
+//! itself limits, and a decision it hands upward rather than makes.
 //!
 //! # One exposition at a time, and what a second connection gets
 //!
@@ -109,16 +136,38 @@ use crate::TCP_MSS;
 /// decision: the parser's limits are stated against a head this size.
 pub const REQUEST_CAPACITY: usize = MAX_REQUEST_BYTES;
 
-/// The one target this server answers with a body.
+/// The exposition's own target, registered by this server rather than by an
+/// owner: the metric surface is what the crate above it exists to serve, and a
+/// build that forgot to register it would answer an operator's scraper `404`.
 pub const METRICS_TARGET: &str = "/metrics";
 
-/// Bytes the shared response buffer holds: the longest head this server can
-/// write, in front of the longest exposition the metric catalogue can produce.
+/// Bytes of request body this server will accumulate, and so the bound a
+/// `Content-Length` is refused against with `413` before a byte is taken.
+///
+/// The configuration document bound: the one body this appliance accepts is a
+/// configuration, and the domain that reads it refuses a longer one in any case.
+/// A caller crossing a protection-domain boundary with it asserts the two agree
+/// (`pd_runtime::configuration`), so a region that could not carry a body this
+/// server took is a build failure rather than a submission that vanishes.
+pub const MAX_BODY_LEN: usize = 64 * 1024;
+
+/// Bytes the shared staging array holds: the longest head this server can write,
+/// in front of the longest body that array ever carries — an exposition the metric
+/// catalogue can produce, or a request body [`MAX_BODY_LEN`] admits.
 ///
 /// Derived rather than chosen, which is what makes a new metric unable to
 /// silently truncate an operator's scrape — a family added to `lfw_metrics`
-/// moves this number and the array with it.
-pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN;
+/// moves this number and the array with it — and what makes a larger body bound
+/// move it too rather than overrun the array quietly.
+pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + longest_body();
+
+const fn longest_body() -> usize {
+    if lfw_metrics::MAX_EXPOSITION_LEN > MAX_BODY_LEN {
+        lfw_metrics::MAX_EXPOSITION_LEN
+    } else {
+        MAX_BODY_LEN
+    }
+}
 
 /// The tail a window keeps behind the byte being sent: everything the transport
 /// can re-ask for and owns no copy of, so a window slid past one of those ranges
@@ -146,16 +195,28 @@ pub const MAX_STREAM_LEN: u64 = 1 << 31;
 /// request target.
 pub const MAX_STREAM_TARGETS: usize = 4;
 
+/// Targets answered on `GET` with a body the owner renders whole, [`METRICS_TARGET`]
+/// among them. Bounded on [`MAX_STREAM_TARGETS`]' terms.
+pub const MAX_RENDERED_TARGETS: usize = 4;
+
+/// Targets that accept a request body on `POST`. One today — the configuration —
+/// and a table rather than a constant because the routing is one comparison
+/// either way and a second body-taking surface must not be a special case
+/// somewhere else.
+pub const MAX_BODY_TARGETS: usize = 2;
+
 // The bound the whole streaming design rests on, stated where both halves are
 // visible: the worst-case exposition and the head in front of it fit the buffer
 // they are composed into, so a scrape is never answered short. Both are
 // stated as numbers, so a new family moves this reservation in a diff.
 const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
+    assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + MAX_BODY_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 76_407);
-    assert!(RESPONSE_CAPACITY == 76_568);
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 77_922);
+    assert!(MAX_BODY_LEN == 65_536);
+    assert!(RESPONSE_CAPACITY == 78_083);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own
@@ -181,9 +242,16 @@ pub struct HttpCounters {
     pub response_bytes: u64,
     /// Requests whose head outgrew [`REQUEST_CAPACITY`], answered 431.
     pub overflowed: u64,
-    /// Expositions the renderer would not fit. **Ours**, and unreachable while
-    /// [`RESPONSE_CAPACITY`] is derived from the renderer's own bound.
-    pub expositions_refused: u64,
+    /// Bodies a caller's renderer would not fit. **Ours**, and unreachable while
+    /// [`RESPONSE_CAPACITY`] is derived from every renderer's own bound.
+    pub bodies_refused: u64,
+    /// Request-body bytes a peer sent past the length it declared, dropped. The
+    /// peer's, and the one dimension of a body a `Content-Length` does not bound
+    /// on its own: the declared length is a claim, and what arrives is refused
+    /// against it rather than believed.
+    pub bodies_overrun: u64,
+    /// Request bodies accumulated whole and handed to the caller.
+    pub bodies_taken: u64,
     /// Ranges the transport asked for again that no response buffer held. A
     /// caller and a transport disagreeing about what is outstanding, which is
     /// **ours**.
@@ -210,11 +278,21 @@ pub struct HttpCounters {
 
 /// What a caller owes a connection whose head has been read, and so which body
 /// shape was decided on.
+///
+/// Each carries the target it is about, because the owner of one target is not
+/// the owner of another: the domain that renders an exposition and the one that
+/// states a configuration are different halves of the same protection domain, and
+/// each must be able to tell whether the request waiting is its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Want {
-    Exposition,
+    /// A body the caller renders whole into the staging array.
+    Rendered(&'static str),
     /// A decision on this target: [`Server::supply_stream`] or an abandon.
     Stream(&'static str),
+    /// A request body has arrived whole in the staging array and the caller owes
+    /// a decision on it: read it with [`Server::submission`], then answer with
+    /// [`Server::supply`].
+    Submitted(&'static str),
 }
 
 /// Where one connection's conversation has got to.
@@ -222,6 +300,15 @@ enum Want {
 enum Phase {
     /// Accumulating a request head.
     Reading,
+    /// The head is read, it declared a body, and the staging array is this
+    /// connection's to accumulate that body into. `received` counts body bytes and
+    /// is what the advertised window is derived from, so a peer is told to send
+    /// exactly what is still owed.
+    Receiving {
+        target: &'static str,
+        total: usize,
+        received: usize,
+    },
     /// The head is read and the staging buffer is this connection's; the caller
     /// owes what [`Want`] names. Deliberately not [`Phase::Responding`]: nothing
     /// may be sent until there is something to send.
@@ -231,6 +318,14 @@ enum Phase {
     /// Everything is out and this end has closed. The slot is kept so a
     /// retransmission can still be served out of it.
     Closed,
+}
+
+impl Phase {
+    /// Whether a request head is still being accumulated, which is the one phase
+    /// [`Server::decide`] parses in.
+    const fn is_reading(self) -> bool {
+        matches!(self, Self::Reading)
+    }
 }
 
 /// What the array needs next: where in the body those bytes begin, how many it
@@ -371,10 +466,21 @@ impl Slot {
         }
     }
 
-    /// The room left in the request buffer, which is the window this connection
-    /// advertises.
+    /// The window this connection advertises: what this end can still hold of
+    /// whatever it is now reading.
+    ///
+    /// Two answers, because a connection reads two things. While a head is being
+    /// accumulated it is the room left in the slot; while a body is, it is what
+    /// that body still owes — so a peer is asked for exactly the remainder and a
+    /// window that stayed at the head's leftover room would stall every submission
+    /// longer than a request buffer.
     const fn room(&self) -> usize {
-        REQUEST_CAPACITY.saturating_sub(self.received)
+        match self.phase {
+            Phase::Receiving {
+                total, received, ..
+            } => total.saturating_sub(received),
+            _ => REQUEST_CAPACITY.saturating_sub(self.received),
+        }
     }
 
     /// Whether the transport has yet to be handed everything. An abandoned
@@ -396,12 +502,19 @@ impl Slot {
     }
 }
 
-/// What a completed head resolved to: two answers rather than a status compared
+/// What a completed head resolved to: three answers rather than a status compared
 /// against `200`, which shape was claimed not being readable off that code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Decision {
     Refuse(Status),
     Claim(Want),
+    /// A body-taking target with a body to take: how many bytes were declared, and
+    /// where in the connection's own buffer the ones already delivered begin.
+    Receive {
+        target: &'static str,
+        total: usize,
+        head_len: usize,
+    },
 }
 
 /// Where the next unsent bytes are, as a span not a borrow: counting a miss
@@ -445,9 +558,17 @@ impl Shared {
 pub struct Server<const SLOTS: usize> {
     slots: [Slot; SLOTS],
     shared: Shared,
+    /// The `GET` targets answered with a body the owner renders whole.
+    /// [`METRICS_TARGET`] is here from the start, this crate being what serves it.
+    rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
     /// The targets an owner registered as streamed: a fixed table this server
     /// only compares against, which keeps recordings and block devices out of it.
     targets: [Option<&'static str>; MAX_STREAM_TARGETS],
+    /// The `POST` targets that accept a request body. A table of its own rather
+    /// than a flag on the two above, because the routing key is the method and the
+    /// target together: one path may be a `GET` that states something and a `POST`
+    /// that changes it, and each is refused `405` under the other's method.
+    bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     counters: HttpCounters,
 }
 
@@ -461,13 +582,21 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 bytes: [0; RESPONSE_CAPACITY],
                 start: MAX_HEAD_LEN,
             },
+            rendered: {
+                let mut table = [None; MAX_RENDERED_TARGETS];
+                table[0] = Some(METRICS_TARGET);
+                table
+            },
             targets: [None; MAX_STREAM_TARGETS],
+            bodies: [None; MAX_BODY_TARGETS],
             counters: HttpCounters {
                 requests: 0,
                 responses: [0; Status::ALL.len()],
                 response_bytes: 0,
                 overflowed: 0,
-                expositions_refused: 0,
+                bodies_refused: 0,
+                bodies_overrun: 0,
+                bodies_taken: 0,
                 retransmits_unavailable: 0,
                 slots_exhausted: 0,
                 streams_started: 0,
@@ -485,22 +614,63 @@ impl<const SLOTS: usize> Server<SLOTS> {
     }
 
     /// Register `target` as one this server answers by streaming; an unregistered
-    /// one stays `404`, which keeps this table the whole of the routing. `false`
-    /// for a full table, one already registered, or [`METRICS_TARGET`], which
+    /// one stays `404`, which keeps these tables the whole of the routing. `false`
+    /// for a full table or a target already answered on `GET`, either of which
     /// would put two answers on one target.
     pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
-        if target == METRICS_TARGET || self.registered(target).is_some() {
+        if self.answers_get(target) {
             return false;
         }
-        let Some(slot) = self.targets.iter_mut().find(|slot| slot.is_none()) else {
+        Self::register(&mut self.targets, target)
+    }
+
+    /// Register `target` as one this server answers on `GET` with a body the
+    /// caller renders whole. `false` on the same terms as
+    /// [`serve_stream_at`](Self::serve_stream_at).
+    pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
+        if self.answers_get(target) {
+            return false;
+        }
+        Self::register(&mut self.rendered, target)
+    }
+
+    /// Register `target` as one this server accepts a request body on. `false` for
+    /// a full table or one already registered — and deliberately **not** for a
+    /// target answered on `GET`: one path that states a thing and changes it is
+    /// the shape this exists for, the two being told apart by method.
+    pub fn serve_body_at(&mut self, target: &'static str) -> bool {
+        if Self::holds(&self.bodies, target).is_some() {
+            return false;
+        }
+        Self::register(&mut self.bodies, target)
+    }
+
+    /// Whether some `GET` answer already claims this target, which is what makes
+    /// the two `GET` tables one namespace.
+    fn answers_get(&self, target: &str) -> bool {
+        Self::holds(&self.rendered, target).is_some()
+            || Self::holds(&self.targets, target).is_some()
+    }
+
+    fn register<const N: usize>(
+        table: &mut [Option<&'static str>; N],
+        target: &'static str,
+    ) -> bool {
+        if Self::holds(table, target).is_some() {
+            return false;
+        }
+        let Some(slot) = table.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
         *slot = Some(target);
         true
     }
 
-    fn registered(&self, path: &str) -> Option<&'static str> {
-        self.targets
+    fn holds<const N: usize>(
+        table: &[Option<&'static str>; N],
+        path: &str,
+    ) -> Option<&'static str> {
+        table
             .iter()
             .flatten()
             .copied()
@@ -518,11 +688,19 @@ impl<const SLOTS: usize> Server<SLOTS> {
             bump(&mut self.counters.slots_exhausted);
             return;
         };
+        let receiving = self
+            .slots
+            .get(index)
+            .is_some_and(|slot| matches!(slot.phase, Phase::Receiving { .. }));
+        if receiving {
+            self.take_body(index, data);
+            return;
+        }
         let overran = {
             let Some(slot) = self.slots.get_mut(index) else {
                 return;
             };
-            let room = slot.room();
+            let room = REQUEST_CAPACITY.saturating_sub(slot.received);
             let taken = room.min(data.len());
             let held = slot.received;
             for (target, byte) in slot
@@ -534,12 +712,12 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 *target = *byte;
             }
             slot.received = held.saturating_add(taken);
-            slot.phase == Phase::Reading && taken < data.len()
+            slot.phase.is_reading() && taken < data.len()
         };
         if self
             .slots
             .get(index)
-            .is_none_or(|slot| slot.phase != Phase::Reading)
+            .is_none_or(|slot| !slot.phase.is_reading())
         {
             // A connection that has already been answered goes on being read so
             // its window accounting stays honest, and nothing further is parsed:
@@ -554,17 +732,78 @@ impl<const SLOTS: usize> Server<SLOTS> {
         self.decide(index, connection);
     }
 
+    /// Take body bytes for a connection whose head declared a length, appending
+    /// them into the staging array behind the room the head reservation holds.
+    ///
+    /// Bounded twice over and by two different things: by the declared length,
+    /// which is the protocol bound and what the excess is counted against, and by
+    /// the array itself, which is the memory one — `MAX_BODY_LEN` having already
+    /// refused a declaration the array could not hold, so the second is
+    /// unreachable and is a `zip` rather than a check.
+    fn take_body(&mut self, index: usize, data: &[u8]) {
+        let overrun = {
+            let Some(slot) = self.slots.get_mut(index) else {
+                return;
+            };
+            let Phase::Receiving {
+                target,
+                total,
+                received,
+            } = slot.phase
+            else {
+                return;
+            };
+            let taken = total.saturating_sub(received).min(data.len());
+            for (cell, byte) in self
+                .shared
+                .bytes
+                .iter_mut()
+                .skip(MAX_HEAD_LEN.saturating_add(received))
+                .zip(data.iter().take(taken))
+            {
+                *cell = *byte;
+            }
+            let received = received.saturating_add(taken);
+            slot.phase = Phase::Receiving {
+                target,
+                total,
+                received,
+            };
+            if received >= total {
+                slot.phase = Phase::AwaitingBody(Want::Submitted(target));
+                slot.len = total;
+            }
+            data.len().saturating_sub(taken)
+        };
+        if overrun > 0 {
+            // A peer that sent more than it announced. Counted rather than
+            // answered: the request it belongs to is complete, and the bytes past
+            // it belong to no message this server will read.
+            self.counters.bodies_overrun =
+                self.counters.bodies_overrun.saturating_add(overrun as u64);
+        }
+        if self
+            .slots
+            .get(index)
+            .is_some_and(|slot| matches!(slot.phase, Phase::AwaitingBody(Want::Submitted(_))))
+        {
+            bump(&mut self.counters.bodies_taken);
+        }
+    }
+
     /// Parse whatever has accumulated and answer if the head is whole.
     fn decide(&mut self, index: usize, connection: ConnectionId) {
-        // Copied out before the slot is borrowed: four words against a borrow of
-        // the whole server across the parse.
-        let targets = self.targets;
+        // Copied out before the slot is borrowed: three small tables against a
+        // borrow of the whole server across the parse.
+        let rendered = self.rendered;
+        let streams = self.targets;
+        let bodies = self.bodies;
         let decision = {
             let Some(slot) = self.slots.get(index) else {
                 return;
             };
             let head = slot.request.get(..slot.received).unwrap_or_default();
-            match parse(head) {
+            match parse(head, MAX_BODY_LEN) {
                 Ok(Parsed::NeedMore) => {
                     // Not yet, and a buffer that is now full will never hold
                     // one: answered here rather than waited on.
@@ -574,19 +813,41 @@ impl<const SLOTS: usize> Server<SLOTS> {
                     }
                     return;
                 }
-                Ok(Parsed::Complete { request, .. }) => {
+                Ok(Parsed::Complete { request, consumed }) => {
                     bump(&mut self.counters.requests);
                     let path = path_of(request.target());
-                    if !request.is_get() {
-                        Decision::Refuse(Status::MethodNotAllowed)
-                    } else if path == METRICS_TARGET {
-                        Decision::Claim(Want::Exposition)
-                    } else if let Some(target) =
-                        targets.iter().flatten().copied().find(|it| *it == path)
-                    {
-                        Decision::Claim(Want::Stream(target))
+                    let claims_get = |table: &[Option<&'static str>]| -> Option<&'static str> {
+                        table.iter().flatten().copied().find(|it| *it == path)
+                    };
+                    if request.is_get() {
+                        if let Some(target) = claims_get(&rendered) {
+                            Decision::Claim(Want::Rendered(target))
+                        } else if let Some(target) = claims_get(&streams) {
+                            Decision::Claim(Want::Stream(target))
+                        } else if claims_get(&bodies).is_some() {
+                            // A target that exists and takes a body rather than
+                            // stating one: `405` says so, where `404` would say
+                            // the resource is absent.
+                            Decision::Refuse(Status::MethodNotAllowed)
+                        } else {
+                            Decision::Refuse(Status::NotFound)
+                        }
+                    } else if request.is_post() {
+                        match claims_get(&bodies) {
+                            Some(target) => Decision::Receive {
+                                target,
+                                total: request.body_len(),
+                                head_len: consumed,
+                            },
+                            None if claims_get(&rendered).is_some()
+                                || claims_get(&streams).is_some() =>
+                            {
+                                Decision::Refuse(Status::MethodNotAllowed)
+                            }
+                            None => Decision::Refuse(Status::NotFound),
+                        }
                     } else {
-                        Decision::Refuse(Status::NotFound)
+                        Decision::Refuse(Status::MethodNotAllowed)
                     }
                 }
                 Err(error) => {
@@ -598,6 +859,76 @@ impl<const SLOTS: usize> Server<SLOTS> {
         match decision {
             Decision::Claim(want) => self.claim_buffer(index, connection, want),
             Decision::Refuse(status) => self.respond_without_body(index, status),
+            Decision::Receive {
+                target,
+                total,
+                head_len,
+            } => self.begin_receiving(index, connection, target, total, head_len),
+        }
+    }
+
+    /// Claim the staging array for a request body and move into it whatever of that
+    /// body arrived in the same segment as the head.
+    ///
+    /// A `POST` with no body at all — `Content-Length: 0`, or none — is complete the
+    /// moment its head is, so it goes straight to the caller's decision rather than
+    /// waiting for a byte that will never come.
+    fn begin_receiving(
+        &mut self,
+        index: usize,
+        connection: ConnectionId,
+        target: &'static str,
+        total: usize,
+        head_len: usize,
+    ) {
+        if !self.reclaim_if_finished() {
+            self.respond_without_body(index, Status::ServiceUnavailable);
+            return;
+        }
+        self.shared.owner = Some(connection);
+        self.shared.start = MAX_HEAD_LEN;
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.phase = Phase::Receiving {
+                target,
+                total,
+                received: 0,
+            };
+            slot.body = Body::Own;
+            slot.len = 0;
+            slot.sent = 0;
+            slot.base = None;
+        }
+        // What the same segment already delivered behind the head, which for a
+        // small document is the whole body.
+        let delivered = {
+            let Some(slot) = self.slots.get(index) else {
+                return;
+            };
+            let end = slot.received;
+            let mut carried = [0u8; REQUEST_CAPACITY];
+            let mut len = 0usize;
+            for (cell, byte) in carried.iter_mut().zip(
+                slot.request
+                    .iter()
+                    .skip(head_len)
+                    .take(end.saturating_sub(head_len)),
+            ) {
+                *cell = *byte;
+                len = len.saturating_add(1);
+            }
+            (carried, len)
+        };
+        let (carried, len) = delivered;
+        if len > 0 {
+            self.take_body(index, carried.get(..len).unwrap_or_default());
+        }
+        if total == 0
+            && let Some(slot) = self.slots.get_mut(index)
+            && matches!(slot.phase, Phase::Receiving { .. })
+        {
+            slot.phase = Phase::AwaitingBody(Want::Submitted(target));
+            slot.len = 0;
+            bump(&mut self.counters.bodies_taken);
         }
     }
 
@@ -663,15 +994,55 @@ impl<const SLOTS: usize> Server<SLOTS> {
         }
     }
 
-    /// The connection whose exposition the caller owes, if any — never one
-    /// waiting on a *stream* decision, which would answer one target with
-    /// another's body.
+    /// The connection whose rendered body the caller owes and the target it asked
+    /// for — never one waiting on a *stream* decision or on a submission, which
+    /// would answer one target with another's body.
     #[must_use]
-    pub fn pending_body(&self) -> Option<ConnectionId> {
-        self.slots
-            .iter()
-            .find(|slot| slot.phase == Phase::AwaitingBody(Want::Exposition))
-            .and_then(|slot| slot.connection)
+    pub fn pending_render(&self) -> Option<(ConnectionId, &'static str)> {
+        self.awaiting(|want| match want {
+            Want::Rendered(target) => Some(target),
+            Want::Stream(_) | Want::Submitted(_) => None,
+        })
+    }
+
+    /// The connection whose submitted body the caller owes a decision on, and the
+    /// target it was submitted to.
+    ///
+    /// Read the body with [`submission`](Self::submission) and answer with
+    /// [`supply`](Self::supply). Leaving one unanswered holds the staging array
+    /// and refuses every scrape meanwhile, exactly as an unsupplied exposition
+    /// already can.
+    #[must_use]
+    pub fn pending_submission(&self) -> Option<(ConnectionId, &'static str)> {
+        self.awaiting(|want| match want {
+            Want::Submitted(target) => Some(target),
+            Want::Rendered(_) | Want::Stream(_) => None,
+        })
+    }
+
+    /// The body a submission delivered, borrowed out of the staging array.
+    ///
+    /// The borrow is the enforcement: [`supply`](Self::supply) needs `&mut self`
+    /// and writes into this same array, so a caller cannot answer while still
+    /// holding the bytes it is answering about. `None` where nothing is waiting.
+    #[must_use]
+    pub fn submission(&self) -> Option<&[u8]> {
+        let (connection, _) = self.pending_submission()?;
+        let index = self.index_of(connection)?;
+        let len = self.slots.get(index)?.len;
+        self.shared
+            .bytes
+            .get(MAX_HEAD_LEN..MAX_HEAD_LEN.saturating_add(len))
+    }
+
+    fn awaiting(
+        &self,
+        of: impl Fn(Want) -> Option<&'static str>,
+    ) -> Option<(ConnectionId, &'static str)> {
+        self.slots.iter().find_map(|slot| match slot.phase {
+            Phase::AwaitingBody(want) => Some((slot.connection?, of(want)?)),
+            _ => None,
+        })
     }
 
     /// The connection whose registered stream target the caller must decide on,
@@ -680,21 +1051,37 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// exposition already can.
     #[must_use]
     pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
-        self.slots.iter().find_map(|slot| match slot.phase {
-            Phase::AwaitingBody(Want::Stream(target)) => Some((slot.connection?, target)),
-            _ => None,
+        self.awaiting(|want| match want {
+            Want::Stream(target) => Some(target),
+            Want::Rendered(_) | Want::Submitted(_) => None,
         })
     }
 
-    /// Render that connection's body with `render` and put a head in front of
-    /// it.
+    /// Answer the request waiting on a whole body — a rendered `GET` or a decided
+    /// submission — with `status` and whatever `render` writes.
     ///
     /// `render` writes into the staging buffer and answers the body's length, or
     /// `None` where it does not fit — which is **ours** rather than the client's,
-    /// [`RESPONSE_CAPACITY`] being derived from the renderer's own worst case, so
-    /// a caller sized by it can never provoke one.
-    pub fn supply(&mut self, render: impl FnOnce(&mut [u8]) -> Option<usize>) {
-        let Some(connection) = self.pending_body() else {
+    /// [`RESPONSE_CAPACITY`] being derived from every renderer's own worst case, so
+    /// a caller sized by it can never provoke one. A caller with nothing to say
+    /// answers a length of zero and no content type.
+    ///
+    /// One call for both shapes, because both are the same act: the owner of a
+    /// target puts a body in the array and this puts a head in front of it. What
+    /// differs is the status and the type, and those are the parameters. For a
+    /// submission the bytes written **overwrite the body that was submitted**,
+    /// which is why [`submission`](Self::submission) borrows and this does not.
+    pub fn supply(
+        &mut self,
+        status: Status,
+        content_type: Option<ContentType>,
+        render: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) {
+        let waiting = self
+            .pending_render()
+            .or_else(|| self.pending_submission())
+            .map(|(connection, _)| connection);
+        let Some(connection) = waiting else {
             return;
         };
         let Some(index) = self.index_of(connection) else {
@@ -707,14 +1094,9 @@ impl<const SLOTS: usize> Server<SLOTS> {
             .and_then(render)
             .and_then(|body| {
                 let mut head = [0u8; MAX_HEAD_LEN];
-                // Lossless: an exposition is at most `MAX_EXPOSITION_LEN` bytes.
-                let len = write_head(
-                    Status::Ok,
-                    Some(ContentType::Metrics),
-                    body as u64,
-                    &mut head,
-                )
-                .ok()?;
+                // Lossless: a body is at most `longest_body()` bytes, which the
+                // module's assertion holds inside the array.
+                let len = write_head(status, content_type, body as u64, &mut head).ok()?;
                 let start = MAX_HEAD_LEN.checked_sub(len)?;
                 self.shared
                     .bytes
@@ -725,9 +1107,9 @@ impl<const SLOTS: usize> Server<SLOTS> {
             });
         let Some(len) = composed else {
             // Counted rather than asserted so a divergence surfaces as a refused
-            // scrape with a number attached. The buffer is released
+            // request with a number attached. The buffer is released
             // here: the refusal has no body to keep it for.
-            bump(&mut self.counters.expositions_refused);
+            bump(&mut self.counters.bodies_refused);
             self.release_shared(index);
             self.respond_without_body(index, Status::ServiceUnavailable);
             return;
@@ -737,7 +1119,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
             slot.body = Body::Staged;
             slot.len = len;
         }
-        self.record(Status::Ok);
+        self.record(status);
     }
 
     /// Commit to answering the pending stream target with a body of `total`
@@ -930,7 +1312,10 @@ impl<const SLOTS: usize> Server<SLOTS> {
             return;
         };
         if let Some(slot) = self.slots.get_mut(index)
-            && matches!(slot.phase, Phase::Reading | Phase::AwaitingBody(_))
+            && matches!(
+                slot.phase,
+                Phase::Reading | Phase::Receiving { .. } | Phase::AwaitingBody(_)
+            )
         {
             slot.phase = Phase::Responding;
             slot.body = Body::Own;
