@@ -676,6 +676,7 @@ dependencies = [
 name = "pd-runtime"
 version = "0.1.0"
 dependencies = [
+ "config",
  "criterion",
  "lfw-blk",
  "lfw-clock",

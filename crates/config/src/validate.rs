@@ -26,10 +26,14 @@
 //! that put arbitrary images and arbitrary documents through both sides.
 
 use lfw_log::{Identifier, RejectReason};
-use net_headers::{Ipv4Address, prefix_mask};
-use wire::{ConfigRule, Enforcement, MAX_PREFIX_LENGTH};
+use net_headers::{Ipv4Address, Protocol, prefix_mask};
+use wire::{ConfigRule, Enforcement, MAX_PREFIX_LENGTH, RuleCriterion};
 
-use crate::{PORT_COUNT, model::Model};
+use crate::{
+    PORT_COUNT,
+    model::Model,
+    rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch},
+};
 
 // The image ABI and the address arithmetic each state the bound independently —
 // `wire` depends on no domain crate — so the two are held equal here, the one
@@ -56,7 +60,14 @@ pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
         // A neighbour names an interface, never a port: the port it ends up on
         // is the one that interface holds, and that one is already a port this
         // build has by `InterfacePortExists`.
-        | ConfigRule::NeighbourPortExists => Enforcement::Unrepresentable,
+        | ConfigRule::NeighbourPortExists
+        // A model holding more rules than the image has slots for does not
+        // exist, on `InterfaceCountWithinCapacity`'s terms; and an action and a
+        // criterion are each parsed into an enum with no arm outside the rule.
+        | ConfigRule::RuleCountWithinCapacity
+        | ConfigRule::RuleIdIsWellFormed
+        | ConfigRule::RuleActionIsKnown
+        | ConfigRule::RuleCriterionIsStatedOrNot => Enforcement::Unrepresentable,
 
         ConfigRule::InterfacePortExists
         | ConfigRule::InterfacePrefixLengthInRange
@@ -83,7 +94,15 @@ pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
         | ConfigRule::ManagementAddressIsUnicast
         | ConfigRule::ManagementAddressIsAHostAddress
         | ConfigRule::ManagementPrefixDoesNotCollideWithInterface
-        | ConfigRule::ManagementMacDoesNotCollideWithInterface => Enforcement::Refuses,
+        | ConfigRule::ManagementMacDoesNotCollideWithInterface
+        | ConfigRule::RuleIdIsUnique
+        | ConfigRule::RuleIngressResolves
+        | ConfigRule::RuleEgressResolves
+        | ConfigRule::RulePrefixLengthInRange
+        | ConfigRule::RulePrefixIsCanonical
+        | ConfigRule::RulePortRangeIsOrdered
+        | ConfigRule::RuleNoPortCriterionOnIcmp
+        | ConfigRule::RuleNoIcmpTypeOnAnotherProtocol => Enforcement::Refuses,
     }
 }
 
@@ -199,6 +218,40 @@ pub enum SemanticError {
     ManagementMacCollidesWithInterface {
         other: Identifier,
     },
+    DuplicateRuleId {
+        id: Identifier,
+    },
+    /// An `ingress` or `egress` naming an interface the configuration has not.
+    UnknownRuleInterfaceReference {
+        id: Identifier,
+        criterion: RuleCriterion,
+        interface: Identifier,
+    },
+    RulePrefixLengthOutOfRange {
+        id: Identifier,
+        criterion: RuleCriterion,
+        prefix_length: u8,
+    },
+    /// A block written with host bits set, which covers what its network covers
+    /// while reading as something narrower.
+    RulePrefixNotCanonical {
+        id: Identifier,
+        criterion: RuleCriterion,
+    },
+    /// A range whose low port is above its high one, which matches nothing.
+    RulePortRangeReversed {
+        id: Identifier,
+        criterion: RuleCriterion,
+    },
+    /// A port criterion on a rule that names ICMP.
+    RulePortCriterionOnIcmp {
+        id: Identifier,
+        criterion: RuleCriterion,
+    },
+    /// An ICMP type on a rule that names another protocol.
+    RuleIcmpTypeOnNonIcmp {
+        id: Identifier,
+    },
 }
 
 impl SemanticError {
@@ -222,7 +275,14 @@ impl SemanticError {
             | Self::NeighbourIsInterfaceAddress { id }
             | Self::NeighbourAddressNotAHostAddress { id }
             | Self::DuplicateInterfaceMac { id, .. }
-            | Self::DuplicateNeighbourAddress { id, .. } => id,
+            | Self::DuplicateNeighbourAddress { id, .. }
+            | Self::DuplicateRuleId { id }
+            | Self::UnknownRuleInterfaceReference { id, .. }
+            | Self::RulePrefixLengthOutOfRange { id, .. }
+            | Self::RulePrefixNotCanonical { id, .. }
+            | Self::RulePortRangeReversed { id, .. }
+            | Self::RulePortCriterionOnIcmp { id, .. }
+            | Self::RuleIcmpTypeOnNonIcmp { id } => id,
             Self::ManagementPrefixLengthOutOfRange { .. }
             | Self::ManagementAddressNotUnicast
             | Self::ManagementAddressNotAHostAddress
@@ -235,12 +295,18 @@ impl SemanticError {
     #[must_use]
     pub const fn reason(self) -> RejectReason {
         match self {
-            Self::DuplicateInterfaceId { .. } | Self::DuplicateNeighbourId { .. } => {
-                RejectReason::DuplicateIdentifier
-            }
+            Self::DuplicateInterfaceId { .. }
+            | Self::DuplicateNeighbourId { .. }
+            | Self::DuplicateRuleId { .. } => RejectReason::DuplicateIdentifier,
             Self::DuplicatePort { .. } => RejectReason::DuplicatePort,
             Self::PortOutOfRange { .. } => RejectReason::PortOutOfRange,
-            Self::PrefixLengthOutOfRange { .. } => RejectReason::PrefixLengthOutOfRange,
+            Self::PrefixLengthOutOfRange { .. } | Self::RulePrefixLengthOutOfRange { .. } => {
+                RejectReason::PrefixLengthOutOfRange
+            }
+            Self::RulePrefixNotCanonical { .. } => RejectReason::PrefixNotCanonical,
+            Self::RulePortRangeReversed { .. } => RejectReason::PortRangeReversed,
+            Self::RulePortCriterionOnIcmp { .. } => RejectReason::PortCriterionOnIcmp,
+            Self::RuleIcmpTypeOnNonIcmp { .. } => RejectReason::IcmpTypeOnNonIcmp,
             Self::InterfaceAddressNotAHostAddress { .. }
             | Self::NeighbourAddressNotAHostAddress { .. } => RejectReason::AddressNotAHostAddress,
             Self::InterfaceAddressNotUnicast { .. } | Self::NeighbourAddressNotUnicast { .. } => {
@@ -250,7 +316,9 @@ impl SemanticError {
             | Self::NeighbourMacNotUnicast { .. }
             | Self::DuplicateInterfaceMac { .. } => RejectReason::MacNotUnicast,
             Self::OverlappingPrefixes { .. } => RejectReason::OverlappingPrefixes,
-            Self::UnknownInterfaceReference { .. } => RejectReason::UnknownInterfaceReference,
+            Self::UnknownInterfaceReference { .. } | Self::UnknownRuleInterfaceReference { .. } => {
+                RejectReason::UnknownInterfaceReference
+            }
             Self::NeighbourOutsidePrefix { .. } => RejectReason::NeighbourOutsidePrefix,
             Self::NeighbourIsInterfaceAddress { .. } => RejectReason::NeighbourIsInterfaceAddress,
             Self::DuplicateNeighbourAddress { .. } => RejectReason::DuplicateNeighbourAddress,
@@ -280,6 +348,96 @@ pub fn validate(model: &Model) -> Result<(), SemanticError> {
     neighbour_fields(model)?;
     neighbour_addresses(model)?;
     management(model)?;
+    rule_identities(model)?;
+    rules(model)?;
+    Ok(())
+}
+
+fn rule_identities(model: &Model) -> Result<(), SemanticError> {
+    for (index, entry) in model.rules().enumerate() {
+        if model
+            .rules()
+            .take(index)
+            .any(|earlier| earlier.id == entry.id)
+        {
+            return Err(SemanticError::DuplicateRuleId { id: entry.id });
+        }
+    }
+    Ok(())
+}
+
+/// Every rule's criteria, in the order the document writes them, then the two
+/// that hold criteria to each other.
+///
+/// The last two are what stops a rule matching nothing while reading as though
+/// it matched something: ICMP carries no ports and nothing else carries an ICMP
+/// type, so either combination is a policy line an operator believes is in
+/// force. On a default-deny appliance that belief is the dangerous half — the
+/// rule they wrote to *allow* traffic is the one silently matching nothing.
+fn rules(model: &Model) -> Result<(), SemanticError> {
+    for entry in model.rules() {
+        let id = entry.id;
+        for (criterion, interface) in [
+            (RuleCriterion::Ingress, entry.ingress),
+            (RuleCriterion::Egress, entry.egress),
+        ] {
+            if let InterfaceMatch::Named(named) = interface
+                && model.interface(named).is_none()
+            {
+                return Err(SemanticError::UnknownRuleInterfaceReference {
+                    id,
+                    criterion,
+                    interface: named,
+                });
+            }
+        }
+        for (criterion, address) in [
+            (RuleCriterion::Source, entry.source),
+            (RuleCriterion::Destination, entry.destination),
+        ] {
+            let AddressMatch::Block {
+                network,
+                prefix_length,
+            } = address
+            else {
+                continue;
+            };
+            if prefix_length > MAX_PREFIX_LENGTH {
+                return Err(SemanticError::RulePrefixLengthOutOfRange {
+                    id,
+                    criterion,
+                    prefix_length,
+                });
+            }
+            if network.bits() & !prefix_mask(prefix_length) != 0 {
+                return Err(SemanticError::RulePrefixNotCanonical { id, criterion });
+            }
+        }
+        let ports = [
+            (RuleCriterion::SourcePort, entry.source_port),
+            (RuleCriterion::DestinationPort, entry.destination_port),
+        ];
+        for (criterion, port) in ports {
+            if let PortMatch::Range { low, high } = port
+                && low > high
+            {
+                return Err(SemanticError::RulePortRangeReversed { id, criterion });
+            }
+        }
+        if entry.protocol == ProtocolMatch::Only(Protocol::ICMP) {
+            for (criterion, port) in ports {
+                if port != PortMatch::Any {
+                    return Err(SemanticError::RulePortCriterionOnIcmp { id, criterion });
+                }
+            }
+        }
+        if entry.icmp_type != IcmpTypeMatch::Any
+            && let ProtocolMatch::Only(protocol) = entry.protocol
+            && protocol != Protocol::ICMP
+        {
+            return Err(SemanticError::RuleIcmpTypeOnNonIcmp { id });
+        }
+    }
     Ok(())
 }
 
@@ -475,7 +633,7 @@ fn overlaps(left: Ipv4Address, left_len: u8, right: Ipv4Address, right_len: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
+    use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
     use net_headers::MacAddress;
     use proptest::prelude::*;
 
@@ -521,6 +679,20 @@ mod tests {
                 interface: id("lan"),
                 address: Ipv4Address::from_octets([10, 0, 1, 2]),
                 mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0b]),
+            })
+            .expect("capacity");
+        model
+            .push_rule(RuleEntry {
+                id: id("allow-all"),
+                ingress: InterfaceMatch::Any,
+                egress: InterfaceMatch::Any,
+                source: AddressMatch::Any,
+                destination: AddressMatch::Any,
+                protocol: ProtocolMatch::Any,
+                source_port: PortMatch::Any,
+                destination_port: PortMatch::Any,
+                icmp_type: IcmpTypeMatch::Any,
+                action: crate::rule::RuleAction::Accept,
             })
             .expect("capacity");
         model
@@ -1096,6 +1268,7 @@ mod tests {
         let mut second = second_interface();
         let mut neighbour = sound_neighbour();
         let mut management = management_entry();
+        let mut filter = sound_rule();
         let model = match rule {
             // No model expresses these: the arrays are fixed, `enabled` is a
             // `bool`, an id is an `Identifier`, and a neighbour names an
@@ -1206,8 +1379,79 @@ mod tests {
                 management.mac = first.mac;
                 with_management(management)
             }
+
+            // No model expresses these: the rules array is fixed and `push`
+            // refuses past the last one, an id is an `Identifier`, an action is
+            // an enum with two arms, and a criterion is an enum whose wildcard
+            // is an arm rather than a byte.
+            ConfigRule::RuleCountWithinCapacity
+            | ConfigRule::RuleIdIsWellFormed
+            | ConfigRule::RuleActionIsKnown
+            | ConfigRule::RuleCriterionIsStatedOrNot => return None,
+
+            ConfigRule::RuleIdIsUnique => {
+                let mut twin = filter;
+                twin.action = crate::rule::RuleAction::Drop;
+                let mut model = with_rule(filter);
+                model.push_rule(twin).expect("capacity");
+                model
+            }
+            ConfigRule::RuleIngressResolves => {
+                filter.ingress = InterfaceMatch::Named(id("nowhere"));
+                with_rule(filter)
+            }
+            ConfigRule::RuleEgressResolves => {
+                filter.egress = InterfaceMatch::Named(id("nowhere"));
+                with_rule(filter)
+            }
+            ConfigRule::RulePrefixLengthInRange => {
+                filter.source = AddressMatch::Block {
+                    network: Ipv4Address::from_octets([10, 0, 0, 0]),
+                    prefix_length: MAX_PREFIX_LENGTH + 1,
+                };
+                with_rule(filter)
+            }
+            ConfigRule::RulePrefixIsCanonical => {
+                filter.destination = AddressMatch::Block {
+                    network: Ipv4Address::from_octets([10, 0, 0, 5]),
+                    prefix_length: 24,
+                };
+                with_rule(filter)
+            }
+            ConfigRule::RulePortRangeIsOrdered => {
+                filter.source_port = PortMatch::Range {
+                    low: 1024,
+                    high: 100,
+                };
+                with_rule(filter)
+            }
+            ConfigRule::RuleNoPortCriterionOnIcmp => {
+                filter.protocol = ProtocolMatch::Only(Protocol::ICMP);
+                filter.destination_port = PortMatch::Range { low: 80, high: 80 };
+                with_rule(filter)
+            }
+            ConfigRule::RuleNoIcmpTypeOnAnotherProtocol => {
+                filter.protocol = ProtocolMatch::Only(Protocol::TCP);
+                filter.icmp_type = IcmpTypeMatch::Only(8);
+                with_rule(filter)
+            }
         };
         Some(model)
+    }
+
+    /// The rule `sound()` carries: every criterion at its widest, accepting.
+    fn sound_rule() -> RuleEntry {
+        *sound().rules().next().expect("the first rule")
+    }
+
+    /// `sound()`'s interfaces with a single rule, `entry`.
+    fn with_rule(entry: RuleEntry) -> Model {
+        let mut model = Model::EMPTY;
+        for interface in sound().interfaces() {
+            model.push_interface(*interface).expect("capacity");
+        }
+        model.push_rule(entry).expect("capacity");
+        model
     }
 
     /// The neighbour `sound()` carries, on the first interface's link.

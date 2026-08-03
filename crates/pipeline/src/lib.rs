@@ -29,6 +29,23 @@
 //! answers [`Verdict`] outright, which makes "the chain always concludes" a fact
 //! about the types rather than a comment.
 //!
+//! # Where policy sits, and why it is last
+//!
+//! The chain is admission, then routing, then policy, and the middle one is the
+//! reason for the order. [`RoutingStage`] does not settle a frame it can
+//! forward: it resolves the egress port and the next hop and *attaches* them to
+//! the [`Inspection`], deferring to what follows. So [`PolicyStage`] decides
+//! with the egress in hand, which is what makes a rule able to name one — a
+//! zone-to-zone policy is the ordinary case and it is unwritable if the filter
+//! runs before the forwarding decision. The converse is the same fact: a packet
+//! with no route has no egress for an egress rule to be about, so there is
+//! nothing for policy to say about it and routing settles it first.
+//!
+//! [`PolicyStage`] is terminal and its default is to drop. A frame matching no
+//! rule is refused under [`DropReason::NoPolicyMatch`], which is what makes an
+//! empty ruleset deny everything rather than permit it — the same posture
+//! generation 0 already has, arrived at from the other direction.
+//!
 //! # Connected routes only, and configured neighbours
 //!
 //! [`RoutingStage`] resolves against connected interface prefixes alone —
@@ -44,7 +61,7 @@
 
 use core::fmt;
 
-use net_headers::{Frame, MacAddress};
+use net_headers::{Frame, Ipv4Address, MacAddress, Protocol, Transport};
 use routing::{PortId, Router};
 
 /// Why a frame was not forwarded — the flat, operator-facing vocabulary every
@@ -89,12 +106,21 @@ pub enum DropReason {
     /// A route exists but no configured neighbour holds the destination's MAC.
     /// With no ARP, this is the unresolvable case.
     NoNeighbour,
+    /// A rule matched and its action is to drop. The frame was routable: an
+    /// operator asked for this one.
+    PolicyDenied,
+    /// No rule matched. Distinct from [`Self::PolicyDenied`] because the two
+    /// are opposite things to go and do — one rule is doing what it says, and
+    /// the other is a policy with nothing to say about this traffic — and
+    /// because a node whose whole ruleset has stopped matching shows up here
+    /// and nowhere else.
+    NoPolicyMatch,
 }
 
 impl DropReason {
     /// Every variant, so a counter table and a report can be built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::UnconfiguredIngressPort,
         Self::InterfaceDisabled,
         Self::NotAddressedToUs,
@@ -106,6 +132,8 @@ impl DropReason {
         Self::NoRoute,
         Self::EgressIsIngress,
         Self::NoNeighbour,
+        Self::PolicyDenied,
+        Self::NoPolicyMatch,
     ];
 
     /// A stable short name, for a metric label or a report line.
@@ -123,6 +151,8 @@ impl DropReason {
             Self::NoRoute => "no_route",
             Self::EgressIsIngress => "egress_is_ingress",
             Self::NoNeighbour => "no_neighbour",
+            Self::PolicyDenied => "policy_denied",
+            Self::NoPolicyMatch => "no_policy_match",
         }
     }
 
@@ -223,12 +253,33 @@ pub enum Step {
 pub struct Inspection<'frame> {
     ingress: PortId,
     frame: Frame<'frame>,
+    forwarding: Option<Forwarding>,
+}
+
+/// What [`RoutingStage`] worked out about a frame it did not settle: where the
+/// frame would leave and under which MAC pair.
+///
+/// Attached rather than returned, which is the whole reason the routing stage
+/// stopped being terminal. A later stage reads the egress port a rule names
+/// without re-deriving it, and the forwarding verdict this becomes is composed
+/// once, at the end of the chain, out of a decision made in the middle of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Forwarding {
+    pub egress: PortId,
+    /// The egress interface's own MAC.
+    pub source: MacAddress,
+    /// The next hop's MAC.
+    pub destination: MacAddress,
 }
 
 impl<'frame> Inspection<'frame> {
     #[must_use]
     pub const fn new(ingress: PortId, frame: Frame<'frame>) -> Self {
-        Self { ingress, frame }
+        Self {
+            ingress,
+            frame,
+            forwarding: None,
+        }
     }
 
     /// The port the frame arrived on.
@@ -244,6 +295,22 @@ impl<'frame> Inspection<'frame> {
     pub const fn frame(&self) -> &Frame<'frame> {
         &self.frame
     }
+
+    /// Where the frame would leave, once a stage has worked it out.
+    ///
+    /// `None` before [`RoutingStage`] has run, and never `None` after it defers
+    /// — a stage that cannot resolve a next hop settles the frame instead of
+    /// passing it on, so every stage behind it sees a resolved one.
+    #[must_use]
+    pub const fn forwarding(&self) -> Option<Forwarding> {
+        self.forwarding
+    }
+
+    /// Attach what this stage derived. Taken by the stage that resolved it, so
+    /// the fact and its derivation stay in one place.
+    pub const fn attach_forwarding(&mut self, forwarding: Forwarding) {
+        self.forwarding = Some(forwarding);
+    }
 }
 
 /// The tables one evaluation decides against, and the generation that produced
@@ -254,6 +321,7 @@ impl<'frame> Inspection<'frame> {
 pub struct Configuration<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize> {
     generation: u32,
     table: &'table Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
+    rules: &'table Ruleset,
 }
 
 impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
@@ -263,8 +331,13 @@ impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
     pub const fn new(
         generation: u32,
         table: &'table Router<MAX_INTERFACES, MAX_NEIGHBOURS>,
+        rules: &'table Ruleset,
     ) -> Self {
-        Self { generation, table }
+        Self {
+            generation,
+            table,
+            rules,
+        }
     }
 
     #[must_use]
@@ -275,6 +348,11 @@ impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
     #[must_use]
     pub const fn table(&self) -> &'table Router<MAX_INTERFACES, MAX_NEIGHBOURS> {
         self.table
+    }
+
+    #[must_use]
+    pub const fn rules(&self) -> &'table Ruleset {
+        self.rules
     }
 }
 
@@ -320,8 +398,9 @@ impl AdmissionStage {
 /// The IPv4 forwarding decision: out of which port an admitted frame leaves,
 /// and under which pair of MAC addresses.
 ///
-/// Last in the chain, and so total — see the crate header on why it answers a
-/// [`Verdict`] and not a [`Step`].
+/// It settles a frame it cannot forward and *defers* one it can, attaching the
+/// egress and the MAC pair to the [`Inspection`] — see the crate header on why
+/// the filter has to run behind it rather than in front of it.
 pub struct RoutingStage;
 
 impl RoutingStage {
@@ -335,30 +414,31 @@ impl RoutingStage {
         &mut self,
         inspection: &mut Inspection<'_>,
         configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
-    ) -> Verdict {
+    ) -> Step {
+        let settle = |reason| Step::Settled(Verdict::Drop(reason));
         let table = configuration.table();
         let ingress = inspection.ingress();
         let header = inspection.frame().ipv4();
 
         let source = header.source;
         if !source.is_unicast() || table.is_local_address(source) {
-            return Verdict::Drop(DropReason::MartianSource);
+            return settle(DropReason::MartianSource);
         }
         let destination = header.destination;
         if !destination.is_unicast() {
-            return Verdict::Drop(DropReason::UnroutableDestination);
+            return settle(DropReason::UnroutableDestination);
         }
         if table.is_local_address(destination) {
-            return Verdict::Drop(DropReason::AddressedToThisRouter);
+            return settle(DropReason::AddressedToThisRouter);
         }
         // Before the route lookup, so an expiring packet is reported as such
         // rather than as whatever the lookup happens to say about it.
         if header.ttl <= 1 {
-            return Verdict::Drop(DropReason::TtlExpired);
+            return settle(DropReason::TtlExpired);
         }
 
         let Some(egress) = table.route(destination) else {
-            return Verdict::Drop(DropReason::NoRoute);
+            return settle(DropReason::NoRoute);
         };
         // Looked up across every interface and only then compared with the
         // ingress, so a longer prefix on the ingress port beats a shorter one
@@ -368,17 +448,422 @@ impl RoutingStage {
         // should have addressed the host directly, and carrying it out of a
         // less specific route would put it on the wrong link.
         if egress.port == ingress {
-            return Verdict::Drop(DropReason::EgressIsIngress);
+            return settle(DropReason::EgressIsIngress);
         }
         let Some(neighbour) = table.neighbour(egress.port, destination) else {
-            return Verdict::Drop(DropReason::NoNeighbour);
+            return settle(DropReason::NoNeighbour);
         };
 
-        Verdict::Forward {
+        inspection.attach_forwarding(Forwarding {
             egress: egress.port,
             source: egress.mac,
             destination: neighbour.mac,
+        });
+        Step::Continue
+    }
+}
+
+/// One address criterion: the block a rule compares an address against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    network: Ipv4Address,
+    /// The mask the length names, precomputed: a match is one `&` and one
+    /// comparison, and deriving the mask per packet per rule would be a shift
+    /// on the hot path for a value that changes once per generation.
+    mask: u32,
+}
+
+impl Prefix {
+    /// `network` is expected to have no host bits set, which is a rule the
+    /// configuration enforces on both sides; masking here anyway costs one
+    /// instruction per generation and makes this total whatever it is handed.
+    #[must_use]
+    pub fn new(network: Ipv4Address, prefix_length: u8) -> Self {
+        let mask = net_headers::prefix_mask(prefix_length);
+        Self {
+            network: Ipv4Address::from_octets((network.bits() & mask).to_be_bytes()),
+            mask,
         }
+    }
+
+    #[must_use]
+    fn covers(&self, address: Ipv4Address) -> bool {
+        address.bits() & self.mask == self.network.bits()
+    }
+}
+
+/// One port criterion, inclusive at both ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortRange {
+    pub low: u16,
+    pub high: u16,
+}
+
+impl PortRange {
+    #[must_use]
+    const fn covers(&self, port: u16) -> bool {
+        self.low <= port && port <= self.high
+    }
+}
+
+/// What a rule does with a frame it matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleAction {
+    Accept,
+    Drop,
+}
+
+/// One filter rule as the dataplane matches it.
+///
+/// Every criterion is an `Option` and `None` is the wildcard, so a criterion an
+/// operator wrote `any` for costs one `is_some` rather than a comparison
+/// against a value standing in for "do not compare". It carries no id: what
+/// identifies a rule on this side is its position, which is also its precedence
+/// and the slot its counter occupies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub ingress: Option<PortId>,
+    pub egress: Option<PortId>,
+    pub source: Option<Prefix>,
+    pub destination: Option<Prefix>,
+    pub protocol: Option<Protocol>,
+    pub source_port: Option<PortRange>,
+    pub destination_port: Option<PortRange>,
+    pub icmp_type: Option<u8>,
+    pub action: RuleAction,
+}
+
+impl Rule {
+    /// Whether this rule is about this frame.
+    ///
+    /// # A truncated transport matches no port and no type
+    ///
+    /// The port and type criteria are answered from [`Transport`], and every
+    /// variant of it that carries no readable field answers `false` rather than
+    /// being skipped: a stated criterion on a frame whose transport header was
+    /// cut short, arrived as a non-initial fragment, or is a protocol this
+    /// build does not break down, does not match. That is the direction that
+    /// matters on a default-deny appliance — a rule cannot be *satisfied* by a
+    /// header nobody read, so a truncated packet cannot be carried through an
+    /// `accept` written for a port. It falls to the next rule, and past the
+    /// last of them to the default deny.
+    #[must_use]
+    fn matches(&self, ingress: PortId, egress: PortId, frame: &Frame<'_>) -> bool {
+        if self.ingress.is_some_and(|port| port != ingress)
+            || self.egress.is_some_and(|port| port != egress)
+        {
+            return false;
+        }
+        let header = frame.ipv4();
+        if self
+            .source
+            .is_some_and(|block| !block.covers(header.source))
+            || self
+                .destination
+                .is_some_and(|block| !block.covers(header.destination))
+        {
+            return false;
+        }
+        if self
+            .protocol
+            .is_some_and(|protocol| protocol != header.protocol)
+        {
+            return false;
+        }
+        let transport = frame.transport();
+        if self.source_port.is_some() || self.destination_port.is_some() {
+            let Some((source, destination)) = transport_ports(transport) else {
+                return false;
+            };
+            if self.source_port.is_some_and(|range| !range.covers(source))
+                || self
+                    .destination_port
+                    .is_some_and(|range| !range.covers(destination))
+            {
+                return false;
+            }
+        }
+        if let Some(wanted) = self.icmp_type {
+            let Transport::Icmp(icmp) = transport else {
+                return false;
+            };
+            if icmp.message_type != wanted {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The two ports a transport carries, or `None` where none were read.
+///
+/// Exhaustive over [`Transport`] rather than a `match` with a fallthrough,
+/// which is the point: a variant added to that enum stops compiling here rather
+/// than silently joining the group that answers nothing — and on this path
+/// "answers nothing" is what keeps a port criterion from matching a header that
+/// was never parsed.
+const fn transport_ports(transport: Transport) -> Option<(u16, u16)> {
+    match transport {
+        Transport::Udp(udp) => Some((udp.source_port, udp.destination_port)),
+        Transport::Tcp(tcp) => Some((tcp.source_port, tcp.destination_port)),
+        Transport::Icmp(_)
+        | Transport::TruncatedUdp { .. }
+        | Transport::TruncatedTcp { .. }
+        | Transport::TruncatedIcmp { .. }
+        | Transport::NonInitialFragment
+        | Transport::Unparsed(_) => None,
+    }
+}
+
+/// Rules one generation may carry, and so the counter slots a shard reserves
+/// for them. The same number the configuration ABI holds, held equal to it
+/// where both are visible.
+pub const MAX_RULES: usize = 256;
+
+/// The ruleset one generation states, in document order.
+///
+/// A fixed array rather than a growable one for the reason every other table
+/// here is: there is no allocator, and a ruleset that could outgrow its storage
+/// would need a decision on the packet path about what to do with the rules
+/// that did not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ruleset {
+    rules: [Option<Rule>; MAX_RULES],
+    len: usize,
+}
+
+/// A ruleset a generation named more rules than this build holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RulesetFull {
+    pub requested: usize,
+    pub capacity: usize,
+}
+
+impl Ruleset {
+    /// No rules, which under a default-deny filter forwards nothing — the same
+    /// posture generation 0 has, and what a domain runs under until it is given
+    /// something else.
+    pub const EMPTY: Self = Self {
+        rules: [None; MAX_RULES],
+        len: 0,
+    };
+
+    /// Build a ruleset from `rules`, in the order they arrive, which is the
+    /// order they are decided in.
+    ///
+    /// # Errors
+    /// [`RulesetFull`] for more rules than [`MAX_RULES`], rather than a
+    /// truncation: a policy silently missing its last rules is a policy that
+    /// denies what it was written to allow, or worse.
+    pub fn build(rules: impl Iterator<Item = Rule>) -> Result<Self, RulesetFull> {
+        let mut built = Self::EMPTY;
+        for rule in rules {
+            let Some(slot) = built.rules.get_mut(built.len) else {
+                return Err(RulesetFull {
+                    requested: built.len.saturating_add(1),
+                    capacity: MAX_RULES,
+                });
+            };
+            *slot = Some(rule);
+            built.len = built.len.saturating_add(1);
+        }
+        Ok(built)
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The first rule that matches, and its position — which is its precedence
+    /// and the slot its counter occupies.
+    ///
+    /// First match wins, so the walk stops at the first hit rather than
+    /// collecting every rule that would have matched. Bounded by the rules the
+    /// generation actually declared and not by [`MAX_RULES`], so an eight-rule
+    /// document costs eight comparisons rather than two hundred and fifty-six.
+    #[must_use]
+    fn first_match(
+        &self,
+        ingress: PortId,
+        egress: PortId,
+        frame: &Frame<'_>,
+    ) -> Option<(usize, Rule)> {
+        self.rules
+            .iter()
+            .take(self.len)
+            .flatten()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(ingress, egress, frame))
+            .map(|(position, rule)| (position, *rule))
+    }
+}
+
+impl Default for Ruleset {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// What the filter has counted, which is one hit counter per declared rule and
+/// the four totals an operator reads first.
+///
+/// Saturating and never reset, on [`DropCounters`]' terms. The per-rule slots
+/// are indexed by position, so a counter belongs to whichever rule sits at that
+/// position in the running generation — which is what makes the label the
+/// management domain joins to it the id of that same rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyCounters {
+    hits: [u64; MAX_RULES],
+    accepted_packets: u64,
+    accepted_bytes: u64,
+    denied_packets: u64,
+    denied_bytes: u64,
+}
+
+impl PolicyCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            hits: [0; MAX_RULES],
+            accepted_packets: 0,
+            accepted_bytes: 0,
+            denied_packets: 0,
+            denied_bytes: 0,
+        }
+    }
+
+    /// Hits against the rule at `position`, or 0 for a position no generation
+    /// has declared.
+    #[must_use]
+    pub fn hits(&self, position: usize) -> u64 {
+        match self.hits.get(position) {
+            Some(count) => *count,
+            None => 0,
+        }
+    }
+
+    /// Every hit slot, for a domain publishing them into its shard.
+    #[must_use]
+    pub const fn all_hits(&self) -> &[u64; MAX_RULES] {
+        &self.hits
+    }
+
+    #[must_use]
+    pub const fn accepted_packets(&self) -> u64 {
+        self.accepted_packets
+    }
+
+    #[must_use]
+    pub const fn accepted_bytes(&self) -> u64 {
+        self.accepted_bytes
+    }
+
+    #[must_use]
+    pub const fn denied_packets(&self) -> u64 {
+        self.denied_packets
+    }
+
+    #[must_use]
+    pub const fn denied_bytes(&self) -> u64 {
+        self.denied_bytes
+    }
+
+    fn record(&mut self, position: Option<usize>, action: RuleAction, bytes: u64) {
+        if let Some(count) = position.and_then(|position| self.hits.get_mut(position)) {
+            *count = count.saturating_add(1);
+        }
+        let (packets, total) = match action {
+            RuleAction::Accept => (&mut self.accepted_packets, &mut self.accepted_bytes),
+            RuleAction::Drop => (&mut self.denied_packets, &mut self.denied_bytes),
+        };
+        *packets = packets.saturating_add(1);
+        *total = total.saturating_add(bytes);
+    }
+}
+
+impl Default for PolicyCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The filter: which of the operator's rules is about this frame, and what it
+/// says to do with it.
+///
+/// Terminal, and its answer for a frame no rule is about is to drop it. That is
+/// the whole of the default-deny posture and it is a property of this function
+/// rather than of any document: there is no ruleset an operator can write that
+/// makes the fallthrough permit anything, because the fallthrough is not a rule.
+pub struct PolicyStage {
+    counters: PolicyCounters,
+}
+
+impl PolicyStage {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counters: PolicyCounters::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> &PolicyCounters {
+        &self.counters
+    }
+
+    /// Match the ruleset and answer with the first rule's action, or deny.
+    ///
+    /// The forwarding facts are [`RoutingStage`]'s, taken off the
+    /// [`Inspection`] rather than re-derived. Their absence is unreachable —
+    /// the stage in front settles every frame it cannot resolve — and it is
+    /// answered as a denial rather than an assertion, because the one thing a
+    /// filter must never do when it cannot tell is permit.
+    pub fn evaluate<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+        &mut self,
+        inspection: &mut Inspection<'_>,
+        configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    ) -> Verdict {
+        let Some(forwarding) = inspection.forwarding() else {
+            return Verdict::Drop(DropReason::NoPolicyMatch);
+        };
+        // The datagram's own length, which is what the sender's L3 claims and
+        // what a byte total an operator compares against a link's throughput
+        // has to be stated in.
+        let bytes = u64::from(inspection.frame().ipv4().total_length);
+        let matched = configuration.rules().first_match(
+            inspection.ingress(),
+            forwarding.egress,
+            inspection.frame(),
+        );
+        match matched {
+            Some((position, rule)) => {
+                self.counters.record(Some(position), rule.action, bytes);
+                match rule.action {
+                    RuleAction::Accept => Verdict::Forward {
+                        egress: forwarding.egress,
+                        source: forwarding.source,
+                        destination: forwarding.destination,
+                    },
+                    RuleAction::Drop => Verdict::Drop(DropReason::PolicyDenied),
+                }
+            }
+            None => {
+                self.counters.record(None, RuleAction::Drop, bytes);
+                Verdict::Drop(DropReason::NoPolicyMatch)
+            }
+        }
+    }
+}
+
+impl Default for PolicyStage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -392,6 +877,7 @@ impl RoutingStage {
 pub struct Pipeline {
     admission: AdmissionStage,
     routing: RoutingStage,
+    policy: PolicyStage,
 }
 
 impl Pipeline {
@@ -400,7 +886,14 @@ impl Pipeline {
         Self {
             admission: AdmissionStage,
             routing: RoutingStage,
+            policy: PolicyStage::new(),
         }
+    }
+
+    /// What the filter has counted since this domain started.
+    #[must_use]
+    pub const fn policy_counters(&self) -> &PolicyCounters {
+        self.policy.counters()
     }
 
     /// Run the chain over one frame and answer with the first stage's verdict
@@ -418,7 +911,14 @@ impl Pipeline {
         if let Step::Settled(verdict) = self.admission.evaluate(inspection, configuration) {
             return verdict;
         }
-        self.routing.evaluate(inspection, configuration)
+        // A connection-tracking stage goes here, between the forwarding
+        // decision and the filter: it needs the egress the one above attaches,
+        // and the filter must not be consulted for a frame an established flow
+        // already accounts for.
+        if let Step::Settled(verdict) = self.routing.evaluate(inspection, configuration) {
+            return verdict;
+        }
+        self.policy.evaluate(inspection, configuration)
     }
 }
 

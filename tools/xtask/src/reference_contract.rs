@@ -69,7 +69,8 @@ use std::{
 
 use lfw_log::{MAX_CAUSE_LEN, RejectReason};
 use lfw_metrics::{
-    ALL_METRICS, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, SHARD_COUNT, SHARDS,
+    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, RULE_HITS,
+    SHARD_COUNT, SHARDS,
 };
 
 use crate::budgets;
@@ -129,6 +130,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         Vocabulary::AsData("lfw_log's closed_vocabulary! ALL arrays"),
     ),
     // Not console vocabularies.
+    (
+        "crates/wire/src/lib.rs",
+        Vocabulary::Other(
+            "`RuleCriterion`'s names, which are the configuration document's own attribute \
+             names: they locate a refused rule inside an image-reader error and reach no \
+             console record, the `rejected=` token a refusal becomes being `RejectReason`'s",
+        ),
+    ),
     (
         "crates/tcp/src/connection.rs",
         Vocabulary::Other(
@@ -508,12 +517,25 @@ fn catalogued() -> BTreeMap<&'static str, Family> {
             }
         }
     }
-    // The one family no shard holds: it is published from the committed
-    // configuration, so its domains are the ports' driver domains and its label
-    // names live in the exposition writer rather than in a table.
+    // The two families no shard holds a series of. Both are published from the
+    // committed configuration — the info family wholly, the rule family's
+    // identity half — so their domains are stated here rather than reached
+    // through a table.
     if let Some(family) = families.get_mut(INTERFACE_INFO.name) {
+        // Its label names live in the exposition writer rather than in a table,
+        // which is why this family alone is exempt from the label comparison
+        // below.
         family.domains.extend(PORT_DOMAINS);
         family.domains.insert(MANAGEMENT_PORT_DOMAIN);
+    }
+    if let Some(family) = families.get_mut(RULE_HITS.name) {
+        // Every count is the forwarding domain's, so that is the one domain its
+        // series carry — and its single label name is named here, so the chapter
+        // is held to it as it is for every table-backed family.
+        family
+            .domains
+            .extend(SHARDS.get(FORWARDER_SHARD).map(|shard| shard.domain));
+        family.labels.insert("rule");
     }
     families
 }

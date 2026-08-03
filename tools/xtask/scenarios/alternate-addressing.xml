@@ -15,6 +15,11 @@
      under the addressing it was configured with rather than under one compiled
      in — the same argument the two dataplane ports make.
 
+     The rule ids differ from the shipped document's too, on the same argument:
+     a per-rule counter is labelled with the id the document gave it, so a
+     scrape that agreed with both files would be reporting a label the build
+     carried rather than one it read.
+
      It lives beside the harness that boots it rather than in `systems/`,
      where a second file would read as a second appliance configuration
      somebody could ship. Nothing outside `tools/xtask` names it. -->
@@ -31,6 +36,14 @@
         <neighbour id="peer-south" interface="downlink"
                    address="172.20.6.9" mac="52:54:00:be:ef:09"/>
     </neighbours>
+    <rules>
+        <rule id="north-blocked" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+        <rule id="north-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+    </rules>
     <management mac="52:54:00:ab:cd:e2" address="172.20.7.20"
                 prefix-length="25" enabled="true"/>
 </configuration>

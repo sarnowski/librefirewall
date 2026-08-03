@@ -54,6 +54,7 @@ use std::time::Duration;
 
 use lfw_http::{METRICS_CONTENT_TYPE, Status};
 
+use crate::forward_harness::PolicyWitness;
 use crate::topology::Topology;
 
 /// How long `curl` may take, end to end. Generous because the guest may be
@@ -65,14 +66,29 @@ const SCRAPE_TIMEOUT: Duration = Duration::from_secs(60);
 /// configuration document the image under test was built from.
 const INTERFACE_INFO: &str = "librefirewall_interface_info";
 
+/// The per-rule family, on the same terms: its one label is the id the document
+/// gave the rule, and its cardinality is the number of rules the document
+/// declares.
+const RULE_HITS: &str = "librefirewall_rule_hits_total";
+
+/// The filter's own totals, which the per-rule counters must add up to.
+const POLICY_PACKETS: &str = "librefirewall_policy_packets_total";
+
+/// Where the two refusals are told apart: the fallthrough is not a rule and has
+/// no counter, so the reason is the only place the default deny appears.
+const ROUTE_DROPS: &str = "librefirewall_route_drops_total";
+
 /// Metric families the scrape must carry, one per subsystem this change made
 /// observable. Deliberately not the whole catalogue — `lfw_metrics`' own tests
 /// hold that to itself — but one name from each shard kind, so a shard that
 /// stopped being published fails here.
 const REQUIRED: &[&str] = &[
     INTERFACE_INFO,
+    RULE_HITS,
+    POLICY_PACKETS,
+    "librefirewall_policy_bytes_total",
     "librefirewall_forwarded_frames_total",
-    "librefirewall_route_drops_total",
+    ROUTE_DROPS,
     "librefirewall_receive_frames_total",
     "librefirewall_transmit_frames_total",
     "librefirewall_input_drops_total",
@@ -421,6 +437,187 @@ fn judge_one_interface<'a>(
     Ok(sample)
 }
 
+/// Hold the filter's own counters to what the harness put on the wire, and to the
+/// appliance's own second account of the same decisions.
+///
+/// This is the per-rule half of what makes the exposition a report about reality
+/// rather than a well-formed set of numbers. It rests on one exact quantity
+/// measured off the wire and two the node states about itself, which together
+/// close the arithmetic.
+///
+/// **The accepting rule's hit counter is the forwarded-frame count.** There is one
+/// `accept` rule in the policy, first match wins, and the appliance denies what
+/// nothing matched — so every frame that left on a dataplane egress passed that
+/// rule, and every frame that rule matched was forwarded. The harness holds a
+/// socket on both ports and counted those frames itself, so this is the same
+/// argument `librefirewall_forwarded_frames_total` rests on, made one level finer,
+/// about a *named rule* rather than about a domain. It is also what would catch
+/// the refusals being credited to the wrong rule: a policy denial counted here
+/// would put this number above the wire's.
+///
+/// **The dropping rule's hit counter is the pipeline's own count of policy
+/// denials.** The filter counts a rule's matches and the routing stage counts what
+/// it discarded and why, and those are two accounts of one set of decisions taken
+/// in two places — so their equality is a real cross-check even though both are
+/// the appliance's. What it pins is attribution: a refusal the fallthrough made
+/// has no rule to be credited to, so it must appear in
+/// `route_drops{reason="no_policy_match"}` and in *neither* rule's counter.
+///
+/// **And the two refusals must have happened, or not, as the probe set decides.**
+/// The routed probe set provokes neither — its four refusals are settled before
+/// the filter is consulted — so both refusal counters must still read exactly
+/// zero, which is as strong as a rise and only a set that provokes neither can
+/// state. The filter set provokes one of each and both must have risen.
+///
+/// **The cardinality is the document's.** One series per rule the document
+/// declares and not one more, each labelled with the id the document gave it. A
+/// scrape from an image built around the *other* policy is judged against its own
+/// document and cannot pass on this one's rule names.
+///
+/// # Errors
+/// The verdict, naming the rule and the two numbers.
+fn judge_policy(
+    exposition: &Exposition,
+    forwarded_frames: u64,
+    witness: PolicyWitness,
+) -> Result<Vec<&Sample>, String> {
+    let series = exposition.select(RULE_HITS, &[]);
+    if series.len() != 2 {
+        return Err(format!(
+            "the exposition carries {} {RULE_HITS} series and the document declares two rules. \
+             One series per declared rule is the whole cardinality of this family — a position no \
+             rule occupies is a counter under no operator's name and must reach no series\n  \
+             found: {}",
+            series.len(),
+            render(&series)
+        ));
+    }
+
+    // The two refusal reasons, summed over the pipelines as a reader must: the
+    // node publishes no total, and a check that read one pipeline would pass a
+    // node that had counted the refusal on the other.
+    let mut asserted = Vec::new();
+    let refused = |reason: &str| -> Result<u64, String> {
+        let per_pipeline = exposition.select(ROUTE_DROPS, &[("reason", reason)]);
+        if per_pipeline.is_empty() {
+            return Err(format!(
+                "{ROUTE_DROPS}{{reason={reason:?}}} carries no series, so the filter's refusals \
+                 cannot be told apart"
+            ));
+        }
+        Ok(per_pipeline.iter().map(|sample| sample.value).sum())
+    };
+    let denied = refused("policy_denied")?;
+    let unmatched = refused("no_policy_match")?;
+    asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "policy_denied")]));
+    asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "no_policy_match")]));
+
+    for (rule, expected, measured) in [
+        (
+            witness.policy.accepted,
+            forwarded_frames,
+            String::from(
+                "frames the harness observed coming back on its two dataplane sockets, every one \
+                 of which passed this rule",
+            ),
+        ),
+        (
+            witness.policy.denied,
+            denied,
+            format!(
+                "policy denials the routing stage counted across its two pipelines, which is the \
+                 same set of decisions this rule's matches are — {ROUTE_DROPS} and {RULE_HITS} \
+                 count them in two places"
+            ),
+        ),
+    ] {
+        let id = rule.id.as_str();
+        let sample = one(exposition, RULE_HITS, &[("rule", id)])?;
+        if sample.value != expected {
+            return Err(format!(
+                "{RULE_HITS}{{rule={id:?}}} reports {} and the contract is {expected}: \
+                 {measured}. The label is the id the configuration document gave the rule and the \
+                 count is the forwarding domain's, joined on the rule's position — so a \
+                 disagreement is either the wrong rule's traffic under this rule's name or a \
+                 filter that did not decide what it says it did",
+                sample.value
+            ));
+        }
+        // Exactly these labels: an extra one would be a dimension the metric
+        // inventory does not name, and this family's cardinality is an
+        // operator's to set.
+        let mut names: Vec<&str> = sample.labels.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        if names != ["domain", "rule"] {
+            return Err(format!(
+                "{RULE_HITS}{{rule={id:?}}} carries labels {names:?} and the contract is \
+                 [\"domain\", \"rule\"]"
+            ));
+        }
+        asserted.push(sample);
+    }
+
+    // Which of the filter's two outcomes this boot's probes reached at all. The
+    // zero case is the routed set's and is the stronger half: it says the six
+    // probes that have crossed this appliance since before it filtered are still
+    // decided by admission, routing and one accepting rule, and by nothing else.
+    for (what, reached, count, reason) in [
+        (
+            "a rule that says drop",
+            witness.probed_the_denying_rule,
+            denied,
+            "policy_denied",
+        ),
+        (
+            "the default deny",
+            witness.probed_the_fallthrough,
+            unmatched,
+            "no_policy_match",
+        ),
+    ] {
+        if reached && count == 0 {
+            return Err(format!(
+                "the boot injected a probe {reason:?} had to refuse and \
+                 {ROUTE_DROPS}{{reason={reason:?}}} sums to zero, so {what} did not happen"
+            ));
+        }
+        if !reached && count != 0 {
+            return Err(format!(
+                "{ROUTE_DROPS}{{reason={reason:?}}} sums to {count} and this boot injected \
+                 nothing {what} could refuse — every probe it did inject is settled before the \
+                 filter is consulted or is permitted by a rule, so a refusal here is a frame \
+                 nobody put on the wire or a stage refusing in another stage's name"
+            ));
+        }
+    }
+
+    // The filter's own totals, against the same quantities: accepted against the
+    // wire, denied against the two reasons it is the sum of. Summing is the
+    // reader's job and this is a reader.
+    for (labels, expected, what) in [
+        (
+            [("verdict", "accepted")],
+            forwarded_frames,
+            String::from("frames the harness observed forwarded"),
+        ),
+        (
+            [("verdict", "denied")],
+            denied + unmatched,
+            format!("refusals {ROUTE_DROPS} accounts for under the filter's two reasons"),
+        ),
+    ] {
+        let sample = one(exposition, POLICY_PACKETS, &labels)?;
+        if sample.value != expected {
+            return Err(format!(
+                "{POLICY_PACKETS}{labels:?} reports {} and the contract is {expected}: {what}",
+                sample.value
+            ));
+        }
+        asserted.push(sample);
+    }
+    Ok(asserted)
+}
+
 fn dotted(address: [u8; 4]) -> String {
     let [a, b, c, d] = address;
     format!("{a}.{b}.{c}.{d}")
@@ -443,6 +640,7 @@ fn colons(mac: [u8; 6]) -> String {
 pub fn judge(
     scrapes: &[Scrape],
     forwarded_frames: u64,
+    witness: PolicyWitness,
     topology: &Topology,
 ) -> Result<String, String> {
     let [first, second] = scrapes else {
@@ -455,8 +653,8 @@ pub fn judge(
     // Both must be answered, and the first identically to the second: a node
     // that answered one scrape and refused the next has a buffer it does not
     // release.
-    judge_one(first, forwarded_frames, topology)?;
-    let judged = judge_one(second, forwarded_frames, topology)?;
+    judge_one(first, forwarded_frames, witness, topology)?;
+    let judged = judge_one(second, forwarded_frames, witness, topology)?;
     let exposition = parse(&second.body)?;
     let requests = one(&exposition, "librefirewall_http_requests_total", &[])?;
     if requests.value < 2 {
@@ -510,6 +708,7 @@ pub fn judge(
 fn judge_one(
     scrape: &Scrape,
     forwarded_frames: u64,
+    witness: PolicyWitness,
     topology: &Topology,
 ) -> Result<String, String> {
     let expected_status = format!("HTTP/1.1 {} {}", Status::Ok.code(), Status::Ok.reason());
@@ -647,6 +846,7 @@ fn judge_one(
     // built from. Last, because it is the one assertion that reads the appliance's
     // own statement of its configuration rather than a count of its traffic.
     asserted.extend(judge_interfaces(&exposition, topology)?);
+    asserted.extend(judge_policy(&exposition, forwarded_frames, witness)?);
 
     Ok(format!(
         "{} families and {} series scraped with curl; {forwarded} forwarded frames reported and \

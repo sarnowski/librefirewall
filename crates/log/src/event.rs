@@ -85,6 +85,7 @@ closed_vocabulary! {
         Interface => "interface",
         Neighbour => "neighbour",
         Management => "management",
+        Rule => "rule",
     }
 }
 
@@ -99,6 +100,20 @@ closed_vocabulary! {
         Address => "address",
         PrefixLength => "prefix-length",
         Interface => "interface",
+        /// A rule's own name. A field rather than the key its records are
+        /// filed under, unlike every other object: a rule is identified by
+        /// where it sits, so its id is something it *says* rather than what it
+        /// is, and renaming one is a change to report like any other.
+        Id => "id",
+        Ingress => "ingress",
+        Egress => "egress",
+        Source => "source",
+        Destination => "destination",
+        Protocol => "protocol",
+        SourcePort => "source-port",
+        DestinationPort => "destination-port",
+        IcmpType => "icmp-type",
+        Action => "action",
     }
 }
 
@@ -153,8 +168,20 @@ closed_vocabulary! {
         NeighbourOutsidePrefix => "neighbour-outside-prefix",
         NeighbourIsInterfaceAddress => "neighbour-is-interface-address",
         DuplicateNeighbourAddress => "duplicate-neighbour-address",
-        /// More interfaces or neighbours than the handover image holds.
+        /// More interfaces, neighbours or rules than the handover image holds.
         CapacityExceeded => "capacity-exceeded",
+        /// A prefix written with host bits set, so the block it names is not the
+        /// one the address suggests. Refused rather than masked off: an operator
+        /// reading `10.0.0.5/24` back as `10.0.0.0/24` learned it from the
+        /// refusal or never at all.
+        PrefixNotCanonical => "prefix-not-canonical",
+        /// A range whose low port exceeds its high one, which matches nothing.
+        PortRangeReversed => "port-range-reversed",
+        /// A port criterion on a rule that names ICMP, which carries no ports.
+        PortCriterionOnIcmp => "port-criterion-on-icmp",
+        /// An ICMP type criterion on a rule that names a protocol other than
+        /// ICMP, which carries no type.
+        IcmpTypeOnNonIcmp => "icmp-type-on-non-icmp",
     }
 }
 
@@ -175,6 +202,20 @@ pub enum Value {
     Generation(u32),
     Count(u32),
     Id(Identifier),
+    /// One filter rule's match criterion, as the token the document writes it
+    /// as: `any`, `tcp`, `accept`, `443`, `1024-65535`. Text rather than a
+    /// variant per criterion because a record renders it and decides nothing
+    /// about it, and the criterion vocabularies are the configuration crate's;
+    /// [`Identifier`]'s alphabet is what makes it renderable, and every token
+    /// those vocabularies mint is inside it.
+    Selector(Identifier),
+    /// The one criterion no token can carry, `.` and `/` being outside that
+    /// alphabet. A wildcard address is [`Self::Selector`]'s `any`, so this is
+    /// always a stated block.
+    Prefix {
+        network: Ipv4Address,
+        prefix_length: u8,
+    },
 }
 
 impl fmt::Display for Value {
@@ -188,6 +229,11 @@ impl fmt::Display for Value {
             Self::Generation(generation) => write!(f, "{generation}"),
             Self::Count(count) => write!(f, "{count}"),
             Self::Id(id) => f.write_str(id.as_str()),
+            Self::Selector(token) => f.write_str(token.as_str()),
+            Self::Prefix {
+                network,
+                prefix_length,
+            } => write!(f, "{network}/{prefix_length}"),
         }
     }
 }

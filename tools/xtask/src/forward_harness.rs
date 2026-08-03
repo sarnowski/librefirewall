@@ -93,7 +93,7 @@ use crate::metrics_contract::{self, Scrape};
 use crate::qemu::{GuestNic, every_guest_nic};
 use crate::recording_contract::{self, Download};
 use crate::surface_contract::Injected;
-use crate::topology::{Endpoint, ManagementPort, PORTS, Topology};
+use crate::topology::{Endpoint, ManagementPort, PORTS, PortPolicy, Topology};
 
 /// Total wall-clock budget from QEMU launch to the contract being decided. A
 /// TCG (no KVM) walk through OVMF, GRUB signature verification, seL4 boot, and
@@ -1020,6 +1020,128 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
     ])
 }
 
+/// Which packets a boot injects into the two dataplane ports.
+///
+/// Two sets rather than one grown by three, and that is the whole point: the
+/// routed set is the regression guard, and every scenario that injected it before
+/// the filter existed must still see exactly the same two deliveries and four
+/// refusals afterwards. A frame added to it would move those counts and destroy
+/// the only evidence that the appliance's behaviour on the wire is unchanged —
+/// so the filter's own probes are a separate set, injected by scenarios written
+/// for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Traffic {
+    /// Two packets that must be routed and four that must be refused, none of
+    /// them for a reason the filter decides: what the routed contract has always
+    /// been. The two that are routed now reach the far port *because a rule
+    /// permitted them*, which is the equivalence this set exists to state.
+    Routed,
+    /// One packet per outcome the filter can reach: permitted by a rule, denied
+    /// by a rule, and denied by the fallthrough. Every one of them is perfectly
+    /// routable, so the only thing that separates their fates is the policy.
+    Policy,
+}
+
+/// What the injected probes oblige the appliance's filter to have counted.
+///
+/// The independent half of the per-rule cross-check: the ports and the rule ids
+/// come out of the document, and these two say which of the filter's outcomes the
+/// boot put traffic through at all.
+///
+/// **Whether, not how many**, and that is a property of the harness rather than a
+/// weakening. A probe that must be *delivered* is re-injected until it arrives —
+/// QEMU loses a frame put on a port that has not yet posted a receive buffer — so
+/// how many times a refused probe was injected is decided by how long the routed
+/// half took. What the appliance forwarded is still an exact number, because the
+/// harness counted the frames that came back; what it refused leaves nothing to
+/// count but its absence. So the exact statements are the ones stated against the
+/// wire and against the appliance's own second account of the same refusals, and
+/// these two decide which counters must have moved and which must still read
+/// zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyWitness {
+    /// The document's own two port rules, which name the two counters.
+    pub policy: PortPolicy,
+    /// Whether any probe was injected to the port the dropping rule names.
+    pub probed_the_denying_rule: bool,
+    /// Whether any probe was injected to a port no rule names, which only the
+    /// fallthrough can refuse.
+    pub probed_the_fallthrough: bool,
+}
+
+/// The probes one boot injects, and what they oblige the filter to have counted.
+///
+/// # Errors
+/// A bench or a policy this harness cannot state the chosen contract against.
+fn injected_probes(
+    topology: &Topology,
+    traffic: Traffic,
+) -> Result<(Vec<Probe>, PolicyWitness), String> {
+    let policy = topology.port_policy().map_err(|error| error.to_string())?;
+    let (probes, touches_the_filter) = match traffic {
+        // Not one of the six names a port the dropping rule is about, and none of
+        // them falls past the last rule: the four refusals are the admission and
+        // routing stages', decided before the filter is consulted, and the two
+        // routed ones carry the port the accepting rule names. So this set obliges
+        // both of the filter's refusal counters to still read zero, which is as
+        // strong a statement as a rise and is only available from a set that
+        // provokes neither.
+        Traffic::Routed => (probes(topology)?, false),
+        Traffic::Policy => (policy_probes(topology, policy), true),
+    };
+    Ok((
+        probes,
+        PolicyWitness {
+            policy,
+            probed_the_denying_rule: touches_the_filter,
+            probed_the_fallthrough: touches_the_filter,
+        },
+    ))
+}
+
+/// One probe per outcome the filter can reach, differing in the one field that
+/// decides which: the UDP destination port.
+///
+/// Every other byte is the same routable datagram, so nothing about admission or
+/// routing separates the three — which is what makes the difference between their
+/// fates attributable to the policy and to nothing else. The ports and the rule
+/// ids come from `policy`, so a document that renamed a rule or moved a port is
+/// asserted against its own text.
+fn policy_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let to_port = |port: u16, marker: &'static [u8]| UdpPacket {
+        destination_port: port,
+        payload: marker.to_vec(),
+        ..datagram(a, b, INJECTED_TTL, marker)
+    };
+    vec![
+        routed(
+            "policy-accepted",
+            b"LFW-PROBE/policy-accepted",
+            a,
+            b,
+            to_port(
+                policy.accepted.destination_port,
+                b"LFW-PROBE/policy-accepted",
+            ),
+        ),
+        dropped(
+            "policy-denied",
+            b"LFW-PROBE/policy-denied",
+            a,
+            "a rule matched it and says drop; it is routable in every other respect",
+            to_port(policy.denied.destination_port, b"LFW-PROBE/policy-denied"),
+        ),
+        dropped(
+            "policy-unmatched",
+            b"LFW-PROBE/policy-unmatched",
+            a,
+            "no rule is about it, so it falls past the last one to the default deny",
+            to_port(policy.unmatched, b"LFW-PROBE/policy-unmatched"),
+        ),
+    ]
+}
+
 /// The datagram `from` sends `to`: addressed at L2 to the appliance interface
 /// it is attached to, and at L3 to the far endpoint.
 fn datagram(from: Endpoint, to: Endpoint, ttl: u8, marker: &[u8]) -> UdpPacket {
@@ -1139,6 +1261,8 @@ pub struct BootTest<'a> {
     /// only ever be judged against the addressing the appliance in it was
     /// actually configured with.
     pub topology: &'a Topology,
+    /// Which probe set the boot injects.
+    pub traffic: Traffic,
 }
 
 /// How the management port is attached, which is the one thing that differs
@@ -2588,6 +2712,10 @@ pub struct Booted {
     /// re-injected before its first delivery was observed is forwarded twice,
     /// and both counters see both.
     pub dataplane_frames: u64,
+    /// What the injected probes oblige the appliance's filter to have counted,
+    /// which is the independent half of the per-rule cross-check the scrape
+    /// scenarios make.
+    pub policy: PolicyWitness,
     /// What `curl` got out of `/logs.pcapng` and `/capture.pcapng`, in that
     /// order, on every boot whose management port a real client can reach.
     /// Empty on every socket-backed boot.
@@ -2633,7 +2761,7 @@ fn run_boot(
     // caller's mistake and must be reported as one, not as a process nobody
     // reaped.
     let stations = test.topology.endpoints();
-    let probes = probes(test.topology)?;
+    let (probes, policy) = injected_probes(test.topology, test.traffic)?;
 
     let mut child = command
         .stdout(Stdio::piped())
@@ -3192,6 +3320,7 @@ fn run_boot(
         management_replies: answered,
         scrapes,
         dataplane_frames,
+        policy,
         recordings,
         injected: probes
             .iter()
@@ -3457,6 +3586,7 @@ mod tests {
             log_path: log,
             log_header: HEADER,
             topology,
+            traffic: Traffic::Routed,
         }
     }
 
@@ -3517,7 +3647,7 @@ mod tests {
                 "mac=\"52:54:00:00:00:0a\"/>",
                 "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
                 "mac=\"52:54:00:00:00:0b\"/>",
-                "</neighbours>",
+                "</neighbours><rules/>",
                 "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
                 "prefix-length=\"24\" enabled=\"true\"/>",
                 "</configuration>"
@@ -3540,7 +3670,7 @@ mod tests {
                 "mac=\"52:54:00:00:00:0a\"/>",
                 "<neighbour id=\"two-b\" interface=\"two\" address=\"10.0.1.2\" ",
                 "mac=\"52:54:00:00:00:0b\"/>",
-                "</neighbours>",
+                "</neighbours><rules/>",
                 "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
                 "prefix-length=\"24\" enabled=\"true\"/>",
                 "</configuration>"
@@ -3575,6 +3705,113 @@ mod tests {
                 shipped.name
             );
         }
+    }
+
+    /// The three filter probes differ in exactly one field, and it is the field
+    /// the policy decides on.
+    ///
+    /// That is the whole of what makes the scenario's three outcomes attributable
+    /// to the document: if the probes differed anywhere else, a difference in
+    /// their fates could be admission's or routing's.
+    #[test]
+    fn the_filter_probes_differ_only_in_the_port_the_policy_decides_on() {
+        let topology = bench();
+        let policy = topology
+            .port_policy()
+            .expect("the shipped document declares an accepting and a dropping port rule");
+        let probes = policy_probes(&topology, policy);
+        let [accepted, denied, unmatched] = probes.as_slice() else {
+            panic!("one probe per outcome the filter can reach");
+        };
+
+        // One routed and two refused: the counts a policy scenario reports.
+        assert!(matches!(accepted.expectation, Expectation::Routed { .. }));
+        assert!(matches!(denied.expectation, Expectation::Dropped { .. }));
+        assert!(matches!(unmatched.expectation, Expectation::Dropped { .. }));
+
+        let ports: Vec<u16> = probes
+            .iter()
+            .map(|probe| {
+                UdpPacket::decode(&probe.frame)
+                    .expect("every filter probe is a well-formed datagram")
+                    .destination_port
+            })
+            .collect();
+        assert_eq!(
+            ports,
+            [
+                policy.accepted.destination_port,
+                policy.denied.destination_port,
+                policy.unmatched,
+            ],
+            "a probe carries a port the document's policy does not decide"
+        );
+
+        // Every other field of the three datagrams is the same, so the port is
+        // the only thing that can explain three different fates.
+        for probe in &probes {
+            let decoded = UdpPacket::decode(&probe.frame).expect("well formed");
+            let base = UdpPacket::decode(&accepted.frame).expect("well formed");
+            assert_eq!(
+                UdpPacket {
+                    destination_port: base.destination_port,
+                    payload: base.payload.clone(),
+                    ..decoded
+                },
+                base,
+                "probe {} differs from the accepted one outside its port",
+                probe.name
+            );
+        }
+    }
+
+    /// The filter probes are the document's too, so a policy scenario against the
+    /// second document cannot pass on the first document's ports.
+    #[test]
+    fn a_filter_probe_carries_the_ports_and_ids_of_its_own_document() {
+        let (shipped, alternate) = (bench(), alternate());
+        let one = shipped.port_policy().expect("the shipped policy");
+        let two = alternate.port_policy().expect("the alternate policy");
+        // The ids differ, which is what makes a per-rule counter's label a thing
+        // the appliance read rather than a thing the build carried.
+        assert_ne!(one.accepted.id, two.accepted.id);
+        assert_ne!(one.denied.id, two.denied.id);
+        for probe in policy_probes(&shipped, one)
+            .iter()
+            .zip(policy_probes(&alternate, two))
+        {
+            let (first, second) = probe;
+            assert_eq!(first.name, second.name);
+            assert_ne!(
+                first.frame, second.frame,
+                "filter probe {} is the same on both benches",
+                first.name
+            );
+        }
+    }
+
+    /// A witness is derived from the probe set, so the two cannot disagree about
+    /// what was injected.
+    #[test]
+    fn each_probe_set_witnesses_what_it_puts_on_the_wire() {
+        let topology = bench();
+        let (routed, witness) =
+            injected_probes(&topology, Traffic::Routed).expect("the shipped bench");
+        assert_eq!(routed.len(), 6);
+        // Not one of the six is about the filter: the four refusals are decided
+        // before it and the two deliveries pass the accepting rule.
+        assert!(!witness.probed_the_denying_rule);
+        assert!(!witness.probed_the_fallthrough);
+
+        let (policy, witness) =
+            injected_probes(&topology, Traffic::Policy).expect("the shipped bench");
+        assert_eq!(policy.len(), 3);
+        assert!(witness.probed_the_denying_rule);
+        assert!(witness.probed_the_fallthrough);
+        assert_eq!(
+            witness.policy,
+            topology.port_policy().expect("the shipped policy")
+        );
     }
 
     #[test]

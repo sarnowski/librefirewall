@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <interfaces>
+        <interface id="dataplane-0" port="0" enabled="true"
+                   mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/>
+        <interface id="dataplane-1" port="1" enabled="true"
+                   mac="52:54:00:12:34:51" address="10.0.1.1" prefix-length="24"/>
+    </interfaces>
+    <neighbours>
+        <neighbour id="endpoint-a" interface="dataplane-0"
+                   address="10.0.0.2" mac="52:54:00:00:00:0a"/>
+    </neighbours>
+    <rules>
+        <rule id="wide" ingress="dataplane-0" egress="dataplane-1" source="10.0.0.0/24" destination="10.0.1.0/24" protocol="udp" source-port="1024-65535" destination-port="5000" icmp-type="any" action="accept"/>
+        <rule id="icmp-echo" ingress="any" egress="any" source="any" destination="any" protocol="icmp" source-port="any" destination-port="any" icmp-type="8" action="accept"/>
+        <rule id="deny-the-rest" ingress="any" egress="any" source="any" destination="any" protocol="any" source-port="any" destination-port="any" icmp-type="any" action="drop"/>
+    </rules>
+    <management mac="52:54:00:12:34:52" address="10.0.2.15"
+                prefix-length="24" enabled="true"/>
+</configuration>

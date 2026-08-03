@@ -9,9 +9,9 @@
 //! is to leave the reader nothing to remember them by.
 
 use lfw_log::Identifier;
-use wire::{MAX_INTERFACES, MAX_NEIGHBOURS};
+use wire::{MAX_INTERFACES, MAX_NEIGHBOURS, MAX_RULES};
 
-use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
+use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
 
 /// The handover image has a fixed number of slots and there is no allocator, so
 /// an object past the last of them cannot be stored and is not truncated away
@@ -28,6 +28,7 @@ pub struct Model {
     interfaces: [Option<InterfaceEntry>; MAX_INTERFACES],
     neighbours: [Option<NeighbourEntry>; MAX_NEIGHBOURS],
     management: Option<ManagementEntry>,
+    rules: [Option<RuleEntry>; MAX_RULES],
 }
 
 impl Model {
@@ -37,6 +38,7 @@ impl Model {
         interfaces: [None; MAX_INTERFACES],
         neighbours: [None; MAX_NEIGHBOURS],
         management: None,
+        rules: [None; MAX_RULES],
     };
 
     /// # Errors
@@ -63,6 +65,18 @@ impl Model {
         }
     }
 
+    /// # Errors
+    /// [`Full`] once [`wire::MAX_RULES`] entries are held.
+    pub fn push_rule(&mut self, entry: RuleEntry) -> Result<(), Full> {
+        match self.rules.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some(entry);
+                Ok(())
+            }
+            None => Err(Full),
+        }
+    }
+
     /// In document order, which is the order every later step iterates in: a
     /// diff is keyed by id and so is order-independent, but a *rejection* names
     /// the first offending object and that has to be the first one an operator
@@ -73,6 +87,13 @@ impl Model {
 
     pub fn neighbours(&self) -> impl Iterator<Item = &NeighbourEntry> {
         self.neighbours.iter().flatten()
+    }
+
+    /// In document order, and for this object that is not a convenience: the
+    /// ruleset is decided first-match-wins, so the order these come back in
+    /// *is* the policy.
+    pub fn rules(&self) -> impl Iterator<Item = &RuleEntry> {
+        self.rules.iter().flatten()
     }
 
     #[must_use]
@@ -86,6 +107,11 @@ impl Model {
     }
 
     #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.rules().count()
+    }
+
+    #[must_use]
     pub fn interface(&self, id: Identifier) -> Option<&InterfaceEntry> {
         self.interfaces().find(|entry| entry.id == id)
     }
@@ -93,6 +119,11 @@ impl Model {
     #[must_use]
     pub fn neighbour(&self, id: Identifier) -> Option<&NeighbourEntry> {
         self.neighbours().find(|entry| entry.id == id)
+    }
+
+    #[must_use]
+    pub fn rule(&self, id: Identifier) -> Option<&RuleEntry> {
+        self.rules().find(|entry| entry.id == id)
     }
 
     /// One port, one element, held here rather than only in the reader.
@@ -117,7 +148,10 @@ impl Model {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.interface_count() == 0 && self.neighbour_count() == 0 && self.management.is_none()
+        self.interface_count() == 0
+            && self.neighbour_count() == 0
+            && self.rule_count() == 0
+            && self.management.is_none()
     }
 
     /// The interfaces by id, whichever order they were written in. Both orders
@@ -143,10 +177,17 @@ impl Model {
     /// `PartialEq` is deliberately not this: it compares the arrays as written,
     /// answering the different question of whether two documents *said* the
     /// same thing.
+    /// The rules are compared **as written** rather than by id, and that is the
+    /// one asymmetry in this comparison. Two documents whose interfaces are the
+    /// same set are the same configuration whichever order they were written
+    /// in; two documents whose rules are the same set in a different order are
+    /// two different policies, so a reordered `<rules>` section is a change and
+    /// re-offering it commits a generation.
     #[must_use]
     pub fn has_same_content(&self, other: &Self) -> bool {
         self.interfaces_by_id() == other.interfaces_by_id()
             && self.neighbours_by_id() == other.neighbours_by_id()
+            && self.rules == other.rules
             && self.management == other.management
     }
 }

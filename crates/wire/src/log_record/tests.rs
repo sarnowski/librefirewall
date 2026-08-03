@@ -696,12 +696,12 @@ fn a_value_slot_the_writer_filled_wrongly_is_refused_at_its_own_position() {
     let cases: [(ValueImage, LogRecordError); 3] = [
         (
             ValueImage {
-                kind: 9,
+                kind: 11,
                 ..ValueImage::ZERO
             },
             LogRecordError::ValueKindUnknown {
                 text: LogText::From,
-                kind: 9,
+                kind: 11,
             },
         ),
         (
@@ -924,10 +924,10 @@ fn every_refusal_names_the_field_and_the_value() {
             "operand count 3 exceeds the 2 the record holds",
             "signalled byte 2 is not 0 or 1",
             "change token 3 is not below 3",
-            "object token 3 is not below 3",
-            "field token 6 is not below 6",
+            "object token 3 is not below 4",
+            "field token 6 is not below 16",
             "outcome token 3 is not below 3",
-            "reason token 30 is not below 30",
+            "reason token 30 is not below 34",
             "from value kind 9 names no value",
             "to value 256 does not fit a byte",
             "from value 2 is not 0 or 1",
@@ -976,10 +976,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogValueKind::Generation,
         LogValueKind::Count,
         LogValueKind::Id,
+        LogValueKind::Selector,
+        LogValueKind::Prefix,
     ] {
         assert_eq!(LogValueKind::from_bits(value.to_bits()), Some(value));
     }
-    assert_eq!(LogValueKind::from_bits(9), None);
+    assert_eq!(LogValueKind::from_bits(11), None);
 }
 
 #[test]

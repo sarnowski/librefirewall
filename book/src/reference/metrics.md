@@ -58,11 +58,17 @@ in the *next* one.
 
 ## Metric inventory
 
-77 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 263 counter and gauge series from the nine shards, plus
-one info series per configured interface, and the document they render into is bounded at 42 142
-bytes — a worst case computed from these tables at build time, which is what the staging buffer
-behind the endpoint is sized from.
+80 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 271 counter and gauge series from the nine shards, plus
+one info series per configured interface and one hit counter per rule the running policy declares,
+and the document they render into is bounded at 68 016 bytes — a worst case computed from these
+tables at build time, which is what the staging buffer behind the endpoint is sized from.
+
+That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
+each under a sixteen-byte id, so a document declaring two rules produces a scrape a third of the
+size. The buffer is sized by what an operator is *entitled* to write rather than by what this
+appliance happens to be running, because the alternative is an endpoint that answers a scrape until
+somebody adds a rule.
 
 **A family's `domain` set and its label values are not a cross-product.** Several families are
 partitioned, one domain carrying part of a label's vocabulary and another domain the rest, and each
@@ -75,10 +81,33 @@ avoiding: it looks exactly like a healthy node.
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_forwarded_frames_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`) | Frames rewritten for their next hop and handed to the transmitting driver. |
-| `librefirewall_route_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`addressed_to_this_router`, `egress_is_ingress`, `interface_disabled`, `martian_source`, `no_neighbour`, `no_route`, `not_addressed_to_us`, `ttl_expired`, `unconfigured_ingress_port`, `unroutable_destination`, `vlan_tagged`) | Frames the router refused, by the reason it named. |
+| `librefirewall_route_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`addressed_to_this_router`, `egress_is_ingress`, `interface_disabled`, `martian_source`, `no_neighbour`, `no_policy_match`, `no_route`, `not_addressed_to_us`, `policy_denied`, `ttl_expired`, `unconfigured_ingress_port`, `unroutable_destination`, `vlan_tagged`) | Frames the router refused, by the reason it named. The last two are the filter's: `policy_denied` is a rule that said drop and `no_policy_match` is the default deny, which is a property of the fallthrough rather than of any rule. |
 | `librefirewall_route_stage_drops_total` | counter | `forwarder` | `pipeline`&nbsp;(`0`, `1`), `reason`&nbsp;(`egress_full`, `ethernet_unparsable`, `frame_too_short`, `ipv4_checksum_invalid`, `ipv4_unparsable`, `malformed_descriptor`, `misrouted`, `snapshot_failed`, `writeback_failed`) | Frames the routing stage refused around the router's own decision. The four parse reasons name where the frame stopped being readable, which is what says whether a port is being fed the wrong link type or malformed IPv4. |
+| `librefirewall_policy_packets_total` | counter | `forwarder` | `verdict`&nbsp;(`accepted`, `denied`) | Packets the filter decided on, by the verdict it reached; `denied` covers both a rule that said so and the default deny, which the route drop reasons tell apart. |
+| `librefirewall_policy_bytes_total` | counter | `forwarder` | `verdict`&nbsp;(`accepted`, `denied`) | Datagram bytes the filter decided on, by the verdict it reached; the sender's own IPv4 total length, so it is comparable against a link's throughput. |
+| `librefirewall_rule_hits_total` | counter | `forwarder` | `rule` | Packets matched by each rule of the running policy, under the id the configuration document gave it. First match wins, so a packet is counted against one rule at most. |
 | `librefirewall_tap_observations_total` | counter | `forwarder` | — | Frame observations the forwarder published to the recorder. |
 | `librefirewall_tap_observations_lost_total` | counter | `forwarder` | `reason`&nbsp;(`inconsistent`, `ring_full`) | Observations the tap could not publish; `ring_full` is the recorder falling behind, `inconsistent` is ours and expected to stay zero. |
+
+**The three filter families carry no `pipeline` either**, and for a different reason: one filter
+serves both directions of the dataplane, because a stage of that chain may hold state spanning a
+whole conversation. There is no per-direction number to report, so none is invented.
+
+**`librefirewall_rule_hits_total` is the one family whose cardinality an operator sets.** It carries
+one series per rule the running document declares — two rules, two series — and none at all while a
+node is on generation 0, which is the honest report of a policy that declares nothing. The `rule`
+label is the id from the document, and that is what makes the family readable: a counter labelled by
+a rule's position in the file would move under every edit above it. The count comes from the
+forwarding domain and the id from the configuration, joined on the rule's position, so a hit is a
+number only the forwarder could have written under a name only an operator could have chosen.
+
+Three checks are worth making across these families rather than reading any of them alone.
+`rule_hits` summed over the `accept` rules equals `policy_packets{verdict="accepted"}`, because
+first match wins. `policy_packets{verdict="denied"}` equals `route_drops` summed over
+`policy_denied` and `no_policy_match` across both pipelines — the same refusals counted by the filter
+and by the pipeline around it. And a rule whose counter never moves is a rule that has never matched:
+on an appliance that denies what nothing matched, an `accept` sitting at zero is the shape a policy
+mistake takes.
 
 The tap is one ring for the domain, not one per pipeline, so neither family carries `pipeline`: the
 packet identity a recording relates two observations by is per appliance, and a per-pipeline split

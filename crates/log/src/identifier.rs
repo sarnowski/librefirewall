@@ -38,7 +38,12 @@ impl fmt::Display for IdentifierError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
     bytes: [u8; MAX_IDENTIFIER_LEN],
-    len: usize,
+    /// A `u8` rather than a `usize`, which is not a micro-optimisation: this
+    /// value is a field of every configuration object, and a configuration is
+    /// held twice in one protection domain and crosses another's stack. Eight
+    /// bits carry every length [`MAX_IDENTIFIER_LEN`] admits and seven bytes of
+    /// padding per identifier do not.
+    len: u8,
 }
 
 impl Identifier {
@@ -50,7 +55,13 @@ impl Identifier {
         len: 10,
     };
 
-    pub fn new(bytes: &[u8]) -> Result<Self, IdentifierError> {
+    /// `const` so a vocabulary's own words can be checked where they are
+    /// written: a literal that is not an identifier is then a build failure
+    /// rather than a refusal on a path nothing exercises.
+    ///
+    /// # Errors
+    /// [`IdentifierError`], naming a length or a position and never a byte.
+    pub const fn new(bytes: &[u8]) -> Result<Self, IdentifierError> {
         if bytes.is_empty() {
             return Err(IdentifierError::Empty);
         }
@@ -59,13 +70,48 @@ impl Identifier {
             return Err(IdentifierError::TooLong { len });
         }
         let mut stored = [0u8; MAX_IDENTIFIER_LEN];
-        for (slot, (offset, &byte)) in stored.iter_mut().zip(bytes.iter().enumerate()) {
-            if !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-') {
+        let mut offset = 0;
+        while offset < len {
+            let byte = bytes[offset];
+            if !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && byte != b'-' {
                 return Err(IdentifierError::NotInAlphabet { offset });
             }
-            *slot = byte;
+            stored[offset] = byte;
+            offset += 1;
         }
-        Ok(Self { bytes: stored, len })
+        // Narrowing cannot lose anything: the bound above is what an
+        // identifier's length was just held to, and it is far inside a `u8`.
+        Ok(Self {
+            bytes: stored,
+            len: len as u8,
+        })
+    }
+
+    /// A decimal number as a token.
+    ///
+    /// Total, and by construction rather than by a check: every byte it writes
+    /// is a decimal digit, and a `u16` is at most five of them — so nothing it
+    /// can build is outside the alphabet or past the storage, and there is no
+    /// refusal for a caller to handle.
+    #[must_use]
+    pub const fn decimal(value: u16) -> Self {
+        let mut stored = [0u8; MAX_IDENTIFIER_LEN];
+        let len = write_decimal(&mut stored, 0, value);
+        Self { bytes: stored, len }
+    }
+
+    /// An inclusive range of two decimal numbers, `low-high`.
+    ///
+    /// Total on [`Self::decimal`]'s terms, with one more byte in the alphabet:
+    /// eleven at the widest, which the storage holds.
+    #[must_use]
+    pub const fn decimal_range(low: u16, high: u16) -> Self {
+        let mut stored = [0u8; MAX_IDENTIFIER_LEN];
+        let mut len = write_decimal(&mut stored, 0, low);
+        stored[len as usize] = b'-';
+        len += 1;
+        len = write_decimal(&mut stored, len, high);
+        Self { bytes: stored, len }
     }
 
     /// The fallback is unreachable: [`Identifier::new`] is what sets `len`, and
@@ -75,7 +121,7 @@ impl Identifier {
     /// faulting a domain over.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.bytes.get(..self.len).unwrap_or_default()
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
     }
 
     /// Unreachable for the same reason plus one step: [`Identifier::new`]
@@ -88,7 +134,7 @@ impl Identifier {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len
+        usize::from(self.len)
     }
 
     /// Always false: [`Identifier::new`] refuses an empty byte string. Present
@@ -99,10 +145,34 @@ impl Identifier {
     }
 }
 
+/// `value`'s decimal digits into `stored` from `at`, answering where they end.
+///
+/// Five digits at the widest and the caller has written at most six bytes
+/// before them, so no write here can leave the array.
+const fn write_decimal(stored: &mut [u8; MAX_IDENTIFIER_LEN], at: u8, value: u16) -> u8 {
+    let mut digits = [0u8; 5];
+    let mut count = 0;
+    let mut rest = value;
+    while {
+        digits[count] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        count += 1;
+        rest > 0
+    } {}
+    let mut written = at;
+    while count > 0 {
+        count -= 1;
+        stored[written as usize] = digits[count];
+        written += 1;
+    }
+    written
+}
+
 /// What [`Identifier::new`] would have checked, checked at build time instead:
 /// a wrong literal is a compile error rather than an unrenderable line.
 const _: () = {
     let Identifier { bytes, len } = Identifier::MANAGEMENT;
+    let len = len as usize;
     assert!(len > 0 && len <= MAX_IDENTIFIER_LEN);
     let mut offset = 0;
     while offset < MAX_IDENTIFIER_LEN {

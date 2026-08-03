@@ -27,7 +27,7 @@
 use lfw_log::{ChangeKind, Field, Identifier, ObjectKind, Value};
 
 use crate::{
-    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry},
+    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry},
     model::Model,
 };
 
@@ -94,6 +94,7 @@ pub fn diff(before: &Model, after: &Model, out: &mut dyn Records) -> usize {
         NeighbourEntry::field_value,
         &mut out,
     );
+    walk_rules(before, after, &mut out);
     // One slot, and the same merge: an element that appears, disappears or
     // changes a field is added, removed or modified on the terms every other
     // object kind is held to.
@@ -106,6 +107,70 @@ pub fn diff(before: &Model, after: &Model, out: &mut dyn Records) -> usize {
         &mut out,
     );
     out.count
+}
+
+/// Merge the two rulesets **by position**, which is the one object kind whose
+/// records are not keyed by an id.
+///
+/// A rule's position is its semantics: the filter is first-match-wins, so
+/// moving a rule from the third line to the fifth changes what the appliance
+/// forwards even though every attribute of it is identical. Keyed by id, that
+/// edit would produce no record at all and a commit would report a policy
+/// change as nothing. Keyed by position, the id becomes a value like any other
+/// and a moved rule is reported as the two positions whose contents changed —
+/// which is what an operator has to read to see what the new policy is.
+///
+/// The cost is that inserting a rule reports every rule behind it as modified.
+/// That is not noise: under first-match-wins, every one of them now sits behind
+/// a test that was not there before.
+fn walk_rules(before: &Model, after: &Model, out: &mut Counted<'_>) {
+    let (before, after) = (before.rules(), after.rules());
+    for (position, (earlier, later)) in zip_longest(before, after).enumerate() {
+        // Bounded by `MAX_RULES`, which is far inside a `u16`, so the token is
+        // the position and never a truncation of it.
+        let key = Identifier::decimal(position as u16);
+        match (earlier, later) {
+            (None, None) => {}
+            (from, to) => {
+                for field in Field::ALL {
+                    let was = from.and_then(|entry| entry.field_value(field));
+                    let now = to.and_then(|entry| entry.field_value(field));
+                    if was == now {
+                        continue;
+                    }
+                    out.push(Change {
+                        kind: match (was, now) {
+                            (None, _) => ChangeKind::Added,
+                            (_, None) => ChangeKind::Removed,
+                            _ => ChangeKind::Modified,
+                        },
+                        object: RuleEntry::OBJECT,
+                        key,
+                        field,
+                        from: was,
+                        to: now,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The two rulesets side by side, position for position, running to the length
+/// of the longer: a position one side has and the other has not is a rule added
+/// or removed, and stopping at the shorter would lose exactly those.
+fn zip_longest<'a>(
+    before: impl Iterator<Item = &'a RuleEntry>,
+    after: impl Iterator<Item = &'a RuleEntry>,
+) -> impl Iterator<Item = (Option<&'a RuleEntry>, Option<&'a RuleEntry>)> {
+    let mut before = before.map(Some).chain(core::iter::repeat(None));
+    let mut after = after.map(Some).chain(core::iter::repeat(None));
+    core::iter::from_fn(
+        move || match (before.next().flatten(), after.next().flatten()) {
+            (None, None) => None,
+            pair => Some(pair),
+        },
+    )
 }
 
 /// The caller's sink and the count of what went through it. Counting here
@@ -240,6 +305,9 @@ fn modified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rule::{
+        AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+    };
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
@@ -709,7 +777,7 @@ mod tests {
                 for offset in 0..count {
                     text.push_str(&peer(order(offset)));
                 }
-                text.push_str("</neighbours>");
+                text.push_str("</neighbours><rules/>");
                 text.push_str(
                     "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" \
                      address=\"192.168.42.15\" prefix-length=\"24\"/>",
@@ -744,6 +812,122 @@ mod tests {
             ObjectKind::Interface => apply_interface(model, change),
             ObjectKind::Neighbour => apply_neighbour(model, change),
             ObjectKind::Management => apply_management(model, change),
+            ObjectKind::Rule => apply_rule(model, change),
+        }
+    }
+
+    /// Replay one rule record, which is keyed by position rather than by id.
+    ///
+    /// The position is the slot to write, so a replay rebuilds the ruleset with
+    /// that slot replaced — which is the same operation an operator performs by
+    /// editing the nth `<rule>` line.
+    fn apply_rule(model: &mut Model, change: &Change) {
+        let position: usize = change.key.as_str().parse().expect("a positional key");
+        let mut rules: Vec<RuleEntry> = model.rules().copied().collect();
+        if change.kind == ChangeKind::Removed {
+            if position < rules.len() {
+                rules.remove(position);
+            }
+        } else {
+            if position >= rules.len() {
+                rules.resize(position + 1, blank_rule());
+            }
+            let entry = rules.get_mut(position).expect("just sized");
+            apply_rule_field(entry, change);
+        }
+        let mut rebuilt = Model::EMPTY;
+        for interface in model.interfaces() {
+            rebuilt.push_interface(*interface).expect("capacity");
+        }
+        for neighbour in model.neighbours() {
+            rebuilt.push_neighbour(*neighbour).expect("capacity");
+        }
+        for rule in rules {
+            rebuilt.push_rule(rule).expect("capacity");
+        }
+        if let Some(management) = model.management() {
+            rebuilt.set_management(management).expect("one");
+        }
+        *model = rebuilt;
+    }
+
+    /// The rule a replay starts from before the record's own field is written
+    /// over it: every criterion at its widest, which is what an `<rule>` with
+    /// nothing said about it would be if the schema admitted one.
+    fn blank_rule() -> RuleEntry {
+        RuleEntry {
+            id: id("placeholder"),
+            ingress: InterfaceMatch::Any,
+            egress: InterfaceMatch::Any,
+            source: AddressMatch::Any,
+            destination: AddressMatch::Any,
+            protocol: ProtocolMatch::Any,
+            source_port: PortMatch::Any,
+            destination_port: PortMatch::Any,
+            icmp_type: IcmpTypeMatch::Any,
+            action: RuleAction::Drop,
+        }
+    }
+
+    /// The one field a record names, written onto `entry`.
+    ///
+    /// Matched on the field rather than on the value's shape, because two
+    /// criteria share a shape: `ingress` and `egress` are both a selector
+    /// token, and a replay keyed on the token would write one into the other.
+    fn apply_rule_field(entry: &mut RuleEntry, change: &Change) {
+        let Some(value) = change.to else {
+            return;
+        };
+        match (change.field, value) {
+            (Field::Id, Value::Selector(id)) => entry.id = id,
+            (Field::Ingress, value) => entry.ingress = interface_of(value),
+            (Field::Egress, value) => entry.egress = interface_of(value),
+            (Field::Source, value) => entry.source = address_of(value),
+            (Field::Destination, value) => entry.destination = address_of(value),
+            (Field::Protocol, Value::Selector(token)) => {
+                entry.protocol = crate::value::protocol_match(token.as_bytes())
+                    .expect("a token this crate minted");
+            }
+            (Field::SourcePort, Value::Selector(token)) => {
+                entry.source_port =
+                    crate::value::port_match(token.as_bytes()).expect("a token this crate minted");
+            }
+            (Field::DestinationPort, Value::Selector(token)) => {
+                entry.destination_port =
+                    crate::value::port_match(token.as_bytes()).expect("a token this crate minted");
+            }
+            (Field::IcmpType, Value::Selector(token)) => {
+                entry.icmp_type = crate::value::icmp_type_match(token.as_bytes())
+                    .expect("a token this crate minted");
+            }
+            (Field::Action, Value::Selector(token)) => {
+                entry.action =
+                    crate::value::action(token.as_bytes()).expect("a token this crate minted");
+            }
+            (field, value) => panic!("a rule record named {field} carrying {value}"),
+        }
+    }
+
+    fn interface_of(value: Value) -> InterfaceMatch {
+        match value {
+            Value::Selector(token) => {
+                crate::value::interface_match(token.as_bytes()).expect("a token this crate minted")
+            }
+            other => panic!("an interface criterion carrying {other}"),
+        }
+    }
+
+    fn address_of(value: Value) -> AddressMatch {
+        match value {
+            Value::Selector(_) => AddressMatch::Any,
+            Value::Prefix {
+                network,
+                prefix_length,
+            } => AddressMatch::Block {
+                network,
+                prefix_length,
+            },
+            other => panic!("an address criterion carrying {other}"),
         }
     }
 

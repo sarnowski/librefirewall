@@ -70,7 +70,7 @@ use lfw_ip_endpoint::{
     http::{MAX_STREAM_TARGETS, METRICS_TARGET},
 };
 use lfw_log::RejectReason;
-use lfw_metrics::{InterfaceInventory, LogSample};
+use lfw_metrics::{InterfaceInventory, LogSample, RuleInventory};
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
 use crate::{
@@ -267,6 +267,11 @@ pub struct EndpointStage<'ring> {
     /// than derived from it: the endpoint is the *management* port's addressing
     /// alone, and the info series cover every port the document configured.
     interfaces: InterfaceInventory,
+    /// The rule identities the committed generation declares, on `interfaces`'
+    /// terms and for the same reader. Identity alone: every hit count is in the
+    /// forwarding domain's shard, which this domain maps read-only, and the two
+    /// are joined on a rule's position.
+    rules: RuleInventory,
     /// The targets this domain answers by streaming. Held here as well as in the
     /// endpoint because a committed generation builds a **new** endpoint: a
     /// registration made at start-up would otherwise be lost the first time an
@@ -332,6 +337,7 @@ impl<'ring> EndpointStage<'ring> {
             clock_generation: 0,
             config: CommittedReader::new(),
             interfaces: InterfaceInventory::EMPTY,
+            rules: RuleInventory::EMPTY,
             targets: [None; MAX_STREAM_TARGETS],
             stats,
             received: [0; BUFFER_SIZE],
@@ -351,48 +357,60 @@ impl<'ring> EndpointStage<'ring> {
         handover: &ConfigHandover,
         ports: u8,
     ) -> Option<ConfigRefused> {
-        match self.config.take(handover, ports)? {
-            Committed::Image {
-                generation,
-                checked,
-            } => {
-                match crate::endpoint_from(&checked, self.secret.clone()) {
-                    Ok(endpoint) => {
-                        self.endpoint = endpoint;
-                        self.apply_targets();
-                        // Replaced wholesale rather than merged: what the metric
-                        // surface reports is the generation in force, and an
-                        // interface the new document dropped must stop being
-                        // reported rather than linger as a stale series.
-                        self.interfaces = crate::interfaces_from(&checked);
-                        self.counters.generation = generation;
-                        None
-                    }
+        // The borrow of the reader's own image ends with this block, so what
+        // leaves it is owned: the endpoint and the inventory the commit
+        // produced, or the refusal it produced instead. Assigning them is the
+        // caller's next step and needs the whole of `self`.
+        let taken = {
+            let Self { config, secret, .. } = self;
+            match config.take(handover, ports)? {
+                Committed::Image {
+                    generation,
+                    checked,
+                } => match crate::endpoint_from(&checked, secret.clone()) {
+                    Ok(endpoint) => Ok((
+                        generation,
+                        endpoint,
+                        crate::interfaces_from(&checked),
+                        crate::rules_from(&checked),
+                    )),
                     // The image's own reader accepted the entry and this
                     // domain's endpoint would not, which is a disagreement
                     // between two checks rather than a malformed field: it is
                     // reported under the reason the stricter one names.
-                    Err(_) => {
-                        bump(&mut self.counters.configs_refused);
-                        Some(ConfigRefused {
-                            generation,
-                            reason: RejectReason::AddressNotUnicast,
-                            detail: generation,
-                        })
-                    }
-                }
-            }
-            Committed::Refused {
-                generation,
-                reason,
-                detail,
-            } => {
-                bump(&mut self.counters.configs_refused);
-                Some(ConfigRefused {
+                    Err(_) => Err(ConfigRefused {
+                        generation,
+                        reason: RejectReason::AddressNotUnicast,
+                        detail: generation,
+                    }),
+                },
+                Committed::Refused {
                     generation,
                     reason,
                     detail,
-                })
+                } => Err(ConfigRefused {
+                    generation,
+                    reason,
+                    detail,
+                }),
+            }
+        };
+        match taken {
+            Ok((generation, endpoint, interfaces, rules)) => {
+                self.endpoint = endpoint;
+                self.apply_targets();
+                // Replaced wholesale rather than merged: what the metric
+                // surface reports is the generation in force, and an interface
+                // or a rule the new document dropped must stop being reported
+                // rather than linger as a stale series.
+                self.interfaces = interfaces;
+                self.rules = rules;
+                self.counters.generation = generation;
+                None
+            }
+            Err(refused) => {
+                bump(&mut self.counters.configs_refused);
+                Some(refused)
             }
         }
     }
@@ -615,6 +633,7 @@ impl<'ring> EndpointStage<'ring> {
     fn supply_body(&mut self) {
         let stats = self.stats;
         let interfaces = self.interfaces;
+        let rules = self.rules;
         let Some(endpoint) = self.endpoint.as_mut() else {
             return;
         };
@@ -625,6 +644,7 @@ impl<'ring> EndpointStage<'ring> {
             stats
                 .snapshot()
                 .with_interfaces(interfaces)
+                .with_rules(rules)
                 .render(out)
                 .ok()
         });

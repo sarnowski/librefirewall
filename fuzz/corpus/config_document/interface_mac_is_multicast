@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration><interfaces>
 <interface id="wan" port="0" enabled="true" mac="01:00:5e:00:00:01" address="10.0.0.1" prefix-length="24"/>
-</interfaces><neighbours/><management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true"/>
+</interfaces><neighbours/><rules/><management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true"/>
 </configuration>

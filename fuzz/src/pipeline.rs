@@ -89,7 +89,7 @@ use pd_runtime::{
     Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
     descriptor_in_bounds,
 };
-use pipeline::Pipeline;
+use pipeline::{Pipeline, Rule, RuleAction, Ruleset};
 use routing::{Interface, Neighbour, PortId, Router};
 
 use crate::region::ZeroedRegion;
@@ -107,6 +107,28 @@ const PORT1: PortId = PortId(1);
 /// forwarder's own and reaches the stage per poll, so it is not something this
 /// peer can express; the number is fixed here for that reason.
 const GENERATION: u32 = 1;
+
+/// One rule permitting whatever the routing stage resolves.
+///
+/// This harness is aimed at the ring and pool protocol under a byzantine peer,
+/// not at the filter: with a default-deny policy and no rules, every frame would
+/// be refused before a descriptor was rewritten and the writeback path — which is
+/// what the peer is attacking — would never be reached. `crates/pipeline`'s own
+/// targets and tests are where the policy is the input.
+static ALLOW_ALL: LazyLock<Ruleset> = LazyLock::new(|| {
+    Ruleset::build(core::iter::once(Rule {
+        ingress: None,
+        egress: None,
+        source: None,
+        destination: None,
+        protocol: None,
+        source_port: None,
+        destination_port: None,
+        icmp_type: None,
+        action: RuleAction::Accept,
+    }))
+    .expect("one rule is inside any capacity")
+});
 
 /// A two-port topology of the shape the appliance is configured into at run
 /// time. The routing decision is not
@@ -281,7 +303,11 @@ pub fn pipeline_harness(data: &[u8]) {
                 );
             }
             4 => {
-                let handed_on = stage.poll(&mut verdicts, Configuration::new(GENERATION, &ROUTER), None);
+                let handed_on = stage.poll(
+                    &mut verdicts,
+                    Configuration::new(GENERATION, &ROUTER, &ALLOW_ALL),
+                    None,
+                );
                 assert!(
                     handed_on <= DRAIN_LIMIT,
                     "the forwarder handed on {handed_on} descriptors, past the {DRAIN_LIMIT} bound"

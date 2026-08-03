@@ -13,6 +13,43 @@
   before being written to logs or the console. Parsing and validation run in the isolated validator
   PD (see [Threat model and isolation](threat-model.md)).
 
+## The filter policy in a document
+
+Most of a configuration is a set of objects whose order does not matter: an interface is the same
+interface wherever in the file it is written, and a reference resolves by name. The filter policy is
+not, and the difference is a design decision rather than an accident of the file format.
+
+- **A policy is an ordered list and the first matching rule decides.** A rule's position in the
+  document is its precedence, so an operator reads a policy the way the appliance evaluates it. The
+  alternative — an unordered set with explicit priorities — puts the evaluation order somewhere other
+  than where the rules are written, and the question "which rule will actually decide this packet"
+  then cannot be answered by reading.
+- **What no rule matched is denied, and no document can say otherwise.** The default deny is a
+  property of the appliance and not an entry in a policy: it is not a rule, so it cannot be
+  reordered, matched around, disabled, or overridden. An empty policy therefore forwards nothing,
+  which is the same posture a node holds before any configuration has been committed and after one
+  has been refused — so "not yet configured", "configuration refused" and "configured to permit
+  nothing" are one behaviour rather than three.
+- **Every criterion is written out, the wildcard included.** A rule states each of the things it
+  matches on, and a criterion that matches everything is written as such rather than omitted. No
+  attribute widens a rule by being absent, because on a device whose whole purpose is to decide what
+  may pass, a criterion that silently widened itself is the one defaulting mistake worth designing
+  the schema around — and a policy an operator can audit by reading is worth the verbosity.
+- **A rule carries an identity of its own.** An id is what an operator edits a rule by and what the
+  appliance reports its matches under, so a rule's counters survive the rules above it being edited.
+  Position is precedence; identity is not positional.
+- **A rule that could never match is refused, not committed.** A criterion combination with no
+  satisfying packet — a range whose ends run backwards, a port criterion on a protocol that has no
+  ports, a block written with host bits set — is a line an operator wrote believing it was in force.
+  The dangerous half of that belief is a permit that quietly matches nothing on an appliance that
+  denies by default, so the document is refused rather than accepted with an inert rule in it. This
+  is the one place the appliance does judge whether a valid configuration is sensible, and it is
+  narrow on purpose: it refuses rules that can have no effect, never rules whose effect it disagrees
+  with.
+- **What the policy decides is what is forwarded, and nothing else.** It is not the selector that
+  decides what reaches a [recording sink](recording.md): a packet the policy dropped is still an
+  observation worth recording, and the two questions have separate answers in a document.
+
 ## Candidate/commit-confirm model
 
 Configuration uses a **candidate/running datastore** model with **commit-confirmed**:

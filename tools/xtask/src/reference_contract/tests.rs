@@ -89,6 +89,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/clock/src/main.rs", &["hpet-not-present"]),
         ("pds/management/src/main.rs", &["rdrand-exhausted"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
+        ("crates/wire/src/lib.rs", &["source-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
         ("crates/http/src/request.rs", &["content-length"]),
     ]

@@ -28,12 +28,13 @@
 
 use lfw_ip_endpoint::{Endpoint, EndpointError, IsnSecret};
 use lfw_log::{Event, RejectReason};
-use lfw_metrics::{InterfaceInfo, InterfaceInventory};
-use net_headers::{Ipv4Address, MacAddress};
+use lfw_metrics::{InterfaceInfo, InterfaceInventory, RuleInventory};
+use net_headers::{Ipv4Address, MacAddress, Protocol};
+use pipeline::{PortRange, Prefix, Rule, RuleAction, Ruleset, RulesetFull};
 use routing::{CapacityError, Interface, Neighbour, PortId, Router};
 use wire::{
-    CheckedConfig, ConfigAck, ConfigHandover, ConfigImage, ConfigImageError, MAX_INTERFACES,
-    MAX_NEIGHBOURS,
+    CheckedAction, CheckedConfig, ConfigAck, ConfigHandover, ConfigImage, ConfigImageError,
+    MAX_INTERFACES, MAX_NEIGHBOURS,
 };
 
 use crate::Configuration;
@@ -85,6 +86,51 @@ pub fn router_from<const MAX_I: usize, const MAX_N: usize>(
     Router::from_slices(filled_interfaces, filled_neighbours)
 }
 
+/// The filter a checked image states, in the order it states it.
+///
+/// Order is carried through untouched, and that is the whole of what this owes
+/// the document: a ruleset is decided first-match-wins, so a builder that
+/// sorted or deduplicated would be rewriting the policy on the way in.
+///
+/// # Errors
+/// [`RulesetFull`] where the image names more rules than this build holds.
+/// Unreachable from a checked image while the two capacities agree, which the
+/// assertion below is what holds; it is answered rather than asserted because
+/// the two constants are declared in two crates.
+pub fn ruleset_from(checked: &CheckedConfig<'_>) -> Result<Ruleset, RulesetFull> {
+    Ruleset::build(checked.rules().map(|entry| Rule {
+        ingress: entry.ingress().map(PortId),
+        egress: entry.egress().map(PortId),
+        source:
+            entry.source().map(|block| {
+                Prefix::new(Ipv4Address::from_octets(block.network), block.prefix_length)
+            }),
+        destination:
+            entry.destination().map(|block| {
+                Prefix::new(Ipv4Address::from_octets(block.network), block.prefix_length)
+            }),
+        protocol: entry.protocol().map(Protocol),
+        source_port: entry.source_port().map(|ports| PortRange {
+            low: ports.low,
+            high: ports.high,
+        }),
+        destination_port: entry.destination_port().map(|ports| PortRange {
+            low: ports.low,
+            high: ports.high,
+        }),
+        icmp_type: entry.icmp_type(),
+        action: match entry.action() {
+            CheckedAction::Accept => RuleAction::Accept,
+            CheckedAction::Drop => RuleAction::Drop,
+        },
+    }))
+}
+
+// The dataplane's ruleset and the configuration ABI's are sized by two
+// constants in two crates, and a dataplane narrower than the image would refuse
+// a generation the publisher was entitled to offer.
+const _: () = assert!(pipeline::MAX_RULES == wire::MAX_RULES);
+
 /// The interface identities a checked image names, as the metric surface reports
 /// them.
 ///
@@ -120,6 +166,29 @@ pub fn interfaces_from(checked: &CheckedConfig) -> InterfaceInventory {
             management.mac(),
         );
         let _ = inventory.push(info);
+    }
+    inventory
+}
+
+/// The rule identities a checked image declares, in the order the filter decides
+/// them — which is the order their counters sit in.
+///
+/// Identity only. Every hit count is the forwarding domain's, published into its
+/// own shard at the same position, so this carries the half of a rule series that
+/// no domain can count and none of the half it can. A rule past the inventory's
+/// capacity is left out rather than reported at a position it does not occupy;
+/// the image's own reader has already refused one, so it is unreachable from a
+/// commit.
+#[must_use]
+pub fn rules_from(checked: &CheckedConfig) -> RuleInventory {
+    let mut inventory = RuleInventory::EMPTY;
+    for entry in checked.rules() {
+        // `MAX_RULES` is exactly the inventory's capacity, so this is
+        // unreachable — and dropped rather than asserted, nothing about a metric
+        // being worth faulting a domain over.
+        if inventory.push(entry.id()).is_err() {
+            return inventory;
+        }
     }
     inventory
 }
@@ -163,8 +232,42 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
     // region; a `count` is already `u32`.
     match error {
         ConfigImageError::InterfaceCountExceedsCapacity { count }
-        | ConfigImageError::NeighbourCountExceedsCapacity { count } => {
+        | ConfigImageError::NeighbourCountExceedsCapacity { count }
+        | ConfigImageError::RuleCountExceedsCapacity { count } => {
             (RejectReason::CapacityExceeded, count)
+        }
+        // A rule's own vocabulary, in the console's terms. The criterion a
+        // refusal names is finer than that vocabulary and is not carried: what
+        // the record locates is the rule, and the rule is what an operator
+        // opens the document at.
+        ConfigImageError::RuleCriterionNotBoolean { index, .. }
+        | ConfigImageError::RuleActionUnknown { index, .. }
+        | ConfigImageError::RuleIdNotAnIdentifier { index, .. } => {
+            (RejectReason::MalformedValue, index as u32)
+        }
+        ConfigImageError::RulePortUnknown { index, .. } => {
+            (RejectReason::PortOutOfRange, index as u32)
+        }
+        ConfigImageError::RulePortUnconfigured { index, .. } => {
+            (RejectReason::UnknownInterfaceReference, index as u32)
+        }
+        ConfigImageError::RulePrefixLengthTooLong { index, .. } => {
+            (RejectReason::PrefixLengthOutOfRange, index as u32)
+        }
+        ConfigImageError::RulePrefixNotCanonical { index, .. } => {
+            (RejectReason::PrefixNotCanonical, index as u32)
+        }
+        ConfigImageError::RulePortRangeReversed { index, .. } => {
+            (RejectReason::PortRangeReversed, index as u32)
+        }
+        ConfigImageError::RulePortCriterionOnIcmp { index, .. } => {
+            (RejectReason::PortCriterionOnIcmp, index as u32)
+        }
+        ConfigImageError::RuleIcmpTypeOnNonIcmp { index, .. } => {
+            (RejectReason::IcmpTypeOnNonIcmp, index as u32)
+        }
+        ConfigImageError::RuleIdDuplicated { index, .. } => {
+            (RejectReason::DuplicateIdentifier, index as u32)
         }
         // An id no reader will take is a malformed value like any other; the
         // fault it names is finer than the console's vocabulary and is not carried.
@@ -413,11 +516,28 @@ pub struct ConfigCounters {
 /// `MAX_I` and `MAX_N` are this domain's own capacity, deliberately not read
 /// from the region: an image naming more entries than the domain can hold is
 /// refused by a bound the writer of that region does not choose.
-#[derive(Clone, Copy, Debug)]
+/// Not `Copy`, and not by omission: this value owns the domain's copy of an
+/// offered image, which is pages long, so a copy of it is a copy of a
+/// configuration generation.
+#[derive(Debug)]
 pub struct ConfigurationSwitch<const MAX_I: usize, const MAX_N: usize> {
+    /// The domain's own storage for one offered image.
+    ///
+    /// A field rather than a `take_offer` local because the image is pages long
+    /// and a protection domain's stack is not: `sel4_microkit`'s `run_main`
+    /// holds the handler as a temporary of its own frame, so what this buys is
+    /// that the copy is made once into storage whose extent is visible in the
+    /// domain's own layout rather than appearing and disappearing under
+    /// whatever else the poll path is doing.
+    image: ConfigImage,
     active: Router<MAX_I, MAX_N>,
+    /// The filter the active table is decided under, beside it rather than
+    /// inside it: `routing` answers where a frame goes and knows nothing about
+    /// whether it may, and joining the two would put a policy question inside
+    /// the forwarding table.
+    active_rules: Ruleset,
     active_generation: u32,
-    staged: Option<(u32, Router<MAX_I, MAX_N>)>,
+    staged: Option<(u32, Router<MAX_I, MAX_N>, Ruleset)>,
     /// The offered generation the last pass judged. A refusal advances neither
     /// field above — the number stays free — so nothing else records it.
     considered: u32,
@@ -433,7 +553,9 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     #[must_use]
     pub const fn new(ports: u8) -> Self {
         Self {
+            image: ConfigImage::ZERO,
             active: Router::empty(),
+            active_rules: Ruleset::EMPTY,
             active_generation: 0,
             staged: None,
             considered: 0,
@@ -460,7 +582,7 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     /// paired where the pairing can still be got right.
     #[must_use]
     pub const fn configuration(&self) -> Configuration<'_, MAX_I, MAX_N> {
-        Configuration::new(self.active_generation, &self.active)
+        Configuration::new(self.active_generation, &self.active, &self.active_rules)
     }
 
     /// Take whatever the publisher is offering that this domain has not already
@@ -484,7 +606,7 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
             return None;
         }
         self.considered = offered;
-        let image = handover.load_image();
+        handover.load_image_into(&mut self.image);
         let refuse = |reason, detail| {
             Some(Offer::Refused {
                 generation: offered,
@@ -492,20 +614,31 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
                 detail,
             })
         };
-        let outcome = match image.check(self.ports) {
+        let Self {
+            image,
+            staged,
+            ports,
+            ..
+        } = self;
+        let outcome = match image.check(*ports) {
             Err(error) => {
                 let (reason, detail) = refusal(error);
                 refuse(reason, detail)
             }
-            Ok(checked) => match router_from(&checked) {
-                Err(_) => refuse(RejectReason::CapacityExceeded, offered),
-                Ok(table) => {
-                    self.staged = Some((offered, table));
+            // Both tables are built here rather than at the commit, so a
+            // capacity this domain cannot hold is a refusal the publisher hears
+            // about. There is no refusal to make at commit time — the
+            // publisher has already released the generation by then — so a
+            // build deferred to it would have nowhere to fail.
+            Ok(checked) => match (router_from(&checked), ruleset_from(&checked)) {
+                (Ok(table), Ok(rules)) => {
+                    *staged = Some((offered, table, rules));
                     ack.publish_staged(offered);
                     Some(Offer::Staged {
                         generation: offered,
                     })
                 }
+                _ => refuse(RejectReason::CapacityExceeded, offered),
             },
         };
         if matches!(outcome, Some(Offer::Refused { .. })) {
@@ -520,11 +653,12 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     /// Returns the generation now in force, or `None` while there is nothing
     /// staged or the publisher has not committed it.
     pub fn take_commit(&mut self, handover: &ConfigHandover, ack: &ConfigAck) -> Option<u32> {
-        let (generation, table) = self.staged?;
+        let (generation, table, rules) = self.staged?;
         if handover.committed_generation() < generation {
             return None;
         }
         self.active = table;
+        self.active_rules = rules;
         self.active_generation = generation;
         self.staged = None;
         ack.publish_running(generation);
@@ -536,7 +670,7 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
     /// running.
     const fn highest_taken(&self) -> u32 {
         match self.staged {
-            Some((generation, _)) => generation,
+            Some((generation, _, _)) => generation,
             None => self.active_generation,
         }
     }
@@ -554,9 +688,12 @@ impl<const MAX_I: usize, const MAX_N: usize> ConfigurationSwitch<MAX_I, MAX_N> {
 /// commit, an image it refuses being one the *forwarder* has already staged. The
 /// cost: it learns of a commit only when something else next wakes it — for the
 /// management port, the next frame that arrives.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 pub struct CommittedReader {
     taken: u32,
+    /// This reader's own copy of the committed image, on
+    /// [`ConfigurationSwitch::image`]'s terms.
+    image: ConfigImage,
 }
 
 /// What one pass over the committed generation found. `None` from
@@ -566,10 +703,10 @@ pub struct CommittedReader {
     reason = "boxing needs an allocator; the value is a temporary destructured at once"
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Committed {
+pub enum Committed<'image> {
     Image {
         generation: u32,
-        checked: CheckedConfig,
+        checked: CheckedConfig<'image>,
     },
     /// The committed image was refused. Nothing this reader had is replaced:
     /// refusing an image is not a reason to forget the one in force.
@@ -583,7 +720,10 @@ pub enum Committed {
 impl CommittedReader {
     #[must_use]
     pub const fn new() -> Self {
-        Self { taken: 0 }
+        Self {
+            taken: 0,
+            image: ConfigImage::ZERO,
+        }
     }
 
     /// The newest committed generation this reader has taken, or 0 while it has
@@ -606,13 +746,14 @@ impl CommittedReader {
     /// `ports` is the caller's own port count, so an image naming a port this
     /// build has no driver for is refused by a bound the publisher does not
     /// choose.
-    pub fn take(&mut self, handover: &ConfigHandover, ports: u8) -> Option<Committed> {
+    pub fn take(&mut self, handover: &ConfigHandover, ports: u8) -> Option<Committed<'_>> {
         let generation = handover.committed_generation();
         if generation <= self.taken {
             return None;
         }
         self.taken = generation;
-        match handover.load_image().check(ports) {
+        handover.load_image_into(&mut self.image);
+        match self.image.check(ports) {
             Ok(checked) => Some(Committed::Image {
                 generation,
                 checked,
@@ -626,6 +767,12 @@ impl CommittedReader {
                 })
             }
         }
+    }
+}
+
+impl Default for CommittedReader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -713,7 +860,7 @@ mod tests {
         }
     }
 
-    fn checked(image: &ConfigImage) -> CheckedConfig {
+    fn checked(image: &ConfigImage) -> CheckedConfig<'_> {
         image.check(PORTS).expect("a valid image")
     }
 
@@ -1153,7 +1300,9 @@ mod tests {
         );
         assert_eq!(publisher.offered(), 5, "the offer did not move");
         assert_eq!(handover.offered_generation(), 5);
-        assert_eq!(handover.load_image().generation, 5, "nor did the region");
+        let mut region = ConfigImage::ZERO;
+        handover.load_image_into(&mut region);
+        assert_eq!(region.generation, 5, "nor did the region");
 
         // And the acknowledgement still releases the generation it named.
         assert_eq!(publisher.take_acknowledgement(&handover, &ack), Some(5));
@@ -1235,7 +1384,8 @@ mod tests {
 
     #[test]
     fn a_table_built_from_an_image_is_the_table_the_image_describes() {
-        let checked = image(1).check(PORTS).expect("the fixture is valid");
+        let raw = image(1);
+        let checked = raw.check(PORTS).expect("the fixture is valid");
         let built: Router<MAX_INTERFACES, MAX_NEIGHBOURS> =
             router_from(&checked).expect("it fits the ABI's own capacity");
         let expected = Router::from_slices(
@@ -1310,7 +1460,8 @@ mod tests {
 
     #[test]
     fn an_endpoint_is_built_only_from_an_entry_that_addresses_the_port() {
-        let checked = image(1).check(PORTS).expect("the fixture is valid");
+        let raw = image(1);
+        let checked = raw.check(PORTS).expect("the fixture is valid");
         assert!(
             endpoint_from(&checked, secret())
                 .expect("no entry is not an error")

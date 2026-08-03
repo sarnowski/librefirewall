@@ -106,6 +106,27 @@ config_rules! {
         ManagementAddressIsAHostAddress,
         ManagementPrefixDoesNotCollideWithInterface,
         ManagementMacDoesNotCollideWithInterface,
+
+        /// More filter rules than the image has slots for.
+        RuleCountWithinCapacity,
+        RuleIdIsWellFormed,
+        RuleIdIsUnique,
+        RuleActionIsKnown,
+        /// A criterion is stated or it is not; there is no third byte.
+        RuleCriterionIsStatedOrNot,
+        /// The interface a rule's `ingress` names is one the configuration has,
+        /// and the same for its `egress`.
+        RuleIngressResolves,
+        RuleEgressResolves,
+        RulePrefixLengthInRange,
+        /// A block written as the block it names, rather than with host bits an
+        /// operator would read back as part of the address.
+        RulePrefixIsCanonical,
+        RulePortRangeIsOrdered,
+        /// A port criterion on a rule that names ICMP.
+        RuleNoPortCriterionOnIcmp,
+        /// An ICMP type criterion on a rule that names another protocol.
+        RuleNoIcmpTypeOnAnotherProtocol,
     }
 }
 
@@ -138,7 +159,19 @@ impl ConfigRule {
             | Self::NeighbourIsInsideItsPrefix
             | Self::NeighbourIsNotTheInterfaceAddress
             | Self::NeighbourAddressIsUnique
-            | Self::ManagementEnabledIsBoolean => Enforcement::Refuses,
+            | Self::ManagementEnabledIsBoolean
+            | Self::RuleCountWithinCapacity
+            | Self::RuleIdIsWellFormed
+            | Self::RuleIdIsUnique
+            | Self::RuleActionIsKnown
+            | Self::RuleCriterionIsStatedOrNot
+            | Self::RuleIngressResolves
+            | Self::RuleEgressResolves
+            | Self::RulePrefixLengthInRange
+            | Self::RulePrefixIsCanonical
+            | Self::RulePortRangeIsOrdered
+            | Self::RuleNoPortCriterionOnIcmp
+            | Self::RuleNoIcmpTypeOnAnotherProtocol => Enforcement::Refuses,
 
             // A disabled management entry is refused for nothing: `enabled == 0`
             // leaves every other field of it uninterpreted, so a zeroed region

@@ -2486,7 +2486,12 @@ fn a_response_still_being_sent_keeps_its_buffer() {
 /// nothing.
 #[test]
 fn a_recording_several_windows_long_arrives_whole_and_in_order() {
-    let recording = Recording(3 * WINDOW_LEN as u64 + 777);
+    // Longer than the staging buffer by at least one whole window, derived from
+    // the buffer rather than chosen: the shape under test is a body that *cannot*
+    // have been staged whole, and a recording sized by a literal stops being one
+    // the day the renderer's worst case — which is what sizes that buffer — grows.
+    // The odd tail keeps the last window a partial one.
+    let recording = Recording((RESPONSE_CAPACITY + WINDOW_LEN) as u64 + 777);
     let mut endpoint = streaming_endpoint();
     let mut station = Station::new(40000, 0x1234_0001);
     let mut out = vec![0u8; ROOMY];

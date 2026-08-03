@@ -406,7 +406,7 @@ pub use endpoint::{
 };
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
-    StaleOffer, endpoint_from, interfaces_from, router_from,
+    StaleOffer, endpoint_from, interfaces_from, router_from, rules_from,
 };
 pub use lfw_ip_endpoint::IsnSecret;
 /// Re-exported rather than restated: a protection domain reaches its whole
@@ -415,7 +415,7 @@ pub use lfw_ip_endpoint::IsnSecret;
 pub use pipeline::Configuration;
 pub use stats::{
     BlockCounters, StatsRegions, config_sample, forwarder_sample, log_sample, management_sample,
-    pipeline_sample, recorder_sample,
+    pipeline_sample, policy_sample, recorder_sample,
 };
 pub use tap::{Observation, Tap, TapCounters, tap_drop_reason};
 pub use wire::{
@@ -1068,6 +1068,149 @@ mod tests {
     use std::boxed::Box;
     use std::collections::BTreeSet;
     use std::sync::LazyLock;
+
+    /// What the forwarding domain's handler occupies, and the stack it is
+    /// declared with.
+    ///
+    /// `sel4_microkit`'s `run_main` holds the handler as a temporary of its own
+    /// frame — `catch_unwind(|| match init().run() { .. })` with
+    /// `Handler::run(&mut self)` — so a field of the handler is on the
+    /// protection domain's stack and not in BSS. That makes the domain's state
+    /// and its `stack_size` one number to keep in step, and this is the side
+    /// that can measure it: the composition below is `pds/forwarder`'s
+    /// `Forwarder`, which is not host-testable.
+    ///
+    /// The bound is the measured total with room to spare for call frames, and
+    /// the declared stack is twice it again. A field that grows past this fails
+    /// here rather than as a boot that dies before the console domain claims
+    /// the UART.
+    #[test]
+    fn the_forwarding_domains_state_fits_the_stack_it_is_declared_with() {
+        /// `<protection_domain name="forwarder" stack_size="0x20000">`.
+        const FORWARDER_STACK: usize = 0x20000;
+        /// Eight `&'static` region references, a `RingSink` and the handler's
+        /// own alignment slack, rounded up: what the composition below carries
+        /// beside the four measured fields.
+        const REFERENCES: usize = 256;
+
+        let state = size_of::<ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>>()
+            + size_of::<pipeline::Pipeline>()
+            + 2 * size_of::<RouteStage<'static>>()
+            + size_of::<Tap<'static>>()
+            + REFERENCES;
+
+        assert!(
+            state <= FORWARDER_STACK / 2,
+            "the forwarder's handler is {state} bytes against a {FORWARDER_STACK}-byte stack, \
+             which leaves under the twofold headroom its call frames are sized by"
+        );
+    }
+
+    /// The same for the configuration domain, whose stack is the one this
+    /// landing overflowed.
+    ///
+    /// Nothing here is a *field* of that domain's handler: a commit's whole
+    /// working set lives in one call frame and is gone by the time `init`
+    /// returns. Three models are live at once — the datastore's running and
+    /// candidate pair, and the one `stage` hands back — plus the byte image
+    /// built from the third, and each of them grew by the 256 rule slots the
+    /// filter added. Measured here rather than in `pds/config` because that
+    /// domain is not host-testable and because the types are this crate's
+    /// dependency to see.
+    #[test]
+    fn the_configuration_domains_state_fits_the_stack_it_is_declared_with() {
+        /// `<protection_domain name="config" stack_size="0x40000">`.
+        const CONFIG_STACK: usize = 0x40000;
+        /// Six `&'static` region references, a `RingSink`, a `ConfigPublisher`
+        /// and the frames' own alignment slack, rounded up.
+        const REFERENCES: usize = 512;
+
+        let state = size_of::<config::Datastore>()
+            + size_of::<config::Staged>()
+            + size_of::<config::CommitReport>()
+            + size_of::<wire::ConfigImage>()
+            + REFERENCES;
+
+        assert!(
+            state <= CONFIG_STACK / 2,
+            "a configuration commit occupies {state} bytes against a {CONFIG_STACK}-byte stack, \
+             which leaves under the twofold headroom its call frames are sized by"
+        );
+    }
+
+    /// The same for the management domain, which is now the largest state in the
+    /// system by a wide margin and had no such guard.
+    ///
+    /// Two things grew it in one change and neither is visible from this file:
+    /// the exposition's staging buffer, sized by the renderer's worst case and so
+    /// by one series per rule the configuration ABI admits, and the snapshot the
+    /// exposition is rendered from, which is every shard read whole and therefore
+    /// grew with the per-rule block reserved in each. The snapshot is a call-frame
+    /// temporary rather than a field, so it is measured beside the handler rather
+    /// than inside it — a bound that ignored it would be the wrong number about
+    /// the right stack.
+    #[test]
+    fn the_management_domains_state_fits_the_stack_it_is_declared_with() {
+        /// `<protection_domain name="management" stack_size="0x100000">`.
+        const MANAGEMENT_STACK: usize = 0x100000;
+        /// Six `&'static` region references, a `RingSink`, the `Downloads` and
+        /// the handler's own alignment slack, rounded up.
+        const REFERENCES: usize = 512;
+
+        let state =
+            size_of::<EndpointStage<'static>>() + size_of::<lfw_metrics::Snapshot>() + REFERENCES;
+
+        assert!(
+            state <= MANAGEMENT_STACK / 2,
+            "the management handler and the snapshot it renders from are {state} bytes against a \
+             {MANAGEMENT_STACK}-byte stack, which leaves under the twofold headroom its call \
+             frames are sized by"
+        );
+    }
+
+    /// A ruleset that accepts every frame the routing stage resolves.
+    ///
+    /// Every test below is about *routing* — which port a frame leaves by and
+    /// under which MACs — and the filter behind it is default-deny, so under an
+    /// empty ruleset each of them would pass for the wrong reason. Stating the
+    /// permission explicitly keeps what each test proves the thing it says it
+    /// proves; the filter's own behaviour is `pipeline`'s to test.
+    static ALLOW_ALL: LazyLock<pipeline::Ruleset> = LazyLock::new(|| {
+        pipeline::Ruleset::build(core::iter::once(pipeline::Rule {
+            ingress: None,
+            egress: None,
+            source: None,
+            destination: None,
+            protocol: None,
+            source_port: None,
+            destination_port: None,
+            icmp_type: None,
+            action: pipeline::RuleAction::Accept,
+        }))
+        .expect("one rule is inside any capacity")
+    });
+
+    /// The same shape, dropping. A frame the routing stage resolves and this
+    /// rule matches is refused by policy rather than by anything about where it
+    /// was going.
+    static DROP_ALL: LazyLock<pipeline::Ruleset> = LazyLock::new(|| {
+        pipeline::Ruleset::build(core::iter::once(pipeline::Rule {
+            ingress: None,
+            egress: None,
+            source: None,
+            destination: None,
+            protocol: None,
+            source_port: None,
+            destination_port: None,
+            icmp_type: None,
+            action: pipeline::RuleAction::Drop,
+        }))
+        .expect("one rule is inside any capacity")
+    });
+
+    /// No rules at all, which is not the absence of a policy but the whole of
+    /// one: the filter denies what nothing matched.
+    static NO_RULES: LazyLock<pipeline::Ruleset> = LazyLock::new(|| pipeline::Ruleset::EMPTY);
     use std::thread;
     use std::vec::Vec;
 
@@ -1154,7 +1297,7 @@ mod tests {
     /// about: the appliance's own table, at the generation a first commit
     /// produces.
     fn running() -> Configuration<'static, 2, 2> {
-        Configuration::new(1, &ROUTER)
+        Configuration::new(1, &ROUTER, &ALLOW_ALL)
     }
 
     /// The two addresses generation `number` writes into a forwarded frame: the
@@ -1241,6 +1384,10 @@ mod tests {
         ttl: u8,
         tagged: bool,
         payload_len: usize,
+        /// The UDP destination port, which is what a filter rule written for a
+        /// port matches on — so a case about the policy varies this and nothing
+        /// else.
+        destination_port: u16,
     }
 
     impl FrameSpec {
@@ -1254,6 +1401,7 @@ mod tests {
                 ttl: 64,
                 tagged: false,
                 payload_len: 24,
+                destination_port: 5000,
             }
         }
 
@@ -1280,7 +1428,7 @@ mod tests {
             frame.extend_from_slice(&ip);
 
             frame.extend_from_slice(&4444u16.to_be_bytes());
-            frame.extend_from_slice(&5000u16.to_be_bytes());
+            frame.extend_from_slice(&self.destination_port.to_be_bytes());
             frame.extend_from_slice(&((UDP_HEADER_LEN + self.payload_len) as u16).to_be_bytes());
             frame.extend_from_slice(&0u16.to_be_bytes());
             frame.extend(payload_pattern(self.payload_len));
@@ -1906,6 +2054,21 @@ mod tests {
                     ..FrameSpec::a_to_b()
                 },
             ),
+            // The two the filter names, on a frame the routing stage resolves:
+            // what refuses these is the policy, so the table and the frame are
+            // the ones every forwarded case uses and only the ruleset differs.
+            (
+                DropReason::PolicyDenied,
+                &*ROUTER,
+                PORT0,
+                FrameSpec::a_to_b(),
+            ),
+            (
+                DropReason::NoPolicyMatch,
+                &*ROUTER,
+                PORT0,
+                FrameSpec::a_to_b(),
+            ),
         ];
 
         // What makes the name of this test true rather than aspirational: a
@@ -1920,6 +2083,14 @@ mod tests {
         );
 
         for (reason, table, ingress, spec) in cases {
+            // The ruleset is the reason for two of these cases and merely
+            // permissive for the rest, so it is chosen here rather than carried
+            // in a column that would read as empty on eleven of thirteen rows.
+            let rules: &pipeline::Ruleset = match reason {
+                DropReason::PolicyDenied => &DROP_ALL,
+                DropReason::NoPolicyMatch => &NO_RULES,
+                _ => &ALLOW_ALL,
+            };
             let r = Regions::new();
             let mut owner = PoolOwner::attach(&r.returns);
             let mut rx_in = r.rings.rx.producer();
@@ -1931,7 +2102,7 @@ mod tests {
             let sent = spec.build();
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
             assert_eq!(
-                stage.poll(&mut pipeline, Configuration::new(1, table), None),
+                stage.poll(&mut pipeline, Configuration::new(1, table, rules), None),
                 1,
                 "{reason}: the descriptor must travel on"
             );
@@ -1960,6 +2131,124 @@ mod tests {
             assert_eq!(owner.reclaim(), 1, "{reason}");
             assert_eq!(owner.owned(), POOL_BUFFERS, "{reason}");
         }
+    }
+
+    /// The three outcomes a filtering appliance owes an operator, driven through
+    /// the same poll the domain runs and read back off the shard it publishes:
+    /// a packet a rule allowed, a packet a rule denied, and a packet no rule was
+    /// about.
+    ///
+    /// Asserted through [`policy_sample`] rather than off the counters directly,
+    /// because the mapping is the part a scrape depends on: a `denied` total in
+    /// the `accepted` slot, or a hit block published at the wrong offset, reports
+    /// one rule's traffic under another rule's name and nothing about the
+    /// counters themselves would notice.
+    #[test]
+    fn the_filters_three_outcomes_reach_three_different_places_in_the_shard() {
+        /// The port the accepting rule names, which is [`FrameSpec::a_to_b`]'s.
+        const ALLOWED: u16 = 5000;
+        /// The port the dropping rule names.
+        const BLOCKED: u16 = 5001;
+        /// A port neither rule names, so the frame falls past both to the
+        /// default deny.
+        const UNMATCHED: u16 = 5002;
+
+        /// The dropping rule first: a rule's place in the document is its
+        /// precedence, and its position is the slot its counter occupies.
+        fn port_rule(port: u16, action: pipeline::RuleAction) -> pipeline::Rule {
+            pipeline::Rule {
+                ingress: None,
+                egress: None,
+                source: None,
+                destination: None,
+                protocol: Some(Protocol::UDP),
+                source_port: None,
+                destination_port: Some(pipeline::PortRange {
+                    low: port,
+                    high: port,
+                }),
+                icmp_type: None,
+                action,
+            }
+        }
+        let rules = pipeline::Ruleset::build(
+            [
+                port_rule(BLOCKED, pipeline::RuleAction::Drop),
+                port_rule(ALLOWED, pipeline::RuleAction::Accept),
+            ]
+            .into_iter(),
+        )
+        .expect("two rules are inside any capacity");
+
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+        let mut pipeline = Pipeline::new();
+        let mut tx_out = r.rings.tx.consumer();
+        let mut free_in = r.returns.free.producer();
+
+        let mut sent = Vec::new();
+        for port in [ALLOWED, BLOCKED, UNMATCHED] {
+            let spec = FrameSpec {
+                destination_port: port,
+                ..FrameSpec::a_to_b()
+            };
+            let frame = spec.build();
+            receive(&r.pool, &mut owner, &mut rx_in, &frame).expect("a full pool has buffers");
+            sent.push(frame);
+        }
+        assert_eq!(
+            stage.poll(&mut pipeline, Configuration::new(1, &ROUTER, &rules), None),
+            sent.len(),
+            "every descriptor travels on, whatever the verdict"
+        );
+
+        // One forwarded and two discarded, which is the wire's own account of
+        // the same three decisions.
+        let mut verdicts = Vec::new();
+        transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, _| {
+            verdicts.push(Verdict::from_bits(descriptor.verdict));
+        });
+        assert_eq!(
+            verdicts,
+            [
+                Some(Verdict::Transmit),
+                Some(Verdict::Discard),
+                Some(Verdict::Discard)
+            ]
+        );
+
+        // The two refusals are told apart by reason, which is what makes a
+        // policy denial and the default deny two facts rather than one.
+        let drops = &stage.counters().drops;
+        assert_eq!(drops.get(DropReason::PolicyDenied), 1);
+        assert_eq!(drops.get(DropReason::NoPolicyMatch), 1);
+        assert_eq!(drops.total(), 2);
+        assert_eq!(stage.counters().forwarded, 1);
+
+        // The datagram's own length, which is what a byte total is stated in.
+        let datagram = u64::from((IPV4_HEADER_LEN + UDP_HEADER_LEN + 24) as u16);
+        let published = policy_sample(pipeline.policy_counters());
+        assert_eq!(published.accepted_packets, 1);
+        assert_eq!(published.accepted_bytes, datagram);
+        assert_eq!(published.denied_packets, 2);
+        assert_eq!(published.denied_bytes, 2 * datagram);
+
+        // Each rule's own slot, and nothing at the positions the policy did not
+        // declare — the default deny is not a rule and has no counter of its own.
+        assert_eq!(published.rule_hits[0], 1, "the dropping rule at position 0");
+        assert_eq!(
+            published.rule_hits[1], 1,
+            "the accepting rule at position 1"
+        );
+        assert!(
+            published.rule_hits[2..].iter().all(|hits| *hits == 0),
+            "a position no rule occupies counted something"
+        );
+
+        assert_eq!(owner.reclaim(), sent.len());
+        assert_eq!(owner.owned(), POOL_BUFFERS);
     }
 
     #[test]
@@ -2646,7 +2935,11 @@ mod tests {
             let (number, table) = generation(tag, port0_up);
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
             assert_eq!(
-                stage.poll(&mut pipeline, Configuration::new(number, &table), None),
+                stage.poll(
+                    &mut pipeline,
+                    Configuration::new(number, &table, &ALLOW_ALL),
+                    None
+                ),
                 1
             );
             assert_eq!(stage.counters().generation, number);
@@ -2770,7 +3063,11 @@ mod tests {
                 let mut idle = 0u64;
                 while handed_on < TOTAL {
                     let (number, table) = &generations[current];
-                    let moved = stage.poll(&mut pipeline, Configuration::new(*number, table), None);
+                    let moved = stage.poll(
+                        &mut pipeline,
+                        Configuration::new(*number, table, &ALLOW_ALL),
+                        None,
+                    );
                     if moved > 0 {
                         handed_on += moved as u64;
                         // The commit, and the only point one can occur: the
@@ -3138,7 +3435,7 @@ mod tests {
                         published += 1;
                     }
                 }
-                prop_assert_eq!(stage.poll(&mut pipeline, Configuration::new(number, &table), None), published);
+                prop_assert_eq!(stage.poll(&mut pipeline, Configuration::new(number, &table, &ALLOW_ALL), None), published);
                 prop_assert_eq!(stage.counters().generation, number);
 
                 let (egress_mac, next_hop_mac) = generation_macs(tag);

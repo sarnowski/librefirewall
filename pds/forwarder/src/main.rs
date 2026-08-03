@@ -151,6 +151,9 @@ impl Forwarder {
             [self.stages[0].counters_ref(), self.stages[1].counters_ref()],
             self.switch.generation(),
             self.switch.counters(),
+            // One filter serves both directions, so its counters come off the
+            // pipeline rather than off either stage.
+            self.pipeline.policy_counters(),
             self.tap.counters(),
             log_sample(self.sink.dropped(), self.sink.refused()),
         );

@@ -6,9 +6,11 @@
 //! is the whole of what the 10 Gbit/s budget has to fit into per packet, and
 //! none of it existed while the stage only moved descriptors.
 //!
-//! Three shapes are measured because they are the three costs, not three
+//! Four shapes are measured because they are the four costs, not four
 //! variations of one: a forwarded packet pays everything; a packet the router
-//! refuses pays the snapshot, the parse and the decision and stops; and a frame
+//! refuses pays the snapshot, the parse and the decision and stops; a packet the
+//! *filter* refuses pays all of that and the rule walk on top, so the difference
+//! between the two refusals is what consulting the policy costs; and a frame
 //! that is not IPv4 at all stops at the parse. Reading them together is what
 //! separates "parsing is expensive" from "the rewrite is expensive", and the
 //! forwarded case is swept across frame sizes because the snapshot is the one
@@ -37,7 +39,7 @@ use pd_runtime::{
     Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
     RouteStage, Verdict,
 };
-use pipeline::Pipeline;
+use pipeline::{Pipeline, Rule, RuleAction, Ruleset};
 use routing::{Interface, Neighbour, PortId, Router};
 
 /// Representative Ethernet payload sizes: a minimum frame, a mid-size frame,
@@ -96,6 +98,32 @@ static ROUTER: LazyLock<Router<2, 2>> = LazyLock::new(|| {
     )
     .expect("two of each fit in two")
 });
+
+/// One rule matching every frame the routing stage resolved, which is what the
+/// forwarded measurement needs the filter to say: the appliance denies what no
+/// rule matched, so a bench with no ruleset would measure the default deny under
+/// the name of the forwarded path.
+///
+/// One rule and every criterion a wildcard, deliberately. The rule walk stops at
+/// the first match, so a longer table would measure the length of *this* table
+/// rather than the per-packet cost of consulting a policy at all.
+fn ruleset(action: RuleAction) -> Ruleset {
+    Ruleset::build(
+        [Rule {
+            ingress: None,
+            egress: None,
+            source: None,
+            destination: None,
+            protocol: None,
+            source_port: None,
+            destination_port: None,
+            icmp_type: None,
+            action,
+        }]
+        .into_iter(),
+    )
+    .expect("one rule fits")
+}
 
 /// A well-formed UDP-over-IPv4 frame from host A to host B.
 fn udp_frame(destination: Ipv4Address, payload_len: usize) -> Vec<u8> {
@@ -203,13 +231,20 @@ const BATCH: usize = 32;
 /// of the snapshot this exists to isolate, so timing it here would roughly halve
 /// the reported throughput and contaminate the difference between the forwarded
 /// and dropped cases, which is the number the two are read for.
-fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes: Option<u64>) {
+fn measure(
+    c: &mut Criterion,
+    name: &str,
+    frame: &[u8],
+    policy: &Ruleset,
+    expected: Verdict,
+    bytes: Option<u64>,
+) {
     let regions = Regions::new();
     let mut owner = PoolOwner::attach(&regions.returns);
     let mut rx_in = regions.rings.rx.producer();
     let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
     let mut pipeline = Pipeline::new();
-    let configuration = Configuration::new(GENERATION, &ROUTER);
+    let configuration = Configuration::new(GENERATION, &ROUTER, policy);
     let mut tx_out = regions.rings.tx.consumer();
     let mut free_in = regions.returns.free.producer();
 
@@ -257,34 +292,77 @@ fn measure(c: &mut Criterion, name: &str, frame: &[u8], expected: Verdict, bytes
     group.finish();
 }
 
-/// The full per-packet cost: snapshot, parse, decide, rewrite, write back.
+/// The full per-packet cost: snapshot, parse, route, consult the policy,
+/// rewrite, write back.
 fn route_forwarded(c: &mut Criterion) {
+    let policy = ruleset(RuleAction::Accept);
     for size in SIZES {
         let frame = udp_frame(HOST_B, size);
         let bytes = frame.len() as u64;
-        measure(c, "route_forwarded", &frame, Verdict::Transmit, Some(bytes));
+        measure(
+            c,
+            "route_forwarded",
+            &frame,
+            &policy,
+            Verdict::Transmit,
+            Some(bytes),
+        );
     }
 }
 
-/// A well-formed packet the router refuses: everything above except the rewrite
-/// and the write back, so the difference against `route_forwarded` at the same
-/// size is what forwarding itself costs.
-fn route_dropped_by_policy(c: &mut Criterion) {
+/// A well-formed packet the *router* refuses: everything above except the rule
+/// walk, the rewrite and the write back, so the difference against
+/// `route_forwarded` at the same size is what the policy and the forwarding
+/// together cost.
+fn route_dropped_by_routing(c: &mut Criterion) {
+    let policy = ruleset(RuleAction::Accept);
     let frame = udp_frame(Ipv4Address::from_octets([203, 0, 113, 4]), SIZES[0]);
-    measure(c, "route_dropped_by_policy", &frame, Verdict::Discard, None);
+    measure(
+        c,
+        "route_dropped_by_routing",
+        &frame,
+        &policy,
+        Verdict::Discard,
+        None,
+    );
+}
+
+/// A packet the router resolves and the *filter* denies: the rule walk is paid
+/// and the rewrite is not, so the difference against `route_dropped_by_routing`
+/// is what consulting the policy costs on its own.
+fn route_denied_by_policy(c: &mut Criterion) {
+    let policy = ruleset(RuleAction::Drop);
+    let frame = udp_frame(HOST_B, SIZES[0]);
+    measure(
+        c,
+        "route_denied_by_policy",
+        &frame,
+        &policy,
+        Verdict::Discard,
+        None,
+    );
 }
 
 /// Bytes that are not an IPv4 frame: the parse rejects them and nothing else
-/// runs, which is the floor the other two are measured against.
+/// runs, which is the floor the other three are measured against.
 fn route_unparsable(c: &mut Criterion) {
+    let policy = ruleset(RuleAction::Accept);
     let frame = vec![0xAA; ETHERNET_HEADER_LEN + SIZES[0]];
-    measure(c, "route_unparsable", &frame, Verdict::Discard, None);
+    measure(
+        c,
+        "route_unparsable",
+        &frame,
+        &policy,
+        Verdict::Discard,
+        None,
+    );
 }
 
 criterion_group!(
     benches,
     route_forwarded,
-    route_dropped_by_policy,
+    route_dropped_by_routing,
+    route_denied_by_policy,
     route_unparsable
 );
 criterion_main!(benches);

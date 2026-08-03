@@ -50,7 +50,7 @@ use crate::{
     artifacts::DIST_DISK,
     diagnose::{self, Run},
     disk::disk_at,
-    forward_harness::ManagementBacking,
+    forward_harness::{ManagementBacking, Traffic},
     image,
     qemu::{boot_and_forward, boot_and_halt},
     topology::Topology,
@@ -302,7 +302,17 @@ fn run_scenario(
     let log_name = format!("ab-{name}{}.log", run.name_suffix());
     let booted = match scenario.outcome {
         Outcome::Routes => {
-            boot_and_forward(root, &work, &log_name, topology, ManagementBacking::Socket)
+            boot_and_forward(
+                root,
+                &work,
+                &log_name,
+                topology,
+                ManagementBacking::Socket,
+                // The A/B scenarios are about which slot boots and what the boot
+                // manager said, so every one of them injects the set whose counts
+                // have not moved since before the filter existed.
+                Traffic::Routed,
+            )
         }
         Outcome::Halts => boot_and_halt(root, &work, &log_name, HALT_RECORD, topology),
     }

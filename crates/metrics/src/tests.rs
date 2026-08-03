@@ -122,10 +122,25 @@ fn worst_case_interfaces() -> InterfaceInventory {
     inventory
 }
 
-/// The snapshot the bound is stated against: every counter at `u64::MAX` and
-/// every info label at its widest.
+/// A policy declaring every rule the ABI admits, each named at the full
+/// identifier width — the widest per-rule block a document can produce.
+fn worst_case_rules() -> RuleInventory {
+    let mut inventory = RuleInventory::EMPTY;
+    for _ in 0..MAX_RULE_SERIES {
+        inventory
+            .push(id("abcdefghijklmnop"))
+            .expect("exactly the inventory's capacity");
+    }
+    assert_eq!(inventory.len(), MAX_RULE_SERIES);
+    inventory
+}
+
+/// The snapshot the bound is stated against: every counter at `u64::MAX`, every
+/// info label at its widest, and every rule the ABI admits declared.
 fn worst_case() -> Snapshot {
-    Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT]).with_interfaces(worst_case_interfaces())
+    Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT])
+        .with_interfaces(worst_case_interfaces())
+        .with_rules(worst_case_rules())
 }
 
 fn render_to_string(snapshot: &Snapshot) -> String {
@@ -207,11 +222,12 @@ fn each_family_is_declared_once_and_its_samples_are_contiguous() {
 fn every_declared_family_has_at_least_one_series() {
     let published: Vec<&str> = declared().iter().map(|(name, _, _)| *name).collect();
     for metric in ALL_METRICS {
-        if core::ptr::eq(*metric, &INTERFACE_INFO) {
-            // Its source is the committed configuration, and a node running
-            // generation 0 has configured no interface — so this family
-            // legitimately carries no sample, and the test below is what holds it
-            // to carrying one when a configuration names one.
+        if core::ptr::eq(*metric, &INTERFACE_INFO) || core::ptr::eq(*metric, &RULE_HITS) {
+            // Their source is the committed configuration, and a node running
+            // generation 0 has configured no interface and declared no rule — so
+            // these two families legitimately carry no sample, and the tests
+            // below are what hold each to carrying one when a configuration
+            // names one.
             continue;
         }
         assert!(
@@ -392,18 +408,27 @@ fn a_shard_round_trips_a_published_sample() {
         pipelines: [
             PipelineSample {
                 forwarded: 11,
-                route_drops: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                route_drops: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
                 stage_drops: [21, 22, 23, 24, 25, 26, 27, 28, 29],
             },
             PipelineSample {
                 forwarded: 12,
-                route_drops: [31; 11],
+                route_drops: [31; 13],
                 stage_drops: [41; 9],
             },
         ],
         generation: 1,
         images_applied: 1,
         images_refused: 0,
+        policy: PolicySample {
+            accepted_packets: 61,
+            accepted_bytes: 62,
+            denied_packets: 63,
+            denied_bytes: 64,
+            // Distinct per position, so a per-rule block published or read at
+            // the wrong offset moves a value rather than repeating one.
+            rule_hits: core::array::from_fn(|position| 100 + position as u64),
+        },
         tap: TapSample {
             observed: 51,
             dropped: 52,
@@ -417,8 +442,13 @@ fn a_shard_round_trips_a_published_sample() {
     let values = sample.values();
     shard.publish(&values);
     let read = shard.sample();
-    assert_eq!(&read[..FORWARDER_SLOTS], &values[..]);
-    assert!(read[FORWARDER_SLOTS..].iter().all(|slot| *slot == 0));
+    assert_eq!(&read[..FORWARDER_SHARD_SLOTS], &values[..]);
+    assert!(read[FORWARDER_SHARD_SLOTS..].iter().all(|slot| *slot == 0));
+    // The per-rule block where the renderer reads it, position for position:
+    // the one offset two independent walkers of this shard have to agree on.
+    for (position, hits) in sample.policy.rule_hits.iter().enumerate() {
+        assert_eq!(read[RULE_HITS_BASE + position], *hits, "rule {position}");
+    }
 }
 
 /// Slot order is the table's order, checked at the one place it matters: the
@@ -516,7 +546,10 @@ proptest! {
 /// and drops none of them.
 #[test]
 fn every_sample_type_fills_exactly_its_declared_slots() {
-    assert_eq!(ForwarderSample::default().values().len(), FORWARDER_SLOTS);
+    assert_eq!(
+        ForwarderSample::default().values().len(),
+        FORWARDER_SHARD_SLOTS
+    );
     assert_eq!(DriverSample::default().values().len(), DRIVER_SLOTS);
     assert_eq!(ManagementSample::default().values().len(), MANAGEMENT_SLOTS);
     assert_eq!(ConsoleSample::default().values().len(), CONSOLE_SLOTS);
@@ -660,6 +693,16 @@ fn the_declared_bound_is_the_sum_of_the_lines_it_bounds() {
             series += bound;
         }
     }
+    let rules = MAX_RULE_SERIES * crate::render::rule_line_len();
+    let widest_rule = format!(
+        "{}{{domain=\"{}\",rule=\"{}\"}} {}\n",
+        RULE_HITS.name,
+        SHARDS[FORWARDER_SHARD].domain,
+        "abcdefghijklmnop",
+        u64::MAX,
+    );
+    assert_eq!(crate::render::rule_line_len(), widest_rule.len());
+
     let info = MAX_INTERFACE_SERIES * crate::render::info_line_len();
     let widest = format!(
         "{}{{domain=\"{}\",interface=\"{}\",role=\"{}\",address=\"{}\",prefix_length=\"{}\",mac=\"{}\"}} 1\n",
@@ -673,8 +716,11 @@ fn the_declared_bound_is_the_sum_of_the_lines_it_bounds() {
     );
     assert_eq!(crate::render::info_line_len(), widest.len());
 
-    assert_eq!(crate::render::exposition_bound(), families + series + info);
-    assert_eq!(MAX_EXPOSITION_LEN, families + series + info);
+    assert_eq!(
+        crate::render::exposition_bound(),
+        families + series + info + rules
+    );
+    assert_eq!(MAX_EXPOSITION_LEN, families + series + info + rules);
 }
 
 /// The bench the info-family tests are stated against: the shipped document's
@@ -860,6 +906,135 @@ fn the_inventory_refuses_one_entry_past_its_capacity() {
     assert_eq!(MAX_INTERFACE_SERIES, wire::MAX_INTERFACES + 1);
 }
 
+/// The shipped document's policy: two rules, the drop first because its line
+/// number is its precedence.
+fn shipped_rules() -> RuleInventory {
+    let mut inventory = RuleInventory::EMPTY;
+    inventory.push(id("probe-blocked")).expect("capacity");
+    inventory.push(id("probe-forward")).expect("capacity");
+    inventory
+}
+
+/// The exact lines a node running a two-rule policy emits, byte for byte, and the
+/// number each of them carries: a rule's series is its own shard slot, so a block
+/// read at the wrong offset reports another rule's traffic under this rule's name.
+#[test]
+fn a_declared_rule_renders_the_hit_count_at_its_own_position() {
+    let mut values = [[0; STATS_SLOTS]; SHARD_COUNT];
+    values[FORWARDER_SHARD][RULE_HITS_BASE] = 7;
+    values[FORWARDER_SHARD][RULE_HITS_BASE + 1] = 11;
+    // A position the document declared no rule at, which must reach no series at
+    // all: a counter under no operator's name is not something to expose.
+    values[FORWARDER_SHARD][RULE_HITS_BASE + 2] = 13;
+    let rendered = render_to_string(&Snapshot::new(values).with_rules(shipped_rules()));
+    let lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with(RULE_HITS.name))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "librefirewall_rule_hits_total{domain=\"forwarder\",rule=\"probe-blocked\"} 7",
+            "librefirewall_rule_hits_total{domain=\"forwarder\",rule=\"probe-forward\"} 11",
+        ]
+    );
+}
+
+/// A node that has committed no configuration declares no rule, so the family
+/// carries no series — the same honest emptiness the info family has under
+/// generation 0, and the state a default-deny appliance forwards nothing in.
+#[test]
+fn an_unconfigured_node_declares_the_rule_family_and_carries_no_series() {
+    let rendered = render_to_string(&Snapshot::new([[u64::MAX; STATS_SLOTS]; SHARD_COUNT]));
+    let (families, samples) = parse(&rendered);
+    assert!(
+        families
+            .iter()
+            .any(|(name, kind, _)| name == RULE_HITS.name && kind == "counter")
+    );
+    assert!(!samples.iter().any(|sample| sample.name == RULE_HITS.name));
+}
+
+/// The join every rule series rests on: its `domain` is the domain the forwarding
+/// shard publishes its own counters under, so the hit count and the drop reasons
+/// that explain it aggregate together.
+#[test]
+fn every_rule_series_joins_to_the_forwarding_domains_counters() {
+    let snapshot = Snapshot::new([[0; STATS_SLOTS]; SHARD_COUNT]).with_rules(shipped_rules());
+    let (_, samples) = parse(&render_to_string(&snapshot));
+    let hits: Vec<&Sample> = samples
+        .iter()
+        .filter(|sample| sample.name == RULE_HITS.name)
+        .collect();
+    assert_eq!(hits.len(), 2);
+    for sample in hits {
+        assert!(
+            sample.labels.contains(&(
+                "domain".to_owned(),
+                SHARDS[FORWARDER_SHARD].domain.to_owned()
+            )),
+            "a rule series carries a domain no forwarding counter does: {sample:?}"
+        );
+    }
+}
+
+/// A full inventory refuses the next rule rather than dropping it silently, and a
+/// checked configuration cannot reach the refusal: it holds at most `MAX_RULES`.
+#[test]
+fn the_rule_inventory_refuses_one_rule_past_its_capacity() {
+    let mut inventory = RuleInventory::EMPTY;
+    assert!(inventory.is_empty());
+    for _ in 0..MAX_RULE_SERIES {
+        inventory.push(id("r")).expect("within capacity");
+    }
+    assert_eq!(inventory.len(), MAX_RULE_SERIES);
+    assert_eq!(inventory.push(id("r")), Err(RulesFull));
+    assert_eq!(MAX_RULE_SERIES, wire::MAX_RULES);
+}
+
+proptest! {
+    /// Whatever policy the renderer is handed, the exposition stays inside the
+    /// declared bound and every rule line reads back as one sample carrying
+    /// exactly `domain` and `rule`. The identifiers are checked ones — that is the
+    /// only shape this renderer can be handed — and every counter is arbitrary.
+    #[test]
+    fn an_arbitrary_policy_renders_within_the_bound(
+        names in prop::collection::vec(
+            prop::collection::vec(
+                prop_oneof![Just(b'a'), Just(b'z'), Just(b'0'), Just(b'9'), Just(b'-')],
+                1..=16,
+            ),
+            0..=MAX_RULE_SERIES,
+        ),
+        counters in any::<u64>(),
+    ) {
+        let mut inventory = RuleInventory::EMPTY;
+        for name in &names {
+            inventory
+                .push(wire::CheckedIdentifier::new(name).expect("within the alphabet"))
+                .expect("at most the inventory's capacity");
+        }
+        let snapshot = Snapshot::new([[counters; STATS_SLOTS]; SHARD_COUNT])
+            .with_rules(inventory)
+            .with_interfaces(worst_case_interfaces());
+        let mut out = vec![0u8; MAX_EXPOSITION_LEN];
+        let len = snapshot.render(&mut out).expect("the declared bound holds");
+        let text = String::from_utf8(out[..len].to_vec()).expect("ASCII");
+        let (_, samples) = parse(&text);
+        let hits: Vec<&Sample> = samples
+            .iter()
+            .filter(|sample| sample.name == RULE_HITS.name)
+            .collect();
+        prop_assert_eq!(hits.len(), names.len());
+        for sample in hits {
+            prop_assert_eq!(sample.value, counters);
+            let mut keys: Vec<&str> = sample.labels.iter().map(|(key, _)| key.as_str()).collect();
+            keys.sort_unstable();
+            prop_assert_eq!(keys, ["domain", "rule"]);
+        }
+    }
+}
+
 proptest! {
     /// Whatever inventory the renderer is handed, the exposition stays inside the
     /// declared bound and every info line reads back as one sample with the six
@@ -935,5 +1110,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 42_142);
+    assert_eq!(MAX_EXPOSITION_LEN, 68_016);
 }

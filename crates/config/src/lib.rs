@@ -50,6 +50,7 @@ pub mod entity;
 pub mod hash;
 pub mod model;
 pub mod report;
+pub mod rule;
 pub mod runtime;
 pub mod schema;
 pub mod store;
@@ -60,11 +61,12 @@ pub mod xml;
 use lfw_log::RejectReason;
 
 pub use diff::{Change, Records, diff};
-pub use entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
+pub use entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
 pub use hash::{ContentHash, content_hash};
 pub use lfw_log::Identifier;
 pub use model::{Full, Model};
 pub use report::{CommitReport, commit_and_report};
+pub use rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction};
 pub use runtime::{BuildError, image_from};
 pub use schema::parse;
 pub use store::{CommitError, CommitOutcome, Datastore, Generation, Staged};
@@ -131,7 +133,7 @@ mod tests {
         "  <neighbours>\n",
         "    <neighbour id=\"gateway-a\" interface=\"wan\"\n",
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
-        "  </neighbours>\n",
+        "  </neighbours>\n  <rules/>\n",
         "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\"\n",
         "              prefix-length=\"24\" enabled=\"true\"/>\n",
         "</configuration>\n"

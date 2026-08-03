@@ -18,6 +18,11 @@
 //!     <neighbour id="gateway-a" interface="wan"
 //!                address="10.0.0.2" mac="52:54:00:00:00:0a"/>
 //!   </neighbours>
+//!   <rules>
+//!     <rule id="allow-web" ingress="wan" egress="any" source="any"
+//!           destination="10.0.1.0/24" protocol="tcp" source-port="any"
+//!           destination-port="443" icmp-type="any" action="accept"/>
+//!   </rules>
 //!   <management mac="52:54:00:12:34:52" address="10.0.2.15"
 //!               prefix-length="24" enabled="true"/>
 //! </configuration>
@@ -25,7 +30,12 @@
 //!
 //! `<management>` is a sibling of `<interfaces>`, not an entry inside it: that
 //! port is not a dataplane one — no `port` number, not in the router's set.
-//! Required like the other two; `enabled="false"` means no address.
+//! Required like the other three; `enabled="false"` means no address.
+//!
+//! `<rules>` is required and may be empty, and an empty one is not the absence
+//! of a policy: the appliance is default-deny, so `<rules/>` forwards nothing.
+//! Its children are ordered — first match wins — which is the one place in this
+//! schema where where a line was written changes what the document means.
 //!
 //! What lives here is the *document's* shape: which elements the root admits,
 //! that each appears once, that a section's children are all of one kind, and
@@ -35,7 +45,7 @@
 //! rather than a reader.
 
 use crate::{
-    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, unknown_attribute},
+    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry, unknown_attribute},
     model::Model,
     xml::{DocumentError, DocumentFault, Element, Event, Reader},
 };
@@ -63,6 +73,7 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
 
     let mut interfaces_read = false;
     let mut neighbours_read = false;
+    let mut rules_read = false;
     let mut management_read = false;
     loop {
         match next(&mut reader)? {
@@ -108,6 +119,18 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
                         NeighbourEntry::read,
                         Model::push_neighbour,
                     )?;
+                } else if section.name == b"rules" {
+                    if rules_read {
+                        return Err(duplicate_element(&section));
+                    }
+                    rules_read = true;
+                    read_section(
+                        &mut reader,
+                        &mut model,
+                        RuleEntry::ELEMENT,
+                        RuleEntry::read,
+                        Model::push_rule,
+                    )?;
                 } else {
                     return Err(unknown_element(&section));
                 }
@@ -118,7 +141,7 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
     }
     end_of_document(&mut reader)?;
 
-    if interfaces_read && neighbours_read && management_read {
+    if interfaces_read && neighbours_read && rules_read && management_read {
         return Ok(model);
     }
     Err(DocumentError {
@@ -252,7 +275,7 @@ mod tests {
         "  <neighbours>\n",
         "    <neighbour id=\"gateway-a\" interface=\"wan\"\n",
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
-        "  </neighbours>\n",
+        "  </neighbours>\n  <rules/>\n",
         "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" ",
         "prefix-length=\"24\" enabled=\"true\"/>\n",
         "</configuration>\n"
@@ -309,7 +332,7 @@ mod tests {
     #[test]
     fn both_sections_may_be_empty_and_both_must_be_present() {
         let empty = concat!(
-            "<configuration><interfaces/><neighbours/>",
+            "<configuration><interfaces/><neighbours/><rules/>",
             management!(),
             "</configuration>"
         );
@@ -320,20 +343,25 @@ mod tests {
             model.management().is_some(),
             "the management element is not one of the two that may be empty"
         );
-        // Every one of the three sections is required, so each of them missing
+        // Every one of the four sections is required, so each of them missing
         // is a rejection rather than a default.
         for partial in [
             concat!(
-                "<configuration><interfaces/>",
+                "<configuration><interfaces/><rules/>",
                 management!(),
                 "</configuration>"
             ),
             concat!(
-                "<configuration><neighbours/>",
+                "<configuration><neighbours/><rules/>",
                 management!(),
                 "</configuration>"
             ),
-            "<configuration><interfaces/><neighbours/></configuration>",
+            concat!(
+                "<configuration><interfaces/><neighbours/>",
+                management!(),
+                "</configuration>"
+            ),
+            "<configuration><interfaces/><neighbours/><rules/></configuration>",
             "<configuration/>",
         ] {
             assert_eq!(
@@ -351,7 +379,7 @@ mod tests {
         let swapped = concat!(
             "<configuration>",
             management!(),
-            "<neighbours/><interfaces/></configuration>"
+            "<rules/><neighbours/><interfaces/></configuration>"
         );
         assert!(parse(swapped.as_bytes()).is_ok());
         // A second section is refused for *being* a second one. It is not an
@@ -360,17 +388,22 @@ mod tests {
         // of them sends them to the wrong edit.
         for twice in [
             concat!(
-                "<configuration><interfaces/><interfaces/><neighbours/>",
+                "<configuration><interfaces/><interfaces/><neighbours/><rules/>",
                 management!(),
                 "</configuration>"
             ),
             concat!(
-                "<configuration><interfaces/><neighbours/><neighbours/>",
+                "<configuration><interfaces/><neighbours/><rules/><rules/>",
                 management!(),
                 "</configuration>"
             ),
             concat!(
-                "<configuration><interfaces/><neighbours/>",
+                "<configuration><interfaces/><neighbours/><rules/><neighbours/>",
+                management!(),
+                "</configuration>"
+            ),
+            concat!(
+                "<configuration><interfaces/><neighbours/><rules/>",
                 management!(),
                 management!(),
                 "</configuration>"
@@ -633,7 +666,7 @@ mod tests {
                      mac=\"52:54:00:00:00:02\"/>"
                 ));
             }
-            text.push_str("</neighbours>");
+            text.push_str("</neighbours><rules/>");
             text.push_str(MANAGEMENT);
             text.push_str("</configuration>");
             text
@@ -679,7 +712,7 @@ mod tests {
     /// trailing-content case below appends to, so each rejection's offset is
     /// this length and the edit is the only thing under test.
     const CLOSED_DOCUMENT: &str = concat!(
-        "<configuration><interfaces/><neighbours/>",
+        "<configuration><interfaces/><neighbours/><rules/>",
         management!(),
         "</configuration>"
     );
@@ -695,7 +728,7 @@ mod tests {
             "<configuration><interfaces>",
             "<interface id=\"lan\" port=\"1\" enabled=\"true\" mac=\"52:54:00:00:00:02\" ",
             "address=\"192.168.0.1\" prefix-length=\"24\"/>",
-            "</interfaces><neighbours/>",
+            "</interfaces><neighbours/><rules/>",
             management!(),
             "</configuration>"
         );
@@ -784,7 +817,7 @@ mod tests {
                      mac=\"52:54:00:00:00:02\"/>"
                 ));
             }
-            text.push_str("</neighbours>");
+            text.push_str("</neighbours><rules/>");
             text.push_str(MANAGEMENT);
             text.push_str("</configuration>");
 
@@ -827,7 +860,7 @@ mod tests {
                 for name in ordered {
                     text.push_str(&entry(name));
                 }
-                text.push_str("</interfaces><neighbours/>");
+                text.push_str("</interfaces><neighbours/><rules/>");
                 text.push_str(MANAGEMENT);
                 text.push_str("</configuration>");
                 text

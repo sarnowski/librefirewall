@@ -152,6 +152,11 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
             applied: 3,
             refused: 1,
         },
+        // A filter that has decided nothing, so this case stays about the two
+        // pipelines. What the policy block maps to is driven through a real poll
+        // by `the_filters_three_outcomes_reach_three_different_places_in_the_shard`,
+        // the counters being the stage's to move and nobody else's.
+        &PolicyCounters::new(),
         TapCounters {
             observed: 33,
             dropped: 4,
@@ -168,6 +173,7 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
     assert_eq!(sample.tap.dropped, 4);
     assert_eq!(sample.log.dropped, 5);
     assert_eq!(sample.log.refused, 2);
+    assert_eq!(sample.policy, lfw_metrics::PolicySample::default());
     assert!(sample.values().len() <= STATS_SLOTS);
 }
 

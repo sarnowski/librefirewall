@@ -21,12 +21,12 @@ use lfw_blk::request::{Operation, RequestFaults};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, ForwarderSample, HttpSample, LogSample, ManagementSample,
-    PipelineSample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS, SinkSample,
-    Snapshot, StatsShard, TapSample, TcpSample,
+    PipelineSample, PolicySample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT,
+    SINKS, SinkSample, Snapshot, StatsShard, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
-use pipeline::DropReason;
+use pipeline::{DropReason, PolicyCounters};
 
 use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, TapCounters};
 
@@ -98,12 +98,30 @@ pub fn pipeline_sample(counters: &RouteCounters) -> PipelineSample {
     }
 }
 
+/// What the filter decided, as the forwarder's shard lays it out.
+///
+/// The per-rule block is copied out whole rather than only as far as the running
+/// generation declared: which positions name a rule is the *renderer's* to decide
+/// from the committed configuration, and a writer that stopped early would leave
+/// a stale count behind at a position a later, shorter policy no longer reaches.
+#[must_use]
+pub fn policy_sample(counters: &PolicyCounters) -> PolicySample {
+    PolicySample {
+        accepted_packets: counters.accepted_packets(),
+        accepted_bytes: counters.accepted_bytes(),
+        denied_packets: counters.denied_packets(),
+        denied_bytes: counters.denied_bytes(),
+        rule_hits: *counters.all_hits(),
+    }
+}
+
 /// The forwarding domain's whole shard.
 #[must_use]
 pub fn forwarder_sample(
     pipelines: [&RouteCounters; 2],
     generation: u32,
     configuration: ConfigCounters,
+    policy: &PolicyCounters,
     tap: TapCounters,
     log: LogSample,
 ) -> ForwarderSample {
@@ -112,6 +130,7 @@ pub fn forwarder_sample(
         generation: u64::from(generation),
         images_applied: configuration.applied,
         images_refused: configuration.refused,
+        policy: policy_sample(policy),
         tap: TapSample {
             observed: tap.observed,
             dropped: tap.dropped,

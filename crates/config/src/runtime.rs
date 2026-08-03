@@ -6,9 +6,18 @@
 //! alternative is a panic reached through a rule enforced in another module.
 
 use lfw_log::Identifier;
-use wire::{ConfigImage, IdentifierImage, InterfaceImage, ManagementImage, NeighbourImage};
+use net_headers::Protocol;
+use wire::{
+    ConfigImage, IdentifierImage, InterfaceImage, ManagementImage, NeighbourImage, RuleImage,
+};
 
-use crate::{entity::NeighbourEntry, hash::content_hash, model::Model, store::Generation};
+use crate::{
+    entity::{NeighbourEntry, RuleEntry},
+    hash::content_hash,
+    model::Model,
+    rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction},
+    store::Generation,
+};
 
 /// Why a validated configuration could not be turned into a handover image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,12 +27,17 @@ pub enum BuildError {
         neighbour: Identifier,
         interface: Identifier,
     },
+    /// The same for a rule's `ingress` or `egress`.
+    UnresolvedRuleInterface {
+        rule: Identifier,
+        interface: Identifier,
+    },
 }
 
 /// Build the handover image a consumer reads a configuration out of.
 ///
 /// # Errors
-/// [`BuildError::UnresolvedInterface`].
+/// [`BuildError`], for an interface reference validation refuses.
 pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, BuildError> {
     let mut image = ConfigImage {
         generation: generation.to_bits(),
@@ -73,7 +87,87 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
     }
     image.neighbour_count = count;
 
+    let mut count = 0u32;
+    for (slot, entry) in image.rules.iter_mut().zip(model.rules()) {
+        *slot = rule_image(model, entry)?;
+        count = count.saturating_add(1);
+    }
+    image.rule_count = count;
+
     Ok(image)
+}
+
+/// One rule as the handover carries it: each criterion split into the byte that
+/// says whether it is stated and the value it states, and each interface name
+/// resolved to the port it will be compared against.
+fn rule_image(model: &Model, entry: &RuleEntry) -> Result<RuleImage, BuildError> {
+    let interface = |criterion: InterfaceMatch| match criterion {
+        InterfaceMatch::Any => Ok((0, 0)),
+        InterfaceMatch::Named(named) => model
+            .interface(named)
+            .map(|interface| (1, interface.port))
+            .ok_or(BuildError::UnresolvedRuleInterface {
+                rule: entry.id,
+                interface: named,
+            }),
+    };
+    let address = |criterion: AddressMatch| match criterion {
+        AddressMatch::Any => (0, [0; 4], 0),
+        AddressMatch::Block {
+            network,
+            prefix_length,
+        } => (1, network.octets(), prefix_length),
+    };
+    let ports = |criterion: PortMatch| match criterion {
+        PortMatch::Any => (0, 0, 0),
+        PortMatch::Range { low, high } => (1, low, high),
+    };
+
+    let (ingress_stated, ingress_port) = interface(entry.ingress)?;
+    let (egress_stated, egress_port) = interface(entry.egress)?;
+    let (source_stated, source_network, source_prefix_length) = address(entry.source);
+    let (destination_stated, destination_network, destination_prefix_length) =
+        address(entry.destination);
+    let (source_port_stated, source_port_low, source_port_high) = ports(entry.source_port);
+    let (destination_port_stated, destination_port_low, destination_port_high) =
+        ports(entry.destination_port);
+    let (protocol_stated, protocol) = match entry.protocol {
+        ProtocolMatch::Any => (0, 0),
+        ProtocolMatch::Only(Protocol(number)) => (1, number),
+    };
+    let (icmp_type_stated, icmp_type) = match entry.icmp_type {
+        IcmpTypeMatch::Any => (0, 0),
+        IcmpTypeMatch::Only(message_type) => (1, message_type),
+    };
+
+    Ok(RuleImage {
+        action: match entry.action {
+            RuleAction::Accept => 0,
+            RuleAction::Drop => 1,
+        },
+        ingress_stated,
+        ingress_port,
+        egress_stated,
+        egress_port,
+        source_stated,
+        source_prefix_length,
+        destination_stated,
+        source_network,
+        destination_network,
+        destination_prefix_length,
+        protocol_stated,
+        protocol,
+        icmp_type_stated,
+        icmp_type,
+        source_port_stated,
+        destination_port_stated,
+        _pad: [0; 1],
+        source_port_low,
+        source_port_high,
+        destination_port_low,
+        destination_port_high,
+        id: IdentifierImage::from_text(entry.id.as_bytes()),
+    })
 }
 
 fn port_of(model: &Model, entry: &NeighbourEntry) -> Result<u8, BuildError> {
@@ -107,7 +201,7 @@ mod tests {
         "</interfaces><neighbours>",
         "<neighbour id=\"gateway-a\" interface=\"lan\" address=\"10.0.1.2\" ",
         "mac=\"52:54:00:00:00:0a\"/>",
-        "</neighbours>",
+        "</neighbours><rules/>",
         "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
         "address=\"192.168.42.15\" prefix-length=\"24\"/>",
         "</configuration>"
@@ -261,7 +355,7 @@ mod tests {
                  prefix-length=\"24\"/>"
             ));
         }
-        text.push_str("</interfaces><neighbours/>");
+        text.push_str("</interfaces><neighbours/><rules/>");
         text.push_str(MANAGEMENT);
         text.push_str("</configuration>");
         text

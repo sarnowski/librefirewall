@@ -127,7 +127,7 @@ pub const TAP_FLAGS_KNOWN: u32 = TAP_FLAG_OUTBOUND;
 /// reverse edge for good. [`TapDropReason`] mirrors that enum the way
 /// [`crate::LogRecord`] mirrors `lfw_log::Event` — as integers, in the source
 /// enum's declaration order, offset by one so zero can mean *no reason*.
-pub const TAP_DROP_REASON_COUNT: u32 = 11;
+pub const TAP_DROP_REASON_COUNT: u32 = 13;
 
 /// Bytes the system description reserves for one records region, derived rather
 /// than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
@@ -219,6 +219,8 @@ pub enum TapDropReason {
     NoRoute,
     EgressIsIngress,
     NoNeighbour,
+    PolicyDenied,
+    NoPolicyMatch,
 }
 
 impl TapDropReason {
@@ -238,6 +240,8 @@ impl TapDropReason {
             Self::NoRoute => 9,
             Self::EgressIsIngress => 10,
             Self::NoNeighbour => 11,
+            Self::PolicyDenied => 12,
+            Self::NoPolicyMatch => 13,
         }
     }
 
@@ -257,6 +261,8 @@ impl TapDropReason {
             9 => Some(Self::NoRoute),
             10 => Some(Self::EgressIsIngress),
             11 => Some(Self::NoNeighbour),
+            12 => Some(Self::PolicyDenied),
+            13 => Some(Self::NoPolicyMatch),
             _ => None,
         }
     }
@@ -1049,7 +1055,7 @@ const _: () = {
     assert!(MAX_INTERFACES >= 1);
     // The mirrored enum's width, so a reason added to `pipeline::DropReason`
     // without a slot here is caught by the count rather than by a reader.
-    assert!(TapDropReason::NoNeighbour.to_bits() == TAP_DROP_REASON_COUNT);
+    assert!(TapDropReason::NoPolicyMatch.to_bits() == TAP_DROP_REASON_COUNT);
     assert!(TapDropReason::from_bits(TAP_DROP_REASON_COUNT).is_some());
     assert!(TapDropReason::from_bits(TAP_DROP_REASON_COUNT + 1).is_none());
 

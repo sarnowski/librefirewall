@@ -69,7 +69,7 @@
 use arbitrary::{Arbitrary as _, Unstructured};
 use wire::{
     ConfigHandover, ConfigImage, ConfigImageError, InterfaceImage, MAX_INTERFACES, MAX_NEIGHBOURS,
-    MAX_PREFIX_LENGTH, NeighbourImage,
+    MAX_PREFIX_LENGTH, MAX_RULES, NeighbourImage, RuleCriterion, RuleImage,
 };
 
 /// Port counts the image is checked against.
@@ -88,6 +88,14 @@ const INTERFACE_BYTES: usize = 36;
 /// Bytes of one neighbour entry in the region.
 const NEIGHBOUR_BYTES: usize = 16;
 
+/// Bytes of one rule entry: the action and the seven stated flags interleaved
+/// with their one-byte values, the two networks, a pad, the four port halves,
+/// and the identifier's twenty.
+const RULE_BYTES: usize = 52;
+
+/// Bytes of the count word the rules array follows.
+const RULE_COUNT_BYTES: usize = 4;
+
 /// Bytes of the management entry, which sits between the header and the
 /// interfaces.
 const MANAGEMENT_BYTES: usize = 16;
@@ -99,7 +107,9 @@ const HEADER_BYTES: usize = 16;
 pub const REGION_BYTES: usize = HEADER_BYTES
     + MANAGEMENT_BYTES
     + MAX_INTERFACES * INTERFACE_BYTES
-    + MAX_NEIGHBOURS * NEIGHBOUR_BYTES;
+    + MAX_NEIGHBOURS * NEIGHBOUR_BYTES
+    + RULE_COUNT_BYTES
+    + MAX_RULES * RULE_BYTES;
 
 // The point of laying the input over the ABI positionally is that a corpus
 // entry *is* the region a writer left behind. That only holds while the two
@@ -125,6 +135,7 @@ pub fn handover_harness(data: &[u8]) {
     let mut narrowed = image;
     narrowed.interface_count = image.interface_count % (MAX_INTERFACES as u32 + 2);
     narrowed.neighbour_count = image.neighbour_count % (MAX_NEIGHBOURS as u32 + 2);
+    narrowed.rule_count = image.rule_count % (MAX_RULES as u32 + 2);
     for port_count in PORT_COUNTS {
         check_one(&narrowed, port_count);
     }
@@ -238,6 +249,9 @@ fn assert_slots_past_the_counts_are_not_read(
     for slot in scribbled.neighbours.iter_mut().skip(neighbours) {
         *slot = SCRIBBLED_NEIGHBOUR;
     }
+    for slot in scribbled.rules.iter_mut().skip(image.rule_count as usize) {
+        *slot = SCRIBBLED_RULE;
+    }
     assert_eq!(
         scribbled.check(port_count).as_ref(),
         Ok(checked),
@@ -257,6 +271,40 @@ const SCRIBBLED_INTERFACE: InterfaceImage = InterfaceImage {
     address: [0xAA; 4],
     // A length past the storage and bytes outside the alphabet, so this field is
     // refused twice over like every other one here.
+    id: wire::TextImage {
+        bytes: [0xAA; wire::LOG_IDENTIFIER_BYTES],
+        len: u8::MAX,
+        _pad: [0xAA; 3],
+    },
+};
+
+/// As [`SCRIBBLED_INTERFACE`], for a rule: the action is unknown, every stated
+/// flag is neither 0 nor 1, and the id is both too long and outside the
+/// alphabet — so a reader that decoded one would refuse, whatever else the
+/// region held.
+const SCRIBBLED_RULE: RuleImage = RuleImage {
+    action: 0xAA,
+    ingress_stated: 0xAA,
+    ingress_port: u8::MAX,
+    egress_stated: 0xAA,
+    egress_port: u8::MAX,
+    source_stated: 0xAA,
+    source_prefix_length: u8::MAX,
+    destination_stated: 0xAA,
+    source_network: [0xAA; 4],
+    destination_network: [0xAA; 4],
+    destination_prefix_length: u8::MAX,
+    protocol_stated: 0xAA,
+    protocol: 0xAA,
+    icmp_type_stated: 0xAA,
+    icmp_type: 0xAA,
+    source_port_stated: 0xAA,
+    destination_port_stated: 0xAA,
+    _pad: [0xAA; 1],
+    source_port_low: u16::MAX,
+    source_port_high: 0,
+    destination_port_low: u16::MAX,
+    destination_port_high: 0,
     id: wire::TextImage {
         bytes: [0xAA; wire::LOG_IDENTIFIER_BYTES],
         len: u8::MAX,
@@ -293,6 +341,12 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
     if neighbours > MAX_NEIGHBOURS {
         return Some(ConfigImageError::NeighbourCountExceedsCapacity {
             count: image.neighbour_count,
+        });
+    }
+    let rules = usize::try_from(image.rule_count).ok()?;
+    if rules > MAX_RULES {
+        return Some(ConfigImageError::RuleCountExceedsCapacity {
+            count: image.rule_count,
         });
     }
     let named: Vec<InterfaceImage> = image.interfaces.iter().copied().take(interfaces).collect();
@@ -425,6 +479,23 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
         }
     }
 
+    let policy: Vec<RuleImage> = image.rules.iter().copied().take(rules).collect();
+    for (index, entry) in policy.iter().enumerate() {
+        if let Some(refusal) = rule_refusal(entry, index, port_count, &named) {
+            return Some(refusal);
+        }
+        // The id is the last thing a rule is held to, so a duplicate is only
+        // reached once both entries are well formed — which is why this sits
+        // after the per-rule pass rather than inside it.
+        for (other, earlier) in policy.iter().enumerate().take(index) {
+            if rule_refusal(earlier, other, port_count, &named).is_none()
+                && identifier_text(&earlier.id) == identifier_text(&entry.id)
+            {
+                return Some(ConfigImageError::RuleIdDuplicated { index, other });
+            }
+        }
+    }
+
     let management = image.management;
     if management.enabled > 1 {
         return Some(ConfigImageError::ManagementEnabledNotBoolean {
@@ -473,6 +544,191 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
 
     None
 }
+
+/// What the ABI contract says one rule is refused for, in the reader's own order:
+/// the action, then each criterion's stated flag and value in the order the image
+/// lays them out, then the two rules *between* criteria, then the identity.
+///
+/// The order is the contract because an operator reading a refusal is sent to one
+/// attribute of one rule. A reader that refused a different criterion first would
+/// still be refusing, and would send them to the wrong line.
+fn rule_refusal(
+    raw: &RuleImage,
+    index: usize,
+    port_count: u8,
+    interfaces: &[InterfaceImage],
+) -> Option<ConfigImageError> {
+    // Every stated flag, in the order the reader decodes them, because a flag
+    // that is neither 0 nor 1 is refused before any value it guards is read.
+    let flags = [
+        (raw.ingress_stated, RuleCriterion::Ingress),
+        (raw.egress_stated, RuleCriterion::Egress),
+        (raw.source_stated, RuleCriterion::Source),
+        (raw.destination_stated, RuleCriterion::Destination),
+        (raw.protocol_stated, RuleCriterion::Protocol),
+        (raw.source_port_stated, RuleCriterion::SourcePort),
+        (raw.destination_port_stated, RuleCriterion::DestinationPort),
+        (raw.icmp_type_stated, RuleCriterion::IcmpType),
+    ];
+    let stated = |criterion: RuleCriterion| {
+        flags
+            .iter()
+            .find(|(_, named)| *named == criterion)
+            .is_some_and(|(flag, _)| *flag == 1)
+    };
+
+    if raw.action > 1 {
+        return Some(ConfigImageError::RuleActionUnknown {
+            index,
+            action: raw.action,
+        });
+    }
+    // The interface criteria first, and each of them decodes its own flag before
+    // the next criterion's is looked at.
+    for (criterion, flag, port) in [
+        (RuleCriterion::Ingress, raw.ingress_stated, raw.ingress_port),
+        (RuleCriterion::Egress, raw.egress_stated, raw.egress_port),
+    ] {
+        if flag > 1 {
+            return Some(ConfigImageError::RuleCriterionNotBoolean {
+                index,
+                criterion,
+                stated: flag,
+            });
+        }
+        if flag == 0 {
+            continue;
+        }
+        if port >= port_count {
+            return Some(ConfigImageError::RulePortUnknown {
+                index,
+                criterion,
+                port,
+            });
+        }
+        if !interfaces.iter().any(|entry| entry.port == port) {
+            return Some(ConfigImageError::RulePortUnconfigured {
+                index,
+                criterion,
+                port,
+            });
+        }
+    }
+    // Then the two address blocks: a length inside 32, and a network whose host
+    // bits are clear — a block written `10.0.0.5/24` covers `10.0.0.0/24` and is
+    // a line an operator wrote meaning something else.
+    for (criterion, flag, network, prefix_length) in [
+        (
+            RuleCriterion::Source,
+            raw.source_stated,
+            raw.source_network,
+            raw.source_prefix_length,
+        ),
+        (
+            RuleCriterion::Destination,
+            raw.destination_stated,
+            raw.destination_network,
+            raw.destination_prefix_length,
+        ),
+    ] {
+        if flag > 1 {
+            return Some(ConfigImageError::RuleCriterionNotBoolean {
+                index,
+                criterion,
+                stated: flag,
+            });
+        }
+        if flag == 0 {
+            continue;
+        }
+        if prefix_length > MAX_PREFIX_LENGTH {
+            return Some(ConfigImageError::RulePrefixLengthTooLong {
+                index,
+                criterion,
+                prefix_length,
+            });
+        }
+        if u32::from_be_bytes(network) & !prefix_mask(prefix_length) != 0 {
+            return Some(ConfigImageError::RulePrefixNotCanonical {
+                index,
+                criterion,
+                network,
+            });
+        }
+    }
+    if raw.protocol_stated > 1 {
+        return Some(ConfigImageError::RuleCriterionNotBoolean {
+            index,
+            criterion: RuleCriterion::Protocol,
+            stated: raw.protocol_stated,
+        });
+    }
+    // Then the two port criteria: a range at all, which is a low no higher than
+    // its high.
+    for (criterion, flag, low, high) in [
+        (
+            RuleCriterion::SourcePort,
+            raw.source_port_stated,
+            raw.source_port_low,
+            raw.source_port_high,
+        ),
+        (
+            RuleCriterion::DestinationPort,
+            raw.destination_port_stated,
+            raw.destination_port_low,
+            raw.destination_port_high,
+        ),
+    ] {
+        if flag > 1 {
+            return Some(ConfigImageError::RuleCriterionNotBoolean {
+                index,
+                criterion,
+                stated: flag,
+            });
+        }
+        if flag == 1 && low > high {
+            return Some(ConfigImageError::RulePortRangeReversed {
+                index,
+                criterion,
+                low,
+                high,
+            });
+        }
+    }
+    if raw.icmp_type_stated > 1 {
+        return Some(ConfigImageError::RuleCriterionNotBoolean {
+            index,
+            criterion: RuleCriterion::IcmpType,
+            stated: raw.icmp_type_stated,
+        });
+    }
+
+    // The two rules between criteria, both about a rule that would match
+    // nothing: ports on ICMP, and an ICMP type on anything else.
+    if stated(RuleCriterion::Protocol) && raw.protocol == ICMP_PROTOCOL {
+        for criterion in [RuleCriterion::SourcePort, RuleCriterion::DestinationPort] {
+            if stated(criterion) {
+                return Some(ConfigImageError::RulePortCriterionOnIcmp { index, criterion });
+            }
+        }
+    }
+    if stated(RuleCriterion::IcmpType)
+        && stated(RuleCriterion::Protocol)
+        && raw.protocol != ICMP_PROTOCOL
+    {
+        return Some(ConfigImageError::RuleIcmpTypeOnNonIcmp {
+            index,
+            protocol: raw.protocol,
+        });
+    }
+
+    identifier_fault(&raw.id).map(|fault| ConfigImageError::RuleIdNotAnIdentifier { index, fault })
+}
+
+/// The IANA number for ICMP, restated from the ABI contract for the reason every
+/// other constant here is: reaching for `wire`'s would be checking the code
+/// against itself.
+const ICMP_PROTOCOL: u8 = 1;
 
 /// The bytes an id names. Only reached once [`identifier_fault`] has admitted
 /// both sides, so the stated length is inside the storage.
@@ -552,9 +808,14 @@ fn identifier_fault(id: &wire::IdentifierImage) -> Option<wire::TextFault> {
 /// the two domains actually use.
 fn assert_region_round_trips(image: &ConfigImage) {
     let region = ConfigHandover::zero();
+    // Read into a caller's own buffer rather than returned by value: the image is
+    // pages long at `MAX_RULES`, and the domains that read one are the ones whose
+    // stacks cannot hold a second copy of it.
+    let mut read = ConfigImage::ZERO;
     assert_eq!(region.offered_generation(), 0);
+    region.load_image_into(&mut read);
     assert_eq!(
-        region.load_image(),
+        read,
         ConfigImage::ZERO,
         "a zeroed region is not the fail-closed configuration"
     );
@@ -565,9 +826,9 @@ fn assert_region_round_trips(image: &ConfigImage) {
         image.generation,
         "the region offered a generation other than the one written into it"
     );
+    region.load_image_into(&mut read);
     assert_eq!(
-        region.load_image(),
-        *image,
+        read, *image,
         "the image did not survive the region it crosses domains through"
     );
 
@@ -641,6 +902,46 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
             address: bytes(&mut unstructured),
         };
     }
+    // The rules, in the position the ABI puts them and every byte of them the
+    // peer's. This is the region a compromised publisher would use to hand the
+    // forwarder a policy: a stated flag that is neither 0 nor 1, a range whose
+    // ends run backwards, a port criterion on ICMP, a block with host bits set,
+    // and an id whose bytes would become a Prometheus label. A harness that left
+    // them zeroed would leave every one of the twelve rules the reader applies
+    // to them unreached — and a zeroed rule is an accepting wildcard, which is
+    // the last shape to take on trust.
+    image.rule_count = word(&mut unstructured);
+    for slot in &mut image.rules {
+        *slot = RuleImage {
+            action: byte(&mut unstructured),
+            ingress_stated: byte(&mut unstructured),
+            ingress_port: byte(&mut unstructured),
+            egress_stated: byte(&mut unstructured),
+            egress_port: byte(&mut unstructured),
+            source_stated: byte(&mut unstructured),
+            source_prefix_length: byte(&mut unstructured),
+            destination_stated: byte(&mut unstructured),
+            source_network: bytes(&mut unstructured),
+            destination_network: bytes(&mut unstructured),
+            destination_prefix_length: byte(&mut unstructured),
+            protocol_stated: byte(&mut unstructured),
+            protocol: byte(&mut unstructured),
+            icmp_type_stated: byte(&mut unstructured),
+            icmp_type: byte(&mut unstructured),
+            source_port_stated: byte(&mut unstructured),
+            destination_port_stated: byte(&mut unstructured),
+            _pad: [byte(&mut unstructured); 1],
+            source_port_low: half(&mut unstructured),
+            source_port_high: half(&mut unstructured),
+            destination_port_low: half(&mut unstructured),
+            destination_port_high: half(&mut unstructured),
+            id: wire::TextImage {
+                bytes: bytes(&mut unstructured),
+                len: byte(&mut unstructured),
+                _pad: bytes(&mut unstructured),
+            },
+        };
+    }
     image
 }
 
@@ -648,6 +949,11 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
 /// unwritten part of a freshly mapped region holds.
 fn word(unstructured: &mut Unstructured<'_>) -> u32 {
     crate::any_u32(unstructured)
+}
+
+/// The next region half-word; see [`word`].
+fn half(unstructured: &mut Unstructured<'_>) -> u16 {
+    crate::any_u16(unstructured)
 }
 
 /// The next region byte; see [`word`].

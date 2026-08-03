@@ -30,9 +30,10 @@ use crate::catalog::{
     ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED, FORWARDED_FRAMES,
     HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
     HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
-    INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POOL_RETURNS_REFUSED,
-    QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS,
-    RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
+    INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
+    POLICY_PACKETS, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
+    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
+    RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
     RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
     RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
@@ -42,6 +43,7 @@ use crate::catalog::{
     TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES,
     UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
+use crate::rules::MAX_RULE_SERIES;
 
 /// Dataplane pipelines the forwarder carries, one per direction. A build fact
 /// matching `config::PORT_COUNT`, held to it by a test in `pd_runtime`.
@@ -49,7 +51,7 @@ pub const PIPELINES: usize = 2;
 
 /// The pipeline's whole refusal vocabulary, in `pipeline::DropReason::ALL` order —
 /// which a test in `pd_runtime` holds this array to, name for name.
-pub const ROUTE_DROP_REASONS: [&str; 11] = [
+pub const ROUTE_DROP_REASONS: [&str; 13] = [
     "unconfigured_ingress_port",
     "interface_disabled",
     "not_addressed_to_us",
@@ -61,6 +63,8 @@ pub const ROUTE_DROP_REASONS: [&str; 11] = [
     "no_route",
     "egress_is_ingress",
     "no_neighbour",
+    "policy_denied",
+    "no_policy_match",
 ];
 
 /// What the routing *stage* refuses around the router's decision: a descriptor, a
@@ -116,9 +120,57 @@ pub struct TapSample {
     pub refused: u64,
 }
 
-/// Slots [`ForwarderSample`] occupies.
+/// What the filter decided, which is one account for the whole domain rather
+/// than one per direction: a single `pipeline::PolicyStage` serves both, so there
+/// is no per-direction number to report.
+///
+/// `rule_hits` is indexed by a rule's position in the running generation. Every
+/// slot the ABI admits is published; which of them names a rule an operator wrote
+/// is [`crate::RuleInventory`]'s to say, and a position no generation declared
+/// reaches no series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicySample {
+    pub accepted_packets: u64,
+    pub accepted_bytes: u64,
+    pub denied_packets: u64,
+    pub denied_bytes: u64,
+    pub rule_hits: [u64; MAX_RULE_SERIES],
+}
+
+impl Default for PolicySample {
+    /// Written out because an array this long is past the width `Default` is
+    /// derived for.
+    fn default() -> Self {
+        Self {
+            accepted_packets: 0,
+            accepted_bytes: 0,
+            denied_packets: 0,
+            denied_bytes: 0,
+            rule_hits: [0; MAX_RULE_SERIES],
+        }
+    }
+}
+
+/// Slots [`ForwarderSample`]'s own **table** occupies — the series the catalogue
+/// names, and so the slot the per-rule block starts at.
 pub const FORWARDER_SLOTS: usize =
-    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 8;
+    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 12;
+
+/// Where a rule's hit counter sits: its position in the running generation,
+/// offset past the table above.
+///
+/// The one place the two halves of a rule series are bound together. The
+/// forwarding domain writes here by position and the renderer reads here by
+/// position, so a slot moved on one side and not the other does not compile.
+pub const RULE_HITS_BASE: usize = FORWARDER_SLOTS;
+
+/// Every slot the forwarding domain writes, table and per-rule block together.
+///
+/// Larger than the table because the per-rule series are not in it: their labels
+/// are the running document's text, so they cannot be a `&'static [Series]`. The
+/// shard is sized by this and the catalogue by [`FORWARDER_SLOTS`], which is what
+/// keeps the block reachable and unnamed rather than named and empty.
+pub const FORWARDER_SHARD_SLOTS: usize = FORWARDER_SLOTS + MAX_RULE_SERIES;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForwarderSample {
@@ -126,6 +178,7 @@ pub struct ForwarderSample {
     pub generation: u64,
     pub images_applied: u64,
     pub images_refused: u64,
+    pub policy: PolicySample,
     pub tap: TapSample,
     pub log: LogSample,
 }
@@ -209,6 +262,20 @@ impl ForwarderSample {
             &[
                 Label::new("pipeline", "0"),
                 Label::new("reason", "no_neighbour"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "policy_denied"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "no_policy_match"),
             ],
         ),
         s(
@@ -354,6 +421,20 @@ impl ForwarderSample {
             ],
         ),
         s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "policy_denied"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "no_policy_match"),
+            ],
+        ),
+        s(
             &ROUTE_STAGE_DROPS,
             &[
                 Label::new("pipeline", "1"),
@@ -421,6 +502,12 @@ impl ForwarderSample {
         plain(&CONFIGURATION_GENERATION),
         s(&CONFIGURATION_IMAGES, &[Label::new("outcome", "applied")]),
         s(&CONFIGURATION_IMAGES, &[Label::new("outcome", "refused")]),
+        // The filter's own totals. No `pipeline` label: one stage serves both
+        // directions, so there is no per-direction number to report.
+        s(&POLICY_PACKETS, &[Label::new("verdict", "accepted")]),
+        s(&POLICY_PACKETS, &[Label::new("verdict", "denied")]),
+        s(&POLICY_BYTES, &[Label::new("verdict", "accepted")]),
+        s(&POLICY_BYTES, &[Label::new("verdict", "denied")]),
         plain(&TAP_OBSERVATIONS),
         s(&TAP_OBSERVATIONS_LOST, &[Label::new("reason", "ring_full")]),
         s(
@@ -431,9 +518,13 @@ impl ForwarderSample {
         plain(&LOG_RECORDS_REFUSED),
     ];
 
+    /// Every slot this domain publishes: the table above in [`SERIES`] order,
+    /// then the per-rule block at [`RULE_HITS_BASE`].
+    ///
+    /// [`SERIES`]: ForwarderSample::SERIES
     #[must_use]
-    pub fn values(&self) -> [u64; FORWARDER_SLOTS] {
-        let mut values = [0u64; FORWARDER_SLOTS];
+    pub fn values(&self) -> [u64; FORWARDER_SHARD_SLOTS] {
+        let mut values = [0u64; FORWARDER_SHARD_SLOTS];
         let mut at = 0;
         for pipeline in &self.pipelines {
             put(&mut values, &mut at, pipeline.forwarded);
@@ -443,11 +534,19 @@ impl ForwarderSample {
         put(&mut values, &mut at, self.generation);
         put(&mut values, &mut at, self.images_applied);
         put(&mut values, &mut at, self.images_refused);
+        put(&mut values, &mut at, self.policy.accepted_packets);
+        put(&mut values, &mut at, self.policy.denied_packets);
+        put(&mut values, &mut at, self.policy.accepted_bytes);
+        put(&mut values, &mut at, self.policy.denied_bytes);
         put(&mut values, &mut at, self.tap.observed);
         put(&mut values, &mut at, self.tap.dropped);
         put(&mut values, &mut at, self.tap.refused);
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);
+        // The cursor has reached the end of the named table exactly, which the
+        // assertion below is what guarantees; the block that follows is placed
+        // by position rather than by the cursor because that is how it is read.
+        put_all(&mut values, &mut at, &self.policy.rule_hits);
         values
     }
 }
@@ -1164,15 +1263,22 @@ const _: () = {
     assert!(ClockSample::SERIES.len() == CLOCK_SLOTS);
     assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
 
-    // The management endpoint's table is the largest, which is the fact
-    // `crate::STATS_SLOTS` is derived from — so every table fits the shard it is
+    // The per-rule block begins exactly where the named table ends, which is
+    // what makes the two writers of a rule series — the domain that publishes by
+    // position and the renderer that reads by position — one fact.
+    assert!(RULE_HITS_BASE == ForwarderSample::SERIES.len());
+    assert!(FORWARDER_SHARD_SLOTS == RULE_HITS_BASE + MAX_RULE_SERIES);
+
+    // The forwarder's shard is the widest published set, the per-rule block
+    // putting it past the management endpoint's table, and that is the fact
+    // `crate::STATS_SLOTS` is derived from — so every set fits the shard it is
     // published into and `StatsShard::publish` can truncate without any
     // first-party caller ever reaching the truncation.
-    assert!(FORWARDER_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(MANAGEMENT_SLOTS <= FORWARDER_SHARD_SLOTS);
     assert!(DRIVER_SLOTS <= MANAGEMENT_SLOTS);
     assert!(CONSOLE_SLOTS <= MANAGEMENT_SLOTS);
     assert!(CONFIG_SLOTS <= MANAGEMENT_SLOTS);
     assert!(CLOCK_SLOTS <= MANAGEMENT_SLOTS);
     assert!(RECORDER_SLOTS <= MANAGEMENT_SLOTS);
-    assert!(MANAGEMENT_SLOTS <= crate::STATS_SLOTS);
+    assert!(FORWARDER_SHARD_SLOTS <= crate::STATS_SLOTS);
 };

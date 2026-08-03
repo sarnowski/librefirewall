@@ -343,16 +343,24 @@ nothing was staged, or the counter is exhausted). `refused` carries no reason to
 about the configuration is wrong; a *document* that is wrong is the third shape.
 
 **Rejection** — a document or an offered image was refused, naming where and why and never the
-bytes. `rejected=` is one of 30 reasons:
+bytes. `rejected=` is one of 34 reasons:
 
 | group | reasons |
 |---|---|
 | document syntax and hardening bounds (17) | `malformed`, `doctype`, `entity-declaration`, `unknown-entity-reference`, `invalid-character-reference`, `document-too-large`, `depth-exceeded`, `too-many-attributes`, `name-too-long`, `value-too-long`, `unexpected-character-data`, `duplicate-attribute`, `unknown-element`, `unknown-attribute`, `missing-element`, `missing-attribute`, `malformed-value` |
 | semantic validation over the parsed model (13) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `capacity-exceeded` |
+| a filter rule that would match nothing (4) | `prefix-not-canonical`, `port-range-reversed`, `port-criterion-on-icmp`, `icmp-type-on-non-icmp` |
 
 `capacity-exceeded` sits in the second group and not the first, which is where a reader expects a
-bound to be: a document naming more interfaces or neighbours than the handover image holds passed
-every bound its *bytes* are held to, and does not fit the model they parse into.
+bound to be: a document naming more interfaces, neighbours or rules than the handover image holds
+passed every bound its *bytes* are held to, and does not fit the model they parse into.
+
+The third group is its own because those four refusals are not about a value being wrong but about
+a rule being *inert*. A port range whose ends run backwards, a port criterion on a rule that names
+ICMP, an ICMP type on a rule that names TCP, a block written `10.0.0.5/24` when it covers
+`10.0.0.0/24` — each is a line an operator wrote believing it was in force. On an appliance that
+denies what no rule matched, the dangerous half of that belief is the `accept` that quietly matches
+nothing, so the document is refused rather than committed with a rule that cannot fire.
 
 The vocabulary is deliberately coarser than the reader's own fault tree: eighteen distinct
 unterminated, mismatched or misplaced constructs all read as `malformed`, because each is one edit

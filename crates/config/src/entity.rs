@@ -29,6 +29,7 @@ use lfw_log::{Field, Identifier, ObjectKind, Value};
 use net_headers::{Ipv4Address, MacAddress};
 
 use crate::{
+    rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction},
     value,
     xml::{Attribute, DocumentError, DocumentFault, Element},
 };
@@ -47,6 +48,12 @@ macro_rules! value_type {
     (prefix_length) => { u8 };
     (ipv4)          => { Ipv4Address };
     (mac)           => { MacAddress };
+    (interface_match) => { InterfaceMatch };
+    (address_match)   => { AddressMatch };
+    (protocol_match)  => { ProtocolMatch };
+    (port_match)      => { PortMatch };
+    (icmp_type_match) => { IcmpTypeMatch };
+    (action)          => { RuleAction };
 }
 
 /// How a value of one kind reaches a change record. Closed by construction: the
@@ -60,6 +67,12 @@ macro_rules! value_record {
     (prefix_length, $value:expr) => { Value::PrefixLength($value) };
     (ipv4, $value:expr)          => { Value::Ipv4($value) };
     (mac, $value:expr)           => { Value::Mac($value) };
+    (interface_match, $value:expr) => { $value.record() };
+    (address_match, $value:expr)   => { $value.record() };
+    (protocol_match, $value:expr)  => { $value.record() };
+    (port_match, $value:expr)      => { $value.record() };
+    (icmp_type_match, $value:expr) => { $value.record() };
+    (action, $value:expr)          => { $value.record() };
 }
 
 /// The bytes a value of one kind folds into the content hash. Every kind but an
@@ -74,6 +87,12 @@ macro_rules! value_fold {
     (prefix_length, $hash:expr, $value:expr) => { $crate::hash::fold($hash, &[$value]) };
     (ipv4, $hash:expr, $value:expr)          => { $crate::hash::fold($hash, &$value.octets()) };
     (mac, $hash:expr, $value:expr)           => { $crate::hash::fold($hash, &$value.0) };
+    (interface_match, $hash:expr, $value:expr) => { $value.fold($hash) };
+    (address_match, $hash:expr, $value:expr)   => { $value.fold($hash) };
+    (protocol_match, $hash:expr, $value:expr)  => { $value.fold($hash) };
+    (port_match, $hash:expr, $value:expr)      => { $value.fold($hash) };
+    (icmp_type_match, $hash:expr, $value:expr) => { $value.fold($hash) };
+    (action, $hash:expr, $value:expr)          => { $value.fold($hash) };
 }
 
 /// The attribute name one role answers to. A field's is its console token, so
@@ -91,6 +110,21 @@ macro_rules! attribute_name {
 macro_rules! entity_key {
     (field($name:ident), $entry:expr)  => { $entry.$name };
     (reserved($value:expr), $entry:expr) => { $value };
+    (positional, $entry:expr) => { compile_error!("a positional object is keyed by its caller") };
+}
+
+/// The `key` accessor, for an object that has one. A positional object does
+/// not: what files its records is where it sits, which is the walk's to say and
+/// not the entry's, so it is given no accessor to be asked for one by mistake.
+macro_rules! entity_key_fn {
+    (positional) => {};
+    ($role:ident ($($arg:tt)*)) => {
+        /// The identifier every change record about this object is keyed
+        /// on, and the one an operator edits it by.
+        pub(crate) const fn key(&self) -> Identifier {
+            $crate::entity::entity_key!($role($($arg)*), self)
+        }
+    };
 }
 
 /// One change record's worth of a field, or nothing at all where the role
@@ -124,7 +158,7 @@ macro_rules! configuration_entity {
     (
         $(#[$entity_meta:meta])*
         $entity:ident reads $element:literal as $object:expr,
-            keyed by $keyrole:ident($($keyarg:tt)*), marked $mark:literal {
+            keyed by $keyrole:ident$(($($keyarg:tt)*))?, marked $mark:literal {
             $(
                 $(#[$field_meta:meta])*
                 @$role:ident $(($($role_arg:tt)*))? $field:ident: $kind:ident,
@@ -181,11 +215,7 @@ macro_rules! configuration_entity {
                 })
             }
 
-            /// The identifier every change record about this object is keyed
-            /// on, and the one an operator edits it by.
-            pub(crate) const fn key(&self) -> Identifier {
-                $crate::entity::entity_key!($keyrole($($keyarg)*), self)
-            }
+            $crate::entity::entity_key_fn!($keyrole $(($($keyarg)*))?);
 
             /// What this object says about one field, or `None` where it has no
             /// such field. Answering per field rather than per position is what
@@ -251,6 +281,29 @@ configuration_entity! {
     }
 }
 
+configuration_entity! {
+    /// One `<rule>`: one line of the filter policy, keyed by the id its metric
+    /// is labelled with.
+    ///
+    /// Every criterion is required and the wildcard is spelled `any`, so a rule
+    /// says in full what it matches. A `<rules>` section's order is the policy —
+    /// first match wins — which is why this is the one object whose place in
+    /// the document means something.
+    RuleEntry reads b"rule" as ObjectKind::Rule,
+        keyed by positional, marked 0x04 {
+        @field(Id) id: identifier,
+        @field(Ingress) ingress: interface_match,
+        @field(Egress) egress: interface_match,
+        @field(Source) source: address_match,
+        @field(Destination) destination: address_match,
+        @field(Protocol) protocol: protocol_match,
+        @field(SourcePort) source_port: port_match,
+        @field(DestinationPort) destination_port: port_match,
+        @field(IcmpType) icmp_type: icmp_type_match,
+        @field(Action) action: action,
+    }
+}
+
 /// Parse one attribute's value, reporting a refusal at the value rather than at
 /// the element: the byte an operator has to go and look at is the one that did
 /// not parse.
@@ -284,7 +337,9 @@ pub(crate) fn unknown_attribute(attribute: &Attribute<'_>) -> DocumentError {
     }
 }
 
-pub(crate) use {attribute_name, entity_key, field_probe, value_fold, value_record, value_type};
+pub(crate) use {
+    attribute_name, entity_key, entity_key_fn, field_probe, value_fold, value_record, value_type,
+};
 
 #[cfg(test)]
 mod tests;

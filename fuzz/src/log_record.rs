@@ -119,7 +119,7 @@ const DETAIL_MEDIUM: u8 = 6;
 const DETAIL_EXTENT: u8 = 7;
 const DETAIL_COUNT: u8 = 8;
 
-/// The nine `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
 const VALUE_PORT: u8 = 1;
 const VALUE_IPV4: u8 = 2;
@@ -129,7 +129,12 @@ const VALUE_BOOL: u8 = 5;
 const VALUE_GENERATION: u8 = 6;
 const VALUE_COUNT_KIND: u8 = 7;
 const VALUE_ID: u8 = 8;
-const VALUE_KIND_COUNT: u8 = 9;
+/// A filter rule's criterion token, carried in the identifier field.
+const VALUE_SELECTOR: u8 = 9;
+/// A filter rule's address block: the network in the first four octets and the
+/// prefix length in `number`.
+const VALUE_PREFIX: u8 = 10;
+const VALUE_KIND_COUNT: u8 = 11;
 
 /// How many operands the record's array holds, which is what an
 /// `operand_count` past it names storage beyond.
@@ -578,7 +583,13 @@ fn keep_only_named_value_fields(value: &ValueImage) -> ValueImage {
         // would be an address nobody configured.
         VALUE_IPV4 => kept.octets[..IPV4_OCTETS].copy_from_slice(&value.octets[..IPV4_OCTETS]),
         VALUE_MAC => kept.octets = value.octets,
-        VALUE_ID => kept.id = value.id,
+        VALUE_ID | VALUE_SELECTOR => kept.id = value.id,
+        // Both halves of a block, and neither of the two octets a MAC adds: a
+        // network decoded out of those would be a block nobody wrote.
+        VALUE_PREFIX => {
+            kept.number = value.number;
+            kept.octets[..IPV4_OCTETS].copy_from_slice(&value.octets[..IPV4_OCTETS]);
+        }
         _ => {}
     }
     kept
@@ -752,7 +763,11 @@ fn text_refusal<const N: usize>(
 fn value_refusal(value: &ValueImage, which: LogText) -> Option<LogRecordError> {
     match value.kind {
         VALUE_ABSENT | VALUE_IPV4 | VALUE_MAC | VALUE_GENERATION | VALUE_COUNT_KIND => None,
-        VALUE_PORT | VALUE_PREFIX_LENGTH => narrowing_refusal(value.number, which),
+        // A prefix's length is narrowed exactly as a standalone one is: the same
+        // byte on the console, so the same refusal for a word that does not fit.
+        VALUE_PORT | VALUE_PREFIX_LENGTH | VALUE_PREFIX => {
+            narrowing_refusal(value.number, which)
+        }
         // The narrowing first and the boolean second: 256 does not fit the byte
         // a `Bool` is carried in, and 2 fits it and is still no boolean.
         VALUE_BOOL => narrowing_refusal(value.number, which).or_else(|| {
@@ -761,7 +776,7 @@ fn value_refusal(value: &ValueImage, which: LogText) -> Option<LogRecordError> {
                 number: value.number,
             })
         }),
-        VALUE_ID => text_refusal(&value.id, which, false),
+        VALUE_ID | VALUE_SELECTOR => text_refusal(&value.id, which, false),
         kind => Some(LogRecordError::ValueKindUnknown { text: which, kind }),
     }
 }

@@ -188,7 +188,9 @@ const fn offset(error: ConfigError) -> u32 {
 /// operator has to fix, so it is reported in the document's vocabulary.
 const fn build_rejection(error: BuildError) -> RejectReason {
     match error {
-        BuildError::UnresolvedInterface { .. } => RejectReason::UnknownInterfaceReference,
+        BuildError::UnresolvedInterface { .. } | BuildError::UnresolvedRuleInterface { .. } => {
+            RejectReason::UnknownInterfaceReference
+        }
     }
 }
 
@@ -209,7 +211,7 @@ mod tests {
     /// A document naming no object at all — every section present and empty,
     /// which is what generation 0 already is.
     const EMPTY: &str = concat!(
-        "<configuration><interfaces/><neighbours/>",
+        "<configuration><interfaces/><neighbours/><rules/>",
         "<management enabled=\"false\" mac=\"52:54:00:12:34:52\" ",
         "address=\"192.168.42.15\" prefix-length=\"24\"/>",
         "</configuration>"
@@ -225,7 +227,7 @@ mod tests {
         "address=\"10.0.0.1\" prefix-length=\"24\"/>",
         "</interfaces><neighbours>",
         "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>",
-        "</neighbours>",
+        "</neighbours><rules/>",
         "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
         "</configuration>"
     );
@@ -349,7 +351,7 @@ mod tests {
             ("<configuration>", RejectReason::Malformed),
             ("<!DOCTYPE x><configuration/>", RejectReason::Doctype),
             (
-                "<configuration><interfaces/><neighbours/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/><extra/></configuration>",
+                "<configuration><interfaces/><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/><extra/></configuration>",
                 RejectReason::UnknownElement,
             ),
         ];

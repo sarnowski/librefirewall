@@ -23,8 +23,12 @@ as one operation that cannot be performed in part. `crates/routing` holds the fo
 answers lookups against it — which interface a port has, which prefix covers a destination, which
 neighbour holds a MAC, which addresses are the appliance's own — and reaches no verdict itself.
 `crates/pipeline` is the chain that does: link-layer admission first, then the forwarding decision,
-each a concrete stage called in a fixed order, ending in a verdict that is either a forward out of a
-named port under a named MAC pair or one of eleven named drop reasons, each with its own counter.
+then the filter, each a concrete stage called in a fixed order, ending in a verdict that is either a
+forward out of a named port under a named MAC pair or one of thirteen named drop reasons, each with
+its own counter. The middle stage is no longer terminal: it attaches the egress port and the MAC
+pair it worked out to the frame under inspection and defers, so the stage behind it can read where a
+frame *would* go without re-deriving it, and the forwarding verdict is composed once, at the end of
+the chain, out of a decision taken in the middle of it.
 The order is compiled in and the tables the stages consult are data. `pd_runtime::RouteStage` joins
 all three to the dataplane — snapshot the frame out of the pool, put it through the chain, rewrite,
 and write back the 34 header bytes — and marks every frame it refuses `Verdict::Discard` so the
@@ -52,7 +56,8 @@ target (`route_frame`) whose input is the frame itself.
   domain on that path can originate a frame at all. Giving a dataplane port an ARP cache and an ICMP
   responder means giving the forwarder a pool it owns, which is a capability change and not a code
   one.
-- **Interfaces, neighbours and the management port are all that is configurable.** They come from
+- **Interfaces, neighbours, the management port and the filter rules are all that is
+  configurable.** They come from
   `systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
   now the single source of the appliance's addressing: the MAC QEMU gives each guest NIC and the
   endpoints the system test states its contract between are both read out of it
@@ -66,17 +71,100 @@ target (`route_frame`) whose input is the frame itself.
   ingress, and traffic that would have needed the default route is `no_route`.
 - **IPv4 only, and no options**: `IHL != 5` is refused rather than skipped, IPv6 is absent, and a
   VLAN tag is parsed but never acted on — a tagged frame is dropped for want of a sub-interface.
-- **The L4 header is annotation, and nothing reads it yet.** The UDP, TCP and ICMP headers behind
-  IPv4 are parsed — ports, TCP flags, sequence and data offset, ICMP type and code — and every
-  field reaches a caller exactly as it was sent. Nothing is validated: a TCP data offset below five
-  or naming more than the segment carries, a UDP length contradicting the datagram, an ICMP
-  checksum that does not verify are all surfaced rather than refused, and a datagram too short for
-  the header it claims reports how few bytes there were. None of them can make a frame unroutable,
-  because judging them would perform the receiving endpoint's check for it — and because there is
-  no filtering stage to consume them: they exist so that one can be written, and today the fields
-  are read and dropped.
+- **The L4 header is read by the filter and validated by nobody.** The UDP, TCP and ICMP headers
+  behind IPv4 are parsed — ports, TCP flags, sequence and data offset, ICMP type and code — and
+  every field reaches a caller exactly as it was sent. The filter now consumes the ports and the
+  ICMP type (see *[Stateless filtering](#stateless-filtering)*); the flags, the sequence number and
+  the code reach nothing. Nothing is validated: a TCP data offset below five or naming more than the
+  segment carries, a UDP length contradicting the datagram, an ICMP checksum that does not verify
+  are all surfaced rather than refused, and a datagram too short for the header it claims reports
+  how few bytes there were. None of them can make a frame unroutable, because judging them would
+  perform the receiving endpoint's check for it.
 - **No fragment reassembly.** A non-initial fragment is forwarded without a transport header being
   read, which is correct for routing and insufficient for anything that must see the whole datagram.
+
+## Stateless filtering
+
+**What exists.** A `<rules>` section in the configuration document, and a terminal stage at the end
+of `crates/pipeline` that decides every frame against it. A rule names ten things — an id, the
+ingress and egress interface, the source and destination CIDR block, the protocol, the source and
+destination port or inclusive port range, the ICMP type, and `accept` or `drop` — and every one of
+them is **required**, with the wildcard written `any`. Nothing is optional, because on a device whose
+whole job is to decide what may pass, a criterion that widened itself by being left out is the one
+defaulting mistake worth designing the schema around.
+
+**Default deny is a property of the code, not of a document.** The stage answers a frame no rule
+matched by dropping it, and there is no `<rules>` section an operator can write that changes that:
+the fallthrough is not a rule, so it cannot be reordered, matched around, or overridden. An empty
+`<rules/>` forwards nothing, and that is the posture a node runs in on generation 0 — before any
+document has been committed and after one has been refused.
+
+**The two refusals stay separate findings.** `policy_denied` is a rule that said drop and
+`no_policy_match` is the fallthrough, each with its own drop reason, its own counter, and its own
+encoding in the recording tap — so an operator reading a refusal can tell "your rule did this" from
+"nothing you wrote covered this", which are different things to go and fix.
+
+**First match wins in document order**, so a rule's line number is its precedence and the `<rules>`
+section is the one element of the document whose order means something. The walk is bounded by the
+rules the running generation declared rather than by the 256 slots the ABI holds, so an eight-rule
+policy costs eight comparisons.
+
+**A criterion cannot be satisfied by a header nobody read.** A truncated UDP, TCP or ICMP header, a
+non-initial fragment, and a protocol this build does not break down all carry no port and no ICMP
+type — and a rule *stating* a port or type criterion matches none of them, however wide the range.
+That is the direction that matters on a default-deny appliance: such a packet falls to the next rule
+and past the last of them to the deny, rather than being carried through an `accept` written for a
+port that was never parsed. It is a single exhaustive match over the parsed transport with no
+fallthrough arm, so a transport shape added to the parser stops compiling here rather than silently
+joining the group that answers nothing.
+
+**Twelve of the forty-one configuration rules are the filter's**, and four of them exist because a
+rule that matches nothing is more dangerous than a rule that is wrong: a port range whose ends run
+backwards, a port criterion on a rule naming ICMP, an ICMP type on a rule naming another protocol,
+and a block written with host bits set are each refused rather than committed, because each is a
+line an operator wrote believing it was in force — and the dangerous half of that belief is the
+`accept` that quietly matches nothing. The other eight are the shapes: the count against the ABI's
+256 slots, a well-formed and unique id, a known action, every criterion stated, an ingress and an
+egress that resolve to a configured port, and a prefix length inside 32. All twelve are re-decided
+over the byte image by the forwarder itself, like every other rule.
+
+**Every rule carries its own hit counter on `/metrics`**, labelled with the id the document gave
+it — one series per rule the running generation declares and none for a slot it does not. The count
+comes from the forwarding domain's own shard and the label from the configuration the management
+domain maps read-only, joined on the rule's position, so a hit is a number only the forwarder could
+have written under a name only an operator could have chosen. Beside them the filter publishes what
+it decided in total, packets and datagram bytes, split by verdict.
+
+Held by unit and property tests in `crates/pipeline` covering every criterion against a matching and
+a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
+prefix length names, and all five unreadable transport shapes against all four port and type
+criteria; by the differential configuration tests that put an image breaking each of the twelve rules
+through both sides; and by two QEMU scenarios that inject three probes differing only in destination
+port and hold the three outcomes apart on the wire, by drop reason, and by per-rule counter — one
+against each of the two documents, whose policies name different ports under different ids.
+
+**Missing.**
+
+- **No state, so no rule about a flow.** There is no connection tracking, which means a reply is
+  permitted only by a rule naming it in its own right — an `accept` outbound needs its inbound
+  counterpart written out, and there is no `established` criterion to write instead. The pipeline
+  reserves the stage position for it, between the forwarding decision and the filter, so that a flow
+  a tracker already accounts for never reaches a rule.
+- **No `reject`.** A rule drops or accepts; it cannot answer an ICMP error. The forwarding domain
+  owns no buffer pool it may allocate from — it forwards what arrived or it does not — so an action
+  it could not carry out has no representation in the model rather than an unimplemented arm.
+- **No zones and no interface groups.** A rule names one interface or `any`; there is no way to name
+  a set of them, so a policy over six ports is written out per port.
+- **No logging per rule.** A rule cannot ask for its matches to be recorded. Every decision reaches
+  the recording tap regardless, with its reason, and the per-rule counters are the only per-rule
+  signal.
+- **No policy change without a reboot.** The `<rules>` section shares the configuration domain's one
+  limitation: the document is compiled into the image, so a policy change is a new image (see
+  *[Configuration management](#configuration-management)*).
+- **Nothing is measured.** `crates/pd-runtime`'s benchmarks now time a frame the filter permits, one
+  it denies and one the router refuses, so the cost of consulting a policy is *measurable* — but the
+  ruleset those benchmarks use is one wildcard rule, and no measurement exists of a realistic table
+  or of how the walk scales across it.
 
 ## Zero-copy dataplane
 
@@ -353,10 +441,12 @@ and wall-clock times. An independent parse of the two files established:
   connection events, no flow identity, no application stack and no deny coalescing, so both
   recordings hold every dataplane observation and one merely keeps less of each frame. The
   annotation carries a version byte precisely so the record can grow when they land.
-- **No filtering.** The capture sink of the [recording design](../design/recording.md) is filtered
-  by design and this one is unfiltered and on by default, which is development state rather than a
-  shipping posture: a deployed node would record every packet crossing it, indefinitely, with no way
-  to say otherwise.
+- **No recording selector.** The capture sink of the [recording design](../design/recording.md)
+  records the flows a selector picks out; this one records everything the dataplane decided on, which
+  is development state rather than a shipping posture: a deployed node would record every packet
+  crossing it, indefinitely, with no way to say otherwise. The filter rules are not that selector and
+  cannot stand in for one — they decide what the appliance *forwards*, and a packet a rule dropped is
+  recorded with its refusal exactly as a forwarded one is.
 - **No TLS and no authentication in front of either download.** This is the pre-existing deviation
   from the [management design](../design/management.md) ([detail](#full-port-role-model)), and
   recording makes it far more consequential: it used to expose counters, and it now hands anyone who
@@ -445,16 +535,17 @@ model — so a syntax rule cannot come to depend on an address and a topology ru
 depend on where in the file something was written. Each configurable object is declared once —
 its value, the attributes a reader accepts for it, the change records it produces and the bytes it
 folds into a content hash all come from that one list, so an attribute cannot be added to the
-reader and forgotten by the hash. Twenty-three semantic rules then run over the
+reader and forgotten by the hash. Forty-one semantic rules then run over the
 model: a duplicate interface id, neighbour id, port or interface MAC; a port the build does not
 have; a prefix length past 32; an address that is its own prefix's network or broadcast address, on
 an interface or on a neighbour; a non-unicast address or MAC on either object; overlapping
 prefixes; a neighbour naming an unknown interface, or sitting outside its interface's prefix, or
-equal to the interface's own address; a duplicate neighbour address on one interface; and six over
+equal to the interface's own address; a duplicate neighbour address on one interface; six over
 the `<management>` element, which is held to the same field rules as an interface *and* to
 colliding with no dataplane prefix and no dataplane MAC —
 because one address reachable both by routing and by local termination is not something the grant set
-can express. A document naming more objects than the handover ABI can carry is refused by the reader
+can express; and twelve over the `<rules>` section, which are described with
+*[Stateless filtering](#stateless-filtering)*. A document naming more objects than the handover ABI can carry is refused by the reader
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
 bytes, so attacker-supplied content never reaches an observability surface.
 
@@ -492,9 +583,11 @@ regions are separate and mirrored (`cfg` read-write here and read-only there, `c
 so neither domain can forge the other's half. Its layout — the `#[repr(C)]` value a reader copies
 out, the atomic mirror a writer stores through, and the offset assertions that hold the two
 byte-identical — comes from one declaration per object, so a mirror cannot drift from the image it
-mirrors. `cfg` is reserved at four pages rather than the one its 840 bytes need, because its size is
-the one thing in the system description that cannot be changed locally: it is mapped at a fixed
-virtual address in three domains, and everything behind it in that window moves when it grows.
+mirrors. `cfg` is reserved at eight pages rather than the four its 14,156 bytes need, because its
+size is the one thing in the system description that cannot be changed locally: it is mapped at a
+fixed virtual address in three domains, and everything behind it in that window moves when it grows.
+The 256 rule slots are what took it from one page to four; the reservation was doubled at the same
+time so the next object to be configured is a table entry rather than a re-lay of that window.
 
 The image has **two readers with different authority**, which is the shape a second consumer takes
 here. The forwarder is the *consumer* of that handover — it reads the offered generation,
@@ -505,7 +598,7 @@ anybody's behalf, or forge the acknowledgement that releases one.
 
 `pd_runtime::ConfigurationSwitch` is the consumer. It treats the region as a byzantine peer's
 claim — copies the image out before deciding on it, exactly as `RouteStage` snapshots a frame, and
-then re-decides the rules itself, in `wire::ConfigImage::check`. **It now re-decides all 23**, at
+then re-decides the rules itself, in `wire::ConfigImage::check`. **It now re-decides all 41**, at
 the validating domain's own strength on all but the two named below, and in a stated order so an
 image breaking several is attributed to the first: the two counts against capacity; then per
 interface the `enabled` byte, a port this build has, a prefix length past 32, a unicast MAC, a
@@ -582,8 +675,8 @@ document that shares no address and no MAC with the first.
   [configuration design](../design/configuration.md) intends needs a pair; the handover protocol is
   written for exactly one consumer, and "every consumer has staged" is one comparison rather than a
   conjunction.
-- **Only interfaces, neighbours and the management port are configurable.** No routes, no policy,
-  no zones, no NAT — none of which exist to configure. Queue depths, pool sizes and buffer extents
+- **Only interfaces, neighbours, the management port and the filter rules are configurable.** No
+  routes, no zones, no NAT — none of which exist to configure. Queue depths, pool sizes and buffer extents
   are deliberately *not* runtime configuration: they are memory-region extents fixed in the system
   description, which is where the [configuration design](../design/configuration.md) draws the line
   at hardware, and moving one would move a capability grant.
@@ -1022,13 +1115,16 @@ established one.
 
 ## Prometheus metrics
 
-**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 77
-metric families and 263 counter and gauge series, plus one info series per configured interface —
-covering every one of the nine protection domains. Its worst case is computed from the catalogue at
-build time (`MAX_EXPOSITION_LEN`, 42 142 bytes), which is what the response staging buffer behind
-the endpoint is sized from, so a scrape can never be short. The end-to-end gate scrapes it with
-`curl` off a booted release image and cross-checks a number in it against traffic the harness
-watched cross the wire itself.
+**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 80
+metric families and 271 counter and gauge series, plus one info series per configured interface and
+one hit counter per rule the running policy declares — covering every one of the nine protection
+domains. Its worst case is computed from the catalogue at build time (`MAX_EXPOSITION_LEN`,
+68 016 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
+scrape can never be short. That bound is dominated by the rules: it covers a policy naming all 256
+the configuration accepts, so it is sized by what an operator is entitled to write rather than by
+what a node happens to be running. The end-to-end gate scrapes it with `curl` off a booted release
+image and cross-checks two numbers in it against traffic the harness watched cross the wire
+itself — the frames the appliance forwarded, and the hits against the rule that permitted them.
 
 **A per-NIC series is joinable to the interface a configuration document names.** Every counter
 family carries `domain`, the protection domain that produced it, and `domain="nic_driver0"` is a name
@@ -1049,10 +1145,23 @@ configuration image it already reads, and the port-to-driver mapping the join ke
 of the system description that `xtask::sysdesc` now checks at build time rather than a comment
 delegating it to a caller.
 
+**A per-rule series is joinable the same way, and by the same argument.** The per-rule hit counters
+sit in the forwarding domain's own shard, indexed by a rule's position in the running generation, and
+the `rule` label is the id out of the configuration image the management domain maps read-only —
+joined on the position. So a hit is a number only the forwarder could have written under a name only
+an operator could have chosen, which is the `domain` label's argument one level finer. A position no
+generation declared reaches no series at all: a counter under nobody's name is not something to
+expose.
+
 The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
-shared table. A shard is a 768-byte, cache-line aligned array of 96 `AtomicU64` slots, mapped
+shared table. A shard is a 2,688-byte, cache-line aligned array of 336 `AtomicU64` slots, mapped
 read-write into the one domain that owns it and read-only into the management domain; slot order is
-the catalogue's series order, asserted statically. So a domain publishes by relaxed store into memory
+the catalogue's series order, asserted statically. Every shard is that wide because the widest set a
+domain publishes — the forwarder's, whose per-rule block reserves one slot per rule the ABI admits —
+is what the width is derived from, and it costs nothing: a shard is its own region and a region is a
+page, so the reservation was already a page before the block existed. A second region carrying the
+rule counters alone would have bought back no memory and added a mapping to the domain that faces the
+management-plane attacker. So a domain publishes by relaxed store into memory
 nobody else may write, and the management domain renders by reading nine regions — no lock, no
 barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are individually
 meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
@@ -1298,7 +1407,7 @@ and a write each terminate within their advertised bound for *any* sequence of d
 representable, `pop` minting a non-`Copy`, non-`Clone` `OwnedBuffer` token.
 
 Every rejection is a **counted drop**, never a fault: `PoolCounters` and `RouteCounters` record
-them, the latter attributing every refused frame to one of the eleven named pipeline reasons or to
+them, the latter attributing every refused frame to one of the thirteen named pipeline reasons or to
 the stage check that caught it. `ConfigCounters` does the same for the handover, so a publisher offering
 images this domain will not run is distinguishable from one that has stopped offering any.
 Descriptors from a peer are range-validated (`descriptor_in_bounds`, plus the transmit header-room

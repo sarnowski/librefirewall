@@ -321,20 +321,23 @@
          page it costs.
 
          `cfg` IS THE ONE REGION HERE RESERVED PAST WHAT IT HOLDS. `ConfigHandover`
-         is 840 bytes and would round to a single page; four are reserved,
+         is 14156 bytes and would round to four pages; eight are reserved,
          because this region's size is the one thing in this file that cannot be
          changed locally. It is mapped at a FIXED VIRTUAL ADDRESS in three
          domains, and every region behind it in that window moves when it grows
-         — so a configuration image that outgrew one page would re-lay an address
-         map three protection domains have to agree on, in the same change as
-         whatever grew it. Four pages is the reservation `wire` states and this
-         file states the consequence of: `cfgack` and `clock` sit at
-         0x3_004_000 and 0x3_005_000 rather than one page apart, and the window
-         from 0x3_000_000 is claimed to 0x3_006_000.
+         — so a configuration image that outgrew its pages would re-lay an
+         address map three protection domains have to agree on, in the same
+         change as whatever grew it. That has now happened once: the filter's 256
+         rule slots took the image from 840 bytes to 14156, and the reservation
+         went from four pages to eight in the same change, so the next entity to
+         be configured lands inside a map already laid. Eight pages is the
+         reservation `wire` states and this file states the consequence of:
+         `cfgack` and `clock` sit at 0x3_008_000 and 0x3_009_000 rather than one
+         page apart, and the window from 0x3_000_000 is claimed to 0x3_00a_000.
 
          Neither carries phys_addr; see the address-map block above on why that
          is the stronger position for a region no device is told about. -->
-    <memory_region name="cfg" size="0x4000" />
+    <memory_region name="cfg" size="0x8000" />
     <memory_region name="cfgack" size="0x1000" />
 
     <!-- THE CLOCK CALIBRATION, and the first region in this system published
@@ -652,8 +655,12 @@
          Size is `lfw_metrics::STATS_REGION_SIZE`, the type's `size_of` rounded
          up to the mapping granularity, on the same footing as every constant
          above and held to it the same way — `xtask::sysdesc` carries a rule per
-         region and compares it. A `StatsShard` is 768 bytes, so each rounds to
-         one page and the nine cost 36 KiB.
+         region and compares it. A `StatsShard` is 2688 bytes, so each rounds to
+         one page and the nine cost 36 KiB. It grew from 768 with the filter, and
+         the page count did not: the shard is sized by the widest set a domain
+         publishes, and the forwarder's now reserves one slot per rule the
+         configuration ABI admits — which is why a second region for those
+         counters would have bought back nothing and added a mapping here.
 
          None carries phys_addr, for the reason the address-map block above gives
          for `cfg`: no device DMAs into a shard, so no domain needs its physical
@@ -726,7 +733,7 @@
          on a ring the recorder is free to refuse and can do nothing else: it
          cannot write a sector, cannot read what has been recorded, and cannot
          see or answer a download. -->
-    <protection_domain name="forwarder" priority="2" stack_size="0x4000">
+    <protection_domain name="forwarder" priority="2" stack_size="0x20000">
         <program_image path="forwarder.elf" />
         <map mr="fwd0" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="fwd0_vaddr" />
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="fwd1_vaddr" />
@@ -735,8 +742,8 @@
         <map mr="tap" vaddr="0x2_400_000" perms="rw" cached="true" setvar_vaddr="tap_vaddr" />
         <map mr="tap_consume" vaddr="0x2_500_000" perms="r" cached="true" setvar_vaddr="tap_consume_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
-        <map mr="cfgack" vaddr="0x3_004_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="cfgack" vaddr="0x3_008_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_forwarder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -769,12 +776,26 @@
          priority in the system cannot starve the dataplane.
 
          cached="true" on both, as everywhere: they are ordinary memory shared
-         between two domains and no device decodes them. -->
-    <protection_domain name="config" priority="3" stack_size="0x10000">
+         between two domains and no device decodes them.
+
+         ITS STACK IS THE LARGEST OF ANY DOMAIN HOLDING NO FRAME BUFFER, and for
+         a reason that is not obvious from what it maps: a commit has three whole
+         configuration models live at once — the datastore's running and candidate
+         pair, and the one staging hands back — plus the byte image built from the
+         third, and every one of them carries the 256 rule slots the filter added.
+         That took the peak past 0x10000 and faulted this domain on the release
+         image with `potential stack overflow, fault address within one page
+         outside of stack region`, leaving the appliance permanently on generation
+         0. `pd_runtime`'s
+         `the_configuration_domains_state_fits_the_stack_it_is_declared_with`
+         holds the number below to those four types, so the next entity added to a
+         configuration fails a host test rather than a boot. Memory rather than
+         authority: nothing this domain may reach changes. -->
+    <protection_domain name="config" priority="3" stack_size="0x40000">
         <program_image path="config-pd.elf" />
         <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
-        <map mr="cfgack" vaddr="0x3_004_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="cfgack" vaddr="0x3_008_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_config" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -873,7 +894,7 @@
         <program_image path="clock.elf" />
         <ioport id="0" addr="0x70" size="2" />
         <map mr="hpet" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="hpet_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="rw" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="rw" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_clock" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_clock_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_clock" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -1003,21 +1024,27 @@
          the reply composed into storage of its own, the pool exposing no safe
          path to its bytes), a request slot of `lfw_http::MAX_REQUEST_BYTES` per
          connection, one `lfw_ip_endpoint::http::RESPONSE_CAPACITY` staging
-         buffer — about 38 KiB, because a Prometheus exposition of this node's
+         buffer — about 67 KiB, because a Prometheus exposition of this node's
          whole metric catalogue is that big and a response composed anywhere else
          could not be retransmitted — and, since recordings became downloadable,
          one `wire::DOWNLOAD_WINDOW_LEN` window of 32 KiB, which is where a
-         recorder's reply is copied before the transport takes it.
+         recorder's reply is copied before the transport takes it. Beside the
+         handler, and not in it, a `lfw_metrics::Snapshot` of about 29 KiB: every
+         shard read whole, once per scrape, in the frame that renders it.
 
-         THE NUMBER DOUBLED BECAUSE THE MEASURED PEAK OVERRAN THE OLD ONE. With
-         the download window added, `init` builds roughly 90 KiB of value and
-         moves it into place twice on the way out of the function, and 0x40000
-         was not enough: the release image faulted the domain with
-         `potential stack overflow, fault address within one page outside of
-         stack region`, and the appliance stopped forwarding. Half a mebibyte
-         leaves the margin an unmeasured peak needs; it is memory rather than
-         authority, and no other domain's stack moves. -->
-    <protection_domain name="management" priority="2" stack_size="0x80000">
+         THE NUMBER HAS DOUBLED TWICE, BOTH TIMES BECAUSE THE MEASURED PEAK
+         OVERRAN THE OLD ONE, and both times the same way: the release image
+         faulted the domain with `potential stack overflow, fault address within
+         one page outside of stack region` and the appliance stopped forwarding.
+         The download window took it past 0x40000; the filter took it past
+         0x80000, because one rule series per rule the ABI admits grew both the
+         staging buffer and the snapshot, and `init` moves the handler into place
+         more than once on the way out of the function. A mebibyte leaves the
+         margin an unmeasured peak needs, and
+         `pd_runtime`'s `the_management_domains_state_fits_the_stack_it_is_declared_with`
+         is what will fail before a boot does next time. It is memory rather than
+         authority: no mapping, no grant and no other domain's stack moves. -->
+    <protection_domain name="management" priority="2" stack_size="0x100000">
         <program_image path="management.elf" />
         <map mr="mgmt_rx_fwd" vaddr="0x2_000_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_fwd_vaddr" />
         <map mr="mgmt_rx_free" vaddr="0x2_002_000" perms="rw" cached="true" setvar_vaddr="mgmt_rx_free_vaddr" />
@@ -1028,7 +1055,7 @@
         <map mr="dl_request" vaddr="0x2_600_000" perms="rw" cached="true" setvar_vaddr="dl_request_vaddr" />
         <map mr="dl_reply" vaddr="0x2_700_000" perms="r" cached="true" setvar_vaddr="dl_reply_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_forwarder" vaddr="0x5_000_000" perms="r" cached="true" setvar_vaddr="stats_forwarder_vaddr" />
@@ -1064,7 +1091,7 @@
         <map mr="fwd1" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free1" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool1" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver0" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver0_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver0" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -1084,7 +1111,7 @@
         <map mr="fwd0" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="free0" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="pool0" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver1" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver1_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver1" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -1120,7 +1147,7 @@
         <map mr="mgmt_tx_fwd" vaddr="0x2_100_000" perms="rw" cached="true" setvar_vaddr="tx_fwd_vaddr" />
         <map mr="mgmt_tx_free" vaddr="0x2_102_000" perms="rw" cached="true" setvar_vaddr="tx_free_vaddr" />
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="tx_pool_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_nic_driver2" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_nic_driver2_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_nic_driver2" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -1258,7 +1285,7 @@
         <map mr="tap_consume" vaddr="0x2_500_000" perms="rw" cached="true" setvar_vaddr="tap_consume_vaddr" />
         <map mr="dl_request" vaddr="0x2_600_000" perms="r" cached="true" setvar_vaddr="dl_request_vaddr" />
         <map mr="dl_reply" vaddr="0x2_700_000" perms="rw" cached="true" setvar_vaddr="dl_reply_vaddr" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_recorder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_recorder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_recorder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -1367,7 +1394,7 @@
     <protection_domain name="console" priority="1" stack_size="0x4000">
         <program_image path="console.elf" />
         <ioport id="0" addr="0x3f8" size="8" />
-        <map mr="clock" vaddr="0x3_005_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="r" cached="true" setvar_vaddr="log_forwarder_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="rw" cached="true" setvar_vaddr="log_forwarder_consume_vaddr" />
         <map mr="log_nic_driver0" vaddr="0x4_100_000" perms="r" cached="true" setvar_vaddr="log_nic_driver0_vaddr" />

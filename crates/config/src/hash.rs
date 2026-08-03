@@ -56,6 +56,11 @@ impl ContentHash {
 /// management entry last. It folds at all because a commit is keyed on this
 /// number: a document whose only edit is the management address would
 /// otherwise read as unchanged.
+///
+/// The rules are the one exception, and they are folded **in document order**
+/// for the reason they are compared that way: first match wins, so two
+/// documents holding the same rules in a different order are two policies, and
+/// a hash that sorted them would report the second as unchanged.
 #[must_use]
 pub fn content_hash(model: &Model) -> ContentHash {
     let mut hash = OFFSET_BASIS;
@@ -63,6 +68,9 @@ pub fn content_hash(model: &Model) -> ContentHash {
         hash = entry.fold(hash);
     }
     for entry in model.neighbours_by_id().iter().flatten() {
+        hash = entry.fold(hash);
+    }
+    for entry in model.rules() {
         hash = entry.fold(hash);
     }
     if let Some(entry) = model.management() {

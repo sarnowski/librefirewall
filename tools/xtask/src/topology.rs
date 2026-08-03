@@ -39,8 +39,11 @@
 
 use std::{fmt, fs, path::Path};
 
-use config::{ConfigError, Identifier, Model};
-use net_headers::{Ipv4Address, prefix_mask};
+use config::{
+    AddressMatch, ConfigError, IcmpTypeMatch, Identifier, InterfaceMatch, Model, PortMatch,
+    ProtocolMatch, RuleAction, RuleEntry,
+};
+use net_headers::{Ipv4Address, Protocol, prefix_mask};
 
 /// Dataplane ports the appliance is built with, and so the ports this harness
 /// plays a station on. A property of the build — the system description
@@ -99,6 +102,36 @@ pub(crate) struct ConfiguredInterface {
     pub(crate) mac: [u8; 6],
 }
 
+/// One rule the bench can state a probe against: it names a single UDP
+/// destination port and leaves every other criterion open, so exactly the
+/// datagrams the harness sends to that port reach its verdict and nothing else
+/// about a probe changes which rule decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PortRule {
+    /// The `<rule>` id, which is the label the appliance's own per-rule counter
+    /// carries — so a probe and the metric it is checked against name the rule
+    /// the same way, and both take the name from the document.
+    pub(crate) id: Identifier,
+    pub(crate) destination_port: u16,
+}
+
+/// The policy a filter contract can be stated against: one rule that accepts a
+/// port, one that drops another, and a third port no rule names.
+///
+/// The three outcomes a default-deny appliance owes an operator, read out of the
+/// document rather than written beside the assertion. A document whose rules are
+/// any other shape is refused by name: the harness would otherwise have to decide
+/// which rule matches a probe, which is the appliance's job and not a thing to
+/// have a second implementation of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PortPolicy {
+    pub(crate) accepted: PortRule,
+    pub(crate) denied: PortRule,
+    /// A UDP destination port neither rule names, so a datagram to it falls past
+    /// both to the default deny — which is not a rule and has no counter.
+    pub(crate) unmatched: u16,
+}
+
 /// One host station on one dataplane port: the address the harness injects as,
 /// and the address a packet routed towards it must be addressed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +161,12 @@ pub(crate) struct Topology {
     ports: [AppliancePort; PORTS],
     endpoints: [Endpoint; PORTS],
     management: ManagementPort,
+    /// The rules the document declares that are about one UDP destination port
+    /// and nothing else, in document order, each with what it does. A rule of any
+    /// other shape is *not* here, so a policy this harness cannot state a probe
+    /// against reads as the wrong number of rules rather than as a rule that
+    /// quietly decides something else.
+    rules: Vec<(RuleAction, PortRule)>,
 }
 
 impl Topology {
@@ -230,11 +269,13 @@ impl Topology {
             stations.push(endpoint);
         }
         let management = management_port(model)?;
+        let rules = model.rules().filter_map(port_rule).collect();
         match (claimed.try_into(), stations.try_into()) {
             (Ok(ports), Ok(endpoints)) => Ok(Self {
                 ports,
                 endpoints,
                 management,
+                rules,
             }),
             // Unreachable by the loop above, which pushes exactly `PORTS` of
             // each; the conversion is fallible and this is what that costs.
@@ -292,6 +333,48 @@ impl Topology {
             .any(|appliance| same_prefix(appliance.address, address, appliance.prefix_length))
     }
 
+    /// The filter policy as a bench can state three outcomes against.
+    ///
+    /// Nothing here decides which rule matches a frame — that is the appliance's
+    /// and there is one implementation of it. What this does is refuse a document
+    /// the question is ambiguous for, so that under a document it accepts the
+    /// answer is a matter of reading rather than of matching: two rules, each
+    /// naming one UDP destination port and every other criterion `any`, one
+    /// accepting and one dropping.
+    ///
+    /// # Errors
+    /// [`TopologyError`] for a policy of any other shape.
+    pub(crate) fn port_policy(&self) -> Result<PortPolicy, TopologyError> {
+        let [(first_action, first), (second_action, second)] = self.rules.as_slice() else {
+            return Err(TopologyError::PolicyIsNotTwoPortRules {
+                rules: self.rules.len(),
+            });
+        };
+        let (accepted, denied) = match (first_action, second_action) {
+            (RuleAction::Accept, RuleAction::Drop) => (*first, *second),
+            (RuleAction::Drop, RuleAction::Accept) => (*second, *first),
+            _ => {
+                return Err(TopologyError::PolicyDoesNotAcceptAndDrop);
+            }
+        };
+        if accepted.destination_port == denied.destination_port {
+            return Err(TopologyError::PolicyDecidesOnePortTwice {
+                port: accepted.destination_port,
+            });
+        }
+        // The lowest port neither rule is about. Searched rather than chosen so
+        // it stays a port of *this* document's policy: a literal would silently
+        // become one of the named ports the day somebody edited the document.
+        let unmatched = (1..=u16::MAX)
+            .find(|port| *port != accepted.destination_port && *port != denied.destination_port)
+            .ok_or(TopologyError::PolicyLeavesNoUnmatchedPort)?;
+        Ok(PortPolicy {
+            accepted,
+            denied,
+            unmatched,
+        })
+    }
+
     /// Whether `mac` belongs to anything on the bench: an appliance port, the
     /// management port, or a station on one of them.
     pub(crate) fn carries_mac(&self, mac: [u8; 6]) -> bool {
@@ -299,6 +382,39 @@ impl Topology {
             || self.endpoints.iter().any(|endpoint| endpoint.mac == mac)
             || self.management.mac == mac
     }
+}
+
+/// Read one `<rule>` as a [`PortRule`], or `None` where it is about anything
+/// besides one UDP destination port.
+///
+/// A rule that names an ingress, an address block, a source port or an ICMP type
+/// decides some frames and not others for a reason a probe would have to model,
+/// so it is dropped here — and dropping it is what makes
+/// [`Topology::port_policy`]'s refusal reachable rather than making the rule
+/// silently ignorable. `protocol` may be `any` or `udp` because every probe is a
+/// UDP datagram: either way the rule is about all of them and none of anything
+/// else the bench sends.
+fn port_rule(entry: &RuleEntry) -> Option<(RuleAction, PortRule)> {
+    let open = matches!(entry.ingress, InterfaceMatch::Any)
+        && matches!(entry.egress, InterfaceMatch::Any)
+        && matches!(entry.source, AddressMatch::Any)
+        && matches!(entry.destination, AddressMatch::Any)
+        && matches!(entry.source_port, PortMatch::Any)
+        && matches!(entry.icmp_type, IcmpTypeMatch::Any)
+        && matches!(
+            entry.protocol,
+            ProtocolMatch::Any | ProtocolMatch::Only(Protocol::UDP)
+        );
+    let PortMatch::Range { low, high } = entry.destination_port else {
+        return None;
+    };
+    (open && low == high).then_some((
+        entry.action,
+        PortRule {
+            id: entry.id,
+            destination_port: low,
+        },
+    ))
 }
 
 /// Read the `<management>` element as a bench: the port's own addressing, and the
@@ -366,6 +482,10 @@ pub(crate) enum TopologyError {
     NoManagementInterface,
     ManagementDisabled,
     ManagementPrefixHasNoStation { address: [u8; 4] },
+    PolicyIsNotTwoPortRules { rules: usize },
+    PolicyDoesNotAcceptAndDrop,
+    PolicyDecidesOnePortTwice { port: u16 },
+    PolicyLeavesNoUnmatchedPort,
 }
 
 impl fmt::Display for TopologyError {
@@ -426,6 +546,27 @@ impl fmt::Display for TopologyError {
                      beside the appliance, so there is nobody for the endpoint to answer"
                 )
             }
+            Self::PolicyIsNotTwoPortRules { rules } => write!(
+                f,
+                "{rules} of the document's rules name one UDP destination port and every other \
+                 criterion `any`, and a filter contract is stated against exactly two — one \
+                 accepting and one dropping. A rule of any other shape decides some frames and \
+                 not others for a reason a probe would have to model, and which rule matches a \
+                 frame is the appliance's to answer"
+            ),
+            Self::PolicyDoesNotAcceptAndDrop => f.write_str(
+                "both of the document's port rules take the same action, so two of the three \
+                 outcomes a filter contract is stated over cannot be told apart",
+            ),
+            Self::PolicyDecidesOnePortTwice { port } => write!(
+                f,
+                "both of the document's port rules name destination port {port}, so only the \
+                 first of them can ever match and the second's verdict is unobservable"
+            ),
+            Self::PolicyLeavesNoUnmatchedPort => f.write_str(
+                "every UDP destination port is named by a rule, so no datagram would reach the \
+                 default deny",
+            ),
         }
     }
 }
@@ -465,8 +606,13 @@ mod tests {
         "</neighbours>"
     );
 
+    /// The empty policy every bench document here carries but the ones written to
+    /// exercise [`Topology::port_policy`]. The element is required, and an empty
+    /// one forwards nothing — which is fine for a document nothing boots.
+    const NO_RULES: &str = "<rules/>";
+
     fn whole() -> Vec<u8> {
-        document(&format!("{INTERFACES}{NEIGHBOURS}{MANAGEMENT}"))
+        document(&format!("{INTERFACES}{NEIGHBOURS}{NO_RULES}{MANAGEMENT}"))
     }
 
     #[test]
@@ -530,7 +676,7 @@ mod tests {
                 "mac=\"52:54:00:00:00:0b\"/>",
                 "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
                 "mac=\"52:54:00:00:00:0a\"/>",
-                "</neighbours>"
+                "</neighbours><rules/>"
             )
         ));
         let straight = Topology::from_document(&whole()).expect("a two-port bench");
@@ -585,7 +731,7 @@ mod tests {
 
     #[test]
     fn a_document_with_no_management_interface_or_a_disabled_one_is_refused() {
-        let absent = document(&format!("{INTERFACES}{NEIGHBOURS}"));
+        let absent = document(&format!("{INTERFACES}{NEIGHBOURS}{NO_RULES}"));
         // `config` refuses it first: the element is required by the schema.
         assert!(matches!(
             Topology::from_document(&absent),
@@ -670,7 +816,7 @@ mod tests {
                 "<neighbours>",
                 "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
                 "mac=\"52:54:00:00:00:0a\"/>",
-                "</neighbours>"
+                "</neighbours><rules/>"
             )
         ));
         let error = Topology::from_document(&one_port).expect_err("port 1 is unclaimed");
@@ -686,7 +832,7 @@ mod tests {
                 "<neighbours>",
                 "<neighbour id=\"station-a\" interface=\"one\" address=\"10.0.0.2\" ",
                 "mac=\"52:54:00:00:00:0a\"/>",
-                "</neighbours>"
+                "</neighbours><rules/>"
             )
         ));
         assert_eq!(
@@ -707,7 +853,7 @@ mod tests {
                 "mac=\"52:54:00:00:00:0c\"/>",
                 "<neighbour id=\"station-b\" interface=\"two\" address=\"10.0.1.2\" ",
                 "mac=\"52:54:00:00:00:0b\"/>",
-                "</neighbours>"
+                "</neighbours><rules/>"
             )
         ));
         assert_eq!(
@@ -825,5 +971,195 @@ mod tests {
         assert_ne!(shipped.management().station, alternate.management().station);
         assert!(!shipped.carries_mac(alternate.management().mac));
         assert!(!alternate.carries_mac(shipped.management().mac));
+    }
+
+    /// A `<rules>` section of the shape a filter contract is stated against: one
+    /// accepting and one dropping rule, each about a single UDP destination port.
+    fn rules(accept: u16, drop: u16) -> String {
+        format!(
+            concat!(
+                "<rules>",
+                "<rule id=\"blocked\" ingress=\"any\" egress=\"any\" source=\"any\" ",
+                "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
+                "destination-port=\"{drop}\" icmp-type=\"any\" action=\"drop\"/>",
+                "<rule id=\"allowed\" ingress=\"any\" egress=\"any\" source=\"any\" ",
+                "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
+                "destination-port=\"{accept}\" icmp-type=\"any\" action=\"accept\"/>",
+                "</rules>"
+            ),
+            accept = accept,
+            drop = drop
+        )
+    }
+
+    /// A whole document carrying `policy` where the bench documents carry
+    /// `<rules/>`.
+    fn with_policy(policy: &str) -> Vec<u8> {
+        document(&format!("{INTERFACES}{NEIGHBOURS}{policy}{MANAGEMENT}"))
+    }
+
+    /// The shipped document's policy, read as a bench reads it: which port each
+    /// rule names, under the id the document gave it, and a port neither names.
+    #[test]
+    fn the_shipped_policy_reads_as_three_outcomes() {
+        let shipped = Topology::from_document(include_bytes!(
+            "../../../systems/qemu-x86_64/configuration.xml"
+        ))
+        .expect("the shipped document");
+        let policy = shipped.port_policy().expect("two port rules");
+        assert_eq!(policy.accepted.id.as_str(), "probe-forward");
+        assert_eq!(policy.accepted.destination_port, 5000);
+        assert_eq!(policy.denied.id.as_str(), "probe-blocked");
+        assert_eq!(policy.denied.destination_port, 5001);
+        // A port neither rule names, searched rather than chosen — so it is a
+        // port of *this* policy and cannot silently become one of the two.
+        assert_ne!(policy.unmatched, policy.accepted.destination_port);
+        assert_ne!(policy.unmatched, policy.denied.destination_port);
+
+        // And the alternate document's, which shares neither id nor port.
+        let alternate =
+            Topology::from_document(include_bytes!("../scenarios/alternate-addressing.xml"))
+                .expect("the alternate document");
+        let other = alternate.port_policy().expect("two port rules");
+        assert_ne!(policy.accepted.id, other.accepted.id);
+        assert_ne!(policy.denied.id, other.denied.id);
+    }
+
+    /// A policy of any other shape is refused by name rather than reduced to the
+    /// first two of something: which rule matches a frame is the appliance's to
+    /// answer, and this harness must not hold a second implementation of it.
+    #[test]
+    fn a_policy_no_filter_contract_can_be_stated_against_is_refused_by_name() {
+        // Too few, and too many.
+        for (policy, expected) in [
+            ("<rules/>", "0 of the document's rules"),
+            (
+                &format!(
+                    "{}{}",
+                    rules(5000, 5001).replace("</rules>", ""),
+                    concat!(
+                        "<rule id=\"third\" ingress=\"any\" egress=\"any\" source=\"any\" ",
+                        "destination=\"any\" protocol=\"udp\" source-port=\"any\" ",
+                        "destination-port=\"5002\" icmp-type=\"any\" action=\"drop\"/>",
+                        "</rules>"
+                    )
+                ),
+                "3 of the document's rules",
+            ),
+        ] {
+            let topology = Topology::from_document(&with_policy(policy)).expect("a valid document");
+            let verdict = topology
+                .port_policy()
+                .expect_err("a policy of the wrong size")
+                .to_string();
+            assert!(verdict.contains(expected), "{verdict}");
+        }
+
+        // A rule that is about more than a port is not a port rule at all, so a
+        // document of two such rules reads as a policy with none.
+        let narrowed = rules(5000, 5001).replace("source=\"any\"", "source=\"10.0.0.0/24\"");
+        let topology = Topology::from_document(&with_policy(&narrowed)).expect("a valid document");
+        let verdict = topology
+            .port_policy()
+            .expect_err("a rule about an address block as well as a port")
+            .to_string();
+        assert!(verdict.contains("0 of the document's rules"), "{verdict}");
+
+        // Two rules that take the same action: two of the three outcomes cannot
+        // be told apart.
+        let both_drop = rules(5000, 5001).replace("action=\"accept\"", "action=\"drop\"");
+        let topology = Topology::from_document(&with_policy(&both_drop)).expect("a valid document");
+        let verdict = topology
+            .port_policy()
+            .expect_err("no accepting rule")
+            .to_string();
+        assert!(verdict.contains("the same action"), "{verdict}");
+
+        // And two rules about one port: the second can never match.
+        let one_port = rules(5000, 5000);
+        let topology = Topology::from_document(&with_policy(&one_port)).expect("a valid document");
+        let verdict = topology
+            .port_policy()
+            .expect_err("one port decided twice")
+            .to_string();
+        assert!(verdict.contains("destination port 5000"), "{verdict}");
+    }
+
+    /// A port range, a wildcard, and a rule narrowed by any other criterion are
+    /// each about something a probe would have to model, so none of them is a port
+    /// rule — and a document of one port rule and one of these reads as a policy
+    /// with one, which is refused.
+    #[test]
+    fn only_a_rule_about_exactly_one_udp_port_is_a_port_rule() {
+        /// One `<rule>` with every criterion at its widest but for the
+        /// substitutions in `narrowed`, which are written out as attributes.
+        fn rule(id: &str, action: &str, narrowed: &[(&str, &str)]) -> String {
+            let mut attributes = vec![
+                ("ingress", "any"),
+                ("egress", "any"),
+                ("source", "any"),
+                ("destination", "any"),
+                ("protocol", "udp"),
+                ("source-port", "any"),
+                ("destination-port", "5000"),
+                ("icmp-type", "any"),
+            ];
+            for (name, value) in narrowed {
+                for attribute in &mut attributes {
+                    if attribute.0 == *name {
+                        attribute.1 = value;
+                    }
+                }
+            }
+            let written: Vec<String> = attributes
+                .iter()
+                .map(|(name, value)| format!("{name}=\"{value}\""))
+                .collect();
+            format!(
+                "<rule id=\"{id}\" {} action=\"{action}\"/>",
+                written.join(" ")
+            )
+        }
+
+        // The accepting rule stays a port rule throughout, so what the verdict
+        // counts is exactly the number of *other* rules that qualified.
+        let accepting = rule("allowed", "accept", &[]);
+        for narrowed in [
+            vec![("destination-port", "5000-5002")],
+            vec![("destination-port", "any")],
+            vec![("protocol", "tcp")],
+            vec![("protocol", "icmp"), ("destination-port", "any")],
+            vec![("ingress", "one")],
+            vec![("egress", "two")],
+            vec![("destination", "10.0.1.0/24")],
+            vec![("source", "10.0.0.0/24")],
+            vec![("source-port", "4444")],
+        ] {
+            let policy = format!(
+                "<rules>{}{accepting}</rules>",
+                rule("blocked", "drop", &narrowed)
+            );
+            let topology =
+                Topology::from_document(&with_policy(&policy)).expect("a valid document");
+            let verdict = topology
+                .port_policy()
+                .expect_err(&format!("{narrowed:?} is not a port rule"))
+                .to_string();
+            assert!(
+                verdict.contains("1 of the document's rules"),
+                "{narrowed:?}: {verdict}"
+            );
+        }
+
+        // The control: the same shape with nothing narrowed is two port rules and
+        // reads as a policy, so the refusals above are the criterion's own.
+        let policy = format!(
+            "<rules>{}{accepting}</rules>",
+            rule("blocked", "drop", &[("destination-port", "5001")])
+        );
+        let topology = Topology::from_document(&with_policy(&policy)).expect("a valid document");
+        let read = topology.port_policy().expect("two port rules");
+        assert_eq!(read.accepted.destination_port, 5000);
+        assert_eq!(read.denied.destination_port, 5001);
     }
 }

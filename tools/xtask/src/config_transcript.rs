@@ -505,11 +505,13 @@ mod tests {
     #[test]
     fn the_shipped_document_produces_a_record_for_every_value_it_names() {
         let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
-        // Two interfaces of five fields, two neighbours of three, and the
-        // management interface's four: the document's own content, counted rather
-        // than restated.
-        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 4);
-        assert!(contract.summary().contains("20"));
+        // Two interfaces of five fields, two neighbours of three, two rules of
+        // ten, and the management interface's four: the document's own content,
+        // counted rather than restated. A rule reports its own `id` as a field
+        // because a rule's records are keyed by its position rather than by its
+        // name, so a ten-attribute rule is ten records.
+        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 2 * 10 + 4);
+        assert!(contract.summary().contains("40"));
         for record in &contract.changes {
             assert!(record.starts_with("LFW-CFG generation=1 seq="), "{record}");
             assert!(record.contains("change=added"), "{record}");
@@ -542,11 +544,21 @@ mod tests {
     /// Every record that names an id, an address or a MAC must differ between the
     /// two documents, or a stale table could satisfy both transcripts.
     ///
-    /// The one record they share is the management interface's `enabled=true`,
-    /// and it is exhaustively accounted for rather than excused: both documents
-    /// enable that port, so that record is the same *statement* in both. A
-    /// boolean carries no addressing, so it can prove nothing either way — but
-    /// it is asserted to be the only one, so a second shared record is a failure.
+    /// That is asserted on the shared records themselves rather than inferred
+    /// from how many there are, and then the shared set is closed by counting
+    /// what each of its records is *about* — so neither half of the claim rests
+    /// on a total somebody has to keep in step with the documents.
+    ///
+    /// What the two documents do share is exhaustively accounted for rather than
+    /// excused. A rule's records are keyed by its **position**, so a criterion
+    /// both documents state the same way is one record in both — and they state
+    /// the same policy on purpose, because that policy is what the forwarding
+    /// contract is stated against. `field=id` is the one rule record naming the
+    /// rule, and the two documents give their rules different ids for exactly
+    /// this reason. Beside those, the management port's `enabled=true`: both
+    /// enable that port. None of them carries addressing or identity, so none
+    /// can prove anything either way; an interface or a neighbour contributes
+    /// nothing at all, being keyed by an id each document coined.
     #[test]
     fn the_alternate_document_produces_a_transcript_that_shares_no_addressing_with_the_shipped_one()
     {
@@ -554,19 +566,50 @@ mod tests {
         let alternate = ConfigContract::from_document(ALTERNATE).expect("the alternate document");
         assert_eq!(shipped.changes.len(), alternate.changes.len());
 
-        let shared: Vec<&String> = alternate
+        let shared: Vec<&str> = alternate
             .changes
             .iter()
-            .filter(|record| shipped.changes.contains(record))
+            .map(String::as_str)
+            .filter(|record| shipped.changes.iter().any(|earlier| earlier == record))
             .collect();
+
+        // The property the two documents exist to hold. A shared record naming
+        // an identity or an address is precisely what would let a table built
+        // from one of them satisfy the other's transcript.
+        for record in &shared {
+            for identifying in [" field=id ", " field=address ", " field=mac "] {
+                assert!(
+                    !record.contains(identifying),
+                    "both documents produce {record:?}, so a table built from either satisfies \
+                     both transcripts"
+                );
+            }
+        }
+
+        // And the set is closed, counted by what each shared record is about so
+        // the documents' own values are not restated here.
+        let about = |kind: &str| {
+            let marker = format!(" object={kind} ");
+            shared
+                .iter()
+                .filter(|record| record.contains(&marker))
+                .count()
+        };
+        let rule_criteria = 2 * (10 - 1);
         assert_eq!(
-            shared,
-            [&format!(
-                "LFW-CFG generation=1 seq={} change=added object=management key=management \
-                 field=enabled to=true",
-                2 * 5 + 2 * 3
-            )],
+            [
+                about("interface"),
+                about("neighbour"),
+                about("rule"),
+                about("management"),
+            ],
+            [0, 0, rule_criteria, 1],
             "a transcript both documents produce proves nothing"
+        );
+        assert_eq!(
+            shared.len(),
+            rule_criteria + 1,
+            "a shared record about none of the four objects the documents name"
         );
     }
 
@@ -644,7 +687,10 @@ mod tests {
         let verdict = contract
             .judge(text.as_bytes(), log())
             .expect_err("the summary ahead of the records it summarises");
-        assert!(verdict.contains("changes=20"), "{verdict}");
+        // The summary record itself, taken from the contract rather than spelled
+        // out: it is what the verdict must name as having reached the line
+        // first, and its change count is the document's to decide.
+        assert!(verdict.contains(&committed), "{verdict}");
         assert!(
             verdict.contains("which the domain published first"),
             "{verdict}"
@@ -936,7 +982,7 @@ mod tests {
         // is exercised against the model directly instead.
         assert!(matches!(
             ConfigContract::from_document(
-                b"<configuration><interfaces/><neighbours/></configuration>"
+                b"<configuration><interfaces/><neighbours/><rules/></configuration>"
             ),
             Err(ContractError::Refused(_))
         ));

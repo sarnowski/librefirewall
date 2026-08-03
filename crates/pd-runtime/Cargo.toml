@@ -40,6 +40,10 @@ proptest = { workspace = true }
 # alone.
 lfw-http = { path = "../http" }
 lfw-tcp = { path = "../tcp" }
+# The types a configuration commit's call frame holds, for the test that keeps
+# `pds/config`'s declared stack ahead of them. A dev dependency and not a real
+# one: nothing in this crate reads a document.
+config = { path = "../config" }
 criterion = { workspace = true }
 
 [lints]

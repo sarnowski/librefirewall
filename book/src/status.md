@@ -8,11 +8,11 @@ today, what it does not, and where the project is heading.
 
 ## The current deployable system
 
-The current deployable system is a two-dataplane-port routed IPv4 slice: one driver protection
-domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4 capabilities
-alone, and an isolated forwarder protection domain routes frames between the two ports — parsing
-each one, deciding on it against the configuration in force, and rewriting its Ethernet and IPv4
-headers in place. A frame is never moved **between** buffers: one pool buffer carries it from one
+The current deployable system is a two-dataplane-port **filtering** IPv4 slice: one driver
+protection domain per port brings up a `virtio-net-pci` device on QEMU q35 from static seL4
+capabilities alone, and an isolated forwarder protection domain decides each frame between the two
+ports — parsing it, working out where it would go, consulting the operator's filter rules, and
+rewriting its Ethernet and IPv4 headers in place if a rule permits it. A frame is never moved **between** buffers: one pool buffer carries it from one
 NIC's DMA to the other's, and only the 34 rewritten header bytes travel back into it. The decision
 itself is taken on a private copy, because a verdict reached on bytes a peer may rewrite underneath
 it is no verdict — so a hop costs one copy of the payload, and a second when the recording tap is
@@ -22,9 +22,9 @@ That configuration is a schema-validated XML document, read and committed by a p
 of its own that holds no device and no dataplane memory, and handed to the forwarder through a
 shared region under an offer/acknowledge protocol. The forwarder boots **fail-closed** — an empty
 table, forwarding nothing — and switches to a configuration only after re-deciding, itself, every
-one of the 23 rules the validating domain applied — at that domain's own strength on all but two,
-both named and both about values the image does not carry — so a compromised parser cannot hand it
-a table those rules refuse. Every boot therefore performs a live
+one of the 41 rules the validating domain applied — at that domain's own strength on all but one,
+which is named where it is declared and is about a value the image does not carry — so a
+compromised parser cannot hand it a table those rules refuse. Every boot therefore performs a live
 configuration swap on a running dataplane. There is still no way to *submit* a document to a
 running node: the configuration is embedded into the image at build time, so a configuration change
 requires a new image and a reboot.
@@ -87,27 +87,40 @@ can be read back from the medium alone with nothing else to consult. The recorde
 domain in the system that can put a byte on persistent storage, and the only path between it and
 the dataplane is a one-way tap that can never backpressure forwarding.
 
-Parsing reaches the L4 header — UDP, TCP and ICMP — but **no filtering decision of any kind is
-made**: a packet is forwarded because it is routable, never because a policy allowed it. The
-ports, flags and types a rule would match on are read and handed on as annotation, and nothing
-consumes them yet. There is no connection tracking and no NAT, and the ARP and ICMP that exist
-belong to the management port alone — the dataplane resolves a next hop from a static neighbour
-table and answers nothing for itself. What exists is a router on a firewall's substrate, not yet
-a firewall.
+**The appliance filters.** A packet is forwarded because a rule the operator wrote permits it, and
+for no other reason: the `<rules>` section of the configuration document is a list of stateless
+L2–L4 rules, matched first-match-wins in document order, and a packet no rule is about is
+dropped. That last part is the whole posture and it is not a setting — the default deny is a
+property of the fallthrough rather than of any document, so there is no `<rules>` section an
+operator can write that makes an unmatched packet pass, and an empty one forwards nothing. Each
+rule matches on ingress and egress interface, source and destination CIDR block, protocol, source
+and destination port or port range, and ICMP type; every criterion is written out, `any` included,
+so no attribute widens a rule by being left out. The two refusals a filter can reach stay separate
+findings — a rule that said drop, and the fallthrough — and each rule carries its own hit counter
+on `/metrics` under the id the document gave it.
+
+What is not there is **state**: there is no connection tracking, so a rule cannot be written about
+an established flow and a reply is permitted only by a rule that names it in its own right. There
+is no NAT. The ARP and ICMP that exist belong to the management port alone — the dataplane resolves
+a next hop from a static neighbour table and answers nothing for itself. What exists is a stateless
+packet filter on a firewall's substrate.
 
 That absence reaches the recordings, and is the largest gap in them. The
 [recording design](design/recording.md) splits the two sinks by *what* they record — the log sink
-connection lifecycle and policy events anchored to their causing packet, the capture sink filtered
-full content. Neither exists: with no connection tracking there are no connection events to
-record, and with no filtering the capture sink is unfiltered and on by default. **Today the two
-recordings differ only in their snap length**, and `/logs.pcapng` is the capture truncated to
-headers rather than an event log.
+connection lifecycle and policy events anchored to their causing packet, the capture sink full
+content for the flows a **recording** selector picks out. Neither exists: with no connection
+tracking there are no connection events to record, and there is no recording selector, so the
+capture sink records everything the dataplane decided on. (The filter rules above decide what the
+appliance *forwards*; they select nothing for recording, and a dropped packet is recorded with its
+refusal exactly as a forwarded one is.) **Today the two recordings differ only in their snap
+length**, and `/logs.pcapng` is the capture truncated to headers rather than an event log.
 
 ## Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
-| Stateful L2–L4 filtering and connection tracking | **open** | |
+| Stateless L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; no state, no `reject`, and no way to change a policy without a new image — [detail](developers/status-detail.md#stateless-filtering) |
+| Connection tracking | **open** | the pipeline has the stage position reserved for it, between the forwarding decision and the filter |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |
@@ -146,7 +159,7 @@ headers rather than an event log.
 |---|---|---|
 | First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
 | pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — described with the [recordings](developers/status-detail.md#recording-and-download) |
-| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no filtering, so the capture sink is unfiltered and on by default — [detail](developers/status-detail.md#recording-and-download) |
+| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no recording selector, so the capture sink records every frame the dataplane decided on — [detail](developers/status-detail.md#recording-and-download) |
 | Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for the *time range* the [management design](design/management.md) does ask for, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
 | A recording that states its own loss in-band | **partial** | `epb_dropcount` is fed: the recorder differences the forwarder's tap-drop counter on every pass and carries the rise as a debt onto the next record placed, so a file does state the observations the tap ring lost ahead of each block. It states **only** those — what a sink could not encode and what the medium refused reach `/metrics` and never the file, and no Interface Statistics Block is emitted — see the [recording design](design/recording.md) |
 | Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
@@ -245,14 +258,14 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
 - **FPU/SIMD in protection domains.** Dataplane PDs run without FPU/SSE state. Sustaining
   checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU context for the
   relevant PDs or staying scalar — a design constraint to resolve when performance work begins.
-- **Full-rate capture of everything is not reachable, and the filter is the sizing control.** A
-  capture sink recording all traffic at the target rate (see the
+- **Full-rate capture of everything is not reachable, and the recording selector is the sizing
+  control.** A capture sink recording all traffic at the target rate (see the
   [recording design](design/recording.md)) would have to sustain writes at the dataplane's own
   rate, which no practical device does and which would consume the medium's write endurance in
-  short order. The sink is therefore sized by its filter rather than by the link, and a filter
-  drawn too broadly yields loss. The loss is reported in-band and is measurable rather than silent,
-  which is the mitigation available — but it remains loss, and choosing filters narrow enough is an
-  operational discipline the appliance can measure and cannot impose.
+  short order. The sink is therefore sized by the selector that decides what reaches it — not by
+  the filter rules, which decide what is forwarded — and a selector drawn too broadly yields loss. The loss is reported in-band and is measurable rather than silent,
+  which is the mitigation available — but it remains loss, and choosing a selector narrow enough is
+  an operational discipline the appliance can measure and cannot impose.
 - **The throughput target and the recording sinks compete for one memory-bandwidth budget.**
   Copying frames into a ring and writing them out draws on the same bandwidth the inspection path
   is already sized to consume. How much recording the target rate can carry is unmeasured, and

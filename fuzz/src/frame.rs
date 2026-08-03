@@ -54,7 +54,9 @@ use net_headers::{
     ETHERNET_HEADER_LEN, Frame, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet,
     MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
-use pipeline::{Configuration, DropReason, Inspection, Pipeline, Verdict};
+use pipeline::{
+    Configuration, DropReason, Inspection, Pipeline, Rule, RuleAction, Ruleset, Verdict,
+};
 use routing::{Interface, Neighbour, PortId, Router};
 
 const PORT0: PortId = PortId(0);
@@ -130,6 +132,51 @@ fn agree_on_the_ipv4_header(data: &[u8]) {
 /// also the fifth and sixth byte of whatever else the datagram carries there.
 const TRANSPORT_LENGTH_AT: usize = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 4;
 
+/// One rule matching every frame the routing stage resolves, which is the policy
+/// every assertion about *routing* below is stated under.
+///
+/// The filter is default-deny, so a harness with no policy would see
+/// `NoPolicyMatch` for every frame and would assert nothing about the forwarding
+/// decision at all. The policy is the operator's input rather than the
+/// adversary's, so it is stated here; what the adversary chooses is the frame.
+static ALLOW_ALL: LazyLock<Ruleset> = LazyLock::new(|| ruleset(wildcard(RuleAction::Accept)));
+
+/// The same shape dropping, an empty policy, and one written for a port the frame
+/// may or may not carry: the three other policies every frame is also put
+/// through, so the filter's own arms are reached on adversarial input rather than
+/// only on frames a test wrote.
+static NARROWER: LazyLock<[Ruleset; 3]> = LazyLock::new(|| {
+    [
+        ruleset(wildcard(RuleAction::Drop)),
+        Ruleset::EMPTY,
+        ruleset(Rule {
+            destination_port: Some(pipeline::PortRange {
+                low: 5000,
+                high: 5000,
+            }),
+            ..wildcard(RuleAction::Accept)
+        }),
+    ]
+});
+
+const fn wildcard(action: RuleAction) -> Rule {
+    Rule {
+        ingress: None,
+        egress: None,
+        source: None,
+        destination: None,
+        protocol: None,
+        source_port: None,
+        destination_port: None,
+        icmp_type: None,
+        action,
+    }
+}
+
+fn ruleset(rule: Rule) -> Ruleset {
+    Ruleset::build(core::iter::once(rule)).expect("one rule is inside any capacity")
+}
+
 /// The verdict this appliance's topology reaches for one frame arriving on each
 /// port in turn.
 ///
@@ -139,8 +186,43 @@ fn verdicts_on_both_ports(bytes: &mut [u8]) -> [Verdict; 2] {
     [PORT0, PORT1].map(|ingress| {
         let frame = Frame::parse(bytes).expect("the caller parsed these bytes already");
         let mut inspection = Inspection::new(ingress, frame);
-        Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER))
+        Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER, &ALLOW_ALL))
     })
+}
+
+/// A verdict a narrower policy may reach for a frame the permissive one
+/// permitted, or the identical refusal where it refused one.
+///
+/// The invariant a filter owes: it decides what to do with a frame the stages in
+/// front of it already resolved, so it can withhold a forward and it can never
+/// produce one. A rule that turned a routing refusal into a forward would be a
+/// policy overriding the router.
+fn the_filter_only_narrows(bytes: &mut [u8], ingress: PortId, permissive: Verdict) {
+    for rules in NARROWER.iter() {
+        let frame = Frame::parse(bytes).expect("the caller parsed these bytes already");
+        let mut inspection = Inspection::new(ingress, frame);
+        let narrowed = Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER, rules));
+        match permissive {
+            // A frame the stages in front of the filter refused is refused for
+            // that same reason under every policy: the filter is never consulted
+            // for it.
+            Verdict::Drop(reason) => assert_eq!(
+                narrowed,
+                Verdict::Drop(reason),
+                "a policy changed a refusal the filter is not consulted for"
+            ),
+            // And a frame they resolved is either forwarded exactly as the
+            // permissive policy forwarded it, or refused by one of the filter's
+            // own two reasons — never forwarded somewhere else.
+            Verdict::Forward { .. } => assert!(
+                narrowed == permissive
+                    || narrowed == Verdict::Drop(DropReason::PolicyDenied)
+                    || narrowed == Verdict::Drop(DropReason::NoPolicyMatch),
+                "a narrower policy reached {narrowed:?} where the permissive one \
+                 reached {permissive:?}"
+            ),
+        }
+    }
 }
 
 /// Rewriting the transport header changes neither the parse nor the verdict.
@@ -342,7 +424,15 @@ pub fn frame_routing_harness(data: &[u8]) {
         let mut inspection = Inspection::new(ingress, frame);
         // Generation 0: nothing in the chain reads it, and the table it names is
         // this harness's fixed topology rather than one an operator committed.
-        let decision = pipeline.evaluate(&mut inspection, &Configuration::new(0, &ROUTER));
+        let decision =
+            pipeline.evaluate(&mut inspection, &Configuration::new(0, &ROUTER, &ALLOW_ALL));
+        // The same frame under three narrower policies, before the rewrite the
+        // permissive verdict authorises: the chain does not touch the bytes, so
+        // the borrow is simply handed back and taken again.
+        drop(inspection);
+        the_filter_only_narrows(&mut bytes, ingress, decision);
+        let frame = Frame::parse(&mut bytes).expect("these bytes parsed a moment ago");
+        let inspection = Inspection::new(ingress, frame);
         // A frame claiming one of this router's own addresses as its source is
         // forged or looped and may never be carried. Asserted for a frame that
         // reaches the source check at all: the link-layer refusals in front of it

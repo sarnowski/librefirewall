@@ -58,16 +58,16 @@ pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
 pub const LOG_CHANGE_KIND_COUNT: u8 = 3;
 
 /// `lfw_log::ObjectKind::ALL`.
-pub const LOG_OBJECT_KIND_COUNT: u8 = 3;
+pub const LOG_OBJECT_KIND_COUNT: u8 = 4;
 
 /// `lfw_log::Field::ALL`.
-pub const LOG_FIELD_COUNT: u8 = 6;
+pub const LOG_FIELD_COUNT: u8 = 16;
 
 /// `lfw_log::GenerationOutcome::ALL`.
 pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
 
 /// `lfw_log::RejectReason::ALL`.
-pub const LOG_REJECT_REASON_COUNT: u8 = 30;
+pub const LOG_REJECT_REASON_COUNT: u8 = 34;
 
 /// Whether a record's instant is one or is the absence of one.
 ///
@@ -197,6 +197,11 @@ pub enum LogValueKind {
     Generation,
     Count,
     Id,
+    /// A filter rule's match criterion as its own token, in `id`.
+    Selector,
+    /// A filter rule's address criterion: the block's network in the first four
+    /// `octets` and its prefix length in `number`.
+    Prefix,
 }
 
 impl LogValueKind {
@@ -212,6 +217,8 @@ impl LogValueKind {
             Self::Generation => 6,
             Self::Count => 7,
             Self::Id => 8,
+            Self::Selector => 9,
+            Self::Prefix => 10,
         }
     }
 
@@ -227,6 +234,8 @@ impl LogValueKind {
             6 => Some(Self::Generation),
             7 => Some(Self::Count),
             8 => Some(Self::Id),
+            9 => Some(Self::Selector),
+            10 => Some(Self::Prefix),
             _ => None,
         }
     }
@@ -310,17 +319,19 @@ pub type CauseImage = TextImage<LOG_CAUSE_BYTES>;
 pub struct ValueImage {
     /// The numeric payload of [`LogValueKind::Port`],
     /// [`LogValueKind::PrefixLength`], [`LogValueKind::Bool`],
-    /// [`LogValueKind::Generation`] and [`LogValueKind::Count`]. The first three
-    /// are narrower than the field, so a value that does not fit is refused.
+    /// [`LogValueKind::Generation`], [`LogValueKind::Count`] and the prefix
+    /// length of [`LogValueKind::Prefix`]. All but two are narrower than the
+    /// field, so a value that does not fit is refused.
     pub number: u32,
     /// Which [`LogValueKind`] this slot holds, as raw bits.
     pub kind: u8,
-    /// The address of [`LogValueKind::Ipv4`] in the first four bytes, or of
+    /// The address of [`LogValueKind::Ipv4`] or the network of
+    /// [`LogValueKind::Prefix`] in the first four bytes, or the address of
     /// [`LogValueKind::Mac`] in all six. Network order, as the address appears
     /// in a header.
     pub octets: [u8; 6],
     pub _pad: u8,
-    /// The text of [`LogValueKind::Id`].
+    /// The text of [`LogValueKind::Id`] and of [`LogValueKind::Selector`].
     pub id: IdentifierImage,
 }
 
@@ -765,6 +776,11 @@ fn check_value(raw: &ValueImage, text: LogText) -> Result<Option<CheckedValue>, 
         LogValueKind::Generation => Some(CheckedValue::Generation(raw.number)),
         LogValueKind::Count => Some(CheckedValue::Count(raw.number)),
         LogValueKind::Id => Some(CheckedValue::Id(check_text(&raw.id, text, false)?)),
+        LogValueKind::Selector => Some(CheckedValue::Selector(check_text(&raw.id, text, false)?)),
+        LogValueKind::Prefix => Some(CheckedValue::Prefix {
+            network: [a, b, c, d],
+            prefix_length: narrow()?,
+        }),
     })
 }
 
@@ -864,6 +880,13 @@ pub enum CheckedValue {
     Generation(u32),
     Count(u32),
     Id(CheckedIdentifier),
+    /// A filter rule's match criterion, as the token the document wrote it as.
+    Selector(CheckedIdentifier),
+    /// A filter rule's address criterion, network order as a header carries it.
+    Prefix {
+        network: [u8; 4],
+        prefix_length: u8,
+    },
 }
 
 /// The numbers a refusal carries, as many as its `operand_count` named.

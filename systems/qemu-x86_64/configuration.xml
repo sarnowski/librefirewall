@@ -27,6 +27,21 @@
      ARP and ICMP echo for the address below and for nothing else; the dataplane
      forwards nothing to it and cannot reach it.
 
+     The `<rules>` element is the filter policy, and it is the one element whose
+     order means something: the appliance matches first-match-wins and drops
+     what nothing matched, so a rule's line number is its precedence and an
+     empty `<rules/>` forwards nothing. Every criterion is written out, `any`
+     included — a wildcard an operator can see is the point of a filter
+     document, and there is no attribute here whose omission widens a rule.
+
+     The two rules are what the forwarding contract is stated against.
+     `probe-forward` is why the routed probes are routed at all; `probe-blocked`
+     names a destination port nothing else uses, so a packet the appliance can
+     route is dropped by policy rather than by any routing reason; and a packet
+     matching neither falls past the last rule to the default deny. The three
+     outcomes are distinguishable by drop reason and by per-rule counter, which
+     is what `tools/xtask/src/forward_harness.rs` asserts.
+
      Its address is 10.0.2.15/24, which is not an arbitrary choice: QEMU's
      user-mode (SLIRP) stack places the guest at 10.0.2.15 with the gateway at
      10.0.2.2, so `make run` reaches this port with no extra configuration, and
@@ -45,6 +60,14 @@
         <neighbour id="endpoint-b" interface="dataplane-1"
                    address="10.0.1.2" mac="52:54:00:00:00:0b"/>
     </neighbours>
+    <rules>
+        <rule id="probe-blocked" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5001" icmp-type="any" action="drop"/>
+        <rule id="probe-forward" ingress="any" egress="any"
+              source="any" destination="any" protocol="udp"
+              source-port="any" destination-port="5000" icmp-type="any" action="accept"/>
+    </rules>
     <management mac="52:54:00:12:34:52" address="10.0.2.15"
                 prefix-length="24" enabled="true"/>
 </configuration>

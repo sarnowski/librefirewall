@@ -139,6 +139,38 @@ pub const ROUTE_STAGE_DROPS: Metric = metric(
     "Frames the routing stage refused around the router's own decision.",
 );
 
+// ── The filter, on the forwarder that decides it ────────────────────────────
+
+/// The filter's own account of what it decided, which is why these two carry no
+/// `pipeline` label where every other forwarder family does: one
+/// `pipeline::PolicyStage` serves both directions, because a stage of that chain
+/// may hold state spanning a whole flow.
+pub const POLICY_PACKETS: Metric = metric(
+    "librefirewall_policy_packets_total",
+    Kind::Counter,
+    "Packets the filter decided on, by the verdict it reached; `denied` covers both a rule that \
+     said so and the default deny, which the route drop reasons tell apart.",
+);
+
+pub const POLICY_BYTES: Metric = metric(
+    "librefirewall_policy_bytes_total",
+    Kind::Counter,
+    "Datagram bytes the filter decided on, by the verdict it reached; the sender's own IPv4 total \
+     length, so it is comparable against a link's throughput.",
+);
+
+/// The second family whose samples do not come from a shard's table: the numbers
+/// are the forwarder's, taken from its shard by position, and the `rule` label is
+/// the id the committed document gave the rule at that position. One series per
+/// rule the running generation declares and none for a position it does not, so a
+/// two-rule policy exposes two series.
+pub const RULE_HITS: Metric = metric(
+    "librefirewall_rule_hits_total",
+    Kind::Counter,
+    "Packets matched by each rule of the running policy, under the id the configuration document \
+     gave it. First match wins, so a packet is counted against one rule at most.",
+);
+
 // ── The recording tap, on the forwarder that fills it ───────────────────────
 
 pub const TAP_OBSERVATIONS: Metric = metric(
@@ -637,6 +669,9 @@ pub const ALL_METRICS: &[&Metric] = &[
     &FORWARDED_FRAMES,
     &ROUTE_DROPS,
     &ROUTE_STAGE_DROPS,
+    &POLICY_PACKETS,
+    &POLICY_BYTES,
+    &RULE_HITS,
     &TAP_OBSERVATIONS,
     &TAP_OBSERVATIONS_LOST,
     &RECEIVE_FRAMES,

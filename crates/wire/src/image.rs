@@ -39,6 +39,7 @@
 #[rustfmt::skip]
 macro_rules! image_type {
     (byte)                                    => { u8 };
+    (half)                                    => { u16 };
     (word)                                    => { u32 };
     (bytes($len:expr))                        => { [u8; $len] };
     (padding($len:expr))                      => { [u8; $len] };
@@ -54,6 +55,7 @@ macro_rules! image_type {
 #[rustfmt::skip]
 macro_rules! slot_type {
     (byte)                                    => { ::core::sync::atomic::AtomicU8 };
+    (half)                                    => { ::core::sync::atomic::AtomicU16 };
     (word)                                    => { ::core::sync::atomic::AtomicU32 };
     (bytes($len:expr))                        => { [::core::sync::atomic::AtomicU8; $len] };
     (padding($len:expr))                      => { [::core::sync::atomic::AtomicU8; $len] };
@@ -69,6 +71,7 @@ macro_rules! slot_type {
 #[rustfmt::skip]
 macro_rules! image_zero {
     (byte)                                    => { 0 };
+    (half)                                    => { 0 };
     (word)                                    => { 0 };
     (bytes($len:expr))                        => { [0; $len] };
     (padding($len:expr))                      => { [0; $len] };
@@ -83,6 +86,7 @@ macro_rules! image_zero {
 #[rustfmt::skip]
 macro_rules! slot_zero {
     (byte)                                    => { ::core::sync::atomic::AtomicU8::new(0) };
+    (half)                                    => { ::core::sync::atomic::AtomicU16::new(0) };
     (word)                                    => { ::core::sync::atomic::AtomicU32::new(0) };
     (bytes($len:expr))                        => { [const { ::core::sync::atomic::AtomicU8::new(0) }; $len] };
     (padding($len:expr))                      => { [const { ::core::sync::atomic::AtomicU8::new(0) }; $len] };
@@ -97,6 +101,7 @@ macro_rules! slot_zero {
 #[rustfmt::skip]
 macro_rules! slot_store {
     (byte, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
+    (half, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
     (word, $cell:expr, $value:expr)           => { $cell.store($value, ::core::sync::atomic::Ordering::Relaxed) };
     (bytes($len:expr), $cell:expr, $value:expr)   => { $crate::store_bytes(&$cell, $value) };
     (padding($len:expr), $cell:expr, $value:expr) => { $crate::store_bytes(&$cell, $value) };
@@ -113,6 +118,7 @@ macro_rules! slot_store {
 #[rustfmt::skip]
 macro_rules! slot_load {
     (byte, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
+    (half, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
     (word, $cell:expr)                        => { $cell.load(::core::sync::atomic::Ordering::Relaxed) };
     (bytes($len:expr), $cell:expr)            => { $crate::load_bytes(&$cell) };
     (padding($len:expr), $cell:expr)          => { $crate::load_bytes(&$cell) };
@@ -137,7 +143,8 @@ macro_rules! slot_load {
 ///
 /// The field kinds, which are the whole vocabulary:
 ///
-/// * `byte` and `word` — a `u8` and a little-endian `u32`.
+/// * `byte`, `half` and `word` — a `u8`, a little-endian `u16` and a
+///   little-endian `u32`.
 /// * `bytes(N)` — `N` bytes that mean something, and `padding(N)` — `N` that
 ///   mean nothing.
 /// * `identifier` — the log record ABI's own text slot, rather than a second

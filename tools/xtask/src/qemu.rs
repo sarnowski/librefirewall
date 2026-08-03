@@ -47,7 +47,7 @@ use crate::{
     config_transcript::ConfigContract,
     data_disk::DataDisk,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
-    forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking},
+    forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking, Traffic},
     image, management_contract, metrics_contract,
     recording_contract::{self, Download},
     stamp_contract, surface_contract,
@@ -232,10 +232,12 @@ struct Scenario {
     image: ImageUnderTest,
     console: Console,
     management: ManagementRole,
+    /// Which probe set this boot injects into the two dataplane ports.
+    traffic: Traffic,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
-/// behaviour across six scenarios, in the kernel configuration a release
+/// behaviour across eight scenarios, in the kernel configuration a release
 /// ships. Returns what the run proved.
 ///
 /// 1. **routed-forwarding** — the published disk, judged by the routed contract
@@ -271,6 +273,19 @@ struct Scenario {
 ///    recording that silently drops, a metric that double-counts and a tap that
 ///    loses a record are each invisible in the surface they occur in.
 ///
+/// 7. **policy-filter** and 8. **policy-filter-alternate** — the filter's own
+///    two, and the only two that inject a different probe set: one packet per
+///    outcome the filter can reach, differing from each other in the UDP
+///    destination port and in nothing else. One is forwarded because a rule
+///    permits it, one is dropped by a rule though it is routable in every other
+///    respect, and one falls past the last rule to the default deny. All three
+///    are held apart three ways — the wire (one delivery, two absences), the drop
+///    reason, and the per-rule hit counter — and each scenario is judged against
+///    its own document, whose policy names different ports under different rule
+///    ids. Two rather than one for scenario 5's reason: a counter labelled with a
+///    name the build carried, rather than one it read, would satisfy one and fail
+///    the other.
+///
 /// Every scenario additionally injects frames into the dedicated management port
 /// and holds that port to carrying nothing back, whatever else it judges; the
 /// two that read the console also hold the management domain's own count to the
@@ -283,6 +298,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             image: ImageUnderTest::Published,
             console: Console::Ignored,
             management: ManagementRole::Station,
+            traffic: Traffic::Routed,
         },
         Scenario {
             name: "generation-swap",
@@ -290,6 +306,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             image: ImageUnderTest::Published,
             console: Console::Judged,
             management: ManagementRole::Station,
+            traffic: Traffic::Routed,
         },
         Scenario {
             name: "alternate-configuration",
@@ -297,6 +314,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             image: ImageUnderTest::BuiltForTheScenario,
             console: Console::Judged,
             management: ManagementRole::Station,
+            traffic: Traffic::Routed,
         },
         Scenario {
             name: "metrics-endpoint",
@@ -308,6 +326,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             // stated against. What it judges instead is the endpoint's answer.
             console: Console::Ignored,
             management: ManagementRole::Client,
+            traffic: Traffic::Routed,
         },
         // The same scrape against a disk built from the second document, and the
         // one thing the scenario above cannot show: that the identity the
@@ -327,6 +346,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             image: ImageUnderTest::BuiltForTheScenario,
             console: Console::Ignored,
             management: ManagementRole::Client,
+            traffic: Traffic::Routed,
         },
         // The recording milestone's own scenario. It is no longer the only one
         // that pulls the recordings — every [`ManagementRole::Client`] scenario
@@ -343,6 +363,35 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             image: ImageUnderTest::Published,
             console: Console::Ignored,
             management: ManagementRole::Client,
+            traffic: Traffic::Routed,
+        },
+        // The filter's own two scenarios, and the reason there are two of them
+        // rather than one: the three outcomes have to be shown to follow from the
+        // *document* rather than from the build, exactly as the routed contract
+        // does. Each boots a disk assembled around its own policy, and the two
+        // policies name different ports under different rule ids — so a per-rule
+        // counter labelled with a name the build carried, or a port a rule no
+        // longer covers, satisfies one and fails the other.
+        //
+        // Both are `Client` scenarios, because the metric is half the evidence: a
+        // drop reason says which of the two refusals happened and the per-rule
+        // counter says which rule reached it, and neither is visible on the wire
+        // — where all a refused probe leaves is its absence.
+        Scenario {
+            name: "policy-filter",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Policy,
+        },
+        Scenario {
+            name: "policy-filter-alternate",
+            document: ALTERNATE_DOCUMENT,
+            image: ImageUnderTest::BuiltForTheScenario,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Policy,
         },
     ];
 
@@ -487,7 +536,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
     } else {
         ManagementBacking::Socket
     };
-    let booted = boot_and_forward(root, &disk, &log_name, &topology, backing)
+    let booted = boot_and_forward(root, &disk, &log_name, &topology, backing, scenario.traffic)
         .map_err(|error| format!("scenario {name}: {error}"))?;
 
     // The table before the verdict: what the two endpoints exchanged and what
@@ -512,14 +561,18 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             ));
         }
         ManagementRole::Client => {
-            let judged =
-                metrics_contract::judge(&booted.scrapes, booted.dataplane_frames, &topology)
-                    .map_err(|error| {
-                        format!(
-                            "scenario {name}: {error}\n  full run log: {}",
-                            log.display()
-                        )
-                    })?;
+            let judged = metrics_contract::judge(
+                &booted.scrapes,
+                booted.dataplane_frames,
+                booted.policy,
+                &topology,
+            )
+            .map_err(|error| {
+                format!(
+                    "scenario {name}: {error}\n  full run log: {}",
+                    log.display()
+                )
+            })?;
             let evidence = metrics_contract::evidence(&booted.scrapes, &judged);
             println!("{evidence}");
             append_evidence(
@@ -591,6 +644,7 @@ pub(crate) fn boot_and_forward(
     log_name: &str,
     topology: &Topology,
     management: ManagementBacking,
+    traffic: Traffic,
 ) -> Result<Booted, String> {
     boot(
         root,
@@ -599,6 +653,7 @@ pub(crate) fn boot_and_forward(
         BootContract::Routed,
         topology,
         management,
+        traffic,
     )
 }
 
@@ -760,6 +815,11 @@ pub(crate) fn boot_and_halt(
         BootContract::Halted { marker },
         topology,
         ManagementBacking::Socket,
+        // A halted slot forwards nothing, so which set would have been injected
+        // decides nothing about the verdict; the routed set keeps the one thing
+        // it does decide — the frames put on the wire — the same as every other
+        // halt scenario's.
+        Traffic::Routed,
     )
 }
 
@@ -770,6 +830,7 @@ fn boot(
     contract: BootContract,
     topology: &Topology,
     management: ManagementBacking,
+    traffic: Traffic,
 ) -> Result<Booted, String> {
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
     // Whether this boot reads the recordings back follows from the backing
@@ -810,6 +871,7 @@ fn boot(
             log_path: &log,
             log_header: &header,
             topology,
+            traffic,
         },
     )?;
 

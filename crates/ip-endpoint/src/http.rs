@@ -18,7 +18,8 @@
 //!
 //! # One exposition at a time, and what a second connection gets
 //!
-//! An exposition is [`RESPONSE_CAPACITY`] bytes — about 39 KiB — and a buffer
+//! An exposition is [`RESPONSE_CAPACITY`] bytes — about 67 KiB, most of it the
+//! one series per filter rule the configuration ABI admits — and a buffer
 //! per connection would be eight of them in a protection domain's own memory.
 //! There is therefore **one**, claimed by the connection whose request completed
 //! and released as soon as its response can no longer be *asked for* again, and
@@ -153,8 +154,8 @@ const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 42_142);
-    assert!(RESPONSE_CAPACITY == 42_303);
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 68_016);
+    assert!(RESPONSE_CAPACITY == 68_177);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own

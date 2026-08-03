@@ -1,5 +1,29 @@
 use super::*;
-use net_headers::{EtherType, IPV4_HEADER_LEN, Ipv4Address, Protocol, UDP_HEADER_LEN};
+
+/// A ruleset that accepts whatever the routing stage resolves.
+///
+/// Most of the tests below are about admission and routing, and the filter
+/// behind them denies by default: under an empty ruleset each would pass for
+/// the wrong reason. The filter's own behaviour is tested against rulesets
+/// written for it.
+fn allow_all() -> Ruleset {
+    Ruleset::build(core::iter::once(Rule {
+        ingress: None,
+        egress: None,
+        source: None,
+        destination: None,
+        protocol: None,
+        source_port: None,
+        destination_port: None,
+        icmp_type: None,
+        action: RuleAction::Accept,
+    }))
+    .expect("one rule is inside any capacity")
+}
+use net_headers::{
+    EtherType, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Protocol, TCP_HEADER_LEN,
+    UDP_HEADER_LEN,
+};
 use proptest::prelude::*;
 use routing::{Interface, Neighbour};
 use std::vec::Vec;
@@ -61,6 +85,90 @@ fn router() -> Router<2, 2> {
     Router::from_slices(&interfaces(), &neighbours()).expect("two of each fit in two")
 }
 
+/// What a frame carries behind its IPv4 header, which is the whole of what a
+/// port or ICMP-type criterion can be answered from.
+///
+/// The five shapes that carry *nothing* readable are here beside the two that do
+/// because that is the property the filter is built around: a criterion cannot be
+/// satisfied by a header nobody read, and on a default-deny appliance the
+/// dangerous direction is an `accept` matching one.
+#[derive(Clone, Copy, Debug)]
+enum TransportSpec {
+    Udp {
+        source: u16,
+        destination: u16,
+    },
+    Tcp {
+        source: u16,
+        destination: u16,
+    },
+    Icmp {
+        message_type: u8,
+    },
+    /// A datagram claiming `protocol` with two bytes behind its IPv4 header: too
+    /// few for any of the three headers, so no port and no type was read.
+    Truncated(Protocol),
+    /// The second piece of a fragmented datagram, which carries no transport
+    /// header at its offset whatever the protocol says.
+    NonInitialFragment,
+    /// A protocol this build does not break down. A router forwards it; a filter
+    /// can say nothing about its ports.
+    Unparsed(Protocol),
+}
+
+impl TransportSpec {
+    /// The IPv4 `protocol` byte this shape claims.
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::Udp { .. } => Protocol::UDP,
+            Self::Tcp { .. } => Protocol::TCP,
+            Self::Icmp { .. } => Protocol::ICMP,
+            Self::Truncated(protocol) | Self::Unparsed(protocol) => protocol,
+            Self::NonInitialFragment => Protocol::UDP,
+        }
+    }
+
+    /// The bytes behind the IPv4 header.
+    fn bytes(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::Udp {
+                source,
+                destination,
+            } => {
+                out.extend_from_slice(&source.to_be_bytes());
+                out.extend_from_slice(&destination.to_be_bytes());
+                out.extend_from_slice(&((UDP_HEADER_LEN + 6) as u16).to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
+                out.extend_from_slice(b"routed");
+            }
+            Self::Tcp {
+                source,
+                destination,
+            } => {
+                out.extend_from_slice(&source.to_be_bytes());
+                out.extend_from_slice(&destination.to_be_bytes());
+                out.resize(TCP_HEADER_LEN, 0);
+                // A plausible data offset, so the header reads as one rather
+                // than as a length the parser refuses.
+                out[12] = 0x50;
+            }
+            Self::Icmp { message_type } => {
+                out.push(message_type);
+                out.resize(ICMP_HEADER_LEN, 0);
+            }
+            // Two bytes: past no header's length, so every one of the three
+            // reports itself truncated.
+            Self::Truncated(_) => out.extend_from_slice(&[0xab, 0xcd]),
+            // A whole UDP header's worth of bytes, which the parser must not
+            // read as one because the fragment offset says they are payload.
+            Self::NonInitialFragment => out.resize(UDP_HEADER_LEN + 6, 0x5a),
+            Self::Unparsed(_) => out.resize(16, 0x5a),
+        }
+        out
+    }
+}
+
 struct FrameSpec {
     destination_mac: MacAddress,
     source_mac: MacAddress,
@@ -68,6 +176,7 @@ struct FrameSpec {
     destination: Ipv4Address,
     ttl: u8,
     vlan: Option<u16>,
+    transport: TransportSpec,
 }
 
 impl FrameSpec {
@@ -79,6 +188,19 @@ impl FrameSpec {
             destination: host_b(),
             ttl: 64,
             vlan: None,
+            transport: TransportSpec::Udp {
+                source: 4444,
+                destination: 5000,
+            },
+        }
+    }
+
+    /// The same frame carrying `transport`, which is the one axis every filter
+    /// case below moves.
+    fn carrying(transport: TransportSpec) -> Self {
+        Self {
+            transport,
+            ..Self::a_to_b()
         }
     }
 
@@ -92,24 +214,24 @@ impl FrameSpec {
         }
         frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
 
-        let payload = b"routed";
-        let total_length = (IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len()) as u16;
+        let payload = self.transport.bytes();
+        let total_length = (IPV4_HEADER_LEN + payload.len()) as u16;
         let mut ip = [0u8; IPV4_HEADER_LEN];
         ip[0] = 0x45;
         ip[2..4].copy_from_slice(&total_length.to_be_bytes());
+        if matches!(self.transport, TransportSpec::NonInitialFragment) {
+            // A non-zero fragment offset, in eight-byte units, with no
+            // more-fragments flag: the last piece of a fragmented datagram.
+            ip[6..8].copy_from_slice(&1u16.to_be_bytes());
+        }
         ip[8] = self.ttl;
-        ip[9] = Protocol::UDP.0;
+        ip[9] = self.transport.protocol().0;
         ip[12..16].copy_from_slice(&self.source.octets());
         ip[16..20].copy_from_slice(&self.destination.octets());
         let checksum = ipv4_checksum(&ip);
         ip[10..12].copy_from_slice(&checksum.to_be_bytes());
         frame.extend_from_slice(&ip);
-
-        frame.extend_from_slice(&4444u16.to_be_bytes());
-        frame.extend_from_slice(&5000u16.to_be_bytes());
-        frame.extend_from_slice(&((UDP_HEADER_LEN + payload.len()) as u16).to_be_bytes());
-        frame.extend_from_slice(&0u16.to_be_bytes());
-        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&payload);
         frame
     }
 }
@@ -143,7 +265,10 @@ fn evaluate_on<const I: usize, const N: usize>(
     let mut bytes = spec.build();
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
     let mut inspection = Inspection::new(ingress, frame);
-    Pipeline::new().evaluate(&mut inspection, &Configuration::new(GENERATION, table))
+    Pipeline::new().evaluate(
+        &mut inspection,
+        &Configuration::new(GENERATION, table, &allow_all()),
+    )
 }
 
 fn evaluate(spec: &FrameSpec, ingress: PortId) -> Verdict {
@@ -168,7 +293,8 @@ fn expect_drop_on<const I: usize, const N: usize>(
 #[test]
 fn an_admissible_frame_is_deferred_to_the_stage_behind_admission() {
     let table = router();
-    let configuration = Configuration::new(GENERATION, &table);
+    let rules = allow_all();
+    let configuration = Configuration::new(GENERATION, &table, &rules);
     let spec = FrameSpec::a_to_b();
     let mut bytes = spec.build();
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
@@ -181,11 +307,17 @@ fn an_admissible_frame_is_deferred_to_the_stage_behind_admission() {
     );
     assert_eq!(
         RoutingStage.evaluate(&mut inspection, &configuration),
-        Verdict::Forward {
+        Step::Continue,
+        "a frame it can resolve is deferred to the filter behind it"
+    );
+    assert_eq!(
+        inspection.forwarding(),
+        Some(Forwarding {
             egress: PORT1,
             source: GATEWAY1_MAC,
             destination: HOST_B_MAC,
-        }
+        }),
+        "and what it resolved is attached for that filter to read"
     );
 }
 
@@ -194,7 +326,8 @@ fn the_first_stage_that_settles_ends_the_chain() {
     // Tagged *and* unroutable: admission settles it, so the routing stage never
     // sees the destination it would otherwise have named.
     let table = router();
-    let configuration = Configuration::new(GENERATION, &table);
+    let rules = allow_all();
+    let configuration = Configuration::new(GENERATION, &table, &rules);
     let spec = FrameSpec {
         vlan: Some(0x0064),
         destination: Ipv4Address::from_octets([192, 0, 2, 9]),
@@ -210,7 +343,7 @@ fn the_first_stage_that_settles_ends_the_chain() {
     );
     assert_eq!(
         RoutingStage.evaluate(&mut inspection, &configuration),
-        Verdict::Drop(DropReason::NoRoute),
+        Step::Settled(Verdict::Drop(DropReason::NoRoute)),
         "the stage behind admission would have named a different reason"
     );
     assert_eq!(
@@ -235,7 +368,8 @@ fn an_inspection_carries_the_port_and_the_frame_the_stages_read() {
 #[test]
 fn a_configuration_carries_the_generation_that_produced_its_table() {
     let table = router();
-    let configuration = Configuration::new(19, &table);
+    let rules = allow_all();
+    let configuration = Configuration::new(19, &table, &rules);
     assert_eq!(configuration.generation(), 19);
     assert_eq!(
         configuration.table().interface(PORT0),
@@ -246,7 +380,8 @@ fn a_configuration_carries_the_generation_that_produced_its_table() {
 #[test]
 fn a_default_pipeline_decides_as_a_new_one_does() {
     let table = router();
-    let configuration = Configuration::new(GENERATION, &table);
+    let rules = allow_all();
+    let configuration = Configuration::new(GENERATION, &table, &rules);
     let spec = FrameSpec::a_to_b();
     let mut bytes = spec.build();
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
@@ -581,6 +716,595 @@ fn a_counter_saturates_rather_than_wrapping() {
     assert_eq!(counters.total(), u64::MAX);
 }
 
+// ── The filter ──────────────────────────────────────────────────────────────
+
+/// One rule with every criterion a wildcard, which each case below narrows by
+/// exactly one field: what a test proves is then the criterion it set and not the
+/// shape of the rule around it.
+fn wildcard(action: RuleAction) -> Rule {
+    Rule {
+        ingress: None,
+        egress: None,
+        source: None,
+        destination: None,
+        protocol: None,
+        source_port: None,
+        destination_port: None,
+        icmp_type: None,
+        action,
+    }
+}
+
+fn ruleset(rules: impl IntoIterator<Item = Rule>) -> Ruleset {
+    Ruleset::build(rules.into_iter()).expect("the cases here are far inside the capacity")
+}
+
+fn prefix(octets: [u8; 4], prefix_length: u8) -> Prefix {
+    Prefix::new(Ipv4Address::from_octets(octets), prefix_length)
+}
+
+fn port(single: u16) -> PortRange {
+    PortRange {
+        low: single,
+        high: single,
+    }
+}
+
+/// Put one frame through the whole chain under `rules` and answer with the
+/// verdict and what the filter counted.
+///
+/// Through the chain rather than into [`PolicyStage`] directly, because the stage
+/// reads facts the stage in front of it attaches: a filter tested on an
+/// inspection somebody assembled by hand would be tested on forwarding nothing
+/// derived.
+fn filter(rules: &Ruleset, spec: &FrameSpec) -> (Verdict, PolicyCounters) {
+    let table = router();
+    let mut bytes = spec.build();
+    let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
+    let mut inspection = Inspection::new(PORT0, frame);
+    let mut pipeline = Pipeline::new();
+    let verdict = pipeline.evaluate(
+        &mut inspection,
+        &Configuration::new(GENERATION, &table, rules),
+    );
+    (verdict, *pipeline.policy_counters())
+}
+
+fn verdict_under(rules: &Ruleset, spec: &FrameSpec) -> Verdict {
+    filter(rules, spec).0
+}
+
+/// The forwarding verdict the routed frame earns when a rule permits it, which
+/// every accepting case below is the same value.
+fn forwarded() -> Verdict {
+    Verdict::Forward {
+        egress: PORT1,
+        source: GATEWAY1_MAC,
+        destination: HOST_B_MAC,
+    }
+}
+
+/// Default deny is a property of the fallthrough and not of any document: there
+/// is no ruleset an operator can write that makes an unmatched frame pass.
+#[test]
+fn a_frame_no_rule_is_about_is_denied_by_the_fallthrough() {
+    let (verdict, counters) = filter(&Ruleset::EMPTY, &FrameSpec::a_to_b());
+    assert_eq!(verdict, Verdict::Drop(DropReason::NoPolicyMatch));
+    assert_eq!(counters.denied_packets, 1);
+    // No rule was matched, so no rule's counter may have moved: the fallthrough
+    // is not a rule and has none of its own.
+    assert!(counters.all_hits().iter().all(|hits| *hits == 0));
+
+    // The same under a policy that exists and is about something else, so the
+    // reason is the fallthrough rather than the absence of a document.
+    let elsewhere = ruleset([Rule {
+        destination_port: Some(port(9999)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let (verdict, counters) = filter(&elsewhere, &FrameSpec::a_to_b());
+    assert_eq!(verdict, Verdict::Drop(DropReason::NoPolicyMatch));
+    assert_eq!(counters.hits(0), 0);
+}
+
+/// The two refusals a filter can reach are two facts, not one: a rule that says
+/// drop names itself, and the fallthrough cannot.
+#[test]
+fn a_rule_that_drops_and_the_fallthrough_are_different_findings() {
+    let denying = ruleset([wildcard(RuleAction::Drop)]);
+    let (verdict, counters) = filter(&denying, &FrameSpec::a_to_b());
+    assert_eq!(verdict, Verdict::Drop(DropReason::PolicyDenied));
+    assert_eq!(counters.hits(0), 1);
+    assert_eq!(counters.denied_packets, 1);
+    assert_ne!(DropReason::PolicyDenied, DropReason::NoPolicyMatch);
+}
+
+/// First match wins in document order, so a rule's line number is its
+/// precedence and a later rule cannot undo an earlier one's verdict.
+#[test]
+fn the_first_matching_rule_decides_and_the_rest_are_not_consulted() {
+    for (first, second, expected, hit) in [
+        (RuleAction::Accept, RuleAction::Drop, forwarded(), 0),
+        (
+            RuleAction::Drop,
+            RuleAction::Accept,
+            Verdict::Drop(DropReason::PolicyDenied),
+            0,
+        ),
+    ] {
+        let rules = ruleset([wildcard(first), wildcard(second)]);
+        let (verdict, counters) = filter(&rules, &FrameSpec::a_to_b());
+        assert_eq!(verdict, expected, "{first:?} before {second:?}");
+        assert_eq!(counters.hits(hit), 1, "the rule that decided it");
+        assert_eq!(counters.hits(1 - hit), 0, "a rule that was never reached");
+    }
+}
+
+/// Every criterion, each one narrowing a wildcard rule by itself: the matching
+/// value permits the frame and a neighbouring value leaves it to the default
+/// deny. One case per field, so a criterion compared against the wrong header
+/// field fails here rather than in a scenario.
+#[test]
+fn each_criterion_matches_its_own_field_and_nothing_else() {
+    let matching = FrameSpec::a_to_b();
+    for (what, hits, misses) in [
+        (
+            "ingress",
+            Rule {
+                ingress: Some(PORT0),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                ingress: Some(PORT1),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "egress",
+            Rule {
+                egress: Some(PORT1),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                egress: Some(PORT0),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "source",
+            Rule {
+                source: Some(prefix([10, 0, 0, 0], 24)),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                source: Some(prefix([10, 0, 1, 0], 24)),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "destination",
+            Rule {
+                destination: Some(prefix([10, 0, 1, 0], 24)),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                destination: Some(prefix([10, 0, 0, 0], 24)),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "protocol",
+            Rule {
+                protocol: Some(Protocol::UDP),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                protocol: Some(Protocol::TCP),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "source port",
+            Rule {
+                source_port: Some(port(4444)),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                source_port: Some(port(4445)),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+        (
+            "destination port",
+            Rule {
+                destination_port: Some(port(5000)),
+                ..wildcard(RuleAction::Accept)
+            },
+            Rule {
+                destination_port: Some(port(5001)),
+                ..wildcard(RuleAction::Accept)
+            },
+        ),
+    ] {
+        assert_eq!(
+            verdict_under(&ruleset([hits]), &matching),
+            forwarded(),
+            "the {what} criterion did not match the value it names"
+        );
+        assert_eq!(
+            verdict_under(&ruleset([misses]), &matching),
+            Verdict::Drop(DropReason::NoPolicyMatch),
+            "the {what} criterion matched a value it does not name"
+        );
+    }
+}
+
+/// A range is inclusive at both ends, and one port past either end is outside
+/// it. An off-by-one here is an `accept` covering a port an operator did not
+/// write, which is the direction that matters.
+#[test]
+fn a_port_range_covers_its_ends_and_nothing_past_them() {
+    let rules = ruleset([Rule {
+        destination_port: Some(PortRange {
+            low: 5000,
+            high: 5002,
+        }),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    for (destination, permitted) in [
+        (4999, false),
+        (5000, true),
+        (5001, true),
+        (5002, true),
+        (5003, false),
+    ] {
+        let spec = FrameSpec::carrying(TransportSpec::Udp {
+            source: 4444,
+            destination,
+        });
+        let expected = if permitted {
+            forwarded()
+        } else {
+            Verdict::Drop(DropReason::NoPolicyMatch)
+        };
+        assert_eq!(verdict_under(&rules, &spec), expected, "port {destination}");
+    }
+}
+
+/// A prefix compares the bits its length names and no others, and a block written
+/// with host bits set covers the same addresses as its canonical form: the
+/// configuration refuses one either way, and the dataplane is total whatever it
+/// is handed.
+#[test]
+fn a_prefix_compares_the_bits_its_length_names() {
+    for (network, length, permitted) in [
+        ([10, 0, 1, 0], 24, true),
+        // The same block written with a host bit set, which masks to the same
+        // network — so it must decide the frame the same way.
+        ([10, 0, 1, 99], 24, true),
+        ([10, 0, 1, 2], 32, true),
+        ([10, 0, 1, 3], 32, false),
+        ([10, 0, 0, 0], 16, true),
+        // Two lengths that are not byte-aligned, so the mask is exercised rather
+        // than the octet comparison a wrong implementation would agree with:
+        // 10.0.0.0/23 reaches 10.0.1.255 and covers the destination, and
+        // 10.0.1.128/25 starts above it and does not.
+        ([10, 0, 0, 0], 23, true),
+        ([10, 0, 1, 128], 25, false),
+        // A zero-length prefix covers everything, which is the one length that
+        // makes a stated criterion equivalent to the wildcard.
+        ([0, 0, 0, 0], 0, true),
+    ] {
+        let rules = ruleset([Rule {
+            destination: Some(prefix(network, length)),
+            ..wildcard(RuleAction::Accept)
+        }]);
+        let expected = if permitted {
+            forwarded()
+        } else {
+            Verdict::Drop(DropReason::NoPolicyMatch)
+        };
+        assert_eq!(
+            verdict_under(&rules, &FrameSpec::a_to_b()),
+            expected,
+            "{network:?}/{length}"
+        );
+    }
+}
+
+/// The property the whole filter rests on: a criterion cannot be satisfied by a
+/// header nobody read.
+///
+/// Five transport shapes carry no port and no ICMP type — two truncations short
+/// of any header's length, a non-initial fragment, and a protocol this build does
+/// not break down — and a port or type criterion must match none of them. On an
+/// appliance that denies what nothing matched, the dangerous half of getting this
+/// wrong is the `accept` written for a port carrying a packet whose port was
+/// never parsed.
+#[test]
+fn a_transport_nobody_read_matches_no_port_and_no_type() {
+    let unreadable = [
+        TransportSpec::Truncated(Protocol::UDP),
+        TransportSpec::Truncated(Protocol::TCP),
+        TransportSpec::Truncated(Protocol::ICMP),
+        TransportSpec::NonInitialFragment,
+        TransportSpec::Unparsed(Protocol(99)),
+    ];
+    let criteria = [
+        Rule {
+            source_port: Some(port(4444)),
+            ..wildcard(RuleAction::Accept)
+        },
+        Rule {
+            destination_port: Some(port(5000)),
+            ..wildcard(RuleAction::Accept)
+        },
+        Rule {
+            icmp_type: Some(8),
+            ..wildcard(RuleAction::Accept)
+        },
+        // A wildcard port range, which is the widest a stated criterion can be:
+        // even it must not match, because the criterion is *stated* and there is
+        // no port to compare.
+        Rule {
+            destination_port: Some(PortRange {
+                low: 0,
+                high: u16::MAX,
+            }),
+            ..wildcard(RuleAction::Accept)
+        },
+    ];
+    for transport in unreadable {
+        let spec = FrameSpec::carrying(transport);
+        for rule in criteria {
+            assert_eq!(
+                verdict_under(&ruleset([rule]), &spec),
+                Verdict::Drop(DropReason::NoPolicyMatch),
+                "{transport:?} satisfied a criterion nothing could be read for: {rule:?}"
+            );
+        }
+        // And the same frame passes a rule that states no port criterion at all,
+        // so the refusals above are the criterion's and not the frame's: an
+        // unparsed transport is still a packet the appliance forwards.
+        assert_eq!(
+            verdict_under(&ruleset([wildcard(RuleAction::Accept)]), &spec),
+            forwarded(),
+            "{transport:?} was refused by a rule that states no port"
+        );
+    }
+}
+
+/// An ICMP type criterion answers from the ICMP header and from no other
+/// protocol's first byte, which is where a naive implementation reads it from.
+#[test]
+fn an_icmp_type_criterion_matches_only_icmp() {
+    let rules = ruleset([Rule {
+        icmp_type: Some(8),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    assert_eq!(
+        verdict_under(
+            &rules,
+            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 8 })
+        ),
+        forwarded()
+    );
+    assert_eq!(
+        verdict_under(
+            &rules,
+            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 0 })
+        ),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+    // A TCP segment whose first header byte happens to be 8: the criterion must
+    // not be answered from it.
+    assert_eq!(
+        verdict_under(
+            &rules,
+            &FrameSpec::carrying(TransportSpec::Tcp {
+                source: 8,
+                destination: 5000,
+            })
+        ),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+}
+
+/// A TCP segment's ports are read from the TCP header, so a rule written for a
+/// port is about both transports that carry one and neither is mistaken for the
+/// other.
+#[test]
+fn a_tcp_segments_ports_are_matched_as_tcps() {
+    let rules = ruleset([Rule {
+        protocol: Some(Protocol::TCP),
+        destination_port: Some(port(443)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    assert_eq!(
+        verdict_under(
+            &rules,
+            &FrameSpec::carrying(TransportSpec::Tcp {
+                source: 4444,
+                destination: 443,
+            })
+        ),
+        forwarded()
+    );
+    // The same port over UDP, which the protocol criterion excludes.
+    assert_eq!(
+        verdict_under(
+            &rules,
+            &FrameSpec::carrying(TransportSpec::Udp {
+                source: 4444,
+                destination: 443,
+            })
+        ),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+}
+
+/// Byte totals are the datagram's own IPv4 total length, split by verdict — what
+/// a link's throughput is comparable against, and not the frame length, which
+/// carries whatever padding a driver added.
+#[test]
+fn the_filter_counts_packets_and_datagram_bytes_by_verdict() {
+    let permissive = ruleset([wildcard(RuleAction::Accept)]);
+    let spec = FrameSpec::a_to_b();
+    let datagram = u64::from((IPV4_HEADER_LEN + UDP_HEADER_LEN + 6) as u16);
+
+    let table = router();
+    let mut pipeline = Pipeline::new();
+    for _ in 0..3 {
+        let mut bytes = spec.build();
+        let frame = Frame::parse(&mut bytes).expect("well formed");
+        let mut inspection = Inspection::new(PORT0, frame);
+        pipeline.evaluate(
+            &mut inspection,
+            &Configuration::new(GENERATION, &table, &permissive),
+        );
+    }
+    let counters = pipeline.policy_counters();
+    assert_eq!(counters.accepted_packets(), 3);
+    assert_eq!(counters.accepted_bytes(), 3 * datagram);
+    assert_eq!(counters.denied_packets(), 0);
+    assert_eq!(counters.denied_bytes(), 0);
+    assert_eq!(counters.hits(0), 3);
+
+    let denying = ruleset([wildcard(RuleAction::Drop)]);
+    let (_, counters) = filter(&denying, &spec);
+    assert_eq!(counters.denied_packets, 1);
+    assert_eq!(counters.denied_bytes, datagram);
+    assert_eq!(counters.accepted_packets, 0);
+    assert_eq!(counters.accepted_bytes, 0);
+}
+
+/// A counter belongs to the position its rule sits at, which is what makes the id
+/// the management domain joins to it that rule's own.
+#[test]
+fn a_hit_is_counted_against_the_position_of_the_rule_that_matched() {
+    let rules = ruleset([
+        Rule {
+            destination_port: Some(port(5001)),
+            ..wildcard(RuleAction::Drop)
+        },
+        Rule {
+            destination_port: Some(port(5002)),
+            ..wildcard(RuleAction::Drop)
+        },
+        Rule {
+            destination_port: Some(port(5000)),
+            ..wildcard(RuleAction::Accept)
+        },
+    ]);
+    let (verdict, counters) = filter(&rules, &FrameSpec::a_to_b());
+    assert_eq!(verdict, forwarded());
+    assert_eq!(counters.hits(0), 0);
+    assert_eq!(counters.hits(1), 0);
+    assert_eq!(counters.hits(2), 1);
+    // A position past the running policy, and one past the array: both answer
+    // zero rather than panicking, a counter being nothing to fault a domain over.
+    assert_eq!(counters.hits(3), 0);
+    assert_eq!(counters.hits(MAX_RULES), 0);
+    assert_eq!(counters.hits(usize::MAX), 0);
+}
+
+/// Every counter saturates, on `DropCounters`' terms: a wrap forges a negative
+/// rate between two scrapes.
+#[test]
+fn a_policy_counter_saturates_rather_than_wrapping() {
+    let mut counters = PolicyCounters::new();
+    counters.hits[0] = u64::MAX;
+    counters.accepted_packets = u64::MAX;
+    counters.accepted_bytes = u64::MAX;
+    for _ in 0..3 {
+        counters.record(Some(0), RuleAction::Accept, 1500);
+    }
+    assert_eq!(counters.hits(0), u64::MAX);
+    assert_eq!(counters.accepted_packets(), u64::MAX);
+    assert_eq!(counters.accepted_bytes(), u64::MAX);
+
+    counters.denied_packets = u64::MAX;
+    counters.denied_bytes = u64::MAX;
+    counters.record(None, RuleAction::Drop, 1500);
+    assert_eq!(counters.denied_packets(), u64::MAX);
+    assert_eq!(counters.denied_bytes(), u64::MAX);
+    assert_eq!(PolicyCounters::default(), PolicyCounters::new());
+}
+
+/// A ruleset refuses the rule past its capacity rather than truncating: a policy
+/// silently missing its last rules denies what it was written to allow, or worse.
+#[test]
+fn a_ruleset_refuses_one_rule_past_its_capacity() {
+    assert!(Ruleset::EMPTY.is_empty());
+    assert_eq!(Ruleset::EMPTY.len(), 0);
+    assert_eq!(Ruleset::default(), Ruleset::EMPTY);
+
+    let full = ruleset(core::iter::repeat_n(
+        wildcard(RuleAction::Accept),
+        MAX_RULES,
+    ));
+    assert_eq!(full.len(), MAX_RULES);
+    assert!(!full.is_empty());
+    assert_eq!(
+        Ruleset::build(core::iter::repeat_n(
+            wildcard(RuleAction::Accept),
+            MAX_RULES + 1
+        )),
+        Err(RulesetFull {
+            requested: MAX_RULES + 1,
+            capacity: MAX_RULES,
+        })
+    );
+}
+
+/// The filter is consulted only for a frame the stage in front of it resolved, so
+/// a frame the routing stage settles is refused under *its* reason and never
+/// reaches a rule.
+#[test]
+fn a_frame_the_routing_stage_settles_never_reaches_a_rule() {
+    let permissive = ruleset([wildcard(RuleAction::Accept)]);
+    let unroutable = FrameSpec {
+        destination: Ipv4Address::from_octets([192, 0, 2, 9]),
+        ..FrameSpec::a_to_b()
+    };
+    let (verdict, counters) = filter(&permissive, &unroutable);
+    assert_eq!(verdict, Verdict::Drop(DropReason::NoRoute));
+    assert_eq!(counters.hits(0), 0, "a rule was consulted for it");
+    assert_eq!(counters.denied_packets, 0, "the filter counted it");
+    assert_eq!(counters.accepted_packets, 0);
+}
+
+/// The one thing a filter must never do when it cannot tell: permit.
+///
+/// Unreachable through the chain — the stage in front settles every frame whose
+/// forwarding it cannot resolve — so the stage is driven directly, which is the
+/// only way to hand it an inspection with nothing attached.
+#[test]
+fn a_filter_asked_about_a_frame_with_no_forwarding_denies_it() {
+    let table = router();
+    let permissive = ruleset([wildcard(RuleAction::Accept)]);
+    let spec = FrameSpec::a_to_b();
+    let mut bytes = spec.build();
+    let frame = Frame::parse(&mut bytes).expect("well formed");
+    let mut inspection = Inspection::new(PORT0, frame);
+    assert_eq!(inspection.forwarding(), None);
+
+    let mut stage = PolicyStage::new();
+    assert_eq!(
+        stage.evaluate(
+            &mut inspection,
+            &Configuration::new(GENERATION, &table, &permissive)
+        ),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+    // Nothing was counted: there was no packet the filter could attribute a
+    // verdict to, and a default stage reports as a new one does.
+    assert_eq!(*stage.counters(), PolicyCounters::new());
+    assert_eq!(
+        *PolicyStage::default().counters(),
+        *PolicyStage::new().counters()
+    );
+}
+
 // ── Properties ──────────────────────────────────────────────────────────────
 
 /// An address out of a small space, so a generated neighbour and a
@@ -660,6 +1384,7 @@ proptest! {
             destination,
             ttl,
             vlan: None,
+            transport: FrameSpec::a_to_b().transport,
         };
 
         match evaluate_on(&table, &spec, ingress) {
@@ -700,6 +1425,7 @@ proptest! {
             destination: Ipv4Address::from_octets(destination),
             ttl,
             vlan: None,
+            transport: FrameSpec::a_to_b().transport,
         };
         let _ = evaluate(&spec, PortId(port));
     }
@@ -724,6 +1450,7 @@ proptest! {
             destination: Ipv4Address::from_octets(destination),
             ttl,
             vlan: None,
+            transport: FrameSpec::a_to_b().transport,
         };
 
         if let Verdict::Forward { egress, source: from, destination: to } =
@@ -763,7 +1490,8 @@ proptest! {
 
         let table = Router::<4, 4>::from_slices(&interfaces, &neighbours)
             .expect("the strategy generates at most the capacity of each table");
-        let configuration = Configuration::new(GENERATION, &table);
+        let rules = allow_all();
+        let configuration = Configuration::new(GENERATION, &table, &rules);
         let spec = FrameSpec {
             destination_mac: MacAddress(destination_mac),
             source_mac: HOST_A_MAC,
@@ -771,6 +1499,7 @@ proptest! {
             destination,
             ttl,
             vlan: tagged.then_some(0x0064),
+            transport: FrameSpec::a_to_b().transport,
         };
         let mut bytes = spec.build();
         let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
@@ -784,7 +1513,7 @@ proptest! {
                 prop_assert!(false, "admission forwarded a frame it cannot route");
             }
             Step::Continue => {
-                if let Verdict::Drop(reason) =
+                if let Step::Settled(Verdict::Drop(reason)) =
                     RoutingStage.evaluate(&mut inspection, &configuration)
                 {
                     prop_assert!(

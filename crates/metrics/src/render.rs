@@ -24,11 +24,18 @@
 //! shards within it. That costs a scan of every shard per family and buys an
 //! output a strict parser accepts.
 
-use crate::catalog::{ALL_METRICS, INTERFACE_INFO, Label, Metric, SHARD_COUNT, SHARDS, Series};
+use wire::CheckedIdentifier;
+
+use crate::catalog::{
+    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Label, Metric, RULE_HITS, SHARD_COUNT, SHARDS,
+    Series,
+};
 use crate::interfaces::{
     InterfaceInfo, InterfaceInventory, MANAGEMENT_PORT_DOMAIN, MAX_INTERFACE_SERIES, PORT_DOMAINS,
     Role,
 };
+use crate::rules::{MAX_RULE_SERIES, RuleInventory};
+use crate::sample::RULE_HITS_BASE;
 use crate::{STATS_SLOTS, StatsShard};
 
 /// Why an exposition was not written.
@@ -91,6 +98,10 @@ pub struct Snapshot {
     /// identity is text rather than a number. Empty is the honest state of a node
     /// running generation 0.
     interfaces: InterfaceInventory,
+    /// The rules the running policy declares, on the same terms. Only the
+    /// *identity* comes from the configuration here — every hit count is in the
+    /// forwarding domain's shard above, joined to an id by position.
+    rules: RuleInventory,
 }
 
 impl Snapshot {
@@ -101,6 +112,7 @@ impl Snapshot {
         Self {
             values,
             interfaces: InterfaceInventory::EMPTY,
+            rules: RuleInventory::EMPTY,
         }
     }
 
@@ -114,6 +126,13 @@ impl Snapshot {
         Self { interfaces, ..self }
     }
 
+    /// The same counters, reporting the rules a configuration declared — which is
+    /// what turns the per-rule block of the forwarder's shard into named series.
+    #[must_use]
+    pub const fn with_rules(self, rules: RuleInventory) -> Self {
+        Self { rules, ..self }
+    }
+
     /// Read every shard once, in [`SHARDS`] order.
     #[must_use]
     pub fn read(shards: [&StatsShard; SHARD_COUNT]) -> Self {
@@ -124,6 +143,7 @@ impl Snapshot {
         Self {
             values,
             interfaces: InterfaceInventory::EMPTY,
+            rules: RuleInventory::EMPTY,
         }
     }
 
@@ -176,12 +196,17 @@ impl Snapshot {
                 writer.bytes(b"\n")?;
             }
         }
-        // One family's samples come from the configuration, so the loop above
-        // contributes nothing to it. Pointer equality rather than a name
+        // Two families' samples are not in any shard's table, so the loop above
+        // contributes nothing to either. Pointer equality rather than a name
         // comparison: `ALL_METRICS` holds a reference to the one declaration.
         if core::ptr::eq(metric, &INTERFACE_INFO) {
             for info in self.interfaces.entries() {
                 Self::render_interface(metric, info, writer)?;
+            }
+        }
+        if core::ptr::eq(metric, &RULE_HITS) {
+            for (position, id) in self.rules.entries() {
+                self.render_rule(metric, position, id, writer)?;
             }
         }
         Ok(())
@@ -210,6 +235,38 @@ impl Snapshot {
         writer.mac(info.mac())?;
         writer.bytes(b"\"} ")?;
         writer.bytes(INFO_VALUE)?;
+        writer.bytes(b"\n")
+    }
+
+    /// One rule's hit counter: the id the document gave it, and the count the
+    /// forwarding domain wrote at that rule's position.
+    ///
+    /// The count is read out of the shard rather than carried in the inventory,
+    /// which is the whole of the join: a number only the forwarder could have
+    /// stored, under a name only the configuration could have chosen. A slot past
+    /// the shard is unreachable — `RULE_HITS_BASE + MAX_RULE_SERIES` is asserted
+    /// to fit `STATS_SLOTS` — and reads as zero rather than as a panic, on the
+    /// terms every other slot read here does.
+    fn render_rule(
+        &self,
+        metric: &Metric,
+        position: usize,
+        id: CheckedIdentifier,
+        writer: &mut Writer<'_>,
+    ) -> Result<(), Full> {
+        let hits = RULE_HITS_BASE
+            .checked_add(position)
+            .and_then(|slot| self.values.get(FORWARDER_SHARD)?.get(slot).copied())
+            .unwrap_or(0);
+        writer.bytes(metric.name.as_bytes())?;
+        writer.bytes(b"{")?;
+        writer.label(&Label::new("domain", SHARDS[FORWARDER_SHARD].domain))?;
+        writer.bytes(b",rule=\"")?;
+        // A `CheckedIdentifier` is proof of `[a-z0-9-]{1,16}`, so no byte of it
+        // can close the quoted value early (`wire::ConfigImage::check`).
+        writer.bytes(id.as_bytes())?;
+        writer.bytes(b"\"} ")?;
+        writer.number(hits)?;
         writer.bytes(b"\n")
     }
 }
@@ -310,7 +367,26 @@ pub(crate) const fn exposition_bound() -> usize {
         }
         shard += 1;
     }
-    total + MAX_INTERFACE_SERIES * info_line_len()
+    total + MAX_INTERFACE_SERIES * info_line_len() + MAX_RULE_SERIES * rule_line_len()
+}
+
+/// The longest per-rule line, and one a real policy can actually produce: a rule
+/// named at the full identifier width, hit `u64::MAX` times.
+///
+/// Reachable rather than merely safe, as the info bound is: the id length is the
+/// configuration reader's own bound, so a document can name a rule that wide.
+pub(crate) const fn rule_line_len() -> usize {
+    // `{`, the two labels with their separating comma, `}`, the space, the digits
+    // and the newline.
+    RULE_HITS.name.len()
+        + 1
+        + label_len("domain", SHARDS[FORWARDER_SHARD].domain)
+        + 1
+        + label_len_of("rule", wire::LOG_IDENTIFIER_BYTES)
+        + 1
+        + 1
+        + MAX_DIGITS
+        + 1
 }
 
 /// The longest info series line, and one a full inventory can actually be made of

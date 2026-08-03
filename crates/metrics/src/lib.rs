@@ -61,6 +61,7 @@
 mod catalog;
 mod interfaces;
 mod render;
+mod rules;
 mod sample;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -68,7 +69,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use wire::MAPPING_ALIGN;
 
 pub use catalog::{
-    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Kind, Label, MANAGEMENT_SHARD, Metric,
+    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Kind, Label, MANAGEMENT_SHARD, Metric, RULE_HITS,
     SHARD_COUNT, SHARDS, Series, ShardSpec, metric,
 };
 pub use interfaces::{
@@ -76,12 +77,14 @@ pub use interfaces::{
     PORT_DOMAINS, Role, port_domain,
 };
 pub use render::{MAX_EXPOSITION_LEN, RenderError, Snapshot};
+pub use rules::{MAX_RULE_SERIES, RuleInventory, RulesFull};
 pub use sample::{
     CLOCK_SLOTS, CONFIG_SLOTS, CONSOLE_SLOTS, ClockSample, ConfigSample, ConsoleSample,
-    DRIVER_SLOTS, DriverSample, EndpointSample, FORWARDER_SLOTS, ForwarderSample, HTTP_STATUSES,
-    HttpSample, LogSample, MANAGEMENT_SLOTS, ManagementSample, PIPELINES, PipelineSample,
-    PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RecorderSample,
-    SINKS, SinkSample, TapSample, TcpSample, UartSample,
+    DRIVER_SLOTS, DriverSample, EndpointSample, FORWARDER_SHARD_SLOTS, FORWARDER_SLOTS,
+    ForwarderSample, HTTP_STATUSES, HttpSample, LogSample, MANAGEMENT_SLOTS, ManagementSample,
+    PIPELINES, PipelineSample, PolicySample, PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS,
+    ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS, SinkSample, TapSample,
+    TcpSample, UartSample,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table
@@ -91,12 +94,20 @@ const STATS_HEADROOM: usize = 16;
 
 /// Counter slots one shard carries.
 ///
-/// Derived rather than chosen: the largest table — the management endpoint's,
-/// whose transport alone keeps twenty-seven — plus [`STATS_HEADROOM`], rounded to
-/// a whole cache line so no shard's last slot shares one with what follows it.
-/// The assertions in [`sample`] hold every other table to the management
-/// endpoint's, so one that outgrew it is a build error and not a dropped counter.
-pub const STATS_SLOTS: usize = (sample::MANAGEMENT_SLOTS + STATS_HEADROOM).next_multiple_of(8);
+/// Derived rather than chosen: the widest set a domain publishes — the
+/// forwarder's, whose per-rule block reserves one slot per rule the
+/// configuration ABI admits — plus [`STATS_HEADROOM`], rounded to a whole cache
+/// line so no shard's last slot shares one with what follows it. The assertions
+/// in [`sample`] hold every other set to it, so one that outgrew it is a build
+/// error and not a dropped counter.
+///
+/// Every shard is this wide, including the seven that publish far fewer, and that
+/// costs nothing: a shard is its own region and a region is a page, so the
+/// reservation was already a page before the per-rule block existed and still is.
+/// The alternative — a second region carrying the rule counters alone — would buy
+/// back no memory and would add a mapping to the domain that faces the
+/// management-plane attacker.
+pub const STATS_SLOTS: usize = (sample::FORWARDER_SHARD_SLOTS + STATS_HEADROOM).next_multiple_of(8);
 
 /// One protection domain's counters, as the shared region lays them out.
 ///
@@ -165,7 +176,7 @@ pub const STATS_REGION_SIZE: usize = size_of::<StatsShard>().next_multiple_of(MA
 // here rather than a reader attributing one domain's counter to another series.
 const _: () = {
     assert!(size_of::<StatsShard>() == STATS_SLOTS * 8);
-    assert!(size_of::<StatsShard>() == 768);
+    assert!(size_of::<StatsShard>() == 2688);
     assert!(align_of::<StatsShard>() == 64);
     // Every slot naturally aligned, which is what makes each store and load a
     // single access rather than two a reader could tear across.

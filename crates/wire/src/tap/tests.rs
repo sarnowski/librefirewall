@@ -725,6 +725,8 @@ fn every_drop_reason_round_trips_through_the_region() {
         TapDropReason::NoRoute,
         TapDropReason::EgressIsIngress,
         TapDropReason::NoNeighbour,
+        TapDropReason::PolicyDenied,
+        TapDropReason::NoPolicyMatch,
     ];
     assert_eq!(reasons.len() as u32, TAP_DROP_REASON_COUNT);
     for (index, reason) in reasons.iter().enumerate() {

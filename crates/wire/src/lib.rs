@@ -211,6 +211,12 @@ const _: () = {
 // system description reserves, so moving one rebuilds every domain that maps it.
 pub const MAX_INTERFACES: usize = 8;
 pub const MAX_NEIGHBOURS: usize = 32;
+/// Filter rules one generation may carry. The largest of the three by two
+/// orders of magnitude, because a ruleset is the one part of a configuration
+/// that grows with what an operator wants to express rather than with the
+/// hardware: eight ports and thirty-two neighbours describe this appliance,
+/// and two hundred and fifty-six rules describe a policy.
+pub const MAX_RULES: usize = 256;
 
 /// Bits an IPv4 prefix can name.
 pub const MAX_PREFIX_LENGTH: u8 = 32;
@@ -280,6 +286,56 @@ shared_image! {
 }
 
 shared_image! {
+    /// One filter rule, with every criterion as a pair: a byte saying whether
+    /// the criterion is stated at all, and the value it states.
+    ///
+    /// The pair is why there is no wildcard *value* anywhere below. A criterion
+    /// that meant "any" by holding a reserved number would make one port, one
+    /// protocol or one ICMP type unwritable, and would put the reader in the
+    /// position of telling a wildcard from a value an operator meant — so
+    /// "stated" is its own byte, held to 0 or 1 by [`ConfigImage::check`] on
+    /// [`InterfaceImage::enabled`]'s terms.
+    ///
+    /// An interface criterion crosses as the *port* the named interface holds,
+    /// as a [`NeighbourImage`]'s does and for the same reason: what a rule
+    /// decides against on the packet path is a port, and resolving the name
+    /// twice would be two answers to one question.
+    RuleImage mirrored by RuleSlot, 52 bytes aligned 2 {
+        /// 0 accepts and 1 drops, as raw bits.
+        @0 action: byte,
+        @1 ingress_stated: byte,
+        @2 ingress_port: byte,
+        @3 egress_stated: byte,
+        @4 egress_port: byte,
+        @5 source_stated: byte,
+        @6 source_prefix_length: byte,
+        @7 destination_stated: byte,
+        /// Network order, as the address appears in a header.
+        @8 source_network: bytes(4),
+        @12 destination_network: bytes(4),
+        @16 destination_prefix_length: byte,
+        @17 protocol_stated: byte,
+        /// The IANA protocol number, so a rule can name one this build's parser
+        /// does not break down.
+        @18 protocol: byte,
+        @19 icmp_type_stated: byte,
+        @20 icmp_type: byte,
+        @21 source_port_stated: byte,
+        @22 destination_port_stated: byte,
+        @23 _pad: padding(1),
+        /// Inclusive, and equal for a single port: one shape rather than two,
+        /// so nothing downstream branches on which of them the document wrote.
+        @24 source_port_low: half,
+        @26 source_port_high: half,
+        @28 destination_port_low: half,
+        @30 destination_port_high: half,
+        /// The `id` of the document's `<rule>`, which is what a per-rule metric
+        /// is labelled by and what a refusal names.
+        @32 id: identifier,
+    }
+}
+
+shared_image! {
     /// A whole configuration generation as bytes in a shared region.
     ///
     /// The arrays are always their full size, so the image is one fixed-size
@@ -289,7 +345,7 @@ shared_image! {
     /// neighbours — so a zeroed region is already the fail-closed
     /// configuration, which is what lets a domain come up before anything has
     /// been written to it.
-    ConfigImage mirrored by ConfigSlot, 832 bytes aligned 4 {
+    ConfigImage mirrored by ConfigSlot, 14148 bytes aligned 4 {
         @0 generation: word,
         /// How many of `interfaces` the writer filled, as raw bits:
         /// peer-written, so it may name more than the array holds.
@@ -301,6 +357,11 @@ shared_image! {
         @16 management: nested(ManagementImage, ManagementSlot),
         @32 interfaces: array(InterfaceImage, InterfaceSlot, MAX_INTERFACES),
         @320 neighbours: array(NeighbourImage, NeighbourSlot, MAX_NEIGHBOURS),
+        @832 rule_count: word,
+        /// **In document order**, which is the one order that is a decision
+        /// rather than a layout: a ruleset is first-match-wins, so a writer
+        /// that reordered these would be rewriting the policy.
+        @836 rules: array(RuleImage, RuleSlot, MAX_RULES),
     }
 }
 
@@ -337,7 +398,7 @@ impl ConfigImage {
     ///
     /// # Errors
     /// [`ConfigImageError`], naming the field and the value that refused it.
-    pub fn check(&self, port_count: u8) -> Result<CheckedConfig, ConfigImageError> {
+    pub fn check(&self, port_count: u8) -> Result<CheckedConfig<'_>, ConfigImageError> {
         let raw_interfaces = self.interfaces.get(..self.interface_count as usize).ok_or(
             ConfigImageError::InterfaceCountExceedsCapacity {
                 count: self.interface_count,
@@ -346,6 +407,11 @@ impl ConfigImage {
         let raw_neighbours = self.neighbours.get(..self.neighbour_count as usize).ok_or(
             ConfigImageError::NeighbourCountExceedsCapacity {
                 count: self.neighbour_count,
+            },
+        )?;
+        let raw_rules = self.rules.get(..self.rule_count as usize).ok_or(
+            ConfigImageError::RuleCountExceedsCapacity {
+                count: self.rule_count,
             },
         )?;
 
@@ -361,12 +427,34 @@ impl ConfigImage {
         }
         check_neighbour_topology(&neighbours)?;
 
+        // Checked in place and never collected: an array of decoded rules is
+        // pages long at `MAX_RULES`, and the domains that read a configuration
+        // are the ones whose stacks cannot hold one. What survives the loop is
+        // the borrow of the entries it accepted.
+        let mut earlier_ids = [None; MAX_RULES];
+        for (index, raw) in raw_rules.iter().enumerate() {
+            let rule = check_rule(raw, index, port_count, &interfaces)?;
+            if let Some((other, _)) = earlier_ids
+                .iter()
+                .flatten()
+                .enumerate()
+                .find(|(_, id)| **id == rule.id)
+            {
+                return Err(ConfigImageError::RuleIdDuplicated { index, other });
+            }
+            if let Some(slot) = earlier_ids.get_mut(index) {
+                *slot = Some(rule.id);
+            }
+        }
+
         Ok(CheckedConfig {
             generation: self.generation,
             content_hash: self.content_hash,
             management: check_management(&self.management, &interfaces)?,
             interfaces,
             neighbours,
+            rules: raw_rules,
+            port_count,
         })
     }
 }
@@ -430,23 +518,34 @@ impl ConfigHandover {
         self.offered.load(Ordering::Acquire)
     }
 
-    /// Copies the whole image out, because the writer may change the region
-    /// again at any moment and a view into it decides nothing.
+    /// Copies the whole image into storage the *caller* owns, because the
+    /// writer may change the region again at any moment and a view into it
+    /// decides nothing.
     ///
-    /// The copy is made through `Relaxed` accesses, and the property that buys
-    /// is narrow: the release/acquire pair on the generation orders the writes
-    /// of *one* publication against a reader that then sees that generation. It
-    /// orders nothing against a publisher that writes again, which is the
-    /// publisher this side is written against — so what comes back here can be
-    /// a blend of two images, one field from each. That is not made safe by
-    /// ordering and is not claimed to be: [`ConfigImage::check`] rules on the
-    /// copy as one value, and a blend is admitted only if every rule holds of
-    /// the blend. What each access buys, therefore, is a read that cannot tear
-    /// *within a field* — which is what keeps a MAC from being half of one
-    /// address and half of another — and nothing more.
-    #[must_use]
-    pub fn load_image(&self) -> ConfigImage {
-        self.image.load()
+    /// Into the caller's storage rather than out by value, and that is a
+    /// property of the system rather than a calling convention: an image is
+    /// pages long and grows with every entity the configuration gains, so a
+    /// return by value puts a whole generation on the stack of whichever
+    /// protection domain asked — twice over, once for the image and once for
+    /// what it decodes to. The domains that read a configuration have stacks
+    /// measured in tens of kilobytes and the hot one has sixteen, so the image
+    /// lives in a field of the reader and this fills it.
+    ///
+    /// **It still copies exactly once**, which is the whole of the argument
+    /// below and is not weakened by where the bytes land. The copy is made
+    /// through `Relaxed` accesses, and the property that buys is narrow: the
+    /// release/acquire pair on the generation orders the writes of *one*
+    /// publication against a reader that then sees that generation. It orders
+    /// nothing against a publisher that writes again, which is the publisher
+    /// this side is written against — so what comes back here can be a blend of
+    /// two images, one field from each. That is not made safe by ordering and
+    /// is not claimed to be: [`ConfigImage::check`] rules on the copy as one
+    /// value, and a blend is admitted only if every rule holds of the blend.
+    /// What each access buys, therefore, is a read that cannot tear *within a
+    /// field* — which is what keeps a MAC from being half of one address and
+    /// half of another — and nothing more.
+    pub fn load_image_into(&self, image: &mut ConfigImage) {
+        *image = self.image.load();
     }
 
     pub fn publish_committed(&self, generation: u32) {
@@ -508,12 +607,17 @@ impl ConfigAck {
 /// at a fixed virtual address in three protection domains and every region
 /// behind it in that window moves when it grows, so a generation that outgrows
 /// the reservation re-lays an address map three domains have to agree on. Four
-/// pages is what the configuration ABI is reserved at so that the entities
-/// still to be added to it — each an array sized by a capacity constant beside
-/// [`MAX_INTERFACES`] — land inside a map already laid rather than beside a new
-/// one. What occupies it today is [`size_of::<ConfigHandover>`] and the
-/// assertions below hold the two in the only order that matters.
-const CONFIG_REGION_RESERVATION: usize = 4 * MAPPING_ALIGN;
+/// pages is what the configuration ABI was first reserved at, and eight is what
+/// it is reserved at now: the ruleset took the four-page map to two kilobytes
+/// of headroom, and re-laying a window three domains agree on is worth doing
+/// once, deliberately, rather than on the landing that discovers it is full.
+/// Address space costs nothing here — the pages are reserved, not populated —
+/// so the reservation is set where the entities still to be added to it, each
+/// an array sized by a capacity constant beside [`MAX_INTERFACES`], land inside
+/// a map already laid. What occupies it today is
+/// [`size_of::<ConfigHandover>`] and the assertions below hold the two in the
+/// only order that matters.
+const CONFIG_REGION_RESERVATION: usize = 8 * MAPPING_ALIGN;
 
 /// Bytes the system description reserves for the handover region: the fewest
 /// [`MAPPING_ALIGN`] pages that hold the type, and never fewer than
@@ -668,6 +772,108 @@ pub enum ConfigImageError {
     ManagementMacCollidesWithInterface {
         index: usize,
     },
+    RuleCountExceedsCapacity {
+        count: u32,
+    },
+    /// A criterion's stated flag that is neither 0 nor 1, which no `Option` can
+    /// be coerced from without picking a meaning the writer did not choose.
+    RuleCriterionNotBoolean {
+        index: usize,
+        criterion: RuleCriterion,
+        stated: u8,
+    },
+    RuleActionUnknown {
+        index: usize,
+        action: u8,
+    },
+    RulePortUnknown {
+        index: usize,
+        criterion: RuleCriterion,
+        port: u8,
+    },
+    /// A port this build has and no interface addresses, so a rule naming it
+    /// names a link the appliance is not on.
+    RulePortUnconfigured {
+        index: usize,
+        criterion: RuleCriterion,
+        port: u8,
+    },
+    RulePrefixLengthTooLong {
+        index: usize,
+        criterion: RuleCriterion,
+        prefix_length: u8,
+    },
+    /// Host bits set below the prefix, so the block is not the one the address
+    /// reads as.
+    RulePrefixNotCanonical {
+        index: usize,
+        criterion: RuleCriterion,
+        network: [u8; 4],
+    },
+    RulePortRangeReversed {
+        index: usize,
+        criterion: RuleCriterion,
+        low: u16,
+        high: u16,
+    },
+    /// A port criterion on a rule naming ICMP, which carries no ports: it would
+    /// match nothing, whatever an operator meant by it.
+    RulePortCriterionOnIcmp {
+        index: usize,
+        criterion: RuleCriterion,
+    },
+    /// The converse: an ICMP type on a rule naming something else.
+    RuleIcmpTypeOnNonIcmp {
+        index: usize,
+        protocol: u8,
+    },
+    RuleIdNotAnIdentifier {
+        index: usize,
+        fault: TextFault,
+    },
+    RuleIdDuplicated {
+        index: usize,
+        other: usize,
+    },
+}
+
+/// Which criterion of a rule a refusal is about, so one rule's eight criteria
+/// are eight things to go and fix rather than one.
+///
+/// The tokens are the document's own attribute names, which is what makes a
+/// refusal point at the text an operator edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleCriterion {
+    Ingress,
+    Egress,
+    Source,
+    Destination,
+    Protocol,
+    SourcePort,
+    DestinationPort,
+    IcmpType,
+}
+
+impl RuleCriterion {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ingress => "ingress",
+            Self::Egress => "egress",
+            Self::Source => "source",
+            Self::Destination => "destination",
+            Self::Protocol => "protocol",
+            Self::SourcePort => "source-port",
+            Self::DestinationPort => "destination-port",
+            Self::IcmpType => "icmp-type",
+        }
+    }
+}
+
+impl fmt::Display for RuleCriterion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl fmt::Display for ConfigImageError {
@@ -798,6 +1004,74 @@ impl fmt::Display for ConfigImageError {
             ),
             Self::ManagementMacCollidesWithInterface { index } => {
                 write!(f, "management shares its MAC with interface {index}")
+            }
+            Self::RuleCountExceedsCapacity { count } => write!(
+                f,
+                "rule count {count} exceeds the {MAX_RULES} slots the image holds"
+            ),
+            Self::RuleCriterionNotBoolean {
+                index,
+                criterion,
+                stated,
+            } => write!(
+                f,
+                "rule {index} {criterion} stated byte {stated} is not 0 or 1"
+            ),
+            Self::RuleActionUnknown { index, action } => {
+                write!(f, "rule {index} action byte {action} is not 0 or 1")
+            }
+            Self::RulePortUnknown {
+                index,
+                criterion,
+                port,
+            } => write!(
+                f,
+                "rule {index} {criterion} names port {port}, which does not exist"
+            ),
+            Self::RulePortUnconfigured {
+                index,
+                criterion,
+                port,
+            } => write!(
+                f,
+                "rule {index} {criterion} names port {port}, which no interface addresses"
+            ),
+            Self::RulePrefixLengthTooLong {
+                index,
+                criterion,
+                prefix_length,
+            } => write!(
+                f,
+                "rule {index} {criterion} prefix length {prefix_length} exceeds {MAX_PREFIX_LENGTH}"
+            ),
+            Self::RulePrefixNotCanonical {
+                index,
+                criterion,
+                network,
+            } => {
+                write!(f, "rule {index} {criterion} ")?;
+                write_address(f, *network)?;
+                write!(f, " has host bits set below its prefix")
+            }
+            Self::RulePortRangeReversed {
+                index,
+                criterion,
+                low,
+                high,
+            } => write!(f, "rule {index} {criterion} range {low}-{high} is empty"),
+            Self::RulePortCriterionOnIcmp { index, criterion } => write!(
+                f,
+                "rule {index} names icmp and states a {criterion}, which icmp carries none of"
+            ),
+            Self::RuleIcmpTypeOnNonIcmp { index, protocol } => write!(
+                f,
+                "rule {index} states an icmp-type and names protocol {protocol}"
+            ),
+            Self::RuleIdNotAnIdentifier { index, fault } => {
+                write!(f, "rule {index} id {fault}")
+            }
+            Self::RuleIdDuplicated { index, other } => {
+                write!(f, "rule {index} repeats rule {other}'s id")
             }
         }
     }
@@ -1093,6 +1367,259 @@ fn check_management(
     }))
 }
 
+/// A stated address criterion: the block a rule matches source or destination
+/// against. A wildcard is the absence of one of these rather than a value of
+/// it, which is what [`CheckedRule`]'s `Option` carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedPrefix {
+    /// Network order, as the address appears in a header. Its host bits are
+    /// clear, which [`check_rule`] is what establishes.
+    pub network: [u8; 4],
+    pub prefix_length: u8,
+}
+
+/// A stated port criterion, inclusive at both ends and equal for a single
+/// port. `low <= high`, which [`check_rule`] is what establishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedPorts {
+    pub low: u16,
+    pub high: u16,
+}
+
+/// What a rule does with a frame it matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedAction {
+    Accept,
+    Drop,
+}
+
+/// Decode one rule, criterion by criterion, then hold the criteria to each
+/// other: a port criterion is meaningless on ICMP and an ICMP type criterion is
+/// meaningless on anything else, and a rule carrying either is one an operator
+/// wrote believing it would match something.
+///
+/// The order is the contract: the stated flags, then each criterion's own
+/// value, then the two rules between criteria, then the identity. An operator
+/// reading a refusal is sent to one attribute.
+fn check_rule(
+    raw: &RuleImage,
+    index: usize,
+    port_count: u8,
+    interfaces: &[Option<CheckedInterface>; MAX_INTERFACES],
+) -> Result<CheckedRule, ConfigImageError> {
+    let RuleImage {
+        action,
+        ingress_stated,
+        ingress_port,
+        egress_stated,
+        egress_port,
+        source_stated,
+        source_prefix_length,
+        destination_stated,
+        source_network,
+        destination_network,
+        destination_prefix_length,
+        protocol_stated,
+        protocol,
+        icmp_type_stated,
+        icmp_type,
+        source_port_stated,
+        destination_port_stated,
+        source_port_low,
+        source_port_high,
+        destination_port_low,
+        destination_port_high,
+        id,
+        ..
+    } = *raw;
+
+    let stated = |flag: u8, criterion: RuleCriterion| match flag {
+        0 => Ok(false),
+        1 => Ok(true),
+        flag => Err(ConfigImageError::RuleCriterionNotBoolean {
+            index,
+            criterion,
+            stated: flag,
+        }),
+    };
+    let action = match action {
+        0 => CheckedAction::Accept,
+        1 => CheckedAction::Drop,
+        action => return Err(ConfigImageError::RuleActionUnknown { index, action }),
+    };
+
+    let ingress = check_rule_port(
+        stated(ingress_stated, RuleCriterion::Ingress)?,
+        ingress_port,
+        index,
+        RuleCriterion::Ingress,
+        port_count,
+        interfaces,
+    )?;
+    let egress = check_rule_port(
+        stated(egress_stated, RuleCriterion::Egress)?,
+        egress_port,
+        index,
+        RuleCriterion::Egress,
+        port_count,
+        interfaces,
+    )?;
+    let source = check_rule_prefix(
+        stated(source_stated, RuleCriterion::Source)?,
+        source_network,
+        source_prefix_length,
+        index,
+        RuleCriterion::Source,
+    )?;
+    let destination = check_rule_prefix(
+        stated(destination_stated, RuleCriterion::Destination)?,
+        destination_network,
+        destination_prefix_length,
+        index,
+        RuleCriterion::Destination,
+    )?;
+    let protocol = stated(protocol_stated, RuleCriterion::Protocol)?.then_some(protocol);
+    let source_port = check_rule_ports(
+        stated(source_port_stated, RuleCriterion::SourcePort)?,
+        source_port_low,
+        source_port_high,
+        index,
+        RuleCriterion::SourcePort,
+    )?;
+    let destination_port = check_rule_ports(
+        stated(destination_port_stated, RuleCriterion::DestinationPort)?,
+        destination_port_low,
+        destination_port_high,
+        index,
+        RuleCriterion::DestinationPort,
+    )?;
+    let icmp_type = stated(icmp_type_stated, RuleCriterion::IcmpType)?.then_some(icmp_type);
+
+    if protocol == Some(ICMP_PROTOCOL) {
+        for criterion in [RuleCriterion::SourcePort, RuleCriterion::DestinationPort] {
+            let stated = match criterion {
+                RuleCriterion::SourcePort => source_port.is_some(),
+                _ => destination_port.is_some(),
+            };
+            if stated {
+                return Err(ConfigImageError::RulePortCriterionOnIcmp { index, criterion });
+            }
+        }
+    }
+    if icmp_type.is_some()
+        && let Some(protocol) = protocol
+        && protocol != ICMP_PROTOCOL
+    {
+        return Err(ConfigImageError::RuleIcmpTypeOnNonIcmp { index, protocol });
+    }
+
+    let id = check_bounded_text(&id, false)
+        .map_err(|fault| ConfigImageError::RuleIdNotAnIdentifier { index, fault })?;
+
+    Ok(CheckedRule {
+        id,
+        ingress,
+        egress,
+        source,
+        destination,
+        protocol,
+        source_port,
+        destination_port,
+        icmp_type,
+        action,
+    })
+}
+
+/// One interface criterion: the port it names, held to this build's port count
+/// and to a port some interface actually addresses.
+fn check_rule_port(
+    stated: bool,
+    port: u8,
+    index: usize,
+    criterion: RuleCriterion,
+    port_count: u8,
+    interfaces: &[Option<CheckedInterface>; MAX_INTERFACES],
+) -> Result<Option<u8>, ConfigImageError> {
+    if !stated {
+        return Ok(None);
+    }
+    if port >= port_count {
+        return Err(ConfigImageError::RulePortUnknown {
+            index,
+            criterion,
+            port,
+        });
+    }
+    if !interfaces.iter().flatten().any(|entry| entry.port == port) {
+        return Err(ConfigImageError::RulePortUnconfigured {
+            index,
+            criterion,
+            port,
+        });
+    }
+    Ok(Some(port))
+}
+
+/// One address criterion, held to a legal prefix length and to naming the block
+/// it appears to: `10.0.0.5/24` covers what `10.0.0.0/24` covers, and an
+/// operator reading it back would not know that.
+fn check_rule_prefix(
+    stated: bool,
+    network: [u8; 4],
+    prefix_length: u8,
+    index: usize,
+    criterion: RuleCriterion,
+) -> Result<Option<CheckedPrefix>, ConfigImageError> {
+    if !stated {
+        return Ok(None);
+    }
+    if prefix_length > MAX_PREFIX_LENGTH {
+        return Err(ConfigImageError::RulePrefixLengthTooLong {
+            index,
+            criterion,
+            prefix_length,
+        });
+    }
+    if address_bits(network) & !prefix_mask(prefix_length) != 0 {
+        return Err(ConfigImageError::RulePrefixNotCanonical {
+            index,
+            criterion,
+            network,
+        });
+    }
+    Ok(Some(CheckedPrefix {
+        network,
+        prefix_length,
+    }))
+}
+
+/// One port criterion, held to being a range at all.
+fn check_rule_ports(
+    stated: bool,
+    low: u16,
+    high: u16,
+    index: usize,
+    criterion: RuleCriterion,
+) -> Result<Option<CheckedPorts>, ConfigImageError> {
+    if !stated {
+        return Ok(None);
+    }
+    if low > high {
+        return Err(ConfigImageError::RulePortRangeReversed {
+            index,
+            criterion,
+            low,
+            high,
+        });
+    }
+    Ok(Some(CheckedPorts { low, high }))
+}
+
+/// The IANA number for ICMP, which is the one protocol whose criteria differ
+/// from every other's. Stated here rather than taken from a header crate: this
+/// crate depends on nothing, and the number is an assigned constant.
+const ICMP_PROTOCOL: u8 = 1;
+
 checked_value! {
     /// An enabled management interface that survived [`ConfigImage::check`].
     /// Holding one *is* the enable flag; see [`check_management`].
@@ -1132,6 +1659,32 @@ checked_value! {
     }
 }
 
+checked_value! {
+    /// One filter rule that survived [`ConfigImage::check`].
+    ///
+    /// Every criterion is an `Option`, and the absence *is* the wildcard: a
+    /// rule that matches every source holds `None` rather than a block covering
+    /// everything, so nothing downstream compares against a value standing in
+    /// for "do not compare". The two criteria that carry more than one number
+    /// arrive as values whose own invariants were established here —
+    /// [`CheckedPrefix`]'s host bits are clear and [`CheckedPorts`] is ordered.
+    CheckedRule {
+        /// Holding one proves `[a-z0-9-]{1,16}`.
+        id: CheckedIdentifier,
+        /// The port the named interface holds, resolved by the writer.
+        ingress: Option<u8>,
+        egress: Option<u8>,
+        source: Option<CheckedPrefix>,
+        destination: Option<CheckedPrefix>,
+        /// The IANA protocol number.
+        protocol: Option<u8>,
+        source_port: Option<CheckedPorts>,
+        destination_port: Option<CheckedPorts>,
+        icmp_type: Option<u8>,
+        action: CheckedAction,
+    }
+}
+
 /// Everything a [`ConfigImage`] said, decoded and owned.
 ///
 /// Owned rather than borrowed because the image it came from may be the shared
@@ -1140,15 +1693,29 @@ checked_value! {
 /// filled from the front, so the length is carried by the data and the writer's
 /// count bounds nothing here: iteration is bounded by the arrays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckedConfig {
+pub struct CheckedConfig<'image> {
     generation: u32,
     content_hash: u32,
     management: Option<CheckedManagement>,
     interfaces: [Option<CheckedInterface>; MAX_INTERFACES],
     neighbours: [Option<CheckedNeighbour>; MAX_NEIGHBOURS],
+    /// The rule entries [`ConfigImage::check`] accepted, borrowed rather than
+    /// decoded into an array of their own.
+    ///
+    /// The two small object kinds are owned above because owning them costs
+    /// hundreds of bytes; owning this one costs pages, and the domains that
+    /// read a configuration are exactly the ones whose stacks cannot hold one.
+    /// The borrow is sound where the owned copies were needed for the opposite
+    /// reason: what the reader holds is *its own* copy of the image, taken once
+    /// by [`ConfigHandover::load_image_into`], so these bytes are not the
+    /// shared region and no writer can move them under a decision.
+    rules: &'image [RuleImage],
+    /// Kept so a rule can be decoded on demand by the very function that
+    /// checked it, rather than by a second one that could come to disagree.
+    port_count: u8,
 }
 
-impl CheckedConfig {
+impl<'image> CheckedConfig<'image> {
     #[must_use]
     pub const fn generation(&self) -> u32 {
         self.generation
@@ -1173,6 +1740,29 @@ impl CheckedConfig {
         self.neighbours.iter().flatten().copied()
     }
 
+    /// One rule by its position, decoded on demand.
+    ///
+    /// `None` past the end, and only past the end: the decode below is the same
+    /// call [`ConfigImage::check`] made over exactly these entries with exactly
+    /// these arguments before it handed out this value, so a refusal here is
+    /// unreachable. It is folded into the `Option` the index bound already
+    /// needs rather than given a variant of its own, which leaves one way for
+    /// this to answer nothing — and [`Self::rule_count`] is the bound a caller
+    /// walks to, so a short read is visible to the caller rather than silent.
+    /// `pipeline::Ruleset::build` is what refuses one.
+    #[must_use]
+    pub fn rule(&self, index: usize) -> Option<CheckedRule> {
+        let raw = self.rules.get(index)?;
+        check_rule(raw, index, self.port_count, &self.interfaces).ok()
+    }
+
+    /// The ruleset **in document order**, which is the order it is decided in:
+    /// first match wins, so an iterator that reordered these would answer a
+    /// different policy.
+    pub fn rules(&self) -> impl Iterator<Item = CheckedRule> + '_ {
+        (0..self.rules.len()).filter_map(|index| self.rule(index))
+    }
+
     #[must_use]
     pub fn interface_count(&self) -> usize {
         self.interfaces().count()
@@ -1182,13 +1772,20 @@ impl CheckedConfig {
     pub fn neighbour_count(&self) -> usize {
         self.neighbours().count()
     }
+
+    /// How many rules the image was accepted with, which is the bound
+    /// [`Self::rule`] answers over and the number a consumer holds itself to.
+    #[must_use]
+    pub const fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
 }
 
 // The two words that publish an image cross protection domains as the image
 // does, and no declaration above covers them: `ConfigHandover` is the image
 // plus a header rather than an image of its own.
 const _: () = {
-    assert!(size_of::<ConfigHandover>() == 840);
+    assert!(size_of::<ConfigHandover>() == 14_156);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
     assert!(offset_of!(ConfigHandover, committed) == 4);
@@ -1211,6 +1808,15 @@ const _: () = {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The image a handover holds, by value. The domains take it into storage
+    /// they own, for the reason `load_image_into` gives; a host test has a
+    /// stack that does not care, and reads better for it.
+    fn loaded(handover: &ConfigHandover) -> ConfigImage {
+        let mut image = ConfigImage::ZERO;
+        handover.load_image_into(&mut image);
+        image
+    }
 
     /// Either verdict, so a property covers both encodable values.
     fn any_verdict() -> impl Strategy<Value = Verdict> {
@@ -1367,7 +1973,8 @@ mod tests {
 
     #[test]
     fn a_checked_image_carries_its_generation_and_hash_and_every_decoded_field() {
-        let checked = image(2, 3).check(PORTS).expect("valid");
+        let raw = image(2, 3);
+        let checked = raw.check(PORTS).expect("valid");
         assert_eq!(checked.generation(), 7);
         assert_eq!(checked.content_hash(), 0xdead_beef);
         assert_eq!(checked.interface_count(), 2);
@@ -1404,7 +2011,8 @@ mod tests {
 
     #[test]
     fn an_interface_count_at_capacity_is_accepted() {
-        let checked = image(MAX_INTERFACES, 0).check(WIDE).expect("valid");
+        let raw = image(MAX_INTERFACES, 0);
+        let checked = raw.check(WIDE).expect("valid");
         assert_eq!(checked.interface_count(), MAX_INTERFACES);
     }
 
@@ -1440,7 +2048,8 @@ mod tests {
 
     #[test]
     fn a_neighbour_count_at_capacity_is_accepted() {
-        let checked = image(2, MAX_NEIGHBOURS).check(PORTS).expect("valid");
+        let raw = image(2, MAX_NEIGHBOURS);
+        let checked = raw.check(PORTS).expect("valid");
         assert_eq!(checked.neighbour_count(), MAX_NEIGHBOURS);
     }
 
@@ -1607,7 +2216,7 @@ mod tests {
         let clash = |change: fn(&mut InterfaceImage)| {
             let mut raw = image(2, 0);
             change(&mut raw.interfaces[1]);
-            raw.check(PORTS)
+            raw.check(PORTS).map(|_| ())
         };
 
         assert_eq!(
@@ -1651,7 +2260,7 @@ mod tests {
         let with = |change: fn(&mut NeighbourImage)| {
             let mut raw = image(2, 1);
             change(&mut raw.neighbours[0]);
-            raw.check(PORTS)
+            raw.check(PORTS).map(|_| ())
         };
 
         for address in [[224, 0, 0, 1], [0, 0, 0, 0], [255; 4]] {
@@ -1768,7 +2377,7 @@ mod tests {
         let with = |management: ManagementImage| {
             let mut raw = image(1, 1);
             raw.management = management;
-            raw.check(PORTS)
+            raw.check(PORTS).map(|_| ())
         };
 
         for byte in [2u8, 3, 0xff] {
@@ -1820,7 +2429,7 @@ mod tests {
         let with = |management: ManagementImage| {
             let mut raw = image(2, 1);
             raw.management = management;
-            raw.check(PORTS)
+            raw.check(PORTS).map(|_| ())
         };
         let enabled = ManagementImage {
             enabled: 1,
@@ -1876,16 +2485,19 @@ mod tests {
         assert_eq!(size_of::<InterfaceImage>(), 36);
         assert_eq!(size_of::<NeighbourImage>(), 16);
         assert_eq!(size_of::<ManagementImage>(), 16);
-        assert_eq!(size_of::<ConfigImage>(), 832);
-        assert_eq!(size_of::<ConfigHandover>(), 840);
+        assert_eq!(size_of::<RuleImage>(), 52);
+        assert_eq!(size_of::<ConfigImage>(), 14_148);
+        assert_eq!(size_of::<ConfigHandover>(), 14_156);
         assert_eq!(size_of::<ConfigAck>(), 8);
         assert_eq!(offset_of!(ConfigImage, management), 16);
         assert_eq!(offset_of!(ConfigImage, interfaces), 32);
         assert_eq!(offset_of!(ConfigImage, neighbours), 320);
+        assert_eq!(offset_of!(ConfigImage, rule_count), 832);
+        assert_eq!(offset_of!(ConfigImage, rules), 836);
         assert_eq!(offset_of!(ConfigHandover, image), 8);
         // The handover region is reserved past what it holds, so its size is
         // the reservation rather than the one page the image would round to.
-        assert_eq!(CONFIG_REGION_SIZE, 0x4000);
+        assert_eq!(CONFIG_REGION_SIZE, 0x8000);
         assert!(CONFIG_REGION_SIZE > size_of::<ConfigHandover>());
         assert_eq!(CONFIG_ACK_REGION_SIZE, 0x1000);
     }
@@ -1987,7 +2599,7 @@ mod tests {
     /// reader come up against one before anything has been published.
     #[test]
     fn an_untouched_handover_holds_the_zero_image() {
-        assert_eq!(ConfigHandover::zero().load_image(), ConfigImage::ZERO);
+        assert_eq!(loaded(&ConfigHandover::zero()), ConfigImage::ZERO);
         assert_eq!(ConfigSlot::zero().load(), ConfigImage::ZERO);
         assert_eq!(InterfaceSlot::zero().load(), InterfaceImage::ZERO);
         assert_eq!(NeighbourSlot::zero().load(), NeighbourImage::ZERO);
@@ -2003,19 +2615,19 @@ mod tests {
         offered.generation = 9;
         handover.publish(&offered);
         assert_eq!(handover.offered_generation(), offered.generation);
-        assert_eq!(handover.load_image(), offered);
+        assert_eq!(loaded(&handover), offered);
         // Committing moves its own word and disturbs neither of the two.
         handover.publish_committed(8);
         assert_eq!(handover.committed_generation(), 8);
         assert_eq!(handover.offered_generation(), 9);
-        assert_eq!(handover.load_image(), offered);
+        assert_eq!(loaded(&handover), offered);
 
         // A second generation replaces both together.
         let mut next = image(1, 1);
         next.generation = 10;
         handover.publish(&next);
         assert_eq!(handover.offered_generation(), 10);
-        assert_eq!(handover.load_image(), next);
+        assert_eq!(loaded(&handover), next);
     }
 
     #[test]
@@ -2029,7 +2641,7 @@ mod tests {
         handover.publish_committed(3);
         assert_eq!(handover.offered_generation(), 4);
         assert_eq!(handover.committed_generation(), 3);
-        assert_eq!(handover.load_image(), offered);
+        assert_eq!(loaded(&handover), offered);
 
         let ack = ConfigAck::zero();
         assert_eq!(ack.staged_generation(), 0);
@@ -2930,7 +3542,7 @@ mod tests {
 
             let handover = ConfigHandover::zero();
             handover.publish(&written);
-            prop_assert_eq!(handover.load_image(), written);
+            prop_assert_eq!(loaded(&handover), written);
             prop_assert_eq!(handover.offered_generation(), written.generation);
         }
 

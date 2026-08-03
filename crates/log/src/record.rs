@@ -206,6 +206,21 @@ fn value_image(value: Option<Value>) -> ValueImage {
             image.id = identifier_image(&id);
             LogValueKind::Id
         }
+        Value::Selector(token) => {
+            image.id = identifier_image(&token);
+            LogValueKind::Selector
+        }
+        Value::Prefix {
+            network,
+            prefix_length,
+        } => {
+            let octets = network.octets();
+            for (slot, &byte) in image.octets.iter_mut().zip(octets.iter()) {
+                *slot = byte;
+            }
+            image.number = u32::from(prefix_length);
+            LogValueKind::Prefix
+        }
     };
     image.kind = kind.to_bits();
     image
@@ -224,6 +239,14 @@ fn decode_value(value: Option<CheckedValue>, which: LogText) -> Result<Option<Va
         CheckedValue::Generation(generation) => Value::Generation(generation),
         CheckedValue::Count(count) => Value::Count(count),
         CheckedValue::Id(id) => Value::Id(identifier(&id, which)?),
+        CheckedValue::Selector(token) => Value::Selector(identifier(&token, which)?),
+        CheckedValue::Prefix {
+            network,
+            prefix_length,
+        } => Value::Prefix {
+            network: net_headers::Ipv4Address::from_octets(network),
+            prefix_length,
+        },
     }))
 }
 

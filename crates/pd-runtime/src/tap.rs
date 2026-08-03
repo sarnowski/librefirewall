@@ -49,6 +49,8 @@ pub const fn tap_drop_reason(reason: DropReason) -> TapDropReason {
         DropReason::NoRoute => TapDropReason::NoRoute,
         DropReason::EgressIsIngress => TapDropReason::EgressIsIngress,
         DropReason::NoNeighbour => TapDropReason::NoNeighbour,
+        DropReason::PolicyDenied => TapDropReason::PolicyDenied,
+        DropReason::NoPolicyMatch => TapDropReason::NoPolicyMatch,
     }
 }
 

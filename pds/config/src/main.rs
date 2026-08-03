@@ -76,10 +76,15 @@ fn init() -> ConfigDomain {
     announce(&sink, DomainState::Starting);
 
     // The datastore lives only as long as this call: a second commit would need
-    // it and there is no path to one, so keeping it would leave several
-    // kilobytes of model in a domain that reads it again never. Its change
-    // records need no room at all — the commit hands each one straight to the
-    // sink, so nothing here is sized by how many objects the ABI can hold.
+    // it and there is no path to one, so keeping it would leave forty-odd
+    // kilobytes of model — two of them, running and candidate — in a domain that
+    // reads it again never. That is also why this domain's stack is the largest
+    // of any that holds no frame buffer: a commit has three models and an image
+    // live at once, and `pd_runtime`'s
+    // `the_configuration_domains_state_fits_the_stack_it_is_declared_with` is
+    // what holds the declared size to them. Its change records need no room at
+    // all — the commit hands each one straight to the sink, so nothing here is
+    // sized by how many objects the ABI can hold.
     let mut store = Datastore::new();
     let mut publisher = ConfigPublisher::new();
 

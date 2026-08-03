@@ -8,7 +8,11 @@
 //! hold.
 
 use lfw_log::Identifier;
-use net_headers::{Ipv4Address, MacAddress};
+use net_headers::{Ipv4Address, MacAddress, Protocol};
+
+use crate::rule::{
+    AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+};
 
 /// Why a value is not the thing its attribute names.
 ///
@@ -96,6 +100,97 @@ pub fn mac(bytes: &[u8]) -> Result<MacAddress, ValueError> {
     Ok(MacAddress(octets))
 }
 
+/// The wildcard every criterion below admits, spelled out for the reason
+/// `enabled` is: a rule that matches everything is the widest thing an operator
+/// can write, and it is written rather than inferred from an omission.
+const ANY: &[u8] = b"any";
+
+/// # Errors
+/// [`ValueError::Malformed`] for anything but `any` or an identifier.
+pub fn interface_match(bytes: &[u8]) -> Result<InterfaceMatch, ValueError> {
+    if bytes == ANY {
+        return Ok(InterfaceMatch::Any);
+    }
+    identifier(bytes).map(InterfaceMatch::Named)
+}
+
+/// # Errors
+/// [`ValueError`] for anything but `any` or exactly one dotted quad, a `/` and
+/// a prefix length. Whether the length is a legal prefix, and whether the
+/// address is the block it names, are decided later against the model.
+pub fn address_match(bytes: &[u8]) -> Result<AddressMatch, ValueError> {
+    if bytes == ANY {
+        return Ok(AddressMatch::Any);
+    }
+    let mut fields = bytes.split(|byte| *byte == b'/');
+    let (Some(address), Some(length), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(ValueError::Malformed);
+    };
+    Ok(AddressMatch::Block {
+        network: ipv4(address)?,
+        prefix_length: decimal(length)?,
+    })
+}
+
+/// # Errors
+/// [`ValueError`] for anything but `any`, one of the three names, or a decimal
+/// protocol number.
+pub fn protocol_match(bytes: &[u8]) -> Result<ProtocolMatch, ValueError> {
+    Ok(match bytes {
+        ANY => ProtocolMatch::Any,
+        b"tcp" => ProtocolMatch::Only(Protocol::TCP),
+        b"udp" => ProtocolMatch::Only(Protocol::UDP),
+        b"icmp" => ProtocolMatch::Only(Protocol::ICMP),
+        number => ProtocolMatch::Only(Protocol(decimal(number)?)),
+    })
+}
+
+/// # Errors
+/// [`ValueError`] for anything but `any`, one port, or two separated by `-`.
+/// Whether the range runs the right way is decided later, the shape being
+/// well formed either way.
+pub fn port_match(bytes: &[u8]) -> Result<PortMatch, ValueError> {
+    if bytes == ANY {
+        return Ok(PortMatch::Any);
+    }
+    let mut fields = bytes.split(|byte| *byte == b'-');
+    let (Some(low), high, rest) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(ValueError::Malformed);
+    };
+    if rest.is_some() {
+        return Err(ValueError::Malformed);
+    }
+    let low = decimal16(low)?;
+    Ok(PortMatch::Range {
+        low,
+        high: match high {
+            Some(high) => decimal16(high)?,
+            None => low,
+        },
+    })
+}
+
+/// # Errors
+/// [`ValueError`] for anything but `any` or a decimal message type.
+pub fn icmp_type_match(bytes: &[u8]) -> Result<IcmpTypeMatch, ValueError> {
+    if bytes == ANY {
+        return Ok(IcmpTypeMatch::Any);
+    }
+    decimal(bytes).map(IcmpTypeMatch::Only)
+}
+
+/// # Errors
+/// [`ValueError::Malformed`] for anything but `accept` or `drop`. There is no
+/// `allow`, no `deny` and no `permit`: one spelling each, so two documents
+/// cannot say the same thing two ways.
+pub fn action(bytes: &[u8]) -> Result<RuleAction, ValueError> {
+    match bytes {
+        b"accept" => Ok(RuleAction::Accept),
+        b"drop" => Ok(RuleAction::Drop),
+        _ => Err(ValueError::Malformed),
+    }
+}
+
 /// A decimal `u8` with no sign, no padding and no leading zero.
 fn decimal(bytes: &[u8]) -> Result<u8, ValueError> {
     const MAX_DIGITS: usize = 3;
@@ -116,6 +211,29 @@ fn decimal(bytes: &[u8]) -> Result<u8, ValueError> {
             .ok_or(ValueError::OutOfRange)?;
     }
     u8::try_from(value).map_err(|_| ValueError::OutOfRange)
+}
+
+/// [`decimal`]'s rule at a port's width: five digits rather than three, and the
+/// same refusal of a sign, padding and a leading zero.
+fn decimal16(bytes: &[u8]) -> Result<u16, ValueError> {
+    const MAX_DIGITS: usize = 5;
+    if bytes.is_empty() || bytes.len() > MAX_DIGITS {
+        return Err(ValueError::Malformed);
+    }
+    if bytes.len() > 1 && bytes.first() == Some(&b'0') {
+        return Err(ValueError::Malformed);
+    }
+    let mut value = 0u32;
+    for byte in bytes {
+        let Some(digit) = char::from(*byte).to_digit(10) else {
+            return Err(ValueError::Malformed);
+        };
+        value = value
+            .checked_mul(10)
+            .and_then(|scaled| scaled.checked_add(digit))
+            .ok_or(ValueError::OutOfRange)?;
+    }
+    u16::try_from(value).map_err(|_| ValueError::OutOfRange)
 }
 
 fn hex_digit(byte: Option<&u8>) -> Result<u8, ValueError> {

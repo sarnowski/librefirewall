@@ -272,7 +272,7 @@ mod tests {
             "<configuration><interfaces>\
              <interface id=\"wan\" port=\"{port}\" enabled=\"{enabled}\" \
              mac=\"52:54:00:00:00:01\" address=\"10.0.{variant}.1\" prefix-length=\"24\"/>\
-             </interfaces><neighbours/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
+             </interfaces><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
         )
     }
 
@@ -477,7 +477,7 @@ mod tests {
         let document = |first: &str, second: &str| {
             format!(
                 "<configuration><interfaces>{first}{second}</interfaces>\
-                 <neighbours/><management enabled=\"true\" \
+                 <neighbours/><rules/><management enabled=\"true\" \
                  mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" \
                  prefix-length=\"24\"/></configuration>"
             )
@@ -593,7 +593,7 @@ mod tests {
             "</interfaces><neighbours>",
             "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" ",
             "mac=\"52:54:00:00:00:02\"/>",
-            "</neighbours>",
+            "</neighbours><rules/>",
             "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
             "</configuration>"
         );
