@@ -21,7 +21,7 @@ use lfw_log::GenerationOutcome;
 
 use crate::{
     ConfigError,
-    diff::{Change, DiffSummary, diff},
+    diff::{Records, diff},
     hash::{ContentHash, content_hash},
     load,
     model::Model,
@@ -90,10 +90,11 @@ pub enum CommitError {
 /// could say both would let a caller log one while holding the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitOutcome {
-    /// The configuration is now `generation`, and `changes` is what moved.
+    /// The configuration is now `generation`, and `changes` records went to
+    /// the caller's sink describing what moved.
     Applied {
         generation: Generation,
-        changes: DiffSummary,
+        changes: usize,
     },
     /// The candidate's content was already running, so no generation was
     /// assigned and no record was written: a commit is keyed by content.
@@ -117,10 +118,10 @@ impl CommitOutcome {
     }
 
     #[must_use]
-    pub const fn changes(self) -> DiffSummary {
+    pub const fn changes(self) -> usize {
         match self {
             Self::Applied { changes, .. } => changes,
-            Self::Unchanged { .. } => DiffSummary::NONE,
+            Self::Unchanged { .. } => 0,
         }
     }
 }
@@ -188,25 +189,24 @@ impl Datastore {
         load(document).map(|_| ())
     }
 
-    /// Make the candidate the running configuration, writing what changed into
-    /// `changes`.
+    /// Make the candidate the running configuration, handing every value that
+    /// moved to `records`.
+    ///
+    /// Nothing reaches `records` unless the commit happens: every way this can
+    /// refuse is decided before the diff is walked, so a record the caller sees
+    /// is a change the running configuration actually took.
     ///
     /// # Errors
     /// [`CommitError::NoCandidate`] with nothing staged, or
     /// [`CommitError::GenerationsExhausted`]; the candidate survives either,
     /// nothing having happened to it.
-    pub fn commit(&mut self, changes: &mut [Option<Change>]) -> Result<CommitOutcome, CommitError> {
+    pub fn commit(&mut self, records: &mut dyn Records) -> Result<CommitOutcome, CommitError> {
         let next = self.candidate.ok_or(CommitError::NoCandidate)?;
         let hash = content_hash(&next);
         // The digest is a fast path and never the decision: `Unchanged` assigns
         // no generation and publishes nothing, so a configuration reaching it
         // wrongly is one silently suppressed.
         if hash == self.hash && next.has_same_content(&self.model) {
-            // Emptied on this path too, so a reused buffer holds this commit's
-            // records whichever way it went rather than the last one's.
-            for slot in changes.iter_mut() {
-                *slot = None;
-            }
             self.candidate = None;
             return Ok(CommitOutcome::Unchanged {
                 generation: self.generation,
@@ -219,14 +219,14 @@ impl Datastore {
             });
         }
 
-        let summary = diff(&self.model, &next, changes);
+        let changes = diff(&self.model, &next, records);
         self.generation = generation;
         self.hash = hash;
         self.model = next;
         self.candidate = None;
         Ok(CommitOutcome::Applied {
             generation,
-            changes: summary,
+            changes,
         })
     }
 }
@@ -241,11 +241,26 @@ impl Default for Datastore {
 mod tests {
     use super::*;
     use crate::PORT_COUNT;
+    use crate::diff::Change;
     use lfw_log::{ObjectKind, RejectReason};
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
 
-    const ROOMY: usize = 256;
+    /// A sink that keeps every record, so a test can assert what a commit
+    /// handed out as well as how many.
+    #[derive(Default)]
+    struct Collected(Vec<Change>);
+
+    impl Records for Collected {
+        fn record(&mut self, change: Change) {
+            self.0.push(change);
+        }
+    }
+
+    /// A sink that keeps nothing, for the commits a test only counts.
+    fn discard() -> impl Records {
+        |_change: Change| {}
+    }
 
     /// One interface whose address `variant` chooses, so two variants are two
     /// configurations rather than two lengths — and `variant` at or above
@@ -276,7 +291,7 @@ mod tests {
     fn commit(store: &mut Datastore, text: &str) -> CommitOutcome {
         store.stage(text.as_bytes()).expect("a sound document");
         store
-            .commit(&mut [None; ROOMY])
+            .commit(&mut discard())
             .expect("a staged candidate commits")
     }
 
@@ -312,7 +327,7 @@ mod tests {
 
         // The candidate is only observable through what a commit makes of it,
         // which is the whole of what holding one is for.
-        let outcome = store.commit(&mut [None; ROOMY]).expect("the first one");
+        let outcome = store.commit(&mut discard()).expect("the first one");
         assert_eq!(outcome.generation(), Generation::from_bits(1));
         assert_eq!(store.running_model().interface_count(), 1);
     }
@@ -341,19 +356,13 @@ mod tests {
         assert_eq!(store.running_hash(), before.running_hash());
         assert_eq!(*store.running_model(), *before.running_model());
         // Nothing was staged either, which a commit is what asks.
-        assert_eq!(
-            store.commit(&mut [None; ROOMY]),
-            Err(CommitError::NoCandidate)
-        );
+        assert_eq!(store.commit(&mut discard()), Err(CommitError::NoCandidate));
     }
 
     #[test]
     fn committing_with_nothing_staged_is_refused() {
         let mut store = store();
-        assert_eq!(
-            store.commit(&mut [None; ROOMY]),
-            Err(CommitError::NoCandidate)
-        );
+        assert_eq!(store.commit(&mut discard()), Err(CommitError::NoCandidate));
         assert_eq!(store.running(), Generation::ZERO);
     }
 
@@ -361,44 +370,37 @@ mod tests {
     fn a_commit_takes_the_candidate_with_it() {
         let mut store = store();
         commit(&mut store, &one());
-        assert_eq!(
-            store.commit(&mut [None; ROOMY]),
-            Err(CommitError::NoCandidate)
-        );
+        assert_eq!(store.commit(&mut discard()), Err(CommitError::NoCandidate));
 
         // Including the commit that assigned nothing: a candidate that has been
         // judged is spent whichever way the judgement went.
         store.stage(one().as_bytes()).expect("sound");
         assert_eq!(
-            store
-                .commit(&mut [None; ROOMY])
-                .expect("a candidate")
-                .outcome(),
+            store.commit(&mut discard()).expect("a candidate").outcome(),
             GenerationOutcome::Unchanged
         );
-        assert_eq!(
-            store.commit(&mut [None; ROOMY]),
-            Err(CommitError::NoCandidate)
-        );
+        assert_eq!(store.commit(&mut discard()), Err(CommitError::NoCandidate));
     }
 
     #[test]
     fn generations_are_assigned_in_order_and_the_diff_is_reported() {
         let mut store = store();
-        let mut changes = [None; ROOMY];
+        let mut changes = Collected::default();
 
         store.stage(one().as_bytes()).expect("sound");
         let first = store.commit(&mut changes).expect("a candidate");
         assert_eq!(first.generation(), Generation::from_bits(1));
         assert_eq!(first.outcome(), GenerationOutcome::Applied);
         // Five interface fields and the management element's four.
-        assert_eq!(first.changes().written(), 9);
-        assert_eq!(changes.iter().flatten().count(), 9);
+        assert_eq!(first.changes(), 9);
+        assert_eq!(changes.0.len(), 9);
 
+        let mut second_changes = Collected::default();
         store.stage(document(1, true).as_bytes()).expect("sound");
-        let second = store.commit(&mut changes).expect("a candidate");
+        let second = store.commit(&mut second_changes).expect("a candidate");
         assert_eq!(second.generation(), Generation::from_bits(2));
-        assert_eq!(second.changes().written(), 1, "only the address moved");
+        assert_eq!(second.changes(), 1, "only the address moved");
+        assert_eq!(second_changes.0.len(), 1);
         assert_eq!(store.running(), Generation::from_bits(2));
     }
 
@@ -407,7 +409,7 @@ mod tests {
         let mut store = store();
         commit(&mut store, &one());
 
-        let mut changes = [None; ROOMY];
+        let mut changes = Collected::default();
         // The same configuration, written differently: whitespace and the
         // attribute order are exactly what the content hash must not see.
         let rewritten = one().replacen("id=\"wan\" port=\"0\"", "port=\"0\"   id=\"wan\"", 1);
@@ -421,9 +423,9 @@ mod tests {
             }
         );
         assert_eq!(outcome.outcome(), GenerationOutcome::Unchanged);
-        assert_eq!(outcome.changes(), DiffSummary::NONE);
+        assert_eq!(outcome.changes(), 0);
         assert_eq!(store.running(), Generation::from_bits(1));
-        assert_eq!(changes.iter().flatten().count(), 0);
+        assert!(changes.0.is_empty());
     }
 
     /// A commit is keyed by content, and the content is what decides — not the
@@ -448,7 +450,7 @@ mod tests {
         );
         store.hash = content_hash(&candidate);
 
-        let outcome = store.commit(&mut [None; ROOMY]).expect("a candidate");
+        let outcome = store.commit(&mut discard()).expect("a candidate");
         assert!(
             matches!(outcome, CommitOutcome::Applied { .. }),
             "a different configuration committed as unchanged: {outcome:?}"
@@ -500,32 +502,32 @@ mod tests {
             "and they are the same configuration"
         );
         assert_eq!(
-            store.commit(&mut [None; ROOMY]).expect("a candidate"),
+            store.commit(&mut discard()).expect("a candidate"),
             CommitOutcome::Unchanged {
                 generation: Generation::from_bits(1)
             }
         );
     }
 
+    /// A commit that assigns nothing hands out nothing, so a caller that keeps
+    /// its sink across commits cannot present an earlier generation's records
+    /// as this one's.
     #[test]
-    fn a_reused_buffer_never_shows_an_earlier_generations_records() {
+    fn a_commit_that_assigns_nothing_hands_out_no_records() {
         let mut store = store();
-        let mut changes = [None; ROOMY];
+        let mut changes = Collected::default();
 
         store.stage(one().as_bytes()).expect("sound");
         assert_eq!(
-            store
-                .commit(&mut changes)
-                .expect("a candidate")
-                .changes()
-                .written(),
+            store.commit(&mut changes).expect("a candidate").changes(),
             9
         );
+        assert_eq!(changes.0.len(), 9);
 
         store.stage(one().as_bytes()).expect("sound");
         let outcome = store.commit(&mut changes).expect("a candidate");
         assert_eq!(outcome.outcome(), GenerationOutcome::Unchanged);
-        assert_eq!(changes.iter().flatten().count(), 0);
+        assert_eq!(changes.0.len(), 9, "nothing was added by the second commit");
     }
 
     #[test]
@@ -535,7 +537,7 @@ mod tests {
         store.stage(one().as_bytes()).expect("sound");
 
         assert_eq!(
-            store.commit(&mut [None; ROOMY]),
+            store.commit(&mut discard()),
             Err(CommitError::GenerationsExhausted {
                 latest: Generation::from_bits(u32::MAX),
             })
@@ -546,25 +548,31 @@ mod tests {
         store.generation = Generation::from_bits(1);
         assert_eq!(
             store
-                .commit(&mut [None; ROOMY])
+                .commit(&mut discard())
                 .expect("nothing happened to it")
                 .generation(),
             Generation::from_bits(2)
         );
     }
 
+    /// A commit that refuses hands out nothing: the diff is the last thing a
+    /// commit does, so a record a caller sees is a change the running
+    /// configuration actually took.
     #[test]
-    fn a_commit_whose_records_do_not_fit_still_commits_and_says_so() {
+    fn a_refused_commit_hands_out_no_records() {
         let mut store = store();
-        let mut changes = [None; 2];
-        store.stage(one().as_bytes()).expect("sound");
-        let outcome = store.commit(&mut changes).expect("a candidate");
+        let mut changes = Collected::default();
 
-        assert_eq!(outcome.generation(), Generation::from_bits(1));
-        assert_eq!(outcome.changes().written(), 2);
-        assert_eq!(outcome.changes().dropped(), 7);
-        assert!(outcome.changes().overflowed());
-        assert_eq!(store.running(), Generation::from_bits(1));
+        assert_eq!(store.commit(&mut changes), Err(CommitError::NoCandidate));
+        assert!(changes.0.is_empty());
+
+        store.generation = Generation::from_bits(u32::MAX);
+        store.stage(one().as_bytes()).expect("sound");
+        assert!(matches!(
+            store.commit(&mut changes),
+            Err(CommitError::GenerationsExhausted { .. })
+        ));
+        assert!(changes.0.is_empty());
     }
 
     #[test]
@@ -589,16 +597,12 @@ mod tests {
             "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
             "</configuration>"
         );
-        let mut changes = [None; ROOMY];
+        let mut changes = Collected::default();
         store.stage(text.as_bytes()).expect("sound");
         let outcome = store.commit(&mut changes).expect("a candidate");
 
-        assert_eq!(outcome.changes().total(), 12);
-        let kinds: Vec<ObjectKind> = changes
-            .iter()
-            .flatten()
-            .map(|change| change.object)
-            .collect();
+        assert_eq!(outcome.changes(), 12);
+        let kinds: Vec<ObjectKind> = changes.0.iter().map(|change| change.object).collect();
         assert_eq!(
             kinds
                 .iter()
@@ -631,7 +635,7 @@ mod tests {
             steps in proptest::collection::vec((0usize..7, any::<bool>()), 0..24),
         ) {
             let mut store = store();
-            let mut changes = [None; ROOMY];
+            let mut changes = discard();
             let mut seen = Generation::ZERO;
 
             for (variant, commit_without_staging) in steps {
@@ -652,9 +656,9 @@ mod tests {
                 };
 
                 match outcome {
-                    Ok(CommitOutcome::Applied { generation, changes: summary }) => {
+                    Ok(CommitOutcome::Applied { generation, changes: moved }) => {
                         prop_assert!(generation > seen);
-                        prop_assert!(!summary.is_empty(), "an applied generation moved something");
+                        prop_assert!(moved > 0, "an applied generation moved something");
                         seen = generation;
                     }
                     Ok(CommitOutcome::Unchanged { generation }) => {
@@ -672,7 +676,7 @@ mod tests {
         fn committing_one_configuration_twice_applies_it_once(variant in 0usize..4) {
             let mut store = store();
             let text = document(variant, true);
-            let mut changes = [None; ROOMY];
+            let mut changes = discard();
 
             store.stage(text.as_bytes()).expect("sound");
             let first = store.commit(&mut changes).expect("a candidate");
@@ -681,7 +685,7 @@ mod tests {
 
             prop_assert_eq!(second.outcome(), GenerationOutcome::Unchanged);
             prop_assert_eq!(second.generation(), first.generation());
-            prop_assert!(second.changes().is_empty());
+            prop_assert_eq!(second.changes(), 0);
         }
 
         /// What a commit applied is what the store then runs: the model, its
@@ -698,7 +702,7 @@ mod tests {
             let staged = store
                 .stage(document(second, false).as_bytes())
                 .expect("sound");
-            let outcome = store.commit(&mut [None; ROOMY]).expect("a candidate");
+            let outcome = store.commit(&mut discard()).expect("a candidate");
 
             prop_assert_eq!(outcome.generation(), staged.generation);
             prop_assert_eq!(store.running(), staged.generation);
@@ -718,7 +722,7 @@ mod tests {
                 store
                     .stage(document(variant % REFUSED, true).as_bytes())
                     .expect("sound");
-                if let Ok(CommitOutcome::Applied { .. }) = store.commit(&mut [None; ROOMY]) {
+                if let Ok(CommitOutcome::Applied { .. }) = store.commit(&mut discard()) {
                     applied = applied.saturating_add(1);
                 }
             }

@@ -41,6 +41,26 @@
 //! maps. So the image in it is expressed as atomics rather than plain fields:
 //! that is what lets a writer exist here without `unsafe`, and the assertions
 //! below hold the result byte-identical to the plain image the reader maps.
+//!
+//! # A region's layout is declared once, and the trade that buys
+//!
+//! The plain image, the atomic mirror and the offset assertions are three
+//! transcriptions of one layout, and they are emitted from one declaration by
+//! `shared_image!` rather than written out three times. The cost is real and is
+//! worth naming: a struct behind a macro is a struct a reader cannot grep for a
+//! field of, and rustdoc shows the expansion rather than the source. What it
+//! buys is that the three cannot disagree — a mirror that drifted from its
+//! image would corrupt every generation that crosses, silently, and no amount
+//! of reading one of the three catches it.
+//!
+//! The trade is only worth it while the declaration stays a *byte map*: each
+//! field states the offset it sits at, padding says that it is padding, and the
+//! macro asserts every one of those offsets against what the compiler laid out.
+//! A reader answering "what is at offset 12" reads one column of one list. A
+//! macro that computed the offsets instead of checking them, or that decided
+//! anything about what a field *means*, would have taken the readability and
+//! given back nothing — so nothing here validates a value, and every semantic
+//! rule about a region stays hand-written below where it can be read as a rule.
 //! [`ConfigImage`] stays that plain value — what a writer composes and a reader
 //! copies out. Its words move `Relaxed` under the generation that publishes
 //! them `Release`, and nothing stops the writer rewriting them afterwards,
@@ -58,7 +78,9 @@
 #![cfg_attr(not(test), no_std)]
 
 mod clock;
+mod config_rule;
 mod download;
+mod image;
 mod log_record;
 mod log_ring;
 mod log_slot;
@@ -71,6 +93,7 @@ use core::{
 };
 
 pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibration, LOAD_ATTEMPTS};
+pub use config_rule::{ConfigRule, Enforcement};
 pub use download::{
     DOWNLOAD_REPLY_REGION_SIZE, DOWNLOAD_REQUEST_REGION_SIZE, DOWNLOAD_WINDOW_LEN, DownloadDemand,
     DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply, DownloadRequest,
@@ -95,8 +118,8 @@ pub use tap::{
     TapRingFull, TapVerdict, TapWriteError, TapWriter,
 };
 
+use image::{checked_value, shared_image};
 use log_record::check_bounded_text;
-use log_slot::TextSlot;
 
 /// The producing domain's decision about the frame a [`Descriptor`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,130 +219,92 @@ pub const MAX_PREFIX_LENGTH: u8 = 32;
 /// that can hold anything and the multiple every size rounds to.
 pub const MAPPING_ALIGN: usize = 0x1000;
 
-/// One interface as the validating domain left it.
-///
-/// The padding is explicit rather than implied, so these offsets are the ones a
-/// writer in another language computes for the same declaration. No field is
-/// placed in it, so the bytes a peer leaves there name nothing.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InterfaceImage {
-    pub port: u8,
-    /// 0 or 1 as raw bits. The region is peer-written, so any byte can appear
-    /// here and [`ConfigImage::check`] refuses the ones that are neither.
-    pub enabled: u8,
-    pub prefix_length: u8,
-    pub _pad: u8,
-    pub mac: [u8; 6],
-    pub _pad2: [u8; 2],
-    /// Network order, as the address appears in a header.
-    pub address: [u8; 4],
-    /// The `id` of the document's `<interface>`, which nothing else here implies:
-    /// a port is hardware topology, fixed at build time rather than configured.
-    pub id: IdentifierImage,
+shared_image! {
+    /// One interface as the validating domain left it.
+    ///
+    /// The padding is declared rather than implied, so these offsets are the
+    /// ones a writer in another language computes for the same declaration. No
+    /// field is placed in it, so the bytes a peer leaves there name nothing.
+    InterfaceImage mirrored by InterfaceSlot, 36 bytes aligned 1 {
+        @0 port: byte,
+        /// 0 or 1 as raw bits. The region is peer-written, so any byte can
+        /// appear here and [`ConfigImage::check`] refuses the ones that are
+        /// neither.
+        @1 enabled: byte,
+        @2 prefix_length: byte,
+        @3 _pad: padding(1),
+        @4 mac: bytes(6),
+        @10 _pad2: padding(2),
+        /// Network order, as the address appears in a header.
+        @12 address: bytes(4),
+        /// The `id` of the document's `<interface>`, which nothing else here
+        /// implies: a port is hardware topology, fixed at build time rather
+        /// than configured.
+        @16 id: identifier,
+    }
 }
 
-impl InterfaceImage {
-    pub const ZERO: Self = Self {
-        port: 0,
-        enabled: 0,
-        prefix_length: 0,
-        _pad: 0,
-        mac: [0; 6],
-        _pad2: [0; 2],
-        address: [0; 4],
-        id: IdentifierImage::ZERO,
-    };
+shared_image! {
+    /// One statically configured neighbour. It carries no prefix: a neighbour
+    /// is a single host, and which prefix reaches it is its interface's
+    /// business.
+    NeighbourImage mirrored by NeighbourSlot, 16 bytes aligned 1 {
+        @0 port: byte,
+        @1 _pad: padding(3),
+        @4 mac: bytes(6),
+        @10 _pad2: padding(2),
+        @12 address: bytes(4),
+    }
 }
 
-/// One statically configured neighbour. It carries no prefix: a neighbour is a
-/// single host, and which prefix reaches it is its interface's business.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NeighbourImage {
-    pub port: u8,
-    pub _pad: [u8; 3],
-    pub mac: [u8; 6],
-    pub _pad2: [u8; 2],
-    pub address: [u8; 4],
+shared_image! {
+    /// The management interface as the validating domain left it: the
+    /// appliance's own presence on the management port, which is kept out of
+    /// the dataplane.
+    ///
+    /// It carries no port, unlike an [`InterfaceImage`]: the management port is
+    /// not in the router's port set and no number in this image can put it
+    /// there.
+    ManagementImage mirrored by ManagementSlot, 16 bytes aligned 1 {
+        /// 0 or 1 as raw bits, on [`InterfaceImage::enabled`]'s terms. A zero
+        /// here is what a zeroed region says, and it is why every other field
+        /// below is left uninterpreted in that case.
+        @0 enabled: byte,
+        @1 prefix_length: byte,
+        @2 _pad: padding(2),
+        @4 mac: bytes(6),
+        @10 _pad2: padding(2),
+        /// Network order, as the address appears in a header.
+        @12 address: bytes(4),
+    }
 }
 
-impl NeighbourImage {
-    pub const ZERO: Self = Self {
-        port: 0,
-        _pad: [0; 3],
-        mac: [0; 6],
-        _pad2: [0; 2],
-        address: [0; 4],
-    };
-}
-
-/// The management interface as the validating domain left it: the appliance's
-/// own presence on the management port, which is kept out of the dataplane.
-///
-/// It carries no port, unlike an [`InterfaceImage`]: the management port is not
-/// in the router's port set and no number in this image can put it there.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManagementImage {
-    /// 0 or 1 as raw bits, on [`InterfaceImage::enabled`]'s terms. A zero here
-    /// is what a zeroed region says, and it is why every other field below is
-    /// left uninterpreted in that case.
-    pub enabled: u8,
-    pub prefix_length: u8,
-    pub _pad: [u8; 2],
-    pub mac: [u8; 6],
-    pub _pad2: [u8; 2],
-    /// Network order, as the address appears in a header.
-    pub address: [u8; 4],
-}
-
-impl ManagementImage {
-    pub const ZERO: Self = Self {
-        enabled: 0,
-        prefix_length: 0,
-        _pad: [0; 2],
-        mac: [0; 6],
-        _pad2: [0; 2],
-        address: [0; 4],
-    };
-}
-
-/// A whole configuration generation as bytes in a shared region.
-///
-/// The arrays are always their full size, so the image is one fixed-size object
-/// whatever it holds: the region is reserved once at build time and a
-/// generation that fills it is the same shape as a generation that does not.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfigImage {
-    pub generation: u32,
-    /// How many of `interfaces` the writer filled, as raw bits: peer-written,
-    /// so it may name more than the array holds.
-    pub interface_count: u32,
-    pub neighbour_count: u32,
-    /// Over the validated model, so re-offering an unchanged document is
-    /// recognisable without comparing every field.
-    pub content_hash: u32,
-    pub management: ManagementImage,
-    pub interfaces: [InterfaceImage; MAX_INTERFACES],
-    pub neighbours: [NeighbourImage; MAX_NEIGHBOURS],
+shared_image! {
+    /// A whole configuration generation as bytes in a shared region.
+    ///
+    /// The arrays are always their full size, so the image is one fixed-size
+    /// object whatever it holds: the region is reserved once at build time and
+    /// a generation that fills it is the same shape as a generation that does
+    /// not. [`ConfigImage::ZERO`] is generation zero — no interfaces, no
+    /// neighbours — so a zeroed region is already the fail-closed
+    /// configuration, which is what lets a domain come up before anything has
+    /// been written to it.
+    ConfigImage mirrored by ConfigSlot, 832 bytes aligned 4 {
+        @0 generation: word,
+        /// How many of `interfaces` the writer filled, as raw bits:
+        /// peer-written, so it may name more than the array holds.
+        @4 interface_count: word,
+        @8 neighbour_count: word,
+        /// Over the validated model, so re-offering an unchanged document is
+        /// recognisable without comparing every field.
+        @12 content_hash: word,
+        @16 management: nested(ManagementImage, ManagementSlot),
+        @32 interfaces: array(InterfaceImage, InterfaceSlot, MAX_INTERFACES),
+        @320 neighbours: array(NeighbourImage, NeighbourSlot, MAX_NEIGHBOURS),
+    }
 }
 
 impl ConfigImage {
-    /// Generation zero: no interfaces, no neighbours. A zeroed region is
-    /// therefore already the fail-closed configuration, which is what lets a
-    /// domain come up before anything has been written to it.
-    pub const ZERO: Self = Self {
-        generation: 0,
-        interface_count: 0,
-        neighbour_count: 0,
-        content_hash: 0,
-        management: ManagementImage::ZERO,
-        interfaces: [InterfaceImage::ZERO; MAX_INTERFACES],
-        neighbours: [NeighbourImage::ZERO; MAX_NEIGHBOURS],
-    };
-
     /// Decodes every field the counts cover, refusing the image on the first
     /// value that cannot be one.
     ///
@@ -403,228 +388,6 @@ pub(crate) fn load_bytes<const N: usize>(cells: &[AtomicU8; N]) -> [u8; N] {
     bytes
 }
 
-/// The shared-memory image of an [`InterfaceImage`].
-///
-/// One atomic per byte rather than four `AtomicU32` words: the entry is a
-/// struct of `u8`s, so packing it into words would place a field inside a word
-/// and make the byte order of the region a thing this crate chooses rather
-/// than a thing it mirrors. Per-byte, each field is at the offset the plain
-/// image puts it at, which is what the assertions below check.
-#[repr(C)]
-struct InterfaceSlot {
-    port: AtomicU8,
-    enabled: AtomicU8,
-    prefix_length: AtomicU8,
-    _pad: AtomicU8,
-    mac: [AtomicU8; 6],
-    _pad2: [AtomicU8; 2],
-    address: [AtomicU8; 4],
-    /// The log record ABI's own text slot rather than a second one beside it.
-    id: TextSlot<LOG_IDENTIFIER_BYTES>,
-}
-
-impl InterfaceSlot {
-    const fn zero() -> Self {
-        Self {
-            port: AtomicU8::new(0),
-            enabled: AtomicU8::new(0),
-            prefix_length: AtomicU8::new(0),
-            _pad: AtomicU8::new(0),
-            mac: [const { AtomicU8::new(0) }; 6],
-            _pad2: [const { AtomicU8::new(0) }; 2],
-            address: [const { AtomicU8::new(0) }; 4],
-            id: TextSlot::zero(),
-        }
-    }
-
-    /// Carries the padding too: this moves an image, and which bytes mean
-    /// something is [`ConfigImage::check`]'s question rather than this one's.
-    fn store(&self, entry: &InterfaceImage) {
-        self.port.store(entry.port, Ordering::Relaxed);
-        self.enabled.store(entry.enabled, Ordering::Relaxed);
-        self.prefix_length
-            .store(entry.prefix_length, Ordering::Relaxed);
-        self._pad.store(entry._pad, Ordering::Relaxed);
-        store_bytes(&self.mac, entry.mac);
-        store_bytes(&self._pad2, entry._pad2);
-        store_bytes(&self.address, entry.address);
-        self.id.store(&entry.id);
-    }
-
-    fn load(&self) -> InterfaceImage {
-        InterfaceImage {
-            port: self.port.load(Ordering::Relaxed),
-            enabled: self.enabled.load(Ordering::Relaxed),
-            prefix_length: self.prefix_length.load(Ordering::Relaxed),
-            _pad: self._pad.load(Ordering::Relaxed),
-            mac: load_bytes(&self.mac),
-            _pad2: load_bytes(&self._pad2),
-            address: load_bytes(&self.address),
-            id: self.id.load(),
-        }
-    }
-}
-
-/// As [`InterfaceSlot`], for a [`NeighbourImage`].
-#[repr(C)]
-struct NeighbourSlot {
-    port: AtomicU8,
-    _pad: [AtomicU8; 3],
-    mac: [AtomicU8; 6],
-    _pad2: [AtomicU8; 2],
-    address: [AtomicU8; 4],
-}
-
-impl NeighbourSlot {
-    const fn zero() -> Self {
-        Self {
-            port: AtomicU8::new(0),
-            _pad: [const { AtomicU8::new(0) }; 3],
-            mac: [const { AtomicU8::new(0) }; 6],
-            _pad2: [const { AtomicU8::new(0) }; 2],
-            address: [const { AtomicU8::new(0) }; 4],
-        }
-    }
-
-    fn store(&self, entry: &NeighbourImage) {
-        self.port.store(entry.port, Ordering::Relaxed);
-        store_bytes(&self._pad, entry._pad);
-        store_bytes(&self.mac, entry.mac);
-        store_bytes(&self._pad2, entry._pad2);
-        store_bytes(&self.address, entry.address);
-    }
-
-    fn load(&self) -> NeighbourImage {
-        NeighbourImage {
-            port: self.port.load(Ordering::Relaxed),
-            _pad: load_bytes(&self._pad),
-            mac: load_bytes(&self.mac),
-            _pad2: load_bytes(&self._pad2),
-            address: load_bytes(&self.address),
-        }
-    }
-}
-
-/// As [`InterfaceSlot`], for the management entry.
-#[repr(C)]
-struct ManagementSlot {
-    enabled: AtomicU8,
-    prefix_length: AtomicU8,
-    _pad: [AtomicU8; 2],
-    mac: [AtomicU8; 6],
-    _pad2: [AtomicU8; 2],
-    address: [AtomicU8; 4],
-}
-
-impl ManagementSlot {
-    const fn zero() -> Self {
-        Self {
-            enabled: AtomicU8::new(0),
-            prefix_length: AtomicU8::new(0),
-            _pad: [const { AtomicU8::new(0) }; 2],
-            mac: [const { AtomicU8::new(0) }; 6],
-            _pad2: [const { AtomicU8::new(0) }; 2],
-            address: [const { AtomicU8::new(0) }; 4],
-        }
-    }
-
-    fn store(&self, entry: &ManagementImage) {
-        self.enabled.store(entry.enabled, Ordering::Relaxed);
-        self.prefix_length
-            .store(entry.prefix_length, Ordering::Relaxed);
-        store_bytes(&self._pad, entry._pad);
-        store_bytes(&self.mac, entry.mac);
-        store_bytes(&self._pad2, entry._pad2);
-        store_bytes(&self.address, entry.address);
-    }
-
-    fn load(&self) -> ManagementImage {
-        ManagementImage {
-            enabled: self.enabled.load(Ordering::Relaxed),
-            prefix_length: self.prefix_length.load(Ordering::Relaxed),
-            _pad: load_bytes(&self._pad),
-            mac: load_bytes(&self.mac),
-            _pad2: load_bytes(&self._pad2),
-            address: load_bytes(&self.address),
-        }
-    }
-}
-
-/// The shared-memory image of a [`ConfigImage`], readable and writable through
-/// a shared reference — the only kind of reference a mapped region is reached
-/// by.
-///
-/// Accesses are `Relaxed`, and the property that buys is narrow: the
-/// release/acquire pair on the generation orders the writes of *one*
-/// publication against a reader that then sees that generation. It orders
-/// nothing against a publisher that writes again, which is the publisher this
-/// side is written against — so a reader copying the region out can observe a
-/// blend of two images, one field from each. That is not made safe by ordering
-/// and is not claimed to be: [`ConfigImage::check`] rules on the copy as one
-/// value, and a blend is admitted only if every rule holds of the blend. What
-/// each access is, therefore, is a read that cannot tear *within a field* —
-/// which is what keeps a MAC from being half of one address and half of another
-/// — and nothing more.
-#[repr(C)]
-struct ConfigSlot {
-    generation: AtomicU32,
-    interface_count: AtomicU32,
-    neighbour_count: AtomicU32,
-    content_hash: AtomicU32,
-    management: ManagementSlot,
-    interfaces: [InterfaceSlot; MAX_INTERFACES],
-    neighbours: [NeighbourSlot; MAX_NEIGHBOURS],
-}
-
-impl ConfigSlot {
-    const fn zero() -> Self {
-        Self {
-            generation: AtomicU32::new(0),
-            interface_count: AtomicU32::new(0),
-            neighbour_count: AtomicU32::new(0),
-            content_hash: AtomicU32::new(0),
-            management: ManagementSlot::zero(),
-            interfaces: [const { InterfaceSlot::zero() }; MAX_INTERFACES],
-            neighbours: [const { NeighbourSlot::zero() }; MAX_NEIGHBOURS],
-        }
-    }
-
-    fn store(&self, image: &ConfigImage) {
-        self.generation.store(image.generation, Ordering::Relaxed);
-        self.interface_count
-            .store(image.interface_count, Ordering::Relaxed);
-        self.neighbour_count
-            .store(image.neighbour_count, Ordering::Relaxed);
-        self.content_hash
-            .store(image.content_hash, Ordering::Relaxed);
-        self.management.store(&image.management);
-        for (slot, entry) in self.interfaces.iter().zip(&image.interfaces) {
-            slot.store(entry);
-        }
-        for (slot, entry) in self.neighbours.iter().zip(&image.neighbours) {
-            slot.store(entry);
-        }
-    }
-
-    fn load(&self) -> ConfigImage {
-        let mut image = ConfigImage {
-            generation: self.generation.load(Ordering::Relaxed),
-            interface_count: self.interface_count.load(Ordering::Relaxed),
-            neighbour_count: self.neighbour_count.load(Ordering::Relaxed),
-            content_hash: self.content_hash.load(Ordering::Relaxed),
-            management: self.management.load(),
-            ..ConfigImage::ZERO
-        };
-        for (entry, slot) in image.interfaces.iter_mut().zip(&self.interfaces) {
-            *entry = slot.load();
-        }
-        for (entry, slot) in image.neighbours.iter_mut().zip(&self.neighbours) {
-            *entry = slot.load();
-        }
-        image
-    }
-}
-
 /// A whole configuration image with the two generation words that publish it.
 ///
 /// Two words rather than one because a consumer has to be able to stage a
@@ -669,6 +432,18 @@ impl ConfigHandover {
 
     /// Copies the whole image out, because the writer may change the region
     /// again at any moment and a view into it decides nothing.
+    ///
+    /// The copy is made through `Relaxed` accesses, and the property that buys
+    /// is narrow: the release/acquire pair on the generation orders the writes
+    /// of *one* publication against a reader that then sees that generation. It
+    /// orders nothing against a publisher that writes again, which is the
+    /// publisher this side is written against — so what comes back here can be
+    /// a blend of two images, one field from each. That is not made safe by
+    /// ordering and is not claimed to be: [`ConfigImage::check`] rules on the
+    /// copy as one value, and a blend is admitted only if every rule holds of
+    /// the blend. What each access buys, therefore, is a read that cannot tear
+    /// *within a field* — which is what keeps a MAC from being half of one
+    /// address and half of another — and nothing more.
     #[must_use]
     pub fn load_image(&self) -> ConfigImage {
         self.image.load()
@@ -725,9 +500,33 @@ impl ConfigAck {
     }
 }
 
-/// Bytes the system description reserves for the handover region, derived
-/// rather than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
-pub const CONFIG_REGION_SIZE: usize = size_of::<ConfigHandover>().next_multiple_of(MAPPING_ALIGN);
+/// The fewest bytes the handover region may be reserved at, whatever the image
+/// currently occupies.
+///
+/// Every other region here is sized by what its type needs and nothing else,
+/// and this one is not, because its size is not free to move: `cfg` is mapped
+/// at a fixed virtual address in three protection domains and every region
+/// behind it in that window moves when it grows, so a generation that outgrows
+/// the reservation re-lays an address map three domains have to agree on. Four
+/// pages is what the configuration ABI is reserved at so that the entities
+/// still to be added to it — each an array sized by a capacity constant beside
+/// [`MAX_INTERFACES`] — land inside a map already laid rather than beside a new
+/// one. What occupies it today is [`size_of::<ConfigHandover>`] and the
+/// assertions below hold the two in the only order that matters.
+const CONFIG_REGION_RESERVATION: usize = 4 * MAPPING_ALIGN;
+
+/// Bytes the system description reserves for the handover region: the fewest
+/// [`MAPPING_ALIGN`] pages that hold the type, and never fewer than
+/// [`CONFIG_REGION_RESERVATION`].
+pub const CONFIG_REGION_SIZE: usize = {
+    let occupied = size_of::<ConfigHandover>();
+    let reserved = if occupied > CONFIG_REGION_RESERVATION {
+        occupied
+    } else {
+        CONFIG_REGION_RESERVATION
+    };
+    reserved.next_multiple_of(MAPPING_ALIGN)
+};
 
 /// As [`CONFIG_REGION_SIZE`], for one consumer's acknowledgement region.
 pub const CONFIG_ACK_REGION_SIZE: usize = size_of::<ConfigAck>().next_multiple_of(MAPPING_ALIGN);
@@ -1294,104 +1093,42 @@ fn check_management(
     }))
 }
 
-/// An enabled management interface that survived [`ConfigImage::check`]. Holding
-/// one *is* the enable flag; see [`check_management`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckedManagement {
-    prefix_length: u8,
-    mac: [u8; 6],
-    address: [u8; 4],
-}
-
-impl CheckedManagement {
-    #[must_use]
-    pub const fn prefix_length(&self) -> u8 {
-        self.prefix_length
-    }
-
-    #[must_use]
-    pub const fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
-    /// Network order, as the address appears in a header.
-    #[must_use]
-    pub const fn address(&self) -> [u8; 4] {
-        self.address
+checked_value! {
+    /// An enabled management interface that survived [`ConfigImage::check`].
+    /// Holding one *is* the enable flag; see [`check_management`].
+    CheckedManagement {
+        prefix_length: u8,
+        mac: [u8; 6],
+        /// Network order, as the address appears in a header.
+        address: [u8; 4],
     }
 }
 
-/// One interface that survived [`ConfigImage::check`]. Its fields are private
-/// and it has no public constructor, so the only way to hold one is to have
-/// checked it — and `enabled` is a `bool` because the byte that was not 0 or 1
-/// did not get this far.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckedInterface {
-    port: u8,
-    enabled: bool,
-    prefix_length: u8,
-    mac: [u8; 6],
-    address: [u8; 4],
-    id: CheckedIdentifier,
-}
-
-impl CheckedInterface {
-    #[must_use]
-    pub const fn port(&self) -> u8 {
-        self.port
-    }
-
-    /// The identity the document gave it; holding one proves `[a-z0-9-]{1,16}`.
-    #[must_use]
-    pub const fn id(&self) -> CheckedIdentifier {
-        self.id
-    }
-
-    #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    #[must_use]
-    pub const fn prefix_length(&self) -> u8 {
-        self.prefix_length
-    }
-
-    #[must_use]
-    pub const fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
-    /// Network order, as the address appears in a header.
-    #[must_use]
-    pub const fn address(&self) -> [u8; 4] {
-        self.address
+checked_value! {
+    /// One interface that survived [`ConfigImage::check`]. Its fields are
+    /// private and it has no public constructor, so the only way to hold one is
+    /// to have checked it — and `enabled` is a `bool` because the byte that was
+    /// not 0 or 1 did not get this far.
+    CheckedInterface {
+        port: u8,
+        enabled: bool,
+        prefix_length: u8,
+        mac: [u8; 6],
+        /// Network order, as the address appears in a header.
+        address: [u8; 4],
+        /// The identity the document gave it; holding one proves
+        /// `[a-z0-9-]{1,16}`.
+        id: CheckedIdentifier,
     }
 }
 
-/// As [`CheckedInterface`], for a neighbour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckedNeighbour {
-    port: u8,
-    mac: [u8; 6],
-    address: [u8; 4],
-}
-
-impl CheckedNeighbour {
-    #[must_use]
-    pub const fn port(&self) -> u8 {
-        self.port
-    }
-
-    #[must_use]
-    pub const fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
-    /// Network order, as the address appears in a header.
-    #[must_use]
-    pub const fn address(&self) -> [u8; 4] {
-        self.address
+checked_value! {
+    /// As [`CheckedInterface`], for a neighbour.
+    CheckedNeighbour {
+        port: u8,
+        mac: [u8; 6],
+        /// Network order, as the address appears in a header.
+        address: [u8; 4],
     }
 }
 
@@ -1447,91 +1184,10 @@ impl CheckedConfig {
     }
 }
 
-// The configuration crosses protection domains byte for byte, so a field
-// reorder or a width change must be a compile error here rather than a silent
-// break of the image the reading domain maps.
+// The two words that publish an image cross protection domains as the image
+// does, and no declaration above covers them: `ConfigHandover` is the image
+// plus a header rather than an image of its own.
 const _: () = {
-    assert!(size_of::<InterfaceImage>() == 36);
-    assert!(align_of::<InterfaceImage>() == 1);
-    assert!(offset_of!(InterfaceImage, port) == 0);
-    assert!(offset_of!(InterfaceImage, enabled) == 1);
-    assert!(offset_of!(InterfaceImage, prefix_length) == 2);
-    assert!(offset_of!(InterfaceImage, _pad) == 3);
-    assert!(offset_of!(InterfaceImage, mac) == 4);
-    assert!(offset_of!(InterfaceImage, _pad2) == 10);
-    assert!(offset_of!(InterfaceImage, address) == 12);
-    assert!(offset_of!(InterfaceImage, id) == 16);
-
-    assert!(size_of::<NeighbourImage>() == 16);
-    assert!(align_of::<NeighbourImage>() == 1);
-    assert!(offset_of!(NeighbourImage, port) == 0);
-    assert!(offset_of!(NeighbourImage, _pad) == 1);
-    assert!(offset_of!(NeighbourImage, mac) == 4);
-    assert!(offset_of!(NeighbourImage, _pad2) == 10);
-    assert!(offset_of!(NeighbourImage, address) == 12);
-
-    assert!(size_of::<ManagementImage>() == 16);
-    assert!(align_of::<ManagementImage>() == 1);
-    assert!(offset_of!(ManagementImage, enabled) == 0);
-    assert!(offset_of!(ManagementImage, prefix_length) == 1);
-    assert!(offset_of!(ManagementImage, _pad) == 2);
-    assert!(offset_of!(ManagementImage, mac) == 4);
-    assert!(offset_of!(ManagementImage, _pad2) == 10);
-    assert!(offset_of!(ManagementImage, address) == 12);
-
-    assert!(size_of::<ConfigImage>() == 832);
-    assert!(align_of::<ConfigImage>() == 4);
-    assert!(offset_of!(ConfigImage, generation) == 0);
-    assert!(offset_of!(ConfigImage, interface_count) == 4);
-    assert!(offset_of!(ConfigImage, neighbour_count) == 8);
-    assert!(offset_of!(ConfigImage, content_hash) == 12);
-    assert!(offset_of!(ConfigImage, management) == 16);
-    assert!(offset_of!(ConfigImage, interfaces) == 32);
-    assert!(offset_of!(ConfigImage, neighbours) == 320);
-
-    // Expressing the image as atomics must leave the region the reading domain
-    // maps byte-identical to a plain `ConfigImage`: same size, same alignment,
-    // every field at the offset the plain image puts it at.
-    assert!(size_of::<InterfaceSlot>() == size_of::<InterfaceImage>());
-    assert!(align_of::<InterfaceSlot>() == align_of::<InterfaceImage>());
-    assert!(offset_of!(InterfaceSlot, port) == offset_of!(InterfaceImage, port));
-    assert!(offset_of!(InterfaceSlot, enabled) == offset_of!(InterfaceImage, enabled));
-    assert!(offset_of!(InterfaceSlot, prefix_length) == offset_of!(InterfaceImage, prefix_length));
-    assert!(offset_of!(InterfaceSlot, _pad) == offset_of!(InterfaceImage, _pad));
-    assert!(offset_of!(InterfaceSlot, mac) == offset_of!(InterfaceImage, mac));
-    assert!(offset_of!(InterfaceSlot, _pad2) == offset_of!(InterfaceImage, _pad2));
-    assert!(offset_of!(InterfaceSlot, address) == offset_of!(InterfaceImage, address));
-    assert!(offset_of!(InterfaceSlot, id) == offset_of!(InterfaceImage, id));
-
-    assert!(size_of::<NeighbourSlot>() == size_of::<NeighbourImage>());
-    assert!(align_of::<NeighbourSlot>() == align_of::<NeighbourImage>());
-    assert!(offset_of!(NeighbourSlot, port) == offset_of!(NeighbourImage, port));
-    assert!(offset_of!(NeighbourSlot, _pad) == offset_of!(NeighbourImage, _pad));
-    assert!(offset_of!(NeighbourSlot, mac) == offset_of!(NeighbourImage, mac));
-    assert!(offset_of!(NeighbourSlot, _pad2) == offset_of!(NeighbourImage, _pad2));
-    assert!(offset_of!(NeighbourSlot, address) == offset_of!(NeighbourImage, address));
-
-    assert!(size_of::<ManagementSlot>() == size_of::<ManagementImage>());
-    assert!(align_of::<ManagementSlot>() == align_of::<ManagementImage>());
-    assert!(offset_of!(ManagementSlot, enabled) == offset_of!(ManagementImage, enabled));
-    assert!(
-        offset_of!(ManagementSlot, prefix_length) == offset_of!(ManagementImage, prefix_length)
-    );
-    assert!(offset_of!(ManagementSlot, _pad) == offset_of!(ManagementImage, _pad));
-    assert!(offset_of!(ManagementSlot, mac) == offset_of!(ManagementImage, mac));
-    assert!(offset_of!(ManagementSlot, _pad2) == offset_of!(ManagementImage, _pad2));
-    assert!(offset_of!(ManagementSlot, address) == offset_of!(ManagementImage, address));
-
-    assert!(size_of::<ConfigSlot>() == size_of::<ConfigImage>());
-    assert!(align_of::<ConfigSlot>() == align_of::<ConfigImage>());
-    assert!(offset_of!(ConfigSlot, generation) == offset_of!(ConfigImage, generation));
-    assert!(offset_of!(ConfigSlot, interface_count) == offset_of!(ConfigImage, interface_count));
-    assert!(offset_of!(ConfigSlot, neighbour_count) == offset_of!(ConfigImage, neighbour_count));
-    assert!(offset_of!(ConfigSlot, content_hash) == offset_of!(ConfigImage, content_hash));
-    assert!(offset_of!(ConfigSlot, management) == offset_of!(ConfigImage, management));
-    assert!(offset_of!(ConfigSlot, interfaces) == offset_of!(ConfigImage, interfaces));
-    assert!(offset_of!(ConfigSlot, neighbours) == offset_of!(ConfigImage, neighbours));
-
     assert!(size_of::<ConfigHandover>() == 840);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
@@ -2206,7 +1862,7 @@ mod tests {
     #[test]
     fn padding_the_writer_chose_is_read_by_nothing() {
         let mut raw = image(1, 1);
-        raw.interfaces[0]._pad = 0xaa;
+        raw.interfaces[0]._pad = [0xaa; 1];
         raw.interfaces[0]._pad2 = [0xbb; 2];
         raw.neighbours[0]._pad = [0xcc; 3];
         raw.neighbours[0]._pad2 = [0xdd; 2];
@@ -2227,7 +1883,10 @@ mod tests {
         assert_eq!(offset_of!(ConfigImage, interfaces), 32);
         assert_eq!(offset_of!(ConfigImage, neighbours), 320);
         assert_eq!(offset_of!(ConfigHandover, image), 8);
-        assert_eq!(CONFIG_REGION_SIZE, 0x1000);
+        // The handover region is reserved past what it holds, so its size is
+        // the reservation rather than the one page the image would round to.
+        assert_eq!(CONFIG_REGION_SIZE, 0x4000);
+        assert!(CONFIG_REGION_SIZE > size_of::<ConfigHandover>());
         assert_eq!(CONFIG_ACK_REGION_SIZE, 0x1000);
     }
 
@@ -2615,7 +2274,7 @@ mod tests {
                     port,
                     enabled,
                     prefix_length,
-                    _pad: pad,
+                    _pad: [pad; 1],
                     mac,
                     _pad2: pad2,
                     address,

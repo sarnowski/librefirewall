@@ -139,12 +139,6 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "crates/http/src/request.rs",
         Vocabulary::Other("HTTP header field names, which are wire syntax rather than a surface"),
     ),
-    (
-        "crates/config/src/schema.rs",
-        Vocabulary::Other(
-            "configuration-document attribute names, the same spelling `Field` carries",
-        ),
-    ),
 ];
 
 /// The four domains whose refusal tokens the console chapter tabulates, in the

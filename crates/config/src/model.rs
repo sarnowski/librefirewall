@@ -1,4 +1,5 @@
-//! The parsed configuration, as a value.
+//! The parsed configuration, as a value: the fixed-capacity container the
+//! objects declared beside it are held in.
 //!
 //! This is what a document becomes once it is no longer bytes, and what every
 //! later step — validation, hashing, diffing, the handover image — reads
@@ -8,51 +9,15 @@
 //! is to leave the reader nothing to remember them by.
 
 use lfw_log::Identifier;
-use net_headers::{Ipv4Address, MacAddress};
 use wire::{MAX_INTERFACES, MAX_NEIGHBOURS};
+
+use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
 
 /// The handover image has a fixed number of slots and there is no allocator, so
 /// an object past the last of them cannot be stored and is not truncated away
 /// either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Full;
-
-/// One `<interface>`: the appliance's own presence on a directly attached
-/// subnet, keyed by the id an operator gave it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InterfaceEntry {
-    pub id: Identifier,
-    pub port: u8,
-    pub enabled: bool,
-    pub mac: MacAddress,
-    pub address: Ipv4Address,
-    pub prefix_length: u8,
-}
-
-/// One `<neighbour>`, naming its interface by that interface's id rather than
-/// by a port number.
-///
-/// An id survives an operator renumbering ports, and it is the reference whose
-/// resolution is a real validation step: a port number would resolve to
-/// whatever happened to be configured there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NeighbourEntry {
-    pub id: Identifier,
-    pub interface: Identifier,
-    pub address: Ipv4Address,
-    pub mac: MacAddress,
-}
-
-/// The `<management>` element: the appliance's own presence on the port
-/// the design keeps out of the dataplane. It carries no `id` and no `port` —
-/// one such port, not in the router's set, so neither has anything to select.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManagementEntry {
-    pub enabled: bool,
-    pub mac: MacAddress,
-    pub address: Ipv4Address,
-    pub prefix_length: u8,
-}
 
 /// A whole configuration.
 ///
@@ -223,6 +188,7 @@ impl Default for Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use net_headers::{Ipv4Address, MacAddress};
     use std::string::String;
 
     pub(crate) fn id(text: &str) -> Identifier {

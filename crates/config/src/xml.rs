@@ -43,9 +43,16 @@ pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 /// change.
 pub const MAX_DEPTH: usize = 8;
 
-/// Attributes one element may carry. The widest element in the schema carries
-/// six.
-pub const MAX_ATTRIBUTES: usize = 8;
+/// Attributes one element may carry.
+///
+/// A bound on the adversary rather than a description of the schema, so it is
+/// set with room for the objects the configuration will grow rather than at the
+/// six the widest element carries today: an element every new attribute pushes
+/// against a bound is one where a schema change and a hardening decision get
+/// made in the same edit, and only one of the two is anybody's intent. Sixteen
+/// costs an element sixteen `Option<Attribute>` slots on the stack while it is
+/// being read, and refuses a document long before that stack matters.
+pub const MAX_ATTRIBUTES: usize = 16;
 
 /// Longest element or attribute name. The longest in the schema is
 /// `prefix-length`.

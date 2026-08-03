@@ -8,11 +8,7 @@
 use lfw_log::Identifier;
 use wire::{ConfigImage, IdentifierImage, InterfaceImage, ManagementImage, NeighbourImage};
 
-use crate::{
-    hash::content_hash,
-    model::{Model, NeighbourEntry},
-    store::Generation,
-};
+use crate::{entity::NeighbourEntry, hash::content_hash, model::Model, store::Generation};
 
 /// Why a validated configuration could not be turned into a handover image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +50,7 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
             port: entry.port,
             enabled: u8::from(entry.enabled),
             prefix_length: entry.prefix_length,
-            _pad: 0,
+            _pad: [0; 1],
             mac: entry.mac.0,
             _pad2: [0; 2],
             address: entry.address.octets(),
@@ -93,7 +89,7 @@ fn port_of(model: &Model, entry: &NeighbourEntry) -> Result<u8, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PORT_COUNT, load, model::InterfaceEntry, validate};
+    use crate::{PORT_COUNT, entity::InterfaceEntry, load, validate};
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String};
@@ -308,7 +304,7 @@ mod tests {
         }
         if let Some(entry) = checked.management() {
             model
-                .set_management(crate::model::ManagementEntry {
+                .set_management(crate::entity::ManagementEntry {
                     enabled: true,
                     mac: MacAddress(entry.mac()),
                     address: Ipv4Address::from_octets(entry.address()),

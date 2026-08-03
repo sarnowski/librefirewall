@@ -13,14 +13,21 @@
 //! unforwardable as their interface counterparts, and the vocabulary already
 //! had the tokens for all three.
 //!
-//! Every rule here is re-decided by [`wire::ConfigImage::check`], which is as
-//! strong on all but two of them. Not redundancy: this crate runs in the domain
-//! that parses the document, so a rule only enforced here is one a compromised
-//! parser does not enforce. Which two is stated on that function.
+//! Every rule here is re-decided by [`wire::ConfigImage::check`]. Not
+//! redundancy: this crate runs in the domain that parses the document, so a
+//! rule only enforced here is one a compromised parser does not enforce.
+//!
+//! Which rules those are is not a matter for either side to remember. They are
+//! named once, in [`wire::ConfigRule`], and [`model_enforcement`] below answers
+//! for every one of them — exhaustively, so a rule added to that list does not
+//! compile until this side has been told what it does about it, and the same is
+//! true of the image side. What the compiler holds is the pairing; that each
+//! answer is true of the code beneath it is held by the differential properties
+//! that put arbitrary images and arbitrary documents through both sides.
 
 use lfw_log::{Identifier, RejectReason};
 use net_headers::{Ipv4Address, prefix_mask};
-use wire::MAX_PREFIX_LENGTH;
+use wire::{ConfigRule, Enforcement, MAX_PREFIX_LENGTH};
 
 use crate::{PORT_COUNT, model::Model};
 
@@ -28,6 +35,74 @@ use crate::{PORT_COUNT, model::Model};
 // `wire` depends on no domain crate — so the two are held equal here, the one
 // place that depends on both.
 const _: () = assert!(MAX_PREFIX_LENGTH == net_headers::MAX_PREFIX_LENGTH);
+
+/// What this side does about one rule.
+///
+/// Exhaustive over [`ConfigRule`], which is the point: a rule added to that
+/// list does not compile until this side has said what it does about it.
+#[must_use]
+pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
+    match rule {
+        // A model holding more objects than the image has slots for does not
+        // exist: the arrays are fixed and `push` refuses past the last one, so
+        // the document is refused where it is read rather than here.
+        ConfigRule::InterfaceCountWithinCapacity
+        | ConfigRule::NeighbourCountWithinCapacity
+        // Parsed into a `bool` and an `Identifier`, neither of which has a
+        // representation that breaks the rule.
+        | ConfigRule::InterfaceEnabledIsBoolean
+        | ConfigRule::InterfaceIdIsWellFormed
+        | ConfigRule::ManagementEnabledIsBoolean
+        // A neighbour names an interface, never a port: the port it ends up on
+        // is the one that interface holds, and that one is already a port this
+        // build has by `InterfacePortExists`.
+        | ConfigRule::NeighbourPortExists => Enforcement::Unrepresentable,
+
+        ConfigRule::InterfacePortExists
+        | ConfigRule::InterfacePrefixLengthInRange
+        | ConfigRule::InterfaceMacIsUnicast
+        | ConfigRule::InterfaceAddressIsUnicast
+        | ConfigRule::InterfaceAddressIsAHostAddress
+        | ConfigRule::InterfaceIdIsUnique
+        | ConfigRule::InterfacePortIsUnique
+        | ConfigRule::InterfaceMacIsUnique
+        | ConfigRule::InterfacePrefixesDoNotOverlap
+        | ConfigRule::NeighbourInterfaceResolves
+        | ConfigRule::NeighbourMacIsUnicast
+        | ConfigRule::NeighbourAddressIsUnicast
+        | ConfigRule::NeighbourAddressIsAHostAddress
+        | ConfigRule::NeighbourIsInsideItsPrefix
+        | ConfigRule::NeighbourIsNotTheInterfaceAddress
+        | ConfigRule::NeighbourAddressIsUnique
+        | ConfigRule::NeighbourIdIsUnique
+        // Held to unconditionally, including of a disabled entry: the model
+        // carries the values beside the flag, so there is something to judge
+        // even where the image would have nothing left to look at.
+        | ConfigRule::ManagementPrefixLengthInRange
+        | ConfigRule::ManagementMacIsUnicast
+        | ConfigRule::ManagementAddressIsUnicast
+        | ConfigRule::ManagementAddressIsAHostAddress
+        | ConfigRule::ManagementPrefixDoesNotCollideWithInterface
+        | ConfigRule::ManagementMacDoesNotCollideWithInterface => Enforcement::Refuses,
+    }
+}
+
+// This side decides every rule there is. It is the side that reads the
+// document, so a rule it could not decide would be one nothing decides before
+// an operator is told their configuration was accepted — and unlike the image
+// side, which is missing the neighbour's identity by construction, nothing here
+// is missing anything. A rule that became undecidable here is therefore a
+// compile error rather than a line in a table.
+const _: () = {
+    let mut index = 0;
+    while index < ConfigRule::ALL.len() {
+        assert!(!matches!(
+            model_enforcement(ConfigRule::ALL[index]),
+            Enforcement::CannotDecide
+        ));
+        index += 1;
+    }
+};
 
 /// Why a configuration cannot be held.
 ///
@@ -400,7 +475,7 @@ fn overlaps(left: Ipv4Address, left_len: u8, right: Ipv4Address, right_len: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InterfaceEntry, ManagementEntry, NeighbourEntry};
+    use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
     use net_headers::MacAddress;
     use proptest::prelude::*;
 
@@ -1007,6 +1082,221 @@ mod tests {
             assert_eq!(variant.id(), Identifier::MANAGEMENT, "{variant:?}");
             assert!(RejectReason::ALL.contains(&variant.reason()), "{variant:?}");
         }
+    }
+
+    /// A configuration that breaks exactly one rule, or `None` where the rule
+    /// cannot be broken in a model at all.
+    ///
+    /// Exhaustive over [`ConfigRule`], which is what makes this the third thing
+    /// a new rule has to be told to: the list, the two enforcement answers, and
+    /// a configuration that actually breaks it. A rule can then be declared
+    /// enforced only where something demonstrably refuses one that breaks it.
+    fn breaking(rule: ConfigRule) -> Option<Model> {
+        let first = *sound().interfaces().next().expect("the first interface");
+        let mut second = second_interface();
+        let mut neighbour = sound_neighbour();
+        let mut management = management_entry();
+        let model = match rule {
+            // No model expresses these: the arrays are fixed, `enabled` is a
+            // `bool`, an id is an `Identifier`, and a neighbour names an
+            // interface rather than a port.
+            ConfigRule::InterfaceCountWithinCapacity
+            | ConfigRule::NeighbourCountWithinCapacity
+            | ConfigRule::InterfaceEnabledIsBoolean
+            | ConfigRule::InterfaceIdIsWellFormed
+            | ConfigRule::ManagementEnabledIsBoolean
+            | ConfigRule::NeighbourPortExists => return None,
+
+            ConfigRule::InterfacePortExists => {
+                second.port = PORT_COUNT;
+                with_interface(second)
+            }
+            ConfigRule::InterfacePrefixLengthInRange => {
+                second.prefix_length = MAX_PREFIX_LENGTH + 1;
+                with_interface(second)
+            }
+            ConfigRule::InterfaceMacIsUnicast => {
+                second.mac = MacAddress([0x01, 0, 0, 0, 0, 1]);
+                with_interface(second)
+            }
+            ConfigRule::InterfaceAddressIsUnicast => {
+                second.address = Ipv4Address::from_octets([224, 0, 0, 1]);
+                with_interface(second)
+            }
+            ConfigRule::InterfaceAddressIsAHostAddress => {
+                second.address = Ipv4Address::from_octets([10, 0, 1, 255]);
+                with_interface(second)
+            }
+            ConfigRule::InterfaceIdIsUnique => {
+                second.id = first.id;
+                with_interface(second)
+            }
+            ConfigRule::InterfacePortIsUnique => {
+                second.port = first.port;
+                with_interface(second)
+            }
+            ConfigRule::InterfaceMacIsUnique => {
+                second.mac = first.mac;
+                with_interface(second)
+            }
+            ConfigRule::InterfacePrefixesDoNotOverlap => {
+                second.address = Ipv4Address::from_octets([10, 0, 0, 2]);
+                with_interface(second)
+            }
+
+            ConfigRule::NeighbourInterfaceResolves => {
+                neighbour.interface = id("nowhere");
+                with_neighbour(neighbour)
+            }
+            ConfigRule::NeighbourMacIsUnicast => {
+                neighbour.mac = MacAddress([0x01, 0, 0, 0, 0, 1]);
+                with_neighbour(neighbour)
+            }
+            ConfigRule::NeighbourAddressIsUnicast => {
+                neighbour.address = Ipv4Address::from_octets([224, 0, 0, 1]);
+                with_neighbour(neighbour)
+            }
+            ConfigRule::NeighbourAddressIsAHostAddress => {
+                neighbour.address = Ipv4Address::from_octets([10, 0, 0, 255]);
+                with_neighbour(neighbour)
+            }
+            ConfigRule::NeighbourIsInsideItsPrefix => {
+                neighbour.address = Ipv4Address::from_octets([10, 0, 5, 2]);
+                with_neighbour(neighbour)
+            }
+            ConfigRule::NeighbourIsNotTheInterfaceAddress => {
+                neighbour.address = first.address;
+                with_neighbour(neighbour)
+            }
+            // The pair that needs two of them: one repeating the other's
+            // address, and one repeating the other's id.
+            ConfigRule::NeighbourAddressIsUnique | ConfigRule::NeighbourIdIsUnique => {
+                let mut twin = neighbour;
+                if rule == ConfigRule::NeighbourAddressIsUnique {
+                    twin.id = id("twin");
+                } else {
+                    twin.address = Ipv4Address::from_octets([10, 0, 0, 3]);
+                }
+                let mut model = with_neighbour(neighbour);
+                model.push_neighbour(twin).expect("capacity");
+                model
+            }
+
+            ConfigRule::ManagementPrefixLengthInRange => {
+                management.prefix_length = MAX_PREFIX_LENGTH + 1;
+                with_management(management)
+            }
+            ConfigRule::ManagementMacIsUnicast => {
+                management.mac = MacAddress([0x01, 0, 0, 0, 0, 1]);
+                with_management(management)
+            }
+            ConfigRule::ManagementAddressIsUnicast => {
+                management.address = Ipv4Address::from_octets([224, 0, 0, 1]);
+                with_management(management)
+            }
+            ConfigRule::ManagementAddressIsAHostAddress => {
+                management.address = Ipv4Address::from_octets([192, 168, 42, 255]);
+                with_management(management)
+            }
+            ConfigRule::ManagementPrefixDoesNotCollideWithInterface => {
+                management.address = first.address;
+                with_management(management)
+            }
+            ConfigRule::ManagementMacDoesNotCollideWithInterface => {
+                management.mac = first.mac;
+                with_management(management)
+            }
+        };
+        Some(model)
+    }
+
+    /// The neighbour `sound()` carries, on the first interface's link.
+    fn sound_neighbour() -> NeighbourEntry {
+        *sound().neighbours().next().expect("the first neighbour")
+    }
+
+    /// Both sides do what they said they would, rule by rule.
+    ///
+    /// This is what stops [`model_enforcement`] and
+    /// [`ConfigRule::image_enforcement`] being two tables nobody ever compared
+    /// against the code: a rule declared enforced whose configuration is
+    /// accepted fails here, and so does a rule declared undecidable that turns
+    /// out to be decided.
+    #[test]
+    fn every_rule_is_enforced_exactly_where_both_sides_say_it_is() {
+        for rule in ConfigRule::ALL {
+            let Some(model) = breaking(rule) else {
+                assert_eq!(
+                    model_enforcement(rule),
+                    Enforcement::Unrepresentable,
+                    "{rule:?} has no configuration that breaks it, so nothing here enforces it"
+                );
+                continue;
+            };
+            assert_eq!(
+                model_enforcement(rule),
+                Enforcement::Refuses,
+                "{rule:?} is declared otherwise but a model can break it"
+            );
+            assert!(
+                validate(&model).is_err(),
+                "{rule:?} is declared refused here and this configuration was accepted"
+            );
+
+            // The image side, from the very model the rules just refused: what
+            // it does with it must be what it said it would.
+            let image = crate::image_from(&model, crate::store::Generation::ZERO);
+            let accepted = match image {
+                // A neighbour naming no interface has no port to be written
+                // into an image, so the refusal lands one step earlier.
+                Err(_) => false,
+                Ok(image) => image.check(PORT_COUNT).is_ok(),
+            };
+            match rule.image_enforcement() {
+                Enforcement::Refuses => assert!(
+                    !accepted,
+                    "{rule:?} is declared re-decided by the image and the image accepted it"
+                ),
+                Enforcement::CannotDecide => assert!(
+                    accepted,
+                    "{rule:?} is declared undecidable by the image, which decided it anyway"
+                ),
+                // The configurations above all carry an enabled entry, so a
+                // conditional rule is an unconditional one here.
+                Enforcement::RefusesWhenEnabled => assert!(
+                    !accepted,
+                    "{rule:?} is declared refused of an enabled entry and the image accepted one"
+                ),
+                Enforcement::Unrepresentable => panic!("{rule:?} is expressible in an image"),
+            }
+        }
+    }
+
+    /// The conditional half of the management rules, which the table above
+    /// cannot reach: disabled, the image has nothing left to judge and the
+    /// model still does.
+    #[test]
+    fn a_disabled_management_entry_is_judged_by_the_model_and_not_by_the_image() {
+        let mut entry = management_entry();
+        entry.enabled = false;
+        entry.mac = MacAddress([0x01, 0, 0, 0, 0, 1]);
+        let model = with_management(entry);
+
+        assert_eq!(
+            validate(&model),
+            Err(SemanticError::ManagementMacNotUnicast),
+            "the model carries the values beside the flag, so it judges them"
+        );
+        let image = crate::image_from(&model, crate::store::Generation::ZERO)
+            .expect("a model with no dangling reference builds");
+        assert!(
+            image.check(PORT_COUNT).is_ok(),
+            "a disabled entry leaves the image nothing to judge"
+        );
+        assert_eq!(
+            ConfigRule::ManagementMacIsUnicast.image_enforcement(),
+            Enforcement::RefusesWhenEnabled
+        );
     }
 
     proptest! {

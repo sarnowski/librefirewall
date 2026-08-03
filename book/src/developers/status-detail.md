@@ -437,12 +437,15 @@ never mix.
 management-plane adversary rather than against a typo: `<!DOCTYPE`, entity declarations, CDATA,
 processing instructions and markup declarations are refused outright, only the five predefined
 entities and bounded numeric character references are expanded, and every dimension is a named
-bound — 64 KiB of document, 8 levels of nesting, 8 attributes per element, 32-byte names and
+bound — 64 KiB of document, 8 levels of nesting, 16 attributes per element, 32-byte names and
 values. The schema is closed: an unknown element or attribute is a refusal, not something skipped,
 because a misspelling nobody can see is the failure an appliance with no shell cannot afford.
 Parsing and semantic validation are separate passes over separate inputs — bytes, then a
 model — so a syntax rule cannot come to depend on an address and a topology rule cannot come to
-depend on where in the file something was written. Twenty-three semantic rules then run over the
+depend on where in the file something was written. Each configurable object is declared once —
+its value, the attributes a reader accepts for it, the change records it produces and the bytes it
+folds into a content hash all come from that one list, so an attribute cannot be added to the
+reader and forgotten by the hash. Twenty-three semantic rules then run over the
 model: a duplicate interface id, neighbour id, port or interface MAC; a port the build does not
 have; a prefix length past 32; an address that is its own prefix's network or broadcast address, on
 an interface or on a neighbour; a non-unicast address or MAC on either object; overlapping
@@ -455,6 +458,16 @@ can express. A document naming more objects than the handover ABI can carry is r
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
 bytes, so attacker-supplied content never reaches an observability surface.
 
+Those rules are decided **twice** — here over the model, and again over the byte image by the
+domain that will forward under it — and which rules there are is now one list rather than two.
+`wire::ConfigRule` names every rule once, and both sides answer for every one of them exhaustively:
+a rule added to that list does not compile until each side has said whether it refuses a
+configuration breaking it, cannot express one, or cannot decide it. The compiler holds the pairing;
+that each answer is true of the code beneath it is held by a test that builds a configuration
+breaking each rule in turn and puts it through both sides. Exactly one rule is undecidable on the
+image side — two neighbours under one id, the image carrying no neighbour identity — and that count
+is itself a compile-time assertion.
+
 `config::Datastore` versions what passed. A candidate is staged without touching what is running,
 `validate_document` takes `&self` so "an operation that changes nothing" is carried by the signature
 rather than by discipline, and a commit assigns the next monotonic generation and returns the diff —
@@ -465,7 +478,8 @@ to carry across the handover is short enough to collide, and a collision here wo
 configuration with no generation, no record and nothing published. The diff is keyed by the
 document's `id`, so reordering the document produces **zero** change records — a property test, not
 an intention — and a modified object produces one record per changed field and nothing for the
-rest.
+rest. A diff hands each record to its caller as it produces one rather than filling a buffer, so
+what a commit costs in memory does not grow with how many objects the ABI can hold.
 
 `pds/config` is a protection domain of its own holding no device capability, no buffer pool and no
 dataplane ring, so the domain that parses attacker-supplied XML cannot reach a frame, a NIC, or the
@@ -475,7 +489,12 @@ publishes it under an **offer/acknowledge handover**: offer, the consumer re-che
 acknowledges, then commit. (It is a handover between two domains of one node and not a two-phase
 commit: nothing is prepared that a later message could abort, and there is no coordinator.) The two
 regions are separate and mirrored (`cfg` read-write here and read-only there, `cfgack` the reverse)
-so neither domain can forge the other's half.
+so neither domain can forge the other's half. Its layout — the `#[repr(C)]` value a reader copies
+out, the atomic mirror a writer stores through, and the offset assertions that hold the two
+byte-identical — comes from one declaration per object, so a mirror cannot drift from the image it
+mirrors. `cfg` is reserved at four pages rather than the one its 840 bytes need, because its size is
+the one thing in the system description that cannot be changed locally: it is mapped at a fixed
+virtual address in three domains, and everything behind it in that window moves when it grows.
 
 The image has **two readers with different authority**, which is the shape a second consumer takes
 here. The forwarder is the *consumer* of that handover — it reads the offered generation,
@@ -504,7 +523,10 @@ enforced on the *untrusted* path rather than only in the domain that parses the 
 nothing downstream of the image consumes such an id. And a *disabled* management entry leaves every
 other field of it uninterpreted, so there is no value for a rule to be about; that is also what
 gives an unaddressed port one representation and makes a zeroed region the valid fail-closed image.
-Both are stated on the function and held by tests of their own.
+Both are now recorded in the shared rule list rather than in prose alone: the first is the one rule
+the image side declares undecidable, the second is the six it declares conditional on the enable
+flag, and both declarations are held to the running code by a test that puts a configuration
+breaking each rule through both sides.
 
 A refused image leaves the running configuration exactly as it was and is never acknowledged, so
 the publisher never commits it. The switch happens **between two polls** and is provable rather

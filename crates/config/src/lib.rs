@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 pub mod diff;
+pub mod entity;
 pub mod hash;
 pub mod model;
 pub mod report;
@@ -58,10 +59,11 @@ pub mod xml;
 
 use lfw_log::RejectReason;
 
-pub use diff::{Change, DiffSummary, diff};
+pub use diff::{Change, Records, diff};
+pub use entity::{InterfaceEntry, ManagementEntry, NeighbourEntry};
 pub use hash::{ContentHash, content_hash};
 pub use lfw_log::Identifier;
-pub use model::{Full, InterfaceEntry, Model, NeighbourEntry};
+pub use model::{Full, Model};
 pub use report::{CommitReport, commit_and_report};
 pub use runtime::{BuildError, image_from};
 pub use schema::parse;

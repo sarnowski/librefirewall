@@ -91,7 +91,6 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
         ("crates/http/src/request.rs", &["content-length"]),
-        ("crates/config/src/schema.rs", &["prefix-length"]),
     ]
 }
 

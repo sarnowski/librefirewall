@@ -2649,7 +2649,7 @@ mod tests {
         // releasing its own generation.
         for (region, vaddr, domain) in [
             ("cfg", "0x3_000_000", "forwarder"),
-            ("cfgack", "0x3_001_000", "config"),
+            ("cfgack", "0x3_004_000", "config"),
         ] {
             let findings = findings_after(
                 &format!(
@@ -2676,9 +2676,9 @@ mod tests {
     #[test]
     fn a_mapping_no_symbol_addresses_is_reported() {
         let findings = findings_after(
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />",
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" />",
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" />",
         );
         let finding = only_finding(&findings);
         assert!(finding.contains("names no setvar_vaddr"), "{finding}");
@@ -3103,10 +3103,10 @@ mod tests {
     #[test]
     fn the_management_domain_reaching_the_acknowledgement_region_is_reported() {
         let findings = findings_after(
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_management\"",
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
-             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_001_000\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_004_000\" \
              perms=\"rw\" cached=\"true\" setvar_vaddr=\"cfgack_vaddr\" />\n        \
              <map mr=\"log_management\"",
         );
@@ -3126,9 +3126,9 @@ mod tests {
     #[test]
     fn a_reader_of_the_calibration_that_could_write_it_is_reported() {
         let findings = findings_after(
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />",
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"rw\" cached=\"true\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"rw\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />",
         );
         let finding = only_finding(&findings);
@@ -3142,7 +3142,7 @@ mod tests {
     #[test]
     fn a_domain_that_stops_reading_the_calibration_is_reported() {
         let findings = findings_after(
-            "<map mr=\"clock\" vaddr=\"0x3_002_000\" perms=\"r\" cached=\"true\" \
+            "<map mr=\"clock\" vaddr=\"0x3_005_000\" perms=\"r\" cached=\"true\" \
              setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_forwarder\" \
              vaddr=\"0x4_000_000\" perms=\"r\"",
             "<map mr=\"log_forwarder\" vaddr=\"0x4_000_000\" perms=\"r\"",

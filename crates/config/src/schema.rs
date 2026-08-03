@@ -26,11 +26,18 @@
 //! `<management>` is a sibling of `<interfaces>`, not an entry inside it: that
 //! port is not a dataplane one — no `port` number, not in the router's set.
 //! Required like the other two; `enabled="false"` means no address.
+//!
+//! What lives here is the *document's* shape: which elements the root admits,
+//! that each appears once, that a section's children are all of one kind, and
+//! that nothing follows the root. Which attributes an object carries is the
+//! object's own business and is declared with it, in [`crate::entity`], so an
+//! object added to the schema adds a section here and a declaration there
+//! rather than a reader.
 
 use crate::{
-    model::{InterfaceEntry, ManagementEntry, Model, NeighbourEntry},
-    value,
-    xml::{Attribute, DocumentError, DocumentFault, Element, Event, Reader},
+    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, unknown_attribute},
+    model::Model,
+    xml::{DocumentError, DocumentFault, Element, Event, Reader},
 };
 
 /// Read a document into a model, checking nothing about what the values mean.
@@ -60,12 +67,12 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
     loop {
         match next(&mut reader)? {
             Some(Event::Start(section)) => {
-                if section.name == b"management" {
+                if section.name == ManagementEntry::ELEMENT {
                     if management_read {
                         return Err(duplicate_element(&section));
                     }
                     management_read = true;
-                    let entry = management_from(&section)?;
+                    let entry = ManagementEntry::read(&section)?;
                     model.set_management(entry).map_err(|_| DocumentError {
                         fault: DocumentFault::CapacityExceeded,
                         offset: section.offset,
@@ -82,13 +89,25 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
                         return Err(duplicate_element(&section));
                     }
                     interfaces_read = true;
-                    read_interfaces(&mut reader, &mut model)?;
+                    read_section(
+                        &mut reader,
+                        &mut model,
+                        InterfaceEntry::ELEMENT,
+                        InterfaceEntry::read,
+                        Model::push_interface,
+                    )?;
                 } else if section.name == b"neighbours" {
                     if neighbours_read {
                         return Err(duplicate_element(&section));
                     }
                     neighbours_read = true;
-                    read_neighbours(&mut reader, &mut model)?;
+                    read_section(
+                        &mut reader,
+                        &mut model,
+                        NeighbourEntry::ELEMENT,
+                        NeighbourEntry::read,
+                        Model::push_neighbour,
+                    )?;
                 } else {
                     return Err(unknown_element(&section));
                 }
@@ -108,15 +127,31 @@ pub fn parse(document: &[u8]) -> Result<Model, DocumentError> {
     })
 }
 
-fn read_interfaces(reader: &mut Reader<'_>, model: &mut Model) -> Result<(), DocumentError> {
+/// One repeated element inside its section, read into the model until the
+/// section closes.
+///
+/// The element name and the attribute grammar are the entity's own, declared
+/// once beside its value; what is left here is what a *section* is — that its
+/// children are all of one kind, that each is a leaf, and that a model with no
+/// room for one refuses rather than truncates.
+fn read_section<T, F>(
+    reader: &mut Reader<'_>,
+    model: &mut Model,
+    element_name: &[u8],
+    read_entry: fn(&Element<'_>) -> Result<T, DocumentError>,
+    push: F,
+) -> Result<(), DocumentError>
+where
+    F: Fn(&mut Model, T) -> Result<(), crate::model::Full>,
+{
     loop {
         match next(reader)? {
             Some(Event::Start(element)) => {
-                if element.name != b"interface" {
+                if element.name != element_name {
                     return Err(unknown_element(&element));
                 }
-                let entry = interface_from(&element)?;
-                model.push_interface(entry).map_err(|_| DocumentError {
+                let entry = read_entry(&element)?;
+                push(model, entry).map_err(|_| DocumentError {
                     fault: DocumentFault::CapacityExceeded,
                     offset: element.offset,
                 })?;
@@ -126,115 +161,6 @@ fn read_interfaces(reader: &mut Reader<'_>, model: &mut Model) -> Result<(), Doc
             None => return Err(DocumentError::at(DocumentFault::UnclosedElement, 0)),
         }
     }
-}
-
-fn read_neighbours(reader: &mut Reader<'_>, model: &mut Model) -> Result<(), DocumentError> {
-    loop {
-        match next(reader)? {
-            Some(Event::Start(element)) => {
-                if element.name != b"neighbour" {
-                    return Err(unknown_element(&element));
-                }
-                let entry = neighbour_from(&element)?;
-                model.push_neighbour(entry).map_err(|_| DocumentError {
-                    fault: DocumentFault::CapacityExceeded,
-                    offset: element.offset,
-                })?;
-                expect_empty(reader)?;
-            }
-            Some(Event::End { .. }) => return Ok(()),
-            None => return Err(DocumentError::at(DocumentFault::UnclosedElement, 0)),
-        }
-    }
-}
-
-fn interface_from(element: &Element<'_>) -> Result<InterfaceEntry, DocumentError> {
-    let mut id = None;
-    let mut port = None;
-    let mut enabled = None;
-    let mut mac = None;
-    let mut address = None;
-    let mut prefix_length = None;
-    for attribute in element.attributes() {
-        match attribute.name {
-            b"id" => id = Some(read(attribute, value::identifier)?),
-            b"port" => port = Some(read(attribute, value::port)?),
-            b"enabled" => enabled = Some(read(attribute, value::boolean)?),
-            b"mac" => mac = Some(read(attribute, value::mac)?),
-            b"address" => address = Some(read(attribute, value::ipv4)?),
-            b"prefix-length" => prefix_length = Some(read(attribute, value::prefix_length)?),
-            _ => return Err(unknown_attribute(attribute)),
-        }
-    }
-    Ok(InterfaceEntry {
-        id: required(id, element)?,
-        port: required(port, element)?,
-        enabled: required(enabled, element)?,
-        mac: required(mac, element)?,
-        address: required(address, element)?,
-        prefix_length: required(prefix_length, element)?,
-    })
-}
-
-fn neighbour_from(element: &Element<'_>) -> Result<NeighbourEntry, DocumentError> {
-    let mut id = None;
-    let mut interface = None;
-    let mut address = None;
-    let mut mac = None;
-    for attribute in element.attributes() {
-        match attribute.name {
-            b"id" => id = Some(read(attribute, value::identifier)?),
-            b"interface" => interface = Some(read(attribute, value::identifier)?),
-            b"address" => address = Some(read(attribute, value::ipv4)?),
-            b"mac" => mac = Some(read(attribute, value::mac)?),
-            _ => return Err(unknown_attribute(attribute)),
-        }
-    }
-    Ok(NeighbourEntry {
-        id: required(id, element)?,
-        interface: required(interface, element)?,
-        address: required(address, element)?,
-        mac: required(mac, element)?,
-    })
-}
-
-fn management_from(element: &Element<'_>) -> Result<ManagementEntry, DocumentError> {
-    let mut enabled = None;
-    let mut mac = None;
-    let mut address = None;
-    let mut prefix_length = None;
-    for attribute in element.attributes() {
-        match attribute.name {
-            b"enabled" => enabled = Some(read(attribute, value::boolean)?),
-            b"mac" => mac = Some(read(attribute, value::mac)?),
-            b"address" => address = Some(read(attribute, value::ipv4)?),
-            b"prefix-length" => prefix_length = Some(read(attribute, value::prefix_length)?),
-            _ => return Err(unknown_attribute(attribute)),
-        }
-    }
-    Ok(ManagementEntry {
-        enabled: required(enabled, element)?,
-        mac: required(mac, element)?,
-        address: required(address, element)?,
-        prefix_length: required(prefix_length, element)?,
-    })
-}
-
-fn read<T>(
-    attribute: &Attribute<'_>,
-    parse_value: fn(&[u8]) -> Result<T, value::ValueError>,
-) -> Result<T, DocumentError> {
-    parse_value(attribute.value.as_bytes()).map_err(|_| DocumentError {
-        fault: DocumentFault::MalformedValue,
-        offset: attribute.value_offset,
-    })
-}
-
-fn required<T>(read: Option<T>, element: &Element<'_>) -> Result<T, DocumentError> {
-    read.ok_or(DocumentError {
-        fault: DocumentFault::MissingAttribute,
-        offset: element.offset,
-    })
 }
 
 /// The element that follows a start tag must be its own end tag: no element in
@@ -283,13 +209,6 @@ fn duplicate_element(element: &Element<'_>) -> DocumentError {
     DocumentError {
         fault: DocumentFault::DuplicateElement,
         offset: element.offset,
-    }
-}
-
-fn unknown_attribute(attribute: &Attribute<'_>) -> DocumentError {
-    DocumentError {
-        fault: DocumentFault::UnknownAttribute,
-        offset: attribute.name_offset,
     }
 }
 

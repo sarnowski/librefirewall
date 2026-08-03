@@ -16,7 +16,7 @@ use wire::ConfigImage;
 
 use crate::{
     ConfigError,
-    diff::Change,
+    diff::{Change, Records},
     runtime::{BuildError, image_from},
     store::{CommitOutcome, Datastore, Generation},
 };
@@ -76,12 +76,7 @@ impl CommitReport {
 
 /// Read `document`, commit it, and report every value it moved. `sink` is told
 /// which of the three outcomes it was before this returns.
-pub fn commit_and_report(
-    store: &mut Datastore,
-    document: &[u8],
-    changes: &mut [Option<Change>],
-    sink: &dyn Sink,
-) -> CommitReport {
+pub fn commit_and_report(store: &mut Datastore, document: &[u8], sink: &dyn Sink) -> CommitReport {
     let staged = match store.stage(document) {
         Ok(staged) => staged,
         Err(error) => return refuse(store.running(), rejection(error), offset(error), sink),
@@ -94,7 +89,16 @@ pub fn commit_and_report(
         Err(error) => return refuse(store.running(), build_rejection(error), 0, sink),
     };
 
-    let outcome = match store.commit(changes) {
+    // The change records are emitted as the commit produces them rather than
+    // buffered and replayed: a generation is not a quantity of stack, and the
+    // numbering is the walk's own so it cannot come to disagree with the order
+    // the records went out in.
+    let mut emitted = ChangeRecords {
+        generation: staged.generation.to_bits(),
+        sequence: 0,
+        sink,
+    };
+    let outcome = match store.commit(&mut emitted) {
         Ok(outcome) => outcome,
         // Nothing about the configuration is wrong, so this has no reason token
         // — see `CommitError`'s own note on the two vocabularies.
@@ -118,32 +122,41 @@ pub fn commit_and_report(
             });
             CommitReport::Unchanged
         }
-        CommitOutcome::Applied {
-            changes: summary, ..
-        } => {
-            let mut sequence = 0u32;
-            for change in changes.iter().flatten() {
-                sink.emit(&Event::ConfigChange {
-                    generation,
-                    sequence,
-                    change: change.kind,
-                    object: change.object,
-                    key: change.key,
-                    field: change.field,
-                    from: change.from,
-                    to: change.to,
-                });
-                sequence = sequence.saturating_add(1);
-            }
+        CommitOutcome::Applied { changes, .. } => {
             sink.emit(&Event::ConfigGeneration {
                 generation,
                 outcome: GenerationOutcome::Applied,
-                // The whole diff and not the part that fitted: a commit whose
-                // records overran the buffer still moved every one of them.
-                changes: saturating(summary.total()),
+                changes: saturating(changes),
             });
             CommitReport::Published(image)
         }
+    }
+}
+
+/// Every change a commit produces, numbered and emitted as it arrives.
+///
+/// The generation it stamps is the one the commit is about to assign, which is
+/// known before the diff is walked; a commit that then refuses emits nothing,
+/// because the diff is the last thing a commit does.
+struct ChangeRecords<'sink> {
+    generation: u32,
+    sequence: u32,
+    sink: &'sink dyn Sink,
+}
+
+impl Records for ChangeRecords<'_> {
+    fn record(&mut self, change: Change) {
+        self.sink.emit(&Event::ConfigChange {
+            generation: self.generation,
+            sequence: self.sequence,
+            change: change.kind,
+            object: change.object,
+            key: change.key,
+            field: change.field,
+            from: change.from,
+            to: change.to,
+        });
+        self.sequence = self.sequence.saturating_add(1);
     }
 }
 
@@ -224,8 +237,7 @@ mod tests {
 
     fn run_on(store: &mut Datastore, document: &str) -> (CommitReport, Vec<Event>) {
         let sink = RecordingSink::<CAPACITY>::new();
-        let mut changes = [None; CAPACITY];
-        let report = commit_and_report(store, document.as_bytes(), &mut changes, &sink);
+        let report = commit_and_report(store, document.as_bytes(), &sink);
         assert_eq!(sink.dropped(), 0, "the fixture sink overran");
         let events = (0..sink.len())
             .map(|index| sink.get(index).expect("in range"))
@@ -470,23 +482,38 @@ mod tests {
         );
     }
 
-    /// The audit trail may fall short of the commit; the summary must not.
+    /// The summary counts the records the commit emitted, and the records the
+    /// commit emitted all carry the generation the summary names. Nothing
+    /// between the diff and the sink can lose one or renumber one, so the two
+    /// halves of a commit's account of itself are held to each other here.
     #[test]
-    fn a_buffer_too_small_still_reports_how_many_records_the_commit_had() {
-        let mut store = Datastore::new();
-        let sink = RecordingSink::<CAPACITY>::new();
-        let mut changes = [None; 2];
-        let report = commit_and_report(&mut store, ONE_PORT.as_bytes(), &mut changes, &sink);
+    fn every_change_record_carries_the_generation_the_summary_reports() {
+        let (report, events) = run(ONE_PORT);
         assert!(report.image().is_some());
 
-        let summary = sink.get(sink.len() - 1).expect("a summary is always last");
-        match summary {
-            Event::ConfigGeneration { changes, .. } => {
-                assert!(changes > 2, "the summary reported only what fitted");
+        let Some(Event::ConfigGeneration {
+            generation,
+            outcome: GenerationOutcome::Applied,
+            changes,
+        }) = events.last().copied()
+        else {
+            panic!("a summary is always last: {events:?}");
+        };
+        assert_eq!(changes as usize, events.len() - 1);
+
+        for (expected, event) in events.iter().take(events.len() - 1).enumerate() {
+            match event {
+                Event::ConfigChange {
+                    generation: stamped,
+                    sequence,
+                    ..
+                } => {
+                    assert_eq!(*stamped, generation, "{event:?}");
+                    assert_eq!(*sequence as usize, expected, "{event:?}");
+                }
+                other => panic!("{other:?} is not a change record"),
             }
-            other => panic!("{other:?} is not the summary"),
         }
-        assert_eq!(sink.len(), 3, "two records fitted, plus the summary");
     }
 
     #[test]
@@ -515,8 +542,7 @@ mod tests {
         let document = include_bytes!("../../../systems/qemu-x86_64/configuration.xml");
         let mut store = Datastore::new();
         let sink = RecordingSink::<CAPACITY>::new();
-        let mut changes = [None; CAPACITY];
-        let image = commit_and_report(&mut store, document, &mut changes, &sink)
+        let image = commit_and_report(&mut store, document, &sink)
             .image()
             .expect("the shipped configuration must commit");
         assert_eq!(image.generation, 1);

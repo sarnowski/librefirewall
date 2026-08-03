@@ -55,7 +55,7 @@
 use std::path::Path;
 
 use config::{Change, Model};
-use lfw_log::{Event, Field, GenerationOutcome, MAX_LINE_LEN, Stamp, render};
+use lfw_log::{Event, GenerationOutcome, MAX_LINE_LEN, Stamp, render};
 
 use crate::console_records::{CONFIG_PREFIX as CONFIG_RECORD_PREFIX, without_time};
 
@@ -63,12 +63,6 @@ use crate::console_records::{CONFIG_PREFIX as CONFIG_RECORD_PREFIX, without_time
 /// generation 0 — the fail-closed empty configuration — and the document a
 /// domain is built with is the next one.
 const FIRST_COMMIT: u32 = 1;
-
-/// Room for every record one commit from the empty model can produce: every
-/// object the handover image holds — the interfaces, the neighbours and the one
-/// management interface — in every field a record can name. The same constants
-/// `pds/config` sizes its own buffer from.
-const MAX_CHANGES: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS + 1) * Field::ALL.len();
 
 /// Why a document does not describe a transcript worth asserting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,10 +73,6 @@ pub(crate) enum ContractError {
     /// empty configuration: the domain would report `outcome=unchanged` and
     /// never publish, and there is no generation swap to prove.
     MovesNothing,
-    /// More records than the buffer this file sizes from the ABI, which cannot
-    /// happen for a document the ABI can hold and is refused rather than
-    /// asserted against a truncated expectation.
-    TooManyChanges { total: usize },
     /// A record would not render, which can only mean the console grammar has
     /// outgrown its own advertised maximum. Names the event rather than the
     /// bytes: every field of one is a parsed domain type, so the rendering is
@@ -101,10 +91,6 @@ impl std::fmt::Display for ContractError {
             }
             Self::MovesNothing => f.write_str(
                 "the document is the empty configuration, so no generation would be published",
-            ),
-            Self::TooManyChanges { total } => write!(
-                f,
-                "the diff has {total} records, past the {MAX_CHANGES} the handover ABI can hold"
             ),
             Self::Unrenderable { event } => write!(
                 f,
@@ -142,20 +128,20 @@ impl ConfigContract {
     /// # Errors
     /// [`ContractError`], as [`ConfigContract::from_document`].
     fn from_model(model: &Model) -> Result<Self, ContractError> {
-        let mut records = [None::<Change>; MAX_CHANGES];
-        let summary = config::diff(&Model::EMPTY, model, &mut records);
-        if summary.overflowed() {
-            return Err(ContractError::TooManyChanges {
-                total: summary.total(),
-            });
-        }
-        if summary.is_empty() {
+        // The same call `pds/config` makes, with the collecting sink this side
+        // can afford: an allocator is what separates the two, never a different
+        // walk.
+        let mut records = Vec::new();
+        config::diff(&Model::EMPTY, model, &mut |change: Change| {
+            records.push(change);
+        });
+        if records.is_empty() {
             return Err(ContractError::MovesNothing);
         }
 
-        let mut changes = Vec::with_capacity(summary.written());
-        for (sequence, change) in records.iter().flatten().enumerate() {
-            let sequence = sequence as u32;
+        let mut changes = Vec::with_capacity(records.len());
+        for (sequence, change) in records.iter().enumerate() {
+            let sequence = u32::try_from(sequence).unwrap_or(u32::MAX);
             changes.push(line(&Event::ConfigChange {
                 generation: FIRST_COMMIT,
                 sequence,
@@ -194,8 +180,6 @@ impl ConfigContract {
         line(&Event::ConfigGeneration {
             generation: FIRST_COMMIT,
             outcome: GenerationOutcome::Applied,
-            // Saturating rather than truncating, though the overflow check in
-            // `from_document` has already bounded this by `MAX_CHANGES`.
             changes: u32::try_from(self.changes.len()).unwrap_or(u32::MAX),
         })
     }
@@ -967,7 +951,6 @@ mod tests {
         let rendered = [
             ContractError::Refused("doctype".to_owned()).to_string(),
             ContractError::MovesNothing.to_string(),
-            ContractError::TooManyChanges { total: 999 }.to_string(),
             ContractError::Unrenderable {
                 event: "ConfigGeneration { generation: 3 }".to_owned(),
             }
@@ -975,8 +958,7 @@ mod tests {
         ];
         assert!(rendered[0].contains("doctype"));
         assert!(rendered[1].contains("empty configuration"));
-        assert!(rendered[2].contains("999"));
-        assert!(rendered[3].contains("generation: 3"));
+        assert!(rendered[2].contains("generation: 3"));
     }
 
     /// The renderer is `lfw_log`'s own, so a grammar change lands here rather
@@ -984,7 +966,7 @@ mod tests {
     /// commit in two different languages.
     #[test]
     fn a_record_is_rendered_by_the_grammar_the_domain_writes() {
-        use lfw_log::{ChangeKind, ObjectKind, Value};
+        use lfw_log::{ChangeKind, Field, ObjectKind, Value};
         let event = Event::ConfigChange {
             generation: 1,
             sequence: 0,

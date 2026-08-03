@@ -63,12 +63,6 @@ use config::{
     MAX_NAME_LEN, Model, PORT_COUNT, Reader, content_hash, diff, image_from, load, parse, validate,
 };
 
-/// Records the self-diff is offered: more than a field apiece for every object
-/// either artifact can hold, so an empty self-diff is empty because there was
-/// nothing to report and not because the buffer was too small to say so. The
-/// overflow flag is asserted beside it rather than trusted to this number.
-const DIFF_CAPACITY: usize = (wire::MAX_INTERFACES + wire::MAX_NEIGHBOURS) * 8;
-
 /// Generations an accepted model is turned into an image under.
 ///
 /// Not drawn from the input: the generation is assigned by the datastore, not
@@ -151,20 +145,16 @@ pub fn document_harness(document: &[u8]) {
         "one document hashed to two contents"
     );
 
-    let mut records = [None::<Change>; DIFF_CAPACITY];
-    let summary = diff(&model, &model, &mut records);
-    assert!(
-        summary.is_empty(),
-        "a configuration differs from itself in {} places",
-        summary.total()
+    let mut records: Vec<Change> = Vec::new();
+    let counted = diff(&model, &model, &mut |change: Change| records.push(change));
+    assert_eq!(
+        counted, 0,
+        "a configuration differs from itself in {counted} places"
     );
     assert!(
-        !summary.overflowed(),
-        "the self-diff was reported empty only because it did not fit"
-    );
-    assert!(
-        records.iter().all(Option::is_none),
-        "an empty diff still wrote a record"
+        records.is_empty(),
+        "an empty diff still handed out {} records",
+        records.len()
     );
 
     assert_artifacts_agree(&model, hash.to_bits());

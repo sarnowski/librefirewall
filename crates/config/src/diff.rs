@@ -8,19 +8,28 @@
 //! order, and an object's fields are walked in [`Field`] order — so the output
 //! is a function of the two configurations and of nothing else.
 //!
-//! # Why the slice holds `Option<Change>`
+//! # Why records are handed out rather than written into a buffer
 //!
-//! There is no allocator, so the caller owns the buffer; and a [`Change`]
-//! carries an [`Identifier`], which has no infallible constructor, so a caller
-//! cannot name an array's fill value without a fallible call standing in a
-//! place that has no failure. `Option` is what the caller can write down —
-//! `[None; N]` — and it carries a second property worth having: a slot past the
-//! last record is emptied rather than left holding whatever a previous diff put
-//! there, so the buffer is the diff rather than a prefix of it.
+//! A diff used to fill a caller's array, and that array had to be sized for the
+//! largest diff the configuration ABI could produce — every object it can hold,
+//! in every field a record can name. That number is a product of capacities, so
+//! it grows with the ABI rather than with what an operator edited, and the
+//! buffer was a stack local in a protection domain with a fixed stack: an
+//! object kind with a large capacity would have overrun it, at boot, in the
+//! domain that decides what the appliance forwards under.
+//!
+//! Handing each record to the caller as it is produced removes the quantity
+//! rather than resizing it. A diff costs one record of stack whatever the ABI
+//! grows to, no bound is left here to keep in step with [`wire::MAX_INTERFACES`]
+//! and its siblings, and a caller that has an allocator — a test, the build
+//! tooling — collects into whatever it likes.
 
 use lfw_log::{ChangeKind, Field, Identifier, ObjectKind, Value};
 
-use crate::model::{InterfaceEntry, ManagementEntry, Model, NeighbourEntry};
+use crate::{
+    entity::{InterfaceEntry, ManagementEntry, NeighbourEntry},
+    model::Model,
+};
 
 /// One value that changed, named the way the document names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,138 +44,82 @@ pub struct Change {
     pub to: Option<Value>,
 }
 
-/// How much of a diff reached the caller's buffer.
+/// Where a diff's records go.
 ///
-/// `dropped` rather than a bare flag because an incomplete audit trail is
-/// worth knowing the size of: the commit still happened, and the number of
-/// records that did not fit is how far the record of it falls short.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DiffSummary {
-    written: usize,
-    dropped: usize,
+/// A trait rather than a closure type so the protection domain can pass a value
+/// that emits straight into its log ring and a test can pass one that collects:
+/// both are one record at a time, which is the whole of what a consumer of this
+/// has to be able to do.
+pub trait Records {
+    fn record(&mut self, change: Change);
 }
 
-impl DiffSummary {
-    /// No records, which is what an unchanged configuration produces.
-    pub const NONE: Self = Self {
-        written: 0,
-        dropped: 0,
-    };
-
-    #[must_use]
-    pub const fn written(self) -> usize {
-        self.written
-    }
-
-    #[must_use]
-    pub const fn dropped(self) -> usize {
-        self.dropped
-    }
-
-    /// Every record the diff had, whether or not it fitted — what a generation
-    /// reports as its change count.
-    #[must_use]
-    pub const fn total(self) -> usize {
-        self.written.saturating_add(self.dropped)
-    }
-
-    #[must_use]
-    pub const fn overflowed(self) -> bool {
-        self.dropped > 0
-    }
-
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.total() == 0
+impl<F: FnMut(Change)> Records for F {
+    fn record(&mut self, change: Change) {
+        self(change);
     }
 }
 
-/// One slot per [`Field`], in `Field` order, empty where the object has no such
-/// field. Comparing two of these slot by slot is what makes a record's position
-/// in the output a property of the field rather than of the code below.
-type Fields = [Option<Value>; Field::ALL.len()];
-
-const _: () = {
-    // The arrays below are positional, so the order they assume is checked
-    // rather than described.
-    assert!(matches!(
-        Field::ALL,
-        [
-            Field::Port,
-            Field::Enabled,
-            Field::Mac,
-            Field::Address,
-            Field::PrefixLength,
-            Field::Interface,
-        ]
-    ));
-};
-
-/// Write the records that turn `before` into `after` into `records`.
+/// What one object says about one field, or `None` where it has no such field.
 ///
-/// Records are ordered by object kind, then id, then field, so two runs over
-/// one pair of configurations produce the same buffer byte for byte.
-pub fn diff(before: &Model, after: &Model, records: &mut [Option<Change>]) -> DiffSummary {
-    let mut out = Records {
-        slots: records.iter_mut(),
-        summary: DiffSummary::NONE,
+/// A lookup rather than an array position: the record's place in the output is
+/// then a property of the field vocabulary alone, and an object that grows a
+/// field cannot shift another object's records by declaring it in a different
+/// place.
+type FieldValue<T> = fn(&T, Field) -> Option<Value>;
+
+/// Hand `out` every record that turns `before` into `after`, and answer how
+/// many there were.
+///
+/// Records are produced by object kind, then id, then field, so two runs over
+/// one pair of configurations produce the same sequence record for record.
+pub fn diff(before: &Model, after: &Model, out: &mut dyn Records) -> usize {
+    let mut out = Counted {
+        records: out,
+        count: 0,
     };
     walk(
-        ObjectKind::Interface,
+        InterfaceEntry::OBJECT,
         &before.interfaces_by_id(),
         &after.interfaces_by_id(),
-        |entry| entry.id,
-        interface_fields,
+        InterfaceEntry::key,
+        InterfaceEntry::field_value,
         &mut out,
     );
     walk(
-        ObjectKind::Neighbour,
+        NeighbourEntry::OBJECT,
         &before.neighbours_by_id(),
         &after.neighbours_by_id(),
-        |entry| entry.id,
-        neighbour_fields,
+        NeighbourEntry::key,
+        NeighbourEntry::field_value,
         &mut out,
     );
     // One slot, and the same merge: an element that appears, disappears or
     // changes a field is added, removed or modified on the terms every other
     // object kind is held to.
     walk(
-        ObjectKind::Management,
+        ManagementEntry::OBJECT,
         &before.management_slot(),
         &after.management_slot(),
-        |_| Identifier::MANAGEMENT,
-        management_fields,
+        ManagementEntry::key,
+        ManagementEntry::field_value,
         &mut out,
     );
-    out.finish()
+    out.count
 }
 
-/// The caller's buffer while it is being filled, and the count of what did not
-/// fit. Holding the iterator rather than an index is what leaves nothing to
-/// bound: a slot that is not there is a `None` from `next`.
-struct Records<'slice> {
-    slots: core::slice::IterMut<'slice, Option<Change>>,
-    summary: DiffSummary,
+/// The caller's sink and the count of what went through it. Counting here
+/// rather than at the caller is what makes the number a generation reports and
+/// the records it emitted the same walk.
+struct Counted<'sink> {
+    records: &'sink mut dyn Records,
+    count: usize,
 }
 
-impl Records<'_> {
+impl Counted<'_> {
     fn push(&mut self, change: Change) {
-        match self.slots.next() {
-            Some(slot) => {
-                *slot = Some(change);
-                self.summary.written = self.summary.written.saturating_add(1);
-            }
-            None => self.summary.dropped = self.summary.dropped.saturating_add(1),
-        }
-    }
-
-    /// Empties what the diff did not write, so a reused buffer cannot present
-    /// a record from an earlier commit as one from this one.
-    fn finish(mut self) -> DiffSummary {
-        for slot in &mut self.slots {
-            *slot = None;
-        }
-        self.summary
+        self.records.record(change);
+        self.count = self.count.saturating_add(1);
     }
 }
 
@@ -178,8 +131,8 @@ fn walk<T: Copy, const N: usize>(
     before: &[Option<T>; N],
     after: &[Option<T>; N],
     key: fn(&T) -> Identifier,
-    fields: fn(&T) -> Fields,
-    out: &mut Records<'_>,
+    field_value: FieldValue<T>,
+    out: &mut Counted<'_>,
 ) {
     let mut before = before.iter().flatten().peekable();
     let mut after = after.iter().flatten().peekable();
@@ -193,17 +146,35 @@ fn walk<T: Copy, const N: usize>(
         match ordering {
             core::cmp::Ordering::Less => {
                 if let Some(entry) = before.next() {
-                    record(object, key(entry), ChangeKind::Removed, fields(entry), out);
+                    record(
+                        object,
+                        key(entry),
+                        ChangeKind::Removed,
+                        |field| field_value(entry, field),
+                        out,
+                    );
                 }
             }
             core::cmp::Ordering::Greater => {
                 if let Some(entry) = after.next() {
-                    record(object, key(entry), ChangeKind::Added, fields(entry), out);
+                    record(
+                        object,
+                        key(entry),
+                        ChangeKind::Added,
+                        |field| field_value(entry, field),
+                        out,
+                    );
                 }
             }
             core::cmp::Ordering::Equal => {
                 if let (Some(gone), Some(kept)) = (before.next(), after.next()) {
-                    modified(object, key(kept), fields(gone), fields(kept), out);
+                    modified(
+                        object,
+                        key(kept),
+                        |field| field_value(gone, field),
+                        |field| field_value(kept, field),
+                        out,
+                    );
                 }
             }
         }
@@ -217,11 +188,11 @@ fn record(
     object: ObjectKind,
     key: Identifier,
     kind: ChangeKind,
-    fields: Fields,
-    out: &mut Records<'_>,
+    value_of: impl Fn(Field) -> Option<Value>,
+    out: &mut Counted<'_>,
 ) {
-    for (field, value) in Field::ALL.into_iter().zip(fields) {
-        let Some(value) = value else {
+    for field in Field::ALL {
+        let Some(value) = value_of(field) else {
             continue;
         };
         let (from, to) = match kind {
@@ -244,12 +215,12 @@ fn record(
 fn modified(
     object: ObjectKind,
     key: Identifier,
-    before: Fields,
-    after: Fields,
-    out: &mut Records<'_>,
+    before: impl Fn(Field) -> Option<Value>,
+    after: impl Fn(Field) -> Option<Value>,
+    out: &mut Counted<'_>,
 ) {
-    for (field, (from, to)) in Field::ALL.into_iter().zip(before.into_iter().zip(after)) {
-        let (Some(from), Some(to)) = (from, to) else {
+    for field in Field::ALL {
+        let (Some(from), Some(to)) = (before(field), after(field)) else {
             continue;
         };
         if from == to {
@@ -266,49 +237,12 @@ fn modified(
     }
 }
 
-fn interface_fields(entry: &InterfaceEntry) -> Fields {
-    [
-        Some(Value::Port(entry.port)),
-        Some(Value::Bool(entry.enabled)),
-        Some(Value::Mac(entry.mac)),
-        Some(Value::Ipv4(entry.address)),
-        Some(Value::PrefixLength(entry.prefix_length)),
-        None,
-    ]
-}
-
-fn management_fields(entry: &ManagementEntry) -> Fields {
-    [
-        None,
-        Some(Value::Bool(entry.enabled)),
-        Some(Value::Mac(entry.mac)),
-        Some(Value::Ipv4(entry.address)),
-        Some(Value::PrefixLength(entry.prefix_length)),
-        None,
-    ]
-}
-
-fn neighbour_fields(entry: &NeighbourEntry) -> Fields {
-    [
-        None,
-        None,
-        Some(Value::Mac(entry.mac)),
-        Some(Value::Ipv4(entry.address)),
-        None,
-        Some(Value::Id(entry.interface)),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
-
-    /// Room for every record two full configurations can produce, so a test
-    /// that did not set out to overflow does not.
-    const ROOMY: usize = 512;
 
     fn id(text: &str) -> Identifier {
         Identifier::new(text.as_bytes()).expect("the test uses the identifier alphabet")
@@ -344,28 +278,24 @@ mod tests {
         model
     }
 
-    /// The records a diff wrote, as owned values, so an assertion reads as the
-    /// list it is checking.
-    fn records(before: &Model, after: &Model) -> (Vec<Change>, DiffSummary) {
-        let mut buffer = [None; ROOMY];
-        let summary = diff(before, after, &mut buffer);
-        let written: Vec<Change> = buffer.iter().flatten().copied().collect();
-        assert_eq!(written.len(), summary.written());
-        assert!(
-            !summary.overflowed(),
-            "{ROOMY} slots were meant to be enough"
-        );
-        (written, summary)
+    /// The records a diff handed out, as owned values, so an assertion reads as
+    /// the list it is checking. The count the diff answers with is asserted
+    /// against the records that actually arrived, because a generation reports
+    /// that number and a walk that counted more than it emitted would say a
+    /// commit moved values nobody can see.
+    fn records(before: &Model, after: &Model) -> (Vec<Change>, usize) {
+        let mut written = Vec::new();
+        let counted = diff(before, after, &mut |change: Change| written.push(change));
+        assert_eq!(written.len(), counted);
+        (written, counted)
     }
 
     #[test]
     fn two_identical_configurations_produce_nothing_at_all() {
         let model = with_interfaces(&["wan", "lan"]);
-        let (written, summary) = records(&model, &model);
+        let (written, counted) = records(&model, &model);
         assert!(written.is_empty());
-        assert!(summary.is_empty());
-        assert_eq!(summary.total(), 0);
-        assert_eq!(summary, DiffSummary::NONE);
+        assert_eq!(counted, 0);
     }
 
     #[test]
@@ -449,8 +379,8 @@ mod tests {
             after.push_interface(entry).expect("capacity");
         }
 
-        let (written, summary) = records(&before, &after);
-        assert_eq!(summary.written(), 1);
+        let (written, counted) = records(&before, &after);
+        assert_eq!(counted, 1);
         assert_eq!(
             written.first().copied(),
             Some(Change {
@@ -534,8 +464,8 @@ mod tests {
         let mut after = Model::EMPTY;
         after.set_management(management(false, 15)).expect("one");
 
-        let (written, summary) = records(&before, &after);
-        assert_eq!(summary.written(), 1);
+        let (written, counted) = records(&before, &after);
+        assert_eq!(counted, 1);
         assert_eq!(
             written.first().copied(),
             Some(Change {
@@ -617,30 +547,24 @@ mod tests {
         );
     }
 
+    /// Every record reaches the caller: there is no buffer between the two, so
+    /// the count a generation reports and the records an operator reads are one
+    /// walk rather than two quantities that could disagree.
     #[test]
-    fn a_buffer_too_small_is_reported_rather_than_quietly_cut_short() {
+    fn the_count_a_diff_answers_with_is_the_records_it_handed_out() {
         let after = with_interfaces(&["wan"]);
-        let mut buffer = [None; 3];
-        let summary = diff(&Model::EMPTY, &after, &mut buffer);
-        assert_eq!(summary.written(), 3);
-        assert_eq!(summary.dropped(), 2);
-        assert_eq!(summary.total(), 5);
-        assert!(summary.overflowed());
-        assert_eq!(buffer.iter().flatten().count(), 3);
+        let (written, counted) = records(&Model::EMPTY, &after);
+        assert_eq!(counted, 5);
+        assert_eq!(written.len(), 5);
 
-        let none = diff(&Model::EMPTY, &after, &mut []);
-        assert_eq!(none.written(), 0);
-        assert_eq!(none.total(), 5);
-        assert!(none.overflowed());
-    }
-
-    #[test]
-    fn a_reused_buffer_holds_this_diff_and_no_part_of_the_last_one() {
-        let mut buffer = [None; ROOMY];
-        let after = with_interfaces(&["wan"]);
-        assert_eq!(diff(&Model::EMPTY, &after, &mut buffer).written(), 5);
-        assert_eq!(diff(&after, &after, &mut buffer), DiffSummary::NONE);
-        assert_eq!(buffer.iter().flatten().count(), 0);
+        // A sink that keeps nothing is still handed every one of them, which is
+        // what makes the count independent of what the caller does with them.
+        let mut seen = 0usize;
+        assert_eq!(
+            diff(&Model::EMPTY, &after, &mut |_: Change| seen += 1),
+            seen
+        );
+        assert_eq!(seen, 5);
     }
 
     #[test]
@@ -661,29 +585,25 @@ mod tests {
     }
 
     proptest! {
-        /// A diff never writes past the buffer it was given, and says how far
-        /// short it fell whenever it would have.
+        /// A diff hands out one record per field of every object it added, and
+        /// the number it answers with is the number that arrived — whatever the
+        /// configuration's size, there being no capacity left between the two
+        /// for them to disagree across.
         #[test]
-        fn a_diff_stays_inside_the_buffer_and_reports_what_did_not_fit(
+        fn every_record_a_diff_counts_is_one_the_caller_was_handed(
             count in 0usize..6,
-            capacity in 0usize..40,
         ) {
             let names: Vec<String> = (0..count).map(|index| format!("i{index}")).collect();
             let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
             let after = with_interfaces(&borrowed);
 
-            let mut buffer = [None; 40];
-            let slice = buffer.get_mut(..capacity).expect("within the array");
-            let summary = diff(&Model::EMPTY, &after, slice);
+            let mut handed = Vec::new();
+            let counted = diff(&Model::EMPTY, &after, &mut |change: Change| {
+                handed.push(change);
+            });
 
-            prop_assert_eq!(summary.total(), count * 5);
-            prop_assert_eq!(summary.written(), summary.total().min(capacity));
-            prop_assert_eq!(summary.overflowed(), summary.total() > capacity);
-            prop_assert_eq!(
-                buffer.iter().flatten().count(),
-                summary.written(),
-                "nothing was written past the slice the caller handed over"
-            );
+            prop_assert_eq!(counted, count * 5);
+            prop_assert_eq!(handed.len(), counted);
         }
 
         /// The ordering rule, stated as the invariant rather than as a list:

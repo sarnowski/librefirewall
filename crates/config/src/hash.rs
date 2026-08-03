@@ -15,20 +15,16 @@
 //! with no generation, no record and nothing published.
 
 use lfw_log::Identifier;
-use net_headers::{Ipv4Address, MacAddress};
 
 use crate::model::Model;
 
 const OFFSET_BASIS: u32 = 0x811c_9dc5;
 const PRIME: u32 = 0x0100_0193;
 
-/// Where one object begins, so the last field of one cannot read as the first
-/// field of the next. Every field but an id is fixed-width, and an id is closed
-/// by [`ID_END`], which the identifier alphabet excludes — so the folded
-/// sequence has exactly one reading.
-const INTERFACE_MARK: u8 = 0x01;
-const NEIGHBOUR_MARK: u8 = 0x02;
-const MANAGEMENT_MARK: u8 = 0x03;
+/// Closes an identifier, so a variable-width field cannot run into the one
+/// after it. Outside the identifier alphabet, which is what makes the folded
+/// sequence have exactly one reading. Every other field is fixed-width, and
+/// where one object begins is the mark each declares for itself.
 const ID_END: u8 = 0xff;
 
 /// The identity of a configuration's content.
@@ -53,44 +49,29 @@ impl ContentHash {
 }
 
 /// Fold a configuration into its content hash.
+///
+/// Each object folds itself, mark first, in the field order its own
+/// declaration fixes; this walks them in the order that makes the result a
+/// property of the configuration rather than of the document — by id, and the
+/// management entry last. It folds at all because a commit is keyed on this
+/// number: a document whose only edit is the management address would
+/// otherwise read as unchanged.
 #[must_use]
 pub fn content_hash(model: &Model) -> ContentHash {
     let mut hash = OFFSET_BASIS;
     for entry in model.interfaces_by_id().iter().flatten() {
-        hash = fold(hash, &[INTERFACE_MARK]);
-        hash = fold_id(hash, entry.id);
-        hash = fold(
-            hash,
-            &[entry.port, u8::from(entry.enabled), entry.prefix_length],
-        );
-        hash = fold_mac(hash, entry.mac);
-        hash = fold_address(hash, entry.address);
+        hash = entry.fold(hash);
     }
     for entry in model.neighbours_by_id().iter().flatten() {
-        hash = fold(hash, &[NEIGHBOUR_MARK]);
-        hash = fold_id(hash, entry.id);
-        hash = fold_id(hash, entry.interface);
-        hash = fold_address(hash, entry.address);
-        hash = fold_mac(hash, entry.mac);
+        hash = entry.fold(hash);
     }
-    // Folded at all because a commit is keyed on this number: a document whose
-    // only edit is the management address would otherwise read as unchanged.
     if let Some(entry) = model.management() {
-        hash = fold(
-            hash,
-            &[
-                MANAGEMENT_MARK,
-                u8::from(entry.enabled),
-                entry.prefix_length,
-            ],
-        );
-        hash = fold_mac(hash, entry.mac);
-        hash = fold_address(hash, entry.address);
+        hash = entry.fold(hash);
     }
     ContentHash(hash)
 }
 
-fn fold(hash: u32, bytes: &[u8]) -> u32 {
+pub(crate) fn fold(hash: u32, bytes: &[u8]) -> u32 {
     let mut hash = hash;
     for byte in bytes {
         hash = (hash ^ u32::from(*byte)).wrapping_mul(PRIME);
@@ -98,22 +79,15 @@ fn fold(hash: u32, bytes: &[u8]) -> u32 {
     hash
 }
 
-fn fold_id(hash: u32, id: Identifier) -> u32 {
+pub(crate) fn fold_identifier(hash: u32, id: Identifier) -> u32 {
     fold(fold(hash, id.as_bytes()), &[ID_END])
-}
-
-fn fold_mac(hash: u32, mac: MacAddress) -> u32 {
-    fold(hash, &mac.0)
-}
-
-fn fold_address(hash: u32, address: Ipv4Address) -> u32 {
-    fold(hash, &address.octets())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InterfaceEntry, NeighbourEntry};
+    use crate::entity::{InterfaceEntry, NeighbourEntry};
+    use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
 
@@ -195,9 +169,9 @@ mod tests {
     /// operator flips without touching an address.
     #[test]
     fn changing_any_single_management_field_changes_the_hash() {
-        let base = |change: fn(&mut crate::model::ManagementEntry)| {
+        let base = |change: fn(&mut crate::entity::ManagementEntry)| {
             let mut model = model(&["wan"]);
-            let mut entry = crate::model::ManagementEntry {
+            let mut entry = crate::entity::ManagementEntry {
                 enabled: true,
                 mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
                 address: Ipv4Address::from_octets([10, 0, 2, 15]),
@@ -208,7 +182,7 @@ mod tests {
             content_hash(&model)
         };
         let hash = base(|_| {});
-        let edits: [fn(&mut crate::model::ManagementEntry); 4] = [
+        let edits: [fn(&mut crate::entity::ManagementEntry); 4] = [
             |entry| entry.enabled = false,
             |entry| entry.mac = MacAddress([1, 2, 3, 4, 5, 6]),
             |entry| entry.address = Ipv4Address::from_octets([9, 9, 9, 9]),

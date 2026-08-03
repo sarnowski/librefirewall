@@ -45,12 +45,11 @@
 //! profile that ships. A typed [`Event`] in this domain's own ring, rendered by
 //! the console, works in both.
 
-use config::{Change, Datastore};
-use lfw_log::{Domain, DomainDetail, DomainState, Event, Field, RingSink, Sink};
+use config::Datastore;
+use lfw_log::{Domain, DomainDetail, DomainState, Event, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    ConfigAck, ConfigHandover, ConfigPublisher, MAX_INTERFACES, MAX_NEIGHBOURS, PdClock,
-    attach_region, config_sample, log_sample,
+    ConfigAck, ConfigHandover, ConfigPublisher, PdClock, attach_region, config_sample, log_sample,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{ClockCalibration, LogConsume, LogRecords};
@@ -65,11 +64,6 @@ const CONFIG_XML: &[u8] = include_bytes!(env!("LIBREFIREWALL_CONFIG_PATH"));
 /// notifications both ways; see the system description on why.
 const CONSUMER: Channel = Channel::new(0);
 
-/// Room for every record one commit can produce: every object the handover
-/// image holds — interfaces, neighbours and the one management interface — in
-/// every field a record can name, sized from the image's own constants.
-const MAX_CHANGES: usize = (MAX_INTERFACES + MAX_NEIGHBOURS + 1) * Field::ALL.len();
-
 #[protection_domain]
 fn init() -> ConfigDomain {
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
@@ -81,16 +75,17 @@ fn init() -> ConfigDomain {
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting);
 
-    // Both live only as long as this call: a second commit would need the
-    // datastore and there is no path to one, so keeping it would leave several
-    // kilobytes of model in a domain that reads it again never.
+    // The datastore lives only as long as this call: a second commit would need
+    // it and there is no path to one, so keeping it would leave several
+    // kilobytes of model in a domain that reads it again never. Its change
+    // records need no room at all — the commit hands each one straight to the
+    // sink, so nothing here is sized by how many objects the ABI can hold.
     let mut store = Datastore::new();
-    let mut changes = [None::<Change>; MAX_CHANGES];
     let mut publisher = ConfigPublisher::new();
 
     // Which state each outcome is, and whether there is anything to offer, are
     // decided in `config` where they are host-tested.
-    let report = config::commit_and_report(&mut store, CONFIG_XML, &mut changes, &sink);
+    let report = config::commit_and_report(&mut store, CONFIG_XML, &sink);
     // The refusal is unreachable — one offer, from a fresh publisher — and is
     // reported rather than dropped anyway: a generation nobody was offered is
     // one nobody runs, and the console is the only place that could say so.
