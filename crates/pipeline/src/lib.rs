@@ -31,15 +31,37 @@
 //!
 //! # Where policy sits, and why it is last
 //!
-//! The chain is admission, then routing, then policy, and the middle one is the
-//! reason for the order. [`RoutingStage`] does not settle a frame it can
-//! forward: it resolves the egress port and the next hop and *attaches* them to
-//! the [`Inspection`], deferring to what follows. So [`PolicyStage`] decides
-//! with the egress in hand, which is what makes a rule able to name one — a
-//! zone-to-zone policy is the ordinary case and it is unwritable if the filter
-//! runs before the forwarding decision. The converse is the same fact: a packet
-//! with no route has no egress for an egress rule to be about, so there is
-//! nothing for policy to say about it and routing settles it first.
+//! The chain is admission, then routing, then connection tracking, then policy,
+//! and the second one is the reason for the order. [`RoutingStage`] does not
+//! settle a frame it can forward: it resolves the egress port and the next hop
+//! and *attaches* them to the [`Inspection`], deferring to what follows. So
+//! [`PolicyStage`] decides with the egress in hand, which is what makes a rule
+//! able to name one — a zone-to-zone policy is the ordinary case and it is
+//! unwritable if the filter runs before the forwarding decision. The converse is
+//! the same fact: a packet with no route has no egress for an egress rule to be
+//! about, so there is nothing for policy to say about it and routing settles it
+//! first.
+//!
+//! # The one stage that is two halves
+//!
+//! [`ConnectionStage`] brackets the filter rather than preceding it, and both
+//! halves are load-bearing. In front, a frame an existing flow already accounts
+//! for is forwarded without the filter being consulted at all — which is what
+//! carries a reply no rule names, and what keeps an edit to the policy from
+//! cutting a conversation that is already running. Behind, a flow the
+//! classification *opened* is withdrawn where the filter then refused the packet
+//! that opened it, because a slot held by a connection the policy rejected is
+//! how default deny turns into a state-exhaustion amplifier.
+//!
+//! So a [`Ruleset`] decides which conversations may **start** and nothing else:
+//! every frame the filter sees has just opened a flow. That is what a rule is
+//! about here, and it is why no criterion names a connection's state.
+//!
+//! A frame the tracker refuses never reaches the filter either, and each refusal
+//! carries a [`DropReason`] of its own. That is a real narrowing of what this
+//! appliance forwards: a protocol no flow can be kept for is one no rule can
+//! honestly be written about, so it is refused rather than passed to a filter
+//! that could only match it on addresses.
 //!
 //! [`PolicyStage`] is terminal and its default is to drop. A frame matching no
 //! rule is refused under [`DropReason::NoPolicyMatch`], which is what makes an
@@ -61,6 +83,8 @@
 
 use core::fmt;
 
+use lfw_clock::Monotonic;
+use lfw_flow::{FlowId, FlowTable, Outcome, RefusalKind};
 use net_headers::{Frame, Ipv4Address, MacAddress, Protocol, Transport};
 use routing::{PortId, Router};
 
@@ -106,6 +130,42 @@ pub enum DropReason {
     /// A route exists but no configured neighbour holds the destination's MAC.
     /// With no ARP, this is the unresolvable case.
     NoNeighbour,
+    /// A protocol the connection tracker holds no state for. It is a *drop*
+    /// rather than a pass to the filter because this appliance decides
+    /// statefully: a protocol no flow can be kept for is one no rule can be
+    /// written about honestly, and forwarding it would be the one hole in
+    /// default deny that no line of the document mentions.
+    FlowUnsupportedProtocol,
+    /// A non-initial fragment, which carries no transport header to key a flow
+    /// by and which nothing here reassembles.
+    FlowFragment,
+    /// A datagram too short for the transport header it claims, or claiming a
+    /// header longer than it carries. Distinct from the parse failures the
+    /// stage around this chain counts: those are the frame, this is the
+    /// transport inside a frame that parsed.
+    FlowMalformed,
+    /// A TCP flag combination no exchange produces.
+    FlowInvalidFlags,
+    /// A TCP segment for a five-tuple with no flow that was not a `SYN`. The
+    /// count of attempts to walk around default deny by starting mid-stream.
+    FlowMidStream,
+    /// A packet the flow's own state does not admit.
+    FlowInvalidState,
+    /// A segment outside the window its peer authorised.
+    FlowOutOfWindow,
+    /// An ICMP echo reply or error naming a flow the table does not hold.
+    FlowNoSuchFlow,
+    /// An ICMP error whose quoted datagram did not corroborate its own claim.
+    FlowQuotedInvalid,
+    /// An ICMP type the tracker neither tracks nor relates.
+    FlowUnsupportedIcmp,
+    /// No slot: every slot the eviction scan reached holds a flow that may not
+    /// be taken back. The fail-closed answer to a connection flood, and the one
+    /// reason here that says legitimate new connections are being turned away.
+    FlowTableFull,
+    /// One bucket's chain is full, so this flow's key has nowhere to go even
+    /// though the table has slots.
+    FlowBucketFull,
     /// A rule matched and its action is to drop. The frame was routable: an
     /// operator asked for this one.
     PolicyDenied,
@@ -120,7 +180,7 @@ pub enum DropReason {
 impl DropReason {
     /// Every variant, so a counter table and a report can be built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 25] = [
         Self::UnconfiguredIngressPort,
         Self::InterfaceDisabled,
         Self::NotAddressedToUs,
@@ -132,9 +192,48 @@ impl DropReason {
         Self::NoRoute,
         Self::EgressIsIngress,
         Self::NoNeighbour,
+        Self::FlowUnsupportedProtocol,
+        Self::FlowFragment,
+        Self::FlowMalformed,
+        Self::FlowInvalidFlags,
+        Self::FlowMidStream,
+        Self::FlowInvalidState,
+        Self::FlowOutOfWindow,
+        Self::FlowNoSuchFlow,
+        Self::FlowQuotedInvalid,
+        Self::FlowUnsupportedIcmp,
+        Self::FlowTableFull,
+        Self::FlowBucketFull,
         Self::PolicyDenied,
         Self::NoPolicyMatch,
     ];
+
+    /// The reason a tracker refusal is reported as.
+    ///
+    /// The one place the tracker's vocabulary and this one are related, so a
+    /// refusal kind added there without a reason here does not compile. Two
+    /// vocabularies rather than one because they answer different questions: a
+    /// [`RefusalKind`] says what the table decided about a packet, and a
+    /// [`DropReason`] says why a frame did not leave — the same event seen from
+    /// the tracker and from the pipeline around it, which is the pairing this
+    /// surface already makes for the filter's own refusals.
+    #[must_use]
+    pub const fn of_refusal(kind: RefusalKind) -> Self {
+        match kind {
+            RefusalKind::UnsupportedProtocol => Self::FlowUnsupportedProtocol,
+            RefusalKind::Fragment => Self::FlowFragment,
+            RefusalKind::Malformed => Self::FlowMalformed,
+            RefusalKind::InvalidFlags => Self::FlowInvalidFlags,
+            RefusalKind::MidStream => Self::FlowMidStream,
+            RefusalKind::InvalidState => Self::FlowInvalidState,
+            RefusalKind::OutOfWindow => Self::FlowOutOfWindow,
+            RefusalKind::NoSuchFlow => Self::FlowNoSuchFlow,
+            RefusalKind::QuotedInvalid => Self::FlowQuotedInvalid,
+            RefusalKind::UnsupportedIcmp => Self::FlowUnsupportedIcmp,
+            RefusalKind::TableFull => Self::FlowTableFull,
+            RefusalKind::BucketFull => Self::FlowBucketFull,
+        }
+    }
 
     /// A stable short name, for a metric label or a report line.
     #[must_use]
@@ -151,6 +250,18 @@ impl DropReason {
             Self::NoRoute => "no_route",
             Self::EgressIsIngress => "egress_is_ingress",
             Self::NoNeighbour => "no_neighbour",
+            Self::FlowUnsupportedProtocol => "flow_unsupported_protocol",
+            Self::FlowFragment => "flow_fragment",
+            Self::FlowMalformed => "flow_malformed",
+            Self::FlowInvalidFlags => "flow_invalid_flags",
+            Self::FlowMidStream => "flow_mid_stream",
+            Self::FlowInvalidState => "flow_invalid_state",
+            Self::FlowOutOfWindow => "flow_out_of_window",
+            Self::FlowNoSuchFlow => "flow_no_such_flow",
+            Self::FlowQuotedInvalid => "flow_quoted_invalid",
+            Self::FlowUnsupportedIcmp => "flow_unsupported_icmp",
+            Self::FlowTableFull => "flow_table_full",
+            Self::FlowBucketFull => "flow_bucket_full",
             Self::PolicyDenied => "policy_denied",
             Self::NoPolicyMatch => "no_policy_match",
         }
@@ -254,6 +365,7 @@ pub struct Inspection<'frame> {
     ingress: PortId,
     frame: Frame<'frame>,
     forwarding: Option<Forwarding>,
+    opened: Option<FlowId>,
 }
 
 /// What [`RoutingStage`] worked out about a frame it did not settle: where the
@@ -279,6 +391,7 @@ impl<'frame> Inspection<'frame> {
             ingress,
             frame,
             forwarding: None,
+            opened: None,
         }
     }
 
@@ -310,6 +423,23 @@ impl<'frame> Inspection<'frame> {
     /// the fact and its derivation stay in one place.
     pub const fn attach_forwarding(&mut self, forwarding: Forwarding) {
         self.forwarding = Some(forwarding);
+    }
+
+    /// The flow this evaluation *opened*, if it opened one.
+    ///
+    /// A handle rather than a fact, because the only thing that reads it is the
+    /// withdrawal behind the filter: a slot committed by a classification whose
+    /// packet is then refused has to be given back, and nothing else in the
+    /// chain has any business naming a flow.
+    #[must_use]
+    pub const fn opened(&self) -> Option<FlowId> {
+        self.opened
+    }
+
+    /// Attach the flow this evaluation opened, so the half behind the filter can
+    /// give its slot back if the packet that opened it is refused.
+    pub const fn attach_opened(&mut self, flow: FlowId) {
+        self.opened = Some(flow);
     }
 }
 
@@ -460,6 +590,143 @@ impl RoutingStage {
             destination: neighbour.mac,
         });
         Step::Continue
+    }
+}
+
+/// The connection table one evaluation classifies against, and the instant it
+/// is classified at.
+///
+/// Lent per evaluation rather than owned by the chain, for one reason that is
+/// not style: at the appliance's capacity the table is sixty-eight mebibytes in
+/// a memory region a protection domain maps, so a [`Pipeline`] that owned one
+/// could not be constructed anywhere else — not in a test, not in a benchmark,
+/// not before the region exists. The capacity is a parameter for the same
+/// reason [`Configuration`]'s table sizes are: a host test drives a sixteen-slot
+/// table through the identical code the appliance runs a million-slot one
+/// through.
+///
+/// The clock is the caller's, as it is everywhere else this crate's dependencies
+/// take one: reading one is a capability a protection domain is granted, and a
+/// chain that reached for a clock could not be driven by a test at all.
+pub struct Tracking<'table, const FLOWS: usize> {
+    table: &'table mut FlowTable<FLOWS>,
+    now: Monotonic,
+}
+
+impl<'table, const FLOWS: usize> Tracking<'table, FLOWS> {
+    #[must_use]
+    pub const fn new(table: &'table mut FlowTable<FLOWS>, now: Monotonic) -> Self {
+        Self { table, now }
+    }
+
+    /// The table itself, for a caller reading what it has counted.
+    #[must_use]
+    pub const fn table(&self) -> &FlowTable<FLOWS> {
+        self.table
+    }
+}
+
+/// State: whether a frame belongs to a conversation the appliance already knows
+/// about, and — where it does not — whether it may open one.
+///
+/// It is two halves bracketing [`PolicyStage`] rather than one stage, and the
+/// split is the whole of what makes stateful filtering safe here.
+///
+/// # The half in front: an existing flow answers for its own packets
+///
+/// An [`Outcome::Established`] or an [`Outcome::Related`] **settles the frame**,
+/// forwarding it under the facts [`RoutingStage`] attached, and the filter is
+/// never consulted. Two things follow, and both are the point. A reply is carried
+/// without a rule naming it, which is the entire value of tracking state — the
+/// alternative is writing the reverse of every rule and opening the appliance in
+/// both directions to permit one. And **an edit to the policy cannot break a live
+/// connection**: the rule that admitted a conversation is consulted once, when it
+/// opened, so an operator narrowing a rule stops *new* connections rather than
+/// cutting established ones mid-stream.
+///
+/// The consequence for [`Ruleset`] is worth stating here rather than leaving to
+/// be worked out: **every frame that reaches the filter has just opened a flow**.
+/// A ruleset is therefore a statement about which conversations may *start*, and
+/// there is no criterion for a rule to name a connection's state with — such a
+/// criterion would have exactly one reachable value and would read as a choice an
+/// operator did not have.
+///
+/// An [`Outcome::New`] defers, because a flow the appliance has not seen before is
+/// exactly the packet the filter exists to decide about. A refusal settles as a
+/// drop under the reason [`DropReason::of_refusal`] names.
+///
+/// # The half behind: a refused opening costs no state
+///
+/// Classification commits the slot, so by the time the filter says no the flow
+/// is already in the table. Left there, a default-deny policy becomes a
+/// state-exhaustion amplifier — every rejected opening packet holds a slot, and
+/// an attacker fills the table with connections the policy already refused
+/// until legitimate ones are turned away with [`DropReason::FlowTableFull`]. So
+/// the half behind the filter withdraws a flow this evaluation opened whenever
+/// the verdict is to drop. It is a security property and not tidiness.
+pub struct ConnectionStage;
+
+impl ConnectionStage {
+    /// Classify the frame, settling it where an existing flow already accounts
+    /// for it and where the tracker refuses it outright.
+    pub fn classify<const FLOWS: usize>(
+        &mut self,
+        inspection: &mut Inspection<'_>,
+        tracking: &mut Tracking<'_, FLOWS>,
+    ) -> Step {
+        let header = inspection.frame().ipv4();
+        let outcome = tracking.table.classify(
+            tracking.now,
+            &lfw_flow::Packet {
+                source: header.source,
+                destination: header.destination,
+                transport: inspection.frame().transport(),
+                transport_bytes: inspection.frame().payload(),
+            },
+        );
+        match outcome {
+            // Deferred so the filter decides, which is what an unrecognised
+            // conversation is for; the handle is what the half behind it needs
+            // if the filter then says no.
+            Outcome::New { flow, .. } => {
+                inspection.attach_opened(flow);
+                Step::Continue
+            }
+            Outcome::Established { .. } | Outcome::Related { .. } => {
+                match inspection.forwarding() {
+                    Some(forwarding) => Step::Settled(Verdict::Forward {
+                        egress: forwarding.egress,
+                        source: forwarding.source,
+                        destination: forwarding.destination,
+                    }),
+                    // Unreachable: the stage in front settles every frame it
+                    // cannot resolve a next hop for. Deferred rather than
+                    // asserted, and the filter's own answer to the same absence
+                    // is to deny — so the one path that cannot tell where a
+                    // frame would go does not forward it.
+                    None => Step::Continue,
+                }
+            }
+            Outcome::Refused(refusal) => {
+                Step::Settled(Verdict::Drop(DropReason::of_refusal(refusal.kind())))
+            }
+        }
+    }
+
+    /// Give back a flow this evaluation opened, where the filter behind it
+    /// refused the packet that opened it.
+    ///
+    /// Takes the verdict rather than reading one, because there is nothing to
+    /// decide here: the caller has the answer and this is the consequence of it.
+    pub fn settle<const FLOWS: usize>(
+        &mut self,
+        inspection: &Inspection<'_>,
+        tracking: &mut Tracking<'_, FLOWS>,
+        verdict: Verdict,
+    ) {
+        if let (Verdict::Drop(_), Some(flow)) = (verdict, inspection.opened()) {
+            tracking.table.withdraw(flow);
+        }
     }
 }
 
@@ -877,6 +1144,7 @@ impl Default for PolicyStage {
 pub struct Pipeline {
     admission: AdmissionStage,
     routing: RoutingStage,
+    connection: ConnectionStage,
     policy: PolicyStage,
 }
 
@@ -886,6 +1154,7 @@ impl Pipeline {
         Self {
             admission: AdmissionStage,
             routing: RoutingStage,
+            connection: ConnectionStage,
             policy: PolicyStage::new(),
         }
     }
@@ -900,25 +1169,39 @@ impl Pipeline {
     /// that settles it.
     ///
     /// This body is the whole of the pipeline's order; a stage inserted
-    /// anywhere else is not in the pipeline. It takes `&mut self` though no
-    /// stage yet holds state, because the stage that will — the connection
-    /// tracker — must not change this signature to arrive.
-    pub fn evaluate<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+    /// anywhere else is not in the pipeline.
+    ///
+    /// [`ConnectionStage`] brackets the filter rather than preceding it, and
+    /// both halves are here rather than inside [`PolicyStage`] so that the
+    /// order is readable in one place: what the tracker settles, the filter
+    /// never sees, and what the filter refuses, the tracker gives the slot back
+    /// for.
+    pub fn evaluate<
+        const MAX_INTERFACES: usize,
+        const MAX_NEIGHBOURS: usize,
+        const FLOWS: usize,
+    >(
         &mut self,
         inspection: &mut Inspection<'_>,
         configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+        tracking: &mut Tracking<'_, FLOWS>,
     ) -> Verdict {
         if let Step::Settled(verdict) = self.admission.evaluate(inspection, configuration) {
             return verdict;
         }
-        // A connection-tracking stage goes here, between the forwarding
-        // decision and the filter: it needs the egress the one above attaches,
-        // and the filter must not be consulted for a frame an established flow
-        // already accounts for.
+        // Behind routing, because a rule names an egress and a flow the tracker
+        // short-circuits is forwarded under the facts routing attached; in
+        // front of the filter, because the filter must not be consulted for a
+        // frame an existing flow already accounts for.
         if let Step::Settled(verdict) = self.routing.evaluate(inspection, configuration) {
             return verdict;
         }
-        self.policy.evaluate(inspection, configuration)
+        if let Step::Settled(verdict) = self.connection.classify(inspection, tracking) {
+            return verdict;
+        }
+        let verdict = self.policy.evaluate(inspection, configuration);
+        self.connection.settle(inspection, tracking, verdict);
+        verdict
     }
 }
 

@@ -89,7 +89,9 @@ use pd_runtime::{
     Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
     descriptor_in_bounds,
 };
-use pipeline::{Pipeline, Rule, RuleAction, Ruleset};
+use lfw_clock::Monotonic;
+use lfw_flow::FlowTable;
+use pipeline::{Pipeline, Rule, RuleAction, Ruleset, Tracking};
 use routing::{Interface, Neighbour, PortId, Router};
 
 use crate::region::ZeroedRegion;
@@ -221,6 +223,14 @@ pub fn pipeline_harness(data: &[u8]) {
     // One chain across the run, as the forwarder holds it, so state a stage
     // accumulates is not quietly reset between operations.
     let mut verdicts = Pipeline::new();
+    // One connection table across the run, as the forwarder holds one: the
+    // whole reason a stage may hold state spanning a flow is that the table
+    // survives between polls, and a harness that reset it would never reach the
+    // paths a second packet of a flow takes. Sixteen slots rather than the
+    // appliance's million, so the eviction and full-table refusals are reachable
+    // inside a bounded operation budget — which is the fail-closed behaviour
+    // this boundary most needs exercised.
+    let mut flows = Box::new(FlowTable::<16>::new());
     let mut peer_free = returns.free.producer();
     let mut peer_tx = rings.tx.consumer();
     let rx_view = PeerView::<RING_SLOTS>::new(&rings.rx);
@@ -306,7 +316,24 @@ pub fn pipeline_harness(data: &[u8]) {
                 let handed_on = stage.poll(
                     &mut verdicts,
                     Configuration::new(GENERATION, &ROUTER, &ALLOW_ALL),
+                    // The boot instant, every time: an unclocked forwarder reads
+                    // exactly this, so a table driven by it expires nothing and
+                    // fills — which is the fail-closed mode, and the one worth
+                    // reaching here.
+                    &mut Tracking::new(&mut flows, Monotonic::BOOT),
                     None,
+                );
+                // The table is bounded by its own capacity whatever the peer
+                // wrote into the rings, and its occupancy is the occupancy it
+                // holds: the two properties `lfw_flow`'s own harness states,
+                // re-asserted here because this is the only boundary where the
+                // packets reaching the table came out of a shared region rather
+                // than out of a generator.
+                assert!(
+                    flows.len() <= flows.capacity(),
+                    "the connection table holds {} flows past its {} slots",
+                    flows.len(),
+                    flows.capacity()
                 );
                 assert!(
                     handed_on <= DRAIN_LIMIT,

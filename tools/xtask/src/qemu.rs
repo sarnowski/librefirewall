@@ -393,6 +393,39 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
             management: ManagementRole::Client,
             traffic: Traffic::Policy,
         },
+        // The one contract a stateless filter cannot meet, on both documents.
+        //
+        // A request goes out, its reply comes back — and the reply is addressed to
+        // a port neither document says anything about, so nothing in the policy
+        // permits it. What carries it is the flow the request opened, and the
+        // scrape says so: `librefirewall_flow_packets_total{outcome="established"}`
+        // rises while the accepting rule's hit counter counts only the openings.
+        //
+        // Beside it, the two refusals that keep that from being a hole: the same
+        // packet with no request in front of it, and a TCP segment from the middle
+        // of a conversation the appliance never saw begin. Both are refused, and
+        // the two are told apart by reason — one falls to the default deny, the
+        // other is refused as mid-stream before the filter is consulted at all.
+        //
+        // `Client` scenarios, because every one of those statements is a metric:
+        // on the wire a refused probe leaves only its absence, and the reply's
+        // arrival alone would not say which mechanism let it through.
+        Scenario {
+            name: "stateful-tracking",
+            document: image::CONFIGURATION_DOCUMENT,
+            image: ImageUnderTest::Published,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Stateful,
+        },
+        Scenario {
+            name: "stateful-tracking-alternate",
+            document: ALTERNATE_DOCUMENT,
+            image: ImageUnderTest::BuiltForTheScenario,
+            console: Console::Ignored,
+            management: ManagementRole::Client,
+            traffic: Traffic::Stateful,
+        },
     ];
 
     let judged = scenarios

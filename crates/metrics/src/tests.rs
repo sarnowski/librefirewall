@@ -408,12 +408,12 @@ fn a_shard_round_trips_a_published_sample() {
         pipelines: [
             PipelineSample {
                 forwarded: 11,
-                route_drops: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                route_drops: core::array::from_fn(|position| 1 + position as u64),
                 stage_drops: [21, 22, 23, 24, 25, 26, 27, 28, 29],
             },
             PipelineSample {
                 forwarded: 12,
-                route_drops: [31; 13],
+                route_drops: [31; ROUTE_DROP_REASONS.len()],
                 stage_drops: [41; 9],
             },
         ],
@@ -428,6 +428,15 @@ fn a_shard_round_trips_a_published_sample() {
             // Distinct per position, so a per-rule block published or read at
             // the wrong offset moves a value rather than repeating one.
             rule_hits: core::array::from_fn(|position| 100 + position as u64),
+        },
+        flow: FlowSample {
+            packets_seen: 71,
+            outcomes: [72, 73, 74],
+            refusals: core::array::from_fn(|position| 200 + position as u64),
+            lifecycle: [81, 82, 83, 84],
+            entries: core::array::from_fn(|position| 300 + position as u64),
+            probe_collisions: 91,
+            slot_desync: 92,
         },
         tap: TapSample {
             observed: 51,
@@ -1110,5 +1119,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 68_016);
+    assert_eq!(MAX_EXPOSITION_LEN, 76_407);
 }

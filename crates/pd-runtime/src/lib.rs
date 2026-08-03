@@ -93,6 +93,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::mem::{align_of, offset_of, size_of};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use net_headers::{
     ETHERNET_HEADER_LEN, Frame, IPV4_HEADER_LEN, MacAddress, ParseCounters, TtlExpired,
@@ -152,6 +153,22 @@ pub const FORWARD_REGION_SIZE: usize = size_of::<ForwardRings>().next_multiple_o
 
 /// As [`POOL_REGION_SIZE`], for the return region.
 pub const RETURN_REGION_SIZE: usize = size_of::<ReturnRing>().next_multiple_of(MAPPING_ALIGN);
+
+/// As [`POOL_REGION_SIZE`], for the connection table — and by some distance the
+/// largest region in the system, at sixty-eight mebibytes and a page.
+///
+/// The rounding costs a whole page for 256 bytes, which is the ordinary price of
+/// a grant being whole pages. What decides the number is
+/// [`lfw_flow::FLOW_CAPACITY`], and that is a knob nothing else here turns:
+/// halving it halves this region and halves how many connections the appliance
+/// can carry at once, which is a decision about the product rather than about
+/// the layout.
+pub const FLOW_TABLE_REGION_SIZE: usize = FLOW_TABLE_BYTES.next_multiple_of(MAPPING_ALIGN);
+
+/// A connection table small enough for a host test to hold, used by the tests in
+/// this crate alone: the appliance's own is far too large to put on a stack.
+#[cfg(test)]
+pub(crate) type ApplianceTestFlows = lfw_flow::FlowTable<16>;
 
 /// Whether a peer's descriptor names a span within one pool buffer; a failing one is rejected.
 #[must_use]
@@ -391,6 +408,114 @@ macro_rules! attach_region {
     }};
 }
 
+/// Whether the connection table's exclusive borrow has been taken.
+///
+/// What makes "once per protection domain" a *check* rather than a claim in a
+/// safety comment. A second `&mut` to those bytes would be undefined behaviour,
+/// and the only thing standing between the system and one is that
+/// [`attach_flow_table`] is expanded once — which nothing about the macro
+/// enforces. So it is enforced here, and a second call faults instead.
+static FLOW_TABLE_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Attach to the connection table's region and borrow it **mutably** for the
+/// domain's lifetime.
+///
+/// This is the one region in the system a domain owns outright, and the one
+/// borrowed `&mut`. Everything else here is shared with a peer or with a device
+/// and is therefore a `&` over a type with no safe path to its own bytes; an
+/// [`ApplianceFlowTable`] is an ordinary Rust value with public methods taking
+/// `&mut self`, so it may be reached that way only where no other domain and no
+/// device can reach it at all.
+///
+/// Concrete rather than generic over the region type, because the argument for
+/// the exclusive borrow is about *this* region — one mapper, no physical
+/// address, zero-filled — and a generic helper would offer that argument to a
+/// region nobody had made it for.
+///
+/// # Panics
+/// If called twice, in every build profile: the second call would produce a
+/// second `&mut` to the same bytes, and a bound absent from the shipped image is
+/// not a bound. Unreachable from first-party code — the forwarder's `init` is the
+/// one caller and `init` runs once — which is why reaching it is a fault rather
+/// than a counted refusal.
+///
+/// # Safety
+/// `ptr` must be aligned to `align_of::<ApplianceFlowTable>()`, point to a live
+/// mapping of at least `size_of::<ApplianceFlowTable>()` bytes that outlives
+/// `'a`, and that mapping must be **zero-filled** and reachable by **no other
+/// protection domain and no device**. Zeroing is a stronger requirement than
+/// [`attach_region`]'s: a table holds `FlowState`, a `#[repr(u8)]` enum, so
+/// *forming* the reference over bytes that are not a valid table is undefined
+/// before any method runs.
+#[must_use]
+pub unsafe fn attach_flow_table_region<'a>(
+    ptr: *mut ApplianceFlowTable,
+) -> &'a mut ApplianceFlowTable {
+    assert!(ptr.is_aligned(), "region is misaligned");
+    assert!(
+        !FLOW_TABLE_TAKEN.swap(true, Ordering::SeqCst),
+        "the connection table's exclusive borrow was taken twice"
+    );
+    // SAFETY: the caller guarantees an aligned, live, correctly sized, zeroed
+    // mapping outliving `'a` that no other domain and no device can reach; the
+    // two assertions above re-check the alignment and establish, unconditionally
+    // and in every profile, that this is the first and only borrow. Together
+    // those make this the only reference to those bytes that exists.
+    unsafe { &mut *ptr }
+}
+
+/// Attach this protection domain to the connection table the Microkit
+/// `setvar_vaddr` symbol names, yielding a `&'static mut ApplianceFlowTable`.
+///
+/// Separate from [`attach_region!`] because the borrow is exclusive and the
+/// argument for it is a different one: not "no safe path to the bytes" but "no
+/// other holder of the bytes".
+#[macro_export]
+macro_rules! attach_flow_table {
+    ($vaddr_symbol:ident) => {{
+        // SAFETY: `attach_flow_table_region`'s preconditions, each named against
+        // the component that guarantees it.
+        //
+        // * Address, page alignment, lifetime — the Microkit tool, which
+        //   patches `$vaddr_symbol` from the matching
+        //   `<map mr="flow_table" ... setvar_vaddr="flow_table_vaddr">` in
+        //   systems/qemu-x86_64/librefirewall.system and makes the mapping
+        //   static, so it outlives the protection domain. An `ApplianceFlowTable`
+        //   is 64-byte aligned and a page is 4096, so page granularity satisfies
+        //   it.
+        // * Minimum size — the `size=` attribute on that region, which
+        //   `xtask::sysdesc`'s `REGIONS` table holds EQUAL to
+        //   `pd_runtime::FLOW_TABLE_REGION_SIZE`, itself `lfw_flow`'s
+        //   `FLOW_TABLE_BYTES` rounded up to the mapping granularity. The check
+        //   runs in the gate and before image assembly.
+        // * Zero-initialisation — the seL4 kernel, which zeroes a frame retyped
+        //   from a general-purpose untyped. This region names no `phys_addr`, so
+        //   Microkit allocates it from general-purpose untyped memory and that
+        //   retyping is the one seL4 zeroes; the region does not rest on the
+        //   RAM-membership argument the DMA regions do. Zeroing is what makes
+        //   forming the reference defined at all, `FlowState::Vacant` being
+        //   discriminant zero.
+        // * No other holder — the same `REGIONS` rule, whose `grants` name
+        //   exactly one mapper, `read_write("forwarder")`, and whose `withheld`
+        //   claim states what every other domain's absence buys. No driver maps
+        //   it, so no device can DMA into it either: a device reaches only what
+        //   a driver hands it the physical address of, and this region has no
+        //   `region_paddr` for anyone to hand over.
+        //
+        // The remaining clause — that this is the only borrow ever taken — is
+        // not delegated anywhere: `attach_flow_table_region` establishes it
+        // itself, and a second call faults.
+        unsafe {
+            $crate::attach_flow_table_region(
+                ::sel4_microkit::memory_region_symbol!(
+                    $vaddr_symbol: *mut $crate::ApplianceFlowTable
+                )
+                .as_ptr(),
+            )
+        }
+    }};
+}
+
 pub mod clock;
 pub mod download;
 pub mod endpoint;
@@ -408,14 +533,15 @@ pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
     StaleOffer, endpoint_from, interfaces_from, router_from, rules_from,
 };
-pub use lfw_ip_endpoint::IsnSecret;
 /// Re-exported rather than restated: a protection domain reaches its whole
 /// dataplane vocabulary through this crate, and the tables a poll decides under
 /// are part of it.
-pub use pipeline::Configuration;
+pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
+pub use lfw_ip_endpoint::IsnSecret;
+pub use pipeline::{Configuration, Tracking};
 pub use stats::{
-    BlockCounters, StatsRegions, config_sample, forwarder_sample, log_sample, management_sample,
-    pipeline_sample, policy_sample, recorder_sample,
+    BlockCounters, StatsRegions, config_sample, flow_sample, forwarder_sample, log_sample,
+    management_sample, pipeline_sample, policy_sample, recorder_sample,
 };
 pub use tap::{Observation, Tap, TapCounters, tap_drop_reason};
 pub use wire::{
@@ -745,10 +871,11 @@ impl<'ring> RouteStage<'ring> {
     /// frame either driver receives afterwards wakes this domain, which
     /// re-drains the backlog ahead of it. Only a total traffic stop is unbounded,
     /// and then the backlog is stationary rather than growing.
-    pub fn poll<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+    pub fn poll<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS: usize>(
         &mut self,
         pipeline: &mut Pipeline,
         configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+        tracking: &mut Tracking<'_, FLOWS>,
         mut tap: Option<&mut Tap<'_>>,
     ) -> usize {
         let Self {
@@ -777,6 +904,7 @@ impl<'ring> RouteStage<'ring> {
                         decide(
                             pipeline,
                             &configuration,
+                            tracking,
                             *ingress,
                             *egress,
                             frame_bytes,
@@ -933,9 +1061,10 @@ impl Routed {
 }
 
 /// Parse one snapshotted frame and put it through the pipeline, untouched.
-fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
+fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS: usize>(
     pipeline: &mut Pipeline,
     configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    tracking: &mut Tracking<'_, FLOWS>,
     ingress: PortId,
     egress: PortId,
     frame_bytes: &mut [u8],
@@ -949,7 +1078,7 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>(
         }
     };
     let mut inspection = Inspection::new(ingress, frame);
-    match pipeline.evaluate(&mut inspection, configuration) {
+    match pipeline.evaluate(&mut inspection, configuration, tracking) {
         pipeline::Verdict::Drop(reason) => {
             counters.drops.record(reason);
             Routed::Dropped(reason)
@@ -1058,6 +1187,24 @@ fn write_back(
 
 #[cfg(test)]
 mod tests {
+    /// One poll under a connection table of its own.
+    ///
+    /// Every case below is about the rings, the pool or the stage around the
+    /// verdict chain, and a table carried between two polls would make an
+    /// identical frame's second appearance `Established` and settle it in front
+    /// of the filter. That behaviour belongs to `pipeline`'s own tests; here a
+    /// fresh table keeps each case about the plumbing it names.
+    macro_rules! poll {
+        ($stage:expr, $pipeline:expr, $configuration:expr, $tap:expr) => {{
+            let mut flows = ::std::boxed::Box::new($crate::ApplianceTestFlows::new());
+            $stage.poll(
+                $pipeline,
+                $configuration,
+                &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                $tap,
+            )
+        }};
+    }
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     use net_headers::{
@@ -1065,6 +1212,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use routing::{Interface, Neighbour, Router};
+    use std::alloc;
     use std::boxed::Box;
     use std::collections::BTreeSet;
     use std::sync::LazyLock;
@@ -1379,15 +1527,58 @@ mod tests {
     /// every field a routing decision reads, and nothing else.
     struct FrameSpec {
         destination_mac: MacAddress,
+        /// The sender's own MAC, a field only because a reply comes from the
+        /// other station: every other case is host A putting a frame on port 0.
+        source_mac: MacAddress,
         source: Ipv4Address,
         destination: Ipv4Address,
         ttl: u8,
         tagged: bool,
         payload_len: usize,
-        /// The UDP destination port, which is what a filter rule written for a
-        /// port matches on — so a case about the policy varies this and nothing
-        /// else.
+        /// The transport source port. Fixed for every case but a reply, which
+        /// swaps it with the destination: what makes a reply the *same flow* is
+        /// its tuple, and a tuple with one end's port unswapped is a different
+        /// conversation.
+        source_port: u16,
+        /// The transport destination port, which is what a filter rule written
+        /// for a port matches on — so a case about the policy varies this and
+        /// nothing else.
         destination_port: u16,
+        /// What rides behind the IPv4 header. The connection tracker in front of
+        /// the filter refuses a shape it cannot keep state for, so a case about
+        /// one of its reasons varies this and nothing else.
+        transport: Transport_,
+    }
+
+    /// The transport shapes these cases need, which is a UDP datagram plus one
+    /// per class of thing the tracker turns away.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Transport_ {
+        Udp,
+        /// A TCP segment with `flags` exactly, so a case chooses between a `SYN`
+        /// that opens a flow, a combination no exchange produces, and a
+        /// mid-stream `ACK`. `sequence` is what puts a segment outside a window.
+        Tcp {
+            flags: u8,
+            sequence: u32,
+            acknowledgement: u32,
+        },
+        /// An ICMP message of `message_type`: an echo request opens a flow, an
+        /// echo reply names one, an error quotes one, and anything else is a type
+        /// the tracker neither tracks nor relates. `quote` is the datagram an
+        /// error carries, empty for the echo types.
+        Icmp {
+            message_type: u8,
+            quote: bool,
+        },
+        /// A protocol byte the parser does not break down.
+        Unparsed(u8),
+        /// A UDP datagram whose transport header is cut short by the IPv4 total
+        /// length.
+        Truncated,
+        /// The second piece of a fragmented datagram, which carries no transport
+        /// header at its offset.
+        Fragment,
     }
 
     impl FrameSpec {
@@ -1396,42 +1587,136 @@ mod tests {
         fn a_to_b() -> Self {
             Self {
                 destination_mac: GATEWAY0_MAC,
+                source_mac: HOST_A_MAC,
                 source: HOST_A,
                 destination: HOST_B,
                 ttl: 64,
                 tagged: false,
                 payload_len: 24,
+                source_port: 4444,
                 destination_port: 5000,
+                transport: Transport_::Udp,
+            }
+        }
+
+        /// The same frame carrying `transport`.
+        fn carrying(transport: Transport_) -> Self {
+            Self {
+                transport,
+                ..Self::a_to_b()
+            }
+        }
+
+        /// The same frame the other way round, which is what a reply is: it is
+        /// still injected on the ingress port the stage was attached to, because
+        /// what decides a flow's direction is its tuple and never the port.
+        fn reversed(&self) -> Self {
+            Self {
+                // The far interface's MAC, because a reply is addressed to the
+                // appliance on the port it arrives on, and the far station's,
+                // because that is who sent it.
+                destination_mac: GATEWAY1_MAC,
+                source_mac: HOST_B_MAC,
+                source: self.destination,
+                destination: self.source,
+                source_port: self.destination_port,
+                destination_port: self.source_port,
+                ..*self
+            }
+        }
+
+        /// The same frame with a different transport, for a script that walks one
+        /// five-tuple through several segments.
+        fn with(&self, transport: Transport_) -> Self {
+            Self { transport, ..*self }
+        }
+
+        /// The bytes behind the IPv4 header, and the protocol byte in front of
+        /// them.
+        fn payload(&self) -> (u8, Vec<u8>) {
+            let mut out = Vec::new();
+            match self.transport {
+                Transport_::Udp | Transport_::Truncated | Transport_::Fragment => {
+                    out.extend_from_slice(&self.source_port.to_be_bytes());
+                    out.extend_from_slice(&self.destination_port.to_be_bytes());
+                    out.extend_from_slice(
+                        &((UDP_HEADER_LEN + self.payload_len) as u16).to_be_bytes(),
+                    );
+                    out.extend_from_slice(&0u16.to_be_bytes());
+                    out.extend(payload_pattern(self.payload_len));
+                    (Protocol::UDP.0, out)
+                }
+                Transport_::Tcp {
+                    flags,
+                    sequence,
+                    acknowledgement,
+                } => {
+                    out.extend_from_slice(&self.source_port.to_be_bytes());
+                    out.extend_from_slice(&self.destination_port.to_be_bytes());
+                    out.extend_from_slice(&sequence.to_be_bytes());
+                    out.extend_from_slice(&acknowledgement.to_be_bytes());
+                    // Data offset 5, then the flags, then a window wide enough
+                    // that a peer's own advertisement is never what refuses a
+                    // segment here.
+                    out.extend_from_slice(&[0x50, flags]);
+                    out.extend_from_slice(&0xffffu16.to_be_bytes());
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                    (Protocol::TCP.0, out)
+                }
+                Transport_::Icmp {
+                    message_type,
+                    quote,
+                } => {
+                    out.extend_from_slice(&[message_type, 0, 0, 0, 0, 9, 0, 1]);
+                    if quote {
+                        // An IPv4 header claiming a version nothing reads, so
+                        // the quote refuses itself rather than naming a flow.
+                        out.extend_from_slice(&[0x65; 20]);
+                    }
+                    (Protocol::ICMP.0, out)
+                }
+                Transport_::Unparsed(protocol) => {
+                    out.extend(payload_pattern(16));
+                    (protocol, out)
+                }
             }
         }
 
         fn build(&self) -> Vec<u8> {
             let mut frame = Vec::new();
             frame.extend_from_slice(&self.destination_mac.0);
-            frame.extend_from_slice(&HOST_A_MAC.0);
+            frame.extend_from_slice(&self.source_mac.0);
             if self.tagged {
                 frame.extend_from_slice(&EtherType::VLAN.0.to_be_bytes());
                 frame.extend_from_slice(&0x0064u16.to_be_bytes());
             }
             frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
 
-            let total_length = (IPV4_HEADER_LEN + UDP_HEADER_LEN + self.payload_len) as u16;
+            let (protocol, payload) = self.payload();
+            // A truncation is stated in the datagram's own length rather than by
+            // sending fewer bytes: what the parser reads is bounded by the total
+            // length, so this is how a sender claims a header it did not carry.
+            let claimed = if matches!(self.transport, Transport_::Truncated) {
+                2
+            } else {
+                payload.len()
+            };
+            let total_length = (IPV4_HEADER_LEN + claimed) as u16;
             let mut ip = [0u8; IPV4_HEADER_LEN];
             ip[0] = 0x45;
             ip[2..4].copy_from_slice(&total_length.to_be_bytes());
+            if matches!(self.transport, Transport_::Fragment) {
+                // Offset 1 in eight-byte units, so this is not the first piece.
+                ip[6..8].copy_from_slice(&1u16.to_be_bytes());
+            }
             ip[8] = self.ttl;
-            ip[9] = Protocol::UDP.0;
+            ip[9] = protocol;
             ip[12..16].copy_from_slice(&self.source.octets());
             ip[16..20].copy_from_slice(&self.destination.octets());
             let checksum = ipv4_checksum(&ip);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
             frame.extend_from_slice(&ip);
-
-            frame.extend_from_slice(&4444u16.to_be_bytes());
-            frame.extend_from_slice(&self.destination_port.to_be_bytes());
-            frame.extend_from_slice(&((UDP_HEADER_LEN + self.payload_len) as u16).to_be_bytes());
-            frame.extend_from_slice(&0u16.to_be_bytes());
-            frame.extend(payload_pattern(self.payload_len));
+            frame.extend_from_slice(&payload);
             frame
         }
     }
@@ -1675,6 +1960,37 @@ mod tests {
         }
     }
 
+    /// The connection table's exclusive borrow is taken once and faults on a
+    /// second attempt.
+    ///
+    /// The enforcer of the one safety clause `attach_flow_table!` does not
+    /// delegate: a second `&mut` to those bytes would be undefined behaviour, and
+    /// nothing about a macro stops it being expanded twice. Both borrows are
+    /// leaked deliberately — a `&'static mut` is what the caller gets and there
+    /// is nothing to give back — and the region is leaked with them, this being
+    /// the only test that may take the one guard in the process.
+    #[test]
+    #[should_panic(expected = "borrow was taken twice")]
+    fn the_connection_tables_borrow_cannot_be_taken_twice() {
+        // Allocated zeroed on the heap rather than built as a value: the
+        // appliance's table is sixty-eight mebibytes, so materialising one would
+        // overflow the stack before the borrow could be taken. The layout is the
+        // type's own, so the size and the 64-byte alignment are the real ones.
+        let layout = alloc::Layout::new::<ApplianceFlowTable>();
+        // SAFETY: the layout has a non-zero size, which is `alloc_zeroed`'s one
+        // requirement.
+        let region = unsafe { alloc::alloc_zeroed(layout) }.cast::<ApplianceFlowTable>();
+        assert!(!region.is_null(), "the test could not reserve the region");
+        // SAFETY: the allocation is aligned for the type, live, exactly its size,
+        // and zero-filled — so the bytes are a valid, if unlinked, table. It is
+        // deliberately never freed, so the `&'static mut` cannot dangle.
+        let first = unsafe { attach_flow_table_region(region) };
+        assert!(first.is_empty(), "a zeroed region is a table with no flows");
+        // SAFETY: as above. This call must fault on the guard rather than produce
+        // a second reference to the same bytes.
+        let _second = unsafe { attach_flow_table_region(region) };
+    }
+
     #[test]
     #[should_panic(expected = "region is misaligned")]
     fn attaching_to_a_misaligned_region_faults_before_the_reference_is_made() {
@@ -1707,7 +2023,7 @@ mod tests {
 
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(&mut pipeline, running(), None), 1);
+        assert_eq!(poll!(stage, &mut pipeline, running(), None), 1);
         assert_eq!(stage.counters().forwarded, 1);
         assert_eq!(stage.counters().drops.total(), 0);
 
@@ -1767,7 +2083,7 @@ mod tests {
         let sent = FrameSpec::a_to_b().build();
         let index =
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-        assert_eq!(stage.poll(&mut pipeline, running(), None), 1);
+        assert_eq!(poll!(stage, &mut pipeline, running(), None), 1);
 
         let mut whole = [0u8; BUFFER_SIZE];
         // SAFETY: the buffer is lent, and this test is the only other party to
@@ -1844,7 +2160,7 @@ mod tests {
                 .expect("the ring is empty");
             drop(buffer);
 
-            assert_eq!(stage.poll(&mut pipeline, running(), None), 1);
+            assert_eq!(poll!(stage, &mut pipeline, running(), None), 1);
             let handed_on = tx_out.try_dequeue().expect("the frame was handed on");
             assert_eq!(
                 Verdict::from_bits(handed_on.verdict),
@@ -1881,7 +2197,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            stage.poll(&mut pipeline, running(), None),
+            poll!(stage, &mut pipeline, running(), None),
             capacity,
             "the destination is now full"
         );
@@ -1892,7 +2208,7 @@ mod tests {
                 .try_enqueue(Descriptor::new(index, 0, 64, Verdict::Transmit))
                 .unwrap();
         }
-        assert_eq!(stage.poll(&mut pipeline, running(), None), 0);
+        assert_eq!(poll!(stage, &mut pipeline, running(), None), 0);
         assert_eq!(stage.counters().egress_full, 1);
         // Draining stopped at the first refusal rather than emptying `rx` into
         // a full destination and losing every buffer with it.
@@ -1909,7 +2225,7 @@ mod tests {
         let mut tx_out = r.rings.tx.consumer();
         for round in 0..8u32 {
             forge_cursors(&r.rings.rx, 0, round.wrapping_mul(37).wrapping_add(11));
-            let handed_on = stage.poll(&mut pipeline, running(), None);
+            let handed_on = poll!(stage, &mut pipeline, running(), None);
             assert!(
                 handed_on <= DRAIN_LIMIT,
                 "poll handled {handed_on} descriptors"
@@ -1943,7 +2259,7 @@ mod tests {
         }
 
         assert_eq!(
-            stage.poll(&mut pipeline, running(), None),
+            poll!(stage, &mut pipeline, running(), None),
             0,
             "nothing may be handed on"
         );
@@ -2069,11 +2385,105 @@ mod tests {
                 PORT0,
                 FrameSpec::a_to_b(),
             ),
+            // The connection tracker's, each on a frame the routing stage
+            // resolves: every one of these is refused for what it carries behind
+            // the IPv4 header and for nothing about where it was going.
+            (
+                DropReason::FlowUnsupportedProtocol,
+                &*ROUTER,
+                PORT0,
+                FrameSpec::carrying(Transport_::Unparsed(47)),
+            ),
+            (
+                DropReason::FlowFragment,
+                &*ROUTER,
+                PORT0,
+                FrameSpec::carrying(Transport_::Fragment),
+            ),
+            (
+                DropReason::FlowMalformed,
+                &*ROUTER,
+                PORT0,
+                FrameSpec::carrying(Transport_::Truncated),
+            ),
+            (
+                DropReason::FlowInvalidFlags,
+                &*ROUTER,
+                PORT0,
+                // No flags at all, which no exchange produces.
+                FrameSpec::carrying(Transport_::Tcp {
+                    flags: 0,
+                    sequence: 1_000,
+                    acknowledgement: 0,
+                }),
+            ),
+            (
+                DropReason::FlowMidStream,
+                &*ROUTER,
+                PORT0,
+                // A bare `ACK` for a five-tuple nothing opened.
+                FrameSpec::carrying(Transport_::Tcp {
+                    flags: 0x10,
+                    sequence: 1_000,
+                    acknowledgement: 1,
+                }),
+            ),
+            (
+                DropReason::FlowNoSuchFlow,
+                &*ROUTER,
+                PORT0,
+                // An echo reply answering a request that never travelled.
+                FrameSpec::carrying(Transport_::Icmp {
+                    message_type: 0,
+                    quote: false,
+                }),
+            ),
+            (
+                DropReason::FlowQuotedInvalid,
+                &*ROUTER,
+                PORT0,
+                // An unreachable error quoting bytes that are not IPv4.
+                FrameSpec::carrying(Transport_::Icmp {
+                    message_type: 3,
+                    quote: true,
+                }),
+            ),
+            (
+                DropReason::FlowUnsupportedIcmp,
+                &*ROUTER,
+                PORT0,
+                // Redirect: excluded outright, being a routing instruction.
+                FrameSpec::carrying(Transport_::Icmp {
+                    message_type: 5,
+                    quote: false,
+                }),
+            ),
+        ];
+
+        /// The four reasons no single frame reaches, because each needs the
+        /// table to already be in a particular condition: two need a flow this
+        /// frame is not the first packet of, and two need a table or a bucket
+        /// with no room left.
+        ///
+        /// They are excluded here and covered elsewhere rather than left
+        /// unstated: `a_flow_state_refusal_still_hands_the_buffer_back` drives
+        /// the first two through this same stage across two polls, and the two
+        /// capacity refusals are `lfw_flow`'s own property tests — the table's
+        /// capacity being that crate's subject and not this one's. What makes
+        /// the exclusion safe is that the buffer-return path below does not
+        /// branch on the reason at all: every `Verdict::Drop` takes one arm.
+        const NEEDS_A_PRIMED_TABLE: [DropReason; 4] = [
+            DropReason::FlowInvalidState,
+            DropReason::FlowOutOfWindow,
+            DropReason::FlowTableFull,
+            DropReason::FlowBucketFull,
         ];
 
         // What makes the name of this test true rather than aspirational: a
-        // reason added to the enum without a case here fails at once.
+        // reason added to the enum without a case here, and without a place in
+        // the exclusion above, fails at once.
         let mut covered: Vec<DropReason> = cases.iter().map(|(reason, ..)| *reason).collect();
+        covered.extend(NEEDS_A_PRIMED_TABLE);
         covered.sort_unstable();
         covered.dedup();
         assert_eq!(
@@ -2102,7 +2512,12 @@ mod tests {
             let sent = spec.build();
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
             assert_eq!(
-                stage.poll(&mut pipeline, Configuration::new(1, table, rules), None),
+                poll!(
+                    stage,
+                    &mut pipeline,
+                    Configuration::new(1, table, rules),
+                    None
+                ),
                 1,
                 "{reason}: the descriptor must travel on"
             );
@@ -2130,6 +2545,153 @@ mod tests {
             // The buffer is back where it started: nothing leaked.
             assert_eq!(owner.reclaim(), 1, "{reason}");
             assert_eq!(owner.owned(), POOL_BUFFERS, "{reason}");
+        }
+    }
+
+    /// The two tracker refusals that need a flow already in the table, driven
+    /// through the appliance's real shape — and with every buffer accounted for
+    /// on the way, so the exclusion the case list above records points at a real
+    /// test rather than at an argument.
+    ///
+    /// **Two stages, one table**, which is the forwarder's own arrangement and the
+    /// only one a handshake can be driven through: a reply is routed out of the
+    /// port the request arrived on, so it has to arrive on the other one, and the
+    /// flow both halves belong to is a single entry because the table is shared.
+    /// The first three steps walk a handshake to `Established`; the last two are
+    /// the segments that flow then refuses.
+    #[test]
+    fn a_flow_state_refusal_still_hands_the_buffer_back() {
+        /// The two sequence spaces the handshake opens on.
+        const CLIENT_ISN: u32 = 100_000;
+        const SERVER_ISN: u32 = 900_000;
+
+        /// One direction's whole apparatus: a pipeline's regions, its pool owner
+        /// and the four handles a frame passes through.
+        struct Direction {
+            regions: Regions,
+        }
+
+        let forward = Direction {
+            regions: Regions::new(),
+        };
+        let back = Direction {
+            regions: Regions::new(),
+        };
+        let mut owners = [
+            PoolOwner::attach(&forward.regions.returns),
+            PoolOwner::attach(&back.regions.returns),
+        ];
+        let mut producers = [
+            forward.regions.rings.rx.producer(),
+            back.regions.rings.rx.producer(),
+        ];
+        let mut stages = [
+            RouteStage::attach(&forward.regions.rings, &forward.regions.pool, PORT0, PORT1),
+            RouteStage::attach(&back.regions.rings, &back.regions.pool, PORT1, PORT0),
+        ];
+        let mut pipeline = Pipeline::new();
+        let mut flows = Box::new(ApplianceTestFlows::new());
+
+        let base = FrameSpec::a_to_b();
+        let segment = |flags: u8, sequence: u32, acknowledgement: u32| Transport_::Tcp {
+            flags,
+            sequence,
+            acknowledgement,
+        };
+        // Every step: which direction carries it, the frame, and what the stage
+        // must have counted afterwards.
+        let script = [
+            // The handshake, which must be carried in full — a tracker that
+            // refused any of it would make the two refusals below vacuous.
+            (0usize, base.with(segment(0x02, CLIENT_ISN, 0)), None),
+            (
+                1,
+                base.reversed()
+                    .with(segment(0x12, SERVER_ISN, CLIENT_ISN.wrapping_add(1))),
+                None,
+            ),
+            (
+                0,
+                base.with(segment(
+                    0x10,
+                    CLIENT_ISN.wrapping_add(1),
+                    SERVER_ISN.wrapping_add(1),
+                )),
+                None,
+            ),
+            // A segment a gibibyte past anything the peer authorised.
+            (
+                0,
+                base.with(segment(
+                    0x10,
+                    CLIENT_ISN.wrapping_add(1).wrapping_add(1 << 30),
+                    SERVER_ISN.wrapping_add(1),
+                )),
+                Some(DropReason::FlowOutOfWindow),
+            ),
+            // And a `SYN` on a flow that is already synchronized, which is the
+            // shape an off-path attacker uses to try to reopen one.
+            (
+                0,
+                base.with(segment(0x02, CLIENT_ISN, 0)),
+                Some(DropReason::FlowInvalidState),
+            ),
+        ];
+
+        let mut sent = [0usize; 2];
+        for (step, (which, spec, expected)) in script.iter().enumerate() {
+            let direction = if *which == 0 { &forward } else { &back };
+            let bytes = spec.build();
+            receive(
+                &direction.regions.pool,
+                &mut owners[*which],
+                &mut producers[*which],
+                &bytes,
+            )
+            .expect("a full pool has buffers");
+            sent[*which] += 1;
+            assert_eq!(
+                stages[*which].poll(
+                    &mut pipeline,
+                    Configuration::new(1, &*ROUTER, &ALLOW_ALL),
+                    &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    None,
+                ),
+                1,
+                "step {step}: the descriptor must travel on"
+            );
+            if let Some(reason) = expected {
+                assert_eq!(
+                    stages[*which].counters().drops.get(*reason),
+                    1,
+                    "step {step}: not refused as {reason}"
+                );
+            }
+        }
+        // The handshake was carried whole, and exactly the two intended segments
+        // were refused: the flow is one entry and the counters name it.
+        assert_eq!(flows.len(), 1, "the handshake left more than one flow");
+        assert_eq!(stages[0].counters().forwarded, 2);
+        assert_eq!(stages[1].counters().forwarded, 1);
+        assert_eq!(stages[0].counters().drops.total(), 2);
+        assert_eq!(stages[1].counters().drops.total(), 0);
+
+        // Every buffer back where it started: nothing leaked on a refusal path.
+        for (which, direction) in [(0usize, &forward), (1, &back)] {
+            let mut tx_out = direction.regions.rings.tx.consumer();
+            let mut free_in = direction.regions.returns.free.producer();
+            let mut seen = 0;
+            transmit(
+                &direction.regions.pool,
+                &mut tx_out,
+                &mut free_in,
+                |_, _| {
+                    seen += 1;
+                },
+            );
+            assert_eq!(seen, sent[which], "direction {which}");
+            assert_eq!(owners[which].reclaim(), sent[which], "direction {which}");
+            assert_eq!(owners[which].owned(), POOL_BUFFERS, "direction {which}");
         }
     }
 
@@ -2199,7 +2761,12 @@ mod tests {
             sent.push(frame);
         }
         assert_eq!(
-            stage.poll(&mut pipeline, Configuration::new(1, &ROUTER, &rules), None),
+            poll!(
+                stage,
+                &mut pipeline,
+                Configuration::new(1, &ROUTER, &rules),
+                None
+            ),
             sent.len(),
             "every descriptor travels on, whatever the verdict"
         );
@@ -2278,7 +2845,10 @@ mod tests {
             receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
         }
 
-        assert_eq!(stage.poll(&mut pipeline, running(), None), unroutable.len());
+        assert_eq!(
+            poll!(stage, &mut pipeline, running(), None),
+            unroutable.len()
+        );
         let unparsable = stage.counters().unparsable;
         assert_eq!(unparsable.total(), unroutable.len() as u64);
         // And each under the class an operator would act on: a frame of
@@ -2323,7 +2893,7 @@ mod tests {
         let sent = FrameSpec::a_to_b().build();
         receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
 
-        assert_eq!(stage.poll(&mut pipeline, running(), None), 1);
+        assert_eq!(poll!(stage, &mut pipeline, running(), None), 1);
         assert_eq!(stage.counters().misrouted, 1);
         assert_eq!(stage.counters().forwarded, 0);
         assert_eq!(
@@ -2387,7 +2957,7 @@ mod tests {
             receive(&r.pool, &mut owner, &mut rx_in, frame).expect("a full pool has buffers");
         }
 
-        assert_eq!(stage.poll(&mut pipeline, running(), Some(&mut tap)), 2);
+        assert_eq!(poll!(stage, &mut pipeline, running(), Some(&mut tap)), 2);
         assert_eq!(stage.counters().forwarded, 1);
 
         let read = ring.drain();
@@ -2434,7 +3004,7 @@ mod tests {
 
         receive(&r.pool, &mut owner, &mut rx_in, &std::vec![0xAA; 64])
             .expect("a full pool has buffers");
-        assert_eq!(stage.poll(&mut pipeline, running(), Some(&mut tap)), 1);
+        assert_eq!(poll!(stage, &mut pipeline, running(), Some(&mut tap)), 1);
 
         assert_eq!(stage.counters().unparsable.total(), 1);
         assert_eq!(tap.counters().observed, 0);
@@ -2474,7 +3044,7 @@ mod tests {
         let mut forwarded = 0;
         for _ in 0..offered {
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
-            forwarded += stage.poll(&mut pipeline, running(), Some(&mut tap));
+            forwarded += poll!(stage, &mut pipeline, running(), Some(&mut tap));
             transmit(&r.pool, &mut tx_out, &mut free_in, |_, _| {});
             owner.reclaim();
         }
@@ -2570,7 +3140,7 @@ mod tests {
         }
         assert_eq!(owner.owned(), POOL_BUFFERS - 2);
 
-        assert_eq!(stage.poll(&mut pipeline, running(), None), 2);
+        assert_eq!(poll!(stage, &mut pipeline, running(), None), 2);
 
         let mut seen = Vec::new();
         let transmitted = transmit(&r.pool, &mut tx_out, &mut free_in, |_, bytes| {
@@ -2935,7 +3505,8 @@ mod tests {
             let (number, table) = generation(tag, port0_up);
             receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
             assert_eq!(
-                stage.poll(
+                poll!(
+                    stage,
                     &mut pipeline,
                     Configuration::new(number, &table, &ALLOW_ALL),
                     None
@@ -3063,10 +3634,11 @@ mod tests {
                 let mut idle = 0u64;
                 while handed_on < TOTAL {
                     let (number, table) = &generations[current];
-                    let moved = stage.poll(
+                    let moved = poll!(
+                        stage,
                         &mut pipeline,
                         Configuration::new(*number, table, &ALLOW_ALL),
-                        None,
+                        None
                     );
                     if moved > 0 {
                         handed_on += moved as u64;
@@ -3286,7 +3858,7 @@ mod tests {
                         }
                     }
                     PeerStep::Route => {
-                        prop_assert!(stage.poll(&mut pipeline, running(), None) <= DRAIN_LIMIT);
+                        prop_assert!(poll!(stage, &mut pipeline, running(), None) <= DRAIN_LIMIT);
                         // Play the tx driver: take what arrived and hand each
                         // buffer straight back, as a well-behaved peer would.
                         for descriptor in tx_out.drain(DRAIN_LIMIT) {
@@ -3383,7 +3955,7 @@ mod tests {
             // Fewer than the pool holds and far fewer than a ring, so nothing
             // here can be refused for want of room: what the stage does with a
             // descriptor is the only thing under test.
-            let handed_on = stage.poll(&mut pipeline, running(), None);
+            let handed_on = poll!(stage, &mut pipeline, running(), None);
             let counters = stage.counters();
             prop_assert_eq!(counters.egress_full, 0);
             prop_assert_eq!(handed_on, published, "a real descriptor did not travel on");
@@ -3435,7 +4007,7 @@ mod tests {
                         published += 1;
                     }
                 }
-                prop_assert_eq!(stage.poll(&mut pipeline, Configuration::new(number, &table, &ALLOW_ALL), None), published);
+                prop_assert_eq!(poll!(stage, &mut pipeline, Configuration::new(number, &table, &ALLOW_ALL), None), published);
                 prop_assert_eq!(stage.counters().generation, number);
 
                 let (egress_mac, next_hop_mac) = generation_macs(tag);

@@ -690,6 +690,7 @@ dependencies = [
  "criterion",
  "lfw-blk",
  "lfw-clock",
+ "lfw-flow",
  "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",
@@ -757,6 +758,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pipeline"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
+ "lfw-flow",
  "net-headers",
  "proptest",
  "routing",
@@ -1515,6 +1518,7 @@ dependencies = [
  "lfw-blk",
  "lfw-capture-ring",
  "lfw-clock",
+ "lfw-flow",
  "lfw-hpet",
  "lfw-http",
  "lfw-log",

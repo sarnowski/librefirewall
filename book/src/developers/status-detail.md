@@ -74,7 +74,7 @@ target (`route_frame`) whose input is the frame itself.
 - **The L4 header is read by the filter and validated by nobody.** The UDP, TCP and ICMP headers
   behind IPv4 are parsed — ports, TCP flags, sequence and data offset, ICMP type and code — and
   every field reaches a caller exactly as it was sent. The filter now consumes the ports and the
-  ICMP type (see *[Stateless filtering](#stateless-filtering)*); the flags, the sequence number and
+  ICMP type (see *[Stateful filtering](#stateful-filtering)*); the flags, the sequence number and
   the code reach nothing. Nothing is validated: a TCP data offset below five or naming more than the
   segment carries, a UDP length contradicting the datagram, an ICMP checksum that does not verify
   are all surfaced rather than refused, and a datagram too short for the header it claims reports
@@ -83,7 +83,7 @@ target (`route_frame`) whose input is the frame itself.
 - **No fragment reassembly.** A non-initial fragment is forwarded without a transport header being
   read, which is correct for routing and insufficient for anything that must see the whole datagram.
 
-## Stateless filtering
+## Stateful filtering
 
 **What exists.** A `<rules>` section in the configuration document, and a terminal stage at the end
 of `crates/pipeline` that decides every frame against it. A rule names ten things — an id, the
@@ -143,13 +143,34 @@ through both sides; and by two QEMU scenarios that inject three probes differing
 port and hold the three outcomes apart on the wire, by drop reason, and by per-rule counter — one
 against each of the two documents, whose policies name different ports under different ids.
 
+**A ruleset decides which conversations may open, and there is no state criterion.** The connection
+tracker settles an established or related packet *before* the filter is consulted, so **every frame a
+rule is ever asked about has just opened a flow**. A criterion naming a connection's state would
+therefore have exactly one reachable value, which on a security device is worse than no criterion:
+an operator could write `established`, watch the document be accepted, and watch the rule sit at zero
+forever. The [configuration design](../design/configuration.md) records the model this follows — pf's,
+where a tracked flow bypasses the ruleset — and names netfilter's, where the established-accept is a
+rule the operator writes, as the alternative that was rejected.
+
+Held by unit and property tests in `crates/pipeline` covering every criterion against a matching and
+a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
+prefix length names, and all five unreadable transport shapes against all four port and type
+criteria; by the differential configuration tests that put an image breaking each of the twelve rules
+through both sides; and by four QEMU scenarios — two that inject three probes differing only in
+destination port and hold the three filter outcomes apart on the wire, by drop reason and by per-rule
+counter, and two that inject a request and its reply and hold the reply's arrival to the tracker
+rather than to any rule.
+
 **Missing.**
 
-- **No state, so no rule about a flow.** There is no connection tracking, which means a reply is
-  permitted only by a rule naming it in its own right — an `accept` outbound needs its inbound
-  counterpart written out, and there is no `established` criterion to write instead. The pipeline
-  reserves the stage position for it, between the forwarding decision and the filter, so that a flow
-  a tracker already accounts for never reaches a rule.
+- **Removing a rule does not stop the flows it admitted.** This is the one real consequence of the
+  model above, and it is a security gap rather than a rough edge: a host found to be compromised
+  keeps every connection it had already opened, and nothing in the appliance can end them. The fix is
+  **not** to evaluate the policy per packet — that would give up the guarantee the model exists for
+  and put the ruleset back on the hot path. It is to re-evaluate the *flow table* against the new
+  policy **on commit**, withdrawing the flows the new policy would not admit: once per commit rather
+  than once per packet, correct by construction, and it leaves the live-connection guarantee intact
+  for every flow the policy still allows. Nothing does this today.
 - **No `reject`.** A rule drops or accepts; it cannot answer an ICMP error. The forwarding domain
   owns no buffer pool it may allocate from — it forwards what arrived or it does not — so an action
   it could not carry out has no representation in the model rather than an unimplemented arm.
@@ -165,6 +186,93 @@ against each of the two documents, whose policies name different ports under dif
   it denies and one the router refuses, so the cost of consulting a policy is *measurable* — but the
   ruleset those benchmarks use is one wildcard rule, and no measurement exists of a realistic table
   or of how the walk scales across it.
+
+## Connection tracking
+
+**What exists.** A bounded connection table (`crates/flow`) in a memory region of the forwarding
+domain's own, and a stage in `crates/pipeline` that classifies every routed packet against it. The
+table holds a million flows in sixty-eight mebibytes, one entry to a cache line, keyed symmetrically
+so a flow and its reply are the same bits. It tracks TCP with the four window comparisons of RFC 793
+and a state machine that runs only on a segment that passed all four, UDP and ICMP echo as
+pseudo-flows, and ICMP errors as related to the flow they quote — where the quote corroborates itself
+against a flow the table holds, travelling away from the party being told, in a direction that flow
+has carried.
+
+**It is strict, and the strictness is the point.** A TCP flow opens on a bare `SYN` and on nothing
+else: a segment from the middle of a conversation the appliance never saw begin is refused as
+`mid_stream` rather than adopted, because adopting one is a way around default deny that costs an
+attacker a single packet. A refused packet never touches a flow's timer, so nothing that can guess a
+five-tuple can hold a slot open with garbage. What it costs is that connections do not survive a
+restart of the forwarding domain, which is the right side of that trade for a firewall.
+
+**The stage is two halves bracketing the filter, and both are load-bearing.**
+
+In front, a packet an existing flow already accounts for is forwarded under the facts the routing
+stage attached, and the filter is never consulted. That is what carries a reply no rule names, and it
+is what keeps a policy edit from cutting a conversation already running: the rule that admitted it
+was consulted once, when it opened.
+
+Behind, a flow the classification *opened* is withdrawn where the filter then refused the packet that
+opened it. Without that, a default-deny policy is a state-exhaustion amplifier — every rejected
+opening packet holds a slot, and an attacker fills the table with connections the policy already
+refused until legitimate ones are turned away. A property test drives a stream of denied openings and
+asserts occupancy returns to zero after each, and a QEMU scenario observes the same thing on a
+running node: six unsolicited packets refused by the default deny leave the table holding one flow,
+the permitted request's.
+
+**Eviction is fail-closed.** An assured flow is never displaced to admit a new one; when every slot
+the bounded eviction scan reaches holds an assured flow, the *new* flow is refused and counted. A
+flood of two hundred distinct tuples against a sixteen-slot table leaves every established flow
+exactly where it was, and a property test says so. Every walk a packet can provoke is bounded by a
+constant no peer chooses: a chain by thirty-two links, the eviction scan by sixty-four slots, the
+timeout sweep by two hundred and fifty-six.
+
+**Every outcome is a signal.** Each of the twelve refusals is its own drop reason on
+`/metrics` — refused before the filter, so a frame the tracker turned away never reaches a rule — and
+its own series in the tracker's own account beside the classified outcomes, the flow lifecycle, and
+the occupancy of every slot by state. `vacant` is one of those states, so the values sum to the
+table's capacity and a flood is watched as `vacant` falling.
+
+**The one region a domain owns outright.** The table is mapped read-write into the forwarder and into
+nothing else, which is what makes the `&mut` to it sound rather than merely uncontended: every other
+region in the system is shared, so its type exposes no safe path to its own bytes. The region carries
+no physical address, so Microkit allocates it from general-purpose untyped memory — the retyping seL4
+zeroes — and that zeroing is what makes forming the reference defined at all, `Vacant` being
+discriminant zero. The forwarder links the free list once at bring-up.
+
+**Measured.** Walking the million slots at bring-up costs about 13 ms under QEMU's emulated CPU, and
+the eight system scenarios take about 0.9 s more per boot than they do with a small table — the
+loader creating and zeroing 17 409 page frames. Both are boot-time only and neither is on the packet
+path.
+
+Held by 140 unit and property tests in `crates/flow` (whole handshakes, whole closes, every window
+edge, both ICMP surfaces, floods against a small table, withdrawal, and the occupancy held to the
+entries themselves), by a `cargo-fuzz` target that drives arbitrary packets at arbitrary instants
+over a table already holding a handshaked connection, by tests in `crates/pipeline` and
+`crates/pd-runtime` that drive the two halves through the real chain and the real ring plumbing, and
+by two QEMU scenarios that hold a reply's arrival to the tracker rather than to a rule.
+
+**Missing.**
+
+- **A commit does not re-evaluate the table.** A flow the newly committed policy would refuse keeps
+  running, because nothing re-decides an existing flow against a new ruleset. It is the same gap the
+  filtering section records from the policy's side, and the fix belongs here: withdrawing, on commit,
+  the flows the new policy would not admit. The table already has everything that needs — a bounded
+  set of flows, each with its key and its handle — so what is missing is the pass over it, not the
+  mechanism.
+- **No connection events in the recordings.** The lifecycle reaches `/metrics` and stops there; the
+  log sink the recording design intends is still the capture truncated to headers. See
+  *[Recording and download](#recording-and-download)*.
+- **No NAT, so no translation state.** The table carries a flow's identity and its state, and nothing
+  it would need to rewrite an address.
+- **The hash is unkeyed.** An attacker who computes colliding tuples can fill one bucket's chain and
+  have new flows whose keys land there refused. It cannot slow a lookup, reach another bucket, or
+  displace anything established. Closing it needs a keyed pseudo-random function, and the one
+  implementation in the workspace is private to `lfw_tcp::isn`.
+- **One table, not one per core.** The multicore dataplane will want the symmetric key this table
+  already has to shard by, and nothing wires that yet.
+- **Nothing is measured on the packet path.** The bring-up walk is measured; the per-packet cost of a
+  classification is not, and the benchmark that times the chain drives a sixteen-slot table.
 
 ## Zero-copy dataplane
 
@@ -434,7 +542,7 @@ and wall-clock times. An independent parse of the two files established:
 
 **Missing.**
 
-- **No connection tracking, so no connection logs — the sinks differ only in snap length.**
+- **The tracker's lifecycle reaches no recording, so no connection logs — the sinks differ only in snap length.**
   The log sink of the [recording design](../design/recording.md) records connection lifecycle and
   policy decisions — an open, each refinement of protocol and application identity, notable events,
   the close — each anchored to the packet that caused it. None of that exists. There are no
@@ -545,7 +653,7 @@ the `<management>` element, which is held to the same field rules as an interfac
 colliding with no dataplane prefix and no dataplane MAC —
 because one address reachable both by routing and by local termination is not something the grant set
 can express; and twelve over the `<rules>` section, which are described with
-*[Stateless filtering](#stateless-filtering)*. A document naming more objects than the handover ABI can carry is refused by the reader
+*[Stateful filtering](#stateful-filtering)*. A document naming more objects than the handover ABI can carry is refused by the reader
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
 bytes, so attacker-supplied content never reaches an observability surface.
 
@@ -1154,7 +1262,7 @@ generation declared reaches no series at all: a counter under nobody's name is n
 expose.
 
 The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
-shared table. A shard is a 2,688-byte, cache-line aligned array of 336 `AtomicU64` slots, mapped
+shared table. A shard is a 3,136-byte, cache-line aligned array of 392 `AtomicU64` slots, mapped
 read-write into the one domain that owns it and read-only into the management domain; slot order is
 the catalogue's series order, asserted statically. Every shard is that wide because the widest set a
 domain publishes — the forwarder's, whose per-rule block reserves one slot per rule the ABI admits —
@@ -1188,8 +1296,9 @@ stated as a freshness property in the [metrics reference](../reference/metrics.m
   answered `503` and counted. A finished-but-not-yet-reaped connection's buffer is reclaimed rather
   than waited out, so a periodic scraper is never refused for the previous scrape — but two
   *concurrent* scrapers can refuse each other.
-- **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, the
-  flow table awaits the stateful one, and log-buffer occupancy awaits the buffer. Occupancy is the
+- **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, and
+  log-buffer occupancy awaits the buffer. The connection table now publishes its own — its
+  occupancy by state, its lifecycle and every refusal. Occupancy is the
   one that is now half here: `librefirewall_virtqueue_posted` publishes how many buffers each port
   has posted to its device and not yet had completed, which is the only reading that tells a
   stalled port from an idle link, while the dataplane's own queues and rings still publish none.
@@ -1275,7 +1384,10 @@ at all and neither dataplane pipeline's `free` ring — so it cannot hand a live
 be issued a second time — and each driver sees only its own ECAM page, BAR, virtqueue region, and
 its two pipelines. Each pipeline is three memory regions rather than one precisely so that those
 grants can differ; the forwarder maps the buffer pools, because a domain that rewrites a header
-must reach the bytes. The recorder is the mirror of that argument in the other direction: it is
+must reach the bytes. It also maps the connection table, and that is the one region in the system a
+domain holds **alone**: nothing else maps it in either direction, which is what makes the exclusive
+borrow of it sound rather than merely uncontended, and it carries no physical address so no device
+can be handed it either. The recorder is the mirror of that argument in the other direction: it is
 the only domain that reaches the block device — its ECAM page, BAR, DMA region and staging window
 are mapped by nothing else — and it maps no pool, no ring, no NIC region and no port, so the
 domain that owns the disk reaches no frame and the domains that move frames reach no medium. What

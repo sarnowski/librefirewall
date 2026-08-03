@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The connection table the tracking stage classifies against, and the instant it
+# classifies at. The dependency runs this way and only this way: `lfw-flow`
+# answers what a packet is without knowing a chain of stages asks.
+lfw-clock = { path = "../clock" }
+lfw-flow = { path = "../flow" }
 net-headers = { path = "../net-headers" }
 # The forwarding table and the port identity a verdict names. The dependency
 # runs this way and never the other: `routing` answers questions about a table

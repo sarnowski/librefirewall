@@ -54,8 +54,10 @@ use net_headers::{
     ETHERNET_HEADER_LEN, Frame, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet,
     MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
+use lfw_clock::Monotonic;
+use lfw_flow::FlowTable;
 use pipeline::{
-    Configuration, DropReason, Inspection, Pipeline, Rule, RuleAction, Ruleset, Verdict,
+    Configuration, DropReason, Inspection, Pipeline, Rule, RuleAction, Ruleset, Tracking, Verdict,
 };
 use routing::{Interface, Neighbour, PortId, Router};
 
@@ -186,8 +188,25 @@ fn verdicts_on_both_ports(bytes: &mut [u8]) -> [Verdict; 2] {
     [PORT0, PORT1].map(|ingress| {
         let frame = Frame::parse(bytes).expect("the caller parsed these bytes already");
         let mut inspection = Inspection::new(ingress, frame);
-        Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER, &ALLOW_ALL))
+        // A fresh connection table too, for the same reason the pipeline is
+        // fresh: a table carried between the two calls would make the second
+        // frame a second packet of the flow the first one opened, and the two
+        // verdicts a caller compares would differ for that reason rather than
+        // for the ingress port.
+        let mut flows = Box::new(fresh_table());
+        Pipeline::new().evaluate(
+            &mut inspection,
+            &Configuration::new(0, &ROUTER, &ALLOW_ALL),
+            &mut Tracking::new(&mut flows, Monotonic::BOOT),
+        )
     })
+}
+
+/// A connection table with nothing in it, small enough to put on the heap per
+/// call: the appliance's own is a memory region, and every path this harness
+/// reaches is reached at any capacity.
+fn fresh_table() -> FlowTable<16> {
+    FlowTable::new()
 }
 
 /// A verdict a narrower policy may reach for a frame the permissive one
@@ -201,7 +220,12 @@ fn the_filter_only_narrows(bytes: &mut [u8], ingress: PortId, permissive: Verdic
     for rules in NARROWER.iter() {
         let frame = Frame::parse(bytes).expect("the caller parsed these bytes already");
         let mut inspection = Inspection::new(ingress, frame);
-        let narrowed = Pipeline::new().evaluate(&mut inspection, &Configuration::new(0, &ROUTER, rules));
+        let mut flows = Box::new(fresh_table());
+        let narrowed = Pipeline::new().evaluate(
+            &mut inspection,
+            &Configuration::new(0, &ROUTER, rules),
+            &mut Tracking::new(&mut flows, Monotonic::BOOT),
+        );
         match permissive {
             // A frame the stages in front of the filter refused is refused for
             // that same reason under every policy: the filter is never consulted
@@ -411,6 +435,10 @@ pub fn frame_routing_harness(data: &[u8]) {
     // One pipeline across both directions, as the forwarder holds it: a stage
     // whose state spans a flow must see the two halves through the same value.
     let mut pipeline = Pipeline::new();
+    // One table across both directions beside the one pipeline, which is the
+    // arrangement the forwarder has: the stage that holds state spanning a flow
+    // must see both halves of it through the same value.
+    let mut flows = Box::new(fresh_table());
     for ingress in [PORT0, PORT1] {
         let original = data.to_vec();
         let mut bytes = original.clone();
@@ -424,8 +452,11 @@ pub fn frame_routing_harness(data: &[u8]) {
         let mut inspection = Inspection::new(ingress, frame);
         // Generation 0: nothing in the chain reads it, and the table it names is
         // this harness's fixed topology rather than one an operator committed.
-        let decision =
-            pipeline.evaluate(&mut inspection, &Configuration::new(0, &ROUTER, &ALLOW_ALL));
+        let decision = pipeline.evaluate(
+            &mut inspection,
+            &Configuration::new(0, &ROUTER, &ALLOW_ALL),
+            &mut Tracking::new(&mut flows, Monotonic::BOOT),
+        );
         // The same frame under three narrower policies, before the rewrite the
         // permissive verdict authorises: the chain does not touch the bytes, so
         // the borrow is simply handed back and taken again.

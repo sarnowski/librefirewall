@@ -221,6 +221,19 @@ pub struct Ticks(pub u64);
 pub struct Monotonic(u64);
 
 impl Monotonic {
+    /// The instant a [`Calibration`] is anchored on: zero nanoseconds since
+    /// boot.
+    ///
+    /// Not a way to build an arbitrary instant out of an integer, which the
+    /// crate header rules out and [`saturating_add`](Self::saturating_add)
+    /// exists to avoid needing. This is the one instant that needs no reading,
+    /// because it is the origin every reading is measured from, and it is here
+    /// for a consumer that has to act *before* a calibration exists: driven by
+    /// it, no deadline is ever reached and no elapsed span is ever positive —
+    /// which is the direction that waits rather than the direction that fires
+    /// early.
+    pub const BOOT: Self = Self(0);
+
     #[must_use]
     pub const fn as_nanos(self) -> u64 {
         self.0

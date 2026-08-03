@@ -31,13 +31,15 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use lfw_clock::Monotonic;
+use lfw_flow::FlowTable;
 use net_headers::{
     ETHERNET_HEADER_LEN, EtherType, IPV4_HEADER_LEN, Ipv4Address, MacAddress, Protocol,
     UDP_HEADER_LEN,
 };
 use pd_runtime::{
     Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
-    RouteStage, Verdict,
+    RouteStage, Tracking, Verdict,
 };
 use pipeline::{Pipeline, Rule, RuleAction, Ruleset};
 use routing::{Interface, Neighbour, PortId, Router};
@@ -244,6 +246,11 @@ fn measure(
     let mut rx_in = regions.rings.rx.producer();
     let mut stage = RouteStage::attach(&regions.rings, &regions.pool, PORT0, PORT1);
     let mut pipeline = Pipeline::new();
+    // Small, and boxed: the measurement is the chain's per-packet cost, and the
+    // appliance's own million-slot table would be sixty-eight mebibytes of stack.
+    // Sixteen slots reach the same code — a classification walks one bucket's
+    // chain whatever the table's width.
+    let mut flows = Box::new(FlowTable::<16>::new());
     let configuration = Configuration::new(GENERATION, &ROUTER, policy);
     let mut tx_out = regions.rings.tx.consumer();
     let mut free_in = regions.returns.free.producer();
@@ -268,8 +275,21 @@ fn measure(
                         publish(&regions.pool, &mut owner, &mut rx_in, frame);
                     }
 
+                    // A table of its own per iteration, and reinitialised
+                    // untimed: every frame of a batch shares one five-tuple, so a
+                    // carried-over table would make all but the first
+                    // `Established` and measure the short-circuit rather than the
+                    // whole chain. The appliance's own table is a memory region
+                    // this bench has no equivalent of.
+                    flows.initialise();
+
                     let started = Instant::now();
-                    let handed_on = black_box(stage.poll(&mut pipeline, configuration, None));
+                    let handed_on = black_box(stage.poll(
+                        &mut pipeline,
+                        configuration,
+                        &mut Tracking::new(&mut flows, Monotonic::BOOT),
+                        None,
+                    ));
                     elapsed += started.elapsed();
 
                     assert_eq!(handed_on, BATCH, "every frame must be handed on");

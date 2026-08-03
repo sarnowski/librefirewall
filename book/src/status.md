@@ -96,32 +96,46 @@ operator can write that makes an unmatched packet pass, and an empty one forward
 rule matches on ingress and egress interface, source and destination CIDR block, protocol, source
 and destination port or port range, and ICMP type; every criterion is written out, `any` included,
 so no attribute widens a rule by being left out. The two refusals a filter can reach stay separate
-findings — a rule that said drop, and the fallthrough — and each rule carries its own hit counter
-on `/metrics` under the id the document gave it.
+findings — a rule that said drop, and the fallthrough — and each rule carries its own hit counter on
+`/metrics` under the id the document gave it.
 
-What is not there is **state**: no connection tracking reaches the dataplane, so a rule cannot be
-written about an established flow and a reply is permitted only by a rule that names it in its own
-right. The tracker itself exists and is tested — it is the stage position that is empty. There
-is no NAT. The ARP and ICMP that exist belong to the management port alone — the dataplane resolves
-a next hop from a static neighbour table and answers nothing for itself. What exists is a stateless
-packet filter on a firewall's substrate.
+**The filter is stateful, and it follows pf's model rather than netfilter's.** A connection tracker
+sits between the forwarding decision and the filter, and a packet an existing flow already accounts
+for is forwarded without the filter being consulted at all. So a ruleset decides which conversations
+may **open**, and the traffic that follows one is carried by the flow. A reply comes back with no
+rule naming it, which is the whole value of tracking state — the alternative is writing the reverse
+of every rule and opening the appliance in both directions to permit one. And an edit to the policy
+cannot cut a conversation already running, because the rule that admitted it was consulted once,
+when it opened. Under netfilter's model that acceptance is a rule an operator writes and can forget;
+here it is structural, which is the trade this appliance makes for the OT environments it is aimed
+at. There is deliberately **no state criterion**: every frame a rule is asked about has just opened a
+flow, so such a criterion would have one reachable value and would read as a choice an operator did
+not have.
 
-That absence reaches the recordings, and is the largest gap in them. The
+It costs something, and the cost is in two places. A packet the tracker cannot keep state for is
+refused *before* the filter, so no rule can permit a non-initial fragment, a protocol the appliance
+does not decode, or a TCP segment from the middle of a conversation it never saw begin; each of
+those refusals is its own reason on `/metrics`. And **removing a rule does not stop the flows it
+admitted** — see the gap recorded below. There is no NAT. The ARP and ICMP that exist belong to the
+management port alone — the dataplane resolves a next hop from a static neighbour table and answers
+nothing for itself.
+
+State reaches the recordings only as far as the packets. The
 [recording design](design/recording.md) splits the two sinks by *what* they record — the log sink
 connection lifecycle and policy events anchored to their causing packet, the capture sink full
-content for the flows a **recording** selector picks out. Neither exists: with no connection
-tracking there are no connection events to record, and there is no recording selector, so the
-capture sink records everything the dataplane decided on. (The filter rules above decide what the
-appliance *forwards*; they select nothing for recording, and a dropped packet is recorded with its
-refusal exactly as a forwarded one is.) **Today the two recordings differ only in their snap
+content for the flows a **recording** selector picks out. Neither exists yet: the tracker's
+lifecycle is visible on `/metrics` and reaches no recording, and there is no recording selector, so
+the capture sink records everything the dataplane decided on. (The filter rules above decide what
+the appliance *forwards*; they select nothing for recording, and a dropped packet is recorded with
+its refusal exactly as a forwarded one is.) **Today the two recordings differ only in their snap
 length**, and `/logs.pcapng` is the capture truncated to headers rather than an event log.
 
 ## Traffic inspection and enforcement
 
 | Capability | Status | Notes |
 |---|---|---|
-| Stateless L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; no state, no `reject`, and no way to change a policy without a new image — [detail](developers/status-detail.md#stateless-filtering) |
-| Connection tracking | **partial** | `crates/flow` is a strict tracker — a million-flow table, TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, and eviction that refuses a new flow rather than displacing an established one. Nothing on the dataplane calls it: the pipeline has the stage position reserved, between the forwarding decision and the filter, and it is empty |
+| Stateful L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; a ruleset decides which flows may open, so **removing a rule does not end the flows it admitted**, and there is no `reject` and no way to change a policy without a new image — [detail](developers/status-detail.md#stateful-filtering) |
+| Connection tracking | **partial** | a million-flow table in a region of the forwarder's own, classifying every routed packet: TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, eviction that refuses a new flow rather than displacing an established one, and withdrawal of a flow whose opening packet the filter then refused. An established or related packet is forwarded without the filter; every refusal is its own drop reason and its own metric. **A configuration commit does not re-evaluate the table**, so a flow the new policy would refuse keeps running — [detail](developers/status-detail.md#connection-tracking) |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |
@@ -160,7 +174,7 @@ length**, and `/logs.pcapng` is the capture truncated to headers rather than an 
 |---|---|---|
 | First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
 | pcapng encoder | **partial** | `crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — described with the [recordings](developers/status-detail.md#recording-and-download) |
-| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — there is no connection tracking, so no connection events, and no recording selector, so the capture sink records every frame the dataplane decided on — [detail](developers/status-detail.md#recording-and-download) |
+| Two pcapng recording sinks (log and capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium; **they differ only in snap length** — the connection tracker's lifecycle reaches `/metrics` and no recording, so there are no connection events, and there is no recording selector, so the capture sink records every frame the dataplane decided on — [detail](developers/status-detail.md#recording-and-download) |
 | Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for the *time range* the [management design](design/management.md) does ask for, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
 | A recording that states its own loss in-band | **partial** | `epb_dropcount` is fed: the recorder differences the forwarder's tap-drop counter on every pass and carries the rise as a debt onto the next record placed, so a file does state the observations the tap ring lost ahead of each block. It states **only** those — what a sink could not encode and what the medium refused reach `/metrics` and never the file, and no Interface Statistics Block is emitted — see the [recording design](design/recording.md) |
 | Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
@@ -193,7 +207,7 @@ length**, and `/logs.pcapng` is the capture truncated to headers rather than an 
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](developers/status-detail.md#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
 | OpenTelemetry structured logs | **open** | call sites emit typed events (`crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the design's **System** category alone — Audit, Traffic and Subsystem have none. No transport, exporter or receiver exists, so the OpenTelemetry inventory in the [observability reference](reference/observability.md) is empty, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
-| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane and the flow table awaits the stateful one; occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
+| Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane; the connection table publishes its own occupancy, lifecycle and every refusal, and the rest of the occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
 | Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *log recording* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. `GET /config` does not exist either, so of the debug dump the [observability reference](reference/observability.md) describes, the state half and the recordings are what a node can be asked for; the retained records and the running document cannot be, and the reference's local-buffer inventory is empty |
 
 ## Lifecycle, boot and trust

@@ -317,16 +317,23 @@ LFW-CFG time=<rfc3339|unsynchronized> generation=<n> rejected=<reason> offset=<n
 the volume of a commit is the size of its diff.
 
 - `change=` is **`added`**, **`removed`** or **`modified`**.
-- `object=` is **`interface`**, **`neighbour`** or **`management`**.
+- `object=` is **`interface`**, **`neighbour`**, **`management`** or **`rule`**.
 - `key=` is the object's `id` from the document — its stable identity, so reordering the document
   produces no records at all. The `<management>` element has none, a document holding exactly one, so
   a record about it reads `key=management`: the two keys are the same word and neither is derived from
-  the other.
-- `field=` is **`port`**, **`enabled`**, **`mac`**, **`address`**, **`prefix-length`** or
-  **`interface`**, spelled as the document's own attribute. Not every field belongs to every object:
+  the other. A **`rule`** is the exception and is keyed by its **position**, `key=0` upward.
+- `field=` is spelled as the document's own attribute, and is one of **`port`**, **`enabled`**,
+  **`mac`**, **`address`**, **`prefix-length`**, **`interface`**, **`id`**, **`ingress`**,
+  **`egress`**, **`source`**, **`destination`**, **`protocol`**, **`source-port`**,
+  **`destination-port`**, **`icmp-type`** or **`action`**. Not every field belongs to every object:
   an `interface` carries `port`, `enabled`, `mac`, `address`, `prefix-length`; a `neighbour` carries
   `mac`, `address`, `interface`; `management` carries `enabled`, `mac`, `address`, `prefix-length` —
-  it has no `port`, being no part of the router's port set. A pairing outside those is not written.
+  it has no `port`, being no part of the router's port set; and a `rule` carries the remaining ten,
+  which are its `id` and its nine criteria. A pairing outside those is not written.
+- **A `rule` reports its own `id` as a field**, which no other object does. Its records are filed
+  under its position, because a policy is an ordered list and position is precedence — so the id is
+  something a rule *says* rather than what it is, and renaming one is a change to report like any
+  other.
 - `from=` is absent exactly when the object was added, `to=` exactly when it was removed. A
   `modified` record carries both.
 - Values render by their type: `port` and `prefix-length` decimal, `enabled` `true|false`, `mac` as

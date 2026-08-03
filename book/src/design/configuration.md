@@ -38,6 +38,31 @@ not, and the difference is a design decision rather than an accident of the file
 - **A rule carries an identity of its own.** An id is what an operator edits a rule by and what the
   appliance reports its matches under, so a rule's counters survive the rules above it being edited.
   Position is precedence; identity is not positional.
+- **A rule decides which conversations may open, and there is no state criterion.** A tracked flow
+  bypasses the ruleset: a packet an existing flow already accounts for is forwarded before the filter
+  is consulted at all, so every frame a rule is ever asked about has just opened a flow. A policy is
+  therefore a statement about *admission* — which conversations may start — and the traffic that
+  follows one is carried by the flow rather than by a line of the document. There is deliberately no
+  criterion for a rule to name a connection's state with, because under this model such a criterion
+  would have exactly one reachable value: an operator could write `established`, watch the document
+  be accepted, and watch the rule sit at zero forever. A writable token that can never mean anything
+  is worse on a security device than no token at all.
+
+  **This is pf's model, and netfilter's was considered and rejected.** Under netfilter the acceptance
+  of established traffic is a rule the operator writes — `--ctstate ESTABLISHED,RELATED -j ACCEPT` —
+  which makes the state criterion meaningful and makes the ruleset a statement about every packet.
+  It was rejected for one consequence: removing or mistyping that rule cuts every connection
+  currently running. This appliance is aimed at OT and industrial environments where an operator
+  editing a policy must not be able to drop a live process link by omission, so the guarantee is made
+  structural instead of entrusted to a line somebody has to remember. A rule cannot be forgotten if
+  there is no rule.
+
+  The cost is stated with it, in both directions. A packet the appliance cannot keep state for — a
+  fragment, a protocol it does not decode, a segment from the middle of a conversation it never saw
+  begin — is refused before the filter, so no rule can permit one. And editing the policy changes
+  which conversations may *start*: it does not end one already running. What closes the second is
+  re-evaluating the flow table on commit rather than consulting the policy per packet, and it does
+  not exist yet — the [development status](../status.md) records it as missing.
 - **A rule that could never match is refused, not committed.** A criterion combination with no
   satisfying packet — a range whose ends run backwards, a port criterion on a protocol that has no
   ports, a block written with host bits set — is a line an operator wrote believing it was in force.

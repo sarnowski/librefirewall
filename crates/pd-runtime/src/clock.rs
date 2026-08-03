@@ -28,7 +28,7 @@
 //! domains over a domain that runs once and parks; the system description says
 //! what the read grant does and does not give instead.
 
-use lfw_clock::{Calibration, Ticks};
+use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_log::Stamp;
 use wire::ClockCalibration;
 
@@ -91,6 +91,23 @@ impl<'region> PdClock<'region> {
     #[must_use]
     pub fn calibration(&self) -> Option<Calibration> {
         calibration_from(self.published.load()?).ok()
+    }
+
+    /// Nanoseconds since boot, for a consumer whose work cannot wait for a
+    /// calibration.
+    ///
+    /// An unclocked domain reads [`Monotonic::BOOT`] rather than nothing, and
+    /// what that buys is stated where it is spent: a connection table driven by
+    /// an instant that never advances expires no flow, so it fills and then
+    /// refuses new ones — which is the fail-closed direction, and strictly
+    /// better than a dataplane that stops forwarding until the clock domain has
+    /// published. A caller that must be able to *tell* asks
+    /// [`calibration`](Self::calibration), which answers `None`.
+    #[must_use]
+    pub fn monotonic(&self) -> Monotonic {
+        self.calibration().map_or(Monotonic::BOOT, |calibration| {
+            calibration.monotonic(read_timestamp_counter())
+        })
     }
 }
 

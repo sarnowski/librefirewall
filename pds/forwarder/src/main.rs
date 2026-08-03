@@ -59,9 +59,9 @@
 use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch, ForwardRings, MAX_INTERFACES,
-    MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, Tap, attach_region, forwarder_sample,
-    log_sample,
+    ApplianceFlowTable, ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch,
+    ForwardRings, MAX_INTERFACES, MAX_NEIGHBOURS, Offer, PdClock, Pool, RouteStage, Tap, Tracking,
+    attach_flow_table, attach_region, flow_sample, forwarder_sample, log_sample,
 };
 use pipeline::Pipeline;
 use routing::PortId;
@@ -93,6 +93,11 @@ fn init() -> Forwarder {
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
     let tap_records: &'static TapRecords = attach_region!(tap_vaddr: TapRecords);
     let tap_consume: &'static TapConsume = attach_region!(tap_consume_vaddr: TapConsume);
+    // The one region this domain owns outright, and the only one borrowed
+    // mutably anywhere in the system; the macro's safety comment names what
+    // makes that sound, and the one clause it cannot delegate — that this is the
+    // only borrow ever taken — is checked rather than claimed.
+    let flows: &'static mut ApplianceFlowTable = attach_flow_table!(flow_table_vaddr);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     sink.emit(&Event::Domain {
@@ -100,6 +105,18 @@ fn init() -> Forwarder {
         state: DomainState::Starting,
         detail: DomainDetail::None,
     });
+    // Once, and before this domain claims to be running under any generation:
+    // every method on the table assumes a linked free list and an occupancy that
+    // counts the slots, and a zeroed region has neither — it is only a table with
+    // no flows *in* it. A restart therefore starts from an empty table rather
+    // than from the previous boot's, which is the right side of that trade for a
+    // firewall: connections do not outlive the thing deciding about them.
+    //
+    // It is between the two records deliberately, so what the walk over a
+    // million slots costs at bring-up is a span an operator can read off the
+    // console rather than a number somebody measured once.
+    flows.initialise();
+
     // Recorded, so a node that never leaves the fail-closed generation is
     // distinguishable from one that was never configured at all.
     sink.emit(&applied(0));
@@ -111,6 +128,8 @@ fn init() -> Forwarder {
         ],
         pipeline: Pipeline::new(),
         switch: ConfigurationSwitch::new(PORTS),
+        flows,
+        clock: PdClock::new(clock),
         tap: Tap::attach(tap_records, tap_consume),
         handover,
         ack,
@@ -132,6 +151,13 @@ struct Forwarder {
     stages: [RouteStage<'static>; 2],
     pipeline: Pipeline,
     switch: ConfigurationSwitch<MAX_INTERFACES, MAX_NEIGHBOURS>,
+    /// One per domain, not one per pipeline: a flow *is* both directions, so two
+    /// tables would be two half-views agreeing about nothing.
+    flows: &'static mut ApplianceFlowTable,
+    /// Read once per wakeup, for the deadlines the table's timeouts are stated
+    /// against. Unclocked it reads the boot instant, under which nothing expires
+    /// — the table fills and then refuses, which is fail-closed.
+    clock: PdClock<'static>,
     /// One per domain: a packet identity is per appliance.
     tap: Tap<'static>,
     handover: &'static ConfigHandover,
@@ -154,6 +180,9 @@ impl Forwarder {
             // One filter serves both directions, so its counters come off the
             // pipeline rather than off either stage.
             self.pipeline.policy_counters(),
+            // Both halves read from the one table at the same moment, so the
+            // occupancy a scrape reports is the occupancy those counters left.
+            flow_sample(self.flows.counters(), self.flows.occupancy()),
             self.tap.counters(),
             log_sample(self.sink.dropped(), self.sink.refused()),
         );
@@ -184,9 +213,23 @@ impl Handler for Forwarder {
         }
         let configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS> =
             self.switch.configuration();
+        // One instant for the whole wakeup: a flow's deadlines are seconds and
+        // minutes wide, so reading the counter per frame would buy nothing and
+        // cost a serialising instruction on the hot path.
+        let now = self.clock.monotonic();
+        let mut tracking = Tracking::new(self.flows, now);
         for stage in &mut self.stages {
-            stage.poll(&mut self.pipeline, configuration, Some(&mut self.tap));
+            stage.poll(
+                &mut self.pipeline,
+                configuration,
+                &mut tracking,
+                Some(&mut self.tap),
+            );
         }
+        // Unconditionally, and after the drain: the sweep is bounded to a window
+        // of slots, so it costs the same whether traffic arrived or not, and a
+        // wakeup that forwarded nothing is exactly when there is room to reclaim.
+        self.flows.poll(now);
         self.publish();
         Ok(())
     }

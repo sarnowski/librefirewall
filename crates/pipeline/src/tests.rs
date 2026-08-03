@@ -1,4 +1,5 @@
 use super::*;
+use lfw_clock::Monotonic;
 
 /// A ruleset that accepts whatever the routing stage resolves.
 ///
@@ -152,6 +153,11 @@ impl TransportSpec {
                 // A plausible data offset, so the header reads as one rather
                 // than as a length the parser refuses.
                 out[12] = 0x50;
+                // A bare `SYN`. The connection tracker in front of the filter
+                // opens a flow on one and on nothing else, so a segment with no
+                // flags would be settled as mid-stream before any criterion
+                // here was read — and these cases are about the criteria.
+                out[13] = 0x02;
             }
             Self::Icmp { message_type } => {
                 out.push(message_type);
@@ -257,6 +263,27 @@ fn ipv4_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
     !(sum as u16)
 }
 
+/// A connection table small enough to hold, and a fresh one per evaluation.
+///
+/// Every test about admission, routing or the filter states what *one* packet
+/// earns, and a table carried between two identical packets would make the
+/// second one `Established` and settle it in front of the filter. That is the
+/// tracker's own behaviour and it is tested where it belongs, below; here a
+/// fresh table keeps each case about the stage it names.
+type Flows = FlowTable<16>;
+
+fn flows() -> Flows {
+    FlowTable::new()
+}
+
+/// An instant, built the way this crate's callers build one.
+fn at(nanos: u64) -> Monotonic {
+    use core::num::NonZeroU64;
+    use lfw_clock::{Calibration, Ticks};
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(nanos))
+}
+
 fn evaluate_on<const I: usize, const N: usize>(
     table: &Router<I, N>,
     spec: &FrameSpec,
@@ -265,9 +292,11 @@ fn evaluate_on<const I: usize, const N: usize>(
     let mut bytes = spec.build();
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
     let mut inspection = Inspection::new(ingress, frame);
+    let mut table_of_flows = flows();
     Pipeline::new().evaluate(
         &mut inspection,
         &Configuration::new(GENERATION, table, &allow_all()),
+        &mut Tracking::new(&mut table_of_flows, at(0)),
     )
 }
 
@@ -387,8 +416,13 @@ fn a_default_pipeline_decides_as_a_new_one_does() {
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
     let mut inspection = Inspection::new(PORT0, frame);
 
+    let mut table_of_flows = flows();
     assert_eq!(
-        Pipeline::default().evaluate(&mut inspection, &configuration),
+        Pipeline::default().evaluate(
+            &mut inspection,
+            &configuration,
+            &mut Tracking::new(&mut table_of_flows, at(0))
+        ),
         Verdict::Forward {
             egress: PORT1,
             source: GATEWAY1_MAC,
@@ -763,9 +797,11 @@ fn filter(rules: &Ruleset, spec: &FrameSpec) -> (Verdict, PolicyCounters) {
     let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
     let mut inspection = Inspection::new(PORT0, frame);
     let mut pipeline = Pipeline::new();
+    let mut table_of_flows = flows();
     let verdict = pipeline.evaluate(
         &mut inspection,
         &Configuration::new(GENERATION, &table, rules),
+        &mut Tracking::new(&mut table_of_flows, at(0)),
     );
     (verdict, *pipeline.policy_counters())
 }
@@ -1055,20 +1091,37 @@ fn a_transport_nobody_read_matches_no_port_and_no_type() {
     ];
     for transport in unreadable {
         let spec = FrameSpec::carrying(transport);
+        let mut bytes = spec.build();
+        let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
         for rule in criteria {
-            assert_eq!(
-                verdict_under(&ruleset([rule]), &spec),
-                Verdict::Drop(DropReason::NoPolicyMatch),
+            assert!(
+                !rule.matches(PORT0, PORT1, &frame),
                 "{transport:?} satisfied a criterion nothing could be read for: {rule:?}"
             );
         }
-        // And the same frame passes a rule that states no port criterion at all,
-        // so the refusals above are the criterion's and not the frame's: an
-        // unparsed transport is still a packet the appliance forwards.
+        // And the criterion is what refused it, not the frame: the same rule
+        // without the port matches the same bytes.
+        assert!(
+            wildcard(RuleAction::Accept).matches(PORT0, PORT1, &frame),
+            "{transport:?} was refused by a rule that states no criterion"
+        );
+        // Through the whole chain none of them reaches the filter at all, which
+        // is the stronger posture the tracker added in front of it: a datagram
+        // whose transport nobody could read is not one a flow can be kept for,
+        // so it is settled before a rule is consulted rather than forwarded by
+        // a rule that states no port. The reason names which shape it was.
+        let expected = match transport {
+            TransportSpec::Truncated(_) => DropReason::FlowMalformed,
+            TransportSpec::NonInitialFragment => DropReason::FlowFragment,
+            TransportSpec::Unparsed(_) => DropReason::FlowUnsupportedProtocol,
+            TransportSpec::Udp { .. } | TransportSpec::Tcp { .. } | TransportSpec::Icmp { .. } => {
+                unreachable!("every shape here is one nobody could read")
+            }
+        };
         assert_eq!(
             verdict_under(&ruleset([wildcard(RuleAction::Accept)]), &spec),
-            forwarded(),
-            "{transport:?} was refused by a rule that states no port"
+            Verdict::Drop(expected),
+            "{transport:?} reached the filter"
         );
     }
 }
@@ -1088,10 +1141,16 @@ fn an_icmp_type_criterion_matches_only_icmp() {
         ),
         forwarded()
     );
+    // The same echo request under a rule stating a different type. An echo
+    // *reply* would say the same thing about the criterion and never reach the
+    // filter to say it: with no flow to answer, the tracker settles it first.
     assert_eq!(
         verdict_under(
-            &rules,
-            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 0 })
+            &ruleset([Rule {
+                icmp_type: Some(0),
+                ..wildcard(RuleAction::Accept)
+            }]),
+            &FrameSpec::carrying(TransportSpec::Icmp { message_type: 8 })
         ),
         Verdict::Drop(DropReason::NoPolicyMatch)
     );
@@ -1157,9 +1216,11 @@ fn the_filter_counts_packets_and_datagram_bytes_by_verdict() {
         let mut bytes = spec.build();
         let frame = Frame::parse(&mut bytes).expect("well formed");
         let mut inspection = Inspection::new(PORT0, frame);
+        let mut table_of_flows = flows();
         pipeline.evaluate(
             &mut inspection,
             &Configuration::new(GENERATION, &table, &permissive),
+            &mut Tracking::new(&mut table_of_flows, at(0)),
         );
     }
     let counters = pipeline.policy_counters();
@@ -1358,6 +1419,264 @@ fn any_configuration() -> impl Strategy<Value = (Vec<Interface>, Vec<Neighbour>)
                 .collect();
             (unique, neighbours)
         })
+}
+
+// ── Connection tracking: the two halves that bracket the filter ─────────────
+
+/// One appliance across several frames: the connection table persists, which is
+/// the whole point, so a test can send a request and then its reply.
+struct Bench {
+    table: Router<2, 2>,
+    pipeline: Pipeline,
+    flows: Flows,
+    nanos: u64,
+}
+
+impl Bench {
+    fn new() -> Self {
+        Self {
+            table: router(),
+            pipeline: Pipeline::new(),
+            flows: FlowTable::new(),
+            nanos: 0,
+        }
+    }
+
+    /// Put one frame through the whole chain under `rules`, advancing the clock
+    /// by a microsecond so successive packets are ordered without ever
+    /// approaching a timeout.
+    fn send(&mut self, rules: &Ruleset, spec: &FrameSpec, ingress: PortId) -> Verdict {
+        self.nanos += 1_000;
+        let mut bytes = spec.build();
+        let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
+        let mut inspection = Inspection::new(ingress, frame);
+        self.pipeline.evaluate(
+            &mut inspection,
+            &Configuration::new(GENERATION, &self.table, rules),
+            &mut Tracking::new(&mut self.flows, at(self.nanos)),
+        )
+    }
+
+    fn counters(&self) -> &lfw_flow::FlowCounters {
+        self.flows.counters()
+    }
+}
+
+/// A request from A to B on `destination_port`, and the reply B sends back to
+/// the port the request came from — the ordinary shape of a conversation, and
+/// the one a stateless filter cannot carry without a rule for each half.
+fn request(destination_port: u16) -> FrameSpec {
+    FrameSpec {
+        transport: TransportSpec::Udp {
+            source: 4444,
+            destination: destination_port,
+        },
+        ..FrameSpec::a_to_b()
+    }
+}
+
+fn reply(destination_port: u16) -> FrameSpec {
+    FrameSpec {
+        destination_mac: GATEWAY1_MAC,
+        source_mac: HOST_B_MAC,
+        source: host_b(),
+        destination: host_a(),
+        transport: TransportSpec::Udp {
+            source: destination_port,
+            destination: 4444,
+        },
+        ..FrameSpec::a_to_b()
+    }
+}
+
+/// The verdict a frame from B to A earns when it is forwarded.
+fn forwarded_back() -> Verdict {
+    Verdict::Forward {
+        egress: PORT0,
+        source: GATEWAY0_MAC,
+        destination: HOST_A_MAC,
+    }
+}
+
+/// **The property the whole landing exists for.** A reply is forwarded although
+/// no rule permits it: the only rule is about the forward direction, and the
+/// reply is carried because the tracker recognises the conversation it belongs
+/// to. The counters say which mechanism did it — the flow was advanced, and the
+/// filter was never asked.
+#[test]
+fn a_reply_is_carried_by_the_flow_and_not_by_a_rule() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+
+    assert_eq!(bench.send(&rules, &request(5000), PORT0), forwarded());
+    assert_eq!(bench.counters().flows_created, 1);
+
+    // No rule is about a datagram to port 4444, in either direction.
+    assert_eq!(bench.send(&rules, &reply(5000), PORT1), forwarded_back());
+    assert_eq!(
+        bench.counters().packets_established,
+        1,
+        "the reply was not classified as belonging to the flow"
+    );
+    // And the filter counted it under neither verdict, because it was never
+    // consulted: one accepted packet, which is the request.
+    assert_eq!(bench.pipeline.policy_counters().accepted_packets(), 1);
+    assert_eq!(bench.pipeline.policy_counters().denied_packets(), 0);
+    assert_eq!(bench.pipeline.policy_counters().hits(0), 1);
+}
+
+/// The same reply with no request in front of it is denied, and the two are
+/// distinguishable: one is `Established` and forwarded, the other opens a flow
+/// nothing permits and is dropped by the default deny.
+#[test]
+fn an_unsolicited_reply_direction_packet_is_denied() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+
+    assert_eq!(
+        bench.send(&rules, &reply(5000), PORT1),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+    assert_eq!(bench.counters().packets_established, 0);
+    assert_eq!(bench.pipeline.policy_counters().denied_packets(), 1);
+}
+
+/// **The withdrawal, end to end.** A denied opening packet leaves no state: the
+/// slot the classification took is given back, so a stream of them cannot fill
+/// the table. Without it, a default-deny policy is a state-exhaustion
+/// amplifier.
+#[test]
+fn a_denied_opening_leaves_no_flow_behind() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+
+    // Far more attempts than the table has slots.
+    for index in 0..64u16 {
+        let spec = FrameSpec {
+            transport: TransportSpec::Udp {
+                source: 40_000 + index,
+                destination: 5001,
+            },
+            ..FrameSpec::a_to_b()
+        };
+        assert_eq!(
+            bench.send(&rules, &spec, PORT0),
+            Verdict::Drop(DropReason::NoPolicyMatch)
+        );
+        assert_eq!(bench.flows.len(), 0, "a denied opening kept its slot");
+    }
+    assert_eq!(bench.counters().flows_created, 64);
+    assert_eq!(bench.counters().flows_withdrawn, 64);
+    assert_eq!(
+        bench.counters().refused_table_full,
+        0,
+        "the table filled with connections the policy had refused"
+    );
+    // And the appliance still admits a permitted connection afterwards, which
+    // is what the exhaustion would have cost.
+    assert_eq!(bench.send(&rules, &request(5000), PORT0), forwarded());
+}
+
+/// A permitted opening keeps its flow: withdrawal is the refusal's consequence
+/// and not something every classification pays.
+#[test]
+fn a_permitted_opening_keeps_its_flow() {
+    let rules = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+    assert_eq!(bench.send(&rules, &request(5000), PORT0), forwarded());
+    assert_eq!(bench.flows.len(), 1);
+    assert_eq!(bench.counters().flows_withdrawn, 0);
+}
+
+/// **A rule change does not break a live connection.** The rule that admitted
+/// the conversation is withdrawn entirely and the reply still arrives, because
+/// the filter is not consulted for a packet an existing flow accounts for. What
+/// the edit stops is the *next* connection.
+#[test]
+fn narrowing_the_policy_does_not_cut_a_live_connection() {
+    let permits = ruleset([Rule {
+        destination_port: Some(port(5000)),
+        ..wildcard(RuleAction::Accept)
+    }]);
+    let mut bench = Bench::new();
+    assert_eq!(bench.send(&permits, &request(5000), PORT0), forwarded());
+
+    let nothing = Ruleset::EMPTY;
+    assert_eq!(bench.send(&nothing, &reply(5000), PORT1), forwarded_back());
+    assert_eq!(
+        bench.send(&nothing, &request(5000), PORT0),
+        forwarded(),
+        "the forward direction of a live flow is carried too"
+    );
+    // A conversation that has not started yet is refused under the new policy.
+    assert_eq!(
+        bench.send(&nothing, &request(5002), PORT0),
+        Verdict::Drop(DropReason::NoPolicyMatch)
+    );
+}
+
+/// A mid-stream TCP segment for a five-tuple nothing opened is refused as such
+/// rather than adopted. Adopting one is a way around default deny that costs an
+/// attacker a single packet, and the reason it earns says which shape it was.
+#[test]
+fn a_mid_stream_segment_for_an_unknown_flow_is_refused() {
+    let permissive = ruleset([wildcard(RuleAction::Accept)]);
+    let mut bench = Bench::new();
+    let spec = FrameSpec::carrying(TransportSpec::Tcp {
+        source: 4444,
+        destination: 443,
+    });
+    let mut bytes = spec.build();
+    // Clear the `SYN` the spec sets, leaving a bare `ACK`: a segment from the
+    // middle of a conversation this appliance never saw begin.
+    let offset = bytes.len() - TCP_HEADER_LEN + 13;
+    bytes[offset] = 0x10;
+    let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
+    let mut inspection = Inspection::new(PORT0, frame);
+    let verdict = bench.pipeline.evaluate(
+        &mut inspection,
+        &Configuration::new(GENERATION, &bench.table, &permissive),
+        &mut Tracking::new(&mut bench.flows, at(1_000)),
+    );
+    assert_eq!(verdict, Verdict::Drop(DropReason::FlowMidStream));
+    assert_eq!(bench.counters().refused_mid_stream, 1);
+    assert_eq!(bench.flows.len(), 0);
+}
+
+/// Every refusal the tracker can reach is reported as a drop reason of its own,
+/// and no two share one: a refusal an operator sees is attributable to what the
+/// packet did rather than to a category.
+#[test]
+fn every_tracker_refusal_has_its_own_drop_reason() {
+    let reasons: Vec<DropReason> = lfw_flow::RefusalKind::ALL
+        .into_iter()
+        .map(DropReason::of_refusal)
+        .collect();
+    for (position, reason) in reasons.iter().enumerate() {
+        assert!(
+            DropReason::ALL.contains(reason),
+            "{reason} is not in the reason vocabulary"
+        );
+        assert!(
+            reasons
+                .iter()
+                .enumerate()
+                .all(|(other, candidate)| other == position || candidate != reason),
+            "{reason} is named by two refusals"
+        );
+    }
 }
 
 proptest! {

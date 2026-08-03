@@ -64,3 +64,36 @@ fn every_count_saturates_rather_than_wrapping() {
     counters.packets_established = u64::MAX;
     assert_eq!(counters.classified_total(), u64::MAX);
 }
+
+/// Every refusal kind reads its own field and no other's, so a metric
+/// enumerating the vocabulary reports what `classify` actually counted. Each
+/// kind is given a distinct value and every one is read back.
+#[test]
+fn each_refusal_kind_reads_its_own_field() {
+    let mut counters = FlowCounters::new();
+    counters.refused_unsupported_protocol = 1;
+    counters.refused_fragment = 2;
+    counters.refused_malformed = 3;
+    counters.refused_invalid_flags = 4;
+    counters.refused_mid_stream = 5;
+    counters.refused_invalid_state = 6;
+    counters.refused_out_of_window = 7;
+    counters.refused_no_flow = 8;
+    counters.refused_quoted_invalid = 9;
+    counters.refused_unsupported_icmp = 10;
+    counters.refused_table_full = 11;
+    counters.refused_bucket_full = 12;
+    for (position, kind) in RefusalKind::ALL.into_iter().enumerate() {
+        assert_eq!(
+            counters.refused(kind),
+            position as u64 + 1,
+            "{kind:?} reads the wrong field"
+        );
+    }
+    // And the enumeration is the whole of the refusal total, which is the
+    // property that makes the per-kind series add up to the aggregate one.
+    let summed = RefusalKind::ALL
+        .into_iter()
+        .fold(0u64, |total, kind| total + counters.refused(kind));
+    assert_eq!(summed, counters.refused_total());
+}

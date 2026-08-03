@@ -1,5 +1,9 @@
+use lfw_flow::FlowTable;
 use lfw_http::Status;
-use lfw_metrics::{HTTP_STATUSES, PIPELINES, ROUTE_STAGE_DROP_REASONS, SHARDS, STATS_SLOTS};
+use lfw_metrics::{
+    FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_STATES, HTTP_STATUSES, PIPELINES,
+    ROUTE_STAGE_DROP_REASONS, SHARDS, STATS_SLOTS,
+};
 use lfw_tcp::TcpCounters;
 use net_headers::{ParseCounters, ParseError, ParseFailure};
 
@@ -157,6 +161,10 @@ fn the_forwarder_sample_keeps_its_two_pipelines_apart() {
         // by `the_filters_three_outcomes_reach_three_different_places_in_the_shard`,
         // the counters being the stage's to move and nobody else's.
         &PolicyCounters::new(),
+        // As the filter: a table that has classified nothing, so this case stays
+        // about the two pipelines. What the flow block maps to is driven through
+        // a real table by `every_flow_counter_reaches_the_slot_its_series_names`.
+        flow_sample(&FlowCounters::new(), FlowTable::<16>::new().occupancy()),
         TapCounters {
             observed: 33,
             dropped: 4,
@@ -390,4 +398,86 @@ fn a_block_counter_saturates_rather_than_wrapping() {
     assert_eq!(blocks.read_bytes, u64::MAX);
     assert_eq!(blocks.writes, u64::MAX);
     assert_eq!(blocks.write_bytes, 1024);
+}
+
+/// The connection tracker's four vocabularies are the owning enums' own, name
+/// for name and in their order — the same obligation the router's reasons carry,
+/// and for the same reason: `lfw_metrics` depends on none of the crates whose
+/// counters it mirrors, so this is where the two lists are held to being one.
+#[test]
+fn the_flow_vocabularies_are_the_trackers_own() {
+    assert_eq!(FLOW_OUTCOMES.len(), Classification::ALL.len());
+    for (token, classification) in FLOW_OUTCOMES.iter().zip(Classification::ALL) {
+        assert_eq!(*token, classification.name(), "{classification:?}");
+    }
+
+    assert_eq!(FLOW_REFUSALS.len(), RefusalKind::ALL.len());
+    for (token, kind) in FLOW_REFUSALS.iter().zip(RefusalKind::ALL) {
+        assert_eq!(*token, kind.name(), "{kind:?}");
+    }
+
+    assert_eq!(FLOW_STATES.len(), FlowState::ALL.len());
+    for (token, state) in FLOW_STATES.iter().zip(FlowState::ALL) {
+        assert_eq!(*token, state.name(), "{state:?}");
+    }
+
+    // The lifecycle family deliberately has no `created` value: a flow is
+    // created by exactly the packet counted as `new` above, and two series for
+    // one counter would invite an operator to add them.
+    assert_eq!(
+        FLOW_LIFECYCLE_EVENTS,
+        ["expired", "evicted", "closed", "withdrawn"]
+    );
+}
+
+/// Every flow counter reaches the slot its series names, and no two share one.
+///
+/// Distinct values per field, so a sample assembled with two fields transposed
+/// moves a number rather than repeating one — which is the failure a
+/// written-out slot list makes easy and this test makes visible.
+#[test]
+fn every_flow_counter_reaches_the_slot_its_series_names() {
+    let mut counters = FlowCounters::new();
+    counters.packets_seen = 1;
+    counters.flows_created = 2;
+    counters.packets_established = 3;
+    counters.packets_related = 4;
+    counters.flows_expired = 5;
+    counters.flows_evicted = 6;
+    counters.flows_closed = 7;
+    counters.flows_withdrawn = 8;
+    counters.probe_tag_collisions = 9;
+    counters.internal_slot_desync = 10;
+    counters.refused_unsupported_protocol = 21;
+    counters.refused_fragment = 22;
+    counters.refused_malformed = 23;
+    counters.refused_invalid_flags = 24;
+    counters.refused_mid_stream = 25;
+    counters.refused_invalid_state = 26;
+    counters.refused_out_of_window = 27;
+    counters.refused_no_flow = 28;
+    counters.refused_quoted_invalid = 29;
+    counters.refused_unsupported_icmp = 30;
+    counters.refused_table_full = 31;
+    counters.refused_bucket_full = 32;
+
+    let table = FlowTable::<16>::new();
+    let sample = flow_sample(&counters, table.occupancy());
+
+    assert_eq!(sample.packets_seen, 1);
+    assert_eq!(sample.outcomes, [2, 3, 4]);
+    assert_eq!(sample.lifecycle, [5, 6, 7, 8]);
+    assert_eq!(sample.probe_collisions, 9);
+    assert_eq!(sample.slot_desync, 10);
+    for (slot, kind) in sample.refusals.iter().zip(RefusalKind::ALL) {
+        assert_eq!(*slot, counters.refused(kind), "{kind:?}");
+    }
+    // The occupancy comes off the table itself, so an empty one reports every
+    // slot vacant and nothing else — and the values sum to the capacity.
+    assert_eq!(sample.entries.iter().sum::<u64>(), 16);
+    assert_eq!(
+        sample.entries.first().copied(),
+        Some(16),
+        "a fresh table does not report every slot vacant"
+    );
 }

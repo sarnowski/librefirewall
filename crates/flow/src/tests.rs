@@ -1299,6 +1299,96 @@ fn a_handle_to_a_reused_slot_resolves_to_nothing() {
     assert!(table.flow(fresh).is_some());
 }
 
+// ------------------------------------------------------------- withdrawal
+
+/// The slot a withdrawn flow held goes back, and the flow is gone from the
+/// index rather than merely unreachable through its handle: the tuple that
+/// opened it opens a *new* flow afterwards.
+#[test]
+fn withdrawing_a_flow_gives_its_slot_back() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+    let syn = exchange.syn();
+    let Outcome::New { flow, .. } = syn.classify(&mut table, at(0)) else {
+        panic!("a SYN did not open a flow");
+    };
+    assert_eq!(table.len(), 1);
+
+    assert!(table.withdraw(flow));
+    assert_eq!(table.len(), 0);
+    assert!(table.flow(flow).is_none());
+    assert_eq!(table.counters().flows_withdrawn, 1);
+    assert_eq!(table.occupancy().get(FlowState::SynSent), 0);
+    assert_eq!(table.occupancy().get(FlowState::Vacant), 16);
+
+    // Off the chain, not merely emptied: the same key finds nothing and opens
+    // again rather than resolving to the corpse.
+    let mut again = Exchange::new(40_000);
+    let syn = again.syn();
+    assert!(matches!(
+        syn.classify(&mut table, at(1_000)),
+        Outcome::New { .. }
+    ));
+}
+
+/// A handle whose slot was reused withdraws nothing. Otherwise a caller holding
+/// a stale handle could destroy whichever flow inherited the slot — which on
+/// this path would be a caller's refusal of one packet taking down somebody
+/// else's live connection.
+#[test]
+fn withdrawing_a_stale_handle_destroys_nothing() {
+    let mut table = FlowTable::<1>::new();
+    let mut first = Exchange::new(40_000);
+    let syn = first.syn();
+    let Outcome::New { flow: stale, .. } = syn.classify(&mut table, at(0)) else {
+        panic!("a SYN did not open a flow");
+    };
+    let mut second = Exchange::new(40_001);
+    let syn = second.syn();
+    let Outcome::New { flow: fresh, .. } = syn.classify(&mut table, at(1_000)) else {
+        panic!("pressure did not take the half-open slot back");
+    };
+    assert_ne!(stale, fresh);
+
+    assert!(!table.withdraw(stale), "a stale handle withdrew a flow");
+    assert_eq!(table.counters().flows_withdrawn, 0);
+    assert_eq!(
+        table.flow(fresh).map(FlowEntry::state),
+        Some(FlowState::SynSent),
+        "a stale handle destroyed the flow that inherited its slot"
+    );
+}
+
+/// Withdrawing a flow that is already gone is not an error and moves no
+/// counter, so a caller need not know whether a sweep got there first.
+#[test]
+fn withdrawing_twice_takes_nothing_back_twice() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+    let syn = exchange.syn();
+    let Outcome::New { flow, .. } = syn.classify(&mut table, at(0)) else {
+        panic!("a SYN did not open a flow");
+    };
+    assert!(table.withdraw(flow));
+    assert!(!table.withdraw(flow));
+    assert_eq!(table.counters().flows_withdrawn, 1);
+    assert_eq!(table.len(), 0);
+}
+
+/// Withdrawal reaches an established flow too, and that is deliberate: this is
+/// the caller's statement that the packet it asked about is refused, and the
+/// caller — not this table — decides which outcomes that applies to.
+#[test]
+fn withdrawing_an_established_flow_takes_it_back() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+    let flow = handshake(&mut table, at(0), &mut exchange);
+    assert_eq!(table.occupancy().get(FlowState::Established), 1);
+    assert!(table.withdraw(flow));
+    assert_eq!(table.occupancy().get(FlowState::Established), 0);
+    assert_eq!(table.len(), 0);
+}
+
 /// One bucket's chain is bounded, so a run of keys that hash into one bucket
 /// costs that bucket and nothing else — the table keeps admitting flows whose
 /// keys land elsewhere.
@@ -1703,4 +1793,215 @@ proptest! {
         prop_assert_eq!(total, 16, "the occupancy does not sum to the capacity");
         prop_assert_eq!(occupancy.occupied() as usize, table.len());
     }
+
+    /// **A stream of denied opening packets costs no state at all.** This is
+    /// the security property withdrawal exists for, stated the way the attack
+    /// is: an adversary sends connection attempts a default-deny policy
+    /// refuses, and every one of them is withdrawn, so occupancy returns to
+    /// zero after each and the table never fills. Without it a refused
+    /// connection still holds a slot and default deny becomes the amplifier —
+    /// the attacker exhausts the table with connections the policy already
+    /// said no to, and legitimate new flows are then refused with
+    /// `TableFull`.
+    ///
+    /// The flood is far longer than the table is wide, so a version that
+    /// withdrew nothing would reach `TableFull` inside the run rather than
+    /// merely finish untidy.
+    #[test]
+    fn a_stream_of_denied_openings_leaves_no_state_behind(
+        attempts in 1usize..200,
+        datagrams in any::<bool>(),
+    ) {
+        let mut table = table();
+        for index in 0..attempts {
+            // Lossless: bounded by the strategy.
+            let port = 40_000 + index as u16;
+            let when = at(1_000 + index as u64);
+            let outcome = if datagrams {
+                udp(CLIENT, SERVER, port, 53).classify(&mut table, when)
+            } else {
+                Exchange::new(port).syn().classify(&mut table, when)
+            };
+            // Every attempt is a distinct tuple against an empty table, so
+            // every one of them opens — which is what makes the withdrawal
+            // below the only thing keeping the table empty.
+            let Outcome::New { flow, .. } = outcome else {
+                prop_assert!(false, "attempt {} did not open a flow: {:?}", index, outcome);
+                unreachable!()
+            };
+            prop_assert_eq!(table.len(), 1);
+            // What the caller does when the policy behind it says no.
+            prop_assert!(table.withdraw(flow));
+            prop_assert_eq!(table.len(), 0, "a denied opening kept its slot");
+        }
+        prop_assert_eq!(table.occupancy().occupied(), 0);
+        prop_assert_eq!(table.occupancy().get(FlowState::Vacant), 16);
+        prop_assert_eq!(table.counters().flows_withdrawn, attempts as u64);
+        prop_assert_eq!(
+            table.counters().refused_table_full,
+            0,
+            "the table filled with connections the policy had refused"
+        );
+    }
+}
+
+// ------------------------------------------------- the operator's vocabulary
+
+/// A refusal reports the kind a counter and a metric label are stated in, and
+/// the mapping is onto: every kind is produced by some refusal, so a label the
+/// exposition can carry is one the table can actually reach.
+#[test]
+fn every_refusal_names_its_kind_and_every_kind_is_reachable() {
+    let refusals = [
+        (
+            Refusal::UnsupportedProtocol(Protocol(47)),
+            RefusalKind::UnsupportedProtocol,
+        ),
+        (Refusal::Fragment, RefusalKind::Fragment),
+        (
+            Refusal::Malformed { needed: 1, got: 0 },
+            RefusalKind::Malformed,
+        ),
+        (Refusal::InvalidFlags, RefusalKind::InvalidFlags),
+        (Refusal::MidStream, RefusalKind::MidStream),
+        (
+            Refusal::InvalidState(FlowState::Established),
+            RefusalKind::InvalidState,
+        ),
+        (
+            Refusal::OutOfWindow(WindowEdge::AckAhead),
+            RefusalKind::OutOfWindow,
+        ),
+        (Refusal::NoSuchFlow, RefusalKind::NoSuchFlow),
+        (
+            Refusal::QuotedInvalid(QuotedError::NotIpv4 { version: 6 }),
+            RefusalKind::QuotedInvalid,
+        ),
+        (
+            Refusal::UnsupportedIcmp {
+                message_type: 5,
+                code: 0,
+            },
+            RefusalKind::UnsupportedIcmp,
+        ),
+        (Refusal::TableFull, RefusalKind::TableFull),
+        (Refusal::BucketFull, RefusalKind::BucketFull),
+    ];
+    for (refusal, kind) in refusals {
+        assert_eq!(refusal.kind(), kind, "{refusal:?} names the wrong kind");
+    }
+    for kind in RefusalKind::ALL {
+        assert!(
+            refusals.iter().any(|(_, named)| *named == kind),
+            "{kind:?} is named by no refusal"
+        );
+    }
+}
+
+/// The two token sets this crate publishes are an operator surface, so each is
+/// distinct within itself and spelled in the alphabet a metric label value
+/// admits: lowercase, digits and underscore, never a hyphen.
+#[test]
+fn every_exposed_token_is_distinct_and_renderable() {
+    let states: Vec<&str> = FlowState::ALL.into_iter().map(FlowState::name).collect();
+    let kinds: Vec<&str> = RefusalKind::ALL
+        .into_iter()
+        .map(RefusalKind::name)
+        .collect();
+    for tokens in [&states, &kinds] {
+        for (position, token) in tokens.iter().enumerate() {
+            assert!(!token.is_empty());
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+                "{token} is not spelled in the label alphabet"
+            );
+            assert!(
+                tokens
+                    .iter()
+                    .enumerate()
+                    .all(|(other, candidate)| other == position || candidate != token),
+                "{token} is not distinct"
+            );
+        }
+    }
+}
+
+/// The classification an outcome reports is the one whose counter moved.
+///
+/// This closes the loop the metric surface rests on: a caller labels a packet
+/// from [`Outcome::classification`] and reads the number from
+/// [`FlowCounters::classified`], and those are two matches in two crates. Driving
+/// a real packet per classification and asserting the counter the outcome *names*
+/// is the one that rose is what keeps them one mapping — a transposed pair would
+/// report established traffic under `new` and nothing about either match would
+/// notice.
+#[test]
+fn every_outcome_names_the_counter_that_moved() {
+    let mut table = table();
+    let mut exchange = Exchange::new(40_000);
+
+    // One packet per classification, in the order a conversation produces them: a
+    // `SYN` opens, its `SYN-ACK` advances, and an ICMP error quoting the data that
+    // followed relates.
+    let mut reached = Vec::new();
+    let mut step = 0usize;
+    let mut expect = |table: &mut Bench, reached: &mut Vec<Classification>, wire: &Wire, now| {
+        let before = *table.counters();
+        let outcome = wire.classify(table, now);
+        let after = *table.counters();
+        let classification = outcome
+            .classification()
+            .unwrap_or_else(|| panic!("step {step} was refused: {outcome:?}"));
+        reached.push(classification);
+        for candidate in Classification::ALL {
+            let moved = after
+                .classified(candidate)
+                .saturating_sub(before.classified(candidate));
+            assert_eq!(
+                moved,
+                u64::from(candidate == classification),
+                "step {step} reported {classification:?} and {candidate:?}'s counter moved by \
+                 {moved}"
+            );
+        }
+        step += 1;
+    };
+
+    let syn = exchange.syn();
+    expect(&mut table, &mut reached, &syn, at(0));
+    let syn_ack = exchange.syn_ack();
+    expect(&mut table, &mut reached, &syn_ack, at(1_000));
+    let ack = exchange.ack(true);
+    ack.classify(&mut table, at(2_000));
+    let data = exchange.data(true, b"request");
+    data.classify(&mut table, at(3_000));
+    let error = icmp_error_quoting_tcp(
+        ROUTER,
+        CLIENT,
+        CLIENT,
+        SERVER,
+        40_000,
+        443,
+        exchange.client_next.wrapping_sub(7),
+    );
+    expect(&mut table, &mut reached, &error, at(4_000));
+
+    // The three steps reached the three classifications, so no arm of the
+    // vocabulary went untested.
+    for classification in Classification::ALL {
+        assert!(
+            reached.contains(&classification),
+            "{classification:?} was not reached"
+        );
+    }
+
+    // And a refusal reports no classification at all, which is what keeps the two
+    // vocabularies disjoint rather than overlapping at one value.
+    let mid_stream = Exchange::new(40_001).ack(true);
+    assert_eq!(
+        mid_stream.classify(&mut table, at(5_000)).classification(),
+        None
+    );
 }

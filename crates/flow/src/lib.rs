@@ -28,6 +28,14 @@
 //!   slot the eviction scan reaches holds an assured flow, the *new* flow is
 //!   refused and counted, which is the fail-closed direction.
 //!
+//!   A third bound is the caller's and cannot be structural here, because this
+//!   table classifies before anything decides: a packet that opens a flow has
+//!   taken a slot by the time a policy behind it says no. So a caller that
+//!   refuses such a packet calls [`FlowTable::withdraw`], and the flow costs
+//!   nothing. A caller that does not turns its own default deny into the
+//!   amplifier — every refused connection attempt holding a slot is how an
+//!   attacker fills a table with connections that were never permitted.
+//!
 //! # Strictness, and what it costs
 //!
 //! Every decision below is the strict one, deliberately:
@@ -137,6 +145,18 @@ use icmp::Message;
 /// The one knob. Everything else about the table's memory follows from it: the
 /// bucket array is one head per flow, so the index is a power-of-two array of the
 /// same length, and [`FLOW_TABLE_BYTES`] is what the region holding it must be.
+///
+/// # What this number costs, measured
+///
+/// Two boot-time costs and nothing on the packet path — a classification walks
+/// one bucket's chain, which is bounded by [`MAX_CHAIN`] whatever the capacity.
+/// [`FlowTable::initialise`] walks every slot, which is about 13 ms under QEMU's
+/// emulated CPU; and the region is 17 409 page frames for the Microkit loader to
+/// create and the kernel to zero, which costs the emulated boot about 0.9 s.
+/// Halving this constant halves both, and halves how many connections the
+/// appliance can carry at once — so it is a decision about the product rather
+/// than about the layout, and the numbers are here so that decision is taken
+/// against them.
 pub const FLOW_CAPACITY: usize = 1 << 20;
 
 /// The appliance's table, at [`FLOW_CAPACITY`].
@@ -237,6 +257,118 @@ pub enum Outcome {
     Refused(Refusal),
 }
 
+impl Outcome {
+    /// What this outcome classified the packet as, or `None` where it refused
+    /// it.
+    ///
+    /// The one place the two vocabularies and this enum are related: a caller
+    /// counting or labelling an outcome reads it from here rather than from a
+    /// second match of its own.
+    #[must_use]
+    pub const fn classification(self) -> Option<Classification> {
+        match self {
+            Self::New { .. } => Some(Classification::New),
+            Self::Established { .. } => Some(Classification::Established),
+            Self::Related { .. } => Some(Classification::Related),
+            Self::Refused(_) => None,
+        }
+    }
+}
+
+/// What one packet *is*, without the flow it names.
+///
+/// The classified half of the vocabulary [`RefusalKind`] is the refused half of,
+/// and it exists for the same reason: an [`Outcome`] carries a handle, and a
+/// counter and a metric label need the category alone. [`Outcome::classification`]
+/// is the one place the two are related, so an outcome added to one without the
+/// other does not compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Classification {
+    /// The packet opened a flow.
+    New,
+    /// The packet advanced a flow the table already held.
+    Established,
+    /// An ICMP error reporting on a flow the table holds.
+    Related,
+}
+
+impl Classification {
+    /// Every classification, so a counter table and a metric's label set are
+    /// built by iteration rather than by a list that drifts from the enum.
+    pub const ALL: [Self; 3] = [Self::New, Self::Established, Self::Related];
+
+    /// A stable short name, for a metric label or a report line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Established => "established",
+            Self::Related => "related",
+        }
+    }
+}
+
+/// Why a packet is not part of any flow, without the value that refused it.
+///
+/// [`Refusal`] carries that value, which is what an operator needs to see one
+/// packet; a counter and a metric label need the category alone, and a variant
+/// carrying data cannot be enumerated in a `const` array. So the vocabulary is
+/// this enum and [`Refusal::kind`] is the one place the two are related — a
+/// refusal added to one without the other does not compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalKind {
+    UnsupportedProtocol,
+    Fragment,
+    Malformed,
+    InvalidFlags,
+    MidStream,
+    InvalidState,
+    OutOfWindow,
+    NoSuchFlow,
+    QuotedInvalid,
+    UnsupportedIcmp,
+    TableFull,
+    BucketFull,
+}
+
+impl RefusalKind {
+    /// Every kind, so a counter table and a metric's label set are built by
+    /// iteration rather than by a list that drifts from the enum.
+    pub const ALL: [Self; 12] = [
+        Self::UnsupportedProtocol,
+        Self::Fragment,
+        Self::Malformed,
+        Self::InvalidFlags,
+        Self::MidStream,
+        Self::InvalidState,
+        Self::OutOfWindow,
+        Self::NoSuchFlow,
+        Self::QuotedInvalid,
+        Self::UnsupportedIcmp,
+        Self::TableFull,
+        Self::BucketFull,
+    ];
+
+    /// A stable short name, for a metric label or a report line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::Fragment => "fragment",
+            Self::Malformed => "malformed",
+            Self::InvalidFlags => "invalid_flags",
+            Self::MidStream => "mid_stream",
+            Self::InvalidState => "invalid_state",
+            Self::OutOfWindow => "out_of_window",
+            Self::NoSuchFlow => "no_such_flow",
+            Self::QuotedInvalid => "quoted_invalid",
+            Self::UnsupportedIcmp => "unsupported_icmp",
+            Self::TableFull => "table_full",
+            Self::BucketFull => "bucket_full",
+        }
+    }
+}
+
 /// Why a packet is not part of any flow.
 ///
 /// Every variant carries the value that refused it, and every one maps to exactly
@@ -273,6 +405,28 @@ pub enum Refusal {
     /// One bucket's chain is full, so this key has nowhere to go even though the
     /// table has slots.
     BucketFull,
+}
+
+impl Refusal {
+    /// This refusal without its value: the category a counter and a metric label
+    /// are stated in.
+    #[must_use]
+    pub const fn kind(self) -> RefusalKind {
+        match self {
+            Self::UnsupportedProtocol(_) => RefusalKind::UnsupportedProtocol,
+            Self::Fragment => RefusalKind::Fragment,
+            Self::Malformed { .. } => RefusalKind::Malformed,
+            Self::InvalidFlags => RefusalKind::InvalidFlags,
+            Self::MidStream => RefusalKind::MidStream,
+            Self::InvalidState(_) => RefusalKind::InvalidState,
+            Self::OutOfWindow(_) => RefusalKind::OutOfWindow,
+            Self::NoSuchFlow => RefusalKind::NoSuchFlow,
+            Self::QuotedInvalid(_) => RefusalKind::QuotedInvalid,
+            Self::UnsupportedIcmp { .. } => RefusalKind::UnsupportedIcmp,
+            Self::TableFull => RefusalKind::TableFull,
+            Self::BucketFull => RefusalKind::BucketFull,
+        }
+    }
 }
 
 /// How many flows are in each state.
@@ -489,6 +643,39 @@ impl<const CAPACITY: usize> FlowTable<CAPACITY> {
             Transport::NonInitialFragment => self.refuse(Refusal::Fragment),
             Transport::Unparsed(protocol) => self.refuse(Refusal::UnsupportedProtocol(protocol)),
         }
+    }
+
+    /// Give back the slot a flow was just opened in, because whatever asked for
+    /// the classification then refused the packet that opened it.
+    ///
+    /// # Why a tracker needs this at all
+    ///
+    /// A filter that runs *behind* this table sees a packet already committed to
+    /// a slot, so a policy that denies the opening packet of a connection leaves
+    /// the flow behind. Under default deny that is the whole of a state-
+    /// exhaustion amplifier: every rejected `SYN` costs a slot, and an attacker
+    /// fills the table with connections the policy already refused — turning the
+    /// fail-closed answer to a flood ([`Refusal::TableFull`]) into a denial of
+    /// service against traffic the policy *does* permit. So the caller that
+    /// refuses a packet a classification opened a flow for withdraws that flow,
+    /// and occupancy returns to where it was.
+    ///
+    /// Answers whether a flow was taken back. A handle whose slot is empty or
+    /// has been reused answers `false` and changes nothing, on
+    /// [`flow`](Self::flow)'s terms — so a caller holding a stale handle cannot
+    /// destroy a flow it does not name.
+    pub fn withdraw(&mut self, id: FlowId) -> bool {
+        let slot = id.slot as usize;
+        let names_it = self
+            .entries
+            .get(slot)
+            .is_some_and(|entry| entry.is_occupied() && entry.generation() == id.generation);
+        if !names_it {
+            return false;
+        }
+        self.release(slot);
+        FlowCounters::bump(&mut self.counters.flows_withdrawn);
+        true
     }
 
     /// Take the expired flows in one bounded window of slots.

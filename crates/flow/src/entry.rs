@@ -109,6 +109,31 @@ impl FlowState {
         self as usize
     }
 
+    /// A stable short name, for a metric label or a report line.
+    ///
+    /// [`Vacant`](Self::Vacant) is named rather than skipped: how much of the
+    /// table is free is the number an operator watches a flood against, and
+    /// deriving it by subtracting twelve series from a capacity nothing else
+    /// publishes would be a gauge nobody computes.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vacant => "vacant",
+            Self::SynSent => "syn_sent",
+            Self::SynReceived => "syn_received",
+            Self::Established => "established",
+            Self::FinWait => "fin_wait",
+            Self::CloseWait => "close_wait",
+            Self::Closing => "closing",
+            Self::TimeWait => "time_wait",
+            Self::Closed => "closed",
+            Self::UdpUnreplied => "udp_unreplied",
+            Self::UdpAssured => "udp_assured",
+            Self::IcmpUnreplied => "icmp_unreplied",
+            Self::IcmpReplied => "icmp_replied",
+        }
+    }
+
     /// Whether the flow has been confirmed in both directions, and so may never
     /// be taken back to make room for a new flow.
     ///

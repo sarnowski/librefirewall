@@ -72,6 +72,44 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
         "{POLICY_PACKETS}{{domain=\"forwarder\",verdict=\"denied\"}} {}\n",
         DENIED_PROBES + UNMATCHED_PROBES
     ));
+    // The connection tracker, as a fixture whose arithmetic closes: every packet
+    // it saw is one outcome or one refusal, exactly once, and the slots sum to
+    // the table's capacity with one flow in it. The classified figures make the
+    // accepting rule's hit count the openings alone — one packet carried by a
+    // flow, so the wire's total is one above the rule's.
+    family(&mut text, FLOW_SEEN, "counter", "Seen.");
+    text.push_str(&format!(
+        "{FLOW_SEEN}{{domain=\"forwarder\"}} {}\n",
+        forwarded.0 + forwarded.1 + DENIED_PROBES + UNMATCHED_PROBES
+    ));
+    family(&mut text, FLOW_PACKETS, "counter", "Classified.");
+    text.push_str(&format!(
+        "{FLOW_PACKETS}{{domain=\"forwarder\",outcome=\"new\"}} {}\n",
+        forwarded.0 + forwarded.1 + DENIED_PROBES + UNMATCHED_PROBES
+    ));
+    text.push_str(&format!(
+        "{FLOW_PACKETS}{{domain=\"forwarder\",outcome=\"established\"}} 0\n"
+    ));
+    text.push_str(&format!(
+        "{FLOW_PACKETS}{{domain=\"forwarder\",outcome=\"related\"}} 0\n"
+    ));
+    family(&mut text, FLOW_REFUSED, "counter", "Refused.");
+    for reason in lfw_metrics::FLOW_REFUSALS {
+        text.push_str(&format!(
+            "{FLOW_REFUSED}{{domain=\"forwarder\",reason=\"{reason}\"}} 0\n"
+        ));
+    }
+    family(&mut text, FLOW_ENTRIES, "gauge", "Slots.");
+    for state in lfw_metrics::FLOW_STATES {
+        let count = match state {
+            "vacant" => FLOW_CAPACITY as u64 - 1,
+            "udp_unreplied" => 1,
+            _ => 0,
+        };
+        text.push_str(&format!(
+            "{FLOW_ENTRIES}{{domain=\"forwarder\",state=\"{state}\"}} {count}\n"
+        ));
+    }
     family(
         &mut text,
         "librefirewall_policy_bytes_total",
@@ -263,6 +301,10 @@ fn witness() -> PolicyWitness {
             .expect("the shipped document declares an accepting and a dropping port rule"),
         probed_the_denying_rule: true,
         probed_the_fallthrough: true,
+        // The fixture body carries a tracker that classified something, and no
+        // TCP segment: the filter probe set injects three datagrams.
+        probed_an_established_flow: false,
+        probed_mid_stream: false,
     }
 }
 

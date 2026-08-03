@@ -42,6 +42,21 @@
      outcomes are distinguishable by drop reason and by per-rule counter, which
      is what `tools/xtask/src/forward_harness.rs` asserts.
 
+     THESE RULES ARE ABOUT WHICH FLOWS MAY OPEN, and nothing else. A packet an
+     existing flow already accounts for is forwarded before the filter is
+     consulted at all, so `probe-forward` decides the *first* packet of a
+     conversation and the rest of it travels on the flow that packet opened.
+     That is why there is no rule here about established traffic and no criterion
+     to write one with: a reply comes back because the appliance recognises the
+     conversation, not because a line of this document permits it.
+
+     What it costs is stated where it is paid: a packet the connection tracker
+     cannot keep state for — a fragment, a protocol it does not decode, a TCP
+     segment from the middle of a conversation it never saw begin — is refused
+     before the filter, so no rule here can permit one. And editing these rules
+     changes which conversations may *start*: it does not end one already
+     running.
+
      Its address is 10.0.2.15/24, which is not an arbitrary choice: QEMU's
      user-mode (SLIRP) stack places the guest at 10.0.2.15 with the gateway at
      10.0.2.2, so `make run` reaches this port with no extra configuration, and

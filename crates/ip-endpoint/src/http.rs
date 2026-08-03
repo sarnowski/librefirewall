@@ -154,8 +154,8 @@ const _: () = {
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 68_016);
-    assert!(RESPONSE_CAPACITY == 68_177);
+    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 76_407);
+    assert!(RESPONSE_CAPACITY == 76_568);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own

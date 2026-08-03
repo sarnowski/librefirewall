@@ -171,6 +171,48 @@ pub const RULE_HITS: Metric = metric(
      gave it. First match wins, so a packet is counted against one rule at most.",
 );
 
+// ── The connection tracker, on the forwarder that keeps it ──────────────────
+
+/// What the table made of the packets it was offered, which is the family that
+/// says whether state is doing anything at all: `established` climbing beside a
+/// flat `librefirewall_rule_hits_total` is a reply carried by its flow rather
+/// than by a rule, and that is the whole reason the table exists.
+pub const FLOW_PACKETS: Metric = metric(
+    "librefirewall_flow_packets_total",
+    Kind::Counter,
+    "Packets the connection tracker classified, by what it made of them. `new` opened a flow,      `established` advanced one the table already held, and `related` is an ICMP error reporting      on one. A packet counted here was not refused; a packet refused is in      `librefirewall_flow_packets_refused_total` and in neither of the two.",
+);
+
+pub const FLOW_PACKETS_SEEN: Metric = metric(
+    "librefirewall_flow_packets_seen_total",
+    Kind::Counter,
+    "Packets offered to the connection tracker, whatever became of them. The denominator the      classified and refused families are read against.",
+);
+
+pub const FLOW_PACKETS_REFUSED: Metric = metric(
+    "librefirewall_flow_packets_refused_total",
+    Kind::Counter,
+    "Packets the connection tracker turned away, by what refused them. `mid_stream` counts      attempts to walk around default deny by starting inside a conversation this appliance never      saw begin; `table_full` is the fail-closed answer to a connection flood and means legitimate      new connections are being refused.",
+);
+
+pub const FLOW_LIFECYCLE: Metric = metric(
+    "librefirewall_flow_lifecycle_total",
+    Kind::Counter,
+    "Flows that left the table, by what ended them. `expired` reached their state's idle timeout,      `evicted` were taken back under pressure and are never assured ones, `closed` were ended by      their own endpoints, and `withdrawn` were opened by a packet the filter then refused. There      is no `created`: a flow is created by exactly the packet counted as `new` above.",
+);
+
+pub const FLOW_TABLE_ENTRIES: Metric = metric(
+    "librefirewall_flow_table_entries",
+    Kind::Gauge,
+    "Slots of the connection table, by the state of the flow in each. `vacant` is how much room      is left, so the values sum to the table's capacity and a flood is watched as `vacant`      falling rather than as an occupancy needing a capacity nothing publishes.",
+);
+
+pub const FLOW_PROBE_COLLISIONS: Metric = metric(
+    "librefirewall_flow_probe_collisions_total",
+    Kind::Counter,
+    "Chain steps that reached an entry which was not the one looked up. Not a refusal — the walk      simply continued — and exposed because the ratio against      `librefirewall_flow_packets_seen_total` is what says whether the index is doing its job.",
+);
+
 // ── The recording tap, on the forwarder that fills it ───────────────────────
 
 pub const TAP_OBSERVATIONS: Metric = metric(
@@ -264,7 +306,7 @@ pub const INVARIANT_FAULTS: Metric = metric(
     "A domain's own broken bookkeeping; ours, never traffic, expected to stay zero. Each domain \
      raises its own faults and no other's: `rx_completion_unmapped`, `tx_completion_unmapped`, \
      `rx_slot_occupied` and `tx_slot_occupied` are a NIC driver's, `block_completion_unmapped` \
-     the recorder's.",
+     the recorder's, and `flow_slot_desync` the forwarder's.",
 );
 
 pub const DEVICE_FAULTS: Metric = metric(
@@ -672,6 +714,12 @@ pub const ALL_METRICS: &[&Metric] = &[
     &POLICY_PACKETS,
     &POLICY_BYTES,
     &RULE_HITS,
+    &FLOW_PACKETS,
+    &FLOW_PACKETS_SEEN,
+    &FLOW_PACKETS_REFUSED,
+    &FLOW_LIFECYCLE,
+    &FLOW_TABLE_ENTRIES,
+    &FLOW_PROBE_COLLISIONS,
     &TAP_OBSERVATIONS,
     &TAP_OBSERVATIONS_LOST,
     &RECEIVE_FRAMES,

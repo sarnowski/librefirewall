@@ -1346,6 +1346,12 @@ pub struct Frame<'a> {
     ipv4: &'a mut [u8; IPV4_HEADER_LEN],
     vlan: Option<VlanTag>,
     transport: Transport,
+    /// The IPv4 payload as the datagram's own total length bounds it, which is
+    /// the transport header and everything behind it and none of the Ethernet
+    /// padding. Kept because two things a decoded [`Transport`] does not carry
+    /// are read from it — a `SYN`'s option area and the datagram an ICMP error
+    /// quotes — and forwarding rewrites nothing in it.
+    payload: &'a [u8],
 }
 
 impl<'a> Frame<'a> {
@@ -1407,6 +1413,10 @@ impl<'a> Frame<'a> {
         };
 
         let (header, datagram_payload_len) = validate_ipv4(ipv4, payload.len(), available_for_ip)?;
+        // Shared for the frame's whole life from here on. The split above made
+        // it disjoint from the two headers this borrow keeps mutable, so a
+        // rewrite and a read of the payload cannot reach the same byte.
+        let payload: &'a [u8] = payload;
         // Everything past `total_length` is padding the sender's L3 disclaims,
         // so no transport field may be read from it.
         let Some(datagram_payload) = payload.get(..datagram_payload_len) else {
@@ -1423,6 +1433,7 @@ impl<'a> Frame<'a> {
             ipv4,
             vlan,
             transport,
+            payload: datagram_payload,
         })
     }
 
@@ -1454,6 +1465,18 @@ impl<'a> Frame<'a> {
     #[must_use]
     pub const fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// The IPv4 payload, bounded by the datagram's own total length: the
+    /// transport header and everything behind it, and none of the Ethernet
+    /// padding a short frame was extended with.
+    ///
+    /// Shared rather than mutable, and untouched by
+    /// [`rewrite_for_forwarding`](Self::rewrite_for_forwarding): what a router
+    /// changes is the two headers, so nothing here goes stale under an edit.
+    #[must_use]
+    pub const fn payload(&self) -> &'a [u8] {
+        self.payload
     }
 
     /// Apply, as one step, every edit forwarding this packet to a next hop
@@ -2616,6 +2639,27 @@ mod tests {
                 .expect("a TTL of 64 survives a hop");
             let reparsed = Frame::parse(&mut bytes).expect("a rewrite keeps the frame well-formed");
             prop_assert_eq!(reparsed.transport(), before);
+        }
+
+        /// The payload is exactly what the datagram's own total length claims,
+        /// whatever the link added behind it. A reader of it — the connection
+        /// tracker, which takes a `SYN`'s options and an ICMP quote from here
+        /// — must never see a byte the sender's L3 disclaimed, because
+        /// Ethernet padding on a short frame is bytes nobody wrote.
+        #[test]
+        fn the_payload_is_the_datagram_and_never_the_padding(
+            payload in prop::collection::vec(any::<u8>(), 0..64),
+            padding in prop::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let mut bytes = ipv4_frame(Protocol::UDP, &payload);
+            bytes.extend_from_slice(&padding);
+            let mut frame = Frame::parse(&mut bytes).expect("constructed well-formed");
+            prop_assert_eq!(frame.payload(), payload.as_slice());
+            // And a rewrite does not disturb it: forwarding changes the two
+            // headers, so a payload read before one is the payload after.
+            frame.rewrite_for_forwarding(MacAddress([1; 6]), MacAddress([2; 6]))
+                .expect("a TTL of 64 survives a hop");
+            prop_assert_eq!(frame.payload(), payload.as_slice());
         }
     }
 

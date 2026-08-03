@@ -27,6 +27,8 @@
 //! and a wrap would turn a sustained flood back into a small number — which is
 //! exactly the signal a counter of attacker-driven events exists to carry.
 
+use crate::{Classification, RefusalKind};
+
 /// Every outcome one table has produced.
 ///
 /// Public fields rather than accessors: this is a value a metrics endpoint reads
@@ -54,6 +56,11 @@ pub struct FlowCounters {
     /// Flows that reached `Closed` or `TimeWait` through the state machine —
     /// closed by their own endpoints rather than by this table.
     pub flows_closed: u64,
+    /// Flows given back because whatever asked for the classification then
+    /// refused the packet that opened them. On a default-deny appliance this
+    /// tracks refused connection attempts, so a number climbing beside
+    /// `flows_created` is a policy turning traffic away rather than a fault.
+    pub flows_withdrawn: u64,
 
     /// Packets of a protocol this tracker holds no state for.
     pub refused_unsupported_protocol: u64,
@@ -111,6 +118,7 @@ impl FlowCounters {
             flows_expired: 0,
             flows_evicted: 0,
             flows_closed: 0,
+            flows_withdrawn: 0,
             refused_unsupported_protocol: 0,
             refused_fragment: 0,
             refused_malformed: 0,
@@ -152,6 +160,45 @@ impl FlowCounters {
         self.flows_created
             .saturating_add(self.packets_established)
             .saturating_add(self.packets_related)
+    }
+
+    /// What one classification has accounted for.
+    ///
+    /// The one place a [`Classification`] and a field of this struct are
+    /// related, so a metric enumerating the vocabulary reads the same numbers
+    /// [`crate::FlowTable::classify`] wrote rather than a second table of them.
+    /// `New` reads `flows_created`, because a flow is created by exactly the
+    /// packet that opens it — one counter, not two.
+    #[must_use]
+    pub const fn classified(&self, classification: Classification) -> u64 {
+        match classification {
+            Classification::New => self.flows_created,
+            Classification::Established => self.packets_established,
+            Classification::Related => self.packets_related,
+        }
+    }
+
+    /// What one refusal kind has turned away.
+    ///
+    /// The one place a [`RefusalKind`] and a field of this struct are related,
+    /// so a metric enumerating the vocabulary reads the same numbers
+    /// [`crate::FlowTable::classify`] wrote rather than a second table of them.
+    #[must_use]
+    pub const fn refused(&self, kind: RefusalKind) -> u64 {
+        match kind {
+            RefusalKind::UnsupportedProtocol => self.refused_unsupported_protocol,
+            RefusalKind::Fragment => self.refused_fragment,
+            RefusalKind::Malformed => self.refused_malformed,
+            RefusalKind::InvalidFlags => self.refused_invalid_flags,
+            RefusalKind::MidStream => self.refused_mid_stream,
+            RefusalKind::InvalidState => self.refused_invalid_state,
+            RefusalKind::OutOfWindow => self.refused_out_of_window,
+            RefusalKind::NoSuchFlow => self.refused_no_flow,
+            RefusalKind::QuotedInvalid => self.refused_quoted_invalid,
+            RefusalKind::UnsupportedIcmp => self.refused_unsupported_icmp,
+            RefusalKind::TableFull => self.refused_table_full,
+            RefusalKind::BucketFull => self.refused_bucket_full,
+        }
     }
 
     /// Bump one count, saturating. A method rather than `+= 1` at forty call

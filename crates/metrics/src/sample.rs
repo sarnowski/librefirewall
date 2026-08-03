@@ -27,10 +27,11 @@ use crate::catalog::{
     CONFIGURATION_IMAGES, CONSOLE_RECORDS, DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES,
     ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US, ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST,
     ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED, ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS,
-    ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED, FORWARDED_FRAMES,
-    HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
-    HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
-    INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
+    ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS,
+    FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN, FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES,
+    FORWARDED_FRAMES, HTTP_EXPOSITIONS_REFUSED, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
+    HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
+    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
     POLICY_PACKETS, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
     RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
     RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
@@ -51,7 +52,7 @@ pub const PIPELINES: usize = 2;
 
 /// The pipeline's whole refusal vocabulary, in `pipeline::DropReason::ALL` order —
 /// which a test in `pd_runtime` holds this array to, name for name.
-pub const ROUTE_DROP_REASONS: [&str; 13] = [
+pub const ROUTE_DROP_REASONS: [&str; 25] = [
     "unconfigured_ingress_port",
     "interface_disabled",
     "not_addressed_to_us",
@@ -63,8 +64,67 @@ pub const ROUTE_DROP_REASONS: [&str; 13] = [
     "no_route",
     "egress_is_ingress",
     "no_neighbour",
+    "flow_unsupported_protocol",
+    "flow_fragment",
+    "flow_malformed",
+    "flow_invalid_flags",
+    "flow_mid_stream",
+    "flow_invalid_state",
+    "flow_out_of_window",
+    "flow_no_such_flow",
+    "flow_quoted_invalid",
+    "flow_unsupported_icmp",
+    "flow_table_full",
+    "flow_bucket_full",
     "policy_denied",
     "no_policy_match",
+];
+
+/// What the connection tracker made of a packet it did not refuse, in
+/// `lfw_flow::Classification::ALL` order — which a test in `pd_runtime` holds
+/// this array to, name for name. There is no `refused` value: a refusal is its
+/// own family, because merging the two would put "belongs to a conversation" and
+/// "was turned away" under one label an alert cannot separate.
+pub const FLOW_OUTCOMES: [&str; 3] = ["new", "established", "related"];
+
+/// Why the tracker turned a packet away, in `lfw_flow::RefusalKind::ALL` order —
+/// which a test in `pd_runtime` holds this array to, name for name.
+pub const FLOW_REFUSALS: [&str; 12] = [
+    "unsupported_protocol",
+    "fragment",
+    "malformed",
+    "invalid_flags",
+    "mid_stream",
+    "invalid_state",
+    "out_of_window",
+    "no_such_flow",
+    "quoted_invalid",
+    "unsupported_icmp",
+    "table_full",
+    "bucket_full",
+];
+
+/// What ended a flow. Deliberately without `created`, which is the `new` value of
+/// [`FLOW_OUTCOMES`] seen from the other side: one counter, one series.
+pub const FLOW_LIFECYCLE_EVENTS: [&str; 4] = ["expired", "evicted", "closed", "withdrawn"];
+
+/// The states a slot of the connection table can be in, in
+/// `lfw_flow::FlowState::ALL` order — which a test in `pd_runtime` holds this
+/// array to. `vacant` is one of them; see the family's help text.
+pub const FLOW_STATES: [&str; 13] = [
+    "vacant",
+    "syn_sent",
+    "syn_received",
+    "established",
+    "fin_wait",
+    "close_wait",
+    "closing",
+    "time_wait",
+    "closed",
+    "udp_unreplied",
+    "udp_assured",
+    "icmp_unreplied",
+    "icmp_replied",
 ];
 
 /// What the routing *stage* refuses around the router's decision: a descriptor, a
@@ -151,10 +211,32 @@ impl Default for PolicySample {
     }
 }
 
+/// What the connection tracker has done, which is one account for the whole
+/// domain rather than one per direction: a flow spans both, so a per-pipeline
+/// split would be two half-views of one conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowSample {
+    pub packets_seen: u64,
+    pub outcomes: [u64; FLOW_OUTCOMES.len()],
+    pub refusals: [u64; FLOW_REFUSALS.len()],
+    pub lifecycle: [u64; FLOW_LIFECYCLE_EVENTS.len()],
+    pub entries: [u64; FLOW_STATES.len()],
+    pub probe_collisions: u64,
+    pub slot_desync: u64,
+}
+
+/// Slots [`FlowSample`] occupies.
+pub const FLOW_SLOTS: usize = 1
+    + FLOW_OUTCOMES.len()
+    + FLOW_REFUSALS.len()
+    + FLOW_LIFECYCLE_EVENTS.len()
+    + FLOW_STATES.len()
+    + 2;
+
 /// Slots [`ForwarderSample`]'s own **table** occupies — the series the catalogue
 /// names, and so the slot the per-rule block starts at.
 pub const FORWARDER_SLOTS: usize =
-    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 12;
+    PIPELINES * (1 + ROUTE_DROP_REASONS.len() + ROUTE_STAGE_DROP_REASONS.len()) + 12 + FLOW_SLOTS;
 
 /// Where a rule's hit counter sits: its position in the running generation,
 /// offset past the table above.
@@ -179,6 +261,7 @@ pub struct ForwarderSample {
     pub images_applied: u64,
     pub images_refused: u64,
     pub policy: PolicySample,
+    pub flow: FlowSample,
     pub tap: TapSample,
     pub log: LogSample,
 }
@@ -262,6 +345,90 @@ impl ForwarderSample {
             &[
                 Label::new("pipeline", "0"),
                 Label::new("reason", "no_neighbour"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_unsupported_protocol"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_fragment"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_malformed"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_invalid_flags"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_mid_stream"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_invalid_state"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_out_of_window"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_no_such_flow"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_quoted_invalid"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_unsupported_icmp"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_table_full"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "0"),
+                Label::new("reason", "flow_bucket_full"),
             ],
         ),
         s(
@@ -424,6 +591,90 @@ impl ForwarderSample {
             &ROUTE_DROPS,
             &[
                 Label::new("pipeline", "1"),
+                Label::new("reason", "flow_unsupported_protocol"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_fragment"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_malformed"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_invalid_flags"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_mid_stream"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_invalid_state"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_out_of_window"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_no_such_flow"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_quoted_invalid"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_unsupported_icmp"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_table_full"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
+                Label::new("reason", "flow_bucket_full"),
+            ],
+        ),
+        s(
+            &ROUTE_DROPS,
+            &[
+                Label::new("pipeline", "1"),
                 Label::new("reason", "policy_denied"),
             ],
         ),
@@ -508,6 +759,74 @@ impl ForwarderSample {
         s(&POLICY_PACKETS, &[Label::new("verdict", "denied")]),
         s(&POLICY_BYTES, &[Label::new("verdict", "accepted")]),
         s(&POLICY_BYTES, &[Label::new("verdict", "denied")]),
+        // The connection tracker. No `pipeline` label either, and for the
+        // filter's reason twice over: one table serves both directions because
+        // a flow *is* both directions.
+        plain(&FLOW_PACKETS_SEEN),
+        s(&FLOW_PACKETS, &[Label::new("outcome", "new")]),
+        s(&FLOW_PACKETS, &[Label::new("outcome", "established")]),
+        s(&FLOW_PACKETS, &[Label::new("outcome", "related")]),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "unsupported_protocol")],
+        ),
+        s(&FLOW_PACKETS_REFUSED, &[Label::new("reason", "fragment")]),
+        s(&FLOW_PACKETS_REFUSED, &[Label::new("reason", "malformed")]),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "invalid_flags")],
+        ),
+        s(&FLOW_PACKETS_REFUSED, &[Label::new("reason", "mid_stream")]),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "invalid_state")],
+        ),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "out_of_window")],
+        ),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "no_such_flow")],
+        ),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "quoted_invalid")],
+        ),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "unsupported_icmp")],
+        ),
+        s(&FLOW_PACKETS_REFUSED, &[Label::new("reason", "table_full")]),
+        s(
+            &FLOW_PACKETS_REFUSED,
+            &[Label::new("reason", "bucket_full")],
+        ),
+        s(&FLOW_LIFECYCLE, &[Label::new("event", "expired")]),
+        s(&FLOW_LIFECYCLE, &[Label::new("event", "evicted")]),
+        s(&FLOW_LIFECYCLE, &[Label::new("event", "closed")]),
+        s(&FLOW_LIFECYCLE, &[Label::new("event", "withdrawn")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "vacant")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "syn_sent")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "syn_received")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "established")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "fin_wait")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "close_wait")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "closing")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "time_wait")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "closed")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "udp_unreplied")]),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "udp_assured")]),
+        s(
+            &FLOW_TABLE_ENTRIES,
+            &[Label::new("state", "icmp_unreplied")],
+        ),
+        s(&FLOW_TABLE_ENTRIES, &[Label::new("state", "icmp_replied")]),
+        plain(&FLOW_PROBE_COLLISIONS),
+        s(
+            &INVARIANT_FAULTS,
+            &[Label::new("fault", "flow_slot_desync")],
+        ),
         plain(&TAP_OBSERVATIONS),
         s(&TAP_OBSERVATIONS_LOST, &[Label::new("reason", "ring_full")]),
         s(
@@ -538,6 +857,13 @@ impl ForwarderSample {
         put(&mut values, &mut at, self.policy.denied_packets);
         put(&mut values, &mut at, self.policy.accepted_bytes);
         put(&mut values, &mut at, self.policy.denied_bytes);
+        put(&mut values, &mut at, self.flow.packets_seen);
+        put_all(&mut values, &mut at, &self.flow.outcomes);
+        put_all(&mut values, &mut at, &self.flow.refusals);
+        put_all(&mut values, &mut at, &self.flow.lifecycle);
+        put_all(&mut values, &mut at, &self.flow.entries);
+        put(&mut values, &mut at, self.flow.probe_collisions);
+        put(&mut values, &mut at, self.flow.slot_desync);
         put(&mut values, &mut at, self.tap.observed);
         put(&mut values, &mut at, self.tap.dropped);
         put(&mut values, &mut at, self.tap.refused);

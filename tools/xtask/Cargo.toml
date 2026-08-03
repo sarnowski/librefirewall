@@ -63,6 +63,10 @@ lfw-metrics = { path = "../../crates/metrics" }
 # the curl scenario compares fields against the appliance's own vocabulary
 # rather than against literals beside it.
 lfw-http = { path = "../../crates/http" }
+# The connection table's capacity, which the metrics scenario sums the occupancy
+# gauge against. A literal here would let the harness agree with itself about a
+# number the appliance is the only source of.
+lfw-flow = { path = "../../crates/flow" }
 # The block driver's three region extents, which `sysdesc` compares the
 # recorder's grants against, and — for the QEMU harness — the sector and the
 # pattern its boot-time proof commits to the data disk. The harness reads that

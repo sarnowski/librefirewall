@@ -76,7 +76,9 @@ use lfw_hpet::MMIO_REGION_SIZE;
 use lfw_metrics::{MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, STATS_REGION_SIZE};
 use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
-use pd_runtime::{FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE};
+use pd_runtime::{
+    FLOW_TABLE_REGION_SIZE, FORWARD_REGION_SIZE, POOL_REGION_SIZE, RETURN_REGION_SIZE,
+};
 use uart_16550::{COM1_BASE, PORT_COUNT as COM1_PORT_COUNT};
 use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
@@ -320,6 +322,24 @@ const RECORDER_DEVICE_WITHHELD: &str = "the recorder is the only domain that map
      is withheld from the management domain deliberately rather than by omission: a download is \
      answered out of `dl_reply`, a bounded copy the recorder composed, because a read grant here \
      would expose whatever that domain happened to be staging at the time";
+
+/// What the connection table's single mapper buys, quoted into the finding on it
+/// gaining a second one.
+///
+/// This is the one exclusion in this table that a *soundness* argument rests on
+/// rather than an isolation one. Everywhere else a second mapper would widen
+/// authority; here it would make the forwarder's `&mut` to the region undefined
+/// behaviour, because that borrow's whole justification is that no other holder
+/// of those bytes exists.
+const FLOW_TABLE_WITHHELD: &str = "the forwarder is the ONLY domain that maps the connection \
+     table, and it is the only region in this system a domain borrows MUTABLY. Every other region \
+     is shared, so its type exposes no safe path to its own bytes and a `&` is sound whatever the \
+     peers do; a `FlowTable` is an ordinary Rust value with methods taking `&mut self`, and \
+     `pd_runtime::attach_flow_table!` forms a `&mut` to it on the strength of this row naming one \
+     grant. A second mapper of any kind — read-only included — would make that reference \
+     undefined rather than merely contended, so this is not an isolation preference but the \
+     premise of the borrow. It also carries no `phys_addr`, so no driver can be handed its \
+     address and no device can reach it by DMA either";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -744,6 +764,18 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("config"), read_write("forwarder")],
         withheld: Some(CONFIG_ACK_WITHHELD),
+    },
+    // The connection table: one region, one mapper, and the only `&mut` borrow of
+    // a region anywhere in this system.
+    RegionRule {
+        name: "flow_table",
+        size: ExpectedSize {
+            rust_name: "pd_runtime::FLOW_TABLE_REGION_SIZE",
+            bytes: FLOW_TABLE_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("forwarder")],
+        withheld: Some(FLOW_TABLE_WITHHELD),
     },
     // The capture tap, and the download handover: two more two-region handovers
     // built the way `cfg`/`cfgack` and every log ring are, and read here the same

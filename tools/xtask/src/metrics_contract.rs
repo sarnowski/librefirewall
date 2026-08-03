@@ -52,6 +52,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
+use lfw_flow::FLOW_CAPACITY;
 use lfw_http::{METRICS_CONTENT_TYPE, Status};
 
 use crate::forward_harness::PolicyWitness;
@@ -77,6 +78,16 @@ const POLICY_PACKETS: &str = "librefirewall_policy_packets_total";
 /// Where the two refusals are told apart: the fallthrough is not a rule and has
 /// no counter, so the reason is the only place the default deny appears.
 const ROUTE_DROPS: &str = "librefirewall_route_drops_total";
+
+/// What the connection tracker made of the packets it was offered.
+const FLOW_PACKETS: &str = "librefirewall_flow_packets_total";
+
+/// Packets it was offered at all, and what it turned away.
+const FLOW_SEEN: &str = "librefirewall_flow_packets_seen_total";
+const FLOW_REFUSED: &str = "librefirewall_flow_packets_refused_total";
+
+/// Slots of the table, by the state of the flow in each.
+const FLOW_ENTRIES: &str = "librefirewall_flow_table_entries";
 
 /// Metric families the scrape must carry, one per subsystem this change made
 /// observable. Deliberately not the whole catalogue — `lfw_metrics`' own tests
@@ -512,13 +523,36 @@ fn judge_policy(
     asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "policy_denied")]));
     asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "no_policy_match")]));
 
+    // What the tracker carried without the filter, summed as a reader must: the
+    // node publishes no total, and these two are the whole of what reaches a
+    // dataplane egress under a decision no rule made.
+    let classified = |outcome: &str| -> Result<u64, String> {
+        Ok(one(exposition, FLOW_PACKETS, &[("outcome", outcome)])?.value)
+    };
+    let established = classified("established")?;
+    let related = classified("related")?;
+    let carried_by_state = established.saturating_add(related);
+    asserted.extend(exposition.select(FLOW_PACKETS, &[("outcome", "established")]));
+    asserted.extend(exposition.select(FLOW_PACKETS, &[("outcome", "related")]));
+    let opened = forwarded_frames.checked_sub(carried_by_state).ok_or_else(|| {
+        format!(
+            "the tracker reports {carried_by_state} packets carried by an existing flow and the \
+             harness observed only {forwarded_frames} frames come back, so more was forwarded \
+             under a flow than left the appliance at all"
+        )
+    })?;
+
     for (rule, expected, measured) in [
         (
             witness.policy.accepted,
-            forwarded_frames,
-            String::from(
-                "frames the harness observed coming back on its two dataplane sockets, every one \
-                 of which passed this rule",
+            opened,
+            format!(
+                "frames the harness observed coming back on its two dataplane sockets \
+                 ({forwarded_frames}), less the {carried_by_state} the connection tracker carried \
+                 without consulting the filter at all ({established} established, {related} \
+                 related). What is left is the packets that OPENED a flow, and every one of those \
+                 passed this rule — which is the whole of what makes a stateful policy different \
+                 from a stateless one: a reply is forwarded under no rule's name"
             ),
         ),
         (
@@ -597,8 +631,11 @@ fn judge_policy(
     for (labels, expected, what) in [
         (
             [("verdict", "accepted")],
-            forwarded_frames,
-            String::from("frames the harness observed forwarded"),
+            opened,
+            String::from(
+                "frames the harness observed forwarded, less the ones an existing flow accounted \
+                 for — the filter is not consulted for those, so it counts neither of them",
+            ),
         ),
         (
             [("verdict", "denied")],
@@ -615,6 +652,124 @@ fn judge_policy(
         }
         asserted.push(sample);
     }
+    asserted.extend(judge_flow_table(exposition, forwarded_frames, witness)?);
+    Ok(asserted)
+}
+
+/// Hold the connection tracker's own account of itself together, and to the
+/// wire.
+///
+/// Three things, and each of them is an arithmetic identity the appliance cannot
+/// satisfy by accident:
+///
+/// **Every packet it was offered went exactly one way.** `packets_seen` is the
+/// classified outcomes plus the refusals, summed over both vocabularies — so a
+/// packet counted twice, or counted under no outcome at all, shows up here and
+/// nowhere else.
+///
+/// **The table's slots sum to its capacity.** Occupancy is maintained as flows
+/// move rather than scanned, so a state transition that moved a flow without
+/// moving its count is a total that has drifted from the width of the array.
+/// `vacant` is one of the states, which is what makes the sum a constant a
+/// reader can check without a capacity series to compare against.
+///
+/// **It saw at least what came back.** Every frame the harness observed forwarded
+/// passed through the tracker, so the packets it was offered cannot be fewer.
+///
+/// # Errors
+/// The verdict, naming the identity and the numbers that broke it.
+fn judge_flow_table(
+    exposition: &Exposition,
+    forwarded_frames: u64,
+    witness: PolicyWitness,
+) -> Result<Vec<&Sample>, String> {
+    let mut asserted = Vec::new();
+    let seen = one(exposition, FLOW_SEEN, &[])?;
+
+    let classified: u64 = exposition
+        .select(FLOW_PACKETS, &[])
+        .iter()
+        .map(|sample| sample.value)
+        .sum();
+    let refused_series = exposition.select(FLOW_REFUSED, &[]);
+    if refused_series.is_empty() {
+        return Err(format!(
+            "{FLOW_REFUSED} carries no series, so what the tracker turned away cannot be told \
+             from what it classified"
+        ));
+    }
+    let refused: u64 = refused_series.iter().map(|sample| sample.value).sum();
+    if seen.value != classified.saturating_add(refused) {
+        return Err(format!(
+            "{FLOW_SEEN} reports {} and the outcomes account for {classified} classified plus \
+             {refused} refused. Every packet offered to the tracker is one or the other, exactly \
+             once, so a disagreement is a packet counted twice or a packet counted under nothing",
+            seen.value
+        ));
+    }
+    if seen.value < forwarded_frames {
+        return Err(format!(
+            "{FLOW_SEEN} reports {} and the harness observed {forwarded_frames} frames come back. \
+             Every forwarded frame passed the tracker, so it cannot have seen fewer",
+            seen.value
+        ));
+    }
+
+    let entries = exposition.select(FLOW_ENTRIES, &[]);
+    if entries.is_empty() {
+        return Err(format!("{FLOW_ENTRIES} carries no series"));
+    }
+    let occupancy: u64 = entries.iter().map(|sample| sample.value).sum();
+    if occupancy != FLOW_CAPACITY as u64 {
+        return Err(format!(
+            "{FLOW_ENTRIES} sums to {occupancy} over {} series and the table holds \
+             {FLOW_CAPACITY} slots. `vacant` is one of the states, so the sum is the capacity \
+             exactly — a smaller one is a flow whose state moved without its count",
+            entries.len()
+        ));
+    }
+
+    // And what this boot's probes oblige the tracker to have decided.
+    //
+    // The `established` half is one-directional on purpose: every set reaches it,
+    // because a probe re-injected before its delivery was observed is a second
+    // packet of the flow the first one opened. What the stateful set adds is a
+    // packet no rule permits, so the rise is evidence rather than a side effect.
+    let established = one(exposition, FLOW_PACKETS, &[("outcome", "established")])?;
+    if witness.probed_an_established_flow && established.value == 0 {
+        return Err(format!(
+            "the boot injected a reply to a request that went first and \
+             {FLOW_PACKETS}{{outcome=\"established\"}} reports zero, so nothing was carried by \
+             the flow it belongs to — which is the only mechanism that could have carried it, no \
+             rule of this document naming the port it is addressed to"
+        ));
+    }
+
+    // The mid-stream refusal is asserted both ways: no probe in any other set is
+    // a TCP segment at all, so a refusal on a boot that injected none is a frame
+    // nobody put on the wire.
+    let mid_stream = one(exposition, FLOW_REFUSED, &[("reason", "mid_stream")])?;
+    if witness.probed_mid_stream && mid_stream.value == 0 {
+        return Err(format!(
+            "the boot injected a bare ACK for a five-tuple nothing opened and \
+             {FLOW_REFUSED}{{reason=\"mid_stream\"}} reports zero, so the segment was adopted \
+             into a flow rather than refused — which is a way around default deny that costs an \
+             attacker one packet"
+        ));
+    }
+    if !witness.probed_mid_stream && mid_stream.value != 0 {
+        return Err(format!(
+            "{FLOW_REFUSED}{{reason=\"mid_stream\"}} reports {} and this boot injected no TCP \
+             segment at all, so the refusal is a frame nobody sent or a datagram refused under a \
+             segment's reason",
+            mid_stream.value
+        ));
+    }
+
+    asserted.push(seen);
+    asserted.push(established);
+    asserted.push(mid_stream);
+    asserted.extend(entries);
     Ok(asserted)
 }
 

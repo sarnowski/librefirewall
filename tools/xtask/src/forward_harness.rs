@@ -275,6 +275,71 @@ const DESTINATION_PORT: u16 = 5000;
 /// takes so the decrement is visible rather than decisive.
 const INJECTED_TTL: u8 = 64;
 
+/// A TCP-over-IPv4 Ethernet frame as fields, for the one probe that has to be a
+/// TCP segment rather than a datagram: a packet from the middle of a conversation
+/// the appliance never saw begin.
+///
+/// Written from RFC 793 here rather than reused from the appliance's own builder,
+/// exactly as the management client's segment is: a frame composed by the code
+/// under test and judged against that code's expectation would agree with itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TcpPacket {
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    source: [u8; 4],
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    /// The eight flag bits as they sit in the header. A bare `ACK` is 0x10, which
+    /// is the shape a segment from mid-conversation has.
+    flags: u8,
+    ttl: u8,
+    payload: Vec<u8>,
+}
+
+impl TcpPacket {
+    /// Serialize to the bytes an endpoint's NIC would put on the wire, padded to
+    /// the Ethernet minimum on [`UdpPacket::build`]'s terms.
+    fn build(&self) -> Vec<u8> {
+        let mut segment = Vec::with_capacity(TCP_HEADER_LEN + self.payload.len());
+        segment.extend_from_slice(&self.source_port.to_be_bytes());
+        segment.extend_from_slice(&self.destination_port.to_be_bytes());
+        // A plausible sequence and acknowledgement. Their values decide nothing
+        // here: an unknown five-tuple is refused for its *flags* before any
+        // window is consulted, which is the whole point of the probe.
+        segment.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        segment.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        // Five words of header and no options.
+        segment.push(5 << 4);
+        segment.push(self.flags);
+        segment.extend_from_slice(&0xffffu16.to_be_bytes());
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        segment.extend_from_slice(&self.payload);
+        let checksum = tcp_checksum(&self.source, &self.destination, &segment);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::with_capacity(MIN_UDP_FRAME + segment.len());
+        frame.extend_from_slice(&self.destination_mac);
+        frame.extend_from_slice(&self.source_mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+        ip[8] = self.ttl;
+        ip[9] = TCP_PROTOCOL;
+        ip[12..16].copy_from_slice(&self.source);
+        ip[16..20].copy_from_slice(&self.destination);
+        let header = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&header.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&segment);
+        if frame.len() < MIN_UDP_FRAME {
+            frame.resize(MIN_UDP_FRAME, 0);
+        }
+        frame
+    }
+}
+
 /// A UDP-over-IPv4 Ethernet frame as fields: what an endpoint puts on the wire,
 /// and — with the next hop's MAC pair and one less TTL — the shape the routed
 /// result must have.
@@ -582,6 +647,17 @@ struct Probe {
     /// `crates/pd-runtime/src/lib.rs` are where that happens, and the comment
     /// there says so. Only [`legacy_broadcast_frame`] is such a frame here.
     observed: bool,
+    /// Whether this probe may only be injected once every *immediate* probe that
+    /// must be delivered has arrived.
+    ///
+    /// The one thing a stateful contract needs that a stateless one does not:
+    /// order. A reply belongs to a flow, so it is only a reply if the request
+    /// opened one first — injected alongside the request it would race it, be
+    /// classified as a connection nothing permits, and be refused. Deferring it
+    /// makes "the appliance carried this because it recognised the conversation"
+    /// a statement about what was on the wire rather than about whichever frame
+    /// QEMU happened to deliver first.
+    deferred: bool,
 }
 
 impl Probe {
@@ -1016,6 +1092,7 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
             // field exists: the router's parser cannot read it, so it is
             // discarded before a decision the tap could record.
             observed: false,
+            deferred: false,
         },
     ])
 }
@@ -1040,6 +1117,16 @@ pub enum Traffic {
     /// by a rule, and denied by the fallthrough. Every one of them is perfectly
     /// routable, so the only thing that separates their fates is the policy.
     Policy,
+    /// The set only a *stateful* appliance can pass, and the one no rule of the
+    /// shipped policy permits more than half of.
+    ///
+    /// A request, then its reply — and the reply is carried although the document
+    /// names nothing about the port it is addressed to. Beside it, the same
+    /// packet with no request in front of it, which must be refused, and a TCP
+    /// segment from the middle of a conversation, which must be refused as such
+    /// rather than adopted. Every one of the four is perfectly routable, so what
+    /// separates their fates is the connection table and nothing else.
+    Stateful,
 }
 
 /// What the injected probes oblige the appliance's filter to have counted.
@@ -1067,6 +1154,20 @@ pub struct PolicyWitness {
     /// Whether any probe was injected to a port no rule names, which only the
     /// fallthrough can refuse.
     pub probed_the_fallthrough: bool,
+    /// Whether the boot injected a packet an *existing flow* had to account for
+    /// — a reply to a request that went first.
+    ///
+    /// Every probe set reaches this, because a probe re-injected before its
+    /// delivery was observed is a second packet of a flow the first one opened.
+    /// What only the stateful set does is reach it *deliberately*, with a packet
+    /// no rule permits, so the counter it raises is evidence rather than a side
+    /// effect — which is why the assertion this drives is one-directional.
+    pub probed_an_established_flow: bool,
+    /// Whether the boot injected a TCP segment from the middle of a conversation
+    /// nothing opened. Both directions are asserted on this one: no other probe
+    /// in any set is a TCP segment at all, so a refusal on a boot that injected
+    /// none is a frame nobody put on the wire.
+    pub probed_mid_stream: bool,
 }
 
 /// The probes one boot injects, and what they oblige the filter to have counted.
@@ -1078,7 +1179,7 @@ fn injected_probes(
     traffic: Traffic,
 ) -> Result<(Vec<Probe>, PolicyWitness), String> {
     let policy = topology.port_policy().map_err(|error| error.to_string())?;
-    let (probes, touches_the_filter) = match traffic {
+    let (probes, touches_the_filter, stateful) = match traffic {
         // Not one of the six names a port the dropping rule is about, and none of
         // them falls past the last rule: the four refusals are the admission and
         // routing stages', decided before the filter is consulted, and the two
@@ -1086,17 +1187,111 @@ fn injected_probes(
         // both of the filter's refusal counters to still read zero, which is as
         // strong a statement as a rise and is only available from a set that
         // provokes neither.
-        Traffic::Routed => (probes(topology)?, false),
-        Traffic::Policy => (policy_probes(topology, policy), true),
+        Traffic::Routed => (probes(topology)?, false, false),
+        Traffic::Policy => (policy_probes(topology, policy), true, false),
+        // The fallthrough, but not the dropping rule: the unsolicited packet
+        // falls past every rule, and nothing in this set is addressed to the port
+        // the dropping rule names.
+        Traffic::Stateful => (stateful_probes(topology, policy), false, true),
     };
     Ok((
         probes,
         PolicyWitness {
             policy,
             probed_the_denying_rule: touches_the_filter,
-            probed_the_fallthrough: touches_the_filter,
+            probed_the_fallthrough: touches_the_filter || stateful,
+            probed_an_established_flow: stateful,
+            probed_mid_stream: stateful,
         },
     ))
+}
+
+/// A request, its reply, an unsolicited packet in the reply direction, and a TCP
+/// segment from mid-conversation.
+///
+/// **The reply is the whole point.** It is addressed to the port the request came
+/// *from*, and the document says nothing about that port in either direction — so
+/// a stateless filter could only carry it by naming it in a rule of its own, and
+/// this appliance carries it because the request opened a flow it belongs to.
+/// `librefirewall_flow_packets_total{outcome="established"}` is what says so, and
+/// `librefirewall_rule_hits_total` is what says no rule did.
+///
+/// The other two are what keep that from being a hole. The unsolicited packet has
+/// the same *shape* as the reply — reply direction, out of the port the accepting
+/// rule names — and no request in front of it, so it falls past every rule to the
+/// default deny. And a bare `ACK` for a five-tuple nothing opened must be refused
+/// as mid-stream rather than adopted, which is the one packet that would otherwise
+/// buy an attacker a way around default deny.
+///
+/// The reply's destination port is the request's source port and the unsolicited
+/// packet's is one above it, so the two are different five-tuples and the second
+/// cannot be answered by the first's flow. Both come from `policy` rather than
+/// from a literal, so a document that renamed its ports is asserted against its
+/// own text.
+fn stateful_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
+    let [a, b] = topology.endpoints();
+    let permitted = policy.accepted.destination_port;
+    let request = UdpPacket {
+        destination_port: permitted,
+        payload: b"LFW-PROBE/stateful-request".to_vec(),
+        ..datagram(a, b, INJECTED_TTL, b"LFW-PROBE/stateful-request")
+    };
+    // The reply: source and destination exchanged, which is what makes it the
+    // same flow rather than a second one.
+    let reply = |marker: &'static [u8], destination_port: u16| UdpPacket {
+        source_port: permitted,
+        destination_port,
+        payload: marker.to_vec(),
+        ..datagram(b, a, INJECTED_TTL, marker)
+    };
+    vec![
+        routed(
+            "stateful-request",
+            b"LFW-PROBE/stateful-request",
+            a,
+            b,
+            request,
+        ),
+        routed_after(
+            "stateful-reply",
+            b"LFW-PROBE/stateful-reply",
+            b,
+            a,
+            reply(b"LFW-PROBE/stateful-reply", SOURCE_PORT),
+        ),
+        dropped(
+            "stateful-unsolicited",
+            b"LFW-PROBE/stateful-unsolicited",
+            b,
+            "it is the reply direction with no request in front of it, so it opens a flow no rule \
+             permits and falls to the default deny",
+            reply(
+                b"LFW-PROBE/stateful-unsolicited",
+                SOURCE_PORT.saturating_add(1),
+            ),
+        ),
+        dropped_frame(
+            "stateful-mid-stream",
+            b"LFW-PROBE/stateful-mid-stream",
+            a,
+            "it is a bare ACK for a five-tuple nothing opened, which the tracker refuses rather \
+             than adopting",
+            TcpPacket {
+                destination_mac: a.gateway_mac,
+                source_mac: a.mac,
+                source: a.address,
+                destination: b.address,
+                source_port: SOURCE_PORT,
+                destination_port: permitted,
+                // A bare `ACK`: the shape of a segment from the middle of a
+                // conversation.
+                flags: 0x10,
+                ttl: INJECTED_TTL,
+                payload: b"LFW-PROBE/stateful-mid-stream".to_vec(),
+            }
+            .build(),
+        ),
+    ]
 }
 
 /// One probe per outcome the filter can reach, differing in the one field that
@@ -1188,6 +1383,21 @@ fn routed(
         // Built from a [`UdpPacket`], so the router parses it and reaches a
         // decision on it — which is what the tap records.
         observed: true,
+        deferred: false,
+    }
+}
+
+/// A routed probe that may only go out once the immediate ones have arrived.
+fn routed_after(
+    name: &'static str,
+    marker: &'static [u8],
+    from: Endpoint,
+    to: Endpoint,
+    sent: UdpPacket,
+) -> Probe {
+    Probe {
+        deferred: true,
+        ..routed(name, marker, from, to, sent)
     }
 }
 
@@ -1208,6 +1418,29 @@ fn dropped(
         // a frame the parser cannot read at all escapes observation, and every
         // probe built from a [`UdpPacket`] parses.
         observed: true,
+        deferred: false,
+    }
+}
+
+/// A probe that must be refused, carrying a frame this harness built itself
+/// rather than a [`UdpPacket`].
+fn dropped_frame(
+    name: &'static str,
+    marker: &'static [u8],
+    from: Endpoint,
+    because: &'static str,
+    frame: Vec<u8>,
+) -> Probe {
+    Probe {
+        name,
+        marker,
+        from,
+        frame,
+        expectation: Expectation::Dropped { because },
+        // A TCP segment over well-formed IPv4 parses, so the router reaches a
+        // decision on it and the tap records that decision with its reason.
+        observed: true,
+        deferred: false,
     }
 }
 
@@ -2931,7 +3164,11 @@ fn run_boot(
         // management frames are the exception and wait, for the reason given at
         // the point they are sent.
         let mut last_injection = Instant::now();
-        inject_probes(&mut endpoints, &probes, |_| true);
+        // Whether the deferred probes have gone out yet. They are what a stateful
+        // contract needs and a stateless one has none of, so on every other
+        // scenario this is true from the start and the arm below never fires.
+        let mut deferred_injected = !probes.iter().any(|probe| probe.deferred);
+        inject_probes(&mut endpoints, &probes, |probe| !probe.deferred);
 
         // Phase 2: watch both ports and the serial channel, re-injecting
         // periodically, until the contract is decided.
@@ -3084,6 +3321,19 @@ fn run_boot(
                     // before its port has posted a receive buffer being lost
                     // rather than queued. Neither implies the other: the
                     // management port takes no part in forwarding.
+                    // The deferred probes, once every immediate one that must be
+                    // delivered has arrived. This is where a reply becomes a
+                    // reply: the flow it belongs to now exists, because the
+                    // request that opened it has been observed coming out the far
+                    // side. Before the refusals below, so the settle window still
+                    // starts after everything has been injected.
+                    None if !deferred_injected
+                        && all_routed_among(&probes, &deliveries, |probe| !probe.deferred) =>
+                    {
+                        deferred_injected = true;
+                        last_injection = Instant::now();
+                        inject_probes(&mut endpoints, &probes, |probe| probe.deferred);
+                    }
                     None if all_routed(&probes, &deliveries)
                         && management_contract::ports_are_ready(&output) =>
                     {
@@ -3257,7 +3507,8 @@ fn run_boot(
             if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 inject_probes(&mut endpoints, &probes, |probe| {
-                    !is_delivered(&probes, &deliveries, probe)
+                    (deferred_injected || !probe.deferred)
+                        && !is_delivered(&probes, &deliveries, probe)
                 });
             }
             thread::sleep(Duration::from_millis(25));
@@ -3335,10 +3586,25 @@ fn run_boot(
 
 /// Whether every probe that must be routed has arrived and been accepted.
 fn all_routed(probes: &[Probe], deliveries: &[Option<Delivery>]) -> bool {
+    all_routed_among(probes, deliveries, |_| true)
+}
+
+/// Whether every probe the filter admits that must be delivered has been.
+///
+/// The filtered form [`all_routed`] is the total case of: a stateful set has to
+/// ask the question of its *immediate* probes alone, because the deferred ones
+/// cannot arrive before they have been sent.
+fn all_routed_among(
+    probes: &[Probe],
+    deliveries: &[Option<Delivery>],
+    admits: impl Fn(&Probe) -> bool,
+) -> bool {
     probes
         .iter()
         .zip(deliveries)
-        .filter(|(probe, _)| matches!(probe.expectation, Expectation::Routed { .. }))
+        .filter(|(probe, _)| {
+            matches!(probe.expectation, Expectation::Routed { .. }) && admits(probe)
+        })
         .all(|(_, seen)| seen.is_some())
 }
 

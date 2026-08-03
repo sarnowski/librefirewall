@@ -127,7 +127,7 @@ pub const TAP_FLAGS_KNOWN: u32 = TAP_FLAG_OUTBOUND;
 /// reverse edge for good. [`TapDropReason`] mirrors that enum the way
 /// [`crate::LogRecord`] mirrors `lfw_log::Event` — as integers, in the source
 /// enum's declaration order, offset by one so zero can mean *no reason*.
-pub const TAP_DROP_REASON_COUNT: u32 = 13;
+pub const TAP_DROP_REASON_COUNT: u32 = 25;
 
 /// Bytes the system description reserves for one records region, derived rather
 /// than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
@@ -219,6 +219,18 @@ pub enum TapDropReason {
     NoRoute,
     EgressIsIngress,
     NoNeighbour,
+    FlowUnsupportedProtocol,
+    FlowFragment,
+    FlowMalformed,
+    FlowInvalidFlags,
+    FlowMidStream,
+    FlowInvalidState,
+    FlowOutOfWindow,
+    FlowNoSuchFlow,
+    FlowQuotedInvalid,
+    FlowUnsupportedIcmp,
+    FlowTableFull,
+    FlowBucketFull,
     PolicyDenied,
     NoPolicyMatch,
 }
@@ -240,8 +252,20 @@ impl TapDropReason {
             Self::NoRoute => 9,
             Self::EgressIsIngress => 10,
             Self::NoNeighbour => 11,
-            Self::PolicyDenied => 12,
-            Self::NoPolicyMatch => 13,
+            Self::FlowUnsupportedProtocol => 12,
+            Self::FlowFragment => 13,
+            Self::FlowMalformed => 14,
+            Self::FlowInvalidFlags => 15,
+            Self::FlowMidStream => 16,
+            Self::FlowInvalidState => 17,
+            Self::FlowOutOfWindow => 18,
+            Self::FlowNoSuchFlow => 19,
+            Self::FlowQuotedInvalid => 20,
+            Self::FlowUnsupportedIcmp => 21,
+            Self::FlowTableFull => 22,
+            Self::FlowBucketFull => 23,
+            Self::PolicyDenied => 24,
+            Self::NoPolicyMatch => 25,
         }
     }
 
@@ -261,8 +285,20 @@ impl TapDropReason {
             9 => Some(Self::NoRoute),
             10 => Some(Self::EgressIsIngress),
             11 => Some(Self::NoNeighbour),
-            12 => Some(Self::PolicyDenied),
-            13 => Some(Self::NoPolicyMatch),
+            12 => Some(Self::FlowUnsupportedProtocol),
+            13 => Some(Self::FlowFragment),
+            14 => Some(Self::FlowMalformed),
+            15 => Some(Self::FlowInvalidFlags),
+            16 => Some(Self::FlowMidStream),
+            17 => Some(Self::FlowInvalidState),
+            18 => Some(Self::FlowOutOfWindow),
+            19 => Some(Self::FlowNoSuchFlow),
+            20 => Some(Self::FlowQuotedInvalid),
+            21 => Some(Self::FlowUnsupportedIcmp),
+            22 => Some(Self::FlowTableFull),
+            23 => Some(Self::FlowBucketFull),
+            24 => Some(Self::PolicyDenied),
+            25 => Some(Self::NoPolicyMatch),
             _ => None,
         }
     }

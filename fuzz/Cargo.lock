@@ -210,6 +210,7 @@ version = "0.1.0"
 dependencies = [
  "lfw-blk",
  "lfw-clock",
+ "lfw-flow",
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
@@ -226,6 +227,8 @@ dependencies = [
 name = "pipeline"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
+ "lfw-flow",
  "net-headers",
  "routing",
 ]

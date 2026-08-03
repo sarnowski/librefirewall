@@ -13,6 +13,10 @@ routing = { path = "../routing" }
 # The verdict chain the routing stage drives, and the refusal vocabulary every
 # counter and every tap annotation here is keyed by.
 pipeline = { path = "../pipeline" }
+# The connection table the forwarding domain places in a region of its own: this
+# crate states how large that region must be and hands the domain its exclusive
+# borrow of it.
+lfw-flow = { path = "../flow" }
 lfw-ip-endpoint = { path = "../ip-endpoint" }
 # The arithmetic that turns a counter reading into an instant: what the
 # transport's timers are stated against, and what `clock.rs` stamps every log

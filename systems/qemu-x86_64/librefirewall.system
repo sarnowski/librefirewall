@@ -340,6 +340,42 @@
     <memory_region name="cfg" size="0x8000" />
     <memory_region name="cfgack" size="0x1000" />
 
+    <!-- THE CONNECTION TABLE, and by two orders of magnitude the largest region
+         in this system: 68 MiB and one page, `pd_runtime::FLOW_TABLE_REGION_SIZE`
+         — a million entries of one cache line each, plus a bucket head per
+         entry and a handful of cursors, rounded up to the mapping granularity.
+         `lfw_flow::FLOW_CAPACITY` is the single knob it follows from, and
+         changing it changes how many connections the appliance can carry at
+         once.
+
+         IT IS MAPPED BY EXACTLY ONE DOMAIN, READ-WRITE, and that exclusivity is
+         not a convenience — it is what makes the borrow sound. Every other
+         region here is shared, so a domain takes a `&` to a type whose fields
+         are atomics or sit behind an unsafe accessor; this one is an ordinary
+         Rust value with methods taking `&mut self`, and the forwarder takes a
+         `&mut` to it. A second mapper would make that undefined rather than
+         merely racy, which is why `xtask::sysdesc`'s rule for this region names
+         one grant and quotes what every other domain's absence buys.
+
+         No phys_addr, deliberately and for the reason `cfg` and `cfgack` have
+         none: no device DMAs into it, so no driver needs to be told where it is,
+         and an unplaced region is one Microkit allocates from general-purpose
+         untyped memory — which is precisely the retyping seL4 ZEROES. That
+         zeroing is load-bearing here in a way it is not for the ring regions: a
+         table holds `FlowState`, a `#[repr(u8)]` enum whose `Vacant`
+         discriminant is 0, so an all-zero region is a valid — if unlinked —
+         table and *forming* the reference over it is defined. Over arbitrary
+         bytes it would not be. This region therefore does not rest on the
+         RAM-membership argument the address map above makes for the DMA
+         regions, which nothing checks; it rests on Microkit not placing it.
+
+         The forwarder calls `initialise` on it once at bring-up, which turns
+         that valid-but-unlinked table into a usable one. Nothing persists across
+         a restart of the domain, and that is the right side of the trade for a
+         firewall: connections do not survive a restart of the thing deciding
+         about them. -->
+    <memory_region name="flow_table" size="0x4401000" />
+
     <!-- THE CLOCK CALIBRATION, and the first region in this system published
          under a SEQLOCK rather than under an identifying generation.
 
@@ -744,6 +780,7 @@
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_008_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="flow_table" vaddr="0x8_000_000" perms="rw" cached="true" setvar_vaddr="flow_table_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_forwarder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />

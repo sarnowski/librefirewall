@@ -18,11 +18,12 @@
 //! the whole of the argument (see the system description).
 
 use lfw_blk::request::{Operation, RequestFaults};
+use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
-    ConfigSample, EndpointSample, ForwarderSample, HttpSample, LogSample, ManagementSample,
-    PipelineSample, PolicySample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT,
-    SINKS, SinkSample, Snapshot, StatsShard, TapSample, TcpSample,
+    ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
+    ManagementSample, PipelineSample, PolicySample, PoolSample, ROUTE_DROP_REASONS, RecorderSample,
+    SHARD_COUNT, SINKS, SinkSample, Snapshot, StatsShard, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
@@ -115,6 +116,42 @@ pub fn policy_sample(counters: &PolicyCounters) -> PolicySample {
     }
 }
 
+/// What the connection tracker has done, as the forwarder's shard lays it out.
+///
+/// The two arguments are read from the one table at the same moment, so the
+/// occupancy a scrape reports is the occupancy the counters beside it left
+/// behind. Every array is filled by iterating the owning enum's `ALL` rather
+/// than by a written-out list, which is what keeps the slot order and the label
+/// order one order: a state or a refusal added upstream lands in its own slot or
+/// fails to compile.
+#[must_use]
+pub fn flow_sample(counters: &FlowCounters, occupancy: Occupancy) -> FlowSample {
+    let mut sample = FlowSample {
+        packets_seen: counters.packets_seen,
+        outcomes: [0; Classification::ALL.len()],
+        refusals: [0; RefusalKind::ALL.len()],
+        lifecycle: [
+            counters.flows_expired,
+            counters.flows_evicted,
+            counters.flows_closed,
+            counters.flows_withdrawn,
+        ],
+        entries: [0; FlowState::ALL.len()],
+        probe_collisions: counters.probe_tag_collisions,
+        slot_desync: counters.internal_slot_desync,
+    };
+    for (slot, classification) in sample.outcomes.iter_mut().zip(Classification::ALL) {
+        *slot = counters.classified(classification);
+    }
+    for (slot, kind) in sample.refusals.iter_mut().zip(RefusalKind::ALL) {
+        *slot = counters.refused(kind);
+    }
+    for (slot, state) in sample.entries.iter_mut().zip(FlowState::ALL) {
+        *slot = u64::from(occupancy.get(state));
+    }
+    sample
+}
+
 /// The forwarding domain's whole shard.
 #[must_use]
 pub fn forwarder_sample(
@@ -122,6 +159,7 @@ pub fn forwarder_sample(
     generation: u32,
     configuration: ConfigCounters,
     policy: &PolicyCounters,
+    flow: FlowSample,
     tap: TapCounters,
     log: LogSample,
 ) -> ForwarderSample {
@@ -131,6 +169,7 @@ pub fn forwarder_sample(
         images_applied: configuration.applied,
         images_refused: configuration.refused,
         policy: policy_sample(policy),
+        flow,
         tap: TapSample {
             observed: tap.observed,
             dropped: tap.dropped,
