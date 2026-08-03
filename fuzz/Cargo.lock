@@ -79,6 +79,15 @@ name = "lfw-clock"
 version = "0.1.0"
 
 [[package]]
+name = "lfw-flow"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "lfw-tcp",
+ "net-headers",
+]
+
+[[package]]
 name = "lfw-http"
 version = "0.1.0"
 
@@ -157,6 +166,7 @@ dependencies = [
  "lfw-blk",
  "lfw-capture-ring",
  "lfw-clock",
+ "lfw-flow",
  "lfw-http",
  "lfw-ip-endpoint",
  "lfw-log",

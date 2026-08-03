@@ -452,6 +452,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-flow"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "lfw-tcp",
+ "net-headers",
+ "proptest",
+]
+
+[[package]]
 name = "lfw-hpet"
 version = "0.1.0"
 dependencies = [

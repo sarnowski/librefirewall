@@ -33,6 +33,9 @@ cargo-fuzz = true
 #                   composes a reply out of an adversary's own bytes
 #   lfw-tcp         the transport that carries a connection on that port: every
 #                   segment field, every option, and the state machine over them
+#   lfw-flow        the connection table those segments move the state of, and
+#                   the ICMP error whose quoted five-tuple is an attacker's own
+#                   bytes deciding which flow a packet is related to
 #   lfw-http        the request head a management-plane attacker composes, cut
 #                   into whatever segments it chooses
 #   lfw-metrics     the exposition rendered out of counters a peer PD wrote, into
@@ -61,6 +64,7 @@ config = { path = "../crates/config" }
 net-headers = { path = "../crates/net-headers" }
 lfw-ip-endpoint = { path = "../crates/ip-endpoint" }
 lfw-tcp = { path = "../crates/tcp" }
+lfw-flow = { path = "../crates/flow" }
 lfw-http = { path = "../crates/http" }
 lfw-metrics = { path = "../crates/metrics" }
 lfw-clock = { path = "../crates/clock" }
@@ -191,6 +195,13 @@ bench = false
 [[bin]]
 name = "tcp_segments"
 path = "fuzz_targets/tcp_segments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flow_table"
+path = "fuzz_targets/flow_table.rs"
 test = false
 doc = false
 bench = false

@@ -13,6 +13,7 @@
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
 //! | [`ip_endpoint`] | `lfw_ip_endpoint`'s ARP and ICMP-echo answers, and the `net_headers` parsers and builders under them | untrusted network traffic **and** a management-plane attacker |
 //! | [`tcp`] | `lfw_tcp`'s segment parser, its option area and the state machine over them, driven as a stack | untrusted network traffic **and** a management-plane attacker |
+//! | [`flow`] | `lfw_flow`'s connection table: the TCP state machine and window checks over it, the UDP and ICMP pseudo-flows, and the quoted datagram inside an ICMP error | untrusted network traffic **and** a connection-flood attacker |
 //! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
 //! | [`metrics_render`] | `lfw_metrics`' exposition renderer, over arbitrary counters and arbitrary storage | a byzantine neighbour PD **and** a management-plane attacker |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
@@ -130,6 +131,7 @@
 
 pub mod blk;
 pub mod document;
+pub mod flow;
 pub mod driver;
 pub mod frame;
 pub mod free_list;
@@ -239,6 +241,7 @@ mod tests {
         ("route_frame", crate::frame::frame_routing_harness),
         ("ip_endpoint", crate::ip_endpoint::ip_endpoint_harness),
         ("tcp_segments", crate::tcp::tcp_segments_harness),
+        ("flow_table", crate::flow::flow_table_harness),
         ("http_request", crate::http_request::http_request_harness),
         (
             "metrics_render",

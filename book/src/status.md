@@ -99,8 +99,9 @@ so no attribute widens a rule by being left out. The two refusals a filter can r
 findings — a rule that said drop, and the fallthrough — and each rule carries its own hit counter
 on `/metrics` under the id the document gave it.
 
-What is not there is **state**: there is no connection tracking, so a rule cannot be written about
-an established flow and a reply is permitted only by a rule that names it in its own right. There
+What is not there is **state**: no connection tracking reaches the dataplane, so a rule cannot be
+written about an established flow and a reply is permitted only by a rule that names it in its own
+right. The tracker itself exists and is tested — it is the stage position that is empty. There
 is no NAT. The ARP and ICMP that exist belong to the management port alone — the dataplane resolves
 a next hop from a static neighbour table and answers nothing for itself. What exists is a stateless
 packet filter on a firewall's substrate.
@@ -120,7 +121,7 @@ length**, and `/logs.pcapng` is the capture truncated to headers rather than an 
 | Capability | Status | Notes |
 |---|---|---|
 | Stateless L2–L4 filtering | **partial** | configurable first-match-wins rules over ingress/egress interface, CIDR blocks, protocol, ports and ICMP type, with default deny and a per-rule hit counter; no state, no `reject`, and no way to change a policy without a new image — [detail](developers/status-detail.md#stateless-filtering) |
-| Connection tracking | **open** | the pipeline has the stage position reserved for it, between the forwarding decision and the filter |
+| Connection tracking | **partial** | `crates/flow` is a strict tracker — a million-flow table, TCP sequence and window validation, UDP and ICMP flows, ICMP errors related to a flow they quote, per-state timeouts, and eviction that refuses a new flow rather than displacing an established one. Nothing on the dataplane calls it: the pipeline has the stage position reserved, between the forwarding decision and the filter, and it is empty |
 | Routing, ARP, ICMP | **partial** | ARP and ICMP echo exist for the **management port only**, not for the dataplane — [detail](developers/status-detail.md#routed-ipv4-forwarding) |
 | Virtual-wire (bump-in-the-wire) operation | **open** | see the [architecture design](design/architecture.md) |
 | NAT (SNAT/masquerade, DNAT, static 1:1) | **open** | see the [architecture design](design/architecture.md) |

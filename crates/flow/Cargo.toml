@@ -1,0 +1,27 @@
+[package]
+# `flow` is a common crate name; the directory keeps the short name and the
+# package carries the project prefix, so the lib target is `lfw_flow` — the same
+# split `crates/clock`, `crates/log` and `crates/tcp` make.
+name = "lfw-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The address, protocol, flag and header types a tuple is formed from, and the
+# ICMP type constants an error message is recognised by.
+net-headers = { path = "../net-headers" }
+# `Monotonic` and `Duration`: every timeout here is stated against the clock the
+# appliance established at boot rather than against a tick count of its own.
+lfw-clock = { path = "../clock" }
+# `SeqNumber` alone, for the modulo-2^32 arithmetic and the four comparisons a
+# window check is stated in. One implementation of RFC 793 section 3.3 in the
+# workspace rather than a second one here — at the cost of a dependency edge
+# that points the wrong way, which the crate header records.
+lfw-tcp = { path = "../tcp" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
