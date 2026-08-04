@@ -533,7 +533,8 @@ fn the_shipped_chapters_present_the_tables_this_reader_needs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("the workspace root is two levels above this crate")
+        .and_then(Path::parent)
+        .expect("the repository root is three levels above this crate")
         .to_owned();
 
     let console = read_page(&root, CONSOLE_PAGE).expect("the console chapter");

@@ -1,7 +1,7 @@
 //! The host-side commands: the fast gate, coverage, benchmarks, fuzzing, clean.
 //!
 //! These run without booting seL4. [`test_host`] is the fast gate the pre-commit
-//! hook and CI share (format, the comment and `unsafe` budgets, the system-description
+//! hook runs (format, the comment and `unsafe` budgets, the system-description
 //! cross-check, host tests, Clippy with warnings denied over *every* workspace
 //! member, the `cargo-deny` dependency/license/source policy, and the library
 //! coverage floor). [`fuzz`] additionally runs in the full `ci` gate (build
@@ -30,7 +30,10 @@ use std::{
     process::Command,
 };
 
-use crate::{budgets, image, reference_contract, sysdesc, util::run_command};
+use crate::{
+    budgets, image, reference_contract, sysdesc,
+    util::{repository_root, run_command},
+};
 
 /// Workspace packages that build and test on the host (no seL4 target). The
 /// protection-domain binaries are excluded: they need the Microkit target, and
@@ -108,7 +111,7 @@ pub(crate) fn library_crate_count() -> usize {
 }
 
 /// Minimum combined line coverage the [`LIBRARY_PACKAGES`] must hold, enforced
-/// by the fast gate so a coverage regression fails locally and in CI. Set well
+/// by the fast gate so a coverage regression fails every commit. Set well
 /// below the measured ~99.3% combined coverage: a real floor that is not
 /// flaky. Raise it as coverage rises; never lower it to land a change.
 const LIBRARY_COVERAGE_FLOOR_PCT: u32 = 94;
@@ -206,7 +209,7 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // shipping domain with the chapter that calls itself complete going stale and
     // every stage of this gate green. It reads two Markdown files and two
     // in-process catalogues, so it costs milliseconds here rather than a boot.
-    reference_contract::check(root)?;
+    reference_contract::check(root, &repository_root()?)?;
     // And for the third time the same argument: a configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost
@@ -245,12 +248,11 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // Enforce the dependency/license/source policy (deny.toml). `advisories`
     // is deliberately not among the three: it must fetch the RustSec database
     // and this gate runs offline (`--network=none`), so adding the flag here
-    // would fail rather than scan. It is moved, not skipped —
-    // `azure-pipelines.yml` runs `cargo deny check advisories` in the same
-    // pinned builder with the network left on, and `deny.toml`'s `[advisories]`
-    // section configures it. The consequence to keep straight: a green run here
-    // is a dependency-policy pass and not a vulnerability scan; the scan is a
-    // CI stage, and only there.
+    // would fail rather than scan. The vulnerability scan is a deliberate
+    // manual run — `cargo deny check advisories` with the network available —
+    // configured by `deny.toml`'s `[advisories]` section. The consequence to
+    // keep straight: a green run here is a dependency-policy pass and not a
+    // vulnerability scan; nothing runs the scan automatically.
     run_command(
         Command::new("cargo")
             .current_dir(root)
@@ -379,7 +381,7 @@ fn enforce_budgets(root: &Path) -> Result<(), String> {
 /// The library tests are instrumented once with `--no-report`; the combined and
 /// per-crate reports then read that one profile, so the extra checks add report
 /// generation, not extra test runs. `--fail-under-lines` makes each report exit
-/// non-zero below its floor, so a regression fails here and identically in CI.
+/// non-zero below its floor, so a regression fails the gate.
 fn enforce_coverage(root: &Path) -> Result<(), String> {
     // `--no-report` adds to whatever profile data is already in the target
     // directory rather than replacing it, and a report merged from a previous

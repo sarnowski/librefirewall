@@ -173,16 +173,20 @@ const REFUSING_DOMAINS: &[&str] = &["nic-driver", "clock", "management", "record
 /// stale in many places at once, and failing on the first would turn one
 /// documentation pass into a dozen.
 ///
+/// Two roots because the two sides live in different trees: the literals are
+/// scanned out of the workspace, while the chapters belong to the book at the
+/// repository root, which covers every component.
+///
 /// # Errors
 /// Every disagreement found, one per line, each naming the exact token, family
 /// or count and which side is missing it — plus anything that stopped a side
 /// being read at all, which is a finding rather than a silent pass.
-pub(crate) fn check(root: &Path) -> Result<(), String> {
-    let console = read_page(root, CONSOLE_PAGE)?;
-    let metrics = read_page(root, METRICS_PAGE)?;
+pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
+    let console = read_page(repository, CONSOLE_PAGE)?;
+    let metrics = read_page(repository, METRICS_PAGE)?;
     let literals = budgets::production_literals(root)?;
 
-    let status = read_page(root, STATUS_DETAIL_PAGE)?;
+    let status = read_page(repository, STATUS_DETAIL_PAGE)?;
 
     let mut findings = Vec::new();
     check_literal_sites(&literals, &mut findings);

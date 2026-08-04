@@ -469,7 +469,7 @@ That guarantee is exact **in the release profile**, and one caveat qualifies it 
   text, or followed by it. **A reader must therefore still recover records by scanning for the
   `LFW-` prefix anywhere in the stream, not by assuming one line is one record.** The captures the
   gate writes are release boots and carry none of this; a debug boot is reached only by a diagnostic
-  re-run of a failed scenario (`build/image/*-debug.log`), by `make run`, or from a `make
+  re-run of a failed scenario (`datad/build/image/*-debug.log`), by `make run`, or from a `make
   image-debug` build, and it is those captures the caveat is about. The kernel prints on boot and on
   faults, never per record, so the interleaving is bounded and occasional rather than routine.
 - **What no reader can recover** is a record whose own bytes were split. Nothing in the release

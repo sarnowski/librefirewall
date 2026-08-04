@@ -1,9 +1,9 @@
 # Building and testing
 
-The supported developer and CI interface is GNU Make backed by rootless Podman. A pinned OCI
+The supported developer interface is GNU Make backed by rootless Podman. A pinned OCI
 builder (Debian 13 by digest, a dated Debian snapshot, the Microkit SDK, `rust-sel4`, the project
 Rust nightly, GRUB, OVMF, QEMU, and the coverage/lint/fuzz/SBOM tooling) provides every build
-input. The downloads are sha256-pinned in `third-party/sources.lock`; each apt package is pinned to
+input. The downloads are sha256-pinned in `datad/third-party/sources.lock`; each apt package is pinned to
 an exact version inline in the Containerfile, next to the package name, against the snapshot that
 file freezes. Nothing outside the builder is required beyond Podman itself.
 
@@ -26,7 +26,7 @@ make image                # build the OCI builder, then `xtask image` — the RE
 make image-debug          # assemble the debug kernel instead; an opt-in no gate reaches
 make run                  # boot the image interactively in QEMU (debug kernel, for its diagnostics)
 make test                 # fast host gate (format, clippy, tests, coverage floor, budgets, the
-                          #   contract checks over systems/, the book and the config document,
+                          #   contract checks over datad/systems/, the book and the config document,
                           #   dependency policy)
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
@@ -34,7 +34,7 @@ make fuzz                 # run the seed smoke tests, build every fuzz target, e
 make test-system          # boot the QEMU system scenarios on the release image
 make test-ab              # boot the A/B state-machine scenarios on the release image
 make ci                   # the complete gate: host gate, fuzz, release image, system and A/B
-make release              # run CI, then keep `dist/` only if it proved what it holds
+make release              # run the full gate, then keep `datad/dist/` only if it proved what it holds
 make verify-reproducible  # build the release payload twice in isolation and compare artifacts
 make hooks                # install the pre-commit and pre-push git hooks
 make book                 # render this book (requires mdbook on the host)
@@ -42,11 +42,12 @@ make clean                # remove generated output only
 ```
 
 The `Makefile` is a thin, stable interface; the orchestration behind it lives in the Rust `xtask`
-(`tools/xtask`), not in shell. `make image` works from a clean checkout: it enters or builds the
-pinned environment, acquires and checksum-verifies the pinned inputs, builds every crate and
+(`datad/tools/xtask`), not in shell. The container mounts the repository root and runs inside
+`datad/`, the appliance component. `make image` works from a clean checkout: it enters or builds
+the pinned environment, acquires and checksum-verifies the pinned inputs, builds every crate and
 protection domain with locked dependencies, validates and assembles the Microkit system
 description, produces the x86_64 Multiboot2 kernel and system image, packages only deployable
-outputs into `dist/`, and emits checksums and an SBOM.
+outputs into `datad/dist/`, and emits checksums and an SBOM.
 
 `make image` is the only network-enabled phase (the OCI build). Every target that runs a build or a
 gate — `make clean` included — checks that the pinned builder image already exists and refuses with
@@ -85,7 +86,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | Formatting | `cargo fmt --all --check` |
 | Lints, warnings denied — every host crate, and the protection domains for seL4 in **both** kernel configurations | `cargo clippy` over an explicit `-p` list, in `xtask test` |
 | A `SAFETY` comment *present* on every `unsafe` block | `undocumented_unsafe_blocks = "deny"` |
-| Per-file comment ratio and per-crate `unsafe` count never rise, across `crates/` and `pds/` | `xtask test` (the budget ratchets) |
+| Per-file comment ratio and per-crate `unsafe` count never rise, across `datad/crates/` and `datad/pds/` | `xtask test` (the budget ratchets) |
 | Coverage floors (94% combined, 90% per library crate) | `cargo llvm-cov` in `xtask test` |
 | Dependency, license and source policy | `cargo deny check bans licenses sources` |
 | The system description agrees with the constants the domains compile against: every region's extent, cacheability and per-grant permissions, the **exact** set of domains that map it, both I/O-port windows against the constants the drivers form addresses from, every channel end's notify direction, the port→driver attribution, and that each of the 115 mappings is named by a `setvar_vaddr` | `xtask test` (`sysdesc::check`) |
@@ -113,15 +114,15 @@ The lint command is **not** a bare `cargo clippy -- -D warnings`:
 looking at a single library crate, which is why `xtask` names its packages explicitly and fails the
 build when the list is incomplete.
 
-The local gate runs offline, so `cargo deny check advisories` is not in it — vulnerability scanning
-is a separate networked CI stage (`azure-pipelines.yml`), so a local green is a dependency-policy
-pass and not an advisory scan.
+The gate runs offline, so `cargo deny check advisories` is not in it — vulnerability scanning is a
+deliberate manual run (`cargo deny check advisories`, with the network available), and nothing runs
+it automatically. A green gate is a dependency-policy pass and not an advisory scan.
 
 The two ratchets do not reach as far as the two `unsafe` lint denials do. `unsafe_op_in_unsafe_fn`
 and `undocumented_unsafe_blocks` are workspace lints and bind every member; the comment and
-`unsafe` budgets measure the product trees, `crates/` and `pds/`, and neither `tools/` nor the
-separate `fuzz/` workspace. For `xtask` and the fuzz harnesses the discipline is review, not a
-gate.
+`unsafe` budgets measure the product trees, `datad/crates/` and `datad/pds/`, and neither
+`datad/tools/` nor the separate `datad/fuzz/` workspace. For `xtask` and the fuzz harnesses the
+discipline is review, not a gate.
 
 And `reference_contract` sees less of its chapters than the row above may suggest. It compares
 the parsed tables and the counts the chapters state about themselves — and deliberately not: prose
@@ -169,32 +170,31 @@ its own outcome. The re-run never changes the verdict, and its artifacts are wri
 
 Two more profiles are intended and do not exist — `benchmark` (PMU-enabled kernel and performance
 instrumentation) and `smp-*` (multicore variants, to arrive with the multicore dataplane). Nothing
-in `Cargo.toml`, `xtask`, or `systems/` wires them.
+in `datad/Cargo.toml`, `xtask`, or `datad/systems/` wires them.
 
 ## Release artifacts
 
 `make release` runs the complete acceptance gate and boots nothing of its own — `ci` already
-assembles the release configuration into `dist/` and already holds that disk to both contracts a
-booted appliance owes. What `make release` adds: if the gate did not prove the artifact, `dist/` is
-emptied rather than left holding an unproven image that looks finished. That covers a failure
-anywhere in the run, not a failed boot alone, because assembly populates `dist/` partway through
-and an incomplete release is no more publishable than an unproven one. CI runs `make release`
-rather than `make ci` (`azure-pipelines.yml`), so that emptying is what actually happens on a red
-CI run rather than documented behaviour no CI run ever reaches; the publish step's `succeeded()`
-condition is then the second of two independent reasons nothing unproven leaves the pipeline.
+assembles the release configuration into `datad/dist/` and already holds that disk to both
+contracts a booted appliance owes. What `make release` adds: if the gate did not prove the
+artifact, `datad/dist/` is emptied rather than left holding an unproven image that looks finished.
+That covers a failure anywhere in the run, not a failed boot alone, because assembly populates
+`datad/dist/` partway through and an incomplete release is no more publishable than an unproven
+one. Nothing publishes these artifacts automatically: a release is whatever a green `make release`
+left in `datad/dist/`.
 
-The deployable artifact is `dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk booted
-through OVMF and GRUB. Alongside it, `dist/` carries five product-prefixed pieces of release
-evidence and nothing else: the loose kernel and system images (the update input), a manifest
-describing the target, pinned inputs and signing trust profile, an SPDX 2.3 SBOM (see
+The deployable artifact is `datad/dist/librefirewall-qemu-x86_64.img`, the signed GPT A/B disk
+booted through OVMF and GRUB. Alongside it, `datad/dist/` carries five product-prefixed pieces of
+release evidence and nothing else: the loose kernel and system images (the update input), a
+manifest describing the target, pinned inputs and signing trust profile, an SPDX 2.3 SBOM (see
 [Implementation status in detail](status-detail.md#engineering-foundations) for what it does and
 does not cover), and a SHA-256 checksum file covering every other artifact. The Microkit
 capability/memory report is deliberately **not** published: it is a full disclosure of the system's
-authority topology, so it stays under `build/image/<config>/`.
+authority topology, so it stays under `datad/build/image/<config>/`.
 
-Image builds generate a throwaway development signing key under `build/dev-keys/` (never committed;
-removed by `make clean`); the manifest records `trust_profile: development` so a development-signed
-image can never be mistaken for a production one.
+Image builds generate a throwaway development signing key under `datad/build/dev-keys/` (never
+committed; removed by `make clean`); the manifest records `trust_profile: development` so a
+development-signed image can never be mistaken for a production one.
 
 All commands force Podman's `cgroupfs` manager. Override `PODMAN` only to select a compatible
 Podman executable; Docker is not a supported build interface.
@@ -214,22 +214,27 @@ enabled for every download. Never commit the certificate — or any other key ma
 
 ## Repository layout
 
-Directories have fixed purposes; they grow as real functionality lands, and no empty placeholders
-are created.
+The repository holds a two-component product. `datad/` is the appliance: the Rust seL4/Microkit
+system and its entire build. `ctrld/` is the management server component, an Elixir application
+arriving separately. The book, `README.md`, and `LICENSE.md` stay at the repository root and cover
+both components.
 
-- `crates/` — portable `no_std` libraries holding the firewall and dataplane logic. This is where
-  most code and almost all tests live.
-- `pds/` — protection-domain binaries: thin adapters that map shared regions and drive a library
-  crate's logic. Correctness logic belongs in a crate, not here, so it can be host-tested.
-- `systems/` — the Microkit system description(s): the static capability topology. A capability
-  change is a security change.
-- `tools/` — the `xtask` build/test/packaging orchestrator and the QEMU harness.
-- `fuzz/` — the persistent `cargo-fuzz` targets for the untrusted parsers, in their own workspace
-  so the ASan/libFuzzer instrumentation never enters a protection-domain build. Criterion
+Inside `datad/`, directories have fixed purposes; they grow as real functionality lands, and no
+empty placeholders are created.
+
+- `datad/crates/` — portable `no_std` libraries holding the firewall and dataplane logic. This is
+  where most code and almost all tests live.
+- `datad/pds/` — protection-domain binaries: thin adapters that map shared regions and drive a
+  library crate's logic. Correctness logic belongs in a crate, not here, so it can be host-tested.
+- `datad/systems/` — the Microkit system description(s): the static capability topology. A
+  capability change is a security change.
+- `datad/tools/` — the `xtask` build/test/packaging orchestrator and the QEMU harness.
+- `datad/fuzz/` — the persistent `cargo-fuzz` targets for the untrusted parsers, in their own
+  workspace so the ASan/libFuzzer instrumentation never enters a protection-domain build. Criterion
   microbenchmarks are *not* a top-level directory: each lives in its crate's own `benches/`, beside
   the code it measures.
 - `book/` — this book, plain Markdown under `book/src/`. Render it with `make book` (which runs
   [mdBook](https://rust-lang.github.io/mdBook/); install it with `cargo install mdbook`), or read
   the Markdown directly.
-- `build/`, `third-party/`, `support/` — the pinned hermetic builder, pinned upstream inputs, and
-  target specifications.
+- `datad/build/`, `datad/third-party/`, `datad/support/` — the pinned hermetic builder, pinned
+  upstream inputs, and target specifications.

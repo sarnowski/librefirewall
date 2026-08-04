@@ -39,8 +39,8 @@ Read the rest on demand:
   it is unread.
 - Run the reviewer checklist against your own change before declaring it done. A green gate is
   necessary, never sufficient.
-- A change with security consequence — the capability topology in `systems/`, a trust boundary,
-  `unsafe`, the boot chain, key handling, any code on an external-input path — is never
+- A change with security consequence — the capability topology in `datad/systems/`, a trust
+  boundary, `unsafe`, the boot chain, key handling, any code on an external-input path — is never
   self-approved: reason about it fully, propose it, and a human owns the final call.
 - Never commit secrets or an inspection CA; treat any secret you encounter as compromised.
 

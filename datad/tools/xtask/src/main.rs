@@ -11,8 +11,8 @@
 //!
 //! # The adversary
 //!
-//! No threat-model adversary reaches this crate: it runs on a developer's or a
-//! CI agent's machine, on the host side of an emulator, and nothing it parses
+//! No threat-model adversary reaches this crate: it runs on a developer's
+//! machine, on the host side of an emulator, and nothing it parses
 //! arrives from a network, a device, or a peer protection domain. Being out of
 //! an adversary's reach is not a licence — only seL4, Microkit and `rust-sel4`
 //! are trusted, and nothing first-party inherits that status — and here the
@@ -57,7 +57,7 @@
 //! - [`diagnose`] — re-run a failed release scenario on the debug kernel.
 //!
 //! `main` is only CLI dispatch: it maps a subcommand to the owning stage, and
-//! composes the two gates. [`ci`] is the complete pull-request gate, and every
+//! composes the two gates. [`ci`] is the complete pre-push gate, and every
 //! end-to-end scenario in it boots the RELEASE configuration — the image a
 //! release publishes. [`release`] is that gate plus the guarantee
 //! `dist/` never survives a run that failed to prove what it holds; it boots

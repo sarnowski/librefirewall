@@ -90,9 +90,9 @@ const KVM_DEVICE: &str = "/dev/kvm";
 const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand";
 
 /// How QEMU will execute the guest and, when hardware acceleration was not
-/// taken, why. Carrying the reason (rather than a bare flag) is the point: a CI
-/// run that silently fell back to emulation must not be indistinguishable from
-/// an accelerated one in its log.
+/// taken, why. Carrying the reason (rather than a bare flag) is the point: a
+/// gate run that silently fell back to emulation must not be indistinguishable
+/// from an accelerated one in its log.
 enum Acceleration {
     Kvm,
     Tcg { kvm_rejected_because: String },

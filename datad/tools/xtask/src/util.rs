@@ -149,14 +149,28 @@ impl error::Error for CommandError {
     }
 }
 
-/// Resolve the workspace root from this crate's compile-time manifest dir
-/// (`tools/xtask` → two levels up). All build paths are anchored here.
+/// Resolve the Cargo workspace root from this crate's compile-time manifest
+/// dir (`tools/xtask` → two levels up). Every build path is anchored here;
+/// only the documentation book lives outside it, one level further up.
 pub(crate) fn workspace_root() -> Result<PathBuf, Error> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::invalid("cannot determine workspace root"))
+}
+
+/// Resolve the repository root: the workspace root's parent.
+///
+/// The two differ because the repository holds more than this Cargo
+/// workspace: the workspace is one component directory below the root, while
+/// the documentation book — which the gate reads as data — sits at the root
+/// and covers every component.
+pub(crate) fn repository_root() -> Result<PathBuf, Error> {
+    workspace_root()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Error::invalid("cannot determine repository root"))
 }
 
 /// Run an external command to completion, failing on a non-zero exit.

@@ -1,16 +1,17 @@
 # cargo-deny policy for librefirewall.
 #
-# Two gates read this file:
+# Two checks read this file:
 #
 # - the offline host gate (`make test`, see tools/xtask) runs
 #   `cargo deny check bans licenses sources`;
-# - a dedicated networked CI step (azure-pipelines.yml) runs
-#   `cargo deny check advisories`, because that check must fetch the RustSec
-#   database and the host gate's container runs `--network=none`.
+# - `cargo deny check advisories` is a deliberate manual run with the network
+#   available, because that check must fetch the RustSec database and the host
+#   gate's container runs `--network=none`. Nothing runs it automatically.
 #
-# Splitting them this way is what keeps vulnerability scanning real: the
-# offline gate cannot fetch an advisory database, so pretending otherwise
-# would leave the repository with no scanning at all.
+# The split keeps the offline gate honest: it cannot fetch an advisory
+# database, so pretending otherwise would fail every run rather than scan.
+# The cost is stated rather than hidden — vulnerability scanning happens only
+# when someone runs it.
 #
 # Dependency shape: our own crates are AGPL-3.0-or-later; every third-party
 # crate is either the pinned `rust-sel4` (a local path source at

@@ -16,13 +16,13 @@ whenever it runs and `make coverage` states the current coverage; what a section
 
 ## Routed IPv4 forwarding
 
-**What exists.** Three host-tested `no_std` crates carry the whole decision. `crates/net-headers`
+**What exists.** Three host-tested `no_std` crates carry the whole decision. `datad/crates/net-headers`
 parses Ethernet, one optional 802.1Q tag, IPv4, and the UDP, TCP or ICMP header behind it, and
 applies the four edits a hop requires — both MACs, the TTL decrement, and the header checksum —
-as one operation that cannot be performed in part. `crates/routing` holds the forwarding table and
+as one operation that cannot be performed in part. `datad/crates/routing` holds the forwarding table and
 answers lookups against it — which interface a port has, which prefix covers a destination, which
 neighbour holds a MAC, which addresses are the appliance's own — and reaches no verdict itself.
-`crates/pipeline` is the chain that does: link-layer admission first, then the forwarding decision,
+`datad/crates/pipeline` is the chain that does: link-layer admission first, then the forwarding decision,
 then the filter, each a concrete stage called in a fixed order, ending in a verdict that is either a
 forward out of a named port under a named MAC pair or one of thirteen named drop reasons, each with
 its own counter. The middle stage is no longer terminal: it attaches the egress port and the MAC
@@ -42,14 +42,14 @@ each poll, because a stage whose state must span both directions of a flow canno
 stage that sees one.
 
 Held by unit and property tests across the two crates, by the stage's own tests in
-`crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
+`datad/crates/pd-runtime` — including one that drives an arbitrary mix of routable, unroutable, malformed
 and garbage traffic through it and asserts the pool comes back whole — and by a persistent fuzz
 target (`route_frame`) whose input is the frame itself.
 
 **Missing.**
 
-- **No ARP and no ICMP on the dataplane.** Both now exist — `crates/net-headers` parses and builds
-  them and `crates/ip-endpoint` answers them — but only for a port that answers *for itself*: the
+- **No ARP and no ICMP on the dataplane.** Both now exist — `datad/crates/net-headers` parses and builds
+  them and `datad/crates/ip-endpoint` answers them — but only for a port that answers *for itself*: the
   management port (see *[Full port role model](#full-port-role-model)*). On a dataplane port
   neighbours are still a static table and a drop is still silent, because a dataplane frame can only
   leave the port opposite the one it arrived on: the pools are owned by the receiving drivers, so no
@@ -58,10 +58,10 @@ target (`route_frame`) whose input is the frame itself.
   one.
 - **Interfaces, neighbours, the management port and the filter rules are all that is
   configurable.** They come from
-  `systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
+  `datad/systems/qemu-x86_64/configuration.xml` and no longer from a `const` table, and that document is
   now the single source of the appliance's addressing: the MAC QEMU gives each guest NIC and the
   endpoints the system test states its contract between are both read out of it
-  (`tools/xtask/src/topology.rs`), so the three literals that used to have to agree — and that
+  (`datad/tools/xtask/src/topology.rs`), so the three literals that used to have to agree — and that
   nothing compared — are one literal and two derivations. Everything else a hop depends on is still
   compiled in: which ports exist, which pipeline joins which pair, and the pool and ring extents.
 - **Connected routes only.** A destination is routable exactly when an interface prefix covers it;
@@ -86,7 +86,7 @@ target (`route_frame`) whose input is the frame itself.
 ## Stateful filtering
 
 **What exists.** A `<rules>` section in the configuration document, and a terminal stage at the end
-of `crates/pipeline` that decides every frame against it. A rule names ten things — an id, the
+of `datad/crates/pipeline` that decides every frame against it. A rule names ten things — an id, the
 ingress and egress interface, the source and destination CIDR block, the protocol, the source and
 destination port or inclusive port range, the ICMP type, and `accept` or `drop` — and every one of
 them is **required**, with the wildcard written `any`. Nothing is optional, because on a device whose
@@ -135,7 +135,7 @@ domain maps read-only, joined on the rule's position, so a hit is a number only 
 have written under a name only an operator could have chosen. Beside them the filter publishes what
 it decided in total, packets and datagram bytes, split by verdict.
 
-Held by unit and property tests in `crates/pipeline` covering every criterion against a matching and
+Held by unit and property tests in `datad/crates/pipeline` covering every criterion against a matching and
 a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
 prefix length names, and all five unreadable transport shapes against all four port and type
 criteria; by the differential configuration tests that put an image breaking each of the twelve rules
@@ -172,7 +172,7 @@ operator writes, as the alternative that was rejected. The one thing netfilter's
 made structural here instead: a `RELATED` accept an operator can forget is, on this appliance, a
 `related` rule they must write to permit at all.
 
-Held by unit and property tests in `crates/pipeline` covering every criterion against a matching and
+Held by unit and property tests in `datad/crates/pipeline` covering every criterion against a matching and
 a neighbouring value, both refusals, precedence, the inclusive ends of a port range, the mask a
 prefix length names, and all five unreadable transport shapes against all four port and type
 criteria; by the differential configuration tests that put an image breaking each of the twelve rules
@@ -221,15 +221,15 @@ what it can decide from a flow's key alone, where it is conservative and what it
 - **No logging per rule.** A rule cannot ask for its matches to be recorded. Every decision reaches
   the recording tap regardless, with its reason, and the per-rule counters are the only per-rule
   signal.
-- **Nothing is measured.** `crates/pd-runtime`'s benchmarks now time a frame the filter permits, one
+- **Nothing is measured.** `datad/crates/pd-runtime`'s benchmarks now time a frame the filter permits, one
   it denies and one the router refuses, so the cost of consulting a policy is *measurable* — but the
   ruleset those benchmarks use is one wildcard rule, and no measurement exists of a realistic table
   or of how the walk scales across it.
 
 ## Connection tracking
 
-**What exists.** A bounded connection table (`crates/flow`) in a memory region of the forwarding
-domain's own, and a stage in `crates/pipeline` that classifies every routed packet against it. The
+**What exists.** A bounded connection table (`datad/crates/flow`) in a memory region of the forwarding
+domain's own, and a stage in `datad/crates/pipeline` that classifies every routed packet against it. The
 table holds a million flows in sixty-eight mebibytes, one entry to a cache line, keyed symmetrically
 so a flow and its reply are the same bits. It tracks TCP with the four window comparisons of RFC 793
 and a state machine that runs only on a segment that passed all four, UDP and ICMP echo as
@@ -303,7 +303,7 @@ holds that description to the constants the domains compile against; a reduced-c
 therefore need a second system description, the constant threaded through `lfw-flow`, `pd-runtime` and
 every protection domain as a build feature, and a capability check that knows which description belongs
 to which capacity. That is a second shippable authority topology to keep correct, for one assertion, so
-it was not taken. The boundary is held instead by `crates/flow`'s property tests against a sixteen-slot
+it was not taken. The boundary is held instead by `datad/crates/flow`'s property tests against a sixteen-slot
 table — a flood of two hundred distinct tuples, every established flow still in place, the new flow
 refused as `TableFull` — and by the `flow_table` fuzz target. What the image proves is the property that
 actually decides whether a default-deny appliance can be exhausted: that a refused opening costs no
@@ -327,11 +327,11 @@ every system scenario takes about 0.9 s more per boot than it would with a small
 loader creating and zeroing 17 409 page frames. Both are boot-time only and neither is on the packet
 path.
 
-Held by 140 unit and property tests in `crates/flow` (whole handshakes, whole closes, every window
+Held by 140 unit and property tests in `datad/crates/flow` (whole handshakes, whole closes, every window
 edge, both ICMP surfaces, floods against a small table, withdrawal, and the occupancy held to the
 entries themselves), by a `cargo-fuzz` target that drives arbitrary packets at arbitrary instants
-over a table already holding a handshaked connection, by tests in `crates/pipeline` and
-`crates/pd-runtime` that drive the two halves through the real chain and the real ring plumbing, and
+over a table already holding a handshaked connection, by tests in `datad/crates/pipeline` and
+`datad/crates/pd-runtime` that drive the two halves through the real chain and the real ring plumbing, and
 by two QEMU scenarios that hold a reply's arrival to the tracker rather than to a rule, and by the
 `connection-flood` scenario above.
 
@@ -413,9 +413,9 @@ wakeups and does not finish its pass, and is also forwarding nothing.
 `librefirewall_policy_sweep_running` reads 1 for exactly as long as that is true, which is the honest
 answer rather than a fault.
 
-Held by unit and property tests in `crates/flow` (a pass that keeps every flow changes not one byte of
+Held by unit and property tests in `datad/crates/flow` (a pass that keeps every flow changes not one byte of
 an entry; every live flow is offered exactly once; the opening reported is the one that was on the wire
-in both orientations; one window is bounded in both of its two ways) and in `crates/pipeline` (a
+in both orientations; one window is bounded in both of its two ways) and in `datad/crates/pipeline` (a
 narrowing commit takes back exactly one of two conversations and leaves the other carrying traffic no
 rule names; a widening or unchanged commit takes back nothing; a rule that matches with `drop` is not
 an admission; each of five table changes the pass cannot place a flow under; an ICMP flow re-decided as
@@ -454,10 +454,10 @@ conversation's to still crossing — carried by its flow, which no rule of eithe
 
 ## Zero-copy dataplane
 
-**What exists.** The substrate exists as four host-tested `no_std` crates: `crates/queue` (the
-lock-free SPSC ring), `crates/packet-buffer` (the shared buffer pool and its ownership ledger),
-`crates/wire` (the descriptor ABI shared across domains, pinned by static layout assertion) and
-`crates/pd-runtime` (the shared regions, pool owner and routing stage the protection domains are
+**What exists.** The substrate exists as four host-tested `no_std` crates: `datad/crates/queue` (the
+lock-free SPSC ring), `datad/crates/packet-buffer` (the shared buffer pool and its ownership ledger),
+`datad/crates/wire` (the descriptor ABI shared across domains, pinned by static layout assertion) and
+`datad/crates/pd-runtime` (the shared regions, pool owner and routing stage the protection domains are
 assembled from).
 
 Correctness is held by unit and property tests across those four crates — including hostile-peer
@@ -474,7 +474,7 @@ third time, out of the routing domain's scratch into the tap ring the recorder r
 ([detail](#recording-and-download)) — up to 2048 bytes, the whole frame rather than its header. The
 copy is taken between the decision and the forwarding rewrite, which is what makes a recorded frame
 the one the wire delivered, and the cost of splitting the two is that the rewrite re-parses the frame
-the decision already parsed. Neither cost is measured: `crates/pd-runtime`'s Criterion routing bench
+the decision already parsed. Neither cost is measured: `datad/crates/pd-runtime`'s Criterion routing bench
 passes no tap, so what it measures is the path with recording off.
 
 **Missing.**
@@ -484,7 +484,7 @@ passes no tap, so what it measures is the path with recording off.
   not designed.
 - Pool is 64 buffers of 2048 bytes; orders of magnitude short of a 10 Gbit/s working set.
 - Fixed 2048-byte buffers: no jumbo frames, no scatter-gather, and no descriptor chaining **on this
-  path** — `crates/virtio` grew chaining for the block driver's three-segment requests, and no NIC
+  path** — `datad/crates/virtio` grew chaining for the block driver's three-segment requests, and no NIC
   pipeline uses it.
 - Exactly two pipelines, hard-coded in the forwarder PD. No per-core sharding, no multi-queue.
 - No backpressure policy beyond releasing the buffer. A peer that stalls a destination ring makes
@@ -494,13 +494,13 @@ passes no tap, so what it measures is the path with recording off.
 
 ## virtio-net driver
 
-**What exists.** A from-scratch modern virtio 1.0 PCI transport in `crates/virtio` —
+**What exists.** A from-scratch modern virtio 1.0 PCI transport in `datad/crates/virtio` —
 capability-list walk, BAR relocation, feature negotiation, queue programming, doorbells, and a
 split-virtqueue driver half — held by unit and property tests and one compile-fail doctest. Every
 transport entry point the device drives returns a typed error (`BarError`, `ResetError`,
 `QueueSetupError`, `NotifyError`, `CapError`) instead of panicking.
 
-`crates/nic-driver-core` holds bring-up and the steady-state poll pass, tested the same way. Rx and
+`datad/crates/nic-driver-core` holds bring-up and the steady-state poll pass, tested the same way. Rx and
 Tx clamp the device-reported length to the buffer behind it, drop runt frames, and validate every
 peer transmit descriptor.
 
@@ -539,7 +539,7 @@ record and its ring (see *[Engineering foundations](#engineering-foundations)*).
 **What exists.** A ninth protection domain, `recorder` — the seventh binary, the driver's three
 instances being one binary — owns a virtio-blk device at the pinned PCI function 00:05.0 and is the
 only domain in the system that can put a byte on persistent storage. The device class is
-`crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
+`datad/crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
 state machine over one virtqueue (`request`), and the sector-addressed staging window every data
 segment names (`io`). The split is `nic-driver-core`'s — every decision is in the library where a
 host test can drive it against a stand-in device, and the protection domain is a thin adapter,
@@ -584,7 +584,7 @@ that the *read* crossed to the medium and not merely to the driver's own staging
   record states it, and the recording itself says nothing about the sectors it lost, because
   `epb_dropcount` accounts for what the tap ring lost and for nothing the *device* refused. A
   medium quietly failing every write is indistinguishable from one that is merely idle.
-- **One device, one extent, no partition.** `systems/qemu-x86_64` declares a single block device and
+- **One device, one extent, no partition.** `datad/systems/qemu-x86_64` declares a single block device and
   the driver addresses the whole of it. The per-deployment device count and named-extent binding the
   [recording design](../design/recording.md) intends are untouched.
 - **Nothing is measured.** The staging window is 256 KiB because that is a plausible amount to have
@@ -698,7 +698,7 @@ LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 **What the gate proves.** Every scenario whose management port is reachable — 12 of the 16 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
-three to **each other** as well as to the wire (`tools/xtask/src/surface_contract.rs`): every record
+three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
 of the connection history *of a frame* pairs into the capture by `epb_packetid` and none of it names
 no event, the one record that is about no frame is held instead to claiming none of the four things a
 frame has, neither recording exceeds the record count the recorder publishes for that sink, every
@@ -721,7 +721,7 @@ them the appliance's own account of itself.
 **What the demonstration showed.** Separately from the gate, and by hand, the published release disk
 was booted under OVMF with a 64 MiB virtio-blk data device attached at 00:05.0, and 14 routable
 IPv4/UDP frames of 84 to 1384 bytes were injected on dataplane-0 for the appliance to route to
-dataplane-1. This was a one-off: the script and its artifacts live under the ignored `build/` tree
+dataplane-1. This was a one-off: the script and its artifacts live under the ignored `datad/build/` tree
 and are not in the repository, so what is *repeatable* is the `recording-download` scenario above and
 this is corroboration beside it. Over the management port, `curl http://…/logs.pcapng` and
 `curl http://…/capture.pcapng` each returned a whole number of 512-byte sectors — which is the
@@ -832,11 +832,11 @@ and wall-clock times. An independent parse of the two files established:
 ## Configuration management
 
 **What exists.** A schema-validated XML document is the whole of the appliance's addressing, and it
-reaches the dataplane through four stages that never mix. `systems/qemu-x86_64/configuration.xml` is
+reaches the dataplane through four stages that never mix. `datad/systems/qemu-x86_64/configuration.xml` is
 the one a build embeds and it is the **first** generation rather than the only one: a document can be
 submitted to a running node over the management API, and every later generation arrives that way.
 
-`crates/config` reads it. The reader is `no_std`, allocator-free and hardened against a
+`datad/crates/config` reads it. The reader is `no_std`, allocator-free and hardened against a
 management-plane adversary rather than against a typo: `<!DOCTYPE`, entity declarations, CDATA,
 processing instructions and markup declarations are refused outright, only the five predefined
 entities and bounded numeric character references are expanded, and every dimension is a named
@@ -891,7 +891,7 @@ an intention — and a modified object produces one record per changed field and
 rest. A diff hands each record to its caller as it produces one rather than filling a buffer, so
 what a commit costs in memory does not grow with how many objects the ABI can hold.
 
-`pds/config` is a protection domain of its own holding no device capability, no buffer pool and no
+`datad/pds/config` is a protection domain of its own holding no device capability, no buffer pool and no
 dataplane ring, so the domain that parses attacker-supplied XML cannot reach a frame, a NIC, or the
 memory either travels through. It writes a fixed-layout POD image of the already-validated model
 into a shared region — the forwarder never parses XML, which is the entire point of the split — and
@@ -950,8 +950,8 @@ as generation 1, **every boot performs a live configuration swap on a running fo
 changed value reaches the console as a structured `LFW-CFG` record (see the
 [console reference](../reference/console.md)).
 
-Held by the tests in `crates/config` and `crates/log`, by the handover's own tests in
-`crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
+Held by the tests in `datad/crates/config` and `datad/crates/log`, by the handover's own tests in
+`datad/crates/pd-runtime` — arbitrary region contents read totally and bounded, forged counts, forged
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
@@ -1038,13 +1038,13 @@ state every configuration it accepts, which is a semantic rule: a document whose
 outgrow the document bound is refused with `rendering-too-large` rather than committed, because a
 policy an operator can read and cannot resubmit is one they cannot edit.
 
-**Held by** the host tests in `crates/config` (the renderer round-trips the shipped document and both
-sides of the statable bound), `crates/http` (the body framing: one `Content-Length`, decimal, `POST`
-only, no `Transfer-Encoding`, refused past the caller's bound), `crates/ip-endpoint` (a body split
+**Held by** the host tests in `datad/crates/config` (the renderer round-trips the shipped document and both
+sides of the statable bound), `datad/crates/http` (the body framing: one `Content-Length`, decimal, `POST`
+only, no `Transfer-Encoding`, refused past the caller's bound), `datad/crates/ip-endpoint` (a body split
 across segments, a peer that overruns its declared length, the method/target routing, a submission
 holding the staging array, and the five that hold the body deadline — expiry at the deadline and not
 before, the refused scrape answered once the array is back, a trickle unable to move the deadline, a
-reset rather than a close, and a stalled or reversed clock expiring nothing), `crates/pd-runtime`
+reset rather than a close, and a stalled or reversed clock expiring nothing), `datad/crates/pd-runtime`
 (the channel driven from both ends, every answer shape, a commit that does not move the addressing
 keeping the connections open on the port, both channel deadlines with a late answer that must not be
 taken for the next request's, and a digest mismatch reported as a node that published incoherent
@@ -1152,14 +1152,14 @@ claims.
 
 ## Console device and log transport
 
-**What exists.** The console is a device with exactly one owner. `pds/console` holds the only
+**What exists.** The console is a device with exactly one owner. `datad/pds/console` holds the only
 I/O-port capability that reaches it — `<ioport id="0" addr="0x3f8" size="8" />`, the PC-compatible
 COM1 window — and is the sole writer of the line; every other domain publishes a typed record into
 a single-producer ring of its own and that domain drains, renders and transmits it. A record is
 therefore whole or absent rather than spliced with another domain's, which is a property of the
 capability grant rather than of scheduling.
 
-`crates/uart-16550` carries the register protocol: interrupts off, 115200 8N1, FIFOs enabled and
+`datad/crates/uart-16550` carries the register protocol: interrupts off, 115200 8N1, FIFOs enabled and
 emptied, each of the six steps confirmed by a readback before the next is attempted, so an absent
 controller (`0xFF` everywhere) and one that took the divisor and then refused the word format are
 two different typed errors rather than a node that prints nothing and says why nowhere. Every wait
@@ -1181,7 +1181,7 @@ same reason. `Com1::claim` then reads every register the driver can address befo
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`crates/wire` carries the transport: a 248-byte fixed-layout `LogRecord` whose every offset is a
+`datad/crates/wire` carries the transport: a 248-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
 record grew by the eight bytes of its instant and one discriminant byte taken out of existing
 padding, and the slot count did not move: the ring is sized for a boot transcript whose first
@@ -1247,8 +1247,8 @@ indifferent to whether anything is printed.
   Trusted Launch VM with Secure Boot) rather than about registers.
 - **The I/O-port CNode slot is hand-rolled and unchecked at build time, now in two places.**
   Microkit publishes a base slot constant for every capability class a domain can hold *except* this
-  one, so the slot number is written out in `pds/console/src/com1.rs` and again in
-  `pds/clock/src/cmos.rs` as a cross-artifact fact — each read from its own domain's CNode in the
+  one, so the slot number is written out in `datad/pds/console/src/com1.rs` and again in
+  `datad/pds/clock/src/cmos.rs` as a cross-artifact fact — each read from its own domain's CNode in the
   generated report, the two happening to agree. Its only detection is the
   pinned SDK version (`MICROKIT_VERSION=2.3.0`, checksum-verified, moved only through the full gate)
   read against the generated capability report; nothing compares the two automatically. What limits
@@ -1257,7 +1257,7 @@ indifferent to whether anything is printed.
 - **The single-writer property is exact only in release.** The debug kernel is built with
   `CONFIG_PRINTING` and writes the *same* port for its boot banner and its fault reports — it is
   handed `debug_port = 0x3f8` on the Multiboot2 command line, which is visible in the capture of any
-  debug boot (a diagnostic re-run's `build/image/*-debug.log`, or `make run`) and in none of the
+  debug boot (a diagnostic re-run's `datad/build/image/*-debug.log`, or `make run`) and in none of the
   captures the gate writes, those being release boots. That is accepted, the kernel printing on boot
   and on faults rather than per record, and it is why the claim is stated of the shipped profile.
 - **The console cannot report its own failure to start *on the line*, and reports one bit of it
@@ -1361,18 +1361,18 @@ downloads ([detail](#recording-and-download)) and `POST /config`
 by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it
 does not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
-The decision is three host-tested `no_std` crates. `crates/net-headers` gained ARP (IPv4 over Ethernet
+The decision is three host-tested `no_std` crates. `datad/crates/net-headers` gained ARP (IPv4 over Ethernet
 only; any other hardware type, protocol type, address length or operation is a typed error) and ICMP
 echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
-and one checksum routine. `crates/ip-endpoint` is the endpoint state machine — the appliance answering
-*for itself*, as against `crates/pipeline`, which decides what to forward for others — with zero `unsafe`, a closed
-`Outcome` vocabulary, and a counter per outcome; it now owns a `crates/tcp` stack and the HTTP
+and one checksum routine. `datad/crates/ip-endpoint` is the endpoint state machine — the appliance answering
+*for itself*, as against `datad/crates/pipeline`, which decides what to forward for others — with zero `unsafe`, a closed
+`Outcome` vocabulary, and a counter per outcome; it now owns a `datad/crates/tcp` stack and the HTTP
 server above it, and keeps the transport's advertised window equal to that server's free
 space. `pd_runtime::EndpointStage` joins it to the two pipelines: copy the frame out of the receive
 pool, decide, and where a reply was composed take a transmit buffer, write the reply into it and lend
 it to the driver.
 
-The addressing is **configured, not compiled in**. `systems/qemu-x86_64/configuration.xml` gained a
+The addressing is **configured, not compiled in**. `datad/systems/qemu-x86_64/configuration.xml` gained a
 `<management mac= address= prefix-length= enabled=/>` element — a sibling of `<interfaces>`, because
 the port is not a dataplane port and `config::PORT_COUNT` is still 2 — which the schema requires, the
 validator holds to its own rules *and* to not colliding with any dataplane prefix or MAC, and the
@@ -1479,7 +1479,7 @@ not satisfy it.
 
 ## Proxy TCP stack
 
-**What exists.** `crates/tcp` is a first-party TCP implementation that completes a real handshake
+**What exists.** `datad/crates/tcp` is a first-party TCP implementation that completes a real handshake
 with a real client, carries a byte stream, and closes cleanly — proven on the booting **release**
 image by the gate performing a whole TCP exchange against the management port. It is not a
 management-endpoint toy: it is the stack the dataplane proxy will run on, and every constraint below
@@ -1574,7 +1574,7 @@ established one.
   is untouched (see the [status table](../status.md)).
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
   the management domain outright, so that node has no management port for the boot. The QEMU bench had
-  to be told to expose it (`tools/xtask/src/qemu.rs`); every deployment target must have it. There is
+  to be told to expose it (`datad/tools/xtask/src/qemu.rs`); every deployment target must have it. There is
   no software fallback and deliberately so — the alternative is a predictable sequence number, which
   is worse than no port.
 - **Timers advance when the caller polls them.** The management domain is woken by a frame, so a
@@ -1639,8 +1639,8 @@ meaningful, so a scrape that straddles two domains' publications is still exactl
 last wrote; that is stated as a freshness boundary in the
 [metrics reference](../reference/metrics.md) rather than papered over.
 
-The exposition is rendered by `crates/metrics` (`no_std`, panic-free, with a computed
-`MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `crates/http`
+The exposition is rendered by `datad/crates/metrics` (`no_std`, panic-free, with a computed
+`MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `datad/crates/http`
 (`no_std`, a bounded server-side HTTP/1.1 head parser that returns a typed error mapping onto one of
 eight statuses). Both are fuzzed. The management domain's own shard is stored before the exposition
 is composed rather than after, which is why a scrape is never one request behind its own surface —
@@ -1672,17 +1672,17 @@ stated as a freshness property in the [metrics reference](../reference/metrics.m
 ## Trusted time source
 
 **What exists.** A node establishes a wall-clock time at boot, and the whole chain that does it is
-host-tested library code driven by a thin domain. `crates/clock` is the arithmetic — a tick delta
+host-tested library code driven by a thin domain. `datad/crates/clock` is the arithmetic — a tick delta
 and a reference interval to a counter frequency, a counter reading to nanoseconds since boot or
 since the epoch, an instant to a civil date and to an RFC 3339 line — with Hinnant's era
 decomposition proved by an exhaustive round trip over every day a `u64` of nanoseconds can name.
-`crates/hpet` is the reference measurement: it decides whether the block at `0xFED00000` is an HPET,
+`datad/crates/hpet` is the reference measurement: it decides whether the block at `0xFED00000` is an HPET,
 starts its main counter and measures a bounded span of it, and it earns that role by being
 *self-describing* — the capabilities register states its own tick period, so no frequency is
-assumed anywhere. `crates/rtc` is the epoch: the CMOS index/data protocol, two agreeing snapshots
+assumed anywhere. `datad/crates/rtc` is the epoch: the CMOS index/data protocol, two agreeing snapshots
 before anything is decoded, and every field ranged.
 
-`pds/clock` joins them. It maps the HPET page (three `unsafe` volatile accesses, each naming the
+`datad/pds/clock` joins them. It maps the HPET page (three `unsafe` volatile accesses, each naming the
 `<memory_region>` row that guarantees it), holds an `<ioport>` for `0x70`–`0x71` and proves the
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
@@ -1735,7 +1735,7 @@ calibration that is torn under the read or outside the band it accepts, having r
   the counter is invariant and no per-core anchoring — neither of which matters on the single vCPU
   this system runs on and both of which would on any multicore variant.
 - **The measurement is biased high by its own overhead**, by one uncached timer read at each end of
-  the window: parts in a thousand at worst, stated in `pds/clock` rather than corrected, because
+  the window: parts in a thousand at worst, stated in `datad/pds/clock` rather than corrected, because
   subtracting an estimate would replace a bounded one-signed error with an unbounded one.
 
 ## Protection-domain decomposition
@@ -1810,7 +1810,7 @@ the split the dataplane already has between its two drivers, which is what keeps
 refused by the ledger rather than believed.
 
 Reaching a port is an **invocation**, never an `in`/`out` instruction; that lesson was paid for once
-on the console's first boot and `pds/clock/src/cmos.rs` is written from it. Both domains prove the
+on the console's first boot and `datad/pds/clock/src/cmos.rs` is written from it. Both domains prove the
 capability answers before relying on it, so a slot the Microkit tool moved is a named refusal rather
 than a fault mid-sequence.
 
@@ -1853,12 +1853,12 @@ naming the component that establishes that. Every one of them is unconditional i
 profile rather than a `debug_assert!`, and `overflow-checks` is on in the shipped profile, so the
 arithmetic the property tests prove panic-free is the arithmetic that ships.
 
-Held by the hostile-device cases in `crates/virtio` and `crates/nic-driver-core`, plus two
+Held by the hostile-device cases in `datad/crates/virtio` and `datad/crates/nic-driver-core`, plus two
 device-facing persistent fuzz targets (`find_virtio_caps`, `virtqueue_poll`) and a third
 (`nic_driver_paths`) that drives a hostile device and a byzantine forwarder at once. Each models the
 device's full authority over the shared region rather than a well-behaved subset of it.
 
-`crates/uart-16550` is the second device this applies to and the smaller one: every byte it reads
+`datad/crates/uart-16550` is the second device this applies to and the smaller one: every byte it reads
 back is the controller's choice, a controller that never answers is indistinguishable from one that
 answers wrongly, and both are met the same way — every wait bounded by a constant of the crate's
 own, every refusal a typed error and a counter, and a property test asserting that initialisation
@@ -1940,7 +1940,7 @@ rubbish are the *other* domains'.
 **What exists.** A GPT disk with ESP, STATE, SLOT_A, SLOT_B and DATA partitions; both slots carry
 a signed kernel and system image. GRUB is built from pinned source as a standalone EFI binary with
 an embedded public key, so it *enforces* detached-signature verification on everything it loads.
-Its module set is a curated allowlist (`third-party/grub/modules.txt`) rather than a default build:
+Its module set is a curated allowlist (`datad/third-party/grub/modules.txt`) rather than a default build:
 every module in the core image is code inside the signed binary, so the list is the verified-boot
 base's attack surface and each entry states which line of `grub.cfg` needs it.
 
@@ -2007,20 +2007,20 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`tools/xtask/src/budgets.rs` against `tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `crates/` and `pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 24 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 24 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (16 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
-| Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; not a CI gate |
-| Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so runs in a networked CI step — not in a local `make ci` |
+| Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
+| Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |
 | Build input pinning | **partial** | every apt package — QEMU and OVMF included — is pinned to an exact version against a dated snapshot, but no sha256 for one is recorded here, so apt's own archive signature is the integrity root; the `cargo install`ed developer tools are version-exact and `--locked`, but their integrity rests on the crates.io index rather than on a checksum in this repository |
 
 Two of those rows deserve more than a table cell, and the fuzzing row deserves two.
 
 **The SBOM does not describe the shipped payload.** syft catalogs the workspace *source tree*, with
-`build/`, `dist/`, `target/`, `fuzz/` and `tools/` excluded, so a consumer must not read the document
+`datad/build/`, `datad/dist/`, `target/`, `datad/fuzz/` and `datad/tools/` excluded, so a consumer must not read the document
 as the boot payload's contents. Host-only crates that never enter an image — `criterion`, `proptest`,
 and their trees — appear in the inventory. And the third-party components that genuinely *do* ship
 inside the disk — the seL4 kernel from the Microkit SDK and the GRUB core image — are absent; they
@@ -2029,14 +2029,14 @@ are recorded as version-verified provenance in the release manifest instead.
 **The two configuration harnesses assert semantics, not survival.** Absence of a panic is the
 least interesting thing a validator can be shown to have, because the failure that reaches a
 dataplane is an image *wrongly accepted* rather than one that crashed the reader.
-`fuzz/src/handover.rs` therefore carries its own statement of the handover ABI's rules and of the
+`datad/fuzz/src/handover.rs` therefore carries its own statement of the handover ABI's rules and of the
 order they are applied in, taken from the contract rather than read out of `wire`, and compares it
 with `ConfigImage::check` on every input — so an image the reader admits and the contract refuses
-fails exactly as loudly as a panic would. `fuzz/src/document.rs` closes the same gap across a crate
-boundary: every document `crates/config` accepts must build a handover image the *consuming* domain
+fails exactly as loudly as a panic would. `datad/fuzz/src/document.rs` closes the same gap across a crate
+boundary: every document `datad/crates/config` accepts must build a handover image the *consuming* domain
 accepts, and a forwarding table carrying the entries the document named, which no test inside either
 crate alone can observe. Both claims were checked by sabotage rather than by reading — deleting the
-prefix-length rule from `ConfigImage::check`, and the port-range rule from `crates/config`, each
+prefix-length rule from `ConfigImage::check`, and the port-range rule from `datad/crates/config`, each
 fails the seed-corpus smoke test on the committed seed named after it, so the corpus alone catches a
 lost rule with no live fuzzing at all.
 

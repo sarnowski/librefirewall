@@ -63,7 +63,7 @@ locally justified — so the mechanical test is the rule:
 A reproducible candidate finder (every hit on an external-input path is a finding):
 
 ```sh
-rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-z0-9_]*\]' crates/ pds/
+rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-z0-9_]*\]' datad/crates/ datad/pds/
 ```
 
 ## Ownership, state, and the hot path
@@ -89,10 +89,11 @@ rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-
   boundary has no other carrier.
 - **The `unsafe` budget only shrinks.** Every `unsafe` block obliges a prose claim the compiler
   cannot check, so the per-crate block count is the leading indicator of unverified prose. The
-  count is recorded (`tools/xtask/budgets.toml`) for every crate under `crates/` and `pds/`, and
-  never rises without explicit human approval. The two `unsafe` lint denials reach further than the
-  ratchet does: they bind every workspace member, while the recorded counts stop at those two
-  trees. In `tools/` and the separate `fuzz/` workspace the rule holds by review, not by a gate.
+  count is recorded (`datad/tools/xtask/budgets.toml`) for every crate under `datad/crates/` and
+  `datad/pds/`, and never rises without explicit human approval. The two `unsafe` lint denials
+  reach further than the ratchet does: they bind every workspace member, while the recorded counts
+  stop at those two trees. In `datad/tools/` and the separate `datad/fuzz/` workspace the rule
+  holds by review, not by a gate.
 
 **A delegated precondition names its enforcer.** A precondition delegated layer by layer can
 complete a circle — the driver defers to the runtime, the runtime to the queue, the queue back to
@@ -134,8 +135,8 @@ The rules for the prose that remains:
   enum is the error documentation; a consumed `self` is the lifecycle documentation. `missing_docs`
   is deliberately not enforced: forcing a comment onto every public item manufactures contentless
   prose.
-- **The comment budget only shrinks.** Per production file under `crates/` and `pds/`, the
-  comment-line ratio is recorded and never rises without explicit human approval and a recorded
+- **The comment budget only shrinks.** Per production file under `datad/crates/` and `datad/pds/`,
+  the comment-line ratio is recorded and never rises without explicit human approval and a recorded
   reason. Benchmarks, test binaries and the build tooling are outside the measurement; the rule
   holds there by review.
 - **Code never references documentation.** No comment, string, or error message names a
@@ -205,7 +206,7 @@ including edge cases; the trusted base is not tested. The pyramid, from broad ba
 **Coverage floors are enforced in the gate**: 94% combined across the library crates and 90% for
 each library crate on its own. A change that drops below either floor does not land; raise a floor
 as coverage rises, never lower one to land a change. A coverage exclusion must cite a reason from
-this closed list, recorded beside the exclusion (`tools/xtask/src/host.rs`):
+this closed list, recorded beside the exclusion (`datad/tools/xtask/src/host.rs`):
 
 1. **Only observable under seL4** — a protection-domain adapter whose behaviour cannot be exercised
    on the host. The exclusion names the QEMU test that covers it instead.
@@ -224,8 +225,8 @@ in a passing run.
 
 - **The fuzz workspace depends on every crate that parses or interprets untrusted input** — bytes
   from a device, a peer protection domain, or the network — with a target per parser. Adding such a
-  crate without adding the dependency and a target is a defect; review `fuzz/Cargo.toml` against
-  the workspace on every change that adds one.
+  crate without adding the dependency and a target is a defect; review `datad/fuzz/Cargo.toml`
+  against the workspace on every change that adds one.
 - **A harness never constrains its input in a way that excludes the adversary's capability.** If a
   peer can send a duplicate index, the harness must be able to generate a duplicate index. Guards
   that "keep the harness sane" delete precisely the adversarial region. Model the *authority* the
@@ -279,12 +280,12 @@ through them rather than about it from the source:
 | `GET /metrics` | **that** something is wrong, and where — which counter moved, in which domain | `curl` through the port forward |
 | `GET /capture.pcapng` | **which packet** — the frames themselves, with the firewall's verdict on each | `curl`, then `tcpdump -r` or Wireshark |
 | `GET /logs.pcapng` | **which conversations, and what happened to them** — an open with the rule that admitted it, an advance, a close with how it closed, a refusal with its reason, each on the packet that caused it | the same |
-| the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `build/image/` |
+| the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `datad/build/image/` |
 
 A counter is a summary and a capture is evidence. When a dataplane question is open — is the frame
 arriving, is it being parsed, is the verdict what the table says, is the rewrite right — download
 the recording and look at the packets. Every QEMU scenario leaves its downloads at
-`build/image/qemu-<scenario>-{logs,capture}.pcapng` and its serial output beside them, so after any
+`datad/build/image/qemu-<scenario>-{logs,capture}.pcapng` and its serial output beside them, so after any
 `make test-system` run the evidence is already on disk. Use the surfaces while developing, not only
 at the end.
 
@@ -325,11 +326,12 @@ shipping a partial result framed as complete.
 
 ## Security-consequential changes
 
-A change with security consequence is never self-approved: the capability topology in `systems/`, a
+A change with security consequence is never self-approved: the capability topology in
+`datad/systems/`, a
 trust boundary, `unsafe`, the boot chain, key handling, or any code on an external-input path.
 Reason about it fully and propose it; a human owns the final call. **Preserve least privilege in
 the Microkit system description** — a capability change is a security change, and the generated
-capability/memory report (`build/image/<config>/report.txt`) is the artifact to check the grant
+capability/memory report (`datad/build/image/<config>/report.txt`) is the artifact to check the grant
 against.
 
 Never commit secrets or an inspection CA; treat any secret you encounter as compromised.
@@ -344,8 +346,9 @@ Never commit secrets or an inspection CA; treat any secret you encounter as comp
   full gate.
 - **First-party userspace is pure Rust.** Audit transitive dependencies for native code, unexpected
   linking, and build scripts; the dependency/license/source policy is enforced by `cargo-deny` in
-  the gate, and the networked `advisories` check runs as its own CI stage. Both halves are
-  configured in `deny.toml`; neither substitutes for the other.
+  the gate, and the networked `advisories` check is a deliberate manual run (`cargo deny check
+  advisories`) that nothing runs automatically. Both halves are configured in `datad/deny.toml`;
+  neither substitutes for the other.
 - Microkit x86_64 differs from Arm and RISC-V: the kernel and system image are separate ELFs loaded
   by a Multiboot2 bootloader. Use the pinned SDK's x86_64 BSP examples as the executable reference;
   never copy an Arm loader recipe.

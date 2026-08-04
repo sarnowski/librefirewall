@@ -1,12 +1,12 @@
-include third-party/sources.lock
+include datad/third-party/sources.lock
 
 PODMAN ?= podman
 BUILDER_IMAGE ?= localhost/librefirewall-builder:microkit-$(MICROKIT_VERSION)
 # Expose the KVM device to the sandbox for accelerated QEMU when the host has
 # it; the harness falls back to emulation when it is absent.
 KVM_FLAGS := $(if $(wildcard /dev/kvm),--device /dev/kvm --group-add keep-groups,)
-CONTAINERFILE := build/container/Containerfile
-CONTAINER_IGNORE := build/container/containerignore
+CONTAINERFILE := datad/build/container/Containerfile
+CONTAINER_IGNORE := datad/build/container/containerignore
 ENTERPRISE_CA_FILE ?= $(firstword $(wildcard /usr/local/share/ca-certificates/*-dpi-ca.crt))
 
 ifeq ($(strip $(ENTERPRISE_CA_FILE)),)
@@ -90,20 +90,23 @@ hooks:
 book:
 	mdbook build book
 
-# xtask owns the list of generated directories (tools/xtask host::clean), so
+# xtask owns the list of generated directories (datad/tools/xtask host::clean), so
 # clean runs in the container like every other command rather than restating
 # that list here where the two would drift.
 clean:
 	$(require_builder)
 	$(call xtask,clean)
 
+# The build context is the appliance component, not the repository root: every
+# COPY in the Containerfile and every pattern in the containerignore is
+# context-relative, so they stay unchanged as the tree around them moves.
 define provision_builder
 $(PODMAN) --cgroup-manager=cgroupfs build \
 	--file $(CONTAINERFILE) \
 	--ignorefile $(CONTAINER_IGNORE) \
 	--build-arg BASE_IMAGE=$(DEBIAN_IMAGE) \
 	$(CA_SECRET) \
-	--tag $(BUILDER_IMAGE) .
+	--tag $(BUILDER_IMAGE) datad
 endef
 
 define require_builder
@@ -114,6 +117,10 @@ define require_builder
 }
 endef
 
+# The repository root is mounted, and the run starts in the appliance
+# component below it: cargo then finds datad/Cargo.toml, the `xtask` alias in
+# datad/.cargo/config.toml, and datad/rust-toolchain.toml, while the book at
+# the repository root stays reachable one level up.
 define container
 $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--network=none \
@@ -126,6 +133,7 @@ $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--env CARGO_NET_OFFLINE=true \
 	--tmpfs /tmp:rw,nosuid,nodev \
 	--mount type=bind,src=$(CURDIR),dst=/workspace,rw=true \
+	--workdir /workspace/datad \
 	$(KVM_FLAGS) \
 	$(1) $(BUILDER_IMAGE) cargo xtask $(2)
 endef

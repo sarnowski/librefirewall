@@ -1,0 +1,11 @@
+/build/*
+!/build/container/
+!/build/container/**
+/dist/
+/target/
+
+# The pinned nightly ICEs on a stale incremental cache, and drops its crash dump
+# in the working directory rather than under target/. Five of them reached a
+# commit before this pattern existed; they are a compiler artifact of one
+# machine's build and belong in no tree.
+/rustc-ice-*.txt
