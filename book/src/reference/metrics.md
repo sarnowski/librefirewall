@@ -58,8 +58,8 @@ in the *next* one.
 
 ## Metric inventory
 
-100 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 367 counter and gauge series from the 11 shards,
+101 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 383 counter and gauge series from the 11 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 83 435 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -421,8 +421,9 @@ parks, and never move again.
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_crypto_proven` | gauge | `crypto` | — | 1 once every primitive answered every published vector this image carries for it; 0 before, and forever on a node that refused. |
-| `librefirewall_crypto_vectors_proven_total` | counter | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`) | Published NIST CAVP, RFC and Wycheproof vectors this node re-ran at bring-up and answered correctly, per primitive. |
-| `librefirewall_crypto_milli_cycles_per_byte` | gauge | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`) | Thousandths of a timestamp-counter cycle per byte this node measured for a primitive at bring-up; 0 for a primitive it does not measure. |
+| `librefirewall_crypto_vectors_proven_total` | counter | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Published NIST CAVP, RFC and Wycheproof vectors this node re-ran at bring-up and answered correctly, per primitive. |
+| `librefirewall_crypto_milli_cycles_per_byte` | gauge | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Thousandths of a timestamp-counter cycle per byte this node measured for a primitive at bring-up; 0 for a primitive it does not measure. |
+| `librefirewall_crypto_cycles_per_operation` | gauge | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Timestamp-counter cycles one operation of a primitive cost this node at bring-up, for the primitives whose work has one size rather than a length; 0 for a primitive measured per byte instead. |
 
 **No series counts unsynchronized records, and that is deliberate.** Whether a domain has a
 calibration is visible on each record it emits — `time=unsynchronized` against an instant — so such

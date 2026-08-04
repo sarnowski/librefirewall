@@ -1,0 +1,26 @@
+[package]
+# The rustls crypto provider and the session driver over it. `lfw-tls` rather
+# than `tls`, on the same split `crates/log` makes.
+name = "lfw-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lfw-crypto = { path = "../crypto" }
+lfw-x509 = { path = "../x509" }
+# TLS itself. `default-features = false` drops `std`, the aws-lc-rs provider
+# and its C toolchain, TLS 1.2, and the logging facade; `custom-provider` is
+# how rustls is told that the provider comes from here and that no process-wide
+# default is to be consulted. `alloc` is not a feature — rustls requires it
+# unconditionally, which is the whole reason this crate's consumer carries an
+# arena.
+rustls = { version = "0.23.43", default-features = false, features = [
+    "custom-provider",
+] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

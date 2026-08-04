@@ -26,6 +26,8 @@ members = [
     "crates/capture-ring",
     "crates/recorder",
     "crates/crypto",
+    "crates/x509",
+    "crates/tls",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",

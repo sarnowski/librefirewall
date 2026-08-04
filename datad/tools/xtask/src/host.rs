@@ -64,6 +64,8 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-hpet",
     "lfw-rtc",
     "lfw-crypto",
+    "lfw-x509",
+    "lfw-tls",
     "xtask",
 ];
 
@@ -102,6 +104,8 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-hpet",
     "lfw-rtc",
     "lfw-crypto",
+    "lfw-x509",
+    "lfw-tls",
 ];
 
 /// How many library crates carry the coverage floors.
@@ -380,7 +384,7 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
                     "--locked",
                     "--release",
                     "-Z",
-                    "build-std=core",
+                    "build-std=core,alloc",
                     "-Z",
                     "build-std-features=compiler-builtins-mem",
                     "--target",

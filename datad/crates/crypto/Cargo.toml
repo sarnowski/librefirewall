@@ -32,6 +32,24 @@ chacha20 = { version = "0.9.1", default-features = false }
 # Clearing a keystream buffer before it leaves the stack. Already in the graph
 # as the AEAD crates' dependency, on the same terms as `chacha20`.
 zeroize = { version = "1.9.0", default-features = false }
+# ECDSA over NIST P-256: the appliance's one signature algorithm. The `ecdsa`
+# feature pulls the curve arithmetic and the SHA-256 binding; `std`, `pem` and
+# `pkcs8` are all dropped, so nothing here parses or prints a key file.
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
+# X25519, the classical half of the hybrid group. `static_secrets` is what
+# exposes a secret that outlives one call, which the key-exchange trait needs:
+# the share is published first and completed later.
+x25519-dalek = { version = "2.0.1", default-features = false, features = [
+    "static_secrets",
+] }
+# ML-KEM-768, the post-quantum half. `default-features = false` drops `std`;
+# `deterministic` adds the two entry points that take the seeds the algorithm
+# is defined on rather than drawing them, which is what makes a published
+# known-answer test possible at all — a randomised key generation has no
+# expected output to compare against.
+ml-kem = { version = "0.2.3", default-features = false, features = [
+    "deterministic",
+] }
 
 [dev-dependencies]
 proptest = { workspace = true }

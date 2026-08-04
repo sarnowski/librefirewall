@@ -25,16 +25,16 @@ use crate::catalog::{
     BLOCK_BYTES, BLOCK_CAPACITY_SECTORS, BLOCK_REQUESTS, BLOCK_STATUS_UNDECODABLE,
     CLOCK_CALIBRATIONS_REFUSED, CLOCK_FREQUENCY_HERTZ, CLOCK_GENERATION, CONFIGURATION_GENERATION,
     CONFIGURATION_IMAGES, CONFIGURATION_READS, CONFIGURATION_SUBMISSIONS, CONSOLE_RECORDS,
-    CRYPTO_MILLI_CYCLES_PER_BYTE, CRYPTO_PROVEN, CRYPTO_VECTORS, DEVICE_FAULTS, ENDPOINT_BYTES,
-    ENDPOINT_FRAMES, ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US, ENDPOINT_REPLIES,
-    ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED, ENDPOINT_STAGE_DROPS,
-    ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED,
-    FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN, FLOW_PROBE_COLLISIONS,
-    FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS, HARDWARE_PROBE_PREEMPTIONS,
-    HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN, HTTP_BODIES_TIMED_OUT,
-    HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
-    HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
-    INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
+    CRYPTO_CYCLES_PER_OPERATION, CRYPTO_MILLI_CYCLES_PER_BYTE, CRYPTO_PROVEN, CRYPTO_VECTORS,
+    DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES, ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US,
+    ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED,
+    ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED,
+    ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN,
+    FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS,
+    HARDWARE_PROBE_PREEMPTIONS, HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN,
+    HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
+    HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
+    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
     POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
     POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
     RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
@@ -1526,7 +1526,7 @@ impl HardwareProbeSample {
 /// `lfw_log::Primitive` because the dependency runs the other way — `lfw-log`
 /// reaches for this crate and never back — and a test in `lfw-log`, which can
 /// see both, holds one list to the other through that transliteration.
-pub const CRYPTO_PRIMITIVES: [&str; 7] = [
+pub const CRYPTO_PRIMITIVES: [&str; 10] = [
     "sha_256",
     "hmac_sha_256",
     "hkdf_sha_256",
@@ -1534,16 +1534,20 @@ pub const CRYPTO_PRIMITIVES: [&str; 7] = [
     "chacha20_poly1305",
     "aes_256_gcm",
     "chacha20_drbg",
+    "ecdsa_p256",
+    "x25519",
+    "ml_kem_768",
 ];
 
 /// Slots [`CryptoSample`] occupies.
-pub const CRYPTO_SLOTS: usize = 3 + 2 * CRYPTO_PRIMITIVES.len();
+pub const CRYPTO_SLOTS: usize = 3 + 3 * CRYPTO_PRIMITIVES.len();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CryptoSample {
     pub proven: bool,
     pub vectors: [u64; CRYPTO_PRIMITIVES.len()],
     pub milli_cycles_per_byte: [u64; CRYPTO_PRIMITIVES.len()],
+    pub cycles_per_operation: [u64; CRYPTO_PRIMITIVES.len()],
     pub log: LogSample,
 }
 
@@ -1560,6 +1564,9 @@ impl CryptoSample {
         ),
         s(&CRYPTO_VECTORS, &[Label::new("primitive", "aes_256_gcm")]),
         s(&CRYPTO_VECTORS, &[Label::new("primitive", "chacha20_drbg")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "ecdsa_p256")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "x25519")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "ml_kem_768")]),
         s(
             &CRYPTO_MILLI_CYCLES_PER_BYTE,
             &[Label::new("primitive", "sha_256")],
@@ -1588,6 +1595,58 @@ impl CryptoSample {
             &CRYPTO_MILLI_CYCLES_PER_BYTE,
             &[Label::new("primitive", "chacha20_drbg")],
         ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "ecdsa_p256")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "x25519")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "ml_kem_768")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "sha_256")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "hmac_sha_256")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "hkdf_sha_256")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "chacha20")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "chacha20_poly1305")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "aes_256_gcm")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "chacha20_drbg")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "ecdsa_p256")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "x25519")],
+        ),
+        s(
+            &CRYPTO_CYCLES_PER_OPERATION,
+            &[Label::new("primitive", "ml_kem_768")],
+        ),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
@@ -1597,11 +1656,15 @@ impl CryptoSample {
         let mut values = [0_u64; CRYPTO_SLOTS];
         values[0] = u64::from(self.proven);
         let measured = 1 + CRYPTO_PRIMITIVES.len();
+        let per_operation = measured + CRYPTO_PRIMITIVES.len();
         for (at, count) in self.vectors.iter().enumerate() {
             values[1 + at] = *count;
         }
         for (at, cost) in self.milli_cycles_per_byte.iter().enumerate() {
             values[measured + at] = *cost;
+        }
+        for (at, cost) in self.cycles_per_operation.iter().enumerate() {
+            values[per_operation + at] = *cost;
         }
         values[CRYPTO_SLOTS - 2] = self.log.dropped;
         values[CRYPTO_SLOTS - 1] = self.log.refused;

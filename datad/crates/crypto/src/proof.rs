@@ -1,11 +1,16 @@
 use crate::{
-    Aes256Gcm, ChaCha20Poly1305, CryptoError, Drbg, MAC_LEN, SEED_LEN,
+    Aes256Gcm, ChaCha20Poly1305, CryptoError, Drbg, MAC_LEN, MlKem768DecapsulationKey,
+    MlKem768EncapsulationKey, P256SecretKey, SEED_LEN, X25519Secret,
     aead::AeadOps,
-    hkdf_expand, hkdf_extract, hmac_sha256, hmac_sha256_verify, sha256,
+    hkdf_expand, hkdf_extract, hmac_sha256, hmac_sha256_verify, p256_verify, sha256,
     vectors::{
-        AES_256_GCM_VECTORS, AeadVector, CHACHA20_POLY1305_VECTORS, CHACHA20_STREAM_VECTORS,
-        DRBG_VECTORS, DrbgVector, HKDF_SHA256_VECTORS, HMAC_SHA256_VECTORS, HashVector, KdfVector,
-        MacVector, SHA256_VECTORS, StreamVector,
+        AES_256_GCM_VECTORS, AeadVector, AgreementVector, CHACHA20_POLY1305_VECTORS,
+        CHACHA20_STREAM_VECTORS, DRBG_VECTORS, DrbgVector, ECDSA_P256_SIGN_VECTORS,
+        ECDSA_P256_VERIFY_VECTORS, HKDF_SHA256_VECTORS, HMAC_SHA256_VECTORS, HashVector, KdfVector,
+        KemDecapsulationVector, KemEncapsulationVector, KemKeyCheckVector, KemKeyGenVector,
+        ML_KEM_768_DECAPSULATION_VECTORS, ML_KEM_768_ENCAPSULATION_VECTORS,
+        ML_KEM_768_KEY_CHECK_VECTORS, ML_KEM_768_KEYGEN_VECTORS, MacVector, SHA256_VECTORS,
+        SignatureVector, SigningVector, StreamVector, X25519_VECTORS,
     },
 };
 use chacha20::cipher::{KeyIvInit as _, StreamCipher as _, StreamCipherSeek as _};
@@ -304,6 +309,179 @@ pub(crate) fn prove_drbg_in(table: &[DrbgVector]) -> Result<u32, VectorFailure> 
         row(index, vector.id, &produced[..want] == vector.first_output)?;
     }
     Ok(table.len() as u32)
+}
+
+/// Prove ECDSA over P-256: every published verification row, forgeries
+/// included, and every deterministic signing row.
+///
+/// Signing and verification are one primitive here and are counted as one,
+/// because a build that could verify and not sign is not one this appliance
+/// could use for anything: it authenticates itself with this key.
+///
+/// # Errors
+/// The first row this build answers differently from the published one.
+pub fn prove_ecdsa_p256() -> Result<u32, VectorFailure> {
+    let verified = prove_ecdsa_p256_verify_in(ECDSA_P256_VERIFY_VECTORS)?;
+    let signed = prove_ecdsa_p256_sign_in(ECDSA_P256_SIGN_VECTORS)?;
+    Ok(verified.saturating_add(signed))
+}
+
+pub(crate) fn prove_ecdsa_p256_verify_in(table: &[SignatureVector]) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let outcome = p256_verify(vector.public_key, vector.message, vector.signature);
+        // Every refusal is the same refusal from outside, so a row is held by
+        // the signature not verifying and not by which step refused it: an
+        // unparseable encoding and a wrong scalar are one answer, which is
+        // what a verifier owes a forger.
+        let held = matches!(
+            (vector.authentic, outcome),
+            (true, Ok(()))
+                | (
+                    false,
+                    Err(CryptoError::NotAuthentic | CryptoError::InvalidPublicKey)
+                )
+        );
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+pub(crate) fn prove_ecdsa_p256_sign_in(table: &[SigningVector]) -> Result<u32, VectorFailure> {
+    let mut produced = [0_u8; crate::P256_MAX_SIGNATURE_LEN];
+    for (index, vector) in table.iter().enumerate() {
+        let held = match P256SecretKey::from_scalar(&vector.secret) {
+            Ok(key) => {
+                let signature = key
+                    .sign(vector.message, &mut produced)
+                    .ok()
+                    .and_then(|len| produced.get(..len));
+                // Three claims per row and all three must hold: the public key
+                // this scalar derives is the published one, the signature is
+                // the published one byte for byte — which only a deterministic
+                // nonce makes checkable — and this build's own verifier
+                // accepts what this build's own signer produced.
+                signature == Some(vector.signature)
+                    && key.public_key() == vector.public_key
+                    && p256_verify(vector.public_key, vector.message, vector.signature).is_ok()
+            }
+            Err(_) => false,
+        };
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+/// Prove X25519, including the peer values whose exchange must be refused.
+///
+/// # Errors
+/// The first row this build answers differently from the published one.
+pub fn prove_x25519() -> Result<u32, VectorFailure> {
+    prove_x25519_in(X25519_VECTORS)
+}
+
+pub(crate) fn prove_x25519_in(table: &[AgreementVector]) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let outcome = X25519Secret::from_scalar(&vector.secret).agree(&vector.peer);
+        let held = match (vector.contributory, outcome) {
+            (true, Ok(shared)) => shared == vector.shared,
+            (false, Err(CryptoError::NonContributory)) => true,
+            _ => false,
+        };
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+/// Prove ML-KEM-768 across all three of its operations.
+///
+/// Key generation, encapsulation and decapsulation are one primitive and are
+/// counted as one: a key exchange needs all three and a build that answered
+/// two of them would be no more usable than one that answered none.
+///
+/// # Errors
+/// The first row this build answers differently from the published one.
+pub fn prove_ml_kem_768() -> Result<u32, VectorFailure> {
+    let generated = prove_ml_kem_768_keygen_in(ML_KEM_768_KEYGEN_VECTORS)?;
+    let encapsulated = prove_ml_kem_768_encapsulation_in(ML_KEM_768_ENCAPSULATION_VECTORS)?;
+    let decapsulated = prove_ml_kem_768_decapsulation_in(ML_KEM_768_DECAPSULATION_VECTORS)?;
+    let checked = prove_ml_kem_768_key_check_in(ML_KEM_768_KEY_CHECK_VECTORS)?;
+    Ok(generated
+        .saturating_add(encapsulated)
+        .saturating_add(decapsulated)
+        .saturating_add(checked))
+}
+
+pub(crate) fn prove_ml_kem_768_key_check_in(
+    table: &[KemKeyCheckVector],
+) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let outcome = MlKem768EncapsulationKey::from_bytes(vector.encapsulation_key);
+        let held = matches!(
+            (vector.acceptable, outcome),
+            (true, Ok(_)) | (false, Err(CryptoError::InvalidPublicKey))
+        );
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+pub(crate) fn prove_ml_kem_768_keygen_in(table: &[KemKeyGenVector]) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let key = MlKem768DecapsulationKey::from_seeds(&vector.d, &vector.z);
+        let held = key.encapsulation_key() == vector.encapsulation_key
+            && key.to_bytes() == vector.decapsulation_key;
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+pub(crate) fn prove_ml_kem_768_encapsulation_in(
+    table: &[KemEncapsulationVector],
+) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let held = match MlKem768EncapsulationKey::from_bytes(vector.encapsulation_key) {
+            Ok(key) => match key.encapsulate_deterministic(&vector.message) {
+                Ok((ciphertext, secret)) => {
+                    ciphertext == vector.ciphertext && secret == vector.shared_secret
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+pub(crate) fn prove_ml_kem_768_decapsulation_in(
+    table: &[KemDecapsulationVector],
+) -> Result<u32, VectorFailure> {
+    for (index, vector) in table.iter().enumerate() {
+        let held = match sized_decapsulation_key(vector.decapsulation_key) {
+            Some(encoded) => {
+                MlKem768DecapsulationKey::from_bytes(&encoded).decapsulate(vector.ciphertext)
+                    == Ok(vector.shared_secret)
+            }
+            None => false,
+        };
+        row(index, vector.id, held)?;
+    }
+    Ok(table.len() as u32)
+}
+
+/// A table's decapsulation key at the length the algorithm defines, or nothing
+/// where the row carries something else. Written out rather than done with
+/// `try_into` at the call site so the array lives in one frame: it is 2400
+/// bytes, and a copy per conversion would be a second one.
+fn sized_decapsulation_key(
+    encoded: &[u8],
+) -> Option<[u8; crate::ML_KEM_768_DECAPSULATION_KEY_LEN]> {
+    let mut sized = [0_u8; crate::ML_KEM_768_DECAPSULATION_KEY_LEN];
+    if encoded.len() != sized.len() {
+        return None;
+    }
+    sized.copy_from_slice(encoded);
+    Some(sized)
 }
 
 /// The tag length the AEAD rows compare against, restated nowhere: this holds

@@ -62,6 +62,16 @@ primitive below is proved on every boot; the counts are on the console and in th
 | `chacha20-poly1305` | RFC 8439's worked example and Wycheproof, forgeries included | yes |
 | `aes-256-gcm` | NIST CAVP `gcmEncryptExtIV256` and `gcmDecrypt256`, and Wycheproof, forgeries included | yes |
 | `chacha20-drbg` | the generator's own output against an independent computation of the keystream it is defined as | no |
+| `ecdsa-p256` | Wycheproof for verification — ten signatures a verifier must accept and one per family of malformation the corpus names — and RFC 6979's own appendix for signing, which is the document that makes a signature reproducible at all | yes |
+| `x25519` | Wycheproof, including the peer values that force an all-zero shared secret, which this appliance refuses rather than keys from | yes |
+| `ml-kem-768` | the NIST ACVP reference vectors for FIPS 203: key generation from fixed seeds, deterministic encapsulation, decapsulation of both valid and modified ciphertexts, and the encapsulation-key validity check | yes |
+
+**The three asymmetric primitives are measured per operation, not per byte.** A signature, a key
+agreement and an encapsulation each do exactly one amount of work, so a per-byte figure for any of
+them would be a number divided by a denominator nobody chose. Each is reported in whole cycles for
+a *complete* operation as a handshake performs it — a signature generated and verified, a key
+agreement run from both sides, an encapsulation followed by its decapsulation — because half of one
+is a figure no path takes.
 
 The corpus is a curated subset and not the whole published files, which run to megabytes: what is
 kept is the adversarial shape of each — the boundary lengths where a padding or block loop changes
@@ -95,23 +105,79 @@ three must hold:
    per byte more. Four sits four times above the accelerated figure and comfortably below the
    portable one, so it cannot be met by a fallback and cannot be missed by a slower accelerated part.
 
-The other two measured primitives carry ceilings too, but those are **regression bounds and not
-backend assertions**: SHA-256 runs the portable path for the reason given above, so a figure below
-its ceiling says nothing about which backend answered.
+The other measured primitives carry ceilings too, but those are **regression bounds and not backend
+assertions**: SHA-256 runs the portable path for the reason given above, so a figure below its
+ceiling says nothing about which backend answered, and the three asymmetric primitives run on
+general-purpose registers, where the acceleration that helps them is invisible as a code path. Each
+of those ceilings sits several times above what this image measures, so what it catches is a
+several-fold regression rather than a slow part.
 
 **Measurements are asserted only on a run executing on real hardware.** Under emulation every guest
 instruction is a host function call and the guest's cycle counter advances against emulated time, so
 a figure taken there describes the emulator. Such a run reports its numbers in full and the verdict
 says they were not asserted, rather than passing quietly.
 
+## The session the appliance proves against itself
+
+Correct primitives are not a working TLS stack, and the difference is where the mistakes are. So the
+cryptography domain also **establishes one complete TLS 1.3 session with itself** on every boot —
+client half and server half both inside the domain, over a transport that is two buffers — and
+reports what it settled on. It needs no network and no configuration, which is why it can be proved
+before the appliance can dial anything.
+
+One session exercises, in one go, everything the management channel's own handshake will: the
+hybrid key exchange, an ECDSA signature over the transcript, a certificate chain validated against
+a trust anchor, the key schedule, and the record layer in both directions. It is
+**mutually authenticated** — each end presents a certificate this domain issued from its own
+certification authority, and each end validates the other's against that anchor — so a boot that
+reports it has proved that a peer can be authenticated and not merely that a handshake ran.
+
+| what the boot reports | what the channel requires |
+|---|---|
+| protocol version | TLS 1.3 (`0x0304`) |
+| cipher suite | `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`) |
+| key exchange group | `X25519MLKEM768` (`0x11ec`) |
+| application data echoed | non-zero, in both directions |
+| peer identity | the authenticated peer's certificate, named by its digest |
+
+The build fails on any of the three code points differing, on no application data having moved, and
+on the peer identity being absent. A session that ends without its closing alert is refused too: a
+stream delimited by the connection going quiet is one a truncation is indistinguishable from.
+
+## The allocator, and why reaching its bound is a report rather than a fault
+
+The domain that runs TLS is the only one on this appliance with an allocator, because a proven TLS
+implementation requires one. It is a **fixed region with a bump cursor**, and three things make it
+acceptable on a path an adversary drives.
+
+**It is bounded.** The region is a first-party constant no peer can move, and the domain reports the
+most it ever held at once against that capacity on every boot — so the bound is a number an operator
+can read rather than a claim the code makes.
+
+**Exhaustion is refused before it happens.** A failed allocation cannot be turned into an error
+return in this language: the allocation-failure path does not return. So the session checks that it
+has a step's worth of headroom *before* each step, and refuses the session if it does not — which is
+a typed answer on a live connection, and closes it cleanly. The allocator's own refusal sits
+underneath that as a backstop; a boot that ever reached it says so, and the build fails.
+
+**It is confined to that one domain.** No dataplane domain has an allocator; every buffer there is
+still a mapped region or a stack array. The arena is mapped read-write into the cryptography domain
+and into nothing else, which also keeps a session's ephemeral keys reachable from one domain only.
+
+The proof of all three is on the image and not only in a test: after the session above, the domain
+runs **a second session on an arena deliberately starved below what one step needs**, and requires
+it to be refused — with the allocator's own refusal count still at zero, which is what says the
+guard and not the allocator did the refusing.
+
 ## Where the numbers appear
 
 | surface | what it carries |
 |---|---|
-| the console | one record per primitive with the vectors it proved, one per measured primitive with its cost, the `CPUID` feature words the part was accepted on, and a single ready or refused verdict |
+| the console | one record per primitive with the vectors it proved, one per measured primitive with its cost, the `CPUID` feature words the part was accepted on, the session's negotiated parameters and peer, the arena's high-water mark and the starved session's refusal, and a single ready or refused verdict |
 | `librefirewall_crypto_proven` | 1 once every primitive answered every vector |
 | `librefirewall_crypto_vectors_proven_total` | vectors answered, per primitive |
-| `librefirewall_crypto_milli_cycles_per_byte` | measured cost, per primitive; 0 for a primitive that is not measured |
+| `librefirewall_crypto_milli_cycles_per_byte` | measured cost per byte, per primitive; 0 for a primitive measured per operation or not measured |
+| `librefirewall_crypto_cycles_per_operation` | measured cost per operation, per primitive; 0 for a primitive measured per byte or not measured |
 
 The exact console grammar is in [Console records](console.md) and the metric definitions in
 [Prometheus metrics](metrics.md).

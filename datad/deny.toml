@@ -174,6 +174,18 @@ allow-build-scripts = [
     # Rust, no C toolchain, no code generation from an external input — and the
     # `deny` list above independently forbids it from reaching one.
     { crate = "generic-array", reason = "rustc version probe, to select a const-generics path" },
+    # The TLS half, added with rustls. Both are pure Rust and neither reaches a
+    # C toolchain, which the `deny` list above independently forbids.
+    #
+    # `rustls`'s build script exists only to turn on a nightly-only language
+    # feature behind its `read_buf` cargo feature, which this appliance does
+    # not enable; with that feature off the script's body is an empty `main`.
+    # `curve25519-dalek`'s probes the compiler version to choose between its
+    # backends — and the one it chooses here is the portable serial backend,
+    # because the vector one is selected by an AVX2 target feature the SIMD
+    # target specification deliberately disables.
+    { crate = "rustls", reason = "nightly-feature probe for `read_buf`, which this build does not enable" },
+    { crate = "curve25519-dalek", reason = "rustc version probe, to select a backend" },
 
     # Reachable only because `all-features = true` resolves every target: these
     # are wasm/WASI shims that no librefirewall target ever builds. They are
@@ -208,6 +220,22 @@ allow-globs = ["cargo.sh", "ci/*.sh"]
 [[bans.build.bypass]]
 crate = "libc"
 allow-globs = ["etc/*.py"]
+
+# `untrusted` ships its maintainer's own build and CI helpers inside the
+# published crate. It has no build script at all — it is a dependency of
+# `rustls-webpki` and is 300 lines of pure Rust with no `unsafe` — so nothing
+# in any build we run can invoke these; they run in that crate's repository.
+[[bans.build.bypass]]
+crate = "untrusted"
+allow-globs = ["mk/*.sh", "mk/runner"]
+
+# `curve25519-dalek` ships a shell script under `tests/` that exercises its own
+# backend selection in its repository's CI. Cargo runs only `build.rs`, and
+# that crate's build script is the rustc version probe listed above — it
+# invokes nothing.
+[[bans.build.bypass]]
+crate = "curve25519-dalek"
+allow-globs = ["tests/*.sh"]
 
 [sources]
 # Only crates.io and local path sources (the pinned rust-sel4 tree) are

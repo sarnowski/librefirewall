@@ -1179,7 +1179,30 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_write("crypto"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
+    // The appliance's one allocator, and the one region with no structure.
+    RegionRule {
+        name: "arena_crypto",
+        size: ExpectedSize {
+            rust_name: "crypto::arena::ARENA_BYTES",
+            bytes: ARENA_BYTES,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto")],
+        withheld: Some(
+            "every other domain, in both directions. A TLS session's ephemeral keys live here \
+             while it runs, so a second mapper would be a second reader of key material — and \
+             the dataplane domains keep having no allocator at all, which is what this region \
+             being reachable from exactly one domain is the mechanism for",
+        ),
+    },
 ];
+
+/// The arena's size, restated from the domain that declares it.
+///
+/// `pds/crypto` is a binary and cannot be depended on, so the number crosses
+/// as a literal and this rule is what holds the two equal — the same shape the
+/// log regions' sizes cross in.
+const ARENA_BYTES: usize = 0x20_0000;
 
 /// Every shard is one page of the same type, so the eleven rules share one
 /// expectation rather than restating it eleven times.

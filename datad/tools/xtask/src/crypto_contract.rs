@@ -67,10 +67,34 @@ const CEILINGS: &[(Primitive, u64)] = &[
     (Primitive::ChaCha20Poly1305, 40_000),
 ];
 
-/// The primitives a ceiling holds, which is what the profile page's `measured`
-/// column is compared against.
+/// The most whole cycles one operation of an asymmetric primitive may cost.
+///
+/// None of these is an accelerated-backend assertion and none could be: the
+/// arithmetic under them runs on general-purpose registers, which ADX and BMI2
+/// accelerate without any of it being visible as a different code path. They
+/// are regression bounds, set roughly four times above what this image
+/// measures so that a change which made one of them several times slower — a
+/// backend selection lost, a portable path taken where a tuned one was
+/// intended — fails rather than passes quietly.
+///
+/// Each figure is for a whole operation as a handshake performs it, not a
+/// half: a signature is generated *and* verified, a key agreement is run from
+/// both sides, and an encapsulation is followed by its decapsulation. A number
+/// for half of one would be a number no path takes.
+const OPERATION_CEILINGS: &[(Primitive, u64)] = &[
+    (Primitive::EcdsaP256, 20_000_000),
+    (Primitive::X25519, 20_000_000),
+    (Primitive::MlKem768, 60_000_000),
+];
+
+/// The primitives a ceiling holds, whichever unit it is in, which is what the
+/// profile page's `measured` column is compared against.
 pub(crate) fn measured_primitives() -> Vec<Primitive> {
-    CEILINGS.iter().map(|(primitive, _)| *primitive).collect()
+    CEILINGS
+        .iter()
+        .chain(OPERATION_CEILINGS)
+        .map(|(primitive, _)| *primitive)
+        .collect()
 }
 
 /// Judge the cryptography domain's records in one boot's serial capture.
@@ -138,29 +162,42 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
 
     let mut costs = String::new();
     let mut breached = Vec::new();
-    for (primitive, ceiling) in CEILINGS {
-        let measured = count(&steps, *primitive, "milli-cycles-per-byte").ok_or_else(|| {
-            format!(
-                "the cryptography domain published no `primitive={primitive} \
-                 milli-cycles-per-byte=` record, and the profile names it as measured. A \
-                 primitive claimed as measured and not measured is the gap this check exists to \
-                 close\n  records observed: {ours:#?}\n  full run log: {}",
-                log.display()
-            )
-        })?;
-        let _ = write!(costs, "{primitive}={measured} ");
-        if measured == 0 {
-            return Err(format!(
-                "the cryptography domain measured {primitive} at 0 thousandths of a cycle per \
-                 byte, which is a counter that did not advance or a loop the optimizer \
-                 removed\n  full run log: {}",
-                log.display()
-            ));
-        }
-        if accelerated && measured > *ceiling {
-            breached.push(format!(
-                "{primitive} cost {measured} against a ceiling of {ceiling}"
-            ));
+    for (ceilings, key, unit) in [
+        (
+            CEILINGS,
+            "milli-cycles-per-byte",
+            "thousandths of a cycle per byte",
+        ),
+        (
+            OPERATION_CEILINGS,
+            "cycles-per-operation",
+            "cycles per operation",
+        ),
+    ] {
+        for (primitive, ceiling) in ceilings {
+            let measured = count(&steps, *primitive, key).ok_or_else(|| {
+                format!(
+                    "the cryptography domain published no `primitive={primitive} {key}=` record, \
+                     and the profile names it as measured. A primitive claimed as measured and \
+                     not measured is the gap this check exists to close\n  records observed: \
+                     {ours:#?}\n  full run log: {}",
+                    log.display()
+                )
+            })?;
+            let _ = write!(costs, "{primitive}={measured} ");
+            if measured == 0 {
+                return Err(format!(
+                    "the cryptography domain measured {primitive} at 0 {unit}, which is a \
+                     counter that did not advance or a loop the optimizer removed\n  full run \
+                     log: {}",
+                    log.display()
+                ));
+            }
+            if accelerated && measured > *ceiling {
+                breached.push(format!(
+                    "{primitive} cost {measured} against a ceiling of {ceiling}"
+                ));
+            }
         }
     }
     if !breached.is_empty() {
@@ -198,10 +235,99 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
     } else {
         "unasserted, this boot being emulated rather than accelerated"
     };
+    let session = session_records(&steps, log)?;
     Ok(format!(
-        "the cryptography domain proved {}vectors on this part and measured {}\
-         milli-cycles-per-byte ({verdict})",
-        proved, costs
+        "the cryptography domain proved {}vectors on this part, measured {}({verdict}), and {}",
+        proved, costs, session
+    ))
+}
+
+/// The three code points the channel contract fixes, as their registries
+/// number them: TLS 1.3, `TLS_CHACHA20_POLY1305_SHA256`, and the hybrid
+/// `X25519MLKEM768` group. Written here as numbers because that is what the
+/// domain reports and what a reader compares against a specification.
+const OWED_VERSION: &str = "0x0304";
+const OWED_SUITE: &str = "0x1303";
+const OWED_GROUP: &str = "0x11ec";
+
+/// Judge the session this domain establishes against itself.
+///
+/// The handshake is the claim the whole asymmetric half exists to support, and
+/// nothing short of a completed one proves it: the key exchange, the
+/// signature, the chain validation against an anchor, the key schedule and the
+/// record layer all have to be right for a peer to be authenticated and for
+/// application data to come back. So the records are checked for exactly the
+/// parameters the channel contract fixes, and for data having moved.
+fn session_records(steps: &[&&str], log: &Path) -> Result<String, String> {
+    let named = |key: &str| -> Result<String, String> {
+        steps
+            .iter()
+            .find_map(|record| field_value(record, key))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "the cryptography domain published no `{key}=` record. One boot establishes \
+                     one mutually-authenticated session against itself and reports what it \
+                     settled on, so a missing field is a session that did not complete\n  \
+                     records observed: {steps:#?}\n  full run log: {}",
+                    log.display()
+                )
+            })
+    };
+    let version = named("tls-version")?;
+    let suite = named("tls-suite")?;
+    let group = named("tls-group")?;
+    let echoed = named("tls-echoed")?;
+    let peer = named("peer-device")?;
+    for (what, found, owed) in [
+        ("protocol version", &version, OWED_VERSION),
+        ("cipher suite", &suite, OWED_SUITE),
+        ("key exchange group", &group, OWED_GROUP),
+    ] {
+        if found != owed {
+            return Err(format!(
+                "the session negotiated {what} {found} and the channel contract fixes {owed}. \
+                 One end of this session is the appliance's own configuration, so a different \
+                 answer is this build offering something the contract does not\n  full run log: \
+                 {}",
+                log.display()
+            ));
+        }
+    }
+    if echoed.parse::<u64>().unwrap_or_default() == 0 {
+        return Err(format!(
+            "the session carried 0 bytes of application data, so the traffic keys were never \
+             used in either direction and the handshake is all that was proved\n  full run log: \
+             {}",
+            log.display()
+        ));
+    }
+    if peer.trim_start_matches('0').is_empty() {
+        return Err(format!(
+            "the session's peer identity is all zeroes, which is no identity: a \
+             mutually-authenticated session names the peer it admitted\n  full run log: {}",
+            log.display()
+        ));
+    }
+    let arena: Vec<&str> = steps
+        .iter()
+        .filter_map(|record| field_value(record, "arena-bytes"))
+        .collect();
+    if arena.len() != 2 {
+        return Err(format!(
+            "the cryptography domain published {} `arena-bytes=` record(s) and a boot \
+             produces exactly two: what a session used against what the arena has, and what a \
+             deliberately starved session was left with against what one step needs. The second \
+             is the proof that reaching the bound is a refusal rather than a fault, and a boot \
+             without it has shown a working allocator and nothing about its bound\n  full run \
+             log: {}",
+            arena.len(),
+            log.display()
+        ));
+    }
+    Ok(format!(
+        "established a {version} session under {suite} and {group}, carried {echoed} bytes of \
+         application data both ways, authenticated peer {peer}, and refused a starved one"
     ))
 }
 

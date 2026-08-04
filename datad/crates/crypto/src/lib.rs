@@ -1,8 +1,10 @@
 #![cfg_attr(not(test), no_std)]
 
 //! The appliance's only door to cryptography: SHA-256, HMAC-SHA-256,
-//! HKDF-SHA-256, the two AEADs, and the deterministic random bit generator
-//! that keys them — over adopted implementations, never a first-party one.
+//! HKDF-SHA-256, the two AEADs, the deterministic random bit generator that
+//! keys them, and the three asymmetric primitives a mutually-authenticated
+//! session needs — ECDSA over P-256, X25519, and ML-KEM-768 — over adopted
+//! implementations, never a first-party one.
 //!
 //! Nothing here computes a cryptographic primitive. Every algorithm is a
 //! pinned third-party crate, and what this crate adds is the shape the
@@ -22,6 +24,25 @@
 //! though the channel does not use it either, because it is the primitive the
 //! hardware baseline exists for: it is what proves, on the shipped image, that
 //! the AES-NI and carry-less-multiply backends are the ones running.
+//!
+//! Post-quantum *signatures* are absent deliberately and not for want of a
+//! crate: the certificate ecosystem the appliance's identity has to interope-
+//! rate with has not moved, so ML-KEM is here for key exchange and nothing
+//! signs with anything but P-256.
+//!
+//! # Which ML-KEM, and the one place this departs from the stated design
+//!
+//! The post-quantum primitive is the RustCrypto `ml-kem` crate and not
+//! `libcrux-ml-kem`, which the architecture names first for its formal
+//! verification. libcrux was investigated and builds cleanly for this target;
+//! what it costs is the dependency policy. Its transitive `libcrux-traits`
+//! takes an unconditional dependency on a random-number crate a major version
+//! ahead of the one the elliptic-curve crates here use, which puts two
+//! versions of it in the graph — a duplicate the policy denies — and it pulls
+//! a libc binding into an appliance that has no libc. The second source the
+//! architecture names is what is adopted instead, on the same terms as every
+//! other crate here: pinned, and proved on the shipped image against the
+//! published known-answer tests rather than trusted.
 //!
 //! # Adversary
 //!
@@ -52,23 +73,38 @@
 
 mod aead;
 mod drbg;
+mod ecdsa;
+mod entropy;
 mod error;
 mod hash;
 mod kdf;
 mod mac;
+mod mlkem;
 mod proof;
 pub mod vectors;
+mod x25519;
 
 #[cfg(test)]
 mod tests;
 
 pub use aead::{Aes256Gcm, ChaCha20Poly1305, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use drbg::{Drbg, RESEED_INTERVAL, SEED_LEN};
+pub use ecdsa::{
+    P256_MAX_SIGNATURE_LEN, P256_PUBLIC_LEN, P256_SECRET_LEN, P256SecretKey, p256_verify,
+};
+pub use entropy::Entropy;
 pub use error::CryptoError;
 pub use hash::{DIGEST_LEN, Sha256, sha256};
 pub use kdf::{MAX_DERIVED_LEN, Prk, hkdf_expand, hkdf_extract};
-pub use mac::{MAC_LEN, hmac_sha256, hmac_sha256_verify};
+pub use mac::{HmacContext, HmacKey, MAC_LEN, hmac_sha256, hmac_sha256_verify};
+pub use mlkem::{
+    ML_KEM_768_CIPHERTEXT_LEN, ML_KEM_768_DECAPSULATION_KEY_LEN, ML_KEM_768_ENCAPSULATION_KEY_LEN,
+    ML_KEM_768_SEED_LEN, ML_KEM_768_SHARED_SECRET_LEN, MlKem768DecapsulationKey,
+    MlKem768EncapsulationKey,
+};
 pub use proof::{
     VectorFailure, prove_aes_256_gcm, prove_chacha20, prove_chacha20_poly1305, prove_drbg,
-    prove_hkdf_sha256, prove_hmac_sha256, prove_sha256,
+    prove_ecdsa_p256, prove_hkdf_sha256, prove_hmac_sha256, prove_ml_kem_768, prove_sha256,
+    prove_x25519,
 };
+pub use x25519::{X25519_LEN, X25519Secret};

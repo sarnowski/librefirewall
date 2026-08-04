@@ -26,9 +26,27 @@ fn capture() -> String {
              milli-cycles-per-byte=900\r\n"
         );
     }
+    for (primitive, _) in OPERATION_CEILINGS {
+        let _ = write!(
+            text,
+            "LFW-PD domain=crypto state=negotiated primitive={primitive} \
+             cycles-per-operation=900000\r\n"
+        );
+    }
+    text.push_str(SESSION);
     text.push_str("LFW-PD domain=crypto state=ready\r\n");
     text
 }
+
+/// What the session and the arena leave behind on a passing boot.
+const SESSION: &str = "LFW-PD domain=crypto state=negotiated tls-version=0x0304 \
+     tls-suite=0x1303\r\n\
+     LFW-PD domain=crypto state=negotiated tls-group=0x11ec tls-echoed=32\r\n\
+     LFW-PD domain=crypto state=negotiated \
+     peer-device=8f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f\r\n\
+     LFW-PD domain=crypto state=negotiated arena-bytes=196608 \
+     arena-bound=2097152\r\n\
+     LFW-PD domain=crypto state=negotiated arena-bytes=4096 arena-bound=262144\r\n";
 
 #[test]
 fn a_boot_that_proved_and_measured_every_primitive_is_accepted() {

@@ -98,6 +98,16 @@ crates that compile or link native code outright, denies build scripts by defaul
 allow-list, and denies two versions of one crate. A new build script needs an entry with a written
 reason beside it, and a crate that would compile C is rejected rather than allow-listed.
 
+**The two protection-domain builds are not one.** The dataplane domains are compiled for the
+softfloat target with `-Z build-std=core`; the two SIMD domains — the hardware probe and the
+cryptography domain — are compiled for the hardfloat, SSE-enabled target with
+`-Z build-std=core,alloc`, in an invocation of their own. The difference in the standard-library
+set is deliberate and is the whole allocator story in one line: the cryptography domain carries the
+appliance's only allocator, because a proven TLS implementation requires one, and the dataplane
+domains keep having none. Both invocations are in `xtask::image`, and the linting in `xtask::host`
+mirrors them exactly — a domain linted with a different standard-library set is a lint of a
+different binary.
+
 ## The management-server toolchain
 
 `ctrld` follows the same discipline with BEAM-shaped mechanics. The builder image pins the

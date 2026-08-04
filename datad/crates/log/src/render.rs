@@ -197,6 +197,26 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " primitive={primitive} milli-cycles-per-byte={milli_cycles_per_byte}"
         ),
+        DomainDetail::Session { version, suite } => write!(
+            cursor,
+            " tls-version=0x{version:04x} tls-suite=0x{suite:04x}"
+        ),
+        DomainDetail::Exchange { group, echoed } => {
+            write!(cursor, " tls-group=0x{group:04x} tls-echoed={echoed}")
+        }
+        // The identifier is written the one way it is ever written: 32
+        // lowercase hexadecimal characters, which is what an administrator
+        // compares against the management application's rendering.
+        DomainDetail::Peer { device } => write!(cursor, " peer-device={device:032x}"),
+        DomainDetail::Arena { bytes, bound } => {
+            write!(cursor, " arena-bytes={bytes} arena-bound={bound}")
+        }
+        DomainDetail::Operation { primitive, cycles } => {
+            write!(
+                cursor,
+                " primitive={primitive} cycles-per-operation={cycles}"
+            )
+        }
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -911,6 +931,23 @@ mod tests {
                 primitive: Primitive::ChaCha20Poly1305,
                 milli_cycles_per_byte: u64::MAX,
             },
+            DomainDetail::Session {
+                version: u16::MAX,
+                suite: u16::MAX,
+            },
+            DomainDetail::Exchange {
+                group: u16::MAX,
+                echoed: u64::MAX,
+            },
+            DomainDetail::Peer { device: u128::MAX },
+            DomainDetail::Arena {
+                bytes: u64::MAX,
+                bound: u64::MAX,
+            },
+            DomainDetail::Operation {
+                primitive: Primitive::EcdsaP256,
+                cycles: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -964,6 +1001,18 @@ mod tests {
                 DomainDetail::Measured {
                     primitive: Primitive::ALL[at],
                     milli_cycles_per_byte: cost,
+                }
+            }),
+            any::<(u16, u16)>()
+                .prop_map(|(version, suite)| DomainDetail::Session { version, suite }),
+            any::<(u16, u64)>()
+                .prop_map(|(group, echoed)| DomainDetail::Exchange { group, echoed }),
+            any::<u128>().prop_map(|device| DomainDetail::Peer { device }),
+            any::<(u64, u64)>().prop_map(|(bytes, bound)| DomainDetail::Arena { bytes, bound }),
+            (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, cycles)| {
+                DomainDetail::Operation {
+                    primitive: Primitive::ALL[at],
+                    cycles,
                 }
             }),
             (

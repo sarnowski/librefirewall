@@ -73,6 +73,9 @@ closed_vocabulary! {
         ChaCha20Poly1305 => "chacha20-poly1305",
         Aes256Gcm => "aes-256-gcm",
         Drbg => "chacha20-drbg",
+        EcdsaP256 => "ecdsa-p256",
+        X25519 => "x25519",
+        MlKem768 => "ml-kem-768",
     }
 }
 

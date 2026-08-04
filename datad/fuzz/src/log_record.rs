@@ -121,7 +121,12 @@ const DETAIL_EXTENT: u8 = 7;
 const DETAIL_PROVEN: u8 = 8;
 const DETAIL_PROVED: u8 = 9;
 const DETAIL_MEASURED: u8 = 10;
-const DETAIL_COUNT: u8 = 11;
+const DETAIL_SESSION: u8 = 11;
+const DETAIL_EXCHANGE: u8 = 12;
+const DETAIL_PEER: u8 = 13;
+const DETAIL_ARENA: u8 = 14;
+const DETAIL_OPERATION: u8 = 15;
+const DETAIL_COUNT: u8 = 16;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -537,7 +542,15 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // details join them for the same reason — their first word is
                 // a token rather than a count, but it is read from the same
                 // place and refused separately below.
-                DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED => {
+                DETAIL_EXTENT
+                | DETAIL_PROVEN
+                | DETAIL_PROVED
+                | DETAIL_MEASURED
+                | DETAIL_SESSION
+                | DETAIL_EXCHANGE
+                | DETAIL_PEER
+                | DETAIL_ARENA
+                | DETAIL_OPERATION => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -681,13 +694,22 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_RECEIVED
         | DETAIL_MEDIUM
         | DETAIL_EXTENT
+        | DETAIL_PEER
+        | DETAIL_ARENA
         | DETAIL_PROVEN => None,
+        // The three details whose first operand word is a protocol registry
+        // code point, which every TLS registry numbers in sixteen bits: a
+        // wider word would render as a code point no registry has. Restated
+        // here as the range check it is, on `DETAIL_PROVED`'s terms.
+        DETAIL_SESSION => wide_code_point(record.operands[0])
+            .or_else(|| wide_code_point(record.operands[1])),
+        DETAIL_EXCHANGE => wide_code_point(record.operands[0]),
         // The two details whose first operand word is a token rather than a
         // count: it names a cryptographic primitive, so a word outside the set
         // names nothing a console line can spell. Restated here as the range
         // check it is, so the harness never asks the code under test what the
         // set is.
-        DETAIL_PROVED | DETAIL_MEASURED => (record.operands[0]
+        DETAIL_PROVED | DETAIL_MEASURED | DETAIL_OPERATION => (record.operands[0]
             >= u64::from(LOG_PRIMITIVE_COUNT))
         .then_some(LogRecordError::PrimitiveUnknown {
             primitive: record.operands[0],
@@ -753,6 +775,11 @@ fn vocabulary(raw: u8, count: u8, error: LogRecordError) -> Option<LogRecordErro
 
 /// One text field: the length against the storage, then emptiness where the
 /// field forbids it, then the alphabet from the first byte outside it.
+/// A code point wider than the sixteen bits a TLS registry numbers one in.
+fn wide_code_point(value: u64) -> Option<LogRecordError> {
+    (value > u64::from(u16::MAX)).then_some(LogRecordError::CodePointTooWide { value })
+}
+
 fn text_refusal<const N: usize>(
     text: &TextImage<N>,
     which: LogText,

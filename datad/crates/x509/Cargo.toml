@@ -1,0 +1,17 @@
+[package]
+# The DER writer and the two certificate structures built on it. Named for
+# what it emits rather than for the encoding, because the encoding is the
+# uninteresting half.
+name = "lfw-x509"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lfw-crypto = { path = "../crypto" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

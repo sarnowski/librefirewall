@@ -47,3 +47,51 @@ pub fn hmac_sha256_verify(
     mac.update(message);
     mac.verify_slice(tag).map_err(|_| CryptoError::NotAuthentic)
 }
+
+/// A key prepared once and used many times, which is what a key schedule
+/// wants: the same secret authenticates a dozen messages in one handshake, and
+/// preparing the key per message would redo the block-sized padding each time.
+///
+/// It holds the initialised state and hands out a clone of it per message,
+/// which is exactly what "prepared" means for HMAC — the inner hash's state
+/// after the padded key, and nothing more.
+///
+/// Infallible where [`hmac_sha256`] is not, because a caller of this type is
+/// inside a key schedule and has nothing to do with a refusal. The refusal the
+/// adopted constructor reserves the right to give is still not assumed away:
+/// it becomes a key that authenticates nothing, whose tags are all zeroes, so
+/// an exchange under it fails at the first tag comparison rather than
+/// proceeding under a key the caller did not choose.
+#[derive(Clone)]
+pub struct HmacKey(Option<HmacSha256>);
+
+impl HmacKey {
+    /// Prepare a key of any length.
+    #[must_use]
+    pub fn new(key: &[u8]) -> Self {
+        Self(keyed(key).ok())
+    }
+
+    /// A message in progress under this key.
+    #[must_use]
+    pub fn start(&self) -> HmacContext {
+        HmacContext(self.0.clone())
+    }
+}
+
+/// One message being authenticated, fed in pieces.
+pub struct HmacContext(Option<HmacSha256>);
+
+impl HmacContext {
+    pub fn update(&mut self, chunk: &[u8]) {
+        if let Some(mac) = &mut self.0 {
+            mac.update(chunk);
+        }
+    }
+
+    #[must_use]
+    pub fn finish(self) -> [u8; MAC_LEN] {
+        self.0
+            .map_or([0; MAC_LEN], |mac| mac.finalize().into_bytes().into())
+    }
+}

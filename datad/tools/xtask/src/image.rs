@@ -401,8 +401,13 @@ fn assemble(
                 "build",
                 "--locked",
                 "--release",
+                // `alloc` and not only `core`, unlike the invocation above:
+                // the cryptography domain carries the appliance's one
+                // allocator, because a proven TLS implementation requires one.
+                // The dataplane domains keep having none, which is why the two
+                // invocations differ here rather than being unified.
                 "-Z",
-                "build-std=core",
+                "build-std=core,alloc",
                 "-Z",
                 "build-std-features=compiler-builtins-mem",
                 "--target",

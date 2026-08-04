@@ -708,6 +708,36 @@
     <memory_region name="log_crypto" size="0x4000" />
     <memory_region name="log_crypto_consume" size="0x1000" />
 
+    <!-- THE ARENA: the appliance's only allocator, and the only region in this
+         system with no structure.
+
+         WHY IT EXISTS AT ALL. A proven TLS implementation requires an
+         allocator, and every dataplane domain still has none — this is the one
+         exception and it is confined to the one domain that runs TLS. What
+         makes an allocator on a path an adversary drives acceptable is stated
+         as a mechanism rather than an intention: it is BOUNDED by this
+         region's size, its exhaustion is a typed refusal that closes the
+         session, and the domain reports its high-water mark against this
+         capacity on every boot so the bound is a number an operator can see
+         rather than one the code asserts.
+
+         NO phys_addr, DELIBERATELY. Nothing DMAs into it, so no driver needs
+         its physical address and the Microkit tool has no reason to demand a
+         fixed one — which means it is allocated from general-purpose untyped
+         memory, is kernel-zeroed, and costs NOTHING from the physical address
+         window the packed range above rations. The store device's regions will
+         come out of that window; this one does not.
+
+         WHY TWO MEGABYTES. Far above what a session measures — the domain
+         reports the figure — and small enough to be an ordinary mapping. It is
+         a whole number of pages, which is what makes an offset the allocator
+         aligns an address that is aligned.
+
+         WHO MAPS IT: the cryptography domain, read-write, and nobody else. It
+         holds the ephemeral keys of a TLS session while one is running, so a
+         second mapper would be a second reader of key material. -->
+    <memory_region name="arena_crypto" size="0x200000" />
+
 
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
          that domain alone and read by the management domain alone.
@@ -1506,12 +1536,13 @@
          ordering it costs. Its work is bounded by its own compile-time
          constants — a fixed vector corpus and a fixed number of timing rounds
          — and the domain then blocks for good. -->
-    <protection_domain name="crypto" priority="2" stack_size="0x8000">
+    <protection_domain name="crypto" priority="2" stack_size="0x20000">
         <program_image path="crypto.elf" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_crypto" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_crypto_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_crypto" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+        <map mr="arena_crypto" vaddr="0x6_000_000" perms="rw" cached="true" setvar_vaddr="arena_vaddr" />
     </protection_domain>
 
     <!-- The console domain: the one holder of the serial controller.

@@ -15,6 +15,11 @@ pub fn sha256(message: &[u8]) -> [u8; DIGEST_LEN] {
 ///
 /// `finish` consumes the hasher, so a digest cannot be taken twice from one
 /// state and a caller cannot keep updating a hasher it has already read.
+///
+/// `Clone` because a TLS transcript is hashed repeatedly while it is still
+/// being appended to: the digest of everything so far is taken from a copy,
+/// and the original keeps growing.
+#[derive(Clone)]
 pub struct Sha256(sha2::Sha256);
 
 impl Sha256 {

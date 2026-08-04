@@ -533,6 +533,14 @@ pub const CRYPTO_MILLI_CYCLES_PER_BYTE: Metric = metric(
      bring-up; 0 for a primitive it does not measure.",
 );
 
+pub const CRYPTO_CYCLES_PER_OPERATION: Metric = metric(
+    "librefirewall_crypto_cycles_per_operation",
+    Kind::Gauge,
+    "Timestamp-counter cycles one operation of a primitive cost this node at bring-up, for the \
+     primitives whose work has one size rather than a length; 0 for a primitive measured per \
+     byte instead.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -927,6 +935,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &CRYPTO_PROVEN,
     &CRYPTO_VECTORS,
     &CRYPTO_MILLI_CYCLES_PER_BYTE,
+    &CRYPTO_CYCLES_PER_OPERATION,
     &LOG_RECORDS_DROPPED,
     &LOG_RECORDS_REFUSED,
 ];

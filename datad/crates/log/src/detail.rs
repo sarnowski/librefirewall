@@ -189,6 +189,46 @@ pub enum DomainDetail<C = &'static str> {
         primitive: Primitive,
         milli_cycles_per_byte: u64,
     },
+    /// What a TLS session settled on, as the protocol registries number it.
+    /// Code points and not names, because the names are the registries' to
+    /// change and an operator comparing a boot against a specification is
+    /// comparing numbers either way.
+    Session {
+        version: u16,
+        suite: u16,
+    },
+    /// The key exchange that session ran, and how many bytes of application
+    /// data made the round trip under its traffic keys. The two travel
+    /// together because a group named without an exchange under it claims a
+    /// handshake and not a working session.
+    Exchange {
+        group: u16,
+        echoed: u64,
+    },
+    /// The device identifier of the peer a mutually-authenticated session
+    /// admitted. The identifier and nothing else about the peer: its
+    /// certificate is not an operator surface.
+    Peer {
+        device: u128,
+    },
+    /// A number of bytes about the bounded allocator, against the bound it is
+    /// judged by: what a session held at its peak against what the arena has,
+    /// and what a starved one was left with against what a phase needs. The
+    /// pair is what makes either number judgeable — a byte count without the
+    /// bound beside it is a number nobody can read.
+    Arena {
+        bytes: u64,
+        bound: u64,
+    },
+    /// What one operation of a primitive cost, in whole cycles. Separate from
+    /// [`DomainDetail::Measured`] because the unit is different and not
+    /// convertible: a signature and a key exchange each have exactly one size,
+    /// so a per-byte figure for either would be a number divided by an
+    /// arbitrary denominator.
+    Operation {
+        primitive: Primitive,
+        cycles: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

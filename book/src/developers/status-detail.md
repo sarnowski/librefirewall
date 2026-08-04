@@ -2007,6 +2007,59 @@ image would fit it, reading the bound out of `grub.cfg` rather than restating it
 There is no TPM anywhere: no vTPM in the QEMU harness, no measured boot, no PCR policy, and no
 anti-rollback epoch. Production key management (HSM-backed signing) does not exist.
 
+## Cryptography and TLS
+
+**What exists.** Three crates and one protection domain, and the whole of it is proved on the
+shipped image rather than only on the host.
+
+`lfw-crypto` is the appliance's only door to cryptography, over pinned RustCrypto and dalek
+implementations with `default-features = false` throughout: SHA-256, HMAC-SHA-256 (one-shot and
+incremental), HKDF-SHA-256, ChaCha20, ChaCha20-Poly1305, AES-256-GCM, a ChaCha20 fast-key-erasure
+generator, ECDSA over P-256 (sign and verify), X25519, and ML-KEM-768. Every refusal is typed;
+nothing on any path panics, indexes bare, or clamps. It carries **154 published test vectors** as
+one committed table both the host suite and the domain run — NIST CAVP, NIST ACVP for FIPS 203,
+RFC 8439, RFC 6979 appendix A.2.5, and Wycheproof — of which 30 are forgeries or refusable inputs a
+verifier must say no to.
+
+`lfw-x509` writes the four certificate kinds of the [certificate profile](../contracts/certificate-profile.md)
+and the PKCS#10 request, over a first-party bounded DER writer. It emits and never parses.
+
+`lfw-tls` is the rustls crypto provider — hash, MAC, the key schedule over it, the record-layer
+AEAD, the hybrid key exchange, the one signature algorithm — plus the bounded arena's bookkeeping
+and a session driver over rustls' unbuffered API. It contains no `unsafe` at all.
+
+`pds/crypto` gates the part on `CPUID`, re-runs all 154 vectors against the code as compiled for
+the SIMD target, measures each primitive (per byte where it has a length, per operation where it
+does not), seeds the generator from 32 `RDRAND` draws, and then establishes **one complete
+mutually-authenticated TLS 1.3 session with itself** — `TLS_CHACHA20_POLY1305_SHA256` over
+`X25519MLKEM768`, both chains validated against an anchor it issued, application data echoed both
+ways, closed with an alert — before running a second, deliberately starved session that must be
+refused. It holds the appliance's only allocator: a 2 MiB region mapped into it and nothing else.
+
+**Two recorded deviations from the design chapters, both deliberate.**
+
+*The post-quantum crate is the second source, not the first.* `libcrux-ml-kem` builds for this
+target — that assumption is resolved and the answer is yes — but its transitive dependency graph
+puts a second major version of a random-number crate into the build, which the dependency policy
+denies, and pulls a libc binding into an appliance with no libc. RustCrypto `ml-kem`, the second
+source the same chapter names, costs no policy exception. The crate header records this at the
+deviation.
+
+*Certificate generation is first-party, not `rcgen`.* `rcgen`'s ASN.1 back end is enabled with that
+crate's `std` feature unconditionally and no feature combination drops it, so it does not build for
+a target with no operating system whatever signing back end it is driven with. The four DER
+structures the profile fixes are written here instead; they carry no algorithm of their own.
+
+**Missing.** Nothing dials with any of this: the transport cannot open a connection, there is no
+channel and no onboarding server, and the cryptography domain holds no device and no channel of its
+own. The device key is generated in that domain and dropped with the proof rather than being held
+by the store domain that will own it — the signing interface is a trait with one local
+implementation precisely so that delegation is a substitution, but the store domain does not exist.
+There is no persisted device identifier, no CSR served anywhere, and no fingerprint on the console.
+The session is proved against this same build on both ends, so nothing about interoperating with a
+second implementation is established. SHA-NI stays unreachable for the reason the
+[status page](../status.md) records.
+
 ## Management server
 
 **What exists.** Onboarding, end to end from the administrator's side. An administrator signs in
@@ -2083,7 +2136,7 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all nine protection-domain binaries — the hardware probe and the cryptography domain against their own SIMD target — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 25 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 27 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (16 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |

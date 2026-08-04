@@ -277,10 +277,10 @@ against are written; almost nothing that implements them is.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Outbound management channel | **open** | the persistent mutually-authenticated connection of the [channel framing contract](contracts/channel-framing.md). Nothing dials: there is no TLS in the appliance, and the transport cannot even open a TCP connection (below) |
+| Outbound management channel | **open** | the persistent mutually-authenticated connection of the [channel framing contract](contracts/channel-framing.md). Nothing dials: the TLS stack exists and proves itself against itself in the cryptography domain (below), but nothing carries it — that domain holds no device and no channel, and the transport cannot open a TCP connection (below) either |
 | Onboarding | **open** | the HTTPS onboarding server, the CSR, the package upload and its tar reader ([contract](contracts/configuration-package.md)); nothing of it exists, and the unboarded/onboarded state machine has nowhere to be stored |
-| Appliance identity | **open** | no device key, no certificate, no fingerprint — **there is no cryptography in the appliance at all today**, not a SHA-256; the [certificate profile](contracts/certificate-profile.md) is the target |
-| Hardware-accelerated cryptography | **partial** | The symmetric and hash foundation is built and proven on the shipped image: a cryptography protection domain, compiled with the SIMD target, re-runs 90 published NIST CAVP, RFC 8439 and Wycheproof vectors covering SHA-256, HMAC-SHA-256, HKDF-SHA-256, ChaCha20, ChaCha20-Poly1305, AES-256-GCM and the node's random bit generator, measures each primitive's cost, seeds that generator from `RDRAND`, and reports all of it — judged on every console-judged QEMU scenario, with the AES-256-GCM figure held below a ceiling no portable implementation reaches. The [cryptography profile](reference/crypto-profile.md) states the processor requirement and is held to the target specification by the gate. **Missing:** rustls and the arena allocator, and the asymmetric half — ECDSA P-256, X25519 and ML-KEM-768 — none of which is built. SHA-NI is not reachable on this target, which the profile page explains. The [architecture](design/architecture.md#hardware-cryptography-profile)'s literature figures are now partly superseded for the symmetric primitives — every boot reports its own cycles-per-byte — but not for the sizing argument they were quoted for, which is about the whole inspected path and needs bare metal and a traffic generator rather than a guest |
+| Appliance identity | **open** | no device key, no certificate and no fingerprint *the appliance keeps*: the certificate machinery is built to the [certificate profile](contracts/certificate-profile.md) — a first-party DER writer emits the four certificate kinds and the PKCS#10 request, and the cryptography domain issues and validates them on every boot — but they are minted for that proof and dropped with it. What is missing is where identity has to live: a device identifier generated once and kept, and a private key held by the store domain that owns the medium, which does not exist |
+| Hardware-accelerated cryptography | **partial** | Built and proven on the shipped image, symmetric and asymmetric both: a cryptography protection domain, compiled with the SIMD target, re-runs **154** published NIST CAVP, NIST ACVP, RFC 8439, RFC 6979 and Wycheproof vectors covering SHA-256, HMAC-SHA-256, HKDF-SHA-256, ChaCha20, ChaCha20-Poly1305, AES-256-GCM, the node's random bit generator, **ECDSA P-256, X25519 and ML-KEM-768**; measures each primitive's cost — per byte where it has a length, per operation where it does not; seeds the generator from `RDRAND`; and then **establishes a complete mutually-authenticated TLS 1.3 session with itself** over rustls and a first-party crypto provider, negotiating `TLS_CHACHA20_POLY1305_SHA256` and the hybrid `X25519MLKEM768`, validating both certificate chains against a trust anchor it issued, and carrying application data both ways. All of it is judged on every console-judged QEMU scenario, with the AES-256-GCM figure held below a ceiling no portable implementation reaches. The domain carries the appliance's **only allocator**: a 2 MiB bounded arena, confined to it, whose exhaustion is a typed refusal that closes the session rather than a fault — proved on the image by a second, deliberately starved session that must be refused with the allocator's own refusal count still zero. The [cryptography profile](reference/crypto-profile.md) states all of it and is held to the target specification, the console vocabulary and the gate's own ceilings by the build. **Missing:** nothing dials with any of this — the transport, the channel and the onboarding server are all open — and the device key is generated in this domain rather than delegated to the store domain that will own it, which the signing interface is already shaped for. SHA-NI is not reachable on this target, and `libcrux-ml-kem` is not the ML-KEM adopted, both for reasons the detail chapter records. Per-primitive cost comes off the image on every boot; what remains unmeasured is the whole-path throughput target, which needs bare metal and an external traffic generator rather than a guest |
 | Persistent store | **open** | the third virtio-blk device, the store domain, the [double-buffered state record and configuration history](design/configuration.md#persistence), and [factory reset](design/updates.md#factory-reset). Today `VIRTIO_BLK_F_FLUSH` is never accepted and no flush is ever issued, so nothing the appliance writes is durable across a power cut |
 | Transport active open | **open** | the TCP stack is passive-open only — no `SynSent`, no connect entry point — and nothing sends an ARP request or holds an ARP cache, and there is no gateway in the configuration schema; all three are prerequisites for dialing out |
 | Configuration over the channel | **open** | stage, validate, commit with confirmation over a fresh connection, rollback, and the version history — the operations exist today only as `POST /config`'s single stage-validate-commit step |
@@ -367,6 +367,35 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
   AVX needs either a per-crate way to force the backend or a wider kernel save area, and neither is
   in scope; the cost is one primitive running at roughly a tenth of its accelerated rate, measured
   and reported on every boot.
+- **The physical address window is measured, and the cryptography domain costs none of it.**
+  Seventeen regions carry a fixed physical address inside RAM, claiming 832 KiB and packed into
+  `0x30000000..0x310CC000` — so RAM must reach past **784.80 MiB**, and under the harness's 1 GiB it
+  does with **239.20 MiB** to spare; the upper bound is unchanged, RAM having to stay below the
+  `0x50000000` device window at 1280 MiB. **None of the cryptography domain's four regions is in
+  that count**, the 2 MiB arena included: nothing reads them by physical address, so they are
+  ordinary untyped memory. What the store domain will claim is a third virtio-blk device's
+  virtqueue page and its staging window — 4 KiB and, if it copies the recorder's, 256 KiB — which
+  moves the packed range's top by about a quarter of a megabyte and leaves roughly 239 MiB. Its
+  configuration page and relocated BAR sit outside RAM in the ECAM and PCI-hole windows, which are
+  nowhere near full. The window is not what constrains the next phase; it is still unasserted, and
+  that is unchanged.
+- **The post-quantum primitive is the second source the architecture names, not the first.**
+  `libcrux-ml-kem` — formally verified, and what the [architecture](design/architecture.md#cryptography)
+  names first — was investigated and **does build** cleanly for this target, portable path and all.
+  What it costs is the dependency policy: a transitive crate of its own takes an unconditional
+  dependency on a random-number crate a major version ahead of the one the elliptic-curve crates
+  here already use, which puts two versions of it in the graph — a duplicate the policy denies — and
+  it pulls a libc binding into an appliance that has no libc. The RustCrypto `ml-kem` crate, which
+  the same chapter names as the second source, costs no exception at all and reuses the hash
+  generation already in the graph, so it is what is adopted. The formal-verification assurance is
+  the price, and recovering it means either upstream loosening that dependency or this project
+  accepting a duplicate-version exception; neither is decided here.
+- **The TLS session is proved against itself, which is the strongest proof available before there
+  is a network.** Both ends of the handshake are in the cryptography domain, over a transport that
+  is two buffers, so what is proved is the whole stack — hybrid key exchange, signature, chain
+  validation, key schedule, record layer, mutual authentication, clean close. What is *not* proved
+  is anything about interoperating with a peer that is not this build: a second implementation on
+  the other end is the first thing the channel milestone establishes.
 - **Hardware cryptography's foundational hypothesis is verified; two narrower ones remain.** The
   pinned kernel saves x87 and SSE state per thread, so the XMM instruction sets the
   [CPU baseline](design/architecture.md#hardware-cryptography-profile) requires — AES-NI,

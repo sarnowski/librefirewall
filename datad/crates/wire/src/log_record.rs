@@ -56,7 +56,7 @@ pub const LOG_DOMAIN_COUNT: u8 = 9;
 /// `LOG_DOMAIN_COUNT`'s terms: the console spells it, the region carries an
 /// index, and a value outside the set is refused rather than rendered as a
 /// number an operator would have to look up.
-pub const LOG_PRIMITIVE_COUNT: u8 = 7;
+pub const LOG_PRIMITIVE_COUNT: u8 = 10;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -161,6 +161,11 @@ pub enum LogDetailKind {
     Proven,
     Proved,
     Measured,
+    Session,
+    Exchange,
+    Peer,
+    Arena,
+    Operation,
 }
 
 impl LogDetailKind {
@@ -178,6 +183,11 @@ impl LogDetailKind {
             Self::Proven => 8,
             Self::Proved => 9,
             Self::Measured => 10,
+            Self::Session => 11,
+            Self::Exchange => 12,
+            Self::Peer => 13,
+            Self::Arena => 14,
+            Self::Operation => 15,
         }
     }
 
@@ -195,6 +205,11 @@ impl LogDetailKind {
             8 => Some(Self::Proven),
             9 => Some(Self::Proved),
             10 => Some(Self::Measured),
+            11 => Some(Self::Session),
+            12 => Some(Self::Exchange),
+            13 => Some(Self::Peer),
+            14 => Some(Self::Arena),
+            15 => Some(Self::Operation),
             _ => None,
         }
     }
@@ -626,6 +641,32 @@ impl LogRecord {
                 primitive: primitive_token(self.operands[0])?,
                 milli_cycles_per_byte: self.operands[1],
             },
+            // The four below carry numbers a peer chose and nothing that names
+            // a vocabulary, so there is nothing here to refuse: a protocol
+            // code point is a sixteen-bit registry value and a wrong one is a
+            // wrong number rather than an undecodable record. The two that
+            // must fit sixteen bits are ranged, because a wider value would
+            // render as a code point no registry has.
+            Some(LogDetailKind::Session) => CheckedDetail::Session {
+                version: code_point(self.operands[0])?,
+                suite: code_point(self.operands[1])?,
+            },
+            Some(LogDetailKind::Exchange) => CheckedDetail::Exchange {
+                group: code_point(self.operands[0])?,
+                echoed: self.operands[1],
+            },
+            Some(LogDetailKind::Peer) => CheckedDetail::Peer {
+                high: self.operands[0],
+                low: self.operands[1],
+            },
+            Some(LogDetailKind::Arena) => CheckedDetail::Arena {
+                bytes: self.operands[0],
+                bound: self.operands[1],
+            },
+            Some(LogDetailKind::Operation) => CheckedDetail::Operation {
+                primitive: primitive_token(self.operands[0])?,
+                cycles: self.operands[1],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -694,6 +735,13 @@ fn primitive_token(raw: u64) -> Result<u8, LogRecordError> {
         Ok(narrow) if narrow < LOG_PRIMITIVE_COUNT => Ok(narrow),
         _ => Err(LogRecordError::PrimitiveUnknown { primitive: raw }),
     }
+}
+
+/// A protocol registry code point, which is sixteen bits wide wherever TLS
+/// names one. A wider value is a record whose renderer would print something
+/// no registry has, so it is refused here rather than truncated.
+fn code_point(raw: u64) -> Result<u16, LogRecordError> {
+    u16::try_from(raw).map_err(|_| LogRecordError::CodePointTooWide { value: raw })
 }
 
 fn token(raw: u8, count: u8, error: LogRecordError) -> Result<u8, LogRecordError> {
@@ -979,6 +1027,37 @@ pub enum CheckedDetail {
         start_sector: u64,
         sectors: u64,
     },
+    /// The protocol version and cipher suite a session settled on, as the
+    /// registries number them.
+    Session {
+        version: u16,
+        suite: u16,
+    },
+    /// The key exchange group that session used, and how many bytes of
+    /// application data made the round trip under it.
+    Exchange {
+        group: u16,
+        echoed: u64,
+    },
+    /// The 128-bit device identifier of the peer that authenticated, most
+    /// significant half first.
+    Peer {
+        high: u64,
+        low: u64,
+    },
+    /// A number of bytes about the bounded allocator, against the bound it is
+    /// judged by. Which pair it is follows from the record's position, the
+    /// domain emitting them in a fixed order.
+    Arena {
+        bytes: u64,
+        bound: u64,
+    },
+    /// What one operation of a primitive cost, where a per-byte figure would
+    /// mean nothing: a signature and a key exchange have one size.
+    Operation {
+        primitive: u8,
+        cycles: u64,
+    },
     /// What the hardware probe proved: both instruction known answers held and
     /// the XMM pattern survived every preemption it observed while running.
     Proven {
@@ -1076,6 +1155,11 @@ pub enum LogRecordError {
     PrimitiveUnknown {
         primitive: u64,
     },
+    /// A protocol code point wider than the sixteen bits every TLS registry
+    /// numbers one in.
+    CodePointTooWide {
+        value: u64,
+    },
     DomainUnknown {
         domain: u8,
     },
@@ -1149,6 +1233,9 @@ impl fmt::Display for LogRecordError {
                 f,
                 "primitive token {primitive} is not below {LOG_PRIMITIVE_COUNT}"
             ),
+            Self::CodePointTooWide { value } => {
+                write!(f, "protocol code point {value} does not fit sixteen bits")
+            }
             Self::DomainUnknown { domain } => {
                 write!(f, "domain token {domain} is not below {LOG_DOMAIN_COUNT}")
             }

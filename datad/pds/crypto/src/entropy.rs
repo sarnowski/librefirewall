@@ -39,6 +39,13 @@
 //! defends against is the hardware failing, which is not an adversary but is
 //! the failure this node cannot afford to survive quietly.
 
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use lfw_crypto::{Drbg, Entropy};
+
 use core::arch::x86_64::{__cpuid, _rdrand64_step};
 
 /// How many times one 64-bit draw is retried before the generator is called
@@ -139,4 +146,55 @@ fn draw() -> Option<u64> {
         }
     }
     None
+}
+
+/// The node's generator, shared the way everything that needs randomness asks
+/// for it.
+///
+/// One generator per node, behind the interface [`lfw_crypto::Entropy`]
+/// defines: the TLS stack, the key generation and the certificate serials all
+/// draw from the one whose seeding this domain proved and whose output its
+/// published vectors cover. A second source would be a second thing to prove.
+pub struct NodeEntropy {
+    /// Held rather than borrowed, because the interface hands out a shared
+    /// reference and the generator advances on every draw.
+    generator: UnsafeCell<Drbg>,
+    /// What makes the sharing sound rather than merely single-threaded.
+    taken: AtomicBool,
+}
+
+impl NodeEntropy {
+    #[must_use]
+    pub const fn new(generator: Drbg) -> Self {
+        Self {
+            generator: UnsafeCell::new(generator),
+            taken: AtomicBool::new(false),
+        }
+    }
+}
+
+// SAFETY: `Sync` requires that concurrent shared access be sound. The
+// guarantor is the flag below rather than the execution model: `fill` acquires
+// `taken` before it touches the generator and releases it after, so at most
+// one caller holds the `&mut` at a time whatever the caller count. A Microkit
+// protection domain runs one thread and so never contends, but the claim does
+// not rest on that — an appliance whose soundness argument was "there is only
+// one thread" would be one edit away from being wrong.
+unsafe impl Sync for NodeEntropy {}
+
+impl Entropy for NodeEntropy {
+    fn fill(&self, out: &mut [u8]) {
+        while self
+            .taken
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: the flag above is held, so this is the only live reference
+        // to the generator for the duration of the call. It is released
+        // immediately afterwards and the reference does not escape.
+        unsafe { (*self.generator.get()).fill(out) };
+        self.taken.store(false, Ordering::Release);
+    }
 }

@@ -15,6 +15,7 @@ sel4-microkit.workspace = true
 lfw-crypto = { path = "../../crates/crypto" }
 lfw-log = { path = "../../crates/log" }
 lfw-metrics = { path = "../../crates/metrics" }
+lfw-tls = { path = "../../crates/tls" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 wire = { path = "../../crates/wire" }
 

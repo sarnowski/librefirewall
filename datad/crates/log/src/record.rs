@@ -388,6 +388,28 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Measured.to_bits();
                     record.operands = [*primitive as u64, *milli_cycles_per_byte];
                 }
+                DomainDetail::Session { version, suite } => {
+                    record.detail = LogDetailKind::Session.to_bits();
+                    record.operands = [u64::from(*version), u64::from(*suite)];
+                }
+                DomainDetail::Exchange { group, echoed } => {
+                    record.detail = LogDetailKind::Exchange.to_bits();
+                    record.operands = [u64::from(*group), *echoed];
+                }
+                DomainDetail::Peer { device } => {
+                    record.detail = LogDetailKind::Peer.to_bits();
+                    // The identifier is wider than an operand, so it crosses
+                    // as its two halves, most significant first.
+                    record.operands = [(*device >> 64) as u64, *device as u64];
+                }
+                DomainDetail::Arena { bytes, bound } => {
+                    record.detail = LogDetailKind::Arena.to_bits();
+                    record.operands = [*bytes, *bound];
+                }
+                DomainDetail::Operation { primitive, cycles } => {
+                    record.detail = LogDetailKind::Operation.to_bits();
+                    record.operands = [*primitive as u64, *cycles];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -529,6 +551,25 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             primitive: primitive_of(*primitive)?,
             vectors: *vectors,
         },
+        CheckedDetail::Session { version, suite } => DomainDetail::Session {
+            version: *version,
+            suite: *suite,
+        },
+        CheckedDetail::Exchange { group, echoed } => DomainDetail::Exchange {
+            group: *group,
+            echoed: *echoed,
+        },
+        CheckedDetail::Peer { high, low } => DomainDetail::Peer {
+            device: (u128::from(*high) << 64) | u128::from(*low),
+        },
+        CheckedDetail::Arena { bytes, bound } => DomainDetail::Arena {
+            bytes: *bytes,
+            bound: *bound,
+        },
+        CheckedDetail::Operation { primitive, cycles } => DomainDetail::Operation {
+            primitive: primitive_of(*primitive)?,
+            cycles: *cycles,
+        },
         CheckedDetail::Measured {
             primitive,
             milli_cycles_per_byte,
@@ -600,6 +641,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     },
                     DomainDetail::Proved { primitive, vectors } => {
                         DomainDetail::Proved { primitive, vectors }
+                    }
+                    DomainDetail::Session { version, suite } => {
+                        DomainDetail::Session { version, suite }
+                    }
+                    DomainDetail::Exchange { group, echoed } => {
+                        DomainDetail::Exchange { group, echoed }
+                    }
+                    DomainDetail::Peer { device } => DomainDetail::Peer { device },
+                    DomainDetail::Arena { bytes, bound } => DomainDetail::Arena { bytes, bound },
+                    DomainDetail::Operation { primitive, cycles } => {
+                        DomainDetail::Operation { primitive, cycles }
                     }
                     DomainDetail::Measured {
                         primitive,

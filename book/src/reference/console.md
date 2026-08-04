@@ -56,7 +56,7 @@ written waits forever:
 | `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`, and one per measured primitive carrying `primitive=` and `milli-cycles-per-byte=`. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; then two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -200,7 +200,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the six tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
-the `recorder` domain raises, 12 the `hardware-probe` domain raises, and 20 the `crypto` domain
+the `recorder` domain raises, 12 the `hardware-probe` domain raises, and 34 the `crypto` domain
 raises. A token outside all six is a defect, not an extension. The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
@@ -336,12 +336,26 @@ of a vector's contents.
 |---|---|
 | the XMM feature gate (`detail=` is `CPUID.01H:ECX`, except `sse2-not-supported`, whose word is `CPUID.01H:EDX`) | `ssse3-not-supported`, `sse41-not-supported`, `sse42-not-supported`, `aes-not-supported`, `pclmulqdq-not-supported`, `sse2-not-supported` |
 | the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the rest) | `cpuid-leaf-seven-unavailable`, `bmi2-not-supported`, `adx-not-supported` |
-| a published vector this build does not answer (`detail=` is the row's position in that primitive's table) | `sha-256-vector-mismatch`, `hmac-sha-256-vector-mismatch`, `hkdf-sha-256-vector-mismatch`, `chacha20-vector-mismatch`, `chacha20-poly1305-vector-mismatch`, `aes-256-gcm-vector-mismatch`, `chacha20-drbg-vector-mismatch` |
+| a published vector this build does not answer (`detail=` is the row's position in that primitive's table) | `sha-256-vector-mismatch`, `hmac-sha-256-vector-mismatch`, `hkdf-sha-256-vector-mismatch`, `chacha20-vector-mismatch`, `chacha20-poly1305-vector-mismatch`, `aes-256-gcm-vector-mismatch`, `chacha20-drbg-vector-mismatch`, `ecdsa-p256-vector-mismatch`, `x25519-vector-mismatch`, `ml-kem-768-vector-mismatch` |
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
+| the session the domain establishes against itself (none carries a `detail=`) | `tls-handshake-refused`, `tls-session-stalled`, `tls-peer-unauthenticated`, `tls-peer-certificate-wrong`, `tls-application-data-lost`, `tls-session-not-closed`, `tls-identity-unbuildable`, `tls-arena-exhausted` |
+| the bounded allocator's own proof (`detail=` is the refusal count for the first and the headroom that was left for the last; the middle carries none) | `arena-allocation-refused`, `arena-starvation-unreachable`, `starved-session-established` |
+
+**The last two groups are what a boot's TLS proof says when it does not hold**, and they divide the
+same way the proof does. A `tls-*` token means the session itself did not establish or did not stay
+established — a handshake the library refused, a peer whose certificate was not the one this domain
+issued it, application data that did not come back, a stream that ended without its closing alert.
+An `arena-*` token means the *bound* did not behave: `arena-allocation-refused` says an allocation
+was answered no, which the session's own headroom check exists to make unreachable;
+`starved-session-established` says a session ran to completion on an arena that should not have
+admitted it, which would mean the guard is not guarding; and `arena-starvation-unreachable` says
+the domain could not set up that starved case at all. All three are findings about the mechanism
+rather than about a cipher.
 
 The primitive names in `primitive=` are `sha-256`, `hmac-sha-256`, `hkdf-sha-256`, `chacha20`,
-`chacha20-poly1305`, `aes-256-gcm` and `chacha20-drbg`. What each is proved against, and what the
-measured numbers mean, is in the [cryptography profile](crypto-profile.md).
+`chacha20-poly1305`, `aes-256-gcm`, `chacha20-drbg`, `ecdsa-p256`, `x25519` and `ml-kem-768`. What
+each is proved against, and what the measured numbers mean, is in the
+[cryptography profile](crypto-profile.md).
 
 ## `LFW-CFG` — configuration
 

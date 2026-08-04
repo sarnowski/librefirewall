@@ -52,25 +52,39 @@
 //! the raw draws are cleared before the buffer holding them goes out of scope.
 //! The only numbers that leave are counts and costs.
 
+extern crate alloc;
+
+mod arena;
 mod entropy;
 
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
 
 use lfw_crypto::{
-    Aes256Gcm, ChaCha20Poly1305, Drbg, KEY_LEN, NONCE_LEN, Sha256, VectorFailure,
-    prove_aes_256_gcm, prove_chacha20, prove_chacha20_poly1305, prove_drbg, prove_hkdf_sha256,
-    prove_hmac_sha256, prove_sha256,
+    Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, KEY_LEN, MlKem768DecapsulationKey,
+    MlKem768EncapsulationKey, NONCE_LEN, P256_MAX_SIGNATURE_LEN, P256SecretKey, Sha256,
+    VectorFailure, X25519Secret, prove_aes_256_gcm, prove_chacha20, prove_chacha20_poly1305,
+    prove_drbg, prove_ecdsa_p256, prove_hkdf_sha256, prove_hmac_sha256, prove_ml_kem_768,
+    prove_sha256, prove_x25519,
 };
 use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
+use lfw_tls::{Negotiated, SessionError, prove_session};
 use pd_runtime::{PdClock, attach_region, log_sample, read_timestamp_counter};
 use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{ClockCalibration, LogConsume, LogRecords};
 
-use entropy::{ENTROPY_LEN, EntropyError, draw_seed_material};
+use arena::{ARENA_BYTES, Arena, ArenaRegion};
+use entropy::{ENTROPY_LEN, EntropyError, NodeEntropy, draw_seed_material};
+
+/// The appliance's only allocator, and the one exception to the rule that a
+/// protection domain has none. It is here because a proven TLS implementation
+/// requires one; every property that makes that acceptable — the bound, the
+/// refusal, the confinement to this domain — is `arena`'s.
+#[global_allocator]
+static ARENA: Arena = Arena::new();
 
 /// Bytes one timing pass runs a primitive over. Four pages: past every cache
 /// line and block boundary that could make a shorter buffer flatter than the
@@ -117,7 +131,7 @@ struct Proof {
 /// table to that vocabulary from the other side: a primitive added there with
 /// no row here produces no record, and the gate fails for the record it did
 /// not see rather than passing on the six it did.
-const PROOFS: [Proof; 7] = [
+const PROOFS: [Proof; 10] = [
     Proof {
         primitive: Primitive::Sha256,
         prove: prove_sha256,
@@ -153,6 +167,21 @@ const PROOFS: [Proof; 7] = [
         prove: prove_drbg,
         cause: "chacha20-drbg-vector-mismatch",
     },
+    Proof {
+        primitive: Primitive::EcdsaP256,
+        prove: prove_ecdsa_p256,
+        cause: "ecdsa-p256-vector-mismatch",
+    },
+    Proof {
+        primitive: Primitive::X25519,
+        prove: prove_x25519,
+        cause: "x25519-vector-mismatch",
+    },
+    Proof {
+        primitive: Primitive::MlKem768,
+        prove: prove_ml_kem_768,
+        cause: "ml-kem-768-vector-mismatch",
+    },
 ];
 
 /// The primitives whose cost is measured, and nothing else: a hash, the
@@ -166,12 +195,63 @@ const MEASURED: [Primitive; 3] = [
     Primitive::Aes256Gcm,
 ];
 
+/// The primitives whose cost is one number per operation rather than per byte.
+///
+/// A signature, a key agreement and an encapsulation each do exactly one
+/// amount of work; dividing that by a message length would be dividing by a
+/// denominator nobody chose. So they are reported in whole cycles, under their
+/// own record and their own metric.
+const PER_OPERATION: [Primitive; 3] =
+    [Primitive::EcdsaP256, Primitive::X25519, Primitive::MlKem768];
+
+/// Operations one timed round performs, and rounds per primitive. Fewer
+/// passes than the per-byte measurement takes because one asymmetric
+/// operation is already tens of thousands of cycles.
+const OPERATIONS_PER_ROUND: u32 = 2;
+
+/// Bytes of application data the proven session carries each way. Short on
+/// purpose: what it establishes is that the traffic keys work in both
+/// directions, and a longer payload would measure the pump.
+const SESSION_PAYLOAD: &[u8] = b"librefirewall management channel";
+
+/// How much of the arena a starved session is left with.
+///
+/// A little more than a phase is required to have, deliberately: the session
+/// passes its first check, sets its two ends up, and is then refused by a
+/// later one — which is the interesting half of the claim, because it is the
+/// case where the arena drains *under a running session* rather than being
+/// short before it starts. The same guard, the same arena and the same
+/// allocator as the session above; the only difference is how much room is
+/// left.
+const STARVED_HEADROOM: usize = lfw_tls::STEP_RESERVE + 8192;
+
 /// The console's primitive vocabulary and the metrics shard's are two arrays
 /// in two crates that neither may read from the other, and this domain indexes
 /// the second one with a member of the first. Held equal here, where both are
 /// visible, so that index is in bounds by construction rather than by a test
 /// somewhere else.
 const _: () = assert!(Primitive::ALL.len() == CRYPTO_PRIMITIVES.len());
+
+/// Seconds since the Unix epoch, as this node believes them.
+///
+/// From the clock domain's published calibration where there is one, and from
+/// a compile-time floor where there is not: a certificate needs a validity
+/// window, and a node whose clock never published would otherwise write one
+/// nothing accepts. The floor is not a security control and is not treated as
+/// one — the appliance's time is an unauthenticated real-time-clock reading
+/// either way, which is enough to bound a certificate and not enough to judge
+/// an adversary by.
+fn wall_seconds(clock: &PdClock<'_>) -> u64 {
+    /// Seconds at the start of 2026, which is before any image carrying this
+    /// code was built and after every year a `UTCTime` cannot name.
+    const FLOOR: u64 = 1_767_225_600;
+    clock
+        .calibration()
+        .map_or(FLOOR, |calibration| {
+            calibration.utc(read_timestamp_counter()).as_nanos() / 1_000_000_000
+        })
+        .max(FLOOR)
+}
 
 /// This domain's lifecycle record.
 fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
@@ -201,6 +281,7 @@ struct Outcome {
     verdict: Result<(), CryptoError>,
     vectors: [u64; CRYPTO_PRIMITIVES.len()],
     milli_cycles_per_byte: [u64; CRYPTO_PRIMITIVES.len()],
+    cycles_per_operation: [u64; CRYPTO_PRIMITIVES.len()],
 }
 
 #[protection_domain]
@@ -211,11 +292,17 @@ fn init() -> Crypto {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let calibration: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let clock = PdClock::new(calibration);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(calibration));
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
+    // Before the first allocation, which is what the null base until now
+    // would otherwise refuse. The region is mapped read-write into this
+    // domain and no other, and nothing else in this system names it.
+    let region: &'static ArenaRegion = attach_region!(arena_vaddr: ArenaRegion);
+    ARENA.attach(region.bytes.as_ptr().cast_mut().cast());
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
-    let outcome = bring_up(&sink);
+    let outcome = bring_up(&sink, wall_seconds(&clock));
     match &outcome.verdict {
         Ok(()) => announce(&sink, DomainState::Ready, DomainDetail::None),
         Err(CryptoError(cause)) => {
@@ -231,6 +318,7 @@ fn init() -> Crypto {
             proven: outcome.verdict.is_ok(),
             vectors: outcome.vectors,
             milli_cycles_per_byte: outcome.milli_cycles_per_byte,
+            cycles_per_operation: outcome.cycles_per_operation,
             log: log_sample(sink.dropped(), sink.refused()),
         }
         .values(),
@@ -241,11 +329,12 @@ fn init() -> Crypto {
 /// Gate on the part, prove every primitive, measure the three that are
 /// measured, and seed the generator — reporting each step as it happens, so a
 /// refusal halfway through leaves the steps that did hold on the console.
-fn bring_up(sink: &dyn Sink) -> Outcome {
+fn bring_up(sink: &dyn Sink, now: u64) -> Outcome {
     let mut outcome = Outcome {
         verdict: Ok(()),
         vectors: [0; CRYPTO_PRIMITIVES.len()],
         milli_cycles_per_byte: [0; CRYPTO_PRIMITIVES.len()],
+        cycles_per_operation: [0; CRYPTO_PRIMITIVES.len()],
     };
     match feature_gate() {
         Ok(features) => announce(
@@ -303,21 +392,152 @@ fn bring_up(sink: &dyn Sink) -> Outcome {
         );
     }
 
-    if let Err(error) = seed_generator() {
+    let generator = match seed_generator() {
+        Ok(generator) => generator,
+        Err(error) => {
+            outcome.verdict = Err(error);
+            return outcome;
+        }
+    };
+    // Leaked deliberately and once: every key exchange the TLS provider holds
+    // reaches the node's randomness through a `'static` borrow, and this
+    // domain runs to completion and parks, so there is nothing to give back
+    // to. The allocation happens before the arena's mark is taken.
+    let entropy: &'static dyn Entropy =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(NodeEntropy::new(generator)));
+
+    for primitive in PER_OPERATION {
+        let cost = measure_operation(primitive, entropy);
+        outcome.cycles_per_operation[primitive as usize] = cost;
+        announce(
+            sink,
+            DomainState::Negotiated,
+            DomainDetail::Operation {
+                primitive,
+                cycles: cost,
+            },
+        );
+    }
+
+    if let Err(error) = prove_tls(sink, entropy, now) {
         outcome.verdict = Err(error);
     }
     outcome
 }
 
-/// Draw hardware entropy, fold it into the node's generator, and prove the
-/// generator answers.
+/// Establish one session, report what it negotiated, and then prove that a
+/// session which runs out of arena refuses rather than faults.
 ///
-/// The generator is built and dropped here because nothing yet consumes it:
-/// the store domain generates keys from one in the phase that gives this
-/// domain a channel, and a generator held open with no reader would be a
-/// seeded secret sitting in memory for no purpose. What this proves now is
-/// that the hardware can seed one and that the seeded one produces bytes.
-fn seed_generator() -> Result<(), CryptoError> {
+/// Both halves are here because they are one claim: the allocator this domain
+/// carries is bounded, and what makes that acceptable is that reaching the
+/// bound is an answer. A boot that showed only the first half would have shown
+/// a working TLS stack and nothing about what happens when it runs out.
+fn prove_tls(sink: &dyn Sink, entropy: &'static dyn Entropy, now: u64) -> Result<(), CryptoError> {
+    let arena = ARENA.bump();
+    let mark = arena.mark();
+    let negotiated =
+        prove_session(entropy, arena, now, SESSION_PAYLOAD).map_err(session_refusal)?;
+    report_session(sink, &negotiated);
+    announce(
+        sink,
+        DomainState::Negotiated,
+        DomainDetail::Arena {
+            bytes: arena.high_water() as u64,
+            bound: ARENA_BYTES as u64,
+        },
+    );
+    arena.reset_to(mark);
+
+    // The same session with the arena all but full. It must refuse, and the
+    // refusal must be the arena's rather than any other — a session that
+    // failed for another reason here would prove nothing about the bound.
+    let starve = arena.remaining().saturating_sub(STARVED_HEADROOM);
+    let filler = arena
+        .allocate(starve, 16)
+        .map_err(|_| CryptoError(refusal("arena-starvation-unreachable", RefusalDetail::None)))?;
+    let starved = prove_session(entropy, arena, now, SESSION_PAYLOAD);
+    arena.release(filler, starve);
+    arena.reset_to(mark);
+    match starved {
+        Err(SessionError::ArenaExhausted(exhausted)) => {
+            announce(
+                sink,
+                DomainState::Negotiated,
+                DomainDetail::Arena {
+                    bytes: exhausted.remaining as u64,
+                    bound: exhausted.requested as u64,
+                },
+            );
+            // The guard is what refused, so the allocator never had to: a
+            // non-zero count here would mean an allocation was answered null,
+            // which is the path this design exists to keep unreachable.
+            if arena.refusals() != 0 {
+                return Err(CryptoError(refusal(
+                    "arena-allocation-refused",
+                    RefusalDetail::One(u64::from(arena.refusals())),
+                )));
+            }
+            Ok(())
+        }
+        Err(other) => Err(session_refusal(other)),
+        Ok(_) => Err(CryptoError(refusal(
+            "starved-session-established",
+            RefusalDetail::One(STARVED_HEADROOM as u64),
+        ))),
+    }
+}
+
+/// One session's parameters, as three records: what it settled on, what it
+/// carried, and who it admitted.
+fn report_session(sink: &dyn Sink, negotiated: &Negotiated) {
+    announce(
+        sink,
+        DomainState::Negotiated,
+        DomainDetail::Session {
+            version: negotiated.version,
+            suite: negotiated.suite,
+        },
+    );
+    announce(
+        sink,
+        DomainState::Negotiated,
+        DomainDetail::Exchange {
+            group: negotiated.group,
+            echoed: u64::from(negotiated.echoed),
+        },
+    );
+    // The peer's identity as the profile defines one: the leading 128 bits of
+    // the digest over the certificate it authenticated with. No certificate
+    // and no key reaches a surface — this is a name for one.
+    let mut device = 0_u128;
+    for byte in negotiated.peer_certificate.iter().take(16) {
+        device = (device << 8) | u128::from(*byte);
+    }
+    announce(sink, DomainState::Negotiated, DomainDetail::Peer { device });
+}
+
+/// Why a session did not establish, as a cause token an operator can act on.
+fn session_refusal(error: SessionError) -> CryptoError {
+    let cause = match error {
+        SessionError::ArenaExhausted(_) => "tls-arena-exhausted",
+        SessionError::Identity(_) => "tls-identity-unbuildable",
+        SessionError::Tls(_) => "tls-handshake-refused",
+        SessionError::Stalled => "tls-session-stalled",
+        SessionError::NoPeerCertificate => "tls-peer-unauthenticated",
+        SessionError::WrongPeerCertificate => "tls-peer-certificate-wrong",
+        SessionError::NotEchoed => "tls-application-data-lost",
+        SessionError::NotClosed => "tls-session-not-closed",
+    };
+    CryptoError(refusal(cause, RefusalDetail::None))
+}
+
+/// Draw hardware entropy, fold it into the node's generator, prove the
+/// generator answers, and hand it back.
+///
+/// It is handed back rather than dropped now that something consumes it: the
+/// session below keys itself from this generator, so what proves the seeding
+/// and what keys the appliance are the same object.
+fn seed_generator() -> Result<Drbg, CryptoError> {
     let mut raw = [0_u8; ENTROPY_LEN];
     let drawn = draw_seed_material(&mut raw);
     let outcome = drawn.map_err(|error| {
@@ -349,7 +569,7 @@ fn seed_generator() -> Result<(), CryptoError> {
                 RefusalDetail::None,
             )));
         }
-        Ok(())
+        Ok(generator)
     });
     // Whatever happened above, the draws do not outlive this frame in
     // readable form. Written through a volatile write so the compiler cannot
@@ -479,7 +699,82 @@ fn run_once(primitive: Primitive, buffer: &mut [u8; MEASURE_BYTES]) {
         }
         // Unreachable by construction: `MEASURED` names exactly the three
         // arms above, and this function has one caller, which iterates it.
-        Primitive::HmacSha256 | Primitive::HkdfSha256 | Primitive::ChaCha20 | Primitive::Drbg => {}
+        Primitive::HmacSha256
+        | Primitive::HkdfSha256
+        | Primitive::ChaCha20
+        | Primitive::Drbg
+        | Primitive::EcdsaP256
+        | Primitive::X25519
+        | Primitive::MlKem768 => {}
+    }
+}
+
+/// Whole timestamp-counter cycles one operation of `primitive` cost, as the
+/// least any round spent.
+///
+/// The same minimum-of-rounds argument the per-byte measurement is taken
+/// under, and the same saturating arithmetic for the same reason.
+fn measure_operation(primitive: Primitive, entropy: &dyn Entropy) -> u64 {
+    let mut least = u64::MAX;
+    for round in 0..ROUNDS {
+        let start = read_timestamp_counter().0;
+        for _ in 0..OPERATIONS_PER_ROUND {
+            run_operation(primitive, entropy);
+        }
+        let spent = read_timestamp_counter().0.wrapping_sub(start);
+        if round > 0 && spent < least {
+            least = spent;
+        }
+    }
+    if least == u64::MAX {
+        return 0;
+    }
+    least / u64::from(OPERATIONS_PER_ROUND)
+}
+
+/// One operation of an asymmetric primitive, end to end.
+///
+/// End to end and not one half: what an operator wants from these numbers is
+/// what a handshake costs, and a handshake signs *and* verifies, agrees from
+/// both sides, and encapsulates *and* decapsulates. Measuring a half would
+/// report a number no path takes.
+fn run_operation(primitive: Primitive, entropy: &dyn Entropy) {
+    match primitive {
+        Primitive::EcdsaP256 => {
+            let Ok(key) = P256SecretKey::generate(entropy) else {
+                return;
+            };
+            let public = key.public_key();
+            let mut signature = [0_u8; P256_MAX_SIGNATURE_LEN];
+            let Ok(len) = key.sign(black_box(SESSION_PAYLOAD), &mut signature) else {
+                return;
+            };
+            black_box(lfw_crypto::p256_verify(&public, SESSION_PAYLOAD, &signature[..len]).is_ok());
+        }
+        Primitive::X25519 => {
+            let ours = X25519Secret::generate(entropy);
+            let theirs = X25519Secret::generate(entropy);
+            black_box(ours.agree(&black_box(theirs.public_key())).is_ok());
+        }
+        Primitive::MlKem768 => {
+            let ours = MlKem768DecapsulationKey::generate(entropy);
+            let Ok(peer) = MlKem768EncapsulationKey::from_bytes(&ours.encapsulation_key()) else {
+                return;
+            };
+            let Ok((ciphertext, _)) = peer.encapsulate(entropy) else {
+                return;
+            };
+            black_box(ours.decapsulate(black_box(&ciphertext)).is_ok());
+        }
+        // Unreachable by construction, on `run_once`'s terms: `PER_OPERATION`
+        // names exactly the three arms above.
+        Primitive::Sha256
+        | Primitive::HmacSha256
+        | Primitive::HkdfSha256
+        | Primitive::ChaCha20
+        | Primitive::ChaCha20Poly1305
+        | Primitive::Aes256Gcm
+        | Primitive::Drbg => {}
     }
 }
 
