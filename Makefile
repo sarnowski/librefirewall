@@ -18,10 +18,10 @@ CA_SECRET :=
 CA_MOUNT :=
 else
 CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
-# The run-time counterpart of CA_SECRET, for the one ctrld target that fetches
-# from the network outside an image build. It is a read-only bind mount rather
-# than a layer: the inspection CA is never baked into an image, and a target
-# that runs offline never sees it at all.
+# The run-time counterpart of CA_SECRET, for the two targets that fetch from
+# the network outside an image build. It is a read-only bind mount rather than a
+# layer: the inspection CA is never baked into an image, and a target that runs
+# offline never sees it at all.
 CA_MOUNT := --mount type=bind,src=$(abspath $(ENTERPRISE_CA_FILE)),dst=/etc/ssl/enterprise-ca.crt,ro=true
 endif
 
@@ -30,21 +30,38 @@ CTRLD_COMPOSE_FILE := ctrld/compose.yaml
 CTRLD_COMPOSE_ENV := ctrld/third-party/sources.lock
 CTRLD_COMPOSE_PROJECT := librefirewall-ctrld
 
-.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks book clean ctrld-image ctrld-deps ctrld-test ctrld-server ctrld-databases-down
+.PHONY: image image-debug deps run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks book clean ctrld-image ctrld-deps ctrld-test ctrld-server ctrld-databases-down
 
-# `image` and `ctrld-image` provision the two pinned builders and are the only
-# targets that fetch from the network. Every other target requires its image
-# to already exist and refuses to build it, so no gate command can quietly
-# turn into an OCI build — and the offline guarantee is enforced here rather
-# than asserted in prose. (`ctrld-server` carries the host network so a
-# browser can reach it, but HEX_OFFLINE keeps its dependencies coming from the
-# image caches like every other target.)
+# `image`, `deps` and `ctrld-image` are the provisioning targets and the only
+# ones that fetch from the network. Every other target requires its builder
+# image to already exist and refuses to build it, so no gate command can
+# quietly turn into an OCI build or a registry fetch — and the offline
+# guarantee is enforced here rather than asserted in prose. (`ctrld-server`
+# carries the host network so a browser can reach it, but HEX_OFFLINE keeps
+# its dependencies coming from the image caches like every other target.)
 #
 # `image` builds the RELEASE seL4 kernel configuration: the artifact a
 # deployment gets, and the one every end-to-end scenario in `ci` boots.
 image:
 	$(provision_builder)
 	$(call xtask,image)
+
+# Resolve the appliance's Cargo manifests into datad/Cargo.lock, and nothing
+# else. This is the ONLY writer of that lockfile and of the fuzz workspace's:
+# every other target runs --network=none against the caches the builder image
+# warmed, so a manifest that gained a dependency cannot resolve anywhere else.
+#
+# The cycle, after editing a Cargo.toml: `make deps` writes the lockfile,
+# `make image` rebuilds the builder so its offline cache holds the new crates,
+# and only then does any gate target see them.
+#
+# It runs the pinned builder's cargo rather than the host's, so the resolution
+# is the one the offline build will replay. Nothing is compiled here and no
+# artifact is produced — a fetch that also built would be a build outside the
+# offline guarantee.
+deps:
+	$(require_builder)
+	$(call deps_container,cargo fetch && cargo fetch --manifest-path fuzz/Cargo.toml)
 
 # The debug kernel as an explicit opt-in, for hand inspection of a build
 # nothing ships. No gate reaches it; `ci` boots the release image.
@@ -221,6 +238,29 @@ endef
 
 define xtask
 	$(call container,, $(1))
+endef
+
+# The one appliance run with the network on, for `deps`. It keeps every other
+# hardening property of `container` — read-only image filesystem, no
+# capabilities, the invoking user's uid, only the repository writable — and
+# differs in exactly two: the network is up, and the corporate TLS-inspection
+# CA is folded into a bundle on the run's own tmpfs so crates.io is reachable
+# from behind it. The bundle is built inside the container and dies with it,
+# on the same reasoning as the image build's tmpfs mount: it cannot reach a
+# layer or the repository however the command exits.
+define deps_container
+$(PODMAN) --cgroup-manager=cgroupfs run --rm \
+	--read-only \
+	--cap-drop=all \
+	--security-opt=no-new-privileges \
+	--userns=keep-id \
+	--user $$(id -u):$$(id -g) \
+	--env HOME=/tmp \
+	--tmpfs /tmp:rw,nosuid,nodev \
+	--mount type=bind,src=$(CURDIR),dst=/workspace,rw=true \
+	$(CA_MOUNT) \
+	--workdir /workspace/datad \
+	$(BUILDER_IMAGE) sh -euc 'if [ -s /etc/ssl/enterprise-ca.crt ]; then cat /etc/ssl/certs/ca-certificates.crt /etc/ssl/enterprise-ca.crt > /tmp/ca-bundle.crt; export SSL_CERT_FILE=/tmp/ca-bundle.crt; fi; export CARGO_HOME=/tmp/cargo; cp -a /opt/rust/cargo /tmp/cargo; $(1)'
 endef
 
 define xtask_interactive

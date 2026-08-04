@@ -15,10 +15,14 @@
          tap it may only read, and to the management domain by a download
          handover, and it holds no dataplane region of any kind. An eighth
          binary, the HARDWARE PROBE, holds no device and no channel at all: it
-         is the one domain compiled with the hardfloat SIMD target, proves the
-         AES-NI/PCLMULQDQ/XMM profile once at boot, and parks. The protection
-         domains are documented in pds/nic-driver, pds/forwarder,
-         pds/management, pds/recorder and pds/hardware-probe. -->
+         is one of the two domains compiled with the hardfloat SIMD target,
+         proves the AES-NI/PCLMULQDQ/XMM profile once at boot, and parks. A
+         ninth, the CRYPTOGRAPHY domain, is the other: it holds no device and
+         no channel either, proves every cryptographic primitive against its
+         published vectors on this part, measures what each costs, seeds a
+         generator from RDRAND, and parks. The protection domains are
+         documented in pds/nic-driver, pds/forwarder, pds/management,
+         pds/recorder, pds/hardware-probe and pds/crypto. -->
 
     <!-- ===================================================================
          The physical address map is a contract, and this is where it is
@@ -444,7 +448,7 @@
          pair of even readings answers "nothing" rather than assembling a triple
          from two publishes.
 
-         ONE WRITER AND NINE READERS, and the direction is the whole grant. The
+         ONE WRITER AND TEN READERS, and the direction is the whole grant. The
          clock domain maps it READ-WRITE: it is the domain that measured the
          numbers, and it publishes them once, after the record that says what it
          measured. Every other domain maps it READ-ONLY, on the same footing as
@@ -464,8 +468,9 @@
          reader and arrived on the same terms: it stamps its own records, and it
          will one day date every observation it commits to the medium — a capture
          whose timestamps are the appliance's own idea of time and not a
-         separate one. The hardware probe is the ninth reader, on the same
-         terms again: it stamps its own records and reads nothing else here.
+         separate one. The hardware probe is the ninth reader and the
+         cryptography domain the tenth, on the same terms again: each stamps
+         its own records and reads nothing else here.
 
          WHAT THE ADDED GRANT GIVES, exactly: a READ of three integers, and
          nothing else. It confers no ability to write the calibration, no channel
@@ -670,7 +675,7 @@
          region and compares it. `LogRecords` is 13320 bytes (64 slots of a
          208-byte record, plus the producer cursor and the drop count) so each
          is four pages; `LogConsume` is one word and so costs the page a region
-         costs, exactly as `cfgack` does. The eighteen together are 180 KiB.
+         costs, exactly as `cfgack` does. The twenty together are 200 KiB.
 
          None carries phys_addr, for the reason the address-map block above
          gives for `cfg` and `cfgack`: no device DMAs into a log region, so no
@@ -700,21 +705,23 @@
     <memory_region name="log_recorder_consume" size="0x1000" />
     <memory_region name="log_hardware_probe" size="0x4000" />
     <memory_region name="log_hardware_probe_consume" size="0x1000" />
+    <memory_region name="log_crypto" size="0x4000" />
+    <memory_region name="log_crypto_consume" size="0x1000" />
 
 
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
          that domain alone and read by the management domain alone.
 
-         WHY TEN REGIONS AND NOT ONE. A region is the unit of grant, and the
+         WHY ELEVEN REGIONS AND NOT ONE. A region is the unit of grant, and the
          property worth having here is that a domain's numbers are *its own
          testimony*: the management domain renders every one of them into the
-         exposition an operator scrapes, so it must read all ten, and a single
-         shared region would make it a writer of all ten too. It could then
+         exposition an operator scrapes, so it must read all eleven, and a single
+         shared region would make it a writer of all eleven too. It could then
          attribute a driver's dropped frames to another driver, or zero a count
          that accuses itself — and it is the domain that faces the
-         management-plane attacker. Ten regions with ten writers is what
+         management-plane attacker. Eleven regions with eleven writers is what
          makes each series a claim only its own domain can make, and it is the
-         same argument the eighteen log regions make one step further: there the
+         same argument the twenty log regions make one step further: there the
          console cannot forge a *record*, here it cannot forge a *number*.
 
          PER-DOMAIN SERIES, NO TOTALS. Nothing in this node sums across shards.
@@ -747,7 +754,7 @@
 
          `stats_management` HAS EXACTLY ONE MAPPER, and that is not an oversight.
          The management domain both writes and reads it, because the renderer
-         walks one uniform array of ten shards rather than nine regions plus a
+         walks one uniform array of eleven shards rather than ten regions plus a
          live read of its own counters — one code path, and a set of numbers
          taken at one publish rather than half of them changing under the render.
          It costs no cross-domain authority: no other domain maps it.
@@ -756,7 +763,7 @@
          up to the mapping granularity, on the same footing as every constant
          above and held to it the same way — `xtask::sysdesc` carries a rule per
          region and compares it. A `StatsShard` is 2688 bytes, so each rounds to
-         one page and the ten cost 40 KiB. It grew from 768 with the filter, and
+         one page and the eleven cost 44 KiB. It grew from 768 with the filter, and
          the page count did not: the shard is sized by the widest set a domain
          publishes, and the forwarder's now reserves one slot per rule the
          configuration ABI admits — which is why a second region for those
@@ -779,6 +786,7 @@
     <memory_region name="stats_clock" size="0x1000" />
     <memory_region name="stats_recorder" size="0x1000" />
     <memory_region name="stats_hardware_probe" size="0x1000" />
+    <memory_region name="stats_crypto" size="0x1000" />
 
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
@@ -1098,9 +1106,9 @@
              other domain's, and one that could write it would serve an operator
              a recording no medium holds while the recorder reported having
              served the one it does.
-           * stats_recorder and stats_hardware_probe (READ-ONLY) — the ninth
-             and tenth shards, on exactly the terms of the other seven that are
-             not this domain's own.
+           * stats_recorder, stats_hardware_probe and stats_crypto (READ-ONLY)
+             — the ninth, tenth and eleventh shards, on exactly the terms of
+             the other seven that are not this domain's own.
 
          WHAT STAYS WITHHELD, and it is the whole of the management/dataplane
          isolation: NO dataplane region of any kind — not a pool, not a
@@ -1188,6 +1196,7 @@
         <map mr="stats_clock" vaddr="0x5_007_000" perms="r" cached="true" setvar_vaddr="stats_clock_vaddr" />
         <map mr="stats_recorder" vaddr="0x5_008_000" perms="r" cached="true" setvar_vaddr="stats_recorder_vaddr" />
         <map mr="stats_hardware_probe" vaddr="0x5_009_000" perms="r" cached="true" setvar_vaddr="stats_hardware_probe_vaddr" />
+        <map mr="stats_crypto" vaddr="0x5_00a_000" perms="r" cached="true" setvar_vaddr="stats_crypto_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -1456,6 +1465,55 @@
         <map mr="stats_hardware_probe" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
+    <!-- The cryptography domain: the other binary compiled with the hardfloat
+         SIMD target, and the reason that target exists. It proves at boot that
+         every cryptographic primitive this appliance owns answers its
+         published NIST CAVP, RFC and Wycheproof vectors on this part, measures
+         what each costs in cycles per byte, seeds a deterministic random bit
+         generator from RDRAND, reports all of it, and parks. The protection
+         domain is documented in pds/crypto.
+
+         WHAT IT MAPS is the same reporting minimum the hardware probe holds:
+         its own log ring read-write with its consume cursor read-only, its own
+         statistics shard read-write, and the clock calibration read-only to
+         stamp its records. NO device region of any kind — no ECAM page, no BAR
+         window, no virtqueue, no block region — NO pool, NO dataplane or
+         management ring, NO configuration region, NO tap, NO download region
+         and NO `<ioport>`. `RDRAND`, `CPUID` and `RDTSC` are unprivileged and
+         carried by no capability, exactly as the management domain's `RDRAND`
+         and every domain's `RDTSC` are, so nothing in this file could grant or
+         withhold them; what this row grants is only the means to say what
+         happened.
+
+         WHY IT HOLDS NO STORE DEVICE, though it is the domain that seeds the
+         generator keys will be drawn from: the device private key must never
+         leave the domain that owns the medium, so the store domain is the
+         identity domain and this one hands it randomness rather than keys.
+         That channel does not exist yet and neither does that domain; until
+         they do, this domain generates nothing that outlives its own frame,
+         which is why it holds no channel in either direction and parks where
+         nothing can reach it, exactly as the clock domain does.
+
+         PRIORITY 2, ABOVE THE BUSY-LOOP DOMAINS AND BELOW THE CLOCK, and both
+         halves are deliberate. Above priority 1, because the throughput figure
+         this domain reports is a measurement and a domain that never yields
+         would otherwise be measured along with the cipher — the reported
+         figure is the least any round spent, so a preemption can only inflate
+         it, but not competing for the slice in the first place is what makes
+         the number worth reporting. Below the clock at priority 3, because
+         this domain stamps its records against a calibration that domain
+         publishes, and a stamp is worth more than the few milliseconds of
+         ordering it costs. Its work is bounded by its own compile-time
+         constants — a fixed vector corpus and a fixed number of timing rounds
+         — and the domain then blocks for good. -->
+    <protection_domain name="crypto" priority="2" stack_size="0x8000">
+        <program_image path="crypto.elf" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="log_crypto" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_crypto_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_crypto" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+    </protection_domain>
+
     <!-- The console domain: the one holder of the serial controller.
 
          =================================================================
@@ -1519,7 +1577,7 @@
          prints on boot and on faults, not per record — but it is the reason the
          single-writer claim is stated of the shipped profile.
 
-         WHAT IT MAPS: eighteen log regions in nine pairs, and the perms are the
+         WHAT IT MAPS: twenty log regions in ten pairs, and the perms are the
          whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
          Each `log_<domain>` is READ-ONLY here: this domain renders those
          records and must read them, and a console that could also write one
@@ -1575,6 +1633,8 @@
         <map mr="log_recorder_consume" vaddr="0x4_710_000" perms="rw" cached="true" setvar_vaddr="log_recorder_consume_vaddr" />
         <map mr="log_hardware_probe" vaddr="0x4_800_000" perms="r" cached="true" setvar_vaddr="log_hardware_probe_vaddr" />
         <map mr="log_hardware_probe_consume" vaddr="0x4_810_000" perms="rw" cached="true" setvar_vaddr="log_hardware_probe_consume_vaddr" />
+        <map mr="log_crypto" vaddr="0x4_900_000" perms="r" cached="true" setvar_vaddr="log_crypto_vaddr" />
+        <map mr="log_crypto_consume" vaddr="0x4_910_000" perms="rw" cached="true" setvar_vaddr="log_crypto_consume_vaddr" />
         <map mr="stats_console" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 

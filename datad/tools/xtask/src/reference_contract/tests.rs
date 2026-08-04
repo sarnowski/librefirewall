@@ -77,7 +77,7 @@ fn minted(files: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// The five domains' sites as they are declared, each holding one token, so a
+/// The six domains' sites as they are declared, each holding one token, so a
 /// case can add or remove exactly one thing.
 fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
     vec![
@@ -89,10 +89,13 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/clock/src/main.rs", &["hpet-not-present"]),
         ("pds/management/src/main.rs", &["rdrand-exhausted"]),
         ("pds/hardware-probe/src/main.rs", &["aes-not-supported"]),
+        ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/wire/src/lib.rs", &["source-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
         ("crates/http/src/request.rs", &["content-length"]),
+        ("crates/crypto/src/vectors.rs", &["cavp-shavs-0"]),
+        ("crates/crypto/src/drbg.rs", &["librefirewall-drbg-seed-v1"]),
     ]
 }
 
@@ -110,6 +113,7 @@ fn sound_console() -> String {
             ],
         ),
         ("hardware-probe", &["aes-not-supported"]),
+        ("crypto", &["rdrand-output-stuck"]),
     ])
 }
 
@@ -207,6 +211,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
             ],
         ),
         ("hardware-probe", &["aes-not-supported"]),
+        ("crypto", &["rdrand-output-stuck"]),
     ]);
     let findings = cause_findings(&sites, &console);
     assert!(findings.is_empty(), "{findings:#?}");
@@ -266,14 +271,14 @@ fn a_stated_per_domain_count_that_disagrees_with_its_own_table_is_a_finding() {
 #[test]
 fn a_stated_table_count_that_disagrees_with_the_tables_present_is_a_finding() {
     let console = sound_console().replace(
-        "five tables together are the complete set",
         "six tables together are the complete set",
+        "seven tables together are the complete set",
     );
     let findings = cause_findings(&sound_sites(), &console);
     let joined = findings.join("\n");
-    assert!(joined.contains("5 refusal-cause table(s)"), "{joined}");
+    assert!(joined.contains("6 refusal-cause table(s)"), "{joined}");
     assert!(
-        joined.contains("the five tables together are the complete set"),
+        joined.contains("the six tables together are the complete set"),
         "{joined}"
     );
 }

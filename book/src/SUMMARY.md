@@ -9,6 +9,7 @@
 - [Console records](reference/console.md)
 - [Prometheus metrics](reference/metrics.md)
 - [Recording downloads](reference/recordings.md)
+- [Cryptography profile](reference/crypto-profile.md)
 
 # Design
 

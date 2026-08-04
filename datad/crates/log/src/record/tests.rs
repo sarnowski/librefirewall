@@ -1,4 +1,5 @@
 use super::*;
+use crate::event::Primitive;
 
 use core::num::NonZeroU64;
 
@@ -225,6 +226,22 @@ fn every_domain_detail_shape_survives_the_crossing() {
         DomainDetail::Proven {
             preemptions: u64::MAX,
             iterations: u64::MAX,
+        },
+        DomainDetail::Proved {
+            primitive: Primitive::Sha256,
+            vectors: 0,
+        },
+        DomainDetail::Proved {
+            primitive: Primitive::Drbg,
+            vectors: u64::MAX,
+        },
+        DomainDetail::Measured {
+            primitive: Primitive::Aes256Gcm,
+            milli_cycles_per_byte: 0,
+        },
+        DomainDetail::Measured {
+            primitive: Primitive::ChaCha20Poly1305,
+            milli_cycles_per_byte: u64::MAX,
         },
     ];
     for operands in [
@@ -693,6 +710,14 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
         any::<(u64, u64)>().prop_map(|(preemptions, iterations)| DomainDetail::Proven {
             preemptions,
             iterations,
+        }),
+        (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, vectors)| DomainDetail::Proved {
+            primitive: Primitive::ALL[at],
+            vectors,
+        }),
+        (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, cost)| DomainDetail::Measured {
+            primitive: Primitive::ALL[at],
+            milli_cycles_per_byte: cost,
         }),
         (
             any_cause(),

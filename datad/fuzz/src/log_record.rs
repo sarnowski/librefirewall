@@ -84,7 +84,8 @@ use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
     LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT,
-    LOG_REJECT_REASON_COUNT, LogRecord, LogRecordError, LogText, TextImage, ValueImage,
+    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LogRecord, LogRecordError, LogText, TextImage,
+    ValueImage,
 };
 
 /// Bytes one record occupies, and so what one corpus entry is.
@@ -108,7 +109,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The nine `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The eleven `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -118,7 +119,9 @@ const DETAIL_RECEIVED: u8 = 5;
 const DETAIL_MEDIUM: u8 = 6;
 const DETAIL_EXTENT: u8 = 7;
 const DETAIL_PROVEN: u8 = 8;
-const DETAIL_COUNT: u8 = 9;
+const DETAIL_PROVED: u8 = 9;
+const DETAIL_MEASURED: u8 = 10;
+const DETAIL_COUNT: u8 = 11;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -530,8 +533,13 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 }
                 // The two words a refusal would carry, read here as an extent
                 // or a proof: whole, not to `operand_count`, because these
-                // details name both unconditionally.
-                DETAIL_EXTENT | DETAIL_PROVEN => kept.operands = record.operands,
+                // details name both unconditionally. The two cryptography
+                // details join them for the same reason — their first word is
+                // a token rather than a count, but it is read from the same
+                // place and refused separately below.
+                DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED => {
+                    kept.operands = record.operands;
+                }
                 DETAIL_REFUSAL => {
                     kept.cause = record.cause;
                     kept.operand_count = record.operand_count;
@@ -674,6 +682,16 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_MEDIUM
         | DETAIL_EXTENT
         | DETAIL_PROVEN => None,
+        // The two details whose first operand word is a token rather than a
+        // count: it names a cryptographic primitive, so a word outside the set
+        // names nothing a console line can spell. Restated here as the range
+        // check it is, so the harness never asks the code under test what the
+        // set is.
+        DETAIL_PROVED | DETAIL_MEASURED => (record.operands[0]
+            >= u64::from(LOG_PRIMITIVE_COUNT))
+        .then_some(LogRecordError::PrimitiveUnknown {
+            primitive: record.operands[0],
+        }),
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.

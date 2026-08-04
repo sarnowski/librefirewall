@@ -280,7 +280,7 @@ against are written; almost nothing that implements them is.
 | Outbound management channel | **open** | the persistent mutually-authenticated connection of the [channel framing contract](contracts/channel-framing.md). Nothing dials: there is no TLS in the appliance, and the transport cannot even open a TCP connection (below) |
 | Onboarding | **open** | the HTTPS onboarding server, the CSR, the package upload and its tar reader ([contract](contracts/configuration-package.md)); nothing of it exists, and the unboarded/onboarded state machine has nowhere to be stored |
 | Appliance identity | **open** | no device key, no certificate, no fingerprint — **there is no cryptography in the appliance at all today**, not a SHA-256; the [certificate profile](contracts/certificate-profile.md) is the target |
-| Hardware-accelerated cryptography | **open** | rustls over a custom provider, the DRBG, and every primitive proven on the shipped image against CAVP and Wycheproof vectors, per the [architecture](design/architecture.md#cryptography). The foundational hypothesis is now verified by the hardware-probe domain: a hardfloat, SSE-enabled protection domain builds and boots on this kernel, AES-NI and PCLMULQDQ answer their known answers, and XMM state survives context switches, judged on every console-judged QEMU scenario (see the known risks for what remains) |
+| Hardware-accelerated cryptography | **partial** | The symmetric and hash foundation is built and proven on the shipped image: a cryptography protection domain, compiled with the SIMD target, re-runs 90 published NIST CAVP, RFC 8439 and Wycheproof vectors covering SHA-256, HMAC-SHA-256, HKDF-SHA-256, ChaCha20, ChaCha20-Poly1305, AES-256-GCM and the node's random bit generator, measures each primitive's cost, seeds that generator from `RDRAND`, and reports all of it — judged on every console-judged QEMU scenario, with the AES-256-GCM figure held below a ceiling no portable implementation reaches. The [cryptography profile](reference/crypto-profile.md) states the processor requirement and is held to the target specification by the gate. **Missing:** rustls and the arena allocator, and the asymmetric half — ECDSA P-256, X25519 and ML-KEM-768 — none of which is built. SHA-NI is not reachable on this target, which the profile page explains. The [architecture](design/architecture.md#hardware-cryptography-profile)'s literature figures are now partly superseded for the symmetric primitives — every boot reports its own cycles-per-byte — but not for the sizing argument they were quoted for, which is about the whole inspected path and needs bare metal and a traffic generator rather than a guest |
 | Persistent store | **open** | the third virtio-blk device, the store domain, the [double-buffered state record and configuration history](design/configuration.md#persistence), and [factory reset](design/updates.md#factory-reset). Today `VIRTIO_BLK_F_FLUSH` is never accepted and no flush is ever issued, so nothing the appliance writes is durable across a power cut |
 | Transport active open | **open** | the TCP stack is passive-open only — no `SynSent`, no connect entry point — and nothing sends an ARP request or holds an ARP cache, and there is no gateway in the configuration schema; all three are prerequisites for dialing out |
 | Configuration over the channel | **open** | stage, validate, commit with confirmation over a fresh connection, rollback, and the version history — the operations exist today only as `POST /config`'s single stage-validate-commit step |
@@ -357,6 +357,16 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
+- **SHA-NI is unreachable on this target, and the same mechanism is what keeps AVX out.** The
+  adopted hash library selects its SHA-NI backend through a runtime feature probe that compiles to
+  a constant `false` on a freestanding target, so SHA-256 runs the portable implementation whatever
+  the processor offers. Making that probe run would also make the AVX probes in the cipher
+  libraries run, and those must not: the pinned kernel does not save the wide vector state, so an
+  AVX instruction in a protection domain is silent corruption rather than a fault. The build now
+  asserts the absence by disassembling the shipped domains. Recovering SHA-NI without recovering
+  AVX needs either a per-crate way to force the backend or a wider kernel save area, and neither is
+  in scope; the cost is one primitive running at roughly a tenth of its accelerated rate, measured
+  and reported on every boot.
 - **Hardware cryptography's foundational hypothesis is verified; two narrower ones remain.** The
   pinned kernel saves x87 and SSE state per thread, so the XMM instruction sets the
   [CPU baseline](design/architecture.md#hardware-cryptography-profile) requires — AES-NI,

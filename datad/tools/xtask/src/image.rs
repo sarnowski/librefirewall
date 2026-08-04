@@ -240,7 +240,7 @@ pub(crate) const SYSTEM_PDS: &[&str] = &[
 /// to prevent for the dataplane. The same single-owner property as
 /// [`SYSTEM_PDS`]: [`crate::host::test_host`] lints exactly these packages for
 /// the SIMD target.
-pub(crate) const SIMD_SYSTEM_PDS: &[&str] = &["hardware-probe"];
+pub(crate) const SIMD_SYSTEM_PDS: &[&str] = &["hardware-probe", "crypto"];
 
 /// The pinned SDK's include directory for one seL4 kernel configuration.
 ///
@@ -422,6 +422,13 @@ fn assemble(
         let elf = format!("{pd}.elf");
         copy_file(&simd_target_dir.join(&elf), &build.join(&elf))?;
     }
+    // The binaries exist for the first time here, which is the only place the
+    // acceleration claim can be checked against them: the adopted
+    // cryptography crates pick a backend at compile time, so whether the fast
+    // one was compiled in is a fact about these bytes and about nothing in the
+    // source. The absence half matters more — a wide vector register in a
+    // protection domain is state the pinned kernel does not save.
+    crate::crypto_profile::check_image(&build).map_err(crate::util::Error::Invalid)?;
 
     run_command(
         Command::new(Path::new(MICROKIT_SDK).join("bin/microkit"))

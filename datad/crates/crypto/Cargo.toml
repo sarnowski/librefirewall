@@ -1,0 +1,40 @@
+[package]
+# `crypto` is a taken crate name; the directory keeps the short name and the
+# package carries the project prefix, so the lib target is `lfw_crypto` — the
+# same split `crates/log` makes for `lfw-log`.
+name = "lfw-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Every dependency below is adopted cryptography: pinned to an exact version,
+# `default-features = false` so neither `std` nor an allocator is pulled in,
+# and held to published vectors on the shipped image rather than trusted. None
+# of them compiles C — the `deny.toml` ban on `cc`, `cmake`, `pkg-config` and
+# `vcpkg` is what enforces that rather than this comment — and none carries a
+# build script except through `generic-array`, which probes rustc and is listed
+# in that file's allow-list with its reason.
+[dependencies]
+# SHA-256. `default-features = false` drops `std`; the `asm` feature is
+# deliberately not enabled, because it reaches for a C toolchain.
+sha2 = { version = "0.10.9", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+hkdf = { version = "0.12.4", default-features = false }
+# The AEAD pair. `aes-gcm`'s default features carry `alloc` and `getrandom`;
+# both are dropped and only the `aes` backend feature is asked for, which is
+# what selects the AES-NI implementation this appliance's baseline mandates.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+# The raw stream cipher, for the generator. Already in the graph as
+# `chacha20poly1305`'s own dependency, so naming it here adds a name to reach
+# it by and no node to the dependency graph.
+chacha20 = { version = "0.9.1", default-features = false }
+# Clearing a keystream buffer before it leaves the stack. Already in the graph
+# as the AEAD crates' dependency, on the same terms as `chacha20`.
+zeroize = { version = "1.9.0", default-features = false }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

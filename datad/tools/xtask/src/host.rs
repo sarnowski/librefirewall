@@ -31,7 +31,7 @@ use std::{
 };
 
 use crate::{
-    budgets, image, reference_contract, sysdesc,
+    budgets, crypto_profile, image, reference_contract, sysdesc,
     util::{repository_root, run_command},
 };
 
@@ -63,6 +63,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-clock",
     "lfw-hpet",
     "lfw-rtc",
+    "lfw-crypto",
     "xtask",
 ];
 
@@ -100,6 +101,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-clock",
     "lfw-hpet",
     "lfw-rtc",
+    "lfw-crypto",
 ];
 
 /// How many library crates carry the coverage floors.
@@ -210,6 +212,14 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // every stage of this gate green. It reads two Markdown files and two
     // in-process catalogues, so it costs milliseconds here rather than a boot.
     reference_contract::check(root, &repository_root()?)?;
+    // And the fourth: the cryptography profile page states the processor
+    // features a deployment must provide and the primitives this appliance
+    // proves on them, and both are readable as data — the target specification
+    // the SIMD domains compile against, and the console vocabulary the
+    // cryptography domain reports in. A page claiming an acceleration the
+    // binary was not built with is worse than no page, because a deployment
+    // buys hardware against it.
+    crypto_profile::check(root, &repository_root()?)?;
     // And for the third time the same argument: a configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost
@@ -990,6 +1000,38 @@ mod tests {
                      is a handful of bit tests and two constant comparisons, and a library crate \
                      for them would buy one host test at the cost of a coverage-floored crate \
                      whose whole content is this file's constants restated.",
+                ),
+            },
+        ),
+        (
+            "crypto",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and \
+                                `crypto_contract.rs` judges the `LFW-PD domain=crypto` records \
+                                its serial output carries on every console-judged scenario: one \
+                                `state=negotiated` per primitive in `lfw_log::Primitive::ALL` \
+                                with the vector count it proved, one measured cost per \
+                                primitive the profile page names as measured, and a single \
+                                `state=ready`. No boot can produce those records without this \
+                                domain — the binary compiled with the hardfloat SIMD target — \
+                                having gated on CPUID, re-run every committed published vector \
+                                against the code as compiled for that target, measured each \
+                                cost on the part, and seeded its generator from `RDRAND`; a \
+                                refusal reaches the same channel with its cause and fails the \
+                                same judge. `xtask test-ab` boots the slot it selected through \
+                                the same image.",
+                residue: Some(
+                    "The feature-gate refusals, the three `RDRAND` refusals and every \
+                     vector-mismatch arm are reached by no QEMU test: the harness pins the \
+                     guest CPU to a model carrying every gated feature, and the committed \
+                     vectors all answer. That is first-party decision logic sitting in a PD \
+                     where neither the host floor nor the QEMU gate can measure it — a layering \
+                     defect shared with the other domains' refusal translations. What is *not* \
+                     left here is the cryptography itself: every primitive, the generator and \
+                     the whole vector runner live in `lfw-crypto`, which carries the library \
+                     coverage floor and tests each mismatch arm against a deliberately \
+                     corrupted table. This file holds the hardware gate, the draw loop, the \
+                     timing loop and the reporting, and nothing else.",
                 ),
             },
         ),

@@ -16,6 +16,14 @@
 # Dependency shape: our own crates are AGPL-3.0-or-later; every third-party
 # crate is either the pinned `rust-sel4` (a local path source at
 # /opt/rust-sel4) or a crate resolved from crates.io.
+#
+# The one class of third-party crate that reaches a deployed binary is adopted
+# cryptography (the RustCrypto family under crates/crypto). It is here because
+# a first-party implementation of a cryptographic algorithm would be strictly
+# less trustworthy than an adopted one — and it is held to published test
+# vectors on the shipped image rather than trusted, which is what this file's
+# bans exist to keep possible: every one of those crates is pure Rust, so the
+# `cc`/`cmake`/`pkg-config`/`vcpkg` ban below is not a hypothetical for them.
 
 [graph]
 # Evaluate every compilation target so a platform-specific dependency cannot
@@ -159,6 +167,13 @@ allow-build-scripts = [
     { crate = "num-traits", reason = "dev-dependency (criterion) build probe" },
     { crate = "crunchy", reason = "dev-dependency (criterion) build probe" },
     { crate = "getrandom", reason = "dev-dependency (proptest) build probe" },
+
+    # Adopted cryptography. `generic-array` is the only crate in that subtree
+    # with a build script at all: it probes the compiler version through
+    # `version_check` to choose between two const-generics code paths. Pure
+    # Rust, no C toolchain, no code generation from an external input — and the
+    # `deny` list above independently forbids it from reaching one.
+    { crate = "generic-array", reason = "rustc version probe, to select a const-generics path" },
 
     # Reachable only because `all-features = true` resolves every target: these
     # are wasm/WASI shims that no librefirewall target ever builds. They are

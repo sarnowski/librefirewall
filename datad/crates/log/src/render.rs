@@ -187,6 +187,16 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " aes=proven pclmul=proven preemptions={preemptions} iterations={iterations}"
         ),
+        DomainDetail::Proved { primitive, vectors } => {
+            write!(cursor, " primitive={primitive} vectors={vectors}")
+        }
+        DomainDetail::Measured {
+            primitive,
+            milli_cycles_per_byte,
+        } => write!(
+            cursor,
+            " primitive={primitive} milli-cycles-per-byte={milli_cycles_per_byte}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -242,6 +252,7 @@ impl fmt::Write for Cursor<'_> {
 mod tests {
     use super::*;
     use crate::detail::{Cause, MAX_CAUSE_LEN};
+    use crate::event::Primitive;
     use crate::event::{
         ChangeKind, Domain, DomainState, Field, GenerationOutcome, ObjectKind, RejectReason, Value,
     };
@@ -485,6 +496,37 @@ mod tests {
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=hardware-probe state=ready \
              aes=proven pclmul=proven preemptions=18446744073709551615 \
              iterations=18446744073709551615"
+        );
+    }
+
+    /// The two records the cryptography domain makes about a primitive: what
+    /// it proved and what it cost. The name is the vocabulary's own, so a
+    /// primitive renamed there moves both lines rather than one.
+    #[test]
+    fn a_cryptography_domain_renders_a_primitive_it_proved_and_what_it_cost() {
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Crypto,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Proved {
+                    primitive: Primitive::Aes256Gcm,
+                    vectors: 22,
+                },
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             primitive=aes-256-gcm vectors=22"
+        );
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Crypto,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Measured {
+                    primitive: Primitive::Sha256,
+                    milli_cycles_per_byte: u64::MAX,
+                },
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             primitive=sha-256 milli-cycles-per-byte=18446744073709551615"
         );
     }
 
@@ -861,6 +903,14 @@ mod tests {
                 preemptions: u64::MAX,
                 iterations: u64::MAX,
             },
+            DomainDetail::Proved {
+                primitive: Primitive::ChaCha20Poly1305,
+                vectors: u64::MAX,
+            },
+            DomainDetail::Measured {
+                primitive: Primitive::ChaCha20Poly1305,
+                milli_cycles_per_byte: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -903,6 +953,18 @@ mod tests {
             any::<(u64, u64)>().prop_map(|(preemptions, iterations)| DomainDetail::Proven {
                 preemptions,
                 iterations,
+            }),
+            (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, vectors)| {
+                DomainDetail::Proved {
+                    primitive: Primitive::ALL[at],
+                    vectors,
+                }
+            }),
+            (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, cost)| {
+                DomainDetail::Measured {
+                    primitive: Primitive::ALL[at],
+                    milli_cycles_per_byte: cost,
+                }
             }),
             (
                 (0..causes.len()),

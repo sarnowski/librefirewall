@@ -1,0 +1,22 @@
+[package]
+# The program image the system description names is `crypto.elf`. Built with
+# the hardfloat, SSE-enabled target specification
+# (support/targets/x86_64-sel4-simd.json) rather than the softfloat minimal one
+# every dataplane domain uses, because the AES-NI and carry-less-multiply
+# backends its cryptography selects are compile-time choices of that
+# specification.
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sel4-microkit.workspace = true
+lfw-crypto = { path = "../../crates/crypto" }
+lfw-log = { path = "../../crates/log" }
+lfw-metrics = { path = "../../crates/metrics" }
+pd-runtime = { path = "../../crates/pd-runtime" }
+wire = { path = "../../crates/wire" }
+
+[lints]
+workspace = true

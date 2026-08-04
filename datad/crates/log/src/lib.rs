@@ -67,8 +67,8 @@ use core::cell::Cell;
 pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter};
 pub use detail::{Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, Refusal, RefusalDetail};
 pub use event::{
-    ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, RejectReason,
-    Value,
+    ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, Primitive,
+    RejectReason, Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};

@@ -106,10 +106,10 @@ use uart_16550::{Transmitter, Uart, WriteError};
 use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
-/// per writing domain, matching the nine pairs of `<map>` rows on the console
+/// per writing domain, matching the ten pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
 /// fixed by the system description, so this is a build fact.
-const RINGS: usize = 9;
+const RINGS: usize = 10;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
 /// the trait and the transmitter are foreign here, and that is all it adds.
@@ -143,6 +143,7 @@ fn init() -> Console {
     let management: &'static LogRecords = attach_region!(log_management_vaddr: LogRecords);
     let recorder: &'static LogRecords = attach_region!(log_recorder_vaddr: LogRecords);
     let hardware_probe: &'static LogRecords = attach_region!(log_hardware_probe_vaddr: LogRecords);
+    let crypto: &'static LogRecords = attach_region!(log_crypto_vaddr: LogRecords);
     let forwarder_consume: &'static LogConsume =
         attach_region!(log_forwarder_consume_vaddr: LogConsume);
     let nic_driver0_consume: &'static LogConsume =
@@ -159,6 +160,7 @@ fn init() -> Console {
         attach_region!(log_recorder_consume_vaddr: LogConsume);
     let hardware_probe_consume: &'static LogConsume =
         attach_region!(log_hardware_probe_consume_vaddr: LogConsume);
+    let crypto_consume: &'static LogConsume = attach_region!(log_crypto_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     // For its own two records alone: a peer's instant is rendered, never minted.
     let stamps = PdClock::new(attach_region!(clock_vaddr: ClockCalibration));
@@ -216,6 +218,7 @@ fn init() -> Console {
         management_consume.reader(management),
         recorder_consume.reader(recorder),
         hardware_probe_consume.reader(hardware_probe),
+        crypto_consume.reader(crypto),
     ];
     printer.print(stamps.now(), &announce(DomainState::Ready));
 

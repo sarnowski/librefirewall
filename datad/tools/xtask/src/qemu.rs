@@ -44,6 +44,7 @@ use crate::{
     artifacts::DIST_DISK,
     clock_contract,
     config_transcript::ConfigContract,
+    crypto_contract,
     data_disk::DataDisk,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking, Traffic},
@@ -109,6 +110,13 @@ enum Acceleration {
 }
 
 impl Acceleration {
+    /// Whether the guest runs on the host's own processor. The one judge that
+    /// asks is the cryptography domain's: a cycles-per-byte figure taken while
+    /// every instruction is being emulated is a figure about the emulator.
+    const fn is_hardware(&self) -> bool {
+        matches!(self, Self::Kvm)
+    }
+
     /// Prefer hardware acceleration, but only when this process can actually
     /// open the KVM device read/write — the access QEMU itself needs.
     /// Existence alone is not enough: a container can expose the device node
@@ -231,7 +239,8 @@ impl Scenario {
 /// [`Console::Judged`] covers is the `LFW-CFG` transcript
 /// ([`crate::config_transcript`]) and three records on the `LFW-PD` channel —
 /// the clock domain's ([`crate::clock_contract`]), the hardware probe's
-/// ([`crate::probe_contract`]) and the management port's count
+/// ([`crate::probe_contract`]), the cryptography domain's
+/// ([`crate::crypto_contract`]) and the management port's count
 /// ([`crate::management_contract`]).
 pub(crate) enum Console {
     Ignored,
@@ -956,6 +965,12 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             // cryptography plan is designed around.
             let probe = probe_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
+            // And the records whose content is the milestone this whole
+            // hardware profile exists for: every cryptographic primitive
+            // answering its published vectors on this part, and costing little
+            // enough that the accelerated backend must be the one running.
+            let crypto = crypto_contract::judge(&booted.serial, &log, booted.hardware_accelerated)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
             // And the record whose content the build knows exactly: the frames
             // the harness put on the management wire, which the appliance must
             // report to the frame and to the byte.
@@ -966,7 +981,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             let stamps = stamp_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!(
-                "; {}; {clock}; {probe}; {management}; {stamps}",
+                "; {}; {clock}; {probe}; {crypto}; {management}; {stamps}",
                 contract.summary()
             )
         }
@@ -1334,6 +1349,7 @@ fn boot(
             log_header: &header,
             topology,
             traffic,
+            hardware_accelerated: acceleration.is_hardware(),
         },
     )?;
 

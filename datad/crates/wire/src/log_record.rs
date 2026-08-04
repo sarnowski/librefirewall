@@ -49,7 +49,14 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 8;
+pub const LOG_DOMAIN_COUNT: u8 = 9;
+
+/// How many cryptographic primitives a record may name —
+/// `lfw_log::Primitive::ALL`. A token rather than a name on the wire, on
+/// `LOG_DOMAIN_COUNT`'s terms: the console spells it, the region carries an
+/// index, and a value outside the set is refused rather than rendered as a
+/// number an operator would have to look up.
+pub const LOG_PRIMITIVE_COUNT: u8 = 7;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -152,6 +159,8 @@ pub enum LogDetailKind {
     Medium,
     Extent,
     Proven,
+    Proved,
+    Measured,
 }
 
 impl LogDetailKind {
@@ -167,6 +176,8 @@ impl LogDetailKind {
             Self::Medium => 6,
             Self::Extent => 7,
             Self::Proven => 8,
+            Self::Proved => 9,
+            Self::Measured => 10,
         }
     }
 
@@ -182,6 +193,8 @@ impl LogDetailKind {
             6 => Some(Self::Medium),
             7 => Some(Self::Extent),
             8 => Some(Self::Proven),
+            9 => Some(Self::Proved),
+            10 => Some(Self::Measured),
             _ => None,
         }
     }
@@ -601,6 +614,18 @@ impl LogRecord {
                 preemptions: self.operands[0],
                 iterations: self.operands[1],
             },
+            // The one detail pair whose first word is a token and not a
+            // count: it names a primitive, so a value outside the set names
+            // nothing a console line could spell and is refused for it. The
+            // second word is a count and unranged, on `Received`'s terms.
+            Some(LogDetailKind::Proved) => CheckedDetail::Proved {
+                primitive: primitive_token(self.operands[0])?,
+                vectors: self.operands[1],
+            },
+            Some(LogDetailKind::Measured) => CheckedDetail::Measured {
+                primitive: primitive_token(self.operands[0])?,
+                milli_cycles_per_byte: self.operands[1],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -662,6 +687,15 @@ impl Default for LogRecord {
 /// caller's error for it. The bound is this ABI's, and a token inside it is
 /// still one the log crate may not map — the two questions are different and
 /// only the crate that owns the vocabulary answers the second.
+/// A primitive token carried in an operand word: it must name a member of the
+/// set, and it arrives as a `u64` because that is the width an operand has.
+fn primitive_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_PRIMITIVE_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::PrimitiveUnknown { primitive: raw }),
+    }
+}
+
 fn token(raw: u8, count: u8, error: LogRecordError) -> Result<u8, LogRecordError> {
     if raw < count { Ok(raw) } else { Err(error) }
 }
@@ -951,6 +985,21 @@ pub enum CheckedDetail {
         preemptions: u64,
         iterations: u64,
     },
+    /// One cryptographic primitive answered every published vector this image
+    /// carries for it. The count travels with the token because a primitive
+    /// named without one would claim a proof whose size nobody can see.
+    Proved {
+        primitive: u8,
+        vectors: u64,
+    },
+    /// What one primitive cost on this part, in thousandths of a cycle per
+    /// byte. Fixed point rather than a ratio of two counts: the two would
+    /// invite a reader to divide them and get a different answer from the
+    /// domain that measured them.
+    Measured {
+        primitive: u8,
+        milli_cycles_per_byte: u64,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1024,6 +1073,9 @@ pub enum LogRecordError {
     KindUnknown {
         kind: u32,
     },
+    PrimitiveUnknown {
+        primitive: u64,
+    },
     DomainUnknown {
         domain: u8,
     },
@@ -1093,6 +1145,10 @@ impl fmt::Display for LogRecordError {
                 )
             }
             Self::KindUnknown { kind } => write!(f, "record kind {kind} names no event"),
+            Self::PrimitiveUnknown { primitive } => write!(
+                f,
+                "primitive token {primitive} is not below {LOG_PRIMITIVE_COUNT}"
+            ),
             Self::DomainUnknown { domain } => {
                 write!(f, "domain token {domain} is not below {LOG_DOMAIN_COUNT}")
             }

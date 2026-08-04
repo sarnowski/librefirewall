@@ -43,8 +43,8 @@ use wire::{
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
-    ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, RejectReason,
-    Value,
+    ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, Primitive,
+    RejectReason, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -86,6 +86,7 @@ pub enum Vocabulary {
     Field,
     GenerationOutcome,
     RejectReason,
+    Primitive,
 }
 
 impl Vocabulary {
@@ -101,6 +102,7 @@ impl Vocabulary {
             Self::Field => Field::ALL.len(),
             Self::GenerationOutcome => GenerationOutcome::ALL.len(),
             Self::RejectReason => RejectReason::ALL.len(),
+            Self::Primitive => Primitive::ALL.len(),
         }
     }
 
@@ -113,6 +115,7 @@ impl Vocabulary {
             Self::Field => "field",
             Self::GenerationOutcome => "outcome",
             Self::RejectReason => "reason",
+            Self::Primitive => "primitive",
         }
     }
 }
@@ -147,6 +150,13 @@ fn variant<T: Copy, const N: usize>(
     all.get(usize::from(token))
         .copied()
         .ok_or(DecodeError::Vocabulary { vocabulary, token })
+}
+
+/// A primitive token as the member it selects. `wire` already ranged it, so
+/// this reaches the refusal only if the two crates' sets ever disagreed — and
+/// the assertion at the foot of this file is what stops them.
+fn primitive_of(token: u8) -> Result<Primitive, DecodeError> {
+    variant(Primitive::ALL, Vocabulary::Primitive, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -367,6 +377,17 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Proven.to_bits();
                     record.operands = [*preemptions, *iterations];
                 }
+                DomainDetail::Proved { primitive, vectors } => {
+                    record.detail = LogDetailKind::Proved.to_bits();
+                    record.operands = [*primitive as u64, *vectors];
+                }
+                DomainDetail::Measured {
+                    primitive,
+                    milli_cycles_per_byte,
+                } => {
+                    record.detail = LogDetailKind::Measured.to_bits();
+                    record.operands = [*primitive as u64, *milli_cycles_per_byte];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -502,6 +523,19 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             preemptions: *preemptions,
             iterations: *iterations,
         },
+        // The token was ranged against the set when the record was checked, so
+        // what is left here is naming the member it selected.
+        CheckedDetail::Proved { primitive, vectors } => DomainDetail::Proved {
+            primitive: primitive_of(*primitive)?,
+            vectors: *vectors,
+        },
+        CheckedDetail::Measured {
+            primitive,
+            milli_cycles_per_byte,
+        } => DomainDetail::Measured {
+            primitive: primitive_of(*primitive)?,
+            milli_cycles_per_byte: *milli_cycles_per_byte,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -563,6 +597,16 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     } => DomainDetail::Proven {
                         preemptions,
                         iterations,
+                    },
+                    DomainDetail::Proved { primitive, vectors } => {
+                        DomainDetail::Proved { primitive, vectors }
+                    }
+                    DomainDetail::Measured {
+                        primitive,
+                        milli_cycles_per_byte,
+                    } => DomainDetail::Measured {
+                        primitive,
+                        milli_cycles_per_byte,
                     },
                     DomainDetail::Refusal(Refusal {
                         cause,
@@ -657,6 +701,7 @@ const _: () = {
     assert!(Field::ALL.len() == wire::LOG_FIELD_COUNT as usize);
     assert!(GenerationOutcome::ALL.len() == wire::LOG_GENERATION_OUTCOME_COUNT as usize);
     assert!(RejectReason::ALL.len() == wire::LOG_REJECT_REASON_COUNT as usize);
+    assert!(Primitive::ALL.len() == wire::LOG_PRIMITIVE_COUNT as usize);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);
     assert!(crate::MAX_CAUSE_LEN == wire::LOG_CAUSE_BYTES);

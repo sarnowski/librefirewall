@@ -24,6 +24,8 @@ use core::{fmt, num::NonZeroU64};
 
 use lfw_clock::UtcNanos;
 
+use crate::event::Primitive;
+
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
 pub const MAX_CAUSE_LEN: usize = 40;
@@ -169,6 +171,23 @@ pub enum DomainDetail<C = &'static str> {
     Proven {
         preemptions: u64,
         iterations: u64,
+    },
+    /// One cryptographic primitive answered every published vector this image
+    /// carries for it. The count travels with the name because a primitive
+    /// named without one claims a proof whose size nobody can see — and the
+    /// size is the whole difference between a table that covers the edges and
+    /// one that covers a single happy path.
+    Proved {
+        primitive: Primitive,
+        vectors: u64,
+    },
+    /// What one primitive cost on this part, in thousandths of a cycle per
+    /// byte. Fixed point rather than the two counts it came from, because two
+    /// counts invite a reader to divide them and reach a different answer from
+    /// the domain that did the measuring.
+    Measured {
+        primitive: Primitive,
+        milli_cycles_per_byte: u64,
     },
 }
 
@@ -339,6 +358,14 @@ mod tests {
             DomainDetail::Proven {
                 preemptions: 0,
                 iterations: 0,
+            },
+            DomainDetail::Proved {
+                primitive: Primitive::Sha256,
+                vectors: 0,
+            },
+            DomainDetail::Measured {
+                primitive: Primitive::Sha256,
+                milli_cycles_per_byte: 0,
             },
             DomainDetail::Refusal(Refusal {
                 cause: "",

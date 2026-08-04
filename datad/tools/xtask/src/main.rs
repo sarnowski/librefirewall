@@ -72,6 +72,8 @@ mod clock_contract;
 mod config_submission_contract;
 mod config_transcript;
 mod console_records;
+mod crypto_contract;
+mod crypto_profile;
 mod data_disk;
 mod diagnose;
 mod disk;

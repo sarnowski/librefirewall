@@ -32,6 +32,7 @@ The full command surface:
 ```sh
 make image                # build the appliance OCI builder, then `xtask image` — the RELEASE configuration
 make image-debug          # assemble the debug kernel instead; an opt-in no gate reaches
+make deps                 # resolve the appliance's Cargo manifests into datad/Cargo.lock, and nothing else
 make run                  # boot the image interactively in QEMU (debug kernel, for its diagnostics)
 make test                 # both fast gates: ctrld first (it is quick, so a finding there surfaces
                           #   before the datad gate spends its minutes), then the datad host gate
@@ -61,14 +62,41 @@ the pinned inputs, builds every crate and protection domain with locked dependen
 and assembles the Microkit system description, produces the x86_64 Multiboot2 kernel and system
 image, packages only deployable outputs into `datad/dist/`, and emits checksums and an SBOM.
 
-`make image`, `make ctrld-image` and `make ctrld-deps` are the only phases that fetch from the
-network. Every target that runs a build or a gate — `make clean` included — checks that its pinned
-builder image already exists and refuses with an actionable message instead of quietly provisioning
-it, so no gate command can turn into an OCI build. Project commands run with networking disabled, a
+`make image`, `make deps`, `make ctrld-image` and `make ctrld-deps` are the only phases that fetch
+from the network. Every target that runs a build or a gate — `make clean` included — checks that its
+pinned builder image already exists and refuses with an actionable message instead of quietly
+provisioning it, so no gate command can turn into an OCI build or a registry fetch. Project commands
+run with networking disabled, a
 read-only container filesystem, no Linux capabilities, and only the workspace mounted writable.
 When the host exposes `/dev/kvm` it is passed through for accelerated QEMU; the harness falls back
 to emulation otherwise, and which of the two happened is printed and written into the run log, so a
 silent degradation to emulation cannot pass for an accelerated run.
+
+### Adding an appliance dependency
+
+The gate is offline by construction: the builder image warms a Cargo cache from the committed
+manifests and lockfile, and every gate target then runs with no network at all. A new dependency
+therefore takes two provisioning steps before any gate can see it, and they must happen in this
+order:
+
+```sh
+# 1. edit the crate's Cargo.toml
+make deps      # resolve it into datad/Cargo.lock — the ONLY thing that writes that file
+make image     # rebuild the builder so its offline cache holds the new crates, then assemble
+make test      # and now the offline gate can compile against them
+```
+
+`make deps` runs the pinned builder's own Cargo with the network on and does nothing else: no
+compilation, no artifact, only the lockfile (and the fuzz workspace's, which is resolved in the
+same run). Running it against the pinned toolchain rather than the host's is what makes the
+resolution the one the offline build replays. Skipping it and going straight to `make image` fails
+with a lockfile that does not match the manifests; skipping `make image` afterwards fails with a
+crate the offline cache does not hold.
+
+Adding a dependency is also a policy decision, not only a resolution: `datad/deny.toml` bans the
+crates that compile or link native code outright, denies build scripts by default with an explicit
+allow-list, and denies two versions of one crate. A new build script needs an entry with a written
+reason beside it, and a crate that would compile C is rejected rather than allow-listed.
 
 ## The management-server toolchain
 

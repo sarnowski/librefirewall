@@ -25,15 +25,16 @@ use crate::catalog::{
     BLOCK_BYTES, BLOCK_CAPACITY_SECTORS, BLOCK_REQUESTS, BLOCK_STATUS_UNDECODABLE,
     CLOCK_CALIBRATIONS_REFUSED, CLOCK_FREQUENCY_HERTZ, CLOCK_GENERATION, CONFIGURATION_GENERATION,
     CONFIGURATION_IMAGES, CONFIGURATION_READS, CONFIGURATION_SUBMISSIONS, CONSOLE_RECORDS,
-    DEVICE_FAULTS, ENDPOINT_BYTES, ENDPOINT_FRAMES, ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US,
-    ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED,
-    ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED,
-    ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN,
-    FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS,
-    HARDWARE_PROBE_PREEMPTIONS, HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN,
-    HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
-    HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
-    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
+    CRYPTO_MILLI_CYCLES_PER_BYTE, CRYPTO_PROVEN, CRYPTO_VECTORS, DEVICE_FAULTS, ENDPOINT_BYTES,
+    ENDPOINT_FRAMES, ENDPOINT_MALFORMED, ENDPOINT_NOT_FOR_US, ENDPOINT_REPLIES,
+    ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED, ENDPOINT_STAGE_DROPS,
+    ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED,
+    FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN, FLOW_PROBE_COLLISIONS,
+    FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS, HARDWARE_PROBE_PREEMPTIONS,
+    HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN, HTTP_BODIES_TIMED_OUT,
+    HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES,
+    HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS,
+    INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
     POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
     POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
     RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
@@ -1516,6 +1517,98 @@ impl HardwareProbeSample {
     }
 }
 
+/// The primitives the cryptography domain proves and reports on, as label
+/// values.
+///
+/// The console spells these with hyphens and this surface with underscores,
+/// because a Prometheus label value on this surface is an underscore token
+/// everywhere. They are restated here rather than read from
+/// `lfw_log::Primitive` because the dependency runs the other way — `lfw-log`
+/// reaches for this crate and never back — and a test in `lfw-log`, which can
+/// see both, holds one list to the other through that transliteration.
+pub const CRYPTO_PRIMITIVES: [&str; 7] = [
+    "sha_256",
+    "hmac_sha_256",
+    "hkdf_sha_256",
+    "chacha20",
+    "chacha20_poly1305",
+    "aes_256_gcm",
+    "chacha20_drbg",
+];
+
+/// Slots [`CryptoSample`] occupies.
+pub const CRYPTO_SLOTS: usize = 3 + 2 * CRYPTO_PRIMITIVES.len();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CryptoSample {
+    pub proven: bool,
+    pub vectors: [u64; CRYPTO_PRIMITIVES.len()],
+    pub milli_cycles_per_byte: [u64; CRYPTO_PRIMITIVES.len()],
+    pub log: LogSample,
+}
+
+impl CryptoSample {
+    pub const SERIES: &'static [Series] = &[
+        plain(&CRYPTO_PROVEN),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "sha_256")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "hmac_sha_256")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "hkdf_sha_256")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "chacha20")]),
+        s(
+            &CRYPTO_VECTORS,
+            &[Label::new("primitive", "chacha20_poly1305")],
+        ),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "aes_256_gcm")]),
+        s(&CRYPTO_VECTORS, &[Label::new("primitive", "chacha20_drbg")]),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "sha_256")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "hmac_sha_256")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "hkdf_sha_256")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "chacha20")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "chacha20_poly1305")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "aes_256_gcm")],
+        ),
+        s(
+            &CRYPTO_MILLI_CYCLES_PER_BYTE,
+            &[Label::new("primitive", "chacha20_drbg")],
+        ),
+        plain(&LOG_RECORDS_DROPPED),
+        plain(&LOG_RECORDS_REFUSED),
+    ];
+
+    #[must_use]
+    pub fn values(&self) -> [u64; CRYPTO_SLOTS] {
+        let mut values = [0_u64; CRYPTO_SLOTS];
+        values[0] = u64::from(self.proven);
+        let measured = 1 + CRYPTO_PRIMITIVES.len();
+        for (at, count) in self.vectors.iter().enumerate() {
+            values[1 + at] = *count;
+        }
+        for (at, cost) in self.milli_cycles_per_byte.iter().enumerate() {
+            values[measured + at] = *cost;
+        }
+        values[CRYPTO_SLOTS - 2] = self.log.dropped;
+        values[CRYPTO_SLOTS - 1] = self.log.refused;
+        values
+    }
+}
+
 /// One recording, in `lfw_recorder::SinkCounters` order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SinkSample {
@@ -1708,6 +1801,7 @@ const _: () = {
     assert!(ClockSample::SERIES.len() == CLOCK_SLOTS);
     assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
     assert!(HardwareProbeSample::SERIES.len() == HARDWARE_PROBE_SLOTS);
+    assert!(CryptoSample::SERIES.len() == CRYPTO_SLOTS);
 
     // The per-rule block begins exactly where the named table ends, which is
     // what makes the two writers of a rule series — the domain that publishes by
@@ -1727,5 +1821,6 @@ const _: () = {
     assert!(CLOCK_SLOTS <= MANAGEMENT_SLOTS);
     assert!(RECORDER_SLOTS <= MANAGEMENT_SLOTS);
     assert!(HARDWARE_PROBE_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(CRYPTO_SLOTS <= MANAGEMENT_SLOTS);
     assert!(FORWARDER_SHARD_SLOTS <= crate::STATS_SLOTS);
 };

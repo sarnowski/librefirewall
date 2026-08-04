@@ -2714,6 +2714,12 @@ pub struct BootTest<'a> {
     pub topology: &'a Topology,
     /// Which probe set the boot injects.
     pub traffic: Traffic,
+    /// Whether QEMU is executing the guest on hardware rather than emulating
+    /// it. Carried through to [`Booted`] because one judge needs it and cannot
+    /// re-derive it honestly: a cycle count taken under emulation measures the
+    /// emulator, so the throughput floor is asserted on an accelerated run and
+    /// reported without a verdict on any other.
+    pub hardware_accelerated: bool,
 }
 
 /// How the management port is attached, which is the one thing that differs
@@ -4128,6 +4134,8 @@ fn inject_probes(
 #[derive(Debug)]
 pub struct Booted {
     pub serial: Vec<u8>,
+    /// What [`BootTest::hardware_accelerated`] said, carried to the judges.
+    pub hardware_accelerated: bool,
     pub traffic: TrafficReport,
     /// What was put on the management wire, which is what the console's own
     /// count is judged against. Empty on a boot that never reached the point
@@ -5070,6 +5078,7 @@ fn run_boot(
     frame_reader_result?;
     Ok(Booted {
         serial: output,
+        hardware_accelerated: test.hardware_accelerated,
         traffic,
         management: injected,
         management_tcp_isn: tcp_isn,
@@ -5368,6 +5377,10 @@ mod tests {
             log_header: HEADER,
             topology,
             traffic: Traffic::Routed,
+            // The harness's own boots are judged on what they forwarded, never
+            // on what anything cost, so which way QEMU executed them decides
+            // nothing here.
+            hardware_accelerated: false,
         }
     }
 

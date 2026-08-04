@@ -35,8 +35,8 @@
 //! not merging them.
 
 use crate::sample::{
-    ClockSample, ConfigSample, ConsoleSample, DriverSample, ForwarderSample, HardwareProbeSample,
-    ManagementSample, RecorderSample,
+    ClockSample, ConfigSample, ConsoleSample, CryptoSample, DriverSample, ForwarderSample,
+    HardwareProbeSample, ManagementSample, RecorderSample,
 };
 
 /// Whether a series is a monotonic total or a value that may move in either
@@ -510,6 +510,29 @@ pub const HARDWARE_PROBE_PREEMPTIONS: Metric = metric(
     "Preemptions the probe observed as timestamp-counter gaps while its XMM state was live.",
 );
 
+// ── Cryptography ────────────────────────────────────────────────────────────
+
+pub const CRYPTO_PROVEN: Metric = metric(
+    "librefirewall_crypto_proven",
+    Kind::Gauge,
+    "1 once every primitive answered every published vector this image carries for it; 0 before, \
+     and forever on a node that refused.",
+);
+
+pub const CRYPTO_VECTORS: Metric = metric(
+    "librefirewall_crypto_vectors_proven_total",
+    Kind::Counter,
+    "Published NIST CAVP, RFC and Wycheproof vectors this node re-ran at bring-up and answered \
+     correctly, per primitive.",
+);
+
+pub const CRYPTO_MILLI_CYCLES_PER_BYTE: Metric = metric(
+    "librefirewall_crypto_milli_cycles_per_byte",
+    Kind::Gauge,
+    "Thousandths of a timestamp-counter cycle per byte this node measured for a primitive at \
+     bring-up; 0 for a primitive it does not measure.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -901,6 +924,9 @@ pub const ALL_METRICS: &[&Metric] = &[
     &HARDWARE_PROBE_PROVEN,
     &HARDWARE_PROBE_ITERATIONS,
     &HARDWARE_PROBE_PREEMPTIONS,
+    &CRYPTO_PROVEN,
+    &CRYPTO_VECTORS,
+    &CRYPTO_MILLI_CYCLES_PER_BYTE,
     &LOG_RECORDS_DROPPED,
     &LOG_RECORDS_REFUSED,
 ];
@@ -969,12 +995,16 @@ pub const SHARDS: [ShardSpec; SHARD_COUNT] = [
         domain: "hardware_probe",
         series: HardwareProbeSample::SERIES,
     },
+    ShardSpec {
+        domain: "crypto",
+        series: CryptoSample::SERIES,
+    },
 ];
 
 /// How many shards a snapshot carries. A build fact — the system description
 /// declares one region per protection domain — and `xtask::sysdesc` holds the
 /// description to it from the other side.
-pub const SHARD_COUNT: usize = 10;
+pub const SHARD_COUNT: usize = 11;
 
 /// Where the forwarder's shard sits in [`SHARDS`], for the cross-check the QEMU
 /// gate makes against traffic it observed itself.

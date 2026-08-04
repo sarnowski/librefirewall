@@ -138,6 +138,7 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "pds/hardware-probe/src/main.rs",
         Vocabulary::Causes("hardware-probe"),
     ),
+    ("pds/crypto/src/main.rs", Vocabulary::Causes("crypto")),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus
     // `Domain`'s and `Field`'s hyphenated ones. Every one of them is reachable
     // as an `ALL` array, so scanning this file would be the second copy.
@@ -164,9 +165,25 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "crates/http/src/request.rs",
         Vocabulary::Other("HTTP header field names, which are wire syntax rather than a surface"),
     ),
+    (
+        "crates/crypto/src/vectors.rs",
+        Vocabulary::Other(
+            "identifiers of published test-vector rows — the NIST CAVP file and case, the \
+             Wycheproof test id, the RFC section — which name where a row came from and reach \
+             no console record: a vector that disagrees is refused with its primitive's own \
+             token and the row's position, never with the row's name",
+        ),
+    ),
+    (
+        "crates/crypto/src/drbg.rs",
+        Vocabulary::Other(
+            "the generator's domain-separation salt and info strings, which are inputs to a key \
+             derivation and appear on no surface at all",
+        ),
+    ),
 ];
 
-/// The five domains whose refusal tokens the console chapter tabulates, in the
+/// The six domains whose refusal tokens the console chapter tabulates, in the
 /// order it presents them. Derived from [`LITERAL_SITES`] would be circular —
 /// the book's own headings are what this list is compared against.
 const REFUSING_DOMAINS: &[&str] = &[
@@ -175,6 +192,7 @@ const REFUSING_DOMAINS: &[&str] = &[
     "management",
     "recorder",
     "hardware-probe",
+    "crypto",
 ];
 
 /// Hold both reference chapters to the code.

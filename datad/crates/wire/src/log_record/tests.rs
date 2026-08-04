@@ -238,6 +238,38 @@ fn a_domain_record_carries_each_detail_shape() {
         })
     ));
 
+    let proved = LogRecord {
+        detail: LogDetailKind::Proved.to_bits(),
+        operands: [5, 22],
+        ..domain_record()
+    };
+    assert!(matches!(
+        proved.body(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Proved {
+                primitive: 5,
+                vectors: 22,
+            },
+            ..
+        })
+    ));
+
+    let measured = LogRecord {
+        detail: LogDetailKind::Measured.to_bits(),
+        operands: [0, 11_740],
+        ..domain_record()
+    };
+    assert!(matches!(
+        measured.body(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Measured {
+                primitive: 0,
+                milli_cycles_per_byte: 11_740,
+            },
+            ..
+        })
+    ));
+
     let Ok(CheckedBody::Domain {
         detail:
             CheckedDetail::Refusal {
@@ -644,7 +676,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 7] = [
+    let cases: [(LogRecord, LogRecordError); 9] = [
         (
             LogRecord {
                 kind: 4,
@@ -661,10 +693,33 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 9,
+                detail: 11,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 9 },
+            LogRecordError::DetailKindUnknown { detail: 11 },
+        ),
+        // The one operand word that is a token: a primitive past the set names
+        // nothing a console line can spell, so it is refused rather than
+        // rendered as a bare index.
+        (
+            LogRecord {
+                detail: LogDetailKind::Proved.to_bits(),
+                operands: [u64::from(LOG_PRIMITIVE_COUNT), 0],
+                ..domain_record()
+            },
+            LogRecordError::PrimitiveUnknown {
+                primitive: u64::from(LOG_PRIMITIVE_COUNT),
+            },
+        ),
+        (
+            LogRecord {
+                detail: LogDetailKind::Measured.to_bits(),
+                operands: [u64::MAX, 0],
+                ..domain_record()
+            },
+            LogRecordError::PrimitiveUnknown {
+                primitive: u64::MAX,
+            },
         ),
         // The one detail whose own field can refuse it: a frequency of zero
         // scales no reading, so it is refused rather than carried on as a
@@ -933,7 +988,7 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 8",
+            "domain token 4 is not below 9",
             "state token 4 is not below 4",
             "detail kind 7 names no payload",
             "the established counter frequency is zero, which scales no reading",
@@ -978,10 +1033,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Medium,
         LogDetailKind::Extent,
         LogDetailKind::Proven,
+        LogDetailKind::Proved,
+        LogDetailKind::Measured,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(9), None);
+    assert_eq!(LogDetailKind::from_bits(11), None);
 
     for value in [
         LogValueKind::Absent,

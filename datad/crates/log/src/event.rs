@@ -57,6 +57,22 @@ closed_vocabulary! {
         Management => "management",
         Recorder => "recorder",
         HardwareProbe => "hardware-probe",
+        Crypto => "crypto",
+    }
+}
+
+closed_vocabulary! {
+    /// Which cryptographic primitive a record is about. The names are what an
+    /// operator reads on the console and what the crypto-profile page states,
+    /// so the page is held to this list rather than to a second copy of it.
+    Primitive {
+        Sha256 => "sha-256",
+        HmacSha256 => "hmac-sha-256",
+        HkdfSha256 => "hkdf-sha-256",
+        ChaCha20 => "chacha20",
+        ChaCha20Poly1305 => "chacha20-poly1305",
+        Aes256Gcm => "aes-256-gcm",
+        Drbg => "chacha20-drbg",
     }
 }
 
@@ -309,7 +325,7 @@ pub enum Event<C = &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::vec::Vec;
+    use std::{string::String, vec::Vec};
 
     /// The property every console vocabulary owes an operator: `ALL` is the
     /// variants in discriminant order — so nothing is missing from the middle
@@ -327,6 +343,21 @@ mod tests {
             names.iter().all(|name| !name.is_empty()),
             "a variant renders as nothing"
         );
+    }
+
+    /// The console spells a primitive with hyphens and the metrics surface
+    /// with underscores, and the two lists live in different crates because
+    /// the dependency runs one way only. This is the place that can see both,
+    /// so it is where they are held equal — a primitive added to one and not
+    /// the other fails here rather than shipping a console name no metric
+    /// carries.
+    #[test]
+    fn the_metric_label_values_are_this_vocabulary_transliterated() {
+        let underscored: Vec<String> = Primitive::ALL
+            .iter()
+            .map(|primitive| primitive.name().replace('-', "_"))
+            .collect();
+        assert_eq!(underscored, lfw_metrics::CRYPTO_PRIMITIVES);
     }
 
     macro_rules! check_vocabulary {

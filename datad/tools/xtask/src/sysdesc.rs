@@ -757,6 +757,7 @@ const REGIONS: &[RegionRule] = &[
             read_only("console"),
             read_only("forwarder"),
             read_only("hardware_probe"),
+            read_only("crypto"),
             read_only("management"),
             read_only("nic_driver0"),
             read_only("nic_driver1"),
@@ -1069,6 +1070,26 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("hardware_probe"), read_write("console")],
         withheld: Some(LOG_WITHHELD),
     },
+    RegionRule {
+        name: "log_crypto",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_crypto_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("crypto"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
     // The metric shards: one per protection domain, each with exactly one
     // writer and — for the nine that are not the reader's own — exactly one
     // reader. The perms carry the whole argument, as `cfg`'s do: the management
@@ -1151,10 +1172,17 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_write("hardware_probe"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
+    RegionRule {
+        name: "stats_crypto",
+        size: STATS_SIZE,
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto"), read_only("management")],
+        withheld: Some(STATS_WITHHELD),
+    },
 ];
 
-/// Every shard is one page of the same type, so the ten rules share one
-/// expectation rather than restating it ten times.
+/// Every shard is one page of the same type, so the eleven rules share one
+/// expectation rather than restating it eleven times.
 const STATS_SIZE: ExpectedSize = ExpectedSize {
     rust_name: "lfw_metrics::STATS_REGION_SIZE",
     bytes: STATS_REGION_SIZE,
@@ -1165,7 +1193,7 @@ const STATS_SIZE: ExpectedSize = ExpectedSize {
 const STATS_WITHHELD: &str = "one writer and one reader per shard, and every other domain maps \
      none of it in either direction. A domain that could write another's shard could make a port \
      that is dropping every frame report a clean line — and the reader is the domain that faces \
-     the management-plane attacker, so its grant is READ-ONLY on all nine that are not its own: \
+     the management-plane attacker, so its grant is READ-ONLY on all ten that are not its own: \
      a `/metrics` surface it could edit would let a compromise of it hide the compromise. The \
      console in particular maps no shard but its own, which is the same exclusion the log rings \
      already make one step further: there it cannot forge a record, here it cannot forge a \
@@ -1295,6 +1323,7 @@ const DOMAINS: &[&str] = &[
     "management",
     "recorder",
     "hardware_probe",
+    "crypto",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is
