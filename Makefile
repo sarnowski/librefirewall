@@ -15,11 +15,22 @@ ENTERPRISE_CA_FILE ?= $(firstword $(wildcard /usr/local/share/ca-certificates/*-
 
 ifeq ($(strip $(ENTERPRISE_CA_FILE)),)
 CA_SECRET :=
+CA_MOUNT :=
 else
 CA_SECRET := --secret=id=enterprise_ca,src=$(abspath $(ENTERPRISE_CA_FILE))
+# The run-time counterpart of CA_SECRET, for the one ctrld target that fetches
+# from the network outside an image build. It is a read-only bind mount rather
+# than a layer: the inspection CA is never baked into an image, and a target
+# that runs offline never sees it at all.
+CA_MOUNT := --mount type=bind,src=$(abspath $(ENTERPRISE_CA_FILE)),dst=/etc/ssl/enterprise-ca.crt,ro=true
 endif
 
-.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks book clean ctrld-image ctrld-test ctrld-server
+COMPOSE ?= docker-compose
+CTRLD_COMPOSE_FILE := ctrld/compose.yaml
+CTRLD_COMPOSE_ENV := ctrld/third-party/sources.lock
+CTRLD_COMPOSE_PROJECT := librefirewall-ctrld
+
+.PHONY: image image-debug run test coverage bench fuzz verify-reproducible test-system test-ab ci release hooks book clean ctrld-image ctrld-deps ctrld-test ctrld-server ctrld-databases-down
 
 # `image` and `ctrld-image` provision the two pinned builders and are the only
 # targets that fetch from the network. Every other target requires its image
@@ -82,27 +93,64 @@ ci: ctrld-test
 	$(require_builder)
 	$(call xtask,ci)
 
-# Provision the pinned BEAM builder for ctrld — the second network-enabled
-# phase, with the same CA-secret plumbing as `image`.
+# Provision the pinned BEAM builder for ctrld and pull the two pinned
+# database images — the second network-enabled phase, with the same CA-secret
+# plumbing as `image`. The databases are pulled here rather than baked into
+# the builder because they run as sibling containers, not as part of it; every
+# later target requires them to be present already, exactly as it requires the
+# builder.
 ctrld-image:
 	$(provision_ctrld_builder)
+	$(pull_ctrld_databases)
+
+# Re-resolve the Hex dependency tree and rewrite mix.lock. This is the one
+# ctrld target besides `ctrld-image` that reaches the network, and it exists
+# because the gate cannot produce a lockfile it is simultaneously checking:
+# editing mix.exs means running this, then `make ctrld-image` to re-warm the
+# offline caches from the new manifests, and only then `make ctrld-test`.
+ctrld-deps:
+	$(require_ctrld_builder)
+	$(call ctrld_container,--network=host --env HEX_OFFLINE=0 $(CA_MOUNT),sh -c 'cp -r /opt/hex /tmp/hex; if [ -s /etc/ssl/enterprise-ca.crt ]; then cat /etc/ssl/certs/ca-certificates.crt /etc/ssl/enterprise-ca.crt > /tmp/ca-bundle.crt; export HEX_CACERTS_PATH=/tmp/ca-bundle.crt SSL_CERT_FILE=/tmp/ca-bundle.crt; fi; exec mix deps.get')
 
 # The ctrld offline gate: dependency lock, formatting, a warning-free compile,
-# the asset binaries provisioned from the image (never downloaded), and the
-# test suite — all with the network disabled, resolving everything from the
-# caches warmed into the builder.
+# the asset binaries provisioned from the image (never downloaded), the schema
+# migrations, and the test suite.
+#
+# The gate needs real databases — Ecto against Postgres, the telemetry writer
+# against ClickHouse — and it must stay offline. Those are not in tension once
+# the property is named precisely: what must not exist is *unpinned input*, not
+# sockets. So the databases are pinned by digest, pulled by `ctrld-image`, and
+# run as sibling containers on a network created `--internal`, which has no
+# gateway and therefore no route off itself. The gate container asserts that
+# absence for itself before it runs anything, so the day the network stops
+# being internal the gate fails rather than quietly gaining the internet.
+#
+# Both databases are torn down with the run, whatever the outcome, and both
+# hold their state on tmpfs: a gate that inherits state from the last run is a
+# gate that can pass for the wrong reason.
 ctrld-test:
 	$(require_ctrld_builder)
-	$(call ctrld_container,--network=none --env MIX_ENV=test,sh -c 'cp -r /opt/hex /tmp/hex && mix deps.get --check-locked && mix format --check-formatted && mix compile --warnings-as-errors && ctrld-provision-assets && mix test')
+	$(require_ctrld_databases)
+	$(ctrld_gate)
 
-# Interactive development server. It carries the host network so the LiveView
-# server on localhost:4000 is reachable — through the machine's port-proxy
-# origin printed below, never a bare localhost address — while HEX_OFFLINE
-# keeps dependencies coming from the image caches.
+# Interactive development server. The compose stack carries the two databases
+# on published loopback ports and the server container carries the host
+# network, so the LiveView server is reachable — through the machine's
+# port-proxy origin printed below, never a bare localhost address — and
+# reaches both databases on localhost. HEX_OFFLINE still holds, so dependency
+# bytes come from the image caches here too.
 ctrld-server:
 	$(require_ctrld_builder)
+	$(require_ctrld_databases)
+	$(ctrld_dev_secrets)
+	$(ctrld_compose) up --detach --wait
 	@echo "ctrld dev server (once booted): https://$$(hostname | sed 's/^vm-//')-4000.proxy.code.gropyus.com/"
-	$(call ctrld_container,--network=host --interactive --tty,sh -c 'cp -r /opt/hex /tmp/hex && mix deps.get --check-locked && ctrld-provision-assets && exec mix phx.server')
+	$(call ctrld_container,--network=host --interactive --tty $(CTRLD_DEV_ENV),sh -c 'cp -r /opt/hex /tmp/hex && mix deps.get --check-locked && ctrld-provision-assets && mix ecto.create --quiet && mix ecto.migrate && mix ctrld.clickhouse.migrate && exec mix phx.server')
+
+# Stop the development databases. They are left running by `ctrld-server` so a
+# restart of the server does not restart them; this is how they go away.
+ctrld-databases-down:
+	$(ctrld_compose) down
 
 release:
 	$(require_builder)
@@ -194,6 +242,91 @@ define require_ctrld_builder
 	echo "make: run 'make ctrld-image' first — it is a network-enabled provisioning phase and builds the pinned BEAM builder."; \
 	exit 1; \
 }
+endef
+
+define pull_ctrld_databases
+$(PODMAN) pull $(POSTGRES_IMAGE)
+$(PODMAN) pull $(CLICKHOUSE_IMAGE)
+endef
+
+define require_ctrld_databases
+@for image in $(POSTGRES_IMAGE) $(CLICKHOUSE_IMAGE); do \
+	$(PODMAN) image exists "$$image" || { \
+		echo "make: database image $$image is not present."; \
+		echo "make: run 'make ctrld-image' first — it is a network-enabled provisioning phase and pulls the pinned databases."; \
+		exit 1; \
+	}; \
+done
+endef
+
+define ctrld_compose
+$(COMPOSE) --project-name $(CTRLD_COMPOSE_PROJECT) --env-file $(CTRLD_COMPOSE_ENV) --file $(CTRLD_COMPOSE_FILE)
+endef
+
+# Development-only credentials, generated once into a gitignored directory
+# rather than written into this file: the development stack keeps state across
+# restarts, so its key-encryption key has to survive a restart too, and a key
+# that survives is a key that must not be committed. The gate needs neither —
+# it mints fresh ones per run for databases it throws away.
+CTRLD_DEV_SECRETS := ctrld/build/dev
+CTRLD_DEV_ENV = --env DATABASE_URL=ecto://ctrld:ctrld-development@127.0.0.1:5432/ctrld_dev \
+	--env CLICKHOUSE_URL=http://127.0.0.1:8123 \
+	--env CLICKHOUSE_USER=ctrld \
+	--env CLICKHOUSE_PASSWORD=ctrld-development \
+	--env CLICKHOUSE_DATABASE=ctrld_dev \
+	--env CTRLD_KEY_ENCRYPTION_KEY=$$(cat $(CTRLD_DEV_SECRETS)/key-encryption-key) \
+	--env CTRLD_CHANNEL_ENDPOINT=127.0.0.1:8443 \
+	--env CTRLD_ADMIN_EMAIL=admin@librefirewall.invalid \
+	--env CTRLD_ADMIN_PASSWORD=$$(cat $(CTRLD_DEV_SECRETS)/admin-password)
+define ctrld_dev_secrets
+@mkdir -p $(CTRLD_DEV_SECRETS)
+@test -s $(CTRLD_DEV_SECRETS)/key-encryption-key || head -c 32 /dev/urandom | base64 -w0 > $(CTRLD_DEV_SECRETS)/key-encryption-key
+@test -s $(CTRLD_DEV_SECRETS)/admin-password || head -c 18 /dev/urandom | base64 -w0 > $(CTRLD_DEV_SECRETS)/admin-password
+@echo "ctrld development administrator: admin@librefirewall.invalid, password in $(CTRLD_DEV_SECRETS)/admin-password"
+endef
+
+# The offline gate, start to finish: an internal network, the two pinned
+# databases on it, the gate container joined to it, and an unconditional
+# teardown. Container names carry this shell's pid so two worktrees can gate at
+# once without colliding, and the databases are addressed by the IP podman
+# assigns them because this host has no aardvark-dns and a network alias would
+# not resolve.
+define ctrld_gate
+@set -eu; \
+run="ctrld-gate-$$$$"; \
+net="$$run-net"; pg="$$run-postgres"; ch="$$run-clickhouse"; \
+password=$$(head -c 18 /dev/urandom | base64 -w0 | tr -d '=+/'); \
+cleanup() { \
+	$(PODMAN) rm --force --ignore "$$pg" "$$ch" >/dev/null 2>&1 || true; \
+	$(PODMAN) network rm --force "$$net" >/dev/null 2>&1 || true; \
+}; \
+trap cleanup EXIT INT TERM; \
+echo "ctrld gate: internal network $$net — no gateway, so no route off it"; \
+$(PODMAN) --cgroup-manager=cgroupfs network create --internal "$$net" >/dev/null; \
+$(PODMAN) --cgroup-manager=cgroupfs run --detach --name "$$pg" --network "$$net" \
+	--env POSTGRES_USER=ctrld --env POSTGRES_PASSWORD="$$password" --env POSTGRES_DB=ctrld_gate \
+	--env PGDATA=/var/lib/postgresql/data/pgdata --tmpfs /var/lib/postgresql/data \
+	$(POSTGRES_IMAGE) >/dev/null; \
+$(PODMAN) --cgroup-manager=cgroupfs run --detach --name "$$ch" --network "$$net" \
+	--env CLICKHOUSE_USER=ctrld --env CLICKHOUSE_PASSWORD="$$password" --env CLICKHOUSE_DB=ctrld_gate \
+	--tmpfs /var/lib/clickhouse --ulimit nofile=262144:262144 \
+	$(CLICKHOUSE_IMAGE) >/dev/null; \
+for attempt in $$(seq 1 90); do \
+	$(PODMAN) exec "$$pg" pg_isready -U ctrld -d ctrld_gate >/dev/null 2>&1 && break; sleep 1; \
+done; \
+$(PODMAN) exec "$$pg" pg_isready -U ctrld -d ctrld_gate >/dev/null 2>&1 || { \
+	echo "ctrld gate: Postgres never became ready — the gate needs a database and does not skip its tests"; \
+	$(PODMAN) logs "$$pg"; exit 1; }; \
+for attempt in $$(seq 1 90); do \
+	$(PODMAN) exec "$$ch" clickhouse-client --user ctrld --password "$$password" --query 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; \
+done; \
+$(PODMAN) exec "$$ch" clickhouse-client --user ctrld --password "$$password" --query 'SELECT 1' >/dev/null 2>&1 || { \
+	echo "ctrld gate: ClickHouse never became ready — the gate needs a database and does not skip its tests"; \
+	$(PODMAN) logs "$$ch"; exit 1; }; \
+pgip=$$($(PODMAN) inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$$pg"); \
+chip=$$($(PODMAN) inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$$ch"); \
+echo "ctrld gate: Postgres at $$pgip:5432 and ClickHouse at $$chip:8123"; \
+$(call ctrld_container,--network=$$net --env MIX_ENV=test --env DATABASE_URL=ecto://ctrld:$$password@$$pgip:5432/ctrld_gate --env CLICKHOUSE_URL=http://$$chip:8123 --env CLICKHOUSE_USER=ctrld --env CLICKHOUSE_PASSWORD=$$password --env CLICKHOUSE_DATABASE=ctrld_gate --env CTRLD_KEY_ENCRYPTION_KEY=$$(head -c 32 /dev/urandom | base64 -w0) --env CTRLD_CHANNEL_ENDPOINT=192.0.2.10:8443,sh -c 'if grep -qE "^[^[:space:]]+[[:space:]]+00000000[[:space:]]" /proc/net/route; then echo "ctrld gate: this container holds a default route so the gate network is not internal and the gate is not offline" >&2; exit 1; fi; cp -r /opt/hex /tmp/hex && mix deps.get --check-locked && mix format --check-formatted && mix compile --warnings-as-errors && ctrld-provision-assets && mix test')
 endef
 
 # The ctrld runs mirror the datad hardening: read-only image filesystem, no

@@ -1,0 +1,52 @@
+# The two databases the management server talks to, for interactive
+# development. `make ctrld-server` brings this stack up and then runs the
+# server container with the host network, so the server reaches both on
+# localhost.
+#
+# The image digests are NOT written here: this file is started with
+# third-party/sources.lock as its env file, so the development stack and the
+# offline gate resolve the same two pinned digests from the same two lines.
+# Starting it without that env file leaves ${POSTGRES_IMAGE} unset and compose
+# refuses, which is the intended failure.
+#
+# Both volumes are named, so a development database survives a restart of the
+# stack. The gate does the opposite — it runs both databases on tmpfs and
+# throws them away with the run — because a gate that inherits state from the
+# last run is a gate that can pass for the wrong reason.
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_USER: ctrld
+      POSTGRES_PASSWORD: ctrld-development
+      POSTGRES_DB: ctrld_dev
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctrld -d ctrld_dev"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  clickhouse:
+    image: ${CLICKHOUSE_IMAGE}
+    environment:
+      CLICKHOUSE_USER: ctrld
+      CLICKHOUSE_PASSWORD: ctrld-development
+      CLICKHOUSE_DB: ctrld_dev
+      CLICKHOUSE_SKIP_USER_SETUP: "0"
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres-data:
+  clickhouse-data:

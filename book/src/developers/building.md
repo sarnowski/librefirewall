@@ -15,8 +15,10 @@ From a clean checkout:
 
 ```sh
 make image          # build the appliance OCI builder, then assemble the release A/B disk + bundle
-make ctrld-image    # build the BEAM OCI builder with its warmed offline caches
-make test           # both fast gates: the ctrld gate (lock, format, warning-free compile, tests),
+make ctrld-image    # build the BEAM OCI builder with its warmed offline caches, and pull the
+                    #   two pinned databases the management server's gate runs against
+make test           # both fast gates: the ctrld gate (lock, format, warning-free compile,
+                    #   migrations and tests against real databases on an isolated network),
                     #   then the datad host gate (format, clippy, unit/property tests, coverage,
                     #   the budget ratchets, the system-description, reference-chapter and
                     #   configuration checks, and dependency policy)
@@ -41,9 +43,11 @@ make test-ab              # boot the A/B state-machine scenarios on the release 
 make ci                   # the complete gate: both fast gates, fuzz, release image, system and A/B
 make release              # run the full gate, then keep `datad/dist/` only if it proved what it holds
 make verify-reproducible  # build the release payload twice in isolation and compare artifacts
-make ctrld-image          # build the pinned BEAM builder for the management server
+make ctrld-image          # build the pinned BEAM builder and pull the two pinned databases
+make ctrld-deps           # re-resolve the Hex dependency tree and rewrite mix.lock (networked)
 make ctrld-test           # the ctrld offline gate on its own
 make ctrld-server         # run the management server interactively for development
+make ctrld-databases-down # stop the development databases `ctrld-server` brought up
 make hooks                # install the pre-commit and pre-push git hooks
 make book                 # render this book (requires mdbook on the host)
 make clean                # remove generated output only
@@ -57,8 +61,8 @@ the pinned inputs, builds every crate and protection domain with locked dependen
 and assembles the Microkit system description, produces the x86_64 Multiboot2 kernel and system
 image, packages only deployable outputs into `datad/dist/`, and emits checksums and an SBOM.
 
-`make image` and `make ctrld-image` are the only phases that fetch from the network (the OCI
-builds). Every target that runs a build or a gate — `make clean` included — checks that its pinned
+`make image`, `make ctrld-image` and `make ctrld-deps` are the only phases that fetch from the
+network. Every target that runs a build or a gate — `make clean` included — checks that its pinned
 builder image already exists and refuses with an actionable message instead of quietly provisioning
 it, so no gate command can turn into an OCI build. Project commands run with networking disabled, a
 read-only container filesystem, no Linux capabilities, and only the workspace mounted writable.
@@ -84,17 +88,62 @@ A dependency change therefore means rebuilding the builder, exactly as it does f
 There are two invocation modes, because the offline discipline and the development experience pull
 in opposite directions:
 
-- **`make ctrld-test`** — the gate. It runs with the network disabled and the same container
-  hardening as the datad gate, and holds the committed lockfile (`mix deps.get --check-locked`),
-  formatting (`mix format --check-formatted`), a warning-free compile
-  (`mix compile --warnings-as-errors`), and the test suite (`mix test`). The asset binaries are
-  provisioned from the image: the provisioning step asks the project which versions it expects and
-  refuses if the image does not carry them, so the pin and `config/config.exs` cannot drift apart
-  silently.
-- **`make ctrld-server`** — interactive development. It carries the host network so the LiveView
-  server is reachable and prints the URL to use; on a Cloud Developer Machine that is the
-  machine's port-proxy origin for port 4000, never a bare localhost address. Dependencies still
-  resolve offline from the image caches.
+- **`make ctrld-test`** — the gate. It runs with the same container hardening as the datad gate,
+  and holds the committed lockfile (`mix deps.get --check-locked`), formatting
+  (`mix format --check-formatted`), a warning-free compile (`mix compile --warnings-as-errors`),
+  the two schema migrations, and the test suite (`mix test`). The asset binaries are provisioned
+  from the image: the provisioning step asks the project which versions it expects and refuses if
+  the image does not carry them, so the pin and `config/config.exs` cannot drift apart silently.
+- **`make ctrld-server`** — interactive development. It brings up the compose stack below and
+  carries the host network, so the LiveView server is reachable and reaches both databases on
+  localhost. It prints the URL to use; on a Cloud Developer Machine that is the machine's
+  port-proxy origin for port 4000 — `https://<machine-uuid>-4000.proxy.code.gropyus.com/` — never
+  a bare localhost address, which a browser-only machine cannot open. Dependencies still resolve
+  offline from the image caches. `make ctrld-databases-down` stops the databases again.
+
+### The gate needs real databases and stays offline
+
+The management server's suite is worth nothing against fakes: Ecto has to meet Postgres and the
+telemetry writer has to meet ClickHouse, or the tests prove only that this codebase agrees with
+itself. That reads as a conflict with the offline discipline and is not one, once the property is
+named precisely. **What must not exist is unpinned input — not sockets.**
+
+So the gate brings both databases up as sibling containers, pinned by digest in
+`ctrld/third-party/sources.lock` and pulled by `make ctrld-image`, on a Podman network created
+`--internal`: it has no gateway, so there is no route off it, no name resolution, and nothing to
+reach. The gate container joins that network and **checks the absence for itself before it runs
+anything** — it refuses to start if its own routing table holds a default route — so the day
+something makes that network routable, the gate fails instead of quietly acquiring the internet.
+Both databases hold their state on tmpfs and are torn down with the run, whatever the outcome: a
+gate that inherits state from the last run is a gate that can pass for the wrong reason.
+
+**A database that is not there fails the run; it never shrinks it.** The suite creates and migrates
+both schemas before its first test and refuses to start if either store does not answer, and it
+refuses to start at all if any test tag is excluded — the failure a gate cannot afford is the one
+that still prints no failures.
+
+The development stack is the same two digests read from the same two lines: `ctrld/compose.yaml`
+takes `ctrld/third-party/sources.lock` as its environment file, so the databases a developer works
+against and the ones the gate runs against cannot drift apart. Unlike the gate's, its volumes are
+named and survive a restart, and its key-encryption key and administrator password are generated
+once into `ctrld/build/dev/` — untracked, because the development database holds CA material
+sealed under the first of them and a key that has to survive a restart is a key that must not be
+committed.
+
+### Changing a dependency means rebuilding the builder
+
+The offline caches are warmed from the committed manifests during the image build, so the manifests
+and the image move together:
+
+1. edit `ctrld/mix.exs`,
+2. `make ctrld-deps` — networked, and the only thing that writes `ctrld/mix.lock`; the gate cannot
+   produce a lockfile it is simultaneously checking,
+3. `make ctrld-image` — re-warms the Hex cache, the git mirrors and the precompiled-NIF cache from
+   the new manifests,
+4. `make ctrld-test` — offline again, resolving everything from those caches.
+
+Skipping step 3 fails at step 4 with a dependency the image does not carry, which is the intended
+failure: the gate never fetches.
 
 ## Landing changes
 
@@ -133,6 +182,8 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves — plus the counts the status detail chapter states about the gate: how many system scenarios there are, how many reach the management port, and how many library crates carry the coverage floor | `xtask test` (`reference_contract`) |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
 | Boot, forwarding and A/B contracts | `xtask test-system`, `xtask test-ab` |
+| The management server's dependency lock, formatting, a warning-free compile, both schema migrations, and its whole suite against a real Postgres and a real ClickHouse | `make ctrld-test` |
+| That the management server's gate is genuinely offline: its container refuses to run if it holds a default route | `make ctrld-test`, before anything else it does |
 
 `sysdesc::check` is the **only** machine check of the capability topology. Because it names each
 region's mapper set exactly, a grant that widens and a grant that vanishes are both findings there
@@ -257,8 +308,9 @@ enabled for every download. Never commit the certificate — or any other key ma
 The repository holds a two-component product. `datad/` is the appliance: the Rust seL4/Microkit
 system and its entire build. `ctrld/` is the management server: an Elixir/Phoenix application laid
 out the way Phoenix projects are (`mix.exs`, `config/`, `lib/`, `test/`, `assets/`, `priv/`), with
-its pinned builder under `ctrld/build/` and its pinned inputs in `ctrld/third-party/`. The book,
-`README.md`, and `LICENSE.md` stay at the repository root and cover both components.
+its pinned builder under `ctrld/build/`, its pinned inputs in `ctrld/third-party/`, and the
+development database stack in `ctrld/compose.yaml`. The book, `README.md`, and `LICENSE.md` stay at
+the repository root and cover both components.
 
 Inside `datad/`, directories have fixed purposes; they grow as real functionality lands, and no
 empty placeholders are created.

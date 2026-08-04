@@ -7,7 +7,11 @@ repository root).
 ## Project guidelines
 
 - Run the gate (`make ctrld-test`, from the repository root) when you are done with all changes and fix any pending issues
+- The gate needs the two pinned databases. Changing `mix.exs` means `make ctrld-deps` (networked, and the only thing that writes `mix.lock`), then `make ctrld-image` to re-warm the offline caches, then `make ctrld-test`
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
+- Certificates, requests and the sealing cipher come from OTP's `:public_key` and `:crypto`. Do not add a cryptography dependency, and do not implement an algorithm
+- Every certificate parameter comes from `Ctrld.PKI.Profile`, which is the certificate-profile contract in one module. Never write a curve, an OID, a validity or a key usage anywhere else
+- A LiveView is for a page that is live. A form that is posted once is a controller, so the flow can be driven by a script against a running server as well as by the suite
 
 ### Phoenix v1.8 guidelines
 

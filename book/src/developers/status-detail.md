@@ -2009,20 +2009,70 @@ anti-rollback epoch. Production key management (HSM-backed signing) does not exi
 
 ## Management server
 
-**What exists.** `ctrld/` holds a green-but-empty Phoenix application with LiveView, and — which is
-the point of landing it this early — the second toolchain as a first-class citizen of the
-repository: a pinned BEAM builder image following the same conventions as the appliance's
-(version- and checksum-pinned inputs, network only while provisioning the image, every gate command
-offline), and a ctrld gate wired into `make test`, so the management server is held to a gate from
-its first line of real code rather than retrofitted with one. The
-[building chapter](building.md) describes the command surface.
+**What exists.** Onboarding, end to end from the administrator's side. An administrator signs in
+with a local account, uploads the certificate signing request an appliance produced, compares the
+SPKI fingerprint the page renders against the one the appliance printed on its console, names the
+appliance, settles its configuration document, and downloads the
+[onboarding package](../contracts/configuration-package.md). That flow has been walked against a
+running server over plain HTTP, and the package it produced was verified from the outside: `tar`
+lists exactly the four members, and `openssl` confirms the device certificate chains to the
+delivered anchor and matches the profile in every field.
 
-**Missing.** The product. Nothing of the [management server design](../design/management-server.md)
-exists: no Postgres or ClickHouse schema, no local users or bootstrapped administrator, no CA and no
-issuance against the [certificate profile](../contracts/certificate-profile.md), no
-configuration-package composition, no appliance inventory, no ThousandIsland channel listener, no
-pcapng decoder and no fixtures drawn from the appliance gate's recordings, no LiveView beyond the
-generator's skeleton.
+- **The server is the certificate authority.** It creates its own authority and the channel
+  endpoint's server certificate at first start, and signs device requests against the
+  [certificate profile](../contracts/certificate-profile.md) — ECDSA P-256 with SHA-256, a random
+  128-bit serial, ten years, the device identifier as the sole subject attribute, and the key usage,
+  extended key usage and basic constraints the profile assigns each artifact. Everything issued
+  comes from the profile and from the request's key: the request is a proof of key possession and a
+  name, and one carrying an attribute is refused rather than honoured in part. Certificates are
+  built with the runtime's own `:public_key` and `:crypto`; the server implements no cryptographic
+  algorithm and links no native one.
+- **Private keys are sealed.** AES-256-GCM under a base64 key from the environment, a fresh
+  initialisation vector per record, and associated data naming the table, so a ciphertext moved
+  between rows opens to nothing. The server refuses to start without a usable key, and no surface
+  exports one.
+- **The package writer is held to the contract by its own decoder.** The archive is written as
+  ustar headers directly rather than through a tar library, and the suite decodes what comes out
+  against every rule the contract states — the magic and version, the regular-file type flag, the
+  four exact names with no path and an empty prefix field, each size field against the bytes
+  present, every header checksum, the bounds, and the two closing zero blocks. That decoder is the
+  mechanism holding this writer and the appliance's reader — two implementations of one format, in
+  two languages — from drifting apart.
+- **Postgres holds accounts and sessions, the authority and the endpoint certificate, the appliance
+  inventory, configuration versions, and the audit trail.** Passwords are PBKDF2-HMAC-SHA512 with
+  the work factor stored on each hash. Sessions are server-side tokens: the cookie carries the
+  token, the database its digest, and signing out deletes the row. Every state-changing action
+  writes an audit record, and issuance writes its record in the same transaction as the issuance.
+- **The inventory is honest.** Status is derived from what the server can evidence, not stored:
+  today "onboarded" and when the request arrived. Nothing renders reachability, and the page says
+  why.
+- **ClickHouse holds the telemetry schema** — flow events, log events and metric samples, with the
+  fields the appliance's recording annotations, log records and metric samples actually carry — and
+  a writer over ClickHouse's HTTP interface. The suite round-trips rows through a real ClickHouse.
+- **The gate runs against real databases and stays offline.** Both are pinned by digest and run on
+  a Podman network with no gateway; the gate container refuses to run if it holds a default route,
+  and a database that does not answer fails the run rather than shrinking it. The
+  [building chapter](building.md) describes it.
+
+**Missing.** Everything the channel carries, and everything that comes after it.
+
+- **No channel listener and no pcapng decoder.** Nothing has ever connected to this server: there
+  is no ThousandIsland listener, no [framing](../contracts/channel-framing.md), and no decoder
+  tested against bytes the appliance's encoder produced. The telemetry schema and its writer
+  therefore have **no producer** — they are exercised only by the suite.
+- **Online, offline and last seen do not exist**, and neither do the columns behind them; they
+  arrive with the connection that establishes them.
+- **No configuration operations.** Generation 1 is the document the package carried, and there is
+  no staging, commit-confirm, rollback, or version beyond it — those are channel operations.
+- **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an
+  administrator-supplied certificate or ACME later. Until then a deployment terminates TLS in front
+  of it or keeps it on a trusted network.
+- **No revocation, no CA rollover, no identity federation.** Device certificates are long-lived and
+  nothing withdraws one yet; the authority cannot be replaced without visiting every appliance; and
+  authentication is local accounts only, with one role.
+- **No live view of anything.** The inventory, the appliance page, the authority page and the audit
+  trail are LiveViews that mount and render; nothing ever pushes an update to one, and PubSub fans
+  out to nothing, because nothing produces events.
 
 ## Engineering foundations
 

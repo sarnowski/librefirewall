@@ -1,0 +1,39 @@
+<Layouts.app flash={@flash} current_user={@current_user}>
+  <div class="flex items-baseline justify-between">
+    <h1 class="text-xl font-semibold">Onboard an appliance</h1>
+    <.link navigate={~p"/appliances"} class="btn btn-ghost btn-sm">Back to inventory</.link>
+  </div>
+
+  <div :if={is_nil(@authority)} id="no-authority" class="alert alert-warning text-sm">
+    This server holds no certificate authority, so it can issue nothing.
+  </div>
+
+  <section id="step-request" class="space-y-4">
+    <p class="text-sm opacity-80">
+      Download the certificate signing request from the appliance's onboarding page and upload it
+      here. Check the appliance's fingerprint against its console before you trust the page you
+      took the request from.
+    </p>
+
+    <form
+      id="request-form"
+      action={~p"/appliances/onboard/review"}
+      method="post"
+      enctype="multipart/form-data"
+      class="space-y-4"
+    >
+      <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+      <input
+        id="certificate-request"
+        type="file"
+        name="certificate_request"
+        class="file-input w-full"
+        required
+      />
+      <p class="text-xs opacity-60">
+        PEM, at most {@maximum_bytes} bytes, ECDSA on P-256 signed with SHA-256.
+      </p>
+      <button id="request-submit" type="submit" class="btn btn-primary">Read the request</button>
+    </form>
+  </section>
+</Layouts.app>

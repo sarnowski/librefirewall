@@ -22,6 +22,31 @@ end
 
 config :ctrld, CtrldWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# The deployment's own inputs, read the same way in every environment so the
+# gate exercises the path a deployment takes rather than a shortcut around it.
+# Nothing is validated here: the values are handed to the modules that own
+# them, each of which refuses a missing or malformed one at boot. One
+# validating implementation, exercised by the suite, beats a second copy in a
+# config file that no test ever reaches.
+config :ctrld, Ctrld.Repo, url: System.get_env("DATABASE_URL")
+
+config :ctrld, Ctrld.Telemetry.Store,
+  url: System.get_env("CLICKHOUSE_URL"),
+  username: System.get_env("CLICKHOUSE_USER"),
+  password: System.get_env("CLICKHOUSE_PASSWORD"),
+  database: System.get_env("CLICKHOUSE_DATABASE")
+
+config :ctrld, Ctrld.Vault, key_base64: System.get_env("CTRLD_KEY_ENCRYPTION_KEY")
+
+config :ctrld, Ctrld.ChannelEndpoint, endpoint: System.get_env("CTRLD_CHANNEL_ENDPOINT")
+
+config :ctrld, Ctrld.Bootstrap,
+  # Off in test: the suite drives the bootstrap directly against the sandbox,
+  # and a boot-time write would race every test that counts users.
+  run_on_start: config_env() != :test,
+  administrator_email: System.get_env("CTRLD_ADMIN_EMAIL"),
+  administrator_password: System.get_env("CTRLD_ADMIN_PASSWORD")
+
 if config_env() == :dev do
   # Reload browser tabs when matching files change.
   config :ctrld, CtrldWeb.Endpoint,

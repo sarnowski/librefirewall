@@ -1,0 +1,86 @@
+<Layouts.app flash={@flash} current_user={@current_user}>
+  <div class="flex items-baseline justify-between">
+    <h1 class="text-xl font-semibold">Onboard an appliance</h1>
+    <.link navigate={~p"/appliances/onboard"} class="btn btn-ghost btn-sm">
+      Use a different request
+    </.link>
+  </div>
+
+  <div :if={is_nil(@authority)} id="no-authority" class="alert alert-warning text-sm">
+    This server holds no certificate authority, so it can issue nothing.
+  </div>
+
+  <section id="step-review" class="space-y-6">
+    <div class="rounded-lg border border-base-300 p-4 space-y-3">
+      <h2 class="font-semibold">Check this against the appliance's console</h2>
+      <dl class="grid grid-cols-[10rem_1fr] gap-y-2 text-sm">
+        <dt class="opacity-70">SPKI fingerprint</dt>
+        <dd id="review-fingerprint" class="font-mono break-all">{@request.spki_fingerprint}</dd>
+        <dt class="opacity-70">Device identifier</dt>
+        <dd id="review-device-id" class="font-mono">{@request.device_id}</dd>
+      </dl>
+      <p class="text-xs opacity-60">
+        The appliance printed this fingerprint on its serial console when it minted its key. If the
+        two do not match character for character, the request came from somewhere else.
+      </p>
+    </div>
+
+    <form id="issue-form" action={~p"/appliances/onboard"} method="post" class="space-y-4">
+      <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+      <input type="hidden" name="appliance[certificate_request]" value={@request.pem} />
+
+      <label class="block space-y-1">
+        <span class="text-sm font-medium">Name this appliance</span>
+        <input
+          id="appliance-name"
+          type="text"
+          name="appliance[name]"
+          value={@name}
+          class="input input-bordered w-full"
+          required
+        />
+      </label>
+
+      <div class="rounded-lg border border-base-300 p-4 space-y-2 text-sm">
+        <div class="flex justify-between">
+          <span class="opacity-70">Management endpoint it will dial</span>
+          <span id="review-endpoint" class="font-mono">
+            {Ctrld.ChannelEndpoint.to_string(@endpoint)}
+          </span>
+        </div>
+        <p :if={is_nil(@endpoint_certificate)} class="text-warning text-xs">
+          This server holds no channel endpoint certificate, so an appliance told to dial that
+          address would find nothing it could validate.
+        </p>
+        <p class="text-xs opacity-60">
+          The endpoint is deployment-wide and cannot be changed over the channel afterwards;
+          changing it means a factory reset and a new package.
+        </p>
+      </div>
+
+      <label class="block space-y-1">
+        <span class="text-sm font-medium">Configuration document</span>
+        <textarea
+          id="appliance-configuration"
+          name="appliance[configuration]"
+          rows="18"
+          class="textarea textarea-bordered w-full font-mono text-xs"
+        >{@configuration}</textarea>
+      </label>
+      <p class="text-xs opacity-60">
+        Checked here for size, well-formedness, and the four sections the appliance's schema
+        requires. <strong>The appliance decides whether it accepts the rest</strong>
+        — it holds the schema and re-validates every rule for itself.
+      </p>
+
+      <button
+        id="issue-submit"
+        type="submit"
+        class="btn btn-primary"
+        disabled={is_nil(@authority)}
+      >
+        Sign and issue
+      </button>
+    </form>
+  </section>
+</Layouts.app>

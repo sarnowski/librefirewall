@@ -1,6 +1,8 @@
 defmodule CtrldWeb.Router do
   use CtrldWeb, :router
 
+  import CtrldWeb.UserAuth
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
@@ -8,30 +10,42 @@ defmodule CtrldWeb.Router do
     plug :put_root_layout, html: {CtrldWeb.Layouts, :root}
     plug :protect_from_forgery
     plug :put_secure_browser_headers
-  end
-
-  pipeline :api do
-    plug :accepts, ["json"]
+    plug :fetch_current_user
   end
 
   scope "/", CtrldWeb do
-    pipe_through :browser
+    pipe_through [:browser, :redirect_if_authenticated]
 
-    get "/", PageController, :home
+    live_session :unauthenticated, on_mount: [{CtrldWeb.UserAuth, :mount_current_user}] do
+      live "/sign-in", LoginLive, :new
+    end
+
+    post "/sign-in", SessionController, :create
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", CtrldWeb do
-  #   pipe_through :api
-  # end
+  scope "/", CtrldWeb do
+    pipe_through [:browser, :require_authenticated_user]
+
+    # The onboarding routes come first: `/appliances/onboard` must not be read
+    # as an appliance whose device identifier is "onboard".
+    get "/appliances/onboard", OnboardingController, :new
+    post "/appliances/onboard/review", OnboardingController, :review
+    post "/appliances/onboard", OnboardingController, :create
+
+    live_session :authenticated, on_mount: [{CtrldWeb.UserAuth, :require_authenticated}] do
+      live "/", ApplianceLive.Index, :index
+      live "/appliances", ApplianceLive.Index, :index
+      live "/appliances/:device_id", ApplianceLive.Show, :show
+      live "/authority", AuthorityLive, :show
+      live "/audit", AuditLive, :index
+    end
+
+    get "/appliances/:device_id/package.tar", PackageController, :show
+    delete "/sign-out", SessionController, :delete
+  end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:ctrld, :dev_routes) do
-    # If you want to use the LiveDashboard in production, you should put
-    # it behind authentication and allow only admins to access it.
-    # If your application does not have an admins-only section yet,
-    # you can use Plug.BasicAuth to set up some basic authentication
-    # as long as you are also using SSL (which you should anyway).
     import Phoenix.LiveDashboard.Router
 
     scope "/dev" do

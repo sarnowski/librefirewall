@@ -1,5 +1,18 @@
 import Config
 
+# The suite owns a whole database and drives it through the sandbox, so every
+# test sees the schema and none sees another's rows. `mix test` creates and
+# migrates it first (see the alias in mix.exs), because a gate that answered
+# "no database, no database tests" would be a gate that passes for the wrong
+# reason.
+config :ctrld, Ctrld.Repo,
+  pool: Ecto.Adapters.SQL.Sandbox,
+  pool_size: System.schedulers_online() * 2
+
+# The real algorithm at a work factor a suite can afford. 600,000 iterations
+# per password would spend the suite's whole budget proving a constant.
+config :ctrld, Ctrld.Accounts.Password, iterations: 1_000
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :ctrld, CtrldWeb.Endpoint,

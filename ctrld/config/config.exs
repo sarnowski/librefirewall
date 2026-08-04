@@ -8,7 +8,19 @@
 import Config
 
 config :ctrld,
+  ecto_repos: [Ctrld.Repo],
   generators: [timestamp_type: :utc_datetime]
+
+# The password hash's work factor. It is configuration rather than a constant
+# because the test environment cannot afford the real one and must still
+# exercise the real algorithm; every stored hash carries the count it was
+# derived under, so lowering or raising this never invalidates an existing
+# password.
+config :ctrld, Ctrld.Accounts.Password, iterations: 600_000
+
+# The name the management certificate authority is created under on first
+# start. It is the CA's subject common name and nothing else depends on it.
+config :ctrld, Ctrld.PKI, authority_name: "librefirewall management CA"
 
 # Configure the endpoint
 config :ctrld, CtrldWeb.Endpoint,

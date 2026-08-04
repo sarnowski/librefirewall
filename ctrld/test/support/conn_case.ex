@@ -1,37 +1,56 @@
 defmodule CtrldWeb.ConnCase do
   @moduledoc """
-  This module defines the test case to be used by
-  tests that require setting up a connection.
-
-  Such tests rely on `Phoenix.ConnTest` and also
-  import other functionality to make it easier
-  to build common data structures and query the data layer.
-
-  Finally, if the test case interacts with the database,
-  we enable the SQL sandbox, so changes done to the database
-  are reverted at the end of every test. If you are using
-  PostgreSQL, you can even run database tests asynchronously
-  by setting `use CtrldWeb.ConnCase, async: true`, although
-  this option is not recommended for other databases.
+  The case template for tests that drive the web interface.
   """
 
   use ExUnit.CaseTemplate
 
   using do
     quote do
-      # The default endpoint for testing
       @endpoint CtrldWeb.Endpoint
 
       use CtrldWeb, :verified_routes
 
-      # Import conveniences for testing with connections
       import Plug.Conn
       import Phoenix.ConnTest
+      import Phoenix.LiveViewTest
       import CtrldWeb.ConnCase
+      import Ctrld.Fixtures
+
+      alias Ctrld.Repo
     end
   end
 
-  setup _tags do
+  setup tags do
+    Ctrld.DataCase.setup_sandbox(tags)
     {:ok, conn: Phoenix.ConnTest.build_conn()}
+  end
+
+  @doc """
+  Sign an administrator in on a connection.
+
+  It goes through the real controller, so a test is exercising the session the
+  interface actually issues rather than one a helper invented.
+  """
+  def sign_in(conn, user, password \\ "a-long-enough-password") do
+    signed =
+      Phoenix.ConnTest.dispatch(conn, CtrldWeb.Endpoint, :post, "/sign-in", %{
+        "user" => %{"email" => user.email, "password" => password}
+      })
+
+    {Phoenix.ConnTest.recycle(signed), Plug.Conn.get_session(signed, :user_token)}
+  end
+
+  @doc """
+  A connection already carrying an administrator's session.
+
+  The token comes back too, because a recycled connection has no fetched
+  session to read it out of and a test that wants to end the session from the
+  server's side needs it.
+  """
+  def sign_in_administrator(conn) do
+    user = Ctrld.Fixtures.administrator_fixture()
+    {conn, token} = sign_in(conn, user)
+    {conn, user, token}
   end
 end

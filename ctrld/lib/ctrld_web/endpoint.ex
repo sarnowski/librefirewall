@@ -42,9 +42,15 @@ defmodule CtrldWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  # A bound on every request body, because nothing this server receives is
+  # large: the biggest single thing an administrator can send is a 64 KiB
+  # configuration document beside a certificate signing request bounded at
+  # 16 KiB, so a megabyte is generous and the framework's own default of eight
+  # is a body size nothing here has a use for.
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
+    length: 1_000_000,
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride

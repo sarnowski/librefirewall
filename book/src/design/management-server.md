@@ -60,7 +60,19 @@ and it signs every device CSR — issuance is the
 [certificate profile](../contracts/certificate-profile.md). It will hold many CAs and private keys
 over time; all of them are **stored encrypted in Postgres under a key supplied to the server as an
 environment variable**, so a database backup is not a key escrow and the key never rests beside the
-data it protects.
+data it protects. The construction is AES-256-GCM with a fresh initialisation vector per record and
+associated data naming what the record is, so a ciphertext is not portable between rows; and the
+server **refuses to start** without a usable key rather than discovering at the first issuance that
+it cannot read the authority it already holds. No surface exports a private key — an authority key
+that can be fetched through a web page is an authority key that will be.
+
+**The channel endpoint is one address for the whole deployment, not a per-appliance choice.** The
+appliance validates the server's certificate against the address it dialed, the server holds one
+endpoint certificate naming one address, and the endpoint is
+[not changeable over the channel](management.md#lifecycle-rules) — so an appliance told to dial
+anything else could neither connect nor be corrected. Onboarding therefore shows the endpoint and
+does not offer it; moving it re-issues the endpoint certificate and retires the old one, because a
+certificate for an address the server no longer answers on is worse than none, as it looks current.
 
 ## Two endpoints, two postures
 
@@ -77,9 +89,19 @@ The server has two listening endpoints, and their transport postures differ deli
 
 ## Authentication
 
-**Local users only, with one administrator account bootstrapped** in Postgres at first start. OIDC —
-and an identity-provider broker for SAML shops — comes later; **SAML is never implemented in our own
-codebase**. Every administrator action lands in the audit record in Postgres.
+**Local users only, with one administrator account bootstrapped** in Postgres at first start, from
+credentials the environment supplies — never generated and printed, because a generated password
+has to be shown somewhere to be usable and every surface this server has is one a secret must not
+reach. A first start with no account and no credentials refuses to come up rather than inventing
+any. OIDC — and an identity-provider broker for SAML shops — comes later; **SAML is never
+implemented in our own codebase**.
+
+Every administrator action lands in the audit record in Postgres, and an action that changes the
+catalog lands **in the same transaction as the change it describes**: a certificate issued without
+a record of who issued it is precisely the fact an audit trail exists to hold, so the two commit
+together or neither does. An audit record keeps the actor's address as it was at the time as well
+as the reference, because a record that goes anonymous when an account is deleted stops answering
+the question it exists for.
 
 ## Appliance inventory
 
@@ -88,3 +110,8 @@ server holds, never an optimistic default. Before the channel exists for an appl
 "onboarded" and "CSR received at *T*": the facts issuance left behind. Once the appliance dials, it
 becomes **online**, **offline**, and **last seen** — facts the connection itself establishes. A
 status the server cannot evidence is not displayed.
+
+Status is therefore *derived* rather than stored, and the columns behind the later statuses arrive
+with the connection that establishes them. A stored status is a status that can disagree with the
+evidence, and a column nothing writes reads as a fact nobody has — which is the same mistake this
+section exists to avoid, made in the schema instead of in the interface.

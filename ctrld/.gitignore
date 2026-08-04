@@ -35,3 +35,11 @@ ctrld-*.tar
 npm-debug.log
 /assets/node_modules/
 
+# The development stack's generated key-encryption key and administrator
+# password. They are generated on first `make ctrld-server` and must survive a
+# restart, because the development database holds CA material encrypted under
+# the first of them — which is exactly why they are generated locally instead
+# of being written into the Makefile.
+/build/dev/
+
+

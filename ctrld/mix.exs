@@ -21,7 +21,10 @@ defmodule Ctrld.MixProject do
   def application do
     [
       mod: {Ctrld.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      # :public_key and :crypto carry the whole certificate authority — key
+      # generation, PKCS#10, X.509 and the sealing cipher — and :xmerl reads
+      # the configuration document far enough to say it is well-formed.
+      extra_applications: [:logger, :runtime_tools, :public_key, :crypto, :xmerl]
     ]
   end
 
@@ -42,6 +45,9 @@ defmodule Ctrld.MixProject do
     [
       {:phoenix, "~> 1.8.9"},
       {:phoenix_html, "~> 4.1"},
+      {:ecto_sql, "~> 3.13"},
+      {:postgrex, "~> 0.21"},
+      {:phoenix_ecto, "~> 4.6"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
       {:phoenix_live_view, "~> 1.2.0"},
       {:lazy_html, ">= 0.1.0", only: :test},
@@ -81,7 +87,13 @@ defmodule Ctrld.MixProject do
   # See the documentation for `Mix` for more info on aliases.
   defp aliases do
     [
-      setup: ["deps.get", "assets.setup", "assets.build"],
+      setup: ["deps.get", "ecto.setup", "assets.setup", "assets.build"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      # `mix test` owns bringing both schemas up: the gate hands it two empty
+      # databases and expects a verdict, not a skip, so a schema that cannot be
+      # created fails the run here rather than turning into an excluded test.
+      test: ["ecto.create --quiet", "ecto.migrate --quiet", "ctrld.clickhouse.migrate", "test"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.build": ["compile", "tailwind ctrld", "esbuild ctrld"],
       "assets.deploy": [
