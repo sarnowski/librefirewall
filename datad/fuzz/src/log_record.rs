@@ -108,7 +108,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The eight `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The nine `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -117,7 +117,8 @@ const DETAIL_ESTABLISHED: u8 = 4;
 const DETAIL_RECEIVED: u8 = 5;
 const DETAIL_MEDIUM: u8 = 6;
 const DETAIL_EXTENT: u8 = 7;
-const DETAIL_COUNT: u8 = 8;
+const DETAIL_PROVEN: u8 = 8;
+const DETAIL_COUNT: u8 = 9;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -527,10 +528,10 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                     kept.capacity_sectors = record.capacity_sectors;
                     kept.leading_word = record.leading_word;
                 }
-                // The two words a refusal would carry, read here as an extent:
-                // whole, not to `operand_count`, because this detail names both
-                // unconditionally.
-                DETAIL_EXTENT => kept.operands = record.operands,
+                // The two words a refusal would carry, read here as an extent
+                // or a proof: whole, not to `operand_count`, because these
+                // details name both unconditionally.
+                DETAIL_EXTENT | DETAIL_PROVEN => kept.operands = record.operands,
                 DETAIL_REFUSAL => {
                     kept.cause = record.cause;
                     kept.operand_count = record.operand_count;
@@ -664,14 +665,15 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         )
     })
     .or_else(|| match record.detail {
-        // `Received`, `Medium` and `Extent` join these: two unranged numbers
-        // each, so the detail carries nothing a rule can refuse it for.
+        // `Received`, `Medium`, `Extent` and `Proven` join these: two unranged
+        // numbers each, so the detail carries nothing a rule can refuse it for.
         DETAIL_NONE
         | DETAIL_FEATURES
         | DETAIL_RECEIVE_POSTED
         | DETAIL_RECEIVED
         | DETAIL_MEDIUM
-        | DETAIL_EXTENT => None,
+        | DETAIL_EXTENT
+        | DETAIL_PROVEN => None,
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.
