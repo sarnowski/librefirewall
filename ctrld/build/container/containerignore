@@ -1,0 +1,12 @@
+# The builder image needs only the pinned-input file and the Mix manifests.
+# Sources are never copied into the image: they arrive at run time through the
+# Makefile's /workspace bind mount. Restricting the build context to the
+# manifests here is what lets the Containerfile warm the dependency caches
+# with a single `COPY .`, and it keeps the cache-warming layer invalidated
+# only by a manifest or lockfile change, never by a source edit.
+**
+!mix.exs
+!mix.lock
+!config/
+!config/*.exs
+!third-party/sources.lock

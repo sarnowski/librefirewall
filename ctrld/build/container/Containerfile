@@ -1,0 +1,242 @@
+# ctrld hermetic build environment.
+#
+# The pinned BEAM builder: every input is version- and checksum-pinned
+# (ELIXIR_IMAGE by digest, a dated Debian snapshot plus an exact version for
+# each apt package, a sha256-verified rebar3 escript, and sha256-verified
+# tailwind and esbuild standalone binaries). This image is a TOOL, not the
+# product — the management server is built and tested inside it.
+#
+# Network is available only while building THIS image; the gate (the Makefile
+# `ctrld_container` recipe) runs --network=none against the warmed offline
+# caches. Contract with the Makefile: BASE_IMAGE arrives as a build-arg (from
+# sources.lock's ELIXIR_IMAGE) and the corporate TLS-inspection CA arrives as
+# the optional build secret `enterprise_ca`. Each RUN that needs it folds it
+# together with the system trust store into a bundle on a per-RUN tmpfs
+# (/run/build-ca), which is not part of the layer's filesystem: the bundle
+# therefore cannot reach an image layer however the block exits.
+#
+# Two deviations from the datad builder, both forced by the base image:
+# ca-certificates is NOT installed — the hexpm base ships it, and its
+# packaging offers nothing to pin that the digest does not already freeze.
+# And the first apt already runs over https, because the trust store is
+# present from the start.
+#
+# Apt package versions are pinned inline below rather than in sources.lock:
+# a version is only meaningful next to the package name it belongs to, and
+# sources.lock pins CTRLD_DEBIAN_SNAPSHOT, the frozen archive they all
+# resolve against.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY third-party/sources.lock /tmp/sources.lock
+
+# git: Mix git dependencies (Phoenix pulls heroicons and daisyui that way).
+# inotify-tools: Phoenix live reload. build-essential/pkg-config: NIFs such as
+# lazy_html. curl/unzip: the pinned downloads below.
+RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
+    set -eu; \
+    . /tmp/sources.lock; \
+    printf '%s\n' \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${CTRLD_DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${CTRLD_DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      > /etc/apt/sources.list; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
+    fi; \
+    apt-get -o Acquire::https::CaInfo="$ca_bundle" update; \
+    DEBIAN_FRONTEND=noninteractive apt-get \
+      -o Acquire::https::CaInfo="$ca_bundle" \
+      --no-install-recommends install -y \
+      build-essential=12.9 \
+      curl=7.88.1-10+deb12u12 \
+      git=1:2.39.5-0+deb12u2 \
+      inotify-tools=3.22.6.0-4 \
+      pkg-config=1.8.1-1 \
+      unzip=6.0-28; \
+    rm -rf /var/lib/apt/lists/* /tmp/*
+
+# Pin Erlang's TLS client to 1.2 for every invocation: the corporate firewall
+# decrypts outbound TLS and rejects any Erlang ClientHello advertising 1.3,
+# for every destination — the symptom is a handshake_failure alert from only
+# the BEAM tooling while curl negotiates 1.3 without complaint. `-config`
+# takes the path without the .config suffix. A library passing an explicit
+# `versions:` option overrides this — tailwind's own downloader does, which is
+# why the asset binaries are baked into /opt/assets below instead of ever
+# being downloaded by the library.
+RUN mkdir -p /opt/beam \
+ && printf "%s\n" "[{ssl, [{protocol_version, ['tlsv1.2']}]}]." > /opt/beam/tls12.config
+
+# MIX_HOME and HEX_HOME are baked image paths, so Hex, rebar3, the Phoenix
+# generator and the Hex package cache come from the image and are read-only at
+# run time; they are upgraded by rebuilding the image. HEX_CACERTS_PATH exists
+# because Hex ships its own CA bundle that does not contain a corporate
+# inspection CA (that failure is unknown_ca, distinct from the handshake one).
+# ELIXIR_MAKE_CACHE_DIR keeps elixir_make's precompiled-NIF tarballs in the
+# image so an offline `mix compile` never reaches for a download.
+ENV ERL_FLAGS="-config /opt/beam/tls12" \
+    HEX_CACERTS_PATH=/etc/ssl/certs/ca-certificates.crt \
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    MIX_HOME=/opt/mix \
+    HEX_HOME=/opt/hex \
+    ELIXIR_MAKE_CACHE_DIR=/opt/elixir-make-cache \
+    LANG=C.UTF-8
+
+# Hex, rebar3 and the Phoenix generator, at the pinned versions. rebar3 is the
+# sha256-verified published escript, handed to `mix local.rebar` as a path so
+# nothing is downloaded by a tool that cannot pin. Mix runs as root here but
+# as the invoking user at run time, so its scratch directories under /tmp
+# would stay root-owned and every later `mix` invocation would fail creating
+# them: /tmp and root's cache are cleared in the same step.
+COPY third-party/sources.lock /tmp/toolchain-sources.lock
+RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
+    set -eu; \
+    . /tmp/toolchain-sources.lock; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
+    fi; \
+    export SSL_CERT_FILE="$ca_bundle" HEX_CACERTS_PATH="$ca_bundle"; \
+    mix local.hex "$HEX_VERSION" --force; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/rebar3 "$REBAR3_URL"; \
+    printf '%s  %s\n' "$REBAR3_SHA256" /tmp/rebar3 | sha256sum --check --strict -; \
+    mix local.rebar rebar3 /tmp/rebar3 --force; \
+    mix archive.install hex phx_new "$PHX_NEW_VERSION" --force; \
+    chmod -R a+rX /opt/mix; \
+    rm -rf /tmp/* /root/.cache
+
+# The standalone asset compilers, fetched with curl at pinned versions and
+# checksums into /opt/assets. tailwind's own downloader hardcodes a TLS
+# version list that includes 1.3 and so defeats the ERL_FLAGS pin; baking the
+# binaries also keeps the offline gate and the development server from ever
+# downloading them. The esbuild binary keeps the version in its image filename
+# even though the project expects it unversioned, so ctrld-provision-assets
+# below can hold the copy it makes to the version the project asked for.
+COPY third-party/sources.lock /tmp/assets-sources.lock
+RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
+    set -eu; \
+    . /tmp/assets-sources.lock; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
+    fi; \
+    mkdir -p /opt/assets; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output "/opt/assets/tailwind-linux-x64-${TAILWIND_VERSION}" "$TAILWIND_URL"; \
+    printf '%s  %s\n' "$TAILWIND_SHA256" "/opt/assets/tailwind-linux-x64-${TAILWIND_VERSION}" \
+      | sha256sum --check --strict -; \
+    chmod 0755 "/opt/assets/tailwind-linux-x64-${TAILWIND_VERSION}"; \
+    curl --fail --location --proto '=https' --tlsv1.2 --cacert "$ca_bundle" \
+      --output /tmp/esbuild.tgz "$ESBUILD_URL"; \
+    printf '%s  %s\n' "$ESBUILD_SHA256" /tmp/esbuild.tgz | sha256sum --check --strict -; \
+    tar --extract --gzip --file /tmp/esbuild.tgz --directory /tmp package/bin/esbuild; \
+    mv /tmp/package/bin/esbuild "/opt/assets/esbuild-linux-x64-${ESBUILD_VERSION}"; \
+    chmod 0755 "/opt/assets/esbuild-linux-x64-${ESBUILD_VERSION}"; \
+    rm -rf /tmp/*
+
+# Satisfy Tailwind.bin_path() and Esbuild.bin_path() from /opt/assets, never
+# from a download. The script asks the project itself where each binary
+# belongs and which version it wants, so it cannot drift from
+# config/config.exs — and a version the image does not carry is a loud
+# refusal naming the rebuild, not a quiet fetch.
+RUN cat > /usr/local/bin/ctrld-provision-assets <<'SCRIPT'
+#!/bin/sh
+set -eu
+
+[ -f mix.exs ] || { echo "ctrld-provision-assets: run inside a Mix project" >&2; exit 1; }
+
+plan=$(mix run --no-start -e '
+  for {mod, label} <- [{Tailwind, "tailwind"}, {Esbuild, "esbuild"}] do
+    if Code.ensure_loaded?(mod) do
+      IO.puts(Enum.join([label, mod.bin_path(), mod.configured_version()], " "))
+    end
+  end' | grep -E '^(tailwind|esbuild) ')
+
+[ -n "$plan" ] || { echo "ctrld-provision-assets: no tailwind or esbuild dependency found" >&2; exit 1; }
+
+printf '%s\n' "$plan" | while read -r tool path version; do
+  if [ -x "$path" ]; then
+    echo "ctrld-provision-assets: $tool $version already present"
+    continue
+  fi
+  src="/opt/assets/${tool}-linux-x64-${version}"
+  [ -f "$src" ] || { \
+    echo "ctrld-provision-assets: the builder image carries no $tool $version;" >&2; \
+    echo "ctrld-provision-assets: align third-party/sources.lock with config/config.exs and run 'make ctrld-image'" >&2; \
+    exit 1; }
+  echo "ctrld-provision-assets: installing $tool $version"
+  mkdir -p "$(dirname "$path")"
+  cp "$src" "$path"
+  chmod +x "$path"
+done
+SCRIPT
+RUN chmod 0755 /usr/local/bin/ctrld-provision-assets
+
+# Warm the offline dependency caches from the manifests alone. The build
+# context is restricted to exactly the manifests by
+# build/container/containerignore, so this layer is invalidated only when
+# mix.exs or mix.lock changes. Three caches come out of it:
+#
+#  - /opt/hex — the Hex package cache `mix deps.get` fills; at run time
+#    HEX_OFFLINE=1 resolves every hex dependency from it.
+#  - /opt/git-cache — a bare mirror of every git dependency, DERIVED FROM THE
+#    LOCKFILE, never listed: a system-level insteadOf rewrite then makes any
+#    later clone of the upstream URL read the mirror, so the offline gate's
+#    `mix deps.get` clones git dependencies without a network. Mirrors are
+#    shallow at the tag or branch the lockfile names (a full history can run
+#    to gigabytes); an entry pinning only a bare commit falls back to a full
+#    mirror, since a commit cannot be shallow-cloned by name. The mirrors'
+#    history is not checksum-pinned; what is pinned is the commit mix.lock
+#    names, which is all a checkout can ever produce.
+#  - /opt/elixir-make-cache — the precompiled-NIF tarballs `mix deps.compile`
+#    would otherwise download, captured by the throwaway full-tree compile
+#    below.
+COPY . /tmp/warm/
+RUN --mount=type=secret,id=enterprise_ca,required=false \
+    --mount=type=tmpfs,target=/run/build-ca \
+    set -eu; \
+    ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
+    if [ -s /run/secrets/enterprise_ca ]; then \
+      cat "$ca_bundle" /run/secrets/enterprise_ca > /run/build-ca/bundle.crt; \
+      ca_bundle=/run/build-ca/bundle.crt; \
+    fi; \
+    export SSL_CERT_FILE="$ca_bundle" HEX_CACERTS_PATH="$ca_bundle" GIT_SSL_CAINFO="$ca_bundle"; \
+    cd /tmp/warm; \
+    grep -E '\{:git, "' mix.lock > /tmp/git-deps.list; \
+    while IFS= read -r entry; do \
+      url=$(printf '%s' "$entry" | sed -E 's/.*\{:git, "([^"]+)".*/\1/'); \
+      ref=$(printf '%s' "$entry" | sed -nE 's/.*(tag|branch): "([^"]+)".*/\2/p'); \
+      mirror="/opt/git-cache/$(printf '%s' "$url" | sed -E 's|^[a-z+]+://||')"; \
+      if [ -n "$ref" ]; then \
+        git clone --quiet --bare --depth 1 --branch "$ref" "$url" "$mirror"; \
+      else \
+        git clone --quiet --bare "$url" "$mirror"; \
+      fi; \
+      git config --system url."$mirror".insteadOf "$url"; \
+      # The mirror is root-owned but read by the keep-id gate user; without
+      # this, git refuses the mirror as dubiously owned.
+      git config --system --add safe.directory "$mirror"; \
+    done < /tmp/git-deps.list; \
+    mix deps.get; \
+    # Compile the whole dependency tree once, under the gate's own
+    # environment: whatever any dependency fetches at compile time — the
+    # precompiled-NIF tarball elixir_make downloads for lazy_html — lands in
+    # the image caches here, and the compiled artifacts themselves are
+    # discarded with this scratch directory. (Compiling a single :make
+    # dependency by name trips a dependency-environment mismatch inside Mix;
+    # the full-tree compile is also what the gate itself runs, so this warms
+    # exactly that path.)
+    mkdir -p "$ELIXIR_MAKE_CACHE_DIR"; \
+    MIX_ENV=test mix deps.compile; \
+    chmod -R a+rX /opt/hex /opt/git-cache "$ELIXIR_MAKE_CACHE_DIR"; \
+    rm -rf /tmp/* /root/.cache /root/.mix
+
+WORKDIR /workspace/ctrld

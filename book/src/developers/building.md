@@ -1,62 +1,100 @@
 # Building and testing
 
-The supported developer interface is GNU Make backed by rootless Podman. A pinned OCI
-builder (Debian 13 by digest, a dated Debian snapshot, the Microkit SDK, `rust-sel4`, the project
-Rust nightly, GRUB, OVMF, QEMU, and the coverage/lint/fuzz/SBOM tooling) provides every build
-input. The downloads are sha256-pinned in `datad/third-party/sources.lock`; each apt package is pinned to
-an exact version inline in the Containerfile, next to the package name, against the snapshot that
-file freezes. Nothing outside the builder is required beyond Podman itself.
+The supported developer interface is GNU Make backed by rootless Podman. Each component builds and
+tests inside its own pinned OCI builder. The appliance builder (Debian 13 by digest, a dated Debian
+snapshot, the Microkit SDK, `rust-sel4`, the project Rust nightly, GRUB, OVMF, QEMU, and the
+coverage/lint/fuzz/SBOM tooling) provides every `datad` build input; the BEAM builder (the
+`hexpm/elixir` image by digest — Erlang/OTP, Elixir and Debian bookworm — plus Hex, rebar3, the
+Phoenix generator, and the tailwind and esbuild standalone binaries) provides every `ctrld` one.
+The downloads are sha256-pinned in `datad/third-party/sources.lock` and
+`ctrld/third-party/sources.lock`; each apt package is pinned to an exact version inline in the
+component's Containerfile, next to the package name, against the snapshot its lock file freezes.
+Nothing outside the builders is required beyond Podman itself.
 
 From a clean checkout:
 
 ```sh
-make image          # build the OCI builder, then assemble the release A/B disk + bundle
-make test           # fast host gate: format, clippy, unit/property tests, coverage, the budget
-                    #   ratchets, the system-description, reference-chapter and configuration
-                    #   checks, and dependency policy
+make image          # build the appliance OCI builder, then assemble the release A/B disk + bundle
+make ctrld-image    # build the BEAM OCI builder with its warmed offline caches
+make test           # both fast gates: the ctrld gate (lock, format, warning-free compile, tests),
+                    #   then the datad host gate (format, clippy, unit/property tests, coverage,
+                    #   the budget ratchets, the system-description, reference-chapter and
+                    #   configuration checks, and dependency policy)
 make test-system    # boot the QEMU system scenarios; the ones with a reachable endpoint judge
                     #   metrics, logs and captures against each other and against the wire
-make ci             # the complete gate (host gate + fuzz + release image + system + A/B scenarios)
+make ci             # the complete gate (both fast gates + fuzz + release image + system + A/B)
 ```
 
 The full command surface:
 
 ```sh
-make image                # build the OCI builder, then `xtask image` — the RELEASE configuration
+make image                # build the appliance OCI builder, then `xtask image` — the RELEASE configuration
 make image-debug          # assemble the debug kernel instead; an opt-in no gate reaches
 make run                  # boot the image interactively in QEMU (debug kernel, for its diagnostics)
-make test                 # fast host gate (format, clippy, tests, coverage floor, budgets, the
-                          #   contract checks over datad/systems/, the book and the config document,
-                          #   dependency policy)
+make test                 # both fast gates: ctrld first (it is quick, so a finding there surfaces
+                          #   before the datad gate spends its minutes), then the datad host gate
 make coverage             # measure host-crate line coverage and print the per-crate summary
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
 make test-system          # boot the QEMU system scenarios on the release image
 make test-ab              # boot the A/B state-machine scenarios on the release image
-make ci                   # the complete gate: host gate, fuzz, release image, system and A/B
+make ci                   # the complete gate: both fast gates, fuzz, release image, system and A/B
 make release              # run the full gate, then keep `datad/dist/` only if it proved what it holds
 make verify-reproducible  # build the release payload twice in isolation and compare artifacts
+make ctrld-image          # build the pinned BEAM builder for the management server
+make ctrld-test           # the ctrld offline gate on its own
+make ctrld-server         # run the management server interactively for development
 make hooks                # install the pre-commit and pre-push git hooks
 make book                 # render this book (requires mdbook on the host)
 make clean                # remove generated output only
 ```
 
-The `Makefile` is a thin, stable interface; the orchestration behind it lives in the Rust `xtask`
-(`datad/tools/xtask`), not in shell. The container mounts the repository root and runs inside
-`datad/`, the appliance component. `make image` works from a clean checkout: it enters or builds
-the pinned environment, acquires and checksum-verifies the pinned inputs, builds every crate and
-protection domain with locked dependencies, validates and assembles the Microkit system
-description, produces the x86_64 Multiboot2 kernel and system image, packages only deployable
-outputs into `datad/dist/`, and emits checksums and an SBOM.
+The `Makefile` is a thin, stable interface; the orchestration behind the `datad` targets lives in
+the Rust `xtask` (`datad/tools/xtask`), and behind the `ctrld` targets in Mix, not in shell. The
+containers mount the repository root and run inside their component directory. `make image` works
+from a clean checkout: it enters or builds the pinned environment, acquires and checksum-verifies
+the pinned inputs, builds every crate and protection domain with locked dependencies, validates
+and assembles the Microkit system description, produces the x86_64 Multiboot2 kernel and system
+image, packages only deployable outputs into `datad/dist/`, and emits checksums and an SBOM.
 
-`make image` is the only network-enabled phase (the OCI build). Every target that runs a build or a
-gate — `make clean` included — checks that the pinned builder image already exists and refuses with
-an actionable message instead of quietly provisioning it, so no gate command can turn into an OCI
-build. Project commands run with networking disabled, a read-only container filesystem, no Linux
-capabilities, and only the workspace mounted writable. When the host exposes `/dev/kvm` it is
-passed through for accelerated QEMU; the harness falls back to emulation otherwise, and which of
-the two happened is printed and written into the run log, so a silent degradation to emulation
-cannot pass for an accelerated run.
+`make image` and `make ctrld-image` are the only phases that fetch from the network (the OCI
+builds). Every target that runs a build or a gate — `make clean` included — checks that its pinned
+builder image already exists and refuses with an actionable message instead of quietly provisioning
+it, so no gate command can turn into an OCI build. Project commands run with networking disabled, a
+read-only container filesystem, no Linux capabilities, and only the workspace mounted writable.
+When the host exposes `/dev/kvm` it is passed through for accelerated QEMU; the harness falls back
+to emulation otherwise, and which of the two happened is printed and written into the run log, so a
+silent degradation to emulation cannot pass for an accelerated run.
+
+## The management-server toolchain
+
+`ctrld` follows the same discipline with BEAM-shaped mechanics. The builder image pins the
+`hexpm/elixir` base by digest, resolves its apt packages against a dated Debian snapshot with the
+exact version of each pinned inline next to its name, installs Hex, rebar3 (the published escript,
+sha256-verified) and the Phoenix generator at pinned versions into an image path that is read-only
+at run time, and fetches the tailwind and esbuild standalone binaries at pinned versions and
+checksums into `/opt/assets` — those two are never downloaded by their libraries, whose own
+downloaders would bypass the toolchain's TLS configuration. The offline dependency caches are
+warmed during the image build from the committed manifests alone: `mix deps.get` fills the Hex
+package cache inside the image, every git dependency in `mix.lock` is mirrored into the image and
+rewritten to its mirror, and one throwaway compile of the dependency tree captures what any
+dependency would otherwise fetch at compile time (the precompiled NIF tarball `lazy_html` uses).
+A dependency change therefore means rebuilding the builder, exactly as it does for `datad`.
+
+There are two invocation modes, because the offline discipline and the development experience pull
+in opposite directions:
+
+- **`make ctrld-test`** — the gate. It runs with the network disabled and the same container
+  hardening as the datad gate, and holds the committed lockfile (`mix deps.get --check-locked`),
+  formatting (`mix format --check-formatted`), a warning-free compile
+  (`mix compile --warnings-as-errors`), and the test suite (`mix test`). The asset binaries are
+  provisioned from the image: the provisioning step asks the project which versions it expects and
+  refuses if the image does not carry them, so the pin and `config/config.exs` cannot drift apart
+  silently.
+- **`make ctrld-server`** — interactive development. It carries the host network so the LiveView
+  server is reachable and prints the URL to use; on a Cloud Developer Machine that is the
+  machine's port-proxy origin for port 4000, never a bare localhost address. Dependencies still
+  resolve offline from the image caches.
 
 ## Landing changes
 
@@ -64,13 +102,14 @@ Commits go straight to `trunk`; there are no long-lived branches, no remote feat
 no pull requests. Install the git hooks once per worktree with `make hooks` — it points
 `core.hooksPath` at `.githooks`, which git resolves relative to each worktree:
 
-- **pre-commit** runs `make test` — the fast host gate. It does not boot QEMU, so it stays fast.
+- **pre-commit** runs `make test` — both fast gates. It does not boot QEMU, so it stays fast.
 - **pre-push** runs `make ci` — the complete gate.
 
 The two hooks do not cover the same commits, and the difference is worth knowing before trusting a
-bisect. Every commit reaching `trunk` has passed the fast host gate — formatting, lints, the host
-tests and their coverage floors, the budget ratchets, the system-description, reference-chapter and
-configuration-document checks, and dependency policy — while the full gate runs once per push,
+bisect. Every commit reaching `trunk` has passed both fast gates — the ctrld gate, and the datad
+host gate's formatting, lints, host tests and their coverage floors, the budget ratchets, the
+system-description, reference-chapter and configuration-document checks, and dependency policy —
+while the full gate runs once per push,
 against the tip. A push carrying several commits therefore leaves the intermediate ones qualified
 by pre-commit alone, so a bisect may land on a commit that was never booted. Do not bypass the
 hooks; a finding is fixed, not skipped. Commit subjects follow Conventional Commits
@@ -199,13 +238,14 @@ development-signed image can never be mistaken for a production one.
 All commands force Podman's `cgroupfs` manager. Override `PODMAN` only to select a compatible
 Podman executable; Docker is not a supported build interface.
 
-On a development machine behind a TLS-inspecting proxy, the build automatically detects an
-installed inspection CA (a `*-dpi-ca.crt` under `/usr/local/share/ca-certificates/`) and provides
+On a development machine behind a TLS-inspecting proxy, both builder builds automatically detect an
+installed inspection CA (a `*-dpi-ca.crt` under `/usr/local/share/ca-certificates/`) and provide
 it as a Podman build secret. On another inspected network, or to select a specific certificate,
 pass its path explicitly:
 
 ```sh
 make image ENTERPRISE_CA_FILE=/path/to/enterprise-ca.pem
+make ctrld-image ENTERPRISE_CA_FILE=/path/to/enterprise-ca.pem
 ```
 
 The CA reaches only the build steps that fetch dependencies, and the bundle each of them derives is
@@ -215,9 +255,10 @@ enabled for every download. Never commit the certificate — or any other key ma
 ## Repository layout
 
 The repository holds a two-component product. `datad/` is the appliance: the Rust seL4/Microkit
-system and its entire build. `ctrld/` is the management server component, an Elixir application
-arriving separately. The book, `README.md`, and `LICENSE.md` stay at the repository root and cover
-both components.
+system and its entire build. `ctrld/` is the management server: an Elixir/Phoenix application laid
+out the way Phoenix projects are (`mix.exs`, `config/`, `lib/`, `test/`, `assets/`, `priv/`), with
+its pinned builder under `ctrld/build/` and its pinned inputs in `ctrld/third-party/`. The book,
+`README.md`, and `LICENSE.md` stay at the repository root and cover both components.
 
 Inside `datad/`, directories have fixed purposes; they grow as real functionality lands, and no
 empty placeholders are created.
