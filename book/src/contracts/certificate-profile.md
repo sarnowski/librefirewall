@@ -49,9 +49,16 @@ that decision in the [management design](../design/management.md#lifecycle-rules
 
 The CA certificate carries `basicConstraints` critical, `CA:true`, path length zero — it signs
 end-entity certificates and nothing signs below it. The other three carry `basicConstraints`
-critical, `CA:false`. The channel endpoint certificate's subject alternative name is the endpoint IP
-address, because the appliance dials an address literal and validates the certificate against what
-it dialed.
+critical, `CA:false`. Key usage is marked critical on all four, as the certificate profile standard
+asks of it.
+
+The channel endpoint certificate's subject alternative name is the endpoint IP address, because the
+appliance dials an address literal and validates the certificate against what it dialed. It carries
+one address per name, and a management server reachable at several addresses issues itself a
+certificate naming each of them — the certificate covers every address any appliance is told to
+dial, and an address no certificate names is an address no appliance can reach. Adding one is a
+re-issuance of the endpoint certificate, which is an ordinary server-side operation; it is not a
+change to an appliance's delivered endpoint, which no operation reaches.
 
 ## The certificate signing request
 

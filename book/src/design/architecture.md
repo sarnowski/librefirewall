@@ -288,23 +288,29 @@ default, not the kernel. The work splits into three tiers, and only one touches 
 
 **The CPU baseline is a product requirement**, decided as such: **AES-NI, PCLMULQDQ, ADX and BMI2
 are mandatory and compile-time enabled**, together with SSE through SSE4.2 — universal on modern
-parts. **SHA-NI is runtime-detected via CPUID, never compile-time enabled**: it arrived with AMD
-Zen 1 and Intel Ice Lake, so enabling it unconditionally would exclude Haswell- and Skylake-era
-Xeons still in service — and this is not a preference, because compile-time-enabling a feature the
-CPU lacks is an illegal-instruction fault on first use, not a slow path.
+parts. **SHA-NI is never compile-time enabled**: it arrived with AMD Zen 1 and Intel Ice Lake, so
+enabling it unconditionally would exclude Haswell- and Skylake-era Xeons still in service — and this
+is not a preference, because compile-time-enabling a feature the CPU lacks is an illegal-instruction
+fault on first use, not a slow path. It is therefore a runtime-detected feature by design, and
+today it is unreached: the adopted primitives' runtime probe is inert on a target that declares no
+operating system, and that same inertness is what keeps the AVX2 paths in those crates from being
+selected on a kernel whose saved state does not include YMM — where the failure would be silent
+corruption across a context switch rather than a fault. Reaching SHA-NI without reaching AVX2 needs
+either a per-crate backend selection or the wider save area of the deferred tier; until one of them
+exists, hashing runs the portable path, which the channel can afford because nothing bulk depends on
+it. What the shipped image actually detects and measures is reported by the cryptography domain on
+every boot.
 
 **Scalar cryptography cannot serve the inspection product**, and for a reason worse than raw speed:
 on the inspected path the appliance does not choose the cipher — the client does, and clients
 overwhelmingly prefer AES-GCM precisely because they have AES-NI. "Just use ChaCha20" is available
 for the management channel, where both ends are ours, and unavailable for traffic inspection. The
-orders of magnitude, from literature and vendor figures — **not measurements on this stack**, and
-replacing them with measured numbers on the shipped image is tracked in the
-[development status](../status.md): 10 Gbit/s of inspection is roughly 2.5 GB/s of AEAD (decrypt
-plus re-encrypt) before any deep inspection; AES-GCM with AES-NI and PCLMULQDQ runs in the
-single-digit GB/s per core, fitting that budget in about one core; fully scalar ChaCha20-Poly1305
-sits around five to seven cycles per byte, roughly five cores; and constant-time AES *without*
-AES-NI is worse still — the classic bitsliced results are around seven cycles per byte, and that is
-with SSSE3.
+orders of magnitude: 10 Gbit/s of inspection is roughly 2.5 GB/s of AEAD (decrypt plus re-encrypt)
+before any deep inspection, which accelerated AES-GCM fits in about one core, while a fully scalar
+stream cipher costs several and constant-time AES without AES-NI costs more still. Those figures are
+what the baseline was decided against; the appliance's own per-primitive numbers come off the
+shipped image on every boot, and what they do **not** settle is the whole-path throughput target,
+which needs bare metal and an external traffic generator rather than a virtual machine.
 
 **Where the `unsafe` for a hardware instruction lives: the protection domain, not a portable
 crate.** A crate that reached for CPUID or a hardware instruction could not be host-tested, so the

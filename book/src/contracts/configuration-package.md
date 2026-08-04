@@ -65,7 +65,10 @@ name:
   path prefix, no `./`, no name derived from the `prefix` field.
 - **Bounded throughout.** The whole archive is bounded at **128 KiB**; each member at the bound in
   the table; the member count at exactly four. Every size field is parsed as bounded octal and
-  checked against the bytes actually present, and each header's checksum must verify.
+  checked against the bytes actually present, and each header's checksum must verify. The archive
+  bound is the outer one a reader applies to bytes it has not yet parsed: the four member bounds
+  together are smaller, so a well-formed package never approaches it, and a writer that composes one
+  to this page can never produce one that exceeds it.
 - **Every violation is a typed refusal** naming what was refused, and refusal installs nothing.
 
 The tar reader is a new parser on an external-input path and is held to the standard for one: typed
