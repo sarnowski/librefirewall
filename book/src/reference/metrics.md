@@ -9,8 +9,8 @@ debug dump, scrapably and without degrading the dataplane.
 contract — its type, its labels and the domains that publish it. It reaches the dataplane's verdict
 and throughput counters, each NIC's own faults and losses, buffer-pool ownership, the management
 port's endpoint and its TCP and HTTP layers, the block device under the recordings and the two
-recordings themselves, the console path's losses, the applied-configuration state and the clock, and
-the identity of each configured interface.
+recordings themselves, the console path's losses, the applied-configuration state and the clock,
+the hardware probe's verdict, and the identity of each configured interface.
 
 **Counter semantics (binding).** Every counter is **monotonic for the protection domain's life** and
 **saturates** rather than wrapping. There is no reset: a scraper derives a rate by differencing
@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-94 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 345 counter and gauge series from the nine shards, plus
+97 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 350 counter and gauge series from the ten shards, plus
 one info series per configured interface and one hit counter per rule the running policy declares,
-and the document they render into is bounded at 79 496 bytes — a worst case computed from these
+and the document they render into is bounded at 81 075 bytes — a worst case computed from these
 tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -198,8 +198,8 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_console_records_total` | counter | `console` | `outcome`&nbsp;(`malformed`, `printed`, `unknown`, `unrenderable`, `write_failed`) | Records the console path resolved, by outcome; each outcome accuses a different party. |
-| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain could not publish because its ring had no slot. |
-| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `forwarder`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
+| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain could not publish because its ring had no slot. |
+| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
 | `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. Non-zero means this node has no console: the domain publishes its shard from the refusal path so that a scrape can say so. |
 | `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
@@ -396,12 +396,24 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 | `librefirewall_configuration_reads_total` | counter | `config` | — | Times the running configuration document was read out of this node. |
 | `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`) | Documents submitted to this node over the management API, by what the configuration domain decided: `applied` moved the generation, `unchanged` was the configuration already running, `refused` broke a rule and changed nothing. |
 
+### The hardware probe
+
+The domain compiled with the SIMD target reports its verdict here as well as on the console, so a
+scrape can answer whether this node proved the hardware-cryptography profile without a serial
+capture. The three families are written once, when the probe parks, and never move again.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_hardware_probe_proven` | gauge | `hardware_probe` | — | 1 once the AES and carry-less-multiply known answers held on every pass and the XMM pattern survived every preemption the probe observed; 0 before, and forever on a node that refused. |
+| `librefirewall_hardware_probe_iterations_total` | counter | `hardware_probe` | — | Probe passes run before the verdict; each re-ran both known answers and re-checked the XMM pattern. |
+| `librefirewall_hardware_probe_preemptions_total` | counter | `hardware_probe` | — | Preemptions the probe observed as timestamp-counter gaps while its XMM state was live. |
+
 **No series counts unsynchronized records, and that is deliberate.** Whether a domain has a
 calibration is visible on each record it emits — `time=unsynchronized` against an instant — so such
 a counter would restate, at lower resolution, something the records already carry one by one.
 `librefirewall_clock_frequency_hertz` says what this node measured and
 `librefirewall_clock_generation` says which calibration the management domain converts
-with; the seven other writing domains publish no such gauge, so *which* of them has taken the
+with; the eight other writing domains publish no such gauge, so *which* of them has taken the
 calibration up is answerable from the log stream and not from a scrape. That is a gap, it is small,
 and it is named here rather than closed with a series nothing needs.
 

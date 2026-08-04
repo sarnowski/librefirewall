@@ -1,0 +1,19 @@
+[package]
+# The program image the system description names is `hardware-probe.elf`. This
+# is the one protection domain built with the hardfloat, SSE-enabled target
+# specification (support/targets/x86_64-sel4-simd.json) rather than the
+# softfloat minimal one every other domain uses.
+name = "hardware-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sel4-microkit.workspace = true
+lfw-log = { path = "../../crates/log" }
+lfw-metrics = { path = "../../crates/metrics" }
+pd-runtime = { path = "../../crates/pd-runtime" }
+wire = { path = "../../crates/wire" }
+
+[lints]
+workspace = true

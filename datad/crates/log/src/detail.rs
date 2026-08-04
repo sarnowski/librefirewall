@@ -160,6 +160,16 @@ pub enum DomainDetail<C = &'static str> {
         start_sector: u64,
         sectors: u64,
     },
+    /// What the hardware probe proved about this part: the AES and carry-less
+    /// multiply known answers held on every pass, and a live XMM pattern
+    /// survived each preemption the counter gaps below observed. The two
+    /// counts travel together because the claim is only as strong as the
+    /// preemptions it was checked across — an unpreempted pass proves the
+    /// instructions and nothing about the state the kernel saves.
+    Proven {
+        preemptions: u64,
+        iterations: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.
@@ -325,6 +335,10 @@ mod tests {
             DomainDetail::Established {
                 tsc_hz: NonZeroU64::MIN,
                 utc: lfw_clock::UtcNanos::from_unix_nanos(0),
+            },
+            DomainDetail::Proven {
+                preemptions: 0,
+                iterations: 0,
             },
             DomainDetail::Refusal(Refusal {
                 cause: "",

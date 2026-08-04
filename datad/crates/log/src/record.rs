@@ -360,6 +360,13 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Extent.to_bits();
                     record.operands = [*start_sector, *sectors];
                 }
+                DomainDetail::Proven {
+                    preemptions,
+                    iterations,
+                } => {
+                    record.detail = LogDetailKind::Proven.to_bits();
+                    record.operands = [*preemptions, *iterations];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -487,6 +494,14 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             start_sector: *start_sector,
             sectors: *sectors,
         },
+        // And here: two counts the emitting domain claims about its own run.
+        CheckedDetail::Proven {
+            preemptions,
+            iterations,
+        } => DomainDetail::Proven {
+            preemptions: *preemptions,
+            iterations: *iterations,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -541,6 +556,13 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     } => DomainDetail::Extent {
                         start_sector,
                         sectors,
+                    },
+                    DomainDetail::Proven {
+                        preemptions,
+                        iterations,
+                    } => DomainDetail::Proven {
+                        preemptions,
+                        iterations,
                     },
                     DomainDetail::Refusal(Refusal {
                         cause,

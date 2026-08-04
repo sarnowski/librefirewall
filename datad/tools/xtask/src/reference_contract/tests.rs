@@ -77,7 +77,7 @@ fn minted(files: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// The four domains' sites as they are declared, each holding one token, so a
+/// The five domains' sites as they are declared, each holding one token, so a
 /// case can add or remove exactly one thing.
 fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
     vec![
@@ -88,6 +88,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/recorder/src/main.rs", &["staging-region-dma-base"]),
         ("pds/clock/src/main.rs", &["hpet-not-present"]),
         ("pds/management/src/main.rs", &["rdrand-exhausted"]),
+        ("pds/hardware-probe/src/main.rs", &["aes-not-supported"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/wire/src/lib.rs", &["source-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
@@ -108,6 +109,7 @@ fn sound_console() -> String {
                 "staging-region-dma-base",
             ],
         ),
+        ("hardware-probe", &["aes-not-supported"]),
     ])
 }
 
@@ -204,6 +206,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
                 "queue-too-small",
             ],
         ),
+        ("hardware-probe", &["aes-not-supported"]),
     ]);
     let findings = cause_findings(&sites, &console);
     assert!(findings.is_empty(), "{findings:#?}");
@@ -263,14 +266,14 @@ fn a_stated_per_domain_count_that_disagrees_with_its_own_table_is_a_finding() {
 #[test]
 fn a_stated_table_count_that_disagrees_with_the_tables_present_is_a_finding() {
     let console = sound_console().replace(
-        "four tables together are the complete set",
         "five tables together are the complete set",
+        "six tables together are the complete set",
     );
     let findings = cause_findings(&sound_sites(), &console);
     let joined = findings.join("\n");
-    assert!(joined.contains("4 refusal-cause table(s)"), "{joined}");
+    assert!(joined.contains("5 refusal-cause table(s)"), "{joined}");
     assert!(
-        joined.contains("the four tables together are the complete set"),
+        joined.contains("the five tables together are the complete set"),
         "{joined}"
     );
 }

@@ -1217,7 +1217,8 @@ operator's console.
 Every end-to-end scenario now boots the **release** image, and two of the 16 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
-the harness injected. Both halves were needed to make the defect non-recurring: a missing
+the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
+probe's record to its proof — `aes=proven`, `pclmul=proven`, and at least one observed preemption. Both halves were needed to make the defect non-recurring: a missing
 console went unnoticed because no gate on the push path booted a release artifact at all, and
 because the one stage that did booted it against the forwarding contract alone — and a dataplane is
 indifferent to whether anything is printed.
@@ -1311,8 +1312,8 @@ judges over every channel at once.
 
 - **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
   no `ready`, no failure — so the [console reference](../reference/console.md)'s "each stage
-  reporting healthy or the specific fault" holds for the driver, configuration, clock, management
-  and recorder domains and not for the one that carries traffic. (The management domain gained a
+  reporting healthy or the specific fault" holds for the driver, configuration, clock, management,
+  recorder and hardware-probe domains and not for the one that carries traffic. (The management domain gained a
   refusal path with its transport: it refuses to start at all when the hardware will not produce a
   per-boot secret for its sequence numbers, reports a published calibration it will not use without
   refusing to run, and — new with the recordings — reports an endpoint that could not register both
@@ -1590,11 +1591,11 @@ established one.
 
 ## Prometheus metrics
 
-**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 80
-metric families and 271 counter and gauge series, plus one info series per configured interface and
-one hit counter per rule the running policy declares — covering every one of the nine protection
+**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 97
+metric families and 350 counter and gauge series, plus one info series per configured interface and
+one hit counter per rule the running policy declares — covering every one of the ten protection
 domains. Its worst case is computed from the catalogue at build time (`MAX_EXPOSITION_LEN`,
-68 016 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
+81 075 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
 scrape can never be short. That bound is dominated by the rules: it covers a policy naming all 256
 the configuration accepts, so it is sized by what an operator is entitled to write rather than by
 what a node happens to be running. The end-to-end gate scrapes it with `curl` off a booted release
@@ -1699,7 +1700,7 @@ published clock does not run ahead by the cost of reading the part.
 
 **Every domain consumes it, and every structured record carries an instant.** The calibration goes
 into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
-clock domain maps read-write and the other seven read-only. Each reads `RDTSC` itself — one
+clock domain maps read-write and the other nine read-only. Each reads `RDTSC` itself — one
 unprivileged instruction, behind the single `unsafe` seam in `pd_runtime::read_timestamp_counter` —
 converts it with the published triple, and stamps the record it is about to emit, so an instant is
 this node's own arithmetic over one counter rather than a value passed between domains. The console
@@ -1734,7 +1735,7 @@ calibration that is torn under the read or outside the band it accepts, having r
   against an external log to about a second, and is evidence of nothing.
 - **No metric says which domain has taken the calibration up.** It is readable per record on the log
   stream (`time=unsynchronized` against an instant) and `/metrics` carries the gauge for the
-  management domain alone; the other seven writing domains publish no such series (see the
+  management domain alone; the other eight writing domains publish no such series (see the
   [metrics reference](../reference/metrics.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
   never corrected; there is no timer, no interrupt, and no second reading to drift against.
@@ -1747,9 +1748,9 @@ calibration that is torn under the read or outside the band it accepts, having r
 
 ## Protection-domain decomposition
 
-**What exists.** Nine protection domains from seven binaries (one forwarder, one configuration
-domain, one console, one clock, one management domain, one recorder, three driver instances of
-one driver binary) with real, verifiable least privilege: the forwarder holds no device capability
+**What exists.** Ten protection domains from eight binaries (one forwarder, one configuration
+domain, one console, one clock, one management domain, one recorder, one hardware probe, three
+driver instances of one driver binary) with real, verifiable least privilege: the forwarder holds no device capability
 at all and neither dataplane pipeline's `free` ring — so it cannot hand a live DMA target back to
 be issued a second time — and each driver sees only its own ECAM page, BAR, virtqueue region, and
 its two pipelines. Each pipeline is three memory regions rather than one precisely so that those
@@ -2031,7 +2032,7 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all seven protection-domain binaries in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all eight protection-domain binaries — the hardware probe against its own SIMD target — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 24 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (16 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |

@@ -46,8 +46,8 @@ pub fn read_timestamp_counter() -> Ticks {
     // SAFETY: `_rdtsc` requires only that the instruction execute, which is two
     // facts neither this crate nor any first-party one provides. The target is
     // the guarantor of the first — `RDTSC` has been architectural on x86_64
-    // since the ISA existed, and `support/targets/x86_64-sel4-minimal.json`
-    // targets nothing else. The seL4 kernel is the guarantor of the
+    // since the ISA existed, and both specifications under `support/targets`
+    // target x86_64 and nothing else. The seL4 kernel is the guarantor of the
     // second: it leaves `CR4.TSD` clear, which is what makes the instruction
     // unprivileged in a protection domain. That is third-party runtime
     // behaviour, recorded rather than asserted — and it is the one step of this

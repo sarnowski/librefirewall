@@ -222,6 +222,22 @@ fn a_domain_record_carries_each_detail_shape() {
         })
     ));
 
+    let proven = LogRecord {
+        detail: LogDetailKind::Proven.to_bits(),
+        operands: [3, 90_000],
+        ..domain_record()
+    };
+    assert!(matches!(
+        proven.body(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Proven {
+                preemptions: 3,
+                iterations: 90_000,
+            },
+            ..
+        })
+    ));
+
     let Ok(CheckedBody::Domain {
         detail:
             CheckedDetail::Refusal {
@@ -645,10 +661,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 8,
+                detail: 9,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 8 },
+            LogRecordError::DetailKindUnknown { detail: 9 },
         ),
         // The one detail whose own field can refuse it: a frequency of zero
         // scales no reading, so it is refused rather than carried on as a
@@ -917,7 +933,7 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 7",
+            "domain token 4 is not below 8",
             "state token 4 is not below 4",
             "detail kind 7 names no payload",
             "the established counter frequency is zero, which scales no reading",
@@ -961,10 +977,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Received,
         LogDetailKind::Medium,
         LogDetailKind::Extent,
+        LogDetailKind::Proven,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(8), None);
+    assert_eq!(LogDetailKind::from_bits(9), None);
 
     for value in [
         LogValueKind::Absent,
@@ -1002,7 +1019,7 @@ fn plausible_record() -> BoxedStrategy<LogRecord> {
     (
         prop_oneof![9 => 0u32..=3, 1 => any::<u32>()],
         prop_oneof![9 => 0u8..=3, 1 => any::<u8>()],
-        prop_oneof![9 => 0u8..=5, 1 => any::<u8>()],
+        prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![9 => 0u8..=8, 1 => any::<u8>()],
         prop_oneof![7 => 1u8..=16, 2 => 0u8..=40, 1 => any::<u8>()],

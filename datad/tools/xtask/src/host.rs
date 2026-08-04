@@ -350,6 +350,36 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
                 .args(["--", "-D", "warnings"]),
             &format!("lint protection domains for seL4 ({config} kernel configuration)"),
         )?;
+        // The SIMD protection domains, against their own target, exactly as
+        // `image::assemble` builds them: a lint of the softfloat compilation
+        // would prove nothing about the binary that ships.
+        run_command(
+            Command::new("cargo")
+                .current_dir(root)
+                .env("SEL4_INCLUDE_DIRS", &include_dir)
+                .env(
+                    "CARGO_TARGET_DIR",
+                    root.join("target/lint-sel4").join(config),
+                )
+                .env(
+                    image::CONFIG_PATH_VAR,
+                    root.join(image::CONFIGURATION_DOCUMENT),
+                )
+                .args([
+                    "clippy",
+                    "--locked",
+                    "--release",
+                    "-Z",
+                    "build-std=core",
+                    "-Z",
+                    "build-std-features=compiler-builtins-mem",
+                    "--target",
+                    image::SIMD_TARGET,
+                ])
+                .args(image::SIMD_SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd]))
+                .args(["--", "-D", "warnings"]),
+            &format!("lint SIMD protection domains for seL4 ({config} kernel configuration)"),
+        )?;
     }
     Ok(())
 }
@@ -935,6 +965,34 @@ mod tests {
                 ),
             },
         ),
+        (
+            "hardware-probe",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and \
+                                `probe_contract.rs` judges the `LFW-PD domain=hardware-probe` \
+                                record its serial output carries on every console-judged \
+                                scenario: exactly one `state=ready` with `aes=proven`, \
+                                `pclmul=proven` and at least one observed preemption. No boot \
+                                can produce that record without this domain — the one binary \
+                                compiled with the hardfloat SIMD target — having been loaded by \
+                                Microkit, executed `AESENC` and `PCLMULQDQ` against their known \
+                                answers on every pass, and re-checked a live XMM value across \
+                                the preemptions it observed; a refusal reaches the same channel \
+                                with its cause and fails the same judge. `xtask test-ab` boots \
+                                the slot it selected through the same image.",
+                residue: Some(
+                    "The feature-gate refusals and both known-answer mismatch arms are reached \
+                     by no QEMU test: the harness pins the guest CPU to a model carrying every \
+                     gated feature, so only the accepting path ever runs. That is first-party \
+                     decision logic sitting in a PD where neither the host floor nor the QEMU \
+                     gate can measure it — a layering defect shared with the other domains' \
+                     refusal translations — and it is kept here deliberately: the portable part \
+                     is a handful of bit tests and two constant comparisons, and a library crate \
+                     for them would buy one host test at the cost of a coverage-floored crate \
+                     whose whole content is this file's constants restated.",
+                ),
+            },
+        ),
         ("xtask", CoverageExclusion::BuildOrchestration),
     ];
 
@@ -1009,20 +1067,20 @@ mod tests {
         let root = crate::util::workspace_root().expect("the workspace root");
         for (name, directory) in members_of_the_whole_workspace(&root) {
             let package = name.as_str();
-            match (
-                HOST_TEST_PACKAGES.contains(&package),
-                image::SYSTEM_PDS.contains(&package),
-            ) {
+            let is_pd =
+                image::SYSTEM_PDS.contains(&package) || image::SIMD_SYSTEM_PDS.contains(&package);
+            match (HOST_TEST_PACKAGES.contains(&package), is_pd) {
                 (true, false) | (false, true) => {}
                 (false, false) => panic!(
                     "{directory} ({package}) is a workspace member that no build list names. \
                      HOST_TEST_PACKAGES does not, so no host command builds, tests or lints it; \
-                     SYSTEM_PDS does not, so it is neither assembled into the image nor linted \
-                     for the seL4 target. Add it to HOST_TEST_PACKAGES, or — if it is a \
-                     protection domain, which does not build for the host — to SYSTEM_PDS."
+                     neither SYSTEM_PDS nor SIMD_SYSTEM_PDS does, so it is neither assembled \
+                     into the image nor linted for a seL4 target. Add it to HOST_TEST_PACKAGES, \
+                     or — if it is a protection domain, which does not build for the host — to \
+                     SYSTEM_PDS or SIMD_SYSTEM_PDS."
                 ),
                 (true, true) => panic!(
-                    "{directory} ({package}) is in both HOST_TEST_PACKAGES and SYSTEM_PDS. A \
+                    "{directory} ({package}) is in HOST_TEST_PACKAGES and in a PD list. A \
                      protection domain does not build for the host, so the two are exclusive: \
                      remove it from whichever describes it wrongly."
                 ),
@@ -1147,6 +1205,7 @@ mod tests {
             .iter()
             .chain(LIBRARY_PACKAGES)
             .chain(image::SYSTEM_PDS)
+            .chain(image::SIMD_SYSTEM_PDS)
             .chain(BENCH_PACKAGES)
             .chain(COVERAGE_EXCLUSIONS.iter().map(|(name, _)| name))
         {

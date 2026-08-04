@@ -52,20 +52,20 @@
 "crates/ip-endpoint/src/http.rs" = 0.3402
 "crates/ip-endpoint/src/lib.rs" = 0.3183
 "crates/log/src/console.rs" = 0.5084
-"crates/log/src/detail.rs" = 0.3990
-"crates/log/src/event.rs" = 0.2997
+"crates/log/src/detail.rs" = 0.4089
+"crates/log/src/event.rs" = 0.2987
 "crates/log/src/identifier.rs" = 0.2775
 "crates/log/src/lib.rs" = 0.4065
-"crates/log/src/record.rs" = 0.1574
-"crates/log/src/render.rs" = 0.1711
+"crates/log/src/record.rs" = 0.1537
+"crates/log/src/render.rs" = 0.1799
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
-"crates/metrics/src/catalog.rs" = 0.1415
+"crates/metrics/src/catalog.rs" = 0.1386
 "crates/metrics/src/interfaces.rs" = 0.3625
-"crates/metrics/src/lib.rs" = 0.5773
+"crates/metrics/src/lib.rs" = 0.5744
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
-"crates/metrics/src/sample.rs" = 0.0949
+"crates/metrics/src/sample.rs" = 0.0936
 "crates/net-headers/src/lib.rs" = 0.2117
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -103,7 +103,7 @@
 "crates/wire/src/download.rs" = 0.3633
 "crates/wire/src/image.rs" = 0.3106
 "crates/wire/src/lib.rs" = 0.2660
-"crates/wire/src/log_record.rs" = 0.2211
+"crates/wire/src/log_record.rs" = 0.2217
 "crates/wire/src/log_ring.rs" = 0.4271
 "crates/wire/src/log_slot.rs" = 0.1088
 "crates/wire/src/submission.rs" = 0.3286
@@ -113,10 +113,11 @@
 "pds/clock/src/main.rs" = 0.4107
 "pds/config/src/main.rs" = 0.4016
 "pds/console/src/com1.rs" = 0.6400
-"pds/console/src/main.rs" = 0.5115
+"pds/console/src/main.rs" = 0.5038
 "pds/forwarder/src/main.rs" = 0.4667
+"pds/hardware-probe/src/main.rs" = 0.4108
 "pds/management/src/entropy.rs" = 0.6489
-"pds/management/src/main.rs" = 0.5012
+"pds/management/src/main.rs" = 0.5000
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3055
 
@@ -149,6 +150,7 @@
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
+"pds/hardware-probe" = 1
 "pds/management" = 1
 "pds/nic-driver" = 4
 "pds/recorder" = 5
@@ -182,6 +184,7 @@
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
+"pds/hardware-probe" = 0
 "pds/management" = 0
 "pds/nic-driver" = 0
 "pds/recorder" = 0
@@ -215,6 +218,7 @@
 "pds/config" = 0
 "pds/console" = 0
 "pds/forwarder" = 0
+"pds/hardware-probe" = 0
 "pds/management" = 0
 "pds/nic-driver" = 0
 "pds/recorder" = 0

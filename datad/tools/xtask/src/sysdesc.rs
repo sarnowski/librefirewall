@@ -256,7 +256,7 @@ const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It ha
      domain that rewrites a header must reach the bytes";
 
 /// As [`POOL_WITHHELD`], for the log transport — the exclusion that holds
-/// between the eight writing domains, and the one thing about a log region that
+/// between the nine writing domains, and the one thing about a log region that
 /// is a mapping rather than an authority.
 ///
 /// What each pair's *perms* withhold is a different argument and is not stated
@@ -756,6 +756,7 @@ const REGIONS: &[RegionRule] = &[
             read_only("config"),
             read_only("console"),
             read_only("forwarder"),
+            read_only("hardware_probe"),
             read_only("management"),
             read_only("nic_driver0"),
             read_only("nic_driver1"),
@@ -1048,11 +1049,31 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("config"), read_write("console")],
         withheld: Some(LOG_WITHHELD),
     },
+    RegionRule {
+        name: "log_hardware_probe",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("hardware_probe"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_hardware_probe_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("hardware_probe"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
     // The metric shards: one per protection domain, each with exactly one
-    // writer and — for the seven that are not the reader's own — exactly one
+    // writer and — for the nine that are not the reader's own — exactly one
     // reader. The perms carry the whole argument, as `cfg`'s do: the management
     // domain renders every one of these into the exposition an operator scrapes,
-    // so it must read all eight, and a grant that let it *write* one would let
+    // so it must read all ten, and a grant that let it *write* one would let
     // the domain an attacker reaches first forge a clean line for a port that is
     // dropping every frame.
     RegionRule {
@@ -1084,8 +1105,8 @@ const REGIONS: &[RegionRule] = &[
         withheld: Some(STATS_WITHHELD),
     },
     // The one region in this description with a single mapper, and it is a
-    // decision: the renderer walks one uniform array of eight shards rather than
-    // seven regions plus a live read of its own counters, so a scrape is one set
+    // decision: the renderer walks one uniform array of ten shards rather than
+    // nine regions plus a live read of its own counters, so a scrape is one set
     // of numbers taken at one publish. It costs no cross-domain authority, which
     // is why "exactly one mapper" is the rule rather than a finding.
     RegionRule {
@@ -1123,10 +1144,17 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_write("recorder"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
+    RegionRule {
+        name: "stats_hardware_probe",
+        size: STATS_SIZE,
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("hardware_probe"), read_only("management")],
+        withheld: Some(STATS_WITHHELD),
+    },
 ];
 
-/// Every shard is one page of the same type, so the eight rules share one
-/// expectation rather than restating it eight times.
+/// Every shard is one page of the same type, so the ten rules share one
+/// expectation rather than restating it ten times.
 const STATS_SIZE: ExpectedSize = ExpectedSize {
     rust_name: "lfw_metrics::STATS_REGION_SIZE",
     bytes: STATS_REGION_SIZE,
@@ -1137,7 +1165,7 @@ const STATS_SIZE: ExpectedSize = ExpectedSize {
 const STATS_WITHHELD: &str = "one writer and one reader per shard, and every other domain maps \
      none of it in either direction. A domain that could write another's shard could make a port \
      that is dropping every frame report a clean line — and the reader is the domain that faces \
-     the management-plane attacker, so its grant is READ-ONLY on all seven that are not its own: \
+     the management-plane attacker, so its grant is READ-ONLY on all nine that are not its own: \
      a `/metrics` surface it could edit would let a compromise of it hide the compromise. The \
      console in particular maps no shard but its own, which is the same exclusion the log rings \
      already make one step further: there it cannot forge a record, here it cannot forge a \
@@ -1266,6 +1294,7 @@ const DOMAINS: &[&str] = &[
     "clock",
     "management",
     "recorder",
+    "hardware_probe",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is
@@ -2964,7 +2993,7 @@ mod tests {
 
     #[test]
     fn a_writer_reaching_another_writers_ring_is_reported() {
-        // What the eight rows isolate *between* writers, which is a mapping
+        // What the nine ring pairs isolate *between* writers, which is a mapping
         // rather than an authority and so is the one thing about a log region
         // the `withheld` claim has to say. A compromised parser domain that
         // could read a driver's ring would learn what it had said about itself;

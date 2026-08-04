@@ -30,13 +30,13 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
-**`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`**, **`recorder`** — the
-domain names in the Microkit system description, seven tokens against nine domains because the
-driver runs as three instances that share one token. **A `nic-driver` record therefore does not say
+**`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`**, **`recorder`**,
+**`hardware-probe`** — the domain names in the Microkit system description, eight tokens against
+ten domains because the driver runs as three instances that share one token. **A `nic-driver` record therefore does not say
 which port it is about**, and nothing on this surface does: three instances publish into three rings
 the console interleaves, so the driver's records are not one port's transcript. `/metrics` is where
 the instances are separate, as `domain="nic_driver0"`, `1` and `2` (see
@@ -55,6 +55,7 @@ written waits forever:
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
 | `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
+| `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -196,10 +197,11 @@ node: an operator holding a silent appliance still has only the external act.
 
 ## `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the four tables together are the complete set: 23 the
-`nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, and 39
-the `recorder` domain raises. A token outside all four is a defect, not an extension. The
-`forwarder` and `console` domains raise none, having no `refused` record.
+Every `cause=` token is listed below and the five tables together are the complete set: 23 the
+`nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
+the `recorder` domain raises, and 12 the `hardware-probe` domain raises. A token outside all five
+is a defect, not an extension. The `forwarder` and `console` domains raise none, having no
+`refused` record.
 
 **`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
 are virtio 1.0 PCI device classes and both run the same handshake in the same order, so a
@@ -302,6 +304,22 @@ whole of the refusal there.
 | the queue and its doorbell | `dma-region-unusable` (paddr), `queue-absent` (offered, required), `queue-size-zero` (index), `queue-too-small` (device maximum, required), `doorbell-outside-bar` (slot end, BAR size — or BAR size alone where the offset overflowed), `doorbell-misaligned` (offset) |
 | the proof of the medium (`signalled=false` throughout; `detail=` numbers are hexadecimal like every other refusal's, so a byte count reads as `0x200`) | `block-device-too-small` (capacity, sectors needed), `block-probe-refused` / `block-witness-refused` (which submit refusal, as a small code), `block-probe-silent` / `block-witness-silent` (the poll budget spent), `block-probe-misattributed` / `block-witness-misattributed` (no `detail=`), `block-probe-failed` / `block-witness-failed` (the outcome, `0x1` device error, `0x2` unsupported, `0x1nn` an undefined status byte `nn`), `block-probe-short` / `block-witness-short` (bytes moved, bytes asked for) |
 | the recordings on it (`signalled=true` throughout, and see above for what that does not mean) | `recording-extent-unusable` (the numbers the geometry rule that refused names: the extent's first sector and the device's capacity, or one count of sectors, bytes or segments), `recording-sink-unusable` (no `detail=`) |
+
+**`hardware-probe`.** The first three groups are the CPUID feature gate, run before the first probe
+instruction: a part below the product's compile-time CPU baseline refuses with the feature word an
+operator compares against the part's documentation, rather than taking an invalid-opcode fault on
+first use. The gate is best effort by nature — the compiler may place a compile-time-enabled
+instruction before it, and such a part faults instead of refusing — so a refusal here is the
+orderly form of the same diagnosis. The last group is the probe itself: an instruction that
+executed and answered wrongly, or a live XMM value that did not survive a context switch, each
+carrying the observed 128-bit value as its two 64-bit halves, low half first. `signalled=` is
+always `false` on this domain: there is no device here to be told anything.
+
+| group | tokens |
+|---|---|
+| the XMM feature gate (`detail=` is `CPUID.01H:ECX`, except `sse2-not-supported`, whose word is `CPUID.01H:EDX`) | `ssse3-not-supported`, `sse41-not-supported`, `sse42-not-supported`, `aes-not-supported`, `pclmulqdq-not-supported`, `sse2-not-supported` |
+| the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the rest) | `cpuid-leaf-seven-unavailable`, `bmi2-not-supported`, `adx-not-supported` |
+| the probe (`detail=` is the observed value's two 64-bit halves, low first) | `aes-known-answer-mismatch`, `pclmul-known-answer-mismatch`, `xmm-pattern-corrupted` |
 
 ## `LFW-CFG` — configuration
 

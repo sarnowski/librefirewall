@@ -294,6 +294,7 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
         "console",
         "config",
         "clock",
+        "hardware_probe",
     ] {
         text.push_str(&format!(
             "librefirewall_log_records_dropped_total{{domain=\"{domain}\"}} 0\n"

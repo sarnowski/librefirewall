@@ -83,6 +83,7 @@ mod image;
 mod management_contract;
 mod metrics_contract;
 mod pins;
+mod probe_contract;
 mod qemu;
 mod recording_contract;
 mod reference_contract;

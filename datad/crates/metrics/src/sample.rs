@@ -29,11 +29,12 @@ use crate::catalog::{
     ENDPOINT_REPLIES, ENDPOINT_REPLIES_LOST, ENDPOINT_REPLIES_SENT, ENDPOINT_REPLY_REFUSED,
     ENDPOINT_STAGE_DROPS, ENDPOINT_TCP_SEGMENTS, ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED,
     ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS, FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN,
-    FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HTTP_BODIES_REFUSED,
-    HTTP_BODIES_TAKEN, HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS,
-    HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE,
-    HTTP_SLOTS_EXHAUSTED, INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED,
-    Label, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
+    FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES, FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS,
+    HARDWARE_PROBE_PREEMPTIONS, HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN,
+    HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
+    HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
+    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
+    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
     POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
     RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
     RECORDING_RECORDS_DROPPED, RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN,
@@ -1483,6 +1484,38 @@ impl ClockSample {
     }
 }
 
+/// Slots [`HardwareProbeSample`] occupies.
+pub const HARDWARE_PROBE_SLOTS: usize = 5;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwareProbeSample {
+    pub proven: bool,
+    pub iterations: u64,
+    pub preemptions: u64,
+    pub log: LogSample,
+}
+
+impl HardwareProbeSample {
+    pub const SERIES: &'static [Series] = &[
+        plain(&HARDWARE_PROBE_PROVEN),
+        plain(&HARDWARE_PROBE_ITERATIONS),
+        plain(&HARDWARE_PROBE_PREEMPTIONS),
+        plain(&LOG_RECORDS_DROPPED),
+        plain(&LOG_RECORDS_REFUSED),
+    ];
+
+    #[must_use]
+    pub fn values(&self) -> [u64; HARDWARE_PROBE_SLOTS] {
+        [
+            u64::from(self.proven),
+            self.iterations,
+            self.preemptions,
+            self.log.dropped,
+            self.log.refused,
+        ]
+    }
+}
+
 /// One recording, in `lfw_recorder::SinkCounters` order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SinkSample {
@@ -1674,6 +1707,7 @@ const _: () = {
     assert!(ConfigSample::SERIES.len() == CONFIG_SLOTS);
     assert!(ClockSample::SERIES.len() == CLOCK_SLOTS);
     assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
+    assert!(HardwareProbeSample::SERIES.len() == HARDWARE_PROBE_SLOTS);
 
     // The per-rule block begins exactly where the named table ends, which is
     // what makes the two writers of a rule series — the domain that publishes by
@@ -1692,5 +1726,6 @@ const _: () = {
     assert!(CONFIG_SLOTS <= MANAGEMENT_SLOTS);
     assert!(CLOCK_SLOTS <= MANAGEMENT_SLOTS);
     assert!(RECORDER_SLOTS <= MANAGEMENT_SLOTS);
+    assert!(HARDWARE_PROBE_SLOTS <= MANAGEMENT_SLOTS);
     assert!(FORWARDER_SHARD_SLOTS <= crate::STATS_SLOTS);
 };

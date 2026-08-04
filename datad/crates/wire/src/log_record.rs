@@ -49,7 +49,7 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 7;
+pub const LOG_DOMAIN_COUNT: u8 = 8;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -151,6 +151,7 @@ pub enum LogDetailKind {
     Received,
     Medium,
     Extent,
+    Proven,
 }
 
 impl LogDetailKind {
@@ -165,6 +166,7 @@ impl LogDetailKind {
             Self::Received => 5,
             Self::Medium => 6,
             Self::Extent => 7,
+            Self::Proven => 8,
         }
     }
 
@@ -179,6 +181,7 @@ impl LogDetailKind {
             5 => Some(Self::Received),
             6 => Some(Self::Medium),
             7 => Some(Self::Extent),
+            8 => Some(Self::Proven),
             _ => None,
         }
     }
@@ -592,6 +595,12 @@ impl LogRecord {
                 start_sector: self.operands[0],
                 sectors: self.operands[1],
             },
+            // Nothing to refuse, on `Received`'s terms: both are counts the
+            // emitting domain claims about its own run.
+            Some(LogDetailKind::Proven) => CheckedDetail::Proven {
+                preemptions: self.operands[0],
+                iterations: self.operands[1],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -935,6 +944,12 @@ pub enum CheckedDetail {
     Extent {
         start_sector: u64,
         sectors: u64,
+    },
+    /// What the hardware probe proved: both instruction known answers held and
+    /// the XMM pattern survived every preemption it observed while running.
+    Proven {
+        preemptions: u64,
+        iterations: u64,
     },
 }
 

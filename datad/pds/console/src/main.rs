@@ -8,14 +8,14 @@
 //! # Adversary
 //!
 //! Both of the adversaries this domain can meet. The **byzantine peer
-//! protection domain** owns the eight records regions mapped here read-only:
+//! protection domain** owns the nine records regions mapped here read-only:
 //! every slot, the producer cursor and the drop count are peer-chosen, and
 //! nothing this domain does can correct one. The **hostile or malfunctioning
 //! device** is the controller, which may never report its transmitter empty.
 //! Neither is judged in this file: `wire` and `lfw_log` refuse a record and
 //! `uart_16550` bounds every wait.
 //!
-//! # Sixteen regions, not eight
+//! # Eighteen regions, not nine
 //!
 //! Each writing domain's ring is two regions carrying opposite grants. This
 //! domain maps the records read-only, so it cannot forge a line attributed to a
@@ -70,7 +70,7 @@
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
 //! drives them; the register protocol and every bounded wait are in
-//! `uart_16550`. This file maps sixteen log regions, claims one port window, and
+//! `uart_16550`. This file maps eighteen log regions, claims one port window, and
 //! calls one function in a loop.
 //!
 //! # Why the port access is here and not in `uart_16550`
@@ -106,10 +106,10 @@ use uart_16550::{Transmitter, Uart, WriteError};
 use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
-/// per writing domain, matching the eight pairs of `<map>` rows on the console
+/// per writing domain, matching the nine pairs of `<map>` rows on the console
 /// domain in `systems/qemu-x86_64/librefirewall.system`. Which domains exist is
 /// fixed by the system description, so this is a build fact.
-const RINGS: usize = 8;
+const RINGS: usize = 9;
 
 /// The programmed controller as somewhere to put bytes. A newtype because both
 /// the trait and the transmitter are foreign here, and that is all it adds.
@@ -142,6 +142,7 @@ fn init() -> Console {
     let nic_driver2: &'static LogRecords = attach_region!(log_nic_driver2_vaddr: LogRecords);
     let management: &'static LogRecords = attach_region!(log_management_vaddr: LogRecords);
     let recorder: &'static LogRecords = attach_region!(log_recorder_vaddr: LogRecords);
+    let hardware_probe: &'static LogRecords = attach_region!(log_hardware_probe_vaddr: LogRecords);
     let forwarder_consume: &'static LogConsume =
         attach_region!(log_forwarder_consume_vaddr: LogConsume);
     let nic_driver0_consume: &'static LogConsume =
@@ -156,6 +157,8 @@ fn init() -> Console {
         attach_region!(log_management_consume_vaddr: LogConsume);
     let recorder_consume: &'static LogConsume =
         attach_region!(log_recorder_consume_vaddr: LogConsume);
+    let hardware_probe_consume: &'static LogConsume =
+        attach_region!(log_hardware_probe_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     // For its own two records alone: a peer's instant is rendered, never minted.
     let stamps = PdClock::new(attach_region!(clock_vaddr: ClockCalibration));
@@ -212,6 +215,7 @@ fn init() -> Console {
         nic_driver2_consume.reader(nic_driver2),
         management_consume.reader(management),
         recorder_consume.reader(recorder),
+        hardware_probe_consume.reader(hardware_probe),
     ];
     printer.print(stamps.now(), &announce(DomainState::Ready));
 

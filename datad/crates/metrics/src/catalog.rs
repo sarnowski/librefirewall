@@ -35,8 +35,8 @@
 //! not merging them.
 
 use crate::sample::{
-    ClockSample, ConfigSample, ConsoleSample, DriverSample, ForwarderSample, ManagementSample,
-    RecorderSample,
+    ClockSample, ConfigSample, ConsoleSample, DriverSample, ForwarderSample, HardwareProbeSample,
+    ManagementSample, RecorderSample,
 };
 
 /// Whether a series is a monotonic total or a value that may move in either
@@ -487,6 +487,29 @@ pub const CLOCK_FREQUENCY_HERTZ: Metric = metric(
     "The timestamp counter frequency this node measured at boot; 0 before it did.",
 );
 
+// ── The hardware probe ──────────────────────────────────────────────────────
+
+pub const HARDWARE_PROBE_PROVEN: Metric = metric(
+    "librefirewall_hardware_probe_proven",
+    Kind::Gauge,
+    "1 once the AES and carry-less-multiply known answers held on every pass and the XMM \
+     pattern survived every preemption the probe observed; 0 before, and forever on a node \
+     that refused.",
+);
+
+pub const HARDWARE_PROBE_ITERATIONS: Metric = metric(
+    "librefirewall_hardware_probe_iterations_total",
+    Kind::Counter,
+    "Probe passes run before the verdict; each re-ran both known answers and re-checked the \
+     XMM pattern.",
+);
+
+pub const HARDWARE_PROBE_PREEMPTIONS: Metric = metric(
+    "librefirewall_hardware_probe_preemptions_total",
+    Kind::Counter,
+    "Preemptions the probe observed as timestamp-counter gaps while its XMM state was live.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -875,6 +898,9 @@ pub const ALL_METRICS: &[&Metric] = &[
     &CLOCK_GENERATION,
     &CLOCK_CALIBRATIONS_REFUSED,
     &CLOCK_FREQUENCY_HERTZ,
+    &HARDWARE_PROBE_PROVEN,
+    &HARDWARE_PROBE_ITERATIONS,
+    &HARDWARE_PROBE_PREEMPTIONS,
     &LOG_RECORDS_DROPPED,
     &LOG_RECORDS_REFUSED,
 ];
@@ -894,7 +920,7 @@ pub struct ShardSpec {
 
 /// Shards this system has, in the fixed order a snapshot holds them: the
 /// forwarder, the three driver instances, the management endpoint, the console,
-/// the configuration publisher, the clock and the recorder.
+/// the configuration publisher, the clock, the recorder and the hardware probe.
 ///
 /// One per protection domain and no exceptions, which is what makes "every
 /// writing domain's own drop counters are exposed" true rather than nearly true.
@@ -939,12 +965,16 @@ pub const SHARDS: [ShardSpec; SHARD_COUNT] = [
         domain: "recorder",
         series: RecorderSample::SERIES,
     },
+    ShardSpec {
+        domain: "hardware_probe",
+        series: HardwareProbeSample::SERIES,
+    },
 ];
 
 /// How many shards a snapshot carries. A build fact — the system description
 /// declares one region per protection domain — and `xtask::sysdesc` holds the
 /// description to it from the other side.
-pub const SHARD_COUNT: usize = 9;
+pub const SHARD_COUNT: usize = 10;
 
 /// Where the forwarder's shard sits in [`SHARDS`], for the cross-check the QEMU
 /// gate makes against traffic it observed itself.

@@ -6,17 +6,26 @@ xtask = "run --locked --package xtask --"
 
 # Loading a target from a JSON specification is itself an unstable rustc
 # feature, so building for the seL4 target is impossible without this flag.
-# Scoped to that target rather than set in `[build]`: host test, clippy, and
+# Scoped to those targets rather than set in `[build]`: host test, clippy, and
 # xtask builds have no custom target to load and must not have unstable rustc
 # CLI options unlocked for them.
 [target.x86_64-sel4-minimal]
 rustflags = ["-Zunstable-options"]
 
+[target.x86_64-sel4-simd]
+rustflags = ["-Zunstable-options"]
+
 [env]
-# Where `--target x86_64-sel4-minimal` is resolved from. The specification in
-# support/targets is rust-sel4 v5.0.0's own x86_64 seL4 target: its generator
+# Where the `--target x86_64-sel4-*` specifications are resolved from. The
+# minimal one is rust-sel4 v5.0.0's own x86_64 seL4 target: its generator
 # derives it from rustc's built-in `x86_64-unknown-none`, overriding only the
 # relocation model and RELRO level. Keep it in step with the pinned rust-sel4
 # rather than tuning it here — the PDs link against crates compiled by that
-# same specification.
+# same specification. The simd one is first-party-authored: the minimal
+# specification with the softfloat ABI and the SSE disables dropped, enabling
+# exactly the XMM tier the pinned kernel's XSAVE feature set 3 already saves
+# and restores per thread (x87 plus SSE, 576 bytes) — SSE through SSE4.2,
+# AES-NI, PCLMULQDQ — plus ADX and BMI2, which carry no XSAVE state at all.
+# MMX stays disabled as unwanted, and AVX/AVX2 stay disabled because YMM state
+# is not in feature set 3.
 RUST_TARGET_PATH = { value = "support/targets", relative = true }

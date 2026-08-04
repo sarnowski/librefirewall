@@ -280,7 +280,7 @@ against are written; almost nothing that implements them is.
 | Outbound management channel | **open** | the persistent mutually-authenticated connection of the [channel framing contract](contracts/channel-framing.md). Nothing dials: there is no TLS in the appliance, and the transport cannot even open a TCP connection (below) |
 | Onboarding | **open** | the HTTPS onboarding server, the CSR, the package upload and its tar reader ([contract](contracts/configuration-package.md)); nothing of it exists, and the unboarded/onboarded state machine has nowhere to be stored |
 | Appliance identity | **open** | no device key, no certificate, no fingerprint — **there is no cryptography in the appliance at all today**, not a SHA-256; the [certificate profile](contracts/certificate-profile.md) is the target |
-| Hardware-accelerated cryptography | **open** | rustls over a custom provider, the DRBG, and every primitive proven on the shipped image against CAVP and Wycheproof vectors, per the [architecture](design/architecture.md#cryptography); whether a hardfloat, SSE-enabled protection domain boots at all is still an unverified hypothesis (see the known risks) |
+| Hardware-accelerated cryptography | **open** | rustls over a custom provider, the DRBG, and every primitive proven on the shipped image against CAVP and Wycheproof vectors, per the [architecture](design/architecture.md#cryptography). The foundational hypothesis is now verified by the hardware-probe domain: a hardfloat, SSE-enabled protection domain builds and boots on this kernel, AES-NI and PCLMULQDQ answer their known answers, and XMM state survives context switches, judged on every console-judged QEMU scenario (see the known risks for what remains) |
 | Persistent store | **open** | the third virtio-blk device, the store domain, the [double-buffered state record and configuration history](design/configuration.md#persistence), and [factory reset](design/updates.md#factory-reset). Today `VIRTIO_BLK_F_FLUSH` is never accepted and no flush is ever issued, so nothing the appliance writes is durable across a power cut |
 | Transport active open | **open** | the TCP stack is passive-open only — no `SynSent`, no connect entry point — and nothing sends an ARP request or holds an ARP cache, and there is no gateway in the configuration schema; all three are prerequisites for dialing out |
 | Configuration over the channel | **open** | stage, validate, commit with confirmation over a fresh connection, rollback, and the version history — the operations exist today only as `POST /config`'s single stage-validate-commit step |
@@ -357,15 +357,18 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
-- **Hardware cryptography rests on an unverified toolchain hypothesis.** The pinned kernel saves
-  x87 and SSE state per thread, so the XMM instruction sets the
+- **Hardware cryptography's foundational hypothesis is verified; two narrower ones remain.** The
+  pinned kernel saves x87 and SSE state per thread, so the XMM instruction sets the
   [CPU baseline](design/architecture.md#hardware-cryptography-profile) requires — AES-NI,
-  PCLMULQDQ, SHA-NI — are architecturally available; what disables them today is a generated
-  default in the shipped target specifications. Whether a hardfloat, SSE-enabled protection domain
-  actually builds and boots on Microkit, whether the IPC fastpath preserves XMM across a domain
-  boundary, and whether a domain can be opted out of paying for FPU state it does not use are
-  hypotheses, not findings, and the crypto stack is designed around them. AVX and AVX2 are
-  genuinely unavailable without building the kernel ourselves, and are deferred.
+  PCLMULQDQ, SHA-NI — are architecturally available; what disabled them was a generated default in
+  the shipped target specifications. The hardware-probe protection domain — built with a
+  first-party hardfloat, SSE-enabled target — now proves on every console-judged QEMU boot that
+  such a domain builds and boots on Microkit, that `AESENC` and `PCLMULQDQ` execute and answer
+  their known answers, and that a live XMM value survives the kernel's context switches. Still
+  hypotheses, to resolve in the crypto milestone: whether the IPC fastpath preserves XMM across a
+  *domain boundary* (the probe holds no channel, so its preemptions exercise the context switch and
+  not the fastpath), and whether a domain can be opted out of paying for FPU state it does not use.
+  AVX and AVX2 are genuinely unavailable without building the kernel ourselves, and are deferred.
 - **Full-rate capture of everything is not reachable, and the recording selector is the sizing
   control.** A capture sink recording all traffic at the target rate (see the
   [recording design](design/recording.md)) would have to sustain writes at the dataplane's own

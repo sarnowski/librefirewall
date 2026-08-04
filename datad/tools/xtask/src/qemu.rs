@@ -47,7 +47,7 @@ use crate::{
     data_disk::DataDisk,
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking, Traffic},
-    image, management_contract, metrics_contract,
+    image, management_contract, metrics_contract, probe_contract,
     recording_contract::{self, Download},
     stamp_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -87,7 +87,17 @@ const KVM_DEVICE: &str = "/dev/kvm";
 /// as it would on a part that lacked it — so the bench must, and any deployment
 /// target must too. It has been present on Intel parts since Ivy Bridge (2012)
 /// and on AMD since Excavator, so it costs no host compatibility either.
-const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand";
+///
+/// The seven features after it are the appliance's compile-time CPU baseline on
+/// `rdrand`'s precedent: the hardware-probe domain is compiled with SSSE3
+/// through SSE4.2, AES-NI, PCLMULQDQ, BMI2 and ADX enabled, so on bare `qemu64`
+/// — which exposes none of them — every boot would refuse the probe exactly as
+/// a below-baseline part would. TCG implements all seven, and every deployment
+/// target carries them (universal since roughly 2013 on Intel and AMD parts),
+/// so pinning them costs no host compatibility either. `popcnt` is deliberately
+/// not among them: the target specification does not enable it, so the
+/// compiler cannot emit it.
+const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand,+ssse3,+sse4.1,+sse4.2,+aes,+pclmulqdq,+bmi2,+adx";
 
 /// How QEMU will execute the guest and, when hardware acceleration was not
 /// taken, why. Carrying the reason (rather than a bare flag) is the point: a
@@ -219,8 +229,9 @@ impl Scenario {
 /// a scenario either judges what the appliance said or is left to report a
 /// forwarding failure as a forwarding failure and nothing else. What
 /// [`Console::Judged`] covers is the `LFW-CFG` transcript
-/// ([`crate::config_transcript`]) and two records on the `LFW-PD` channel — the
-/// clock domain's ([`crate::clock_contract`]) and the management port's count
+/// ([`crate::config_transcript`]) and three records on the `LFW-PD` channel —
+/// the clock domain's ([`crate::clock_contract`]), the hardware probe's
+/// ([`crate::probe_contract`]) and the management port's count
 /// ([`crate::management_contract`]).
 pub(crate) enum Console {
     Ignored,
@@ -704,7 +715,8 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
     let distinct = judge_sequence_numbers(&sequence_numbers)?;
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
-         configuration transcript, the clock record and the management port's count, and \
+         configuration transcript, the clock record, the hardware probe's record and the \
+         management port's count, and \
          {scraped} scraped with curl against the document each was built from; {distinct}",
         scenarios.len(),
         Run::Shipping.config(),
@@ -939,16 +951,24 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
             // its configuration is the larger finding.
             let clock = clock_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
+            // The other record whose content is a measurement: what the
+            // hardware probe proved about the instruction sets the
+            // cryptography plan is designed around.
+            let probe = probe_contract::judge(&booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
             // And the record whose content the build knows exactly: the frames
             // the harness put on the management wire, which the appliance must
             // report to the frame and to the byte.
             let management = management_contract::judge(&booted.serial, &log, booted.management)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            // Last, over every channel at once: the field the other three do
+            // Last, over every channel at once: the field the other four do
             // not judge, on the records they do not name.
             let stamps = stamp_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            format!("; {}; {clock}; {management}; {stamps}", contract.summary())
+            format!(
+                "; {}; {clock}; {probe}; {management}; {stamps}",
+                contract.summary()
+            )
         }
     };
     println!(

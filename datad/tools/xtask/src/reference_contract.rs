@@ -134,6 +134,10 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "pds/management/src/main.rs",
         Vocabulary::Causes("management"),
     ),
+    (
+        "pds/hardware-probe/src/main.rs",
+        Vocabulary::Causes("hardware-probe"),
+    ),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus
     // `Domain`'s and `Field`'s hyphenated ones. Every one of them is reachable
     // as an `ALL` array, so scanning this file would be the second copy.
@@ -162,10 +166,16 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     ),
 ];
 
-/// The four domains whose refusal tokens the console chapter tabulates, in the
+/// The five domains whose refusal tokens the console chapter tabulates, in the
 /// order it presents them. Derived from [`LITERAL_SITES`] would be circular —
 /// the book's own headings are what this list is compared against.
-const REFUSING_DOMAINS: &[&str] = &["nic-driver", "clock", "management", "recorder"];
+const REFUSING_DOMAINS: &[&str] = &[
+    "nic-driver",
+    "clock",
+    "management",
+    "recorder",
+    "hardware-probe",
+];
 
 /// Hold both reference chapters to the code.
 ///

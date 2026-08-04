@@ -32,6 +32,7 @@ members = [
     "pds/clock",
     "pds/management",
     "pds/recorder",
+    "pds/hardware-probe",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

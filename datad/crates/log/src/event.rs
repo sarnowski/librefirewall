@@ -56,6 +56,7 @@ closed_vocabulary! {
         Clock => "clock",
         Management => "management",
         Recorder => "recorder",
+        HardwareProbe => "hardware-probe",
     }
 }
 

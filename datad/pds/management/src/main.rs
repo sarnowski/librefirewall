@@ -246,6 +246,7 @@ fn init() -> Management {
             attach_region!(stats_config_vaddr: StatsShard),
             attach_region!(stats_clock_vaddr: StatsShard),
             attach_region!(stats_recorder_vaddr: StatsShard),
+            attach_region!(stats_hardware_probe_vaddr: StatsShard),
         ],
     };
     let stage = EndpointStage::attach(

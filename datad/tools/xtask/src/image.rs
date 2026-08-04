@@ -1,6 +1,7 @@
 //! seL4/Microkit image assembly — the `image` command.
 //!
-//! Builds the [`SYSTEM_PDS`] protection-domain ELFs for the seL4 target,
+//! Builds the [`SYSTEM_PDS`] protection-domain ELFs for the seL4 target and
+//! the [`SIMD_SYSTEM_PDS`] for the hardfloat SIMD one,
 //! assembles them with the Microkit tool into the kernel/system pair, copies
 //! that pair into `dist/` as the update input, then hands off to
 //! [`crate::disk`] to produce the signed A/B GPT disk and to
@@ -54,6 +55,10 @@ use crate::{
 };
 
 pub(crate) const TARGET: &str = "x86_64-sel4-minimal";
+/// The hardfloat, SSE-enabled target the [`SIMD_SYSTEM_PDS`] compile with;
+/// first-party-authored under `support/targets`, where the minimal one is
+/// rust-sel4's own.
+pub(crate) const SIMD_TARGET: &str = "x86_64-sel4-simd";
 pub(crate) const BOARD: &str = "x86_64_generic";
 pub(crate) const DEBUG_CONFIG: &str = "debug";
 pub(crate) const RELEASE_CONFIG: &str = "release";
@@ -228,6 +233,15 @@ pub(crate) const SYSTEM_PDS: &[&str] = &[
     "recorder",
 ];
 
+/// Protection-domain binaries built with the SIMD target rather than
+/// [`TARGET`], in a cargo invocation of their own: one target per invocation
+/// is cargo's shape, and mixing the two lists would build every domain with
+/// the vector units enabled — exactly what the softfloat specification exists
+/// to prevent for the dataplane. The same single-owner property as
+/// [`SYSTEM_PDS`]: [`crate::host::test_host`] lints exactly these packages for
+/// the SIMD target.
+pub(crate) const SIMD_SYSTEM_PDS: &[&str] = &["hardware-probe"];
+
 /// The pinned SDK's include directory for one seL4 kernel configuration.
 ///
 /// These headers are what `sel4-sys` generates its bindings from and what
@@ -374,10 +388,39 @@ fn assemble(
         "build protection domains",
     )?;
 
+    // The SIMD protection domains, in an invocation of their own because a
+    // cargo build has one `--target`: same profile, same flags, same
+    // environment — only the specification differs.
+    run_command(
+        Command::new("cargo")
+            .current_dir(root)
+            .env("SEL4_INCLUDE_DIRS", board_include_dir(config))
+            .env("CARGO_TARGET_DIR", &target_root)
+            .env(CONFIG_PATH_VAR, root.join(document))
+            .args([
+                "build",
+                "--locked",
+                "--release",
+                "-Z",
+                "build-std=core",
+                "-Z",
+                "build-std-features=compiler-builtins-mem",
+                "--target",
+                SIMD_TARGET,
+            ])
+            .args(SIMD_SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd])),
+        "build SIMD protection domains",
+    )?;
+
     let target_dir = target_root.join(TARGET).join("release");
     for pd in SYSTEM_PDS {
         let elf = format!("{pd}.elf");
         copy_file(&target_dir.join(&elf), &build.join(&elf))?;
+    }
+    let simd_target_dir = target_root.join(SIMD_TARGET).join("release");
+    for pd in SIMD_SYSTEM_PDS {
+        let elf = format!("{pd}.elf");
+        copy_file(&simd_target_dir.join(&elf), &build.join(&elf))?;
     }
 
     run_command(

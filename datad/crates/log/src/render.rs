@@ -176,6 +176,17 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             start_sector,
             sectors,
         } => write!(cursor, " start={start_sector} sectors={sectors}"),
+        // `proven` is written as two constant fields rather than derived from a
+        // payload, because the variant is the proof: it is constructible only
+        // by the domain whose every pass held both known answers, so a value
+        // that could read "unproven" would be a state the type cannot carry.
+        DomainDetail::Proven {
+            preemptions,
+            iterations,
+        } => write!(
+            cursor,
+            " aes=proven pclmul=proven preemptions={preemptions} iterations={iterations}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -446,6 +457,34 @@ mod tests {
             medium(u64::MAX, u64::MAX),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=recorder state=ready \
              sectors=18446744073709551615 leading=0xffffffffffffffff"
+        );
+    }
+
+    /// Both counts at the widest a `u64` carries, and the pair a short run
+    /// produces: the two constant fields are the variant's own claim, so they
+    /// appear whatever the counts are.
+    #[test]
+    fn a_hardware_probe_renders_its_proof_and_the_preemptions_it_survived() {
+        let proven = |preemptions, iterations| {
+            rendered(&Event::Domain {
+                domain: Domain::HardwareProbe,
+                state: DomainState::Ready,
+                detail: DomainDetail::Proven {
+                    preemptions,
+                    iterations,
+                },
+            })
+        };
+        assert_eq!(
+            proven(3, 90_000),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=hardware-probe state=ready \
+             aes=proven pclmul=proven preemptions=3 iterations=90000"
+        );
+        assert_eq!(
+            proven(u64::MAX, u64::MAX),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=hardware-probe state=ready \
+             aes=proven pclmul=proven preemptions=18446744073709551615 \
+             iterations=18446744073709551615"
         );
     }
 
@@ -818,6 +857,10 @@ mod tests {
                 start_sector: u64::MAX,
                 sectors: u64::MAX,
             },
+            DomainDetail::Proven {
+                preemptions: u64::MAX,
+                iterations: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -856,6 +899,10 @@ mod tests {
             any::<(u64, u64)>().prop_map(|(start_sector, sectors)| DomainDetail::Extent {
                 start_sector,
                 sectors,
+            }),
+            any::<(u64, u64)>().prop_map(|(preemptions, iterations)| DomainDetail::Proven {
+                preemptions,
+                iterations,
             }),
             (
                 (0..causes.len()),

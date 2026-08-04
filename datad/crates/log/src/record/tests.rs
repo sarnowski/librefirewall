@@ -218,6 +218,14 @@ fn every_domain_detail_shape_survives_the_crossing() {
             frames: u64::MAX,
             bytes: u64::MAX,
         },
+        DomainDetail::Proven {
+            preemptions: 0,
+            iterations: 0,
+        },
+        DomainDetail::Proven {
+            preemptions: u64::MAX,
+            iterations: u64::MAX,
+        },
     ];
     for operands in [
         RefusalDetail::None,
@@ -682,6 +690,10 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
         any::<u32>().prop_map(DomainDetail::ReceivePosted),
         any::<(u64, u64)>().prop_map(|(frames, bytes)| DomainDetail::Received { frames, bytes }),
         (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),
+        any::<(u64, u64)>().prop_map(|(preemptions, iterations)| DomainDetail::Proven {
+            preemptions,
+            iterations,
+        }),
         (
             any_cause(),
             prop_oneof![
