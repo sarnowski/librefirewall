@@ -1,10 +1,11 @@
 # Recording and persistent storage
 
 The appliance keeps its own durable record of the traffic it handled, on block storage it owns, in a
-format an analyst opens without conversion. For the connection and policy events of the
-[management plane](management.md) this is not a second copy beside the log transport but the source
-beneath it: what is written here is what the exporters ship onward, and it is what remains when
-nothing is listening.
+format an analyst opens without conversion. For everything the
+[management channel](management.md#the-channel) carries upstream — connection and policy events,
+metric snapshots, audit records — this is not a second copy beside the transport but the source
+beneath it: what is written here is what the channel ships onward, byte for byte, and it is what
+remains when nothing is listening.
 
 ## Two sinks, one format
 
@@ -102,29 +103,33 @@ port scan must cost a bounded number of records, not one per probe.
 
 Each ring has **exactly one writer and any number of independent readers**, each holding its own
 cursor. The ring is the single durable copy; a reader is a position in it, not a copy of it. The
-readers are the pcapng download of the [management API](management.md), the OpenTelemetry exporter
-that ships connection events onward, and a live event stream for an operator console. None is
-privileged; adding one adds a cursor and nothing else.
+principal reader is the [management channel](management.md#the-channel): a **cursor-holding reader**
+that ships the ring's own bytes to the management server — there is no re-encoding, because the ring
+bytes are the wire bytes — and serves its range reads off the same medium. None is privileged;
+adding one adds a cursor and nothing else.
 
 Three properties follow, and they are the reason for the shape:
 
-- **A collector that was unreachable catches up rather than losing data.** External collection is
-  routinely delayed and can be unavailable outright (see
-  [Management plane](management.md)); with the ring as the durable copy an exporter resumes from
-  its cursor instead of dropping what it could not send.
+- **A management server that was unreachable catches up rather than losing data.** The channel can
+  be down for however long it is down (see [Management plane](management.md)); with the ring as the
+  durable copy the reader resumes from its cursor instead of dropping what it could not send.
 - **A slow or dead reader costs the dataplane nothing.** The writer always wins: it never waits, and
   a reader that has been overtaken detects this on its next read and reports a gap. Loss is
   therefore not merely bounded but *measurable* — the gap is the distance by which the cursor was
-  overtaken, a number rather than a suspicion.
-- **Delivery to an external collector is at-least-once.** A cursor advances only after the data is
-  accepted, so a failure between the two replays rather than skips. Exactly-once would require the
-  collector to participate in the appliance's commit, which is not a dependency an inline firewall
-  takes on for the sake of avoiding a duplicate.
+  overtaken, a number rather than a suspicion. This is the channel's whole backpressure story: the
+  appliance never blocks on a slow management server, and true overrun is reported in-band through
+  the drop counts the recordings carry.
+- **Delivery to the management server is at-least-once.** A cursor advances only after the server
+  acknowledges the data as durably ingested, so a failure between the two replays rather than
+  skips. Exactly-once would require the server to participate in the appliance's commit, which is
+  not a dependency an inline firewall takes on for the sake of avoiding a duplicate.
 
 **Reader cursors live in the ring's own superblock**, so the medium carries the data and the delivery
-state together. A node that restarts, or one that
-[falls back to its other slot](updates.md#boot-manager-and-slot-selection), resumes every reader
-where it stood without a separate store that could disagree with the ring.
+state together: the channel's acknowledged cursor is recorded in the superblock's reader-cursor
+slots. A node that restarts, or one that
+[falls back to its other slot](updates.md#boot-manager-and-slot-selection), **resumes** every reader
+— and the ring itself — where it stood, rather than starting a fresh ring over the old bytes,
+without a separate store that could disagree with the ring.
 
 **Rings are segmented** into fixed-size units, each beginning with its own Section Header Block and
 the full interface set. Any one segment is independently parseable; any contiguous run of segments
@@ -148,7 +153,7 @@ system description** and is therefore a per-deployment-target image variant, exa
 which extent is runtime configuration.
 
 **Rate classes are deliberately not mixed.** Configuration and identity are written in bytes per day
-and belong on the [boot medium](updates.md#on-disk-layout), so that a node is self-contained. A
+and belong on the [store device](updates.md#the-store-device), a small device of their own. A
 capture ring rewrites its device continuously and wants a device to itself: a single sequential
 writer per device is what obtains that device's bandwidth, and the write-endurance profiles of the
 two workloads are not comparable — sizing a medium for one says nothing about its life under the

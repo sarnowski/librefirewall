@@ -6,6 +6,15 @@ further — what exists and what specifically remains — in the developer chapt
 without re-deriving it from the code. This page is the evaluator's view: what the appliance does
 today, what it does not, and where the project is heading.
 
+One reorientation frames everything below. The design chapters now describe a **two-component
+product**: an appliance with no management surface of its own, dialing home over one
+mutually-authenticated channel, and a central [management server](design/management-server.md) that
+owns onboarding, configuration and telemetry. Very little of that exists yet — the
+[redesign table](#management-plane-redesign) below records it as open — while the appliance built so
+far, its plain-HTTP management surface included, is present, working, and deliberately kept until
+the channel replaces it: the end-to-end gate's whole cross-check strategy rests on those HTTP
+surfaces, so they are erased last, not first.
+
 ## The current deployable system
 
 The current deployable system is a two-dataplane-port **filtering** IPv4 slice: one driver
@@ -55,8 +64,9 @@ whole; `GET /config` states the running configuration and `POST /config` replace
 plain HTTP — **there is no TLS and no authentication in front of any of it yet**, so anyone who can
 reach the port can scrape the metrics, download every packet the appliance recorded, read the policy,
 and *replace* it. That last one is not a lesser gap than the others: it is the authority to decide
-what this firewall forwards. Until the intended mTLS termination and certificate handling exist, the
-management port belongs on an isolated network and nowhere else. The port's MAC, address and prefix
+what this firewall forwards. Until the [management-plane redesign](design/management.md) replaces
+this surface with the onboarding flow and the authenticated channel, the management port belongs on
+an isolated network and nowhere else. The port's MAC, address and prefix
 come from the configuration document like every other address on the appliance, so the port is
 configured rather than compiled in.
 
@@ -192,7 +202,7 @@ revocation nothing emits one.
 | Flow classifier (cut-through vs. proxy path) | **open** | |
 | L7 protocol parsing (HTTP/1.1, HTTP/2, HTTP/3) | **partial** | a server-side HTTP/1.1 request parser (`datad/crates/http`) reads the management port's requests; it is a bounded head parser with no body, no HTTP/2 and no HTTP/3, and no dataplane consumer — described with the [`/metrics` endpoint](developers/status-detail.md#prometheus-metrics) |
 | OT/industrial protocol inspection | **open** | |
-| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | this row is about the dataplane and the proxy, where nothing exists. **Nothing bounds the rate of requests to the management port either** — the [management design](design/management.md) asks it to, and the only rate bound anywhere in the appliance is RFC 5961 §7's per-second challenge budget, which caps unsolicited TCP replies and not requests. What does exist is bounded *state*: the transport's connection table is fixed and reaped under pressure — [detail](developers/status-detail.md#proxy-tcp-stack) |
+| DoS resilience (SYN cookies, rate limiting, bounded state) | **open** | this row is about the dataplane and the proxy, where nothing exists. **Nothing bounds the rate of requests to the management port either** — the [management design](design/management.md) requires rate limiting with backoff on the onboarding endpoints, and the only rate bound anywhere in the appliance is RFC 5961 §7's per-second challenge budget, which caps unsolicited TCP replies and not requests. What does exist is bounded *state*: the transport's connection table is fixed and reaped under pressure — [detail](developers/status-detail.md#proxy-tcp-stack) |
 | Mirror port | **open** | the [recording design](design/recording.md) holds the recording sinks and a mirror to be complementary rather than alternatives; the sinks exist, the mirror does not |
 | TLS termination and re-origination | **open** | |
 | QUIC / HTTP-3 termination | **open** | |
@@ -225,15 +235,14 @@ revocation nothing emits one.
 | First-party virtio-blk driver | **partial** | [detail](developers/status-detail.md#virtio-blk-driver) |
 | pcapng encoder | **partial** | `datad/crates/pcapng` writes SHB, IDB, EPB, ISB, Custom Block and a padding block, allocation-free, `no_std` and `forbid(unsafe_code)`, and `tcpdump` reads what it produces. The [recording design](design/recording.md)'s Decryption Secrets Block is not implemented, and of what is, only the blocks the recorder uses are exercised end to end — no ISB is emitted — described with the [recordings](developers/status-detail.md#recording-and-download) |
 | Two pcapng recording sinks (a connection history and a capture) | **partial** | both are written to the device from the forwarder's tap and both parse as pcapng off the medium, and **they differ by what they record**: the history holds a record where the appliance reached a lifecycle or policy event, the capture holds every observation with its verdict, and each record carries the flow, the rule and the event as a PEN-tagged annotation. There is still no recording selector, so the capture records every frame the dataplane decided on rather than the flows a policy picks out, and a conversation reclaimed by its idle timeout produces no close event — [detail](developers/status-detail.md#recording-and-download) |
-| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for the *time range* the [management design](design/management.md) does ask for, and **no TLS and no authentication in front of them** — [detail](developers/status-detail.md#recording-and-download) |
+| Recording download over HTTP | **partial** | `GET /logs.pcapng` and `GET /capture.pcapng` answer a whole recording as a windowed body with an exact `Content-Length`; no `Range`, no `If-Match`, no way to ask for part of a recording, and **no TLS and no authentication in front of them**. The [management design](design/management.md) now replaces these downloads with range reads over the channel; they stay until it does — [detail](developers/status-detail.md#recording-and-download) |
 | A recording that states its own loss in-band | **partial** | `epb_dropcount` is fed: the recorder differences the forwarder's tap-drop counter on every pass and carries the rise as a debt onto the next record placed, so a file does state the observations the tap ring lost ahead of each block. It states **only** those — what a sink could not encode and what the medium refused reach `/metrics` and never the file, and no Interface Statistics Block is emitted — see the [recording design](design/recording.md) |
 | Paired ingress/egress observation of one forwarded frame | **open** | one observation per frame, taken at the decision point; `epb_packetid` is minted and monotone but never relates two records — see the [recording design](design/recording.md) |
 | Recording the management port | **open** | only the dataplane is tapped, so nothing on the management port — including a download — is recorded |
 | Retention bound and zeroization | **open** | the only bound is the ring's size; there is no time bound and nothing is erased on stop — see the [recording design](design/recording.md) |
 | Rotation and checkpointing on a schedule | **open** | a superblock is written when the recorder decides to, never on a clock |
 | Resuming a recording across a boot | **open** | `Sink::resume` exists and is host-tested; nothing calls it, so a reboot starts a fresh ring over the old bytes |
-| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path. That is a named deviation from the [recording design](design/recording.md), and it is why no series says how much history a recording still holds: a wrap count says a segment was evicted and there is no cursor for it to have been evicted past |
-| Live event stream, OTEL and syslog exporters as ring readers | **open** | see the [management](design/management.md) and [recording](design/recording.md) designs |
+| Reader cursors in the ring superblock, one writer many readers | **open** | the superblock carries four reader-cursor slots and no reader registers one; the ring has exactly one reader, the download path. That is a named deviation from the [recording design](design/recording.md), whose cursor-holding reader is now the [management channel](design/management.md), and it is why no series says how much history a recording still holds: a wrap count says a segment was evicted and there is no cursor for it to have been evicted past |
 | Registered Private Enterprise Number | **open** | the annotations are tagged `0xFFFFFFFF`, IANA-reserved so it cannot collide, but registered to nobody — a recording must not leave a customer's premises under it. Which party would hold one is itself unsettled — [detail](developers/status-detail.md#recording-and-download) |
 | Storage binding from the configuration document | **open** | the extents are compiled into `lfw_recorder::deck` and the device is the whole of one disk; nothing resolves a partition and no configuration item names one — see the [configuration](design/configuration.md) and [recording](design/recording.md) designs |
 | Decryption Secrets Block (inspected flow as ciphertext plus keys) | **open** | nothing is inspected, so there is no key material — see the [recording design](design/recording.md) |
@@ -250,15 +259,33 @@ revocation nothing emits one.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Management HTTP API over mTLS | **partial** | the API exists and carries the whole surface — `GET /metrics`, `GET /config`, `POST /config` and both recording downloads — over **plain HTTP with no authentication at all**. Anyone who can reach the port can read the policy and replace it, so the port must not be exposed to an untrusted network; the mTLS pair, the authorization split and the request-rate bound the [management design](design/management.md) requires are all absent — [detail](developers/status-detail.md#management-http-api) |
+| Management HTTP API | **partial** | the API exists and carries the whole surface — `GET /metrics`, `GET /config`, `POST /config` and both recording downloads — over **plain HTTP with no authentication at all**. Anyone who can reach the port can read the policy and replace it, so the port must not be exposed to an untrusted network. The [management design](design/management.md) now erases this surface entirely in favor of the authenticated channel; it stays, exactly as insecure as stated, until the channel replaces it — [detail](developers/status-detail.md#full-port-role-model) |
 | Schema-validated XML configuration, hardened validator PD | **partial** | [detail](developers/status-detail.md#configuration-management) |
 | Candidate/commit-confirm transactions, versioning, rollback | **partial** | a document is submitted with `POST /config`, staged as the candidate, validated and committed under the next generation, and refusing one changes nothing; the candidate/running split and monotonic generations are what carry it. Neither **rollback** nor **commit-confirm** exists, so a change that validates and then breaks management connectivity is not undone by anything — [detail](developers/status-detail.md#configuration-management) |
 | Distributed staged rollout across the pair | **open** | there is no pair; the handover protocol has one consumer |
 | Console device and log transport (16550 COM1, one owning PD) | **partial** | [detail](developers/status-detail.md#console-device-and-log-transport) |
 | Console system-state events | **partial** | [detail](developers/status-detail.md#console-system-state-events) |
-| OpenTelemetry structured logs | **open** | call sites emit typed events (`datad/crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the design's **System** category alone — Audit, Traffic and Subsystem have none. No transport, exporter or receiver exists, so the OpenTelemetry inventory in the [observability reference](reference/observability.md) is empty, and the exporter the [management design](design/management.md) makes a reader of the recording ring is not one of the ring's readers either — it has none but the download path |
+| Structured log events and their transport | **open** | call sites emit typed events (`datad/crates/log`); the console is one rendering of them, and the record a domain publishes into its log ring is a second, already-structured one. Those call sites are the System category alone — audit and traffic events for the channel have no producers yet. **The OpenTelemetry export the design used to intend is superseded**: the [management design](design/management.md) erases OTEL from the appliance, and events travel the channel instead — which does not exist either, so the ring's only reader remains the download path. The [observability reference](reference/observability.md) still describes the OTEL surface and is retargeted in the phase that changes the surface, never before |
 | Prometheus `/metrics` | **partial** | `GET /metrics` answers an exposition covering every protection domain, the capture tap and both recordings, with each NIC's counters joinable to the interface the configuration document names; scraped with `curl` in the gate against two different documents. The endpoint has **no mutual TLS and no bound on how often it may be asked**. Of the coverage the design intends, per-core counters await the multicore dataplane; the connection table publishes its own occupancy, lifecycle and every refusal, and the rest of the occupancy is half-published — each port's virtqueue depth is a gauge, and the dataplane's own queues and rings are not — and the log buffer's occupancy awaits the buffer — [detail](developers/status-detail.md#prometheus-metrics) |
 | Local log buffer (`GET /logs`) | **open** | not to be confused with `GET /logs.pcapng`, which exists: that is the pcapng *connection history* on the block device ([detail](developers/status-detail.md#recording-and-download)), a different artifact on a different medium. Of the debug dump the [observability reference](reference/observability.md) describes, the state half, the running document and the recordings are what a node can be asked for; the retained records cannot be, and the reference's local-buffer inventory is empty |
+
+## Management plane redesign
+
+The two-component target — the channel, onboarding, the store, and the management server — measured
+against what exists. The [contracts](contracts/configuration-package.md) the rows below implement
+against are written; almost nothing that implements them is.
+
+| Capability | Status | Notes |
+|---|---|---|
+| Outbound management channel | **open** | the persistent mutually-authenticated connection of the [channel framing contract](contracts/channel-framing.md). Nothing dials: there is no TLS in the appliance, and the transport cannot even open a TCP connection (below) |
+| Onboarding | **open** | the HTTPS onboarding server, the CSR, the package upload and its tar reader ([contract](contracts/configuration-package.md)); nothing of it exists, and the unboarded/onboarded state machine has nowhere to be stored |
+| Appliance identity | **open** | no device key, no certificate, no fingerprint — **there is no cryptography in the appliance at all today**, not a SHA-256; the [certificate profile](contracts/certificate-profile.md) is the target |
+| Hardware-accelerated cryptography | **open** | rustls over a custom provider, the DRBG, and every primitive proven on the shipped image against CAVP and Wycheproof vectors, per the [architecture](design/architecture.md#cryptography); whether a hardfloat, SSE-enabled protection domain boots at all is still an unverified hypothesis (see the known risks) |
+| Persistent store | **open** | the third virtio-blk device, the store domain, the [double-buffered state record and configuration history](design/configuration.md#persistence), and [factory reset](design/updates.md#factory-reset). Today `VIRTIO_BLK_F_FLUSH` is never accepted and no flush is ever issued, so nothing the appliance writes is durable across a power cut |
+| Transport active open | **open** | the TCP stack is passive-open only — no `SynSent`, no connect entry point — and nothing sends an ARP request or holds an ARP cache, and there is no gateway in the configuration schema; all three are prerequisites for dialing out |
+| Configuration over the channel | **open** | stage, validate, commit with confirmation over a fresh connection, rollback, and the version history — the operations exist today only as `POST /config`'s single stage-validate-commit step |
+| Management server (`ctrld`) | **partial** | a green-but-empty Phoenix application with its own pinned BEAM toolchain image and its own gate wired into `make test`; nothing of the [product](design/management-server.md) — no CA, no users, no inventory, no channel listener, no decoder — [detail](developers/status-detail.md#management-server) |
+| Erasing the HTTP management surface | **open** | deliberately last: the end-to-end gate's cross-check strategy — metrics against recordings against injected frames — rests on the HTTP surfaces, so they are removed only once the channel carries a replacement cross-check |
 
 ## Lifecycle, boot and trust
 
@@ -267,7 +294,7 @@ revocation nothing emits one.
 | Signed A/B disk image and slot selection | **partial** | [detail](developers/status-detail.md#ab-image-update) |
 | Signature-enforced boot chain (OVMF → GRUB → Multiboot2 → seL4) | **partial** | [detail](developers/status-detail.md#signed-boot-chain) |
 | In-system update/health protection domain | **open** | nothing inside seL4 holds a capability on the **boot** disk, so nothing can write boot state. The recorder's block device is a second, data-only disk and reaches no partition of the boot one — [detail](developers/status-detail.md#ab-image-update) |
-| Configuration, identity or secrets on persistent storage | **open** | one domain now holds a disk capability, but it writes recordings and nothing else; the DATA partition is still an empty unformatted GPT entry with no consumer and no encryption — [detail](developers/status-detail.md#configuration-management) |
+| Configuration, identity or secrets on persistent storage | **open** | one domain now holds a disk capability, but it writes recordings and nothing else. The [store device and store domain](design/updates.md#the-store-device) the design intends do not exist, and the DATA partition is an empty unformatted GPT entry — [detail](developers/status-detail.md#configuration-management) |
 | UEFI Secure Boot enrolment | **open** | manifest records `secure_boot: false` |
 | TPM-backed anti-rollback | **open** | no TPM anywhere, including the QEMU harness |
 
@@ -288,17 +315,27 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
 
 ### Open decisions
 
-- **Onboarding process** for issuing the management mTLS certificate pair — required; its design is
-  open.
-- **TLS crypto provider** for rustls (pure-Rust vs. an external provider), to be resolved by
-  benchmarking.
 - **CA signing-trust sharing across HA nodes** — required; the form (e.g. per-node intermediate CAs
-  under a common trusted root) is open.
+  under a common trusted root) is open. This is the TLS-*interception* CA; the device-issuing CA is
+  settled — it is the [management server](design/management-server.md).
+- **CA rollover for the management CA.** The [non-remotable trust anchor](design/threat-model.md#the-compromised-management-server)
+  makes remote anchor rotation impossible, so rotating the management CA means visiting every
+  appliance. Two directions exist — carrying two anchor slots and permitting the *addition* of a
+  second while the current one is valid (reversible, therefore not self-harming), never the removal
+  of the last; or deferring entirely. Deferred, because there is no fleet yet; this is the one item
+  that control is expected to force a revisit of.
 - **HA-link split-brain arbitration** — witness, quorum, or fencing.
-- **Trusted time source mechanism.**
+- **Trusted time source mechanism** for the inspection path. The management channel deliberately
+  judges its certificates against the CMOS-derived clock (a recorded decision in the
+  [threat model](design/threat-model.md)); validating upstream certificates on behalf of protected
+  clients still needs a genuinely trusted source, and that mechanism is open.
 - **Proxy vs. cut-through throughput split** — the proportion of traffic on the terminating proxy
   path, which drives core sizing.
-- **Central configuration management application** (multi-cluster) — built later.
+- **Access control and multi-admin concurrent editing in the management server** — roles and scopes
+  over appliances and policy subtrees, and the concurrent-editing model (changeset review with
+  semantic merge, or a live shared candidate with presence).
+- **Whether anything replaces CI.** The pipeline definition is deleted and the git hooks are the
+  whole gate; no replacement has been decided.
 
 ### Known risks
 
@@ -320,9 +357,15 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
 - **Azure platform scope.** Azure support requires Hyper-V/VMBus (for netvsc), the MANA driver,
   Gateway Load Balancer VXLAN handling, and seL4 booting as an Azure guest — a substantial platform
   effort, not a single NIC driver.
-- **FPU/SIMD in protection domains.** Dataplane PDs run without FPU/SSE state. Sustaining
-  checksums, crypto, and DPI at 10 Gbit/s will require either kernel-supported FPU context for the
-  relevant PDs or staying scalar — a design constraint to resolve when performance work begins.
+- **Hardware cryptography rests on an unverified toolchain hypothesis.** The pinned kernel saves
+  x87 and SSE state per thread, so the XMM instruction sets the
+  [CPU baseline](design/architecture.md#hardware-cryptography-profile) requires — AES-NI,
+  PCLMULQDQ, SHA-NI — are architecturally available; what disables them today is a generated
+  default in the shipped target specifications. Whether a hardfloat, SSE-enabled protection domain
+  actually builds and boots on Microkit, whether the IPC fastpath preserves XMM across a domain
+  boundary, and whether a domain can be opted out of paying for FPU state it does not use are
+  hypotheses, not findings, and the crypto stack is designed around them. AVX and AVX2 are
+  genuinely unavailable without building the kernel ourselves, and are deferred.
 - **Full-rate capture of everything is not reachable, and the recording selector is the sizing
   control.** A capture sink recording all traffic at the target rate (see the
   [recording design](design/recording.md)) would have to sustain writes at the dataplane's own

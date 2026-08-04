@@ -113,7 +113,15 @@ Configuration uses a **candidate/running datastore** model with **commit-confirm
 - **Commit-confirmed:** a commit arms a rollback timer; if it is not confirmed within the timeout,
   the appliance automatically rolls back to the previous running configuration. This protects
   against a change that validates but breaks management connectivity at runtime (anti-lockout).
+  Because the appliance's management plane is an [outbound dial](management.md#the-channel), the
+  confirmation must arrive over a **fresh** connection — one established under the committed
+  configuration — since confirming over the pre-existing session proves nothing about a
+  configuration that breaks new connections.
 - Configurations are **versioned**, enabling **rollback**.
+
+The stage, validate, commit and confirm operations arrive over the
+[management channel](management.md); the [channel framing contract](../contracts/channel-framing.md)
+carries exactly these operations and no wider write authority.
 
 ### The document travels one way, and the decision is made where a parser is safe
 
@@ -131,9 +139,8 @@ direction is the whole of why the split exists.
 The bytes are **copied out of the shared region before a field of them is looked at**: the region is
 written by a peer, so a decision taken on the bytes in place would be a decision taken on bytes that
 are no longer there. And the answer travels back through a region the management domain may read and
-not write, because a management domain that could write it could answer `GET /config` with a policy
-the appliance is not running — an operator would then edit and resubmit that, which is worse than a
-wrong answer.
+not write, because a management domain that could write it could state back a policy the appliance
+is not running — an operator would then edit and resubmit that, which is worse than a wrong answer.
 
 ### The appliance can state what it is running, and only what it could accept
 
@@ -149,6 +156,40 @@ resubmit is one they cannot edit. The refusal is narrow and reachable only by a 
 bound in both directions at once; it is a rule about the *appliance's ability to state itself* rather
 than about the configuration's content, and it is the one refusal that names no object in the
 document.
+
+## Persistence
+
+The appliance persists its own state — the device private key, the signed device certificate, the
+management CA certificate as delivered, the management endpoint, the onboarding state, and a bounded
+history of configuration document versions — on the [store device](updates.md#the-store-device),
+owned by the store domain. What follows is the mechanism, and it is chosen for one property: **a
+power cut at any instant leaves either the old state or the new one, never a torn one.**
+
+**The state record is an A/B transactional double-buffer, deliberately not a ring.** A ring
+overwrites by design — the [recording rings](recording.md) are deliberately non-durable temporary
+buffers, which is exactly the wrong nature for an identity. The state record is two copies at fixed
+sectors, each carrying a magic, a version, a monotonic generation, its payload, and a hash covering
+everything; the current state is the valid copy with the higher generation. To change anything, the
+**whole** new state is composed into the *other* copy and flushed — so a power cut mid-write leaves
+the previous copy intact and valid, and the either-old-or-new property is structural rather than
+argued. This is the pattern U-Boot's redundant environment and RAUC's status block use. What it
+reuses from the recording superblock is only that superblock's **proven primitives**: two copies at
+a fixed location, a checksum covering everything, the rule that every unnamed byte must be zero, the
+rule that both copies invalid means a fresh medium rather than an error, and a typestate boundary
+where only a checked state may be acted on.
+
+**Configuration version history is a fixed slot array, not a ring**: N slots, each holding one whole
+document with its hash and generation, with the double-buffered record naming which slot holds which
+generation and which is running versus candidate. Reuse takes the slot with the lowest generation,
+and **the current configuration is never a reuse candidate** — which is the difference from a ring:
+dropping the oldest *version* is bounded and intentional, while a structure that could overwrite the
+running configuration would be one whose worst case is losing the state the whole store exists to
+keep. Documents are bounded at 64 KiB, so the history and the record together stay under a
+megabyte.
+
+**Durability has one prerequisite: the flush.** The block device's flush feature is accepted and a
+flush is issued at every point the double-buffer's ordering depends on — without it the device is
+free to reorder and cache writes, and the double-buffer is theatre.
 
 ## Distributed staged rollout
 

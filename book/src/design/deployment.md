@@ -7,9 +7,10 @@
 Interfaces are assigned **roles**, and the role — not a fixed port count — is the architectural
 unit. Four roles exist:
 
-- **Management port** — the *only* surface that exposes the
-  [management API](management.md). It is isolated from the dataplane and carries no forwarded
-  traffic.
+- **Management port** — the appliance's only management-facing interface: while unboarded it serves
+  the [onboarding server](management.md#onboarding), and once onboarded it carries the outbound
+  [management channel](management.md#the-channel) and listens for nothing. It is isolated from the
+  dataplane and carries no forwarded traffic.
 - **Session-replication port** — the dedicated [HA link](#high-availability) carrying heartbeat and
   batched flow-state synchronization between the two nodes of a pair.
 - **Dataplane ports** — the inspected-traffic ports, handled in **pairs**. The common labels
@@ -99,3 +100,12 @@ Azure support is a substantial platform effort rather than a single NIC driver �
     Gateway Load Balancer health probe and letting the platform reprogram routing to the survivor.
 - **Split-brain is arbitrated over the dedicated HA link.** The arbitration scheme (witness, quorum,
   or fencing) is still open (see [development status](../status.md)).
+
+## Deploying the management server
+
+The management server is deployed independently of every appliance target above, and its inventory
+is deliberately complete in three pieces: **the Phoenix release, Postgres, and ClickHouse — nothing
+else**. No Prometheus server, no collector, no agents, no message broker; Phoenix is the
+[sole collector](management-server.md), and the appliances dial it. A deployment that can run those
+three can run the management plane, and sizing it is a database question rather than a fleet
+protocol one.

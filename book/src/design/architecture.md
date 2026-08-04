@@ -208,7 +208,8 @@ All first-party code is Rust. Building blocks:
   precisely what the [zero-copy dataplane](#performance-target) exists to avoid, and no amount of
   hardening or extension removes it — the buffers *are* the interface. Per-core shardability and
   the ability to tune the transport for a terminating 10 Gbit/s proxy path point the same way.
-- **TLS:** **rustls**, with a pluggable crypto provider.
+- **TLS:** **rustls**, `no_std` plus `alloc`, over a custom crypto provider — see
+  [Cryptography](#cryptography) for the decision and the stack under it.
 - **QUIC:** a Rust-native QUIC stack (e.g. quinn, s2n-quic, or quiche), used as both server and
   client to terminate and re-originate.
 - **DPI / signature matching:** the Rust `aho-corasick` (Teddy SIMD) and `regex-automata` engines,
@@ -217,5 +218,117 @@ All first-party code is Rust. Building blocks:
 - **NIC drivers:** implemented in Rust, drawing on ixy.rs for virtio/ixgbe register-level logic.
 
 **C boundary:** the only C in the system is the seL4 kernel and its boot/loader chain (the trusted
-base). The TLS crypto provider choice (pure-Rust vs. an external provider) is still open, to be
-resolved by benchmarking (see [development status](../status.md)).
+base). The adopted cryptography below is pure Rust, so the boundary does not move for it.
+
+## Cryptography
+
+**We implement no cryptographic algorithm.** Cryptography is adopted from proven third-party
+sources, pinned, and held to published test vectors on the shipped image; the one thing that cannot
+be adopted is the provider plumbing that binds those sources into rustls, and that is trait glue,
+not cryptography. Adopted cryptography libraries are deliberately **not** part of the trusted
+computing base and inherit no trust — their correctness is proven on the image rather than assumed
+(see the [engineering practice](../developers/engineering.md)).
+
+**TLS is rustls, `no_std` plus `alloc`, with a custom crypto provider.** rustls is battle-proven,
+speaks TLS 1.3 as client and server with mutual TLS, and expects an explicitly supplied crypto
+provider — so a custom provider is the library's intended shape, not a workaround. The
+battle-proven alternatives were investigated and are unusable here: **aws-lc-rs** and **ring** need
+a C toolchain, which the dependency policy bans, and target hosted environments; **graviola** is
+pure Rust with formally proven assembly but requires AVX2, which is precisely the tier the kernel
+configuration does not save (below); **rustls-rustcrypto** is an experimental alpha that needs
+`std`; **embedded-tls** is client-only, so it cannot serve onboarding. A `std` environment (via the
+musl target in the pinned tree) was investigated and rejected: it is achievable and buys nothing,
+because the blocker is the instruction set, not the standard library — and it would cost a libc
+port and an expanded trusted base. The appliance stays `no_std` plus `alloc`.
+
+The stack, chosen for proven provenance, post-quantum readiness, and the hardware profile below:
+
+| Layer | Choice | Why |
+|---|---|---|
+| TLS | **rustls**, `no_std` + `alloc` | Battle-proven; TLS 1.3, client and server, mutual TLS; custom provider is the expected shape |
+| Post-quantum key exchange | **libcrux-ml-kem** | Formally verified, portable path needs no AVX2, `no_std`; what Firefox ships for X25519MLKEM768 |
+| Post-quantum second source | RustCrypto `ml-kem` | Audited, FIPS 203 final |
+| AEAD | **ChaCha20-Poly1305** for the channel; AES-GCM via AES-NI | ChaCha20 is designed for scalar execution; with AES-NI present, AES-GCM is the fast path for the eventual inspection product |
+| Classical key exchange | X25519 | |
+| Signatures | ECDSA P-256 | Interoperates with any CA tooling and with the BEAM's certificate handling natively |
+| Hash, HMAC, HKDF | RustCrypto `sha2` family, SHA-NI when detected | |
+| Chain validation | `rustls-webpki` | rustls-family |
+| Certificate and CSR generation | `rcgen` | rustls-family, explicit CSR support |
+
+Several RustCrypto crates select a backend at runtime and fall back silently to a portable
+implementation when detection fails. The appliance therefore **positively asserts that the
+accelerated backend is in use** — "we have AES-NI" becoming quietly untrue is exactly the failure
+mode that does not announce itself.
+
+**Post-quantum scope is split, deliberately.** Hybrid key exchange (X25519MLKEM768) is in from the
+start: it protects confidentiality against
+[harvest-now-decrypt-later](threat-model.md#harvest-now-decrypt-later), and the channel carries the
+customer's network history. Post-quantum *signatures* are not in scope — the certificate ecosystem
+has not moved, and neither chain validation nor the BEAM validates post-quantum chains — so device
+identity stays classical, and the [certificate profile](../contracts/certificate-profile.md) treats
+the algorithm as a field, never an assumption, so the later migration is a re-issuance campaign
+rather than a redesign.
+
+## Hardware cryptography profile
+
+The kernel configuration in the pinned SDK saves x87 and SSE state per thread (XSAVE feature set 3),
+which makes the XMM-based instruction sets — SSE through SSE4.2, AES-NI, PCLMULQDQ, SHA-NI —
+architecturally available to protection domains; what disables them today is a generated toolchain
+default, not the kernel. The work splits into three tiers, and only one touches the kernel:
+
+- **Free — no kernel implication.** ADX and BMI2: general-purpose-register instructions carrying no
+  XSAVE state, accelerating the big-integer arithmetic under P-256, X25519 and part of ML-KEM.
+- **Available now — no kernel change.** SSE through SSE4.2, **AES-NI**, **PCLMULQDQ**, and SHA-NI:
+  all XMM-based, already covered by the saved state. This tier contains everything that decides
+  whether 10 Gbit/s inspection is viable.
+- **Deferred — needs a kernel rebuild.** AVX and AVX2: YMM state is not in feature set 3, so
+  enabling them means raising the kernel's XSAVE feature set and building seL4 ourselves instead of
+  consuming the SDK's prebuilt kernel. It would buy ChaCha20, SHA-2 and ML-KEM a factor of two to
+  four; AES-NI is the large win and needs only SSE.
+
+**The CPU baseline is a product requirement**, decided as such: **AES-NI, PCLMULQDQ, ADX and BMI2
+are mandatory and compile-time enabled**, together with SSE through SSE4.2 — universal on modern
+parts. **SHA-NI is runtime-detected via CPUID, never compile-time enabled**: it arrived with AMD
+Zen 1 and Intel Ice Lake, so enabling it unconditionally would exclude Haswell- and Skylake-era
+Xeons still in service — and this is not a preference, because compile-time-enabling a feature the
+CPU lacks is an illegal-instruction fault on first use, not a slow path.
+
+**Scalar cryptography cannot serve the inspection product**, and for a reason worse than raw speed:
+on the inspected path the appliance does not choose the cipher — the client does, and clients
+overwhelmingly prefer AES-GCM precisely because they have AES-NI. "Just use ChaCha20" is available
+for the management channel, where both ends are ours, and unavailable for traffic inspection. The
+orders of magnitude, from literature and vendor figures — **not measurements on this stack**, and
+replacing them with measured numbers on the shipped image is tracked in the
+[development status](../status.md): 10 Gbit/s of inspection is roughly 2.5 GB/s of AEAD (decrypt
+plus re-encrypt) before any deep inspection; AES-GCM with AES-NI and PCLMULQDQ runs in the
+single-digit GB/s per core, fitting that budget in about one core; fully scalar ChaCha20-Poly1305
+sits around five to seven cycles per byte, roughly five cores; and constant-time AES *without*
+AES-NI is worse still — the classic bitsliced results are around seven cycles per byte, and that is
+with SSSE3.
+
+**Where the `unsafe` for a hardware instruction lives: the protection domain, not a portable
+crate.** A crate that reached for CPUID or a hardware instruction could not be host-tested, so the
+domain is where that `unsafe` belongs — the same standing decision the TCP crate was built under,
+applied to the cryptography domain.
+
+## Key custody
+
+Only one domain can own a given virtio-blk device, and the device private key must never leave the
+domain that holds it. Therefore **the store domain is the identity domain**: it owns the
+[store device](updates.md#the-store-device), generates the device keypair, holds it, signs with it,
+and never emits it. TLS **delegates the private-key operation** to that domain — rustls supports a
+caller-supplied signing key for exactly this — so the domain that faces the network authenticates
+with a key it can use and never read.
+
+**The key is plaintext on the medium**: no TPM, no secure element, nowhere to keep a wrapping key.
+Physical access to the store device is identity theft, recorded as such in the
+[threat model](threat-model.md), and [factory reset](updates.md#factory-reset) overwrites the key
+rather than marking it free.
+
+## The allocator
+
+rustls requires `alloc`, so the appliance gains an allocator — **a necessity, not a feature**. An
+allocator on an external-input path makes allocation failure adversary-reachable, so the design
+property is stated with the mechanism: the arena is **bounded**, exhaustion **fails closed**, and it
+is **confined to the domain that runs TLS**. The dataplane domains keep having no allocator: every
+buffer there remains a mapped memory region or a stack array, exactly as before.

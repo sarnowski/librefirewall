@@ -8,11 +8,11 @@ it cannot see. A green gate is necessary, never sufficient.
 
 A change is done when, from a clean checkout:
 
-1. The full gate is green through the same root commands users and CI run — formatting, Clippy, the
-   documented-`unsafe` lint, the comment and `unsafe` budget ratchets, the system-description,
-   reference-chapter and configuration-document checks, dependency policy, unit and property tests
-   at or above the coverage floors, the fuzz targets, image assembly, and the QEMU system and A/B
-   scenarios.
+1. The full gate is green through the same root commands users and the git hooks run — formatting,
+   Clippy, the documented-`unsafe` lint, the comment and `unsafe` budget ratchets, the
+   system-description, reference-chapter and configuration-document checks, dependency policy, unit
+   and property tests at or above the coverage floors, the fuzz targets, image assembly, the QEMU
+   system and A/B scenarios, and the ctrld gate.
 2. Documentation and tests are updated **in the same change** — crate headers, rustdoc, `SAFETY`
    comments with their named guarantors, delegated preconditions with their named enforcers, and
    every book page the change touches the truth of.

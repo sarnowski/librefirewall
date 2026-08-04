@@ -14,6 +14,14 @@ first-party inherits that status: not a protection domain, not `xtask`, not a cr
 sees our own data". A first-party component claiming trust it was not granted is how it escapes the
 scrutiny its position requires. Everything first-party is exhaustively tested instead.
 
+**Adopted cryptography libraries are not in the trusted computing base and inherit no trust.** The
+rustls family, RustCrypto and libcrux enter the appliance as dependencies, not as an extension of
+the kernel's status: each is pinned, its provenance is audited, and its correctness is proven on the
+shipped image against published test vectors — NIST CAVP and Wycheproof — rather than assumed. A
+cryptography library that fails its vectors on the image is a build that does not ship, which is a
+stronger position than trusting it and a weaker one than only ever trusting seL4 — exactly where a
+third-party dependency belongs.
+
 The system targets **x86_64 exclusively**: no `cfg` branch, abstraction layer, or "portable for
 later" indirection for another architecture.
 
@@ -21,10 +29,11 @@ later" indirection for another architecture.
 
 The [threat model](../design/threat-model.md) assumes six adversaries: untrusted network traffic, a
 hostile or malfunctioning NIC device, a compromised parser or inspection domain, a byzantine
-neighbour protection domain, a management-plane attacker, and a connection-flood or
-state-exhaustion attacker against the terminating proxy. The last is not a mode of the first: its
-every frame is well-formed and its weapon is how much per-connection state each one commits, which
-is why the isolation model carries a denial-of-service item at all.
+neighbour protection domain, a management-plane attacker up to and including a compromised
+management server, and a connection-flood or state-exhaustion attacker against the terminating
+proxy. The last is not a mode of the first: its every frame is well-formed and its weapon is how
+much per-connection state each one commits, which is why the isolation model carries a
+denial-of-service item at all.
 
 A crate or module that handles external input states in its header, in plain words, which of them
 it faces. That statement is what makes "reachable from external input" reviewable rather than a
@@ -71,6 +80,12 @@ rg -n 'unwrap\(\)|expect\(|panic!|unreachable!|assert!|debug_assert!|\[[a-z_][a-
 - **Make ownership transfer explicit in types and queue protocols.** A buffer has exactly one owner
   at every instant, and the type system says so rather than a comment.
 - **Keep hot-path state per core; avoid shared locks on the hot path.**
+- **Protection domains carry no allocator, with one deliberate exception.** Every buffer is a mapped
+  memory region or a stack array. The exception is the domain that runs TLS: a proven TLS
+  implementation requires `alloc`, so that domain carries a **bounded arena that fails closed on
+  exhaustion** — an allocator on an external-input path makes allocation failure
+  adversary-reachable, and the bound plus the fail-closed answer is what keeps that reach a refusal
+  rather than a lever. The dataplane domains keep having none.
 - **Trust the framework and the pinned runtime**; do not reimplement what they already provide.
 
 ## `unsafe`
@@ -252,9 +267,12 @@ The decisions that constrain all observability code:
 
 - The **console** carries system state only — the startup sequence and its outcome, and runtime
   configuration changes — never traffic or per-request data.
-- **Logs** are structured OpenTelemetry logs only; no syslog.
-- **Metrics** are Prometheus format only, with bounded cardinality (no per-flow, per-connection or
-  per-packet labels) and no measurable dataplane cost.
+- **Logs** are structured typed events with one transport — today the OpenTelemetry log stream, and
+  under the [management-plane redesign](../design/management.md) the channel — never syslog, and
+  never two transports at once.
+- **Metrics** are exposed in Prometheus format today, and become channel-carried snapshots under
+  the redesign; under either transport the cardinality is bounded (no per-flow, per-connection or
+  per-packet labels) and the dataplane cost is unmeasurable.
 - **No distributed tracing** — deliberately out of scope.
 - **No surface carries packet payloads, secrets, keys, or personal data** — with one named
   exception: the [two recording sinks](../design/recording.md), which exist to carry the traffic
@@ -263,11 +281,15 @@ The decisions that constrain all observability code:
   absolutely); a recording is authorized, never merely scraped; an inspected flow is recorded as
   ciphertext plus its keys, never as decrypted plaintext at rest; and neither sink is a licence for
   a third — widening the exception is a design change, not a commit.
-- Six surfaces are the **complete** debug surface: the console, the OpenTelemetry log stream,
+- **The debug surface is closed and enumerated, and adding to it is a design change, not a
+  commit.** Today the enumeration is six surfaces: the console, the OpenTelemetry log stream,
   `GET /metrics`, `GET /logs`, `GET /config`, and the recording download — one surface carrying two
-  files, `/logs.pcapng` and `/capture.pcapng`. Adding another introspection mechanism — a debug
-  endpoint, a side channel, a diagnostic dump — changes the product's attack surface and is a
-  design change, not a commit.
+  files, `/logs.pcapng` and `/capture.pcapng`. That enumeration stays true until the
+  [management-plane redesign](../design/management.md) replaces the HTTP members with the channel,
+  retargeting the list to **console, channel, and recordings**; the list changes in the phase that
+  changes the surface, never before. What never changes is the invariant: a new introspection
+  mechanism — a debug endpoint, a side channel, a diagnostic dump — changes the product's attack
+  surface and is a design change.
 
 ## Verifying on a running appliance
 
@@ -344,11 +366,16 @@ Never commit secrets or an inspection CA; treat any secret you encounter as comp
   from the pinned inputs. A cache may accelerate a build but is never required for correctness.
 - **Never track a floating branch** — an upstream update is an explicit change that must pass the
   full gate.
-- **First-party userspace is pure Rust.** Audit transitive dependencies for native code, unexpected
-  linking, and build scripts; the dependency/license/source policy is enforced by `cargo-deny` in
-  the gate, and the networked `advisories` check is a deliberate manual run (`cargo deny check
-  advisories`) that nothing runs automatically. Both halves are configured in `datad/deny.toml`;
-  neither substitutes for the other.
+- **First-party userspace is pure Rust, and we implement no cryptographic algorithm.** Proven
+  third-party cryptography — the rustls family, RustCrypto, libcrux — is adopted, pinned, and held
+  to published test vectors on the shipped image; it is the one class of third-party runtime
+  dependency the appliance carries, because a first-party implementation of a cryptographic
+  algorithm would be strictly less trustworthy than the adopted one. Everything else stays
+  first-party. Audit transitive dependencies for native code, unexpected linking, and build
+  scripts; the dependency/license/source policy is enforced by `cargo-deny` in the gate, and the
+  networked `advisories` check is a deliberate manual run (`cargo deny check advisories`) that
+  nothing runs automatically. Both halves are configured in `datad/deny.toml`; neither substitutes
+  for the other.
 - Microkit x86_64 differs from Arm and RISC-V: the kernel and system image are separate ELFs loaded
   by a Multiboot2 bootloader. Use the pinned SDK's x86_64 BSP examples as the executable reference;
   never copy an Arm loader recipe.

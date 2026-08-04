@@ -2,10 +2,15 @@
 
 **A high-performance, deeply inspecting firewall built for strong isolation.**
 
-librefirewall is a defensive network security gateway for x86_64 appliances and virtual machines:
-full deep packet inspection across ISO layers 2 through 7, TLS interception, and inline content
-scanning — built on the seL4 microkernel with a pure-Rust userspace, decomposed into
-least-privilege protection domains whose authority the kernel enforces.
+librefirewall is a defensive network security gateway: full deep packet inspection across ISO
+layers 2 through 7, TLS interception, and inline content scanning. It is a two-component product:
+
+- **`datad/`** — the appliance, for x86_64 machines and virtual machines: built on the seL4
+  microkernel with a pure-Rust userspace, decomposed into least-privilege protection domains whose
+  authority the kernel enforces.
+- **`ctrld/`** — the central management application, a single pane of glass for many single and
+  clustered appliances. Appliances have no user interface of their own; they are onboarded once and
+  then dial home over one persistent, mutually-authenticated connection.
 
 ## Documentation
 
@@ -23,9 +28,10 @@ directly):
 ## Building
 
 ```sh
-make image   # build the pinned OCI builder, then assemble the release A/B disk
-make test    # fast host gate
-make ci      # the complete gate, QEMU scenarios included
+make image        # build the pinned appliance builder, then assemble the release A/B disk
+make ctrld-image  # build the pinned BEAM builder for the management server
+make test         # fast gate, both components
+make ci           # the complete gate, QEMU scenarios included
 ```
 
 Every build and gate target requires rootless Podman and nothing else. Rendering the book with

@@ -759,12 +759,13 @@ and wall-clock times. An independent parse of the two files established:
   crossing it, indefinitely, with no way to say otherwise. The filter rules are not that selector and
   cannot stand in for one — they decide what the appliance *forwards*, and a packet a rule dropped is
   recorded with its refusal exactly as a forwarded one is.
-- **No TLS and no authentication in front of either download.** This is the pre-existing deviation
-  from the [management design](../design/management.md) ([detail](#full-port-role-model)), and
-  recording makes it far more consequential: it used to expose counters, and it now hands anyone who
-  can reach the management port every packet the appliance recorded. The design makes authorization
-  a *condition* of the exception that lets a recording carry packet payloads at all; the condition
-  is unmet.
+- **No TLS and no authentication in front of either download.** The
+  [management design](../design/management.md) now erases these downloads outright — a recording
+  reaches the management server over the authenticated channel or not at all — and until that
+  replacement exists the gap stands at its full width ([detail](#full-port-role-model)): anyone who
+  can reach the management port is handed every packet the appliance recorded. The design makes
+  authorization a *condition* of the exception that lets a recording carry packet payloads at all;
+  the condition is unmet.
 - **One observation per frame.** The paired ingress and egress observation of one forwarded frame
   that the [recording design](../design/recording.md) intends — the thing a mirror port cannot give
   you — is not emitted: the packet identity that would relate them is minted and monotone, and only
@@ -813,16 +814,17 @@ and wall-clock times. An independent parse of the two files established:
   a resumed recording's download starts at the segment *this* boot opened rather than the previous
   boot's unsealed one, and there is no separate `open` for it to be called out of order with — but
   it is called by no protection domain, so a restart begins a fresh ring over the old bytes.
-- **One reader, and no live event stream.** The superblock carries four reader-cursor slots and
-  nothing registers one. The [management](../design/management.md) and
-  [recording](../design/recording.md) designs make the OTEL exporter, a syslog exporter and an
-  operator console's live event stream readers of this ring; the ring's only reader is the download
-  path. That unregistered cursor is why no series says how much history a recording still holds: a
-  wrap count states that a segment was evicted, and there is no cursor for it to have been evicted
-  past.
+- **One reader, and it holds no durable cursor.** The superblock carries four reader-cursor slots
+  and nothing registers one. The [management](../design/management.md) and
+  [recording](../design/recording.md) designs make the channel the ring's cursor-holding reader —
+  resuming from the server-acknowledged cursor after a reconnect — and no channel exists; the
+  ring's only reader is the download path. That unregistered cursor is why no series says how much
+  history a recording still holds: a wrap count states that a segment was evicted, and there is no
+  cursor for it to have been evicted past.
 - **A download is the whole recording.** No `Range`, no `If-Match`, no `ETag`, and no way to ask for
-  one segment or a time range — the [management design](../design/management.md) asks for a *time
-  range* of a sink. A body over 2 GiB is refused outright rather than served wrong.
+  one segment or a byte extent — the [management design](../design/management.md) serves recording
+  range reads over the channel, and the download it replaces cannot even express one. A body over
+  2 GiB is refused outright rather than served wrong.
 - **Nothing is measured.** There is no Criterion bench on the tap or the recording path, nothing has
   been measured against the 10 Gbit/s target with recording on or off, and the segment size, the
   staging split and the two drain budgets are plausible numbers rather than measured ones. The tap
@@ -1103,9 +1105,10 @@ claims.
 
 - **No authentication, no TLS, no authorization and no rate limit on any of it.** Anything that can
   reach the management port can read this appliance's policy and **replace** it, which is the
-  authority to decide what it forwards. That is a recorded deviation from the
-  [management design](../design/management.md), it is the largest gap in this document, and the port
-  must not be exposed to an untrusted network until the intended mTLS pair exists.
+  authority to decide what it forwards. The [management design](../design/management.md) now closes
+  this by erasing the surface: configuration travels the authenticated channel, and nothing listens
+  on an onboarded appliance. Until that exists this is the largest gap in this document, and the
+  port must not be exposed to an untrusted network.
 - **No rollback.** The [configuration design](../design/configuration.md)'s return to an earlier
   version does not exist. The datastore holds the running configuration and at most one candidate, so
   there is no version history to roll back *to*, and with no persistence there is none worth holding:
@@ -1442,11 +1445,11 @@ not satisfy it.
 - **No TLS, and now that gap carries a write.** HTTP answers `GET /metrics`
   ([detail](#prometheus-metrics)), `GET /config`, both recordings
   ([detail](#recording-and-download)) and `POST /config` ([detail](#configuration-management)) — all
-  in the clear, with no authentication and no authorization split. The
-  [management design](../design/management.md) requires mutual TLS on the management port and there is
-  none, so **anything that can reach the port can scrape it, download every packet the appliance
-  recorded, read its policy, and replace that policy** — which is the authority to decide what this
-  firewall forwards. Until the mTLS pair exists the port belongs on an isolated network. `/logs` does
+  in the clear, with no authentication and no authorization split, so **anything that can reach the
+  port can scrape it, download every packet the appliance recorded, read its policy, and replace
+  that policy** — which is the authority to decide what this firewall forwards. The
+  [management design](../design/management.md) erases this surface in favor of onboarding and the
+  authenticated channel; until that exists the port belongs on an isolated network. `/logs` does
   not exist, so of the debug dump the
   [observability reference](../reference/observability.md) describes, the state half, the running
   document and the two recordings are what a node can be asked for and the retained records cannot be.
@@ -1465,7 +1468,8 @@ not satisfy it.
   records are keyed by a synthetic identifier: the element has no `id` of its own, so every record
   about it reads `object=management key=management`.
 - **Nothing bounds the rate of requests to this port.** The
-  [management design](../design/management.md) asks the surface to bound it; nothing does. The only
+  [management design](../design/management.md) requires its onboarding endpoints rate-limited with
+  backoff; the surface serving today is not those endpoints and bounds nothing. The only
   rate bound anywhere in the appliance is RFC 5961 §7's per-second budget on *unsolicited replies*,
   shared across the connection table — which caps what this node emits at a peer and caps nothing a
   peer sends at it. What does exist against a flood is bounded state rather than a bounded rate: a
@@ -1648,13 +1652,13 @@ stated as a freshness property in the [metrics reference](../reference/metrics.m
 
 **Missing.**
 
-- **No mutual TLS — the endpoint is plain HTTP with no client authentication, and no bound on how
-  often it may be asked.** The [management design](../design/management.md) requires mTLS on the
-  management port and asks it to bound the request rate; neither exists. Anyone who can reach the
-  port can scrape it as fast as they like, and the exposition names every domain, drop reason and
-  fault class in the node. This is a **deviation from the design**, recorded here and in
-  `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network the management port is
-  not already isolated on.
+- **No TLS — the endpoint is plain HTTP with no client authentication, and no bound on how often it
+  may be asked.** Anyone who can reach the port can scrape it as fast as they like, and the
+  exposition names every domain, drop reason and fault class in the node. The
+  [management design](../design/management.md) removes this endpoint outright — metrics become
+  snapshots in the ring, shipped over the authenticated channel — and until then the gap is
+  recorded here and in `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network
+  the management port is not already isolated on.
 - **One response is staged at a time.** A scrape arriving while another is still going out is
   answered `503` and counted. A finished-but-not-yet-reaped connection's buffer is reclaimed rather
   than waited out, so a periodic scraper is never refused for the previous scrape — but two
@@ -1716,8 +1720,11 @@ calibration that is torn under the read or outside the band it accepts, having r
 - **The time is unauthenticated and unattested.** It comes from a battery-backed register file that
   any firmware, hypervisor or dead battery can make say anything plausible. There is no NTP, no
   Roughtime, no signed time source and no attestation, so a wrong-but-plausible instant is
-  indistinguishable from a right one. The [threat model](../design/threat-model.md) makes
-  certificate validity depend on accurate time; nothing here may be used for that.
+  indistinguishable from a right one. The [threat model](../design/threat-model.md) now records a
+  deliberate split over what may be judged against it: the management channel's certificate
+  validity is judged against this clock, trusting the hardware; TLS-interception validation — the
+  appliance judging upstream certificates on behalf of protected clients — may not be, and its
+  trusted source remains open.
 - **UTC is assumed, not discovered.** The CMOS carries no field saying whether it holds UTC or local
   time. A machine whose firmware set it to local time yields an epoch wrong by that zone's offset,
   detectably by nothing.
@@ -1998,6 +2005,23 @@ image would fit it, reading the bound out of `grub.cfg` rather than restating it
 `BOOTX64.EFI` itself is unsigned in the Authenticode sense (no shim, MOK, or PK/KEK/db hierarchy).
 There is no TPM anywhere: no vTPM in the QEMU harness, no measured boot, no PCR policy, and no
 anti-rollback epoch. Production key management (HSM-backed signing) does not exist.
+
+## Management server
+
+**What exists.** `ctrld/` holds a green-but-empty Phoenix application with LiveView, and — which is
+the point of landing it this early — the second toolchain as a first-class citizen of the
+repository: a pinned BEAM builder image following the same conventions as the appliance's
+(version- and checksum-pinned inputs, network only while provisioning the image, every gate command
+offline), and a ctrld gate wired into `make test`, so the management server is held to a gate from
+its first line of real code rather than retrofitted with one. The
+[building chapter](building.md) describes the command surface.
+
+**Missing.** The product. Nothing of the [management server design](../design/management-server.md)
+exists: no Postgres or ClickHouse schema, no local users or bootstrapped administrator, no CA and no
+issuance against the [certificate profile](../contracts/certificate-profile.md), no
+configuration-package composition, no appliance inventory, no ThousandIsland channel listener, no
+pcapng decoder and no fixtures drawn from the appliance gate's recordings, no LiveView beyond the
+generator's skeleton.
 
 ## Engineering foundations
 

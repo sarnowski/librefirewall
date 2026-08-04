@@ -16,9 +16,16 @@
 - [Threat model and isolation](design/threat-model.md)
 - [Deployment and high availability](design/deployment.md)
 - [Management plane](design/management.md)
+- [Management server](design/management-server.md)
 - [Configuration](design/configuration.md)
 - [Recording and persistent storage](design/recording.md)
 - [Updates and secure boot](design/updates.md)
+
+# Contracts
+
+- [Configuration package](contracts/configuration-package.md)
+- [Certificate profile](contracts/certificate-profile.md)
+- [Channel framing](contracts/channel-framing.md)
 
 # Development
 

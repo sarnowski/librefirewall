@@ -1,106 +1,139 @@
 # Management plane
 
-- **No user interface.** The only management interface is an **HTTP API**.
-- **Endpoints / operations:**
+librefirewall is a **two-component product**: the appliance, and a central management application —
+a single pane of glass for many single and clustered appliances, Panorama-like, where **appliances
+have no user interface of their own at all**. The management application owns appliance onboarding,
+configuration management with version control and audit, log and capture search, and the operators
+who do all of it; the [management server chapter](management-server.md) is its own design. This
+chapter is the appliance's side of the relationship: the channel, onboarding, and the trust model
+they rest on.
 
-  | Operation | Purpose |
-  |---|---|
-  | `GET /metrics` | Metrics in Prometheus format |
-  | `GET /config` | Read the current running configuration (XML) |
-  | `POST /config` | Submit a document: it becomes the candidate, is validated, and is committed |
-  | `GET /logs` | Read the most recent structured log records held in the node's local buffer |
-  | Recording download | Retrieve a time range of either [recording sink](recording.md) as a pcapng file |
-  | Configuration change | The [candidate/commit-confirmed workflow](configuration.md): submit a candidate, validate, commit (with commit-confirmed), confirm, and roll back to a previous version |
+The appliance exposes **no management surface**. No HTTP API, no metrics endpoint, no download
+endpoint, no log exporter — nothing listens on an onboarded appliance. In their place is one
+persistent **outbound**, mutually-authenticated TLS connection from the appliance to the management
+server, and that connection is the whole management plane.
 
-  Configuration is never changed by a single unqualified write; every change goes through the
-  candidate/commit-confirmed workflow (see [Configuration](configuration.md)), so the API exposes
-  the stage, validate, commit, confirm, and rollback operations that workflow requires. `POST /config`
-  is the first of those to exist: it stages, validates and commits in one request. Confirm and
-  rollback do not exist yet, so a change that validates and then breaks management connectivity is
-  not undone by anything — the [development status](../status.md) records it.
+## The channel
 
-  **A submission is answered when the configuration is committed, and the dataplane switches
-  immediately afterwards rather than inside the request.** The two-phase offer/acknowledge handover
-  to the forwarding domain is what makes that switch happen between two frames instead of part-way
-  through one, so a node is never deciding a packet under half a policy. What says a change is in
-  force on the dataplane is that domain's own reported generation, which is why every generation is
-  published per domain rather than once for the node.
-- **Security:** the API provides encryption, authentication, and read/write authorization using an
-  **mTLS certificate pair issued during onboarding** (the design of the onboarding process is
-  still open — see [development status](../status.md)). The management API runs in an isolated PD,
-  on a dedicated management interface, and bounds the rate of requests it accepts.
+One connection, multiplexing everything, in both directions:
 
-  ## None of that security exists yet, and what that means in plain words
+- **Up**: pcapng blocks as the wire format — connection and policy events, metric snapshots as
+  PEN-tagged custom blocks, and audit records — flushed in roughly one-second batches, so an
+  administrator sees logs and metrics near-realtime.
+- **Down**: configuration operations (stage, validate, commit-confirm) and recording range-read
+  requests.
 
-  **Anything that can reach the management port can reconfigure this firewall.** There is no TLS
-  anywhere in the appliance, the endpoint authenticates nobody, there is no read/write split, and
-  there is no rate limit. Every operation above is served over plain HTTP to whoever asks: a
-  `GET /config` hands out the policy, and a `POST /config` **replaces** it — which is the authority to
-  decide what this appliance forwards, to whom, and what it drops. Downloading the recordings is on
-  the same footing and hands out every packet the node has captured.
+**The ring bytes are the wire bytes.** The pcapng recording rings on the appliance remain the source
+of truth, and the channel is [one more reader of them](recording.md#one-writer-many-readers) — a
+cursor-holding reader that ships the rings' own bytes onward with no re-encoding on the appliance.
+One consequence is worth stating here: every surface but the
+[two recording sinks](recording.md#two-sinks-one-format) is barred from carrying packet payloads,
+and the channel does not widen that exception — it *carries the sinks*, under the same authorization
+the sinks' own design demands, rather than being a third place payloads appear.
 
-  So the port must be on a physically or logically isolated management network, reachable only by
-  the operator, and **must not be exposed to an untrusted network** — not to the internet, not to a
-  general-purpose office LAN, not to a network segment the appliance itself is filtering. An
-  appliance whose management port is reachable from a network it protects is one an attacker
-  reconfigures instead of attacking.
+**The session layer is deliberately thin**: mutual TLS, a resume cursor giving at-least-once
+catch-up from the ring after a reconnect, and periodic acknowledgements — nothing else. Backpressure
+is the recording ring's existing semantics, not a second mechanism: the appliance **never blocks on
+a slow management server**, a lagging server catches up from the ring, and true overrun — a server
+that fell further behind than the ring holds — is reported in-band through the drop counts the
+recordings already carry. The exact frame layout, types, cadences and bounds are the
+[channel framing contract](../contracts/channel-framing.md).
 
-  This is a recorded, deliberate stage of development rather than an oversight: the design above is
-  the target, the [development status](../status.md) records the gap, and the crates that serve the
-  surface state it in their own headers. It is written out here at length because a reader who
-  skimmed the paragraph above it would otherwise have every reason to believe the API is
-  authenticated.
+## Onboarding
 
-  What the isolation the API *does* have still buys, and it is not nothing: the domain that answers
-  the port holds no dataplane memory, and the domain that parses a submitted document holds no
-  device, no buffer pool and no dataplane ring. So an attacker who reaches the port can change the
-  policy — which is the whole of the authority the port carries — and cannot reach a frame in flight
-  or the memory one travels through.
-- **Metrics:** exposed in **Prometheus exposition format** via `GET /metrics` — the *only* metrics
-  interface — with disciplined, bounded cardinality (aggregate metrics, never per-flow labels).
-  Every moving part (queues, buffer pools, per-NIC and per-core counters) is observable there
-  without measurable dataplane cost, and the endpoint also reflects applied-configuration state.
-- **Logs:** emitted as **structured OpenTelemetry logs** to an external receiver — the single log
-  transport; syslog is not used. Audit logs (management/user actions), traffic logs, and
-  per-subsystem logs are OTEL-only. System-state events (see *Console*) are additionally written to
-  the console. Connection and policy events are not composed for the wire: they are written to the
-  [log sink](recording.md#two-sinks-one-format) and the OTEL exporter is
-  [one reader of that ring](recording.md#one-writer-many-readers), which is what lets a collector
-  that was unreachable catch up rather than lose them.
-- **Local log buffer:** the node retains a **bounded ring of its most recent structured log
-  records** and exposes it via `GET /logs`. External OTEL collection is routinely delayed by minutes
-  and can be unavailable outright, and there is no shell — so without this ring there is no way to
-  observe what a node is doing *now*, which is precisely what live debugging requires. It is a
-  debugging surface, not a log archive: bounded, deliberately lossy (overflow is dropped and
-  counted, and the drop count is exposed), and bound by the same rule as every other surface — no
-  payloads, secrets, or personal data.
-- **Recording:** the two pcapng sinks (see
-  [Recording and persistent storage](recording.md)) are retrieved through the management API as
-  pcapng files, over the same mTLS-authenticated, authorized and rate-limited surface as everything
-  else, as is a **live event stream** for an operator console — another
-  [reader of the log ring](recording.md#one-writer-many-readers).
-- **The recording sinks are a deliberate exception to the no-payload rule, not an oversight in
-  it.** Every other surface named here is barred from carrying packet payloads, and that bar
-  stands unchanged: metrics, logs, the local log buffer, and the console carry none. The capture
-  sink exists precisely to carry them and the log sink carries packet headers by construction —
-  recording the evidence *is* the feature, and a capture that omitted the payload would not be
-  one. The exception is therefore scoped and stated: it applies to these two sinks and to nothing
-  else, it is why they are gated by an authorization decision rather than merely scraped, and it
-  is why an inspected flow is recorded as
-  [ciphertext plus its keys](recording.md#pcapng-as-the-internal-representation) rather than as
-  decrypted plaintext at rest.
-- **Console:** carries **system state only** — the startup sequence and its success/failure, and
-  runtime configuration changes (an interface brought up, a MAC reconfigured, a config version
-  applied). It never carries traffic or per-request data. It is the last-resort survivability
-  channel that lets an operator diagnose a node whose log streaming is unavailable.
-- **No distributed tracing.** OpenTelemetry is used for structured logs only; tracing — including
-  of the management API — is deliberately out of scope.
-- **The exposed interfaces are the complete debug surface.** There is no shell, no CLI, and no
-  other introspection mechanism. Scraping `GET /metrics`, reading `GET /config`, tailing
-  `GET /logs`, and downloading the recording sinks once yields the entire observable state of a
-  node — applied configuration, every metric around it, what it has just been doing, and the
-  recorded evidence of what it did to traffic — which is, by design, all that is available to
-  debug it. The externalized logs and metrics are therefore a first-class operator contract,
-  specified in the [reference part](../reference/observability.md) of this book.
-- **Management application:** configuration management, log analysis, and metric analysis are
-  handled by a separate management application.
+An appliance is **unboarded** or **onboarded**, and nothing in between.
+
+While unboarded it **forwards nothing** — fail-closed, the same posture as before any configuration
+is committed. The management port runs only a minimal HTTPS onboarding server presenting the
+appliance's self-signed certificate, whose SPKI fingerprint is printed on the output-only console.
+The onboarding endpoints are rate-limited with backoff and are **never permanently locked out**: a
+permanent lockout would be a remote bricking primitive, and an attacker who can reach an
+unprovisioned appliance's management port already holds the position the trust model assigns to the
+owner (below).
+
+The flow:
+
+1. On first boot — and after every factory reset — the appliance generates a keypair, self-signs a
+   certificate, prints the key's SPKI fingerprint on the console, and persists both.
+2. The administrator reaches the onboarding server over HTTPS and verifies the presented
+   certificate's fingerprint against the console output. This authenticates the appliance to the
+   administrator.
+3. `GET /` serves a deliberately plain, unstyled HTML page: a link to the CSR, and a form to upload
+   a configuration package.
+4. `GET /certificate.csr` downloads the certificate signing request (its exact profile is the
+   [certificate contract](../contracts/certificate-profile.md)).
+5. The administrator uploads the CSR to the management application, which shows the fingerprint
+   again and signs it — the management application is the device-issuing CA.
+6. The administrator downloads a package from the management application and uploads it to the
+   appliance via `POST /configuration.tar`. The appliance unpacks and validates it against the
+   [package contract](../contracts/configuration-package.md) and installs its contents: the signed
+   device certificate, the management CA certificate as trust anchor, the management endpoint, and
+   the configuration — which may already carry substantial inherited configuration, so the appliance
+   comes up with the connectivity it needs.
+7. The appliance prints the installed anchor's SPKI fingerprint and the endpoint on the console,
+   closes the onboarding server **permanently**, and from then on dials out, pinned to the delivered
+   anchor.
+
+## The ownership trust model
+
+Trust is established by **the administrator controlling physical and logical access to the
+management port during onboarding**. Whoever reaches an unprovisioned appliance becomes its owner;
+ensuring nobody else can is the administrator's job, and an attacker who can reach an unprovisioned
+appliance is indistinguishable from the user who is supposed to. There is no vendor-embedded trust
+anchor, deliberately: a factory-fresh appliance has no owner and cannot know which management plane
+will adopt it, and a vendor anchor would make the vendor a trust root for every appliance ever
+shipped, which contradicts the product.
+
+**One asymmetry must be read precisely, because the flow above looks mutual and is not.** The
+fingerprint printed on the console authenticates the *appliance to the administrator* — the
+administrator cannot be intercepted and cannot onboard the wrong box. **Nothing authenticates the
+administrator to the appliance.** That is deliberate, and physical access control is the property
+that stands in for it. The package is accordingly [not signed](../contracts/configuration-package.md):
+it is authenticated by the TLS session the administrator opened after verifying the fingerprint out
+of band.
+
+**Factory reset is the only ownership transfer.** It removes all ownership — the key, the delivered
+certificate and anchor, the endpoint, the configuration history, the recordings — and returns the
+appliance to unowned, ready to onboard again. It is local-only and never remotely triggerable; its
+mechanics are with the [store design](updates.md#factory-reset).
+
+## Lifecycle rules
+
+- **The trust anchor and the management endpoint are never changeable over the channel — ever.**
+  Changing either requires factory reset and re-onboarding: the same physical boundary that
+  established ownership. The [threat model](threat-model.md#the-compromised-management-server) is
+  why, and the package contract makes an endpoint change
+  [structurally inexpressible](../contracts/configuration-package.md#members) in a pushed document.
+- **Commit-confirm must arrive over a fresh connection.** The appliance's whole relationship to its
+  management plane is an outbound dial, so what a committed configuration must not break is *new*
+  connections — and confirming over the pre-existing session proves nothing about those, that
+  session surviving regardless. After a commit the appliance re-dials under the new configuration,
+  and only a confirmation on that fresh session keeps it; the deadline passing rolls back.
+- **Management unreachability is never traffic-affecting.** The dataplane keeps forwarding the last
+  committed configuration; reconnection uses bounded exponential backoff; and there are no rollback
+  loops — an unreachable server changes nothing about what the appliance forwards, however long it
+  stays unreachable.
+- **Revocation is server-side.** The management application authorizes every connection per device,
+  and revoking an appliance is withdrawing that authorization. There is no CRL and no OCSP machinery
+  on the appliance, and device certificates are long-lived — expiry is not the revocation mechanism
+  (see the [certificate profile](../contracts/certificate-profile.md)).
+- **Certificate validity windows are judged against the CMOS-derived clock.** The hardware is
+  trusted at this point, and that is a recorded decision rather than an oversight: the clock is
+  unauthenticated, and an adversary who can set it is an adversary with a position — firmware, the
+  hypervisor, the board — that the software design already cannot defend against.
+
+## What remains on the appliance
+
+- **Console:** unchanged — system state only, the startup sequence and its outcome, configuration
+  changes, and the onboarding records above (the fingerprint, the installed anchor, the endpoint).
+  It is the last-resort survivability channel, and during onboarding it is the trust root's display.
+- **Recordings:** unchanged — the two pcapng sinks remain the durable record on the appliance's own
+  storage, and remain [evidence that requires physical access](threat-model.md#the-compromised-management-server)
+  even after a management-server compromise.
+- **The debug surface is the console, the channel, and the recordings — and it is complete.** There
+  is no shell, no CLI, and no other introspection mechanism. Everything an operator learns about a
+  node arrives over the channel, is printed on the console, or is read out of the recordings; adding
+  another mechanism changes the product's attack surface and is a design change.
+- **No distributed tracing, no syslog, no Prometheus server, no OpenTelemetry export.** Metrics are
+  snapshots in the ring; logs are events in the ring; both travel the channel, and the management
+  server is the [sole collector](management-server.md).
