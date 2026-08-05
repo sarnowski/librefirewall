@@ -1175,5 +1175,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 89_178);
+    assert_eq!(MAX_EXPOSITION_LEN, 89_371);
 }

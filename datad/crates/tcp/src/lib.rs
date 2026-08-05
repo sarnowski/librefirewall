@@ -1,10 +1,10 @@
-//! The appliance's TCP: a passive-open transport that never owns a byte of the
-//! streams it carries.
+//! The appliance's TCP: a transport that never owns a byte of the streams it
+//! carries.
 //!
 //! # What this is for
 //!
-//! It is the stack the management endpoint answers on today and the one the
-//! proxy dataplane will run on. That second use is what fixes every constraint
+//! It is the stack the management endpoint answers on and dials out of, and the
+//! one the proxy dataplane will run on. That second use is what fixes every constraint
 //! below, so none of them is a management-endpoint economy: a proxy terminating
 //! traffic at the 10 Gbit/s-per-port-pair target cannot afford a copy, cannot
 //! afford a lock, and cannot afford an allocator.
@@ -53,14 +53,22 @@
 //! capacity is a const generic, so a shard's memory is fixed at compile time and
 //! sized by the caller rather than by this crate.
 //!
-//! # Scope: passive open, and what is deliberately outside it
+//! # One port, in both directions
+//!
+//! A stack answers on one port and dials **from that same port**: a segment is
+//! matched to a connection by the peer's address and port alone, so a second
+//! local port would be a second key the table does not carry, and a dial from an
+//! ephemeral one would arrive back at a port [`TcpStack::receive`] refuses. What
+//! follows is that the appliance's outbound connection carries its management
+//! port's own number as its source port — unusual on the wire, entirely legal,
+//! and the price of a table one number wide. The peer is still distinguished, so
+//! a dial and an inbound connection coexist unless they name the same peer
+//! address and port, which is the one case [`TcpStack::connect`] refuses outright.
+//!
+//! # Scope: what is deliberately outside it
 //!
 //! Each of the following is a decision with a reason, not an unfinished edge.
 //!
-//! * **No active open.** Nothing in the appliance originates a connection yet, so
-//!   `SYN_SENT` and the simultaneous-open path have no caller. They arrive with
-//!   the proxy, which is what will first need to *make* a connection rather than
-//!   accept one; adding them is a state and a transition, not a restructuring.
 //! * **No selective acknowledgement.** SACK's value is retransmitting only the
 //!   holes in a reassembly queue, and there is no reassembly queue here — that
 //!   would be a buffer this crate owns. `crate::segment` reads and records the
@@ -308,6 +316,37 @@ pub enum SendError {
     NothingOutstanding,
 }
 
+/// Why a dial was refused.
+///
+/// Every variant is about *this* end — no room in the table, a connection on the
+/// 4-tuple already, storage too small — because a dial is refused before a peer
+/// has been given the chance to say anything. What the peer then does with the
+/// `SYN` is an [`Outcome`] and a [`Timeout`], never one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialError {
+    /// The table is full and nothing in it may be taken back. A dial never evicts:
+    /// see [`Connection::evictable`](connection::Connection::evictable) for which
+    /// connections may be, and the crate header for what a full table costs.
+    TableFull,
+    /// A connection on this 4-tuple already exists, and its handle is named so a
+    /// caller that lost track of one can go on using it rather than opening a
+    /// second connection the table could not tell apart from the first.
+    AlreadyOpen { connection: ConnectionId },
+    /// The caller's storage could not hold the `SYN`. The connection is *not*
+    /// opened: a dial whose `SYN` never left would sit out its whole
+    /// retransmission budget before the caller learned anything.
+    Write(WriteError),
+}
+
+/// What one dial produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialled {
+    /// The connection the dial opened, which a caller answers and closes on.
+    pub connection: ConnectionId,
+    /// Bytes of `out` now holding the `SYN`.
+    pub len: usize,
+}
+
 /// What one send accepted and produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sent {
@@ -465,6 +504,71 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             Some(slot) => self.advance(now, slot, source, &parsed, out),
             None => self.open(now, source, &parsed, out),
         }
+    }
+
+    /// Dial `peer` on `port`: open a connection this end originates, writing its
+    /// `SYN` into `out`.
+    ///
+    /// The connection comes back in `SYN_SENT` and is not usable yet — a caller
+    /// watches for [`State::Established`] and sends then. Nothing else is owed:
+    /// the `SYN` is recorded like any other segment, so a lost one is re-sent from
+    /// [`poll_timeouts`](Self::poll_timeouts) under RFC 6298's backoff, and a peer
+    /// that never answers reaches [`MAX_RETRANSMITS`] and arrives as
+    /// [`Timeout::Abandoned`] — which is how a dial to an address with nothing on
+    /// it ends rather than by hanging.
+    ///
+    /// # Errors
+    /// [`DialError`], for a full table, a 4-tuple already connected, or storage
+    /// too small.
+    pub fn connect(
+        &mut self,
+        now: Monotonic,
+        peer: Ipv4Address,
+        port: u16,
+        out: &mut [u8],
+    ) -> Result<Dialled, DialError> {
+        if let Some(slot) = self.find(peer, port) {
+            return Err(DialError::AlreadyOpen {
+                connection: self.id_of(slot),
+            });
+        }
+        // Not counted as a refusal: every count in `TcpCounters` beyond
+        // `write_refused` is a statement about what a *peer* sent, and a dial this
+        // end could not make is neither. The caller is told instead.
+        let Some(slot) = self.dial_slot(now) else {
+            return Err(DialError::TableFull);
+        };
+        let iss = self
+            .isn
+            .initial_sequence(now, self.address, self.port, peer, port);
+        let connection =
+            Connection::open(now, peer, port, iss, self.mss_limit, self.receive_window);
+        let reply = connection.syn();
+        let window = connection.advertised_window();
+        let scale = connection.handshake_scale();
+        // Composed before the slot is filled, so a refusal leaves the table as it
+        // was: a connection whose `SYN` is not on the wire would hold a slot and
+        // spend its whole retransmission budget re-sending a segment the caller
+        // never learned had failed to go out.
+        let len = match self.write(peer, port, window, scale, &reply, out) {
+            Ok(len) => len,
+            Err(error) => {
+                TcpCounters::bump(&mut self.counters.write_refused);
+                return Err(DialError::Write(error));
+            }
+        };
+        if let Some(cell) = self.slots.get_mut(slot) {
+            *cell = Some(connection);
+        }
+        if let Some(generation) = self.generations.get_mut(slot) {
+            *generation = generation.wrapping_add(1);
+        }
+        TcpCounters::bump(&mut self.counters.connections_dialled);
+        TcpCounters::bump(&mut self.counters.segments_sent);
+        Ok(Dialled {
+            connection: self.id_of(slot),
+            len,
+        })
     }
 
     /// Send up to `data.len()` bytes on a connection.
@@ -726,8 +830,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                         peer: connection.peer_address(),
                         port: connection.peer_port(),
                         window: connection.advertised_window(),
-                        scale: connection.window_scale(),
-                        acknowledgement: connection.rcv_nxt(),
+                        scale: connection.handshake_scale(),
+                        control: connection.control(&range),
                     })
                 });
             let Some(plan) = plan else { continue };
@@ -750,13 +854,14 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                     len: plan.range.len,
                 });
             }
-            let reply = Reply {
-                flags: control_flags(&plan.range),
-                sequence: plan.range.sequence,
-                acknowledgement: plan.acknowledgement,
-                with_options: plan.range.syn,
-            };
-            let len = match self.write(plan.peer, plan.port, plan.window, plan.scale, &reply, out) {
+            let len = match self.write(
+                plan.peer,
+                plan.port,
+                plan.window,
+                plan.scale,
+                &plan.control,
+                out,
+            ) {
                 Ok(len) => len,
                 Err(_) => {
                     TcpCounters::bump(&mut self.counters.write_refused);
@@ -779,17 +884,20 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             .slots
             .get(slot)
             .and_then(Option::as_ref)
-            .map(|connection| {
-                (
-                    connection.peer_address(),
-                    connection.peer_port(),
-                    connection.advertised_window(),
-                    connection.reset(),
-                )
+            .and_then(|connection| {
+                connection.abandonment().map(|reply| {
+                    (
+                        connection.peer_address(),
+                        connection.peer_port(),
+                        connection.advertised_window(),
+                        reply,
+                    )
+                })
             });
-        // The zero is unreachable — the caller found the slot occupied to reach
-        // here — and is a value rather than an assertion, no panic being
-        // admissible on a path a peer's traffic reaches.
+        // Zero where the connection owed no reset — a dial nothing ever answered
+        // — and zero too where the slot was empty, which the caller found
+        // occupied to reach here: a value rather than an assertion, no panic
+        // being admissible on a path a peer's traffic reaches.
         let len = composed.map_or(0, |(peer, port, window, reply)| {
             self.send_reset(peer, port, window, &reply, out)
         });
@@ -956,6 +1064,7 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                 Refusal::UnacceptableAck => &mut self.counters.refused_unacceptable_ack,
                 Refusal::OutOfOrder => &mut self.counters.refused_out_of_order,
                 Refusal::NoAcknowledgement => &mut self.counters.refused_no_acknowledgement,
+                Refusal::NotAHandshake => &mut self.counters.refused_not_a_handshake,
             };
             TcpCounters::bump(count);
         }
@@ -1131,6 +1240,27 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         Some(victim)
     }
 
+    /// A slot for a dial: an empty one, else one whose connection is already over.
+    ///
+    /// It never evicts, which is [`free_slot`](Self::free_slot)'s rule read from
+    /// the other side. That one refuses to let a peer's `SYN` destroy an
+    /// established connection; this one refuses to let *this end's own dial* do
+    /// it — a table full of live connections is a table an operator is using, and
+    /// a dial that took one back would trade a session somebody holds for one
+    /// nobody has answered yet.
+    fn dial_slot(&mut self, now: Monotonic) -> Option<usize> {
+        if let Some(slot) = self.slots.iter().position(Option::is_none) {
+            return Some(slot);
+        }
+        let victim = self.slots.iter().position(|held| {
+            held.as_ref()
+                .is_some_and(|connection| connection.expired(now))
+        })?;
+        self.free(victim);
+        TcpCounters::bump(&mut self.counters.connections_reaped);
+        Some(victim)
+    }
+
     /// Empty a slot.
     fn free(&mut self, slot: usize) {
         if let Some(cell) = self.slots.get_mut(slot) {
@@ -1173,22 +1303,11 @@ struct Expiry {
     port: u16,
     window: u16,
     scale: Option<u8>,
-    acknowledgement: SeqNumber,
-}
-
-/// The flags a re-sent control segment carries, from what its record says it was.
-///
-/// Only a record with no payload reaches this — `TcpStack::poll_timeouts` sends
-/// a caller's data back to the caller instead — so there is no `PSH` case.
-fn control_flags(record: &connection::Unacked) -> Flags {
-    let mut flags = Flags::ACK;
-    if record.syn {
-        flags = flags.with(Flags::SYN);
-    }
-    if record.fin {
-        flags = flags.with(Flags::FIN);
-    }
-    flags
+    /// The segment a payload-free record is re-sent as, composed by the
+    /// connection because which one it is depends on the state the record was
+    /// made in: a dial's `SYN` carries no acknowledgement and every other
+    /// control segment does.
+    control: Reply,
 }
 
 #[cfg(test)]

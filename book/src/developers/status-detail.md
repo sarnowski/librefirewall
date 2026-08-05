@@ -1522,11 +1522,34 @@ several instances run on several cores with no coordination and the compiler is 
 capacity is a const generic, so a shard's memory is fixed at compile time and sized by its caller.
 There is no allocator and no `alloc`.
 
-What the passive-open path implements, completely:
+**One port, in both directions.** A stack answers on one port and dials from that same port: a
+segment is matched to a connection by the peer's address and port alone, so a second local port
+would be a second key the table does not carry, and a dial from an ephemeral one would arrive back
+at a port the stack refuses. The appliance's outbound connection therefore carries its management
+port's own number as its source port — unusual on the wire, entirely legal, and the price of a table
+one number wide. A dial and an inbound connection coexist unless they name the same peer address and
+port, which is the one case a dial refuses outright.
 
-- **RFC 793's state machine** as a passive open reaches it: `LISTEN` → `SYN_RECEIVED` →
-  `ESTABLISHED` → `CLOSE_WAIT`/`LAST_ACK`, `FIN_WAIT_1`/`FIN_WAIT_2`, `CLOSING` (the simultaneous
-  close), `TIME_WAIT` and `CLOSED`.
+What the stack implements, completely:
+
+- **RFC 793's state machine**, both ways it can be entered: `LISTEN` → `SYN_RECEIVED` and
+  `SYN_SENT` → `ESTABLISHED` → `CLOSE_WAIT`/`LAST_ACK`, `FIN_WAIT_1`/`FIN_WAIT_2`, `CLOSING` (the
+  simultaneous close), `TIME_WAIT` and `CLOSED`.
+- **The active open.** A connect entry point composes a `SYN` and returns a connection in
+  `SYN_SENT`; RFC 793 p.66's arrival processing follows that section's own order, and the order is
+  the security property. An acknowledgement is checked before a reset is believed, so a reset a peer
+  sends in the blind cannot cancel a dial; an answer acknowledging a number this end never sent
+  draws a reset carrying that number and **leaves the dial standing**, because one forged segment
+  must not be able to cancel this node's dial; and a `SYN` with no acknowledgement is the
+  **simultaneous open**, which moves the connection to `SYN_RECEIVED` and re-uses the sequence
+  number the outstanding record already covers, so the timer that was arming for the `SYN` arms for
+  the `SYN-ACK` and nothing else moves. A `SYN` is retransmitted under the same RFC 6298 backoff as
+  any other segment and an unanswered dial is abandoned at the retransmission limit — at least 31
+  seconds — **in silence**: nothing at the far end ever answered, so there is no connection for a
+  reset to end and a frame sent anyway would only confirm this node's presence to an address that
+  said nothing. A dial never evicts, which is the eviction rule read from the other side: a table
+  full of live connections is one an operator is using, and a peer flooding `SYN`s cannot evict a
+  dial either, so neither end can cancel the other's half-open connections.
 - **Sequence-number validation.** RFC 793 p.69's four-case acceptability test; an out-of-window
   segment is answered with an acknowledgement naming what was expected and never accepted, and a
   retransmission overlapping the window's left edge is trimmed rather than refused.
@@ -1563,7 +1586,7 @@ What the passive-open path implements, completely:
   server keeps it equal to the room it has left, so a peer is never told it may send more than the
   endpoint can take.
 
-Every outcome is counted, one field per cause — twenty-seven of them — under the
+Every outcome is counted, one field per cause — twenty-nine of them — under the
 [metrics reference](../reference/metrics.md)'s attribution rule: what a peer sent that was refused,
 and separately the one count that accuses this code (`write_refused`, storage too small, expected to
 read zero forever). There is no device class here, because nothing in the crate reads a register.
@@ -1577,8 +1600,6 @@ established one.
 
 **Missing.**
 
-- **No active open.** Nothing in the appliance originates a connection, so `SYN_SENT` and the
-  simultaneous-open path have no caller; they arrive with the proxy.
 - **No SACK.** Its value is retransmitting the holes in a reassembly queue, and there is no
   reassembly queue — that would be a buffer the crate owns. The SACK-permitted option is parsed and
   recorded, so adding it is a change to the state machine rather than to the parser.
@@ -2296,8 +2317,8 @@ which is what keeps a handshake from becoming a domain that never returns. It te
 read in practice, and that is a scheduling fact: the holder sits at priority 3 and this domain at 2,
 so a notification preempts into it immediately.
 
-**Missing.** Nothing dials with any of this: the transport cannot open a connection, there is no
-channel and no onboarding server, and the cryptography domain holds no device. The session is proved
+**Missing.** Nothing dials with any of this: the transport can open a connection but has no way to
+resolve a next hop for one, and there is no channel and no onboarding server, and the cryptography domain holds no device. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,
 standing in for a management server and an anchor this appliance has never seen. There is no CSR

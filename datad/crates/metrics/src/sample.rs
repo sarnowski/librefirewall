@@ -1067,13 +1067,14 @@ pub struct EndpointSample {
     pub unhandled: [u64; 9],
 }
 
-/// The transport's twenty-seven causes, in `lfw_tcp::TcpCounters` declaration
+/// The transport's twenty-nine causes, in `lfw_tcp::TcpCounters` declaration
 /// order — which a test in `pd_runtime` holds this to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpSample {
     pub segments_received: u64,
     pub segments_sent: u64,
     pub connections_accepted: u64,
+    pub connections_dialled: u64,
     pub connections_established: u64,
     pub connections_closed: u64,
     pub connections_evicted: u64,
@@ -1091,6 +1092,7 @@ pub struct TcpSample {
     pub refused_no_connection: u64,
     pub refused_unacceptable_ack: u64,
     pub refused_no_acknowledgement: u64,
+    pub refused_not_a_handshake: u64,
     pub refused_out_of_order: u64,
     pub urgent_ignored: u64,
     pub challenge_acks: u64,
@@ -1117,7 +1119,7 @@ pub struct HttpSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 85;
+pub const MANAGEMENT_SLOTS: usize = 87;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1231,6 +1233,7 @@ impl ManagementSample {
         s(&TCP_SEGMENTS, &[Label::new("direction", "received")]),
         s(&TCP_SEGMENTS, &[Label::new("direction", "sent")]),
         s(&TCP_CONNECTIONS, &[Label::new("event", "accepted")]),
+        s(&TCP_CONNECTIONS, &[Label::new("event", "dialled")]),
         s(&TCP_CONNECTIONS, &[Label::new("event", "established")]),
         s(&TCP_CONNECTIONS, &[Label::new("event", "closed")]),
         s(&TCP_CONNECTIONS, &[Label::new("event", "evicted")]),
@@ -1248,6 +1251,7 @@ impl ManagementSample {
         s(&TCP_REFUSED, &[Label::new("reason", "no_connection")]),
         s(&TCP_REFUSED, &[Label::new("reason", "unacceptable_ack")]),
         s(&TCP_REFUSED, &[Label::new("reason", "no_acknowledgement")]),
+        s(&TCP_REFUSED, &[Label::new("reason", "not_a_handshake")]),
         s(&TCP_REFUSED, &[Label::new("reason", "out_of_order")]),
         plain(&TCP_URGENT_IGNORED),
         plain(&TCP_CHALLENGE_ACKS),
@@ -1314,6 +1318,7 @@ impl ManagementSample {
         put(&mut values, &mut at, tcp.segments_received);
         put(&mut values, &mut at, tcp.segments_sent);
         put(&mut values, &mut at, tcp.connections_accepted);
+        put(&mut values, &mut at, tcp.connections_dialled);
         put(&mut values, &mut at, tcp.connections_established);
         put(&mut values, &mut at, tcp.connections_closed);
         put(&mut values, &mut at, tcp.connections_evicted);
@@ -1331,6 +1336,7 @@ impl ManagementSample {
         put(&mut values, &mut at, tcp.refused_no_connection);
         put(&mut values, &mut at, tcp.refused_unacceptable_ack);
         put(&mut values, &mut at, tcp.refused_no_acknowledgement);
+        put(&mut values, &mut at, tcp.refused_not_a_handshake);
         put(&mut values, &mut at, tcp.refused_out_of_order);
         put(&mut values, &mut at, tcp.urgent_ignored);
         put(&mut values, &mut at, tcp.challenge_acks);

@@ -13,10 +13,13 @@
 //! parser answers one frame; a transport carries a *connection*, so a defect here
 //! is reached by a sequence — a handshake half-completed, a window moved by a
 //! stale segment, a range acknowledged twice, a timer fired between two arrivals.
-//! The harness therefore drives an operation stream over two stacks at once: a
-//! **listening** one that has never seen a valid segment, and an **established**
-//! one whose handshake this harness completed itself, so the synchronized paths
-//! are reached even by an input that could never compose a handshake.
+//! The harness therefore drives an operation stream over three stacks at once: a
+//! **listening** one that has never seen a valid segment, an **established** one
+//! whose handshake this harness completed itself, so the synchronized paths are
+//! reached even by an input that could never compose a handshake, and a
+//! **dialling** one holding a connection this end opened — whose arrival
+//! processing is the one path an inbound segment can never reach, and the one an
+//! answer to the appliance's own dial arrives on.
 //!
 //! # Modelling authority, not politeness
 //!
@@ -59,13 +62,20 @@
 //! * **Every segment is counted, exactly once.** The counters are the only
 //!   evidence a port is doing anything, so the total is asserted to move by one
 //!   per segment.
+//! * **A dial only ever reaches a state a dial can reach.** Whatever a peer
+//!   answers with, a connection this end opened is observed in `SYN_SENT`,
+//!   `SYN_RECEIVED`, `ESTABLISHED` or one of the closing states — never in a
+//!   state no transition from a dial leads to. An invalid transition is what this
+//!   asserts against, and a bare no-panic run would not see one.
 //! * **Sequence numbers stay unpredictable.** Two stacks with different secrets
 //!   answer the same `SYN` with different numbers, which is the RFC 6528 property
 //!   an off-path attacker attacks.
 
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_clock::{Calibration, Monotonic, Ticks};
-use lfw_tcp::{Connection, ConnectionId, Flags, IsnSecret, Outgoing, SeqNumber, TcpStack, Timeout};
+use lfw_tcp::{
+    Connection, ConnectionId, Flags, IsnSecret, Outgoing, SeqNumber, State, TcpStack, Timeout,
+};
 use net_headers::Ipv4Address;
 use std::num::NonZeroU64;
 
@@ -110,7 +120,8 @@ pub fn tcp_segments_harness(data: &[u8]) {
     // fixed here.
     let secret = IsnSecret::from_bytes(<[u8; 16]>::arbitrary(&mut unstructured).unwrap_or([0; 16]));
     let mut listening = stack(secret.clone());
-    let (mut established, opened, acknowledgement) = established_stack(secret);
+    let (mut established, opened, acknowledgement) = established_stack(secret.clone());
+    let (mut dialling, dialled) = dialling_stack(secret);
 
     // Segments handed to the *listening* stack, which is what its own received
     // counter is held to. Only the arm that delivers to it may move this;
@@ -126,7 +137,7 @@ pub fn tcp_segments_harness(data: &[u8]) {
     while let Some(op) = next_op(&mut unstructured) {
         operations += 1;
         let now = instant(any_u32(&mut unstructured));
-        match op % 7 {
+        match op % 8 {
             6 => {
                 // A well-formed data segment on the established connection,
                 // longer than the receive window as often as not. Nothing else
@@ -164,6 +175,7 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 let bytes = segment_bytes(&mut unstructured);
                 deliver(&mut listening, now, source, &bytes);
                 deliver(&mut established, now, source, &bytes);
+                deliver(&mut dialling, now, source, &bytes);
                 segments += 1;
                 assert_eq!(
                     listening.counters().segments_received,
@@ -197,6 +209,27 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 // one and the stack holds it to what the shift can express.
                 established.set_receive_window(id, any_u32(&mut unstructured));
             }
+            7 => {
+                // A dial to an arbitrary peer, which is this end deciding to reach
+                // out: the table's bound has to hold against a caller opening
+                // connections as much as against a peer flooding them, and a
+                // refusal is a typed one rather than a panic.
+                let peer = source_address(&mut unstructured);
+                let port = any_u16(&mut unstructured);
+                let mut out = [UNTOUCHED; OUT];
+                if let Ok(dial) = dialling.connect(now, peer, port, &mut out) {
+                    assert!(dial.len <= OUT);
+                    assert!(
+                        out[dial.len..].iter().all(|byte| *byte == UNTOUCHED),
+                        "a dial wrote past the length it reported"
+                    );
+                    assert_eq!(
+                        dialling.connection(dial.connection).map(Connection::state),
+                        Some(State::SynSent),
+                        "a dial opened a connection in some other state"
+                    );
+                }
+            }
             _ => {
                 // A retransmission with a range and bytes the caller may have
                 // wrong, which is the disagreement `SendError::WrongRange` exists
@@ -212,12 +245,35 @@ pub fn tcp_segments_harness(data: &[u8]) {
             }
         }
 
-        for stack in [&mut listening, &mut established] {
+        for stack in [&mut listening, &mut established, &mut dialling] {
             assert!(
                 stack.connections() <= CONNECTIONS,
                 "the connection table exceeded its capacity"
             );
             drain_timers(stack, now);
+        }
+        // A connection this end opened is only ever somewhere a dial leads. The
+        // handle survives the connection being freed, so `None` — refused,
+        // abandoned or reaped — is one of the answers.
+        if let Some(state) = dialled
+            .and_then(|id| dialling.connection(id))
+            .map(Connection::state)
+        {
+            assert!(
+                matches!(
+                    state,
+                    State::SynSent
+                        | State::SynReceived
+                        | State::Established
+                        | State::CloseWait
+                        | State::LastAck
+                        | State::FinWait1
+                        | State::FinWait2
+                        | State::Closing
+                        | State::TimeWait
+                ),
+                "a dial reached {state:?}"
+            );
         }
         if operations >= MAX_OPERATIONS {
             break;
@@ -350,6 +406,22 @@ fn established_stack(secret: IsnSecret) -> (TcpStack<CONNECTIONS>, Option<Connec
     // (RFC 5961 section 5), so a stream driven with a stale one would never
     // reach the data path at all.
     (stack, Some(id), acknowledgement)
+}
+
+/// A stack holding one connection this end dialled, so `SYN_SENT`'s own arrival
+/// processing is reached by every segment the stream carries.
+///
+/// The dial is left unanswered: what the input then does to it — answer it,
+/// reset it, dial it back, or say nothing until it is abandoned — is the whole of
+/// what is under test here.
+fn dialling_stack(secret: IsnSecret) -> (TcpStack<CONNECTIONS>, Option<ConnectionId>) {
+    let mut stack = stack(secret);
+    let mut out = [0u8; OUT];
+    let dialled = stack
+        .connect(instant(0), ESTABLISHED_PEER, 8443, &mut out)
+        .ok()
+        .map(|dial| dial.connection);
+    (stack, dialled)
 }
 
 /// One well-formed segment, for the handshake the harness performs itself.

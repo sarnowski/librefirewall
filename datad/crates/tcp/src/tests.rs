@@ -149,6 +149,11 @@ impl Peer {
         self.segment(Flags::FIN.with(Flags::ACK), &[])
     }
 
+    /// The answer to a dial: this peer's own `SYN` acknowledging the appliance's.
+    fn syn_ack(&mut self) -> Vec<u8> {
+        self.segment(Flags::SYN.with(Flags::ACK), &[])
+    }
+
     /// Read a segment the appliance sent, learning this peer's own expectation
     /// from it, and answer with its fields.
     fn read<'bytes>(&mut self, bytes: &'bytes [u8]) -> Segment<'bytes> {
@@ -183,6 +188,33 @@ fn handshake(stack: &mut Bench, now: Monotonic, peer: &mut Peer) -> ConnectionId
         Some(State::Established)
     );
     id
+}
+
+/// Dial a peer and let it answer, returning the connection the dial opened.
+///
+/// The mirror of [`handshake`]: there the peer opens and the appliance answers,
+/// here the appliance opens and the peer answers, and everything after the two
+/// is the same connection.
+fn dial(stack: &mut Bench, now: Monotonic, peer: &mut Peer) -> ConnectionId {
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(now, peer.address, peer.port, &mut out)
+        .expect("a slot and room for a SYN");
+    let syn = peer.read(&out[..dialled.len]);
+    assert!(syn.flags.contains(Flags::SYN));
+    assert!(!syn.flags.contains(Flags::ACK));
+
+    let syn_ack = peer.syn_ack();
+    let received = stack.receive(now, peer.address, &syn_ack, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    let ack = peer.read(&out[..received.emitted]);
+    assert!(ack.flags.contains(Flags::ACK));
+    assert!(!ack.flags.contains(Flags::SYN));
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::Established)
+    );
+    dialled.connection
 }
 
 #[test]
@@ -2225,4 +2257,702 @@ fn aborting_resets_the_peer_and_frees_the_slot() {
     ));
     assert!(stack.connection(alive).is_some());
     assert_eq!(stack.abort(alive, &mut out).map(|len| len > 0), Ok(true));
+}
+
+// ── The dial ────────────────────────────────────────────────────────────────
+
+/// The whole of what an active open negotiates, read off the two segments it
+/// takes: the `SYN` this end composes and the answer it accepts.
+#[test]
+fn a_dial_opens_a_connection_and_negotiates_the_segment_size() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5a_0000);
+    peer.mss = Some(700);
+    let mut out = [0u8; 2048];
+
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a slot and room for a SYN");
+    let syn = peer.read(&out[..dialled.len]);
+    // A dial carries `SYN` and nothing else: it has no peer sequence number to
+    // acknowledge, so the acknowledgement field is zero and the flag is clear.
+    assert_eq!(syn.flags, Flags::SYN);
+    assert_eq!(syn.acknowledgement, SeqNumber::new(0));
+    // The source port is this stack's own, which is the whole of the one-port
+    // rule: a segment comes back to the port it left from or is refused.
+    assert_eq!(syn.source_port, PORT);
+    assert_eq!(syn.destination_port, 8443);
+    assert_eq!(syn.options.mss, Some(MSS_LIMIT));
+    // Offered unconditionally, which is what makes scaling available at all.
+    assert_eq!(syn.options.window_scale, Some(0));
+    assert_eq!(syn.window, RECEIVE_WINDOW as u16);
+
+    let connection = stack
+        .connection(dialled.connection)
+        .expect("the connection the dial opened");
+    assert_eq!(connection.state(), State::SynSent);
+    assert_eq!(connection.peer_address(), STATION);
+    assert_eq!(connection.peer_port(), 8443);
+    assert_eq!(stack.counters().connections_dialled, 1);
+    assert_eq!(stack.counters().connections_accepted, 0);
+    assert_eq!(
+        stack.outstanding(dialled.connection),
+        1,
+        "the SYN is unacknowledged"
+    );
+
+    let syn_ack = peer.syn_ack();
+    let received = stack.receive(at(1_000), STATION, &syn_ack, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    let ack = peer.read(&out[..received.emitted]);
+    assert_eq!(ack.flags, Flags::ACK);
+    assert_eq!(ack.acknowledgement, SeqNumber::new(0x5a_0001));
+
+    let connection = stack
+        .connection(dialled.connection)
+        .expect("the connection");
+    assert_eq!(connection.state(), State::Established);
+    // The peer's own offer, which is below this end's limit.
+    assert_eq!(connection.send_mss(), 700);
+    assert!(
+        connection.measured(),
+        "the answer to the SYN is the connection's first round-trip sample"
+    );
+    assert_eq!(stack.counters().connections_established, 1);
+    assert_eq!(
+        stack.outstanding(dialled.connection),
+        0,
+        "the SYN was acknowledged"
+    );
+}
+
+/// A dialled connection is an ordinary one from the acknowledgement onwards:
+/// bytes cross both ways and the close is the same close.
+#[test]
+fn a_dialled_connection_carries_a_stream_and_closes_cleanly() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5b_0000);
+    let mut out = [0u8; 2048];
+    let id = dial(&mut stack, at(0), &mut peer);
+
+    let request = b"hello";
+    let sent = stack
+        .send(at(1_000), id, request, &mut out)
+        .expect("the peer's window is open");
+    assert_eq!(sent.bytes, request.len());
+    let segment = peer.read(&out[..sent.len]);
+    assert_eq!(segment.payload, request);
+
+    let ack = peer.ack();
+    stack.receive(at(2_000), STATION, &ack, &mut out);
+    assert_eq!(stack.outstanding(id), 0);
+
+    let answer = b"world";
+    let data = peer.data(answer);
+    let received = stack.receive(at(3_000), STATION, &data, &mut out);
+    assert_eq!(received.data, answer);
+    peer.read(&out[..received.emitted]);
+
+    let len = stack.close(at(4_000), id, &mut out).expect("a FIN");
+    let fin = peer.read(&out[..len]);
+    assert!(fin.flags.contains(Flags::FIN));
+    assert_eq!(
+        stack.connection(id).map(Connection::state),
+        Some(State::FinWait1)
+    );
+    let ack = peer.ack();
+    stack.receive(at(5_000), STATION, &ack, &mut out);
+    assert_eq!(
+        stack.connection(id).map(Connection::state),
+        Some(State::FinWait2)
+    );
+    let fin = peer.fin();
+    let received = stack.receive(at(6_000), STATION, &fin, &mut out);
+    peer.read(&out[..received.emitted]);
+    assert_eq!(
+        stack.connection(id).map(Connection::state),
+        Some(State::TimeWait)
+    );
+}
+
+/// RFC 793 p.66: an answer acknowledging a number this end never sent draws a
+/// reset carrying that number, and **the dial stands**. Tearing it down instead
+/// would let one forged segment cancel this node's own dial.
+#[test]
+fn an_answer_acknowledging_the_wrong_sequence_is_reset_and_the_dial_stands() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5c_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let syn = peer.read(&out[..dialled.len]);
+    let dialled_isn = syn.sequence;
+
+    // Far ahead of anything sent, which is the direction RFC 793 tests first.
+    peer.expect = dialled_isn.add(500);
+    let bogus = peer.syn_ack();
+    let received = stack.receive(at(1_000), STATION, &bogus, &mut out);
+    assert_eq!(
+        received.outcome,
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+    );
+    let reset = Segment::parse(APPLIANCE, STATION, &out[..received.emitted]).expect("a reset");
+    assert!(reset.flags.contains(Flags::RST));
+    assert_eq!(
+        reset.sequence,
+        dialled_isn.add(500),
+        "the reset carries the number the peer claimed"
+    );
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent),
+        "a segment acknowledging what was never sent moved the dial"
+    );
+
+    // And the other edge: an acknowledgement at or below the initial sequence
+    // number, which acknowledges nothing at all.
+    peer.expect = dialled_isn;
+    let bogus = peer.segment_at(peer.next, Flags::SYN.with(Flags::ACK), &[]);
+    let received = stack.receive(at(2_000), STATION, &bogus, &mut out);
+    assert_eq!(
+        received.outcome,
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+    );
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent)
+    );
+    assert_eq!(stack.counters().refused_unacceptable_ack, 2);
+
+    // The real answer still completes the dial that survived both.
+    peer.expect = dialled_isn.add(1);
+    let syn_ack = peer.syn_ack();
+    stack.receive(at(3_000), STATION, &syn_ack, &mut out);
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::Established)
+    );
+}
+
+/// A reset ends a dial exactly where it acknowledges the `SYN` that dial sent.
+/// One that acknowledges nothing names nothing, and is the blind reset RFC 5961
+/// exists to refuse — stated here for the one state that has no window to state
+/// it over.
+#[test]
+fn a_reset_ends_a_dial_only_where_it_acknowledges_it() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5d_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let dialled_isn = peer.read(&out[..dialled.len]).sequence;
+
+    let blind = peer.segment_at(peer.next, Flags::RST, &[]);
+    let received = stack.receive(at(1_000), STATION, &blind, &mut out);
+    assert_eq!(
+        received.outcome,
+        Outcome::Rejected(Rejection::Connection(Refusal::UnvalidatedReset))
+    );
+    assert_eq!(received.emitted, 0, "a reset was answered");
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent),
+        "a reset naming nothing cancelled a dial"
+    );
+
+    peer.expect = dialled_isn.add(1);
+    let refusal = peer.segment_at(peer.next, Flags::RST.with(Flags::ACK), &[]);
+    let received = stack.receive(at(2_000), STATION, &refusal, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    assert_eq!(received.emitted, 0, "a reset was answered with a segment");
+    assert_eq!(
+        stack.connection(dialled.connection),
+        None,
+        "a refused connection outlived its reset"
+    );
+    assert_eq!(stack.counters().resets_received, 1);
+    assert_eq!(stack.counters().connections_closed, 1);
+}
+
+/// RFC 793 p.68: a segment reaching a dial that carries neither `SYN` nor `RST`
+/// says nothing about the handshake being waited for, so it is dropped without
+/// an answer and under its own cause.
+#[test]
+fn a_segment_that_is_neither_a_syn_nor_a_reset_leaves_a_dial_untouched() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5e_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let dialled_isn = peer.read(&out[..dialled.len]).sequence;
+    peer.expect = dialled_isn.add(1);
+
+    let bare = peer.segment_at(peer.next, Flags::ACK, b"payload");
+    let received = stack.receive(at(1_000), STATION, &bare, &mut out);
+    assert_eq!(
+        received.outcome,
+        Outcome::Rejected(Rejection::Connection(Refusal::NotAHandshake))
+    );
+    assert_eq!(received.emitted, 0);
+    assert!(received.data.is_empty(), "a dial delivered a byte");
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent)
+    );
+    assert_eq!(stack.counters().refused_not_a_handshake, 1);
+    assert_eq!(stack.counters().bytes_received, 0);
+}
+
+/// RFC 793's simultaneous open: both ends dial, so the answer to this end's
+/// `SYN` is a `SYN` with no acknowledgement. It becomes the state a passive open
+/// is already in, and the `SYN-ACK` re-uses the sequence number the outstanding
+/// record already covers.
+#[test]
+fn a_simultaneous_open_turns_a_dial_into_an_answered_handshake() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5f_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let syn = peer.read(&out[..dialled.len]);
+    let dialled_isn = syn.sequence;
+
+    // The peer's own `SYN`, composed before it saw this end's: no acknowledgement.
+    let their_syn = peer.segment(Flags::SYN, &[]);
+    let received = stack.receive(at(1_000), STATION, &their_syn, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    let syn_ack = peer.read(&out[..received.emitted]);
+    assert!(syn_ack.flags.contains(Flags::SYN));
+    assert!(syn_ack.flags.contains(Flags::ACK));
+    assert_eq!(
+        syn_ack.sequence, dialled_isn,
+        "the SYN-ACK left the sequence space the SYN already occupied"
+    );
+    assert_eq!(syn_ack.acknowledgement, SeqNumber::new(0x5f_0001));
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynReceived)
+    );
+    assert_eq!(
+        stack.outstanding(dialled.connection),
+        1,
+        "one record covers the SYN and the SYN-ACK alike"
+    );
+
+    // And the peer's answer to this end's `SYN`, which arrives at the sequence
+    // number its own `SYN` already occupied.
+    let their_answer = peer.segment_at(SeqNumber::new(0x5f_0000), Flags::SYN.with(Flags::ACK), &[]);
+    let received = stack.receive(at(2_000), STATION, &their_answer, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    let ack = peer.read(&out[..received.emitted]);
+    assert_eq!(ack.flags, Flags::ACK);
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::Established)
+    );
+    assert_eq!(stack.counters().connections_established, 1);
+    assert_eq!(stack.outstanding(dialled.connection), 0);
+}
+
+/// An unanswered dial re-sends its `SYN` under RFC 6298's backoff, and then ends
+/// — in silence, because nothing at the far end ever answered for a reset to
+/// tell.
+#[test]
+fn an_unanswered_dial_is_re_sent_and_then_abandoned_in_silence() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x60_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let dialled_isn = peer.read(&out[..dialled.len]).sequence;
+
+    // The deadlines are walked at exactly RFC 6298's schedule — one second, then
+    // doubling — rather than by jumping past them, so the backoff is asserted and
+    // not merely survived. Nothing here reaches `IDLE_TIMEOUT`, which is the
+    // other way a dial ends and would mask this one.
+    let mut elapsed = 0u64;
+    let mut timeout = INITIAL_RTO.as_nanos();
+    let mut resent = 0;
+    for _ in 0..MAX_RETRANSMITS {
+        elapsed = elapsed.saturating_add(timeout);
+        assert_eq!(
+            stack.poll_timeouts(at(elapsed - 1), &mut out),
+            None,
+            "the SYN was re-sent before its deadline"
+        );
+        let due = stack
+            .poll_timeouts(at(elapsed), &mut out)
+            .expect("the SYN is due");
+        let Timeout::Resent { connection, len } = due else {
+            panic!("a dial owes its own SYN, got {due:?}");
+        };
+        assert_eq!(connection, dialled.connection);
+        let again = Segment::parse(APPLIANCE, STATION, &out[..len]).expect("a segment");
+        // Every retransmission is the same segment the dial composed: a `SYN`
+        // with no acknowledgement, at the same number, offering the same options.
+        assert_eq!(again.flags, Flags::SYN);
+        assert_eq!(again.sequence, dialled_isn);
+        assert_eq!(again.acknowledgement, SeqNumber::new(0));
+        assert_eq!(again.options.mss, Some(MSS_LIMIT));
+        resent += 1;
+        timeout = timeout.saturating_mul(2).min(MAX_RTO.as_nanos());
+    }
+    assert_eq!(resent, MAX_RETRANSMITS);
+    assert!(
+        elapsed >= 31 * lfw_clock::NANOS_PER_SECOND,
+        "the give-up interval was shorter than RFC 1122 asks of one"
+    );
+
+    elapsed = elapsed.saturating_add(timeout);
+    let timeout = stack
+        .poll_timeouts(at(elapsed), &mut out)
+        .expect("the retransmission budget is spent");
+    assert_eq!(
+        timeout,
+        Timeout::Abandoned {
+            connection: dialled.connection,
+            len: 0,
+        },
+        "an unanswered dial announced itself to an address that never answered"
+    );
+    assert_eq!(stack.connection(dialled.connection), None);
+    assert_eq!(stack.counters().connections_abandoned, 1);
+    assert_eq!(
+        stack.counters().resets_sent,
+        0,
+        "a reset went to a peer that had said nothing"
+    );
+    assert_eq!(stack.poll_timeouts(at(elapsed), &mut out), None);
+}
+
+/// A dial names a 4-tuple, and the table is keyed by one: a second dial to a
+/// peer already connected is refused and hands back the connection that exists,
+/// so a caller that lost track of one cannot open a connection the table could
+/// not tell from the first.
+#[test]
+fn a_second_dial_to_the_same_peer_is_refused_and_names_the_connection() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x61_0000);
+    let mut out = [0u8; 2048];
+    let id = dial(&mut stack, at(0), &mut peer);
+
+    assert_eq!(
+        stack.connect(at(1_000), STATION, 8443, &mut out),
+        Err(DialError::AlreadyOpen { connection: id })
+    );
+    // A different port on the same address is a different connection.
+    let other = stack
+        .connect(at(1_000), STATION, 8444, &mut out)
+        .expect("a second dial to a second port");
+    assert_ne!(other.connection, id);
+    assert_eq!(stack.connections(), 2);
+
+    // And a peer that dialled *in* is likewise a connection a dial will not
+    // duplicate: the table cannot tell two connections on one 4-tuple apart,
+    // whichever end opened them.
+    let mut inbound = Peer::new(40000, 0x61_9000);
+    handshake(&mut stack, at(2_000), &mut inbound);
+    assert!(matches!(
+        stack.connect(at(3_000), STATION, 40000, &mut out),
+        Err(DialError::AlreadyOpen { .. })
+    ));
+}
+
+/// A dial never evicts. `free_slot` refuses to let a peer's `SYN` destroy an
+/// established connection; this is the same rule read from the other side, and
+/// it is what keeps this node's own dial from trading a session somebody holds
+/// for one nobody has answered.
+#[test]
+fn a_dial_refuses_rather_than_evicting_and_takes_a_dead_slot_back() {
+    let mut stack = stack();
+    let mut out = [0u8; 2048];
+    let mut peers: Vec<Peer> = (0..4)
+        .map(|index| Peer::new(40000 + index, 0x62_0000 + u32::from(index) * 0x100))
+        .collect();
+    for peer in &mut peers {
+        handshake(&mut stack, at(0), peer);
+    }
+    assert_eq!(stack.connections(), 4);
+
+    assert_eq!(
+        stack.connect(at(1_000), STATION, 8443, &mut out),
+        Err(DialError::TableFull)
+    );
+    assert_eq!(stack.connections(), 4, "a dial evicted a live connection");
+    assert_eq!(
+        stack.counters().connections_evicted,
+        0,
+        "a dial was counted as an eviction"
+    );
+
+    // A slot whose connection is over is a reaping rather than an eviction, and a
+    // dial may take one: every connection here has sat idle past its limit.
+    let idle = after(IDLE_TIMEOUT);
+    let dialled = stack
+        .connect(idle, STATION, 8443, &mut out)
+        .expect("a slot whose connection is over");
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent)
+    );
+    assert_eq!(stack.counters().connections_reaped, 1);
+}
+
+/// Storage too small refuses the dial and opens nothing: a connection whose
+/// `SYN` never left would hold a slot and spend its whole retransmission budget
+/// re-sending a segment its caller never learned had failed to go out.
+#[test]
+fn storage_too_small_refuses_a_dial_and_opens_nothing() {
+    let mut stack = stack();
+    let mut tiny = [0u8; 8];
+    let mut out = [0u8; 2048];
+
+    assert!(matches!(
+        stack.connect(at(0), STATION, 8443, &mut tiny),
+        Err(DialError::Write(WriteError::DoesNotFit { .. }))
+    ));
+    assert_eq!(stack.connections(), 0, "a refused dial took a slot");
+    assert_eq!(stack.counters().write_refused, 1);
+    assert_eq!(stack.counters().connections_dialled, 0);
+    assert_eq!(stack.counters().segments_sent, 0);
+
+    // And the same dial with room succeeds, so nothing was left behind.
+    assert!(stack.connect(at(1_000), STATION, 8443, &mut out).is_ok());
+    assert_eq!(stack.connections(), 1);
+}
+
+/// A dial has no stream for a `FIN` to end, so a caller closing one is refused
+/// and told the state. Tearing it down is what is available, and the reset it
+/// composes carries no acknowledgement — a dial has no peer sequence number to
+/// acknowledge, and one claiming to acknowledge zero is one a peer refuses.
+#[test]
+fn a_dial_cannot_be_closed_gracefully_and_its_reset_acknowledges_nothing() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x63_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let dialled_isn = peer.read(&out[..dialled.len]).sequence;
+
+    assert_eq!(
+        stack.close(at(1_000), dialled.connection, &mut out),
+        Err(SendError::WrongState(State::SynSent))
+    );
+    assert_eq!(
+        stack.send(at(1_000), dialled.connection, b"early", &mut out),
+        Err(SendError::WrongState(State::SynSent)),
+        "a dial carried a byte before it was answered"
+    );
+
+    let len = stack
+        .abort(dialled.connection, &mut out)
+        .expect("a dial may be torn down");
+    let reset = Segment::parse(APPLIANCE, STATION, &out[..len]).expect("a reset");
+    assert_eq!(reset.flags, Flags::RST);
+    assert_eq!(reset.acknowledgement, SeqNumber::new(0));
+    assert_eq!(reset.sequence, dialled_isn.add(1));
+    assert_eq!(stack.connection(dialled.connection), None);
+}
+
+/// RFC 7323 section 2.2: a dial offers the option and a peer that answers
+/// without it leaves **both** directions unshifted — which also holds the window
+/// this end advertises back to what an unshifted field can express.
+#[test]
+fn a_peer_that_declines_the_window_scale_leaves_a_dial_unscaled() {
+    let mut stack = TcpStack::<4>::new(APPLIANCE, PORT, MSS_LIMIT, 400_000, secret());
+    let mut peer = Peer::at(STATION, 8443, 0x64_0000);
+    peer.window_scale = None;
+    peer.window = 1_000;
+    let mut out = [0u8; 2048];
+
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let syn = peer.read(&out[..dialled.len]);
+    // 400 000 bytes needs three bits of shift to be expressed in sixteen.
+    assert_eq!(syn.options.window_scale, Some(3));
+    assert_eq!(u32::from(syn.window) << 3, 400_000);
+
+    let syn_ack = peer.syn_ack();
+    let received = stack.receive(at(1_000), STATION, &syn_ack, &mut out);
+    let ack = peer.read(&out[..received.emitted]);
+    // Unshifted from here on, so the window on the wire is the whole of what this
+    // end will take.
+    assert_eq!(ack.window, u16::MAX);
+    assert_eq!(
+        stack
+            .connection(dialled.connection)
+            .map(Connection::receive_window),
+        Some(u32::from(u16::MAX))
+    );
+    // And the peer's own window is read unshifted too, so a send is bounded by
+    // the thousand bytes it actually offered.
+    let sent = stack
+        .send(at(2_000), dialled.connection, &[0xcd; 4096], &mut out)
+        .expect("the window has room");
+    assert_eq!(sent.bytes, 1_000);
+}
+
+/// A peer that answers with a scale gets one: the option this end offered is
+/// what enables it, and the peer's window is then read under its own shift.
+#[test]
+fn a_peer_that_answers_with_a_scale_gets_a_scaled_connection() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x65_0000);
+    peer.window_scale = Some(7);
+    peer.window = 1_000;
+    let mut out = [0u8; 2048];
+    let id = dial(&mut stack, at(0), &mut peer);
+
+    // 1000 read under a shift of seven is 128 000 bytes, so the send is bounded
+    // by the negotiated segment size rather than by the window.
+    let sent = stack
+        .send(at(1_000), id, &[0xab; 4096], &mut out)
+        .expect("the window is wide open");
+    assert_eq!(sent.bytes, usize::from(MSS_LIMIT));
+}
+
+/// Two dials to two peers are offered unrelated sequence spaces, for the reason
+/// two accepted connections are: an off-path attacker that learned the offset for
+/// one 4-tuple could otherwise inject into another.
+#[test]
+fn two_dials_are_offered_different_sequence_spaces() {
+    let mut stack = stack();
+    let mut out = [0u8; 2048];
+    let first = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let one = Segment::parse(APPLIANCE, STATION, &out[..first.len])
+        .expect("a SYN")
+        .sequence;
+    let elsewhere = Ipv4Address::from_octets([10, 0, 2, 99]);
+    let second = stack
+        .connect(at(0), elsewhere, 8443, &mut out)
+        .expect("a second dial");
+    let two = Segment::parse(APPLIANCE, elsewhere, &out[..second.len])
+        .expect("a SYN")
+        .sequence;
+    assert_ne!(one, two);
+}
+
+proptest! {
+    /// A dial never panics and never delivers a byte for an arbitrary stream of
+    /// arbitrary segments, and it always ends: whatever a peer sends or withholds,
+    /// the table is empty once every deadline has passed. This is the dial's
+    /// half of the no-panic-on-arbitrary-input invariant, and its own
+    /// termination property beside it — a dial that could be held open by a
+    /// peer's silence would hold a slot for the life of the node.
+    #[test]
+    fn an_arbitrary_answer_never_panics_and_a_dial_always_ends(
+        segments in prop::collection::vec(
+            (prop::collection::vec(any::<u8>(), 0..80), any::<u16>()),
+            0..24,
+        ),
+    ) {
+        let mut stack = stack();
+        let mut out = [0u8; 2048];
+        let dialled = stack
+            .connect(at(0), STATION, 8443, &mut out)
+            .expect("a dial");
+        for (bytes, span) in &segments {
+            let now = at(u64::from(*span) * 1_000_000);
+            let received = stack.receive(now, STATION, bytes, &mut out);
+            prop_assert!(received.emitted <= out.len());
+            // Nothing a dial has not been answered for can carry a byte to the
+            // caller, and once it is answered a byte is only ever a subslice of
+            // the segment it came in.
+            prop_assert!(received.data.len() <= bytes.len());
+            prop_assert!(stack.connections() <= 4);
+            let mut drained = 0;
+            while stack.poll_timeouts(now, &mut out).is_some() {
+                drained += 1;
+                prop_assert!(drained <= 64, "the timers did not settle");
+            }
+        }
+        // Far beyond every deadline this crate holds, and beyond the whole
+        // retransmission budget of a dial nothing answered.
+        let far = at(
+            IDLE_TIMEOUT.as_nanos()
+                + TIME_WAIT_DURATION.as_nanos()
+                + MAX_RTO.as_nanos() * u64::from(MAX_RETRANSMITS + 1)
+                + 1,
+        );
+        let mut drained = 0;
+        while stack.poll_timeouts(far, &mut out).is_some() {
+            drained += 1;
+            prop_assert!(drained <= 64, "the timers did not settle");
+        }
+        prop_assert_eq!(stack.connections(), 0, "a dial outlived every timer");
+        prop_assert!(stack.connection(dialled.connection).is_none());
+    }
+
+    /// Whatever a peer answers with, a connection this end dialled is only ever
+    /// in a state a dial can reach — and it reaches `ESTABLISHED` only through an
+    /// answer that acknowledged the `SYN` it sent. An invalid transition is
+    /// therefore not merely untested but unrepresentable in what the state can
+    /// be observed to be.
+    #[test]
+    fn a_dial_only_ever_reaches_a_state_a_dial_can_reach(
+        flags in any::<u8>(),
+        acknowledgement in any::<u32>(),
+        payload in prop::collection::vec(any::<u8>(), 0..24),
+    ) {
+        let mut stack = stack();
+        let mut out = [0u8; 2048];
+        let dialled = stack
+            .connect(at(0), STATION, 8443, &mut out)
+            .expect("a dial");
+        let iss = Segment::parse(APPLIANCE, STATION, &out[..dialled.len])
+            .expect("a SYN")
+            .sequence;
+
+        // Composed out of the six flags a header carries rather than from the
+        // byte, so the strategy reaches every combination through the same
+        // constants a peer's segment is read into.
+        let mut carried = Flags::default();
+        for (bit, flag) in [
+            (0x01, Flags::FIN),
+            (0x02, Flags::SYN),
+            (0x04, Flags::RST),
+            (0x08, Flags::PSH),
+            (0x10, Flags::ACK),
+            (0x20, Flags::URG),
+        ] {
+            if flags & bit != 0 {
+                carried = carried.with(flag);
+            }
+        }
+        let mut peer = Peer::at(STATION, 8443, 0x7000_0000);
+        peer.expect = SeqNumber::new(acknowledgement);
+        let answer = peer.segment_at(peer.next, carried, &payload);
+        let received = stack.receive(at(1_000), STATION, &answer, &mut out);
+        prop_assert!(received.data.is_empty(), "a dial delivered a byte to its caller");
+
+        let state = stack.connection(dialled.connection).map(Connection::state);
+        let carries = |flag: Flags| carried.contains(flag);
+        let acknowledges_the_syn = carries(Flags::ACK)
+            && SeqNumber::new(acknowledgement) == iss.add(1);
+        match state {
+            // Answered, so the handshake completed — which needs the `SYN` this
+            // end sent to have been acknowledged.
+            Some(State::Established) => {
+                prop_assert!(acknowledges_the_syn && carries(Flags::SYN));
+            }
+            // A `SYN` with no acknowledgement of this end's: a simultaneous open.
+            Some(State::SynReceived) => {
+                prop_assert!(carries(Flags::SYN) && !carries(Flags::ACK));
+            }
+            // Nothing about the handshake, so the dial stands.
+            Some(State::SynSent) => prop_assert!(!carries(Flags::SYN) || !acknowledges_the_syn),
+            // Refused, which needs a reset that acknowledged the `SYN`.
+            None => prop_assert!(carries(Flags::RST) && acknowledges_the_syn),
+            other => prop_assert!(false, "a dial reached {other:?}"),
+        }
+    }
 }

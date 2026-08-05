@@ -59,7 +59,7 @@ in the *next* one.
 ## Metric inventory
 
 108 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 402 counter and gauge series from the 12 shards,
+domains publishing that family. A scrape is 404 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 89 178 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -170,8 +170,8 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 | `librefirewall_tcp_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
 | `librefirewall_tcp_challenge_acks_total` | counter | `management` | — | Segments challenged rather than acted on under RFC 5961 — a blind in-window `RST` (§3.2) or a `SYN` on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's answer. |
 | `librefirewall_tcp_challenges_suppressed_total` | counter | `management` | — | Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge acknowledgement, or the reset a segment naming no connection would have drawn. The budget is shared across the whole connection table, so this rising is the node declining to be an amplifier and not a connection in trouble. |
-| `librefirewall_tcp_connections_total` | counter | `management` | `event`&nbsp;(`abandoned`, `accepted`, `closed`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. |
-| `librefirewall_tcp_refused_total` | counter | `management` | `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. |
+| `librefirewall_tcp_connections_total` | counter | `management` | `event`&nbsp;(`abandoned`, `accepted`, `closed`, `dialled`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. `accepted` is a handshake a peer began and `dialled` one this node began, and the two are never merged: dials rising while `established` stays flat is a node that cannot reach where it is trying to go. |
+| `librefirewall_tcp_refused_total` | counter | `management` | `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_a_handshake`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. `not_a_handshake` is a segment answering a connection this node dialled that carried neither `SYN` nor `RST`, which such a connection has no window to refuse under. |
 | `librefirewall_tcp_resets_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
 | `librefirewall_tcp_retransmits_total` | counter | `management` | — | Segments re-sent, data and control alike. |
 | `librefirewall_tcp_segments_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |

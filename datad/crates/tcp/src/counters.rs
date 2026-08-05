@@ -41,8 +41,15 @@ pub struct TcpCounters {
     pub segments_received: u64,
     /// Segments the stack composed, whatever they carried.
     pub segments_sent: u64,
-    /// Connections that reached `SYN_RECEIVED` — a handshake begun.
+    /// Connections that reached `SYN_RECEIVED` — a handshake begun by a peer.
     pub connections_accepted: u64,
+    /// Connections that reached `SYN_SENT` — a handshake begun by this end. Its
+    /// own field rather than part of `connections_accepted`, because the two
+    /// accuse nothing alike: one is traffic arriving and the other is this node
+    /// deciding to reach out, and a rising count of dials beside a flat
+    /// `connections_established` is a node that cannot reach where it is trying
+    /// to go.
+    pub connections_dialled: u64,
     /// Connections that reached `ESTABLISHED` — a handshake completed. The gap
     /// between this and the count above is the half-open population, which is
     /// what a `SYN` flood produces.
@@ -95,6 +102,12 @@ pub struct TcpCounters {
     /// accuses something different from a *wrong* acknowledgement: a peer that
     /// is not running TCP, or a probe.
     pub refused_no_acknowledgement: u64,
+    /// Segments reaching a dial that carried neither `SYN` nor `RST`, which
+    /// RFC 793 p.68 drops without answering. Its own field because a connection
+    /// this end has only dialled has no window for a segment to be outside of:
+    /// the refusal is that the segment says nothing about the handshake being
+    /// waited for.
+    pub refused_not_a_handshake: u64,
     /// In-window payload that was not the next byte expected. This stack holds
     /// no reassembly queue (see the crate header), so it is dropped and
     /// re-requested by the acknowledgement that follows.
@@ -134,6 +147,7 @@ impl TcpCounters {
             segments_received: 0,
             segments_sent: 0,
             connections_accepted: 0,
+            connections_dialled: 0,
             connections_established: 0,
             connections_closed: 0,
             connections_evicted: 0,
@@ -151,6 +165,7 @@ impl TcpCounters {
             refused_no_connection: 0,
             refused_unacceptable_ack: 0,
             refused_no_acknowledgement: 0,
+            refused_not_a_handshake: 0,
             refused_out_of_order: 0,
             urgent_ignored: 0,
             challenge_acks: 0,
@@ -174,6 +189,7 @@ impl TcpCounters {
             .saturating_add(self.refused_no_connection)
             .saturating_add(self.refused_unacceptable_ack)
             .saturating_add(self.refused_no_acknowledgement)
+            .saturating_add(self.refused_not_a_handshake)
             .saturating_add(self.refused_out_of_order)
     }
 
@@ -215,11 +231,13 @@ mod tests {
         counters.refused_unacceptable_ack = 64;
         counters.refused_out_of_order = 128;
         counters.refused_no_acknowledgement = 256;
-        assert_eq!(counters.refused_total(), 511);
+        counters.refused_not_a_handshake = 512;
+        assert_eq!(counters.refused_total(), 1023);
         // A count that is not a refusal stays out of it.
         counters.segments_received = 1_000;
         counters.write_refused = 1_000;
-        assert_eq!(counters.refused_total(), 511);
+        counters.connections_dialled = 1_000;
+        assert_eq!(counters.refused_total(), 1023);
     }
 
     #[test]

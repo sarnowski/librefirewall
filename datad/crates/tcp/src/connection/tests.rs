@@ -9,6 +9,7 @@ use proptest::prelude::*;
 #[test]
 fn every_state_has_a_distinct_name() {
     let states = [
+        State::SynSent,
         State::SynReceived,
         State::Established,
         State::CloseWait,
@@ -25,6 +26,7 @@ fn every_state_has_a_distinct_name() {
     names.dedup();
     assert_eq!(names.len(), count, "two states share a name");
     assert_eq!(State::Established.name(), "established");
+    assert_eq!(State::SynSent.name(), "syn-sent");
 }
 
 /// RFC 1122 section 4.2.2.6's default when the peer offers no option, and the clamp in

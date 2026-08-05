@@ -245,11 +245,14 @@ fn every_transport_counter_reaches_its_own_slot() {
         resets_sent: 25,
         write_refused: 26,
         challenges_suppressed: 27,
+        connections_dialled: 28,
+        refused_not_a_handshake: 29,
     };
     let sample = TcpSample {
         segments_received: counters.segments_received,
         segments_sent: counters.segments_sent,
         connections_accepted: counters.connections_accepted,
+        connections_dialled: counters.connections_dialled,
         connections_established: counters.connections_established,
         connections_closed: counters.connections_closed,
         connections_evicted: counters.connections_evicted,
@@ -267,6 +270,7 @@ fn every_transport_counter_reaches_its_own_slot() {
         refused_no_connection: counters.refused_no_connection,
         refused_unacceptable_ack: counters.refused_unacceptable_ack,
         refused_no_acknowledgement: counters.refused_no_acknowledgement,
+        refused_not_a_handshake: counters.refused_not_a_handshake,
         refused_out_of_order: counters.refused_out_of_order,
         urgent_ignored: counters.urgent_ignored,
         challenge_acks: counters.challenge_acks,
@@ -282,7 +286,7 @@ fn every_transport_counter_reaches_its_own_slot() {
     let values = management.values();
     let mut seen: Vec<u64> = values.iter().copied().filter(|value| *value != 0).collect();
     seen.sort_unstable();
-    assert_eq!(seen, (1..=27).collect::<Vec<u64>>());
+    assert_eq!(seen, (1..=29).collect::<Vec<u64>>());
 }
 
 /// A log ring's counts are `u32` on the writing side and `u64` on the wire, and

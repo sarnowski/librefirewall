@@ -79,7 +79,7 @@
 "crates/metrics/src/lib.rs" = 0.5714
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
-"crates/metrics/src/sample.rs" = 0.0936
+"crates/metrics/src/sample.rs" = 0.0934
 "crates/net-headers/src/lib.rs" = 0.2117
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -92,7 +92,7 @@
 "crates/pd-runtime/src/endpoint.rs" = 0.4464
 "crates/pd-runtime/src/handover.rs" = 0.3606
 "crates/pd-runtime/src/lib.rs" = 0.5070
-"crates/pd-runtime/src/stats.rs" = 0.2313
+"crates/pd-runtime/src/stats.rs" = 0.2305
 "crates/pd-runtime/src/tap.rs" = 0.3727
 "crates/pipeline/src/lib.rs" = 0.4136
 "crates/queue/src/lib.rs" = 0.4260
@@ -106,10 +106,10 @@
 "crates/store/src/reset.rs" = 0.5297
 "crates/store/src/slots.rs" = 0.2922
 "crates/store/src/state.rs" = 0.2266
-"crates/tcp/src/connection.rs" = 0.3133
-"crates/tcp/src/counters.rs" = 0.5183
+"crates/tcp/src/connection.rs" = 0.3269
+"crates/tcp/src/counters.rs" = 0.5314
 "crates/tcp/src/isn.rs" = 0.3564
-"crates/tcp/src/lib.rs" = 0.3118
+"crates/tcp/src/lib.rs" = 0.3262
 "crates/tcp/src/rto.rs" = 0.4386
 "crates/tcp/src/segment.rs" = 0.2939
 "crates/tcp/src/seq.rs" = 0.3786

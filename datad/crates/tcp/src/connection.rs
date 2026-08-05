@@ -1,5 +1,5 @@
-//! One connection: RFC 793 section 3.9's *SEGMENT ARRIVES* for everything a passive
-//! open can reach, with RFC 5961's validation and RFC 6298's timer over it.
+//! One connection: RFC 793 section 3.9's *SEGMENT ARRIVES*, with RFC 5961's
+//! validation and RFC 6298's timer over it.
 //!
 //! # What a connection holds, and what it deliberately does not
 //!
@@ -78,13 +78,16 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_millis(300_000);
 /// deny service.
 pub const TIME_WAIT_DURATION: Duration = Duration::from_millis(60_000);
 
-/// The states a passive open can reach.
+/// The states a connection can reach.
 ///
 /// `LISTEN` is absent by construction: it is a property of the stack rather than
-/// of a connection, so there is no way to hold a `Connection` in it. `SYN_SENT`
-/// is absent because nothing here originates a connection (crate header).
+/// of a connection, so there is no way to hold a `Connection` in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
+    /// This end dialled and the peer has not answered. It knows the peer's
+    /// address and port and nothing about its sequence space, so it can neither
+    /// send nor receive a byte.
+    SynSent,
     SynReceived,
     Established,
     /// The peer has closed; this end may still send.
@@ -107,6 +110,7 @@ impl State {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::SynSent => "syn-sent",
             Self::SynReceived => "syn-received",
             Self::Established => "established",
             Self::CloseWait => "close-wait",
@@ -197,6 +201,13 @@ pub enum Refusal {
     /// A segment with no `ACK` on a synchronized connection, which RFC 793 p.72
     /// drops without answering.
     NoAcknowledgement,
+    /// A segment reaching a dial that carried neither `SYN` nor `RST`, which
+    /// RFC 793 p.68 drops without answering. Its own cause rather than
+    /// [`OutOfWindow`](Self::OutOfWindow): a connection this end has only
+    /// dialled has no receive window for a segment to be outside of, so the
+    /// refusal is that the segment says nothing about the handshake being
+    /// waited for.
+    NotAHandshake,
 }
 
 /// One connection's whole state.
@@ -298,6 +309,86 @@ impl Connection {
         connection
     }
 
+    /// Dial `peer`: compose the state a `SYN` about to go out leaves behind.
+    ///
+    /// The mirror of [`accept`](Self::accept) with one asymmetry that shapes
+    /// everything below — **nothing about the peer's sequence space is known
+    /// yet**. Its initial sequence number, the window it will offer, the segment
+    /// size it will accept and whether it scales all arrive on the `SYN-ACK`, so
+    /// until then this connection advertises a window it has committed to and
+    /// sends nothing — `snd_wnd` is zero, so [`sendable`](Self::sendable) is
+    /// zero on top of the state check its caller makes. `irs` and `rcv_nxt`
+    /// stand at this end's own `iss` as placeholders and are replaced by
+    /// [`receive`](Self::receive) out of the answer, which is the first thing
+    /// that happens to a dialled connection and happens before it can deliver a
+    /// byte or acknowledge one.
+    ///
+    /// `mss_limit` and `receive_window` are the stack's, as they are for a
+    /// passive open, and `iss` comes from the same generator — an off-path
+    /// attacker that could predict the number this end dials with could inject
+    /// into a connection it cannot see, whichever end opened it.
+    pub(crate) fn open(
+        now: Monotonic,
+        peer_address: Ipv4Address,
+        peer_port: u16,
+        iss: SeqNumber,
+        mss_limit: u16,
+        receive_window: u32,
+    ) -> Self {
+        // Offered unconditionally, which is the only way scaling is ever
+        // enabled: RFC 7323 section 2.2 makes an answer that carries the option
+        // conditional on a `SYN` that did, so a dial that withheld it could
+        // never scale in either direction.
+        let rcv_scale = receive_scale(receive_window);
+        let mut connection = Self {
+            peer_address,
+            peer_port,
+            state: State::SynSent,
+            snd_una: iss,
+            // The `SYN` about to go out occupies one number.
+            snd_nxt: iss.add(1),
+            snd_wnd: 0,
+            snd_wnd_max: 0,
+            snd_wl1: iss,
+            snd_wl2: iss,
+            irs: iss,
+            rcv_nxt: iss,
+            rcv_wnd: advertisable(receive_window, rcv_scale),
+            rcv_scale,
+            snd_scale: 0,
+            // The limit until the answer narrows it, which is exactly what
+            // `negotiated_mss` takes as its second argument.
+            send_mss: mss_limit,
+            sack_permitted: false,
+            unacked: [None; MAX_UNACKED],
+            timer: RetransmissionTimer::new(),
+            rto_deadline: None,
+            time_wait_deadline: None,
+            last_activity: now,
+        };
+        // Recorded so the `SYN` is re-sent if it or the answer is lost, which is
+        // the whole of what a dial owes before a connection exists at all — and
+        // what bounds how long an unanswered one holds its slot, the record
+        // being what `MAX_RETRANSMITS` is counted against.
+        connection.record(now, iss, 0, true, false);
+        connection
+    }
+
+    /// The `SYN` a dial owes, composed from its own state so a retransmission and
+    /// the original are the same segment.
+    ///
+    /// It carries no acknowledgement: this end has no peer sequence number to
+    /// acknowledge, and a `SYN` claiming to acknowledge zero is one a peer is
+    /// entitled to answer with a reset.
+    pub(crate) fn syn(&self) -> Reply {
+        Reply {
+            flags: Flags::SYN,
+            sequence: self.snd_una,
+            acknowledgement: SeqNumber::new(0),
+            with_options: true,
+        }
+    }
+
     /// The `SYN-ACK` this connection owes, composed from its own state so a
     /// retransmission and the original are the same segment.
     pub(crate) fn syn_ack(&self) -> Reply {
@@ -374,6 +465,13 @@ impl Connection {
     /// connections of everybody else. What that costs is stated in the crate
     /// header — a table full of established connections refuses a new one until
     /// [`IDLE_TIMEOUT`] takes one back.
+    ///
+    /// `SYN_SENT` is the other one that never may, and for the same reason read
+    /// from the other side: a half-open connection this end *dialled* is not
+    /// state a peer made this node commit, and letting an inbound `SYN` evict one
+    /// would hand the party on the port a way to cancel this node's own dial by
+    /// flooding. It is still bounded in time — the retransmission limit ends an
+    /// unanswered dial, and [`IDLE_TIMEOUT`] ends one whose answer never came.
     #[must_use]
     pub fn evictable(&self) -> bool {
         matches!(
@@ -474,6 +572,26 @@ impl Connection {
         }
     }
 
+    /// The shift a handshake segment of this connection carries.
+    ///
+    /// A dial offers the option whatever shift it needs, because that is what
+    /// makes scaling available at all; every other segment sends it exactly where
+    /// the peer offered one first.
+    pub(crate) fn handshake_scale(&self) -> Option<u8> {
+        match self.state {
+            State::SynSent => Some(self.rcv_scale),
+            State::SynReceived
+            | State::Established
+            | State::CloseWait
+            | State::LastAck
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::Closed => self.window_scale(),
+        }
+    }
+
     /// How many payload bytes may be sent right now: the peer's window less
     /// what is already in flight, capped by the negotiated segment size.
     pub(crate) fn sendable(&self) -> usize {
@@ -569,13 +687,85 @@ impl Connection {
         self.arm(now);
     }
 
-    /// The `RST` this connection sends when it is abandoned or torn down.
-    pub(crate) fn reset(&self) -> Reply {
+    /// The segment one payload-free record is re-sent as.
+    ///
+    /// Only a record with no payload reaches this: the bytes of one that has a
+    /// payload are the caller's, so its timeout asks the caller for them instead
+    /// — which is why there is no `PSH` case here.
+    ///
+    /// Which segment it is depends on the state the record was made in, and that
+    /// is the whole reason this lives on the connection: a dial's `SYN` carries no
+    /// acknowledgement and offers the window scale, and every other control
+    /// segment acknowledges what has been received.
+    pub(crate) fn control(&self, record: &Unacked) -> Reply {
+        if record.syn && matches!(self.state, State::SynSent) {
+            return self.syn();
+        }
+        let mut flags = Flags::ACK;
+        if record.syn {
+            flags = flags.with(Flags::SYN);
+        }
+        if record.fin {
+            flags = flags.with(Flags::FIN);
+        }
         Reply {
-            flags: Flags::RST.with(Flags::ACK),
-            sequence: self.snd_nxt,
+            flags,
+            sequence: record.sequence,
             acknowledgement: self.rcv_nxt,
-            with_options: false,
+            with_options: record.syn,
+        }
+    }
+
+    /// The `RST` this connection sends when it is torn down.
+    ///
+    /// A dial the peer has not answered carries no acknowledgement, there being
+    /// no peer sequence number to acknowledge: RFC 793 section 3.4's reset from
+    /// an unsynchronized state is a bare `RST` at this end's own next number, and
+    /// one claiming to acknowledge zero is one the peer would refuse.
+    pub(crate) fn reset(&self) -> Reply {
+        match self.state {
+            State::SynSent => Reply {
+                flags: Flags::RST,
+                sequence: self.snd_nxt,
+                acknowledgement: SeqNumber::new(0),
+                with_options: false,
+            },
+            State::SynReceived
+            | State::Established
+            | State::CloseWait
+            | State::LastAck
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::Closed => Reply {
+                flags: Flags::RST.with(Flags::ACK),
+                sequence: self.snd_nxt,
+                acknowledgement: self.rcv_nxt,
+                with_options: false,
+            },
+        }
+    }
+
+    /// The `RST` an exhausted connection owes, and `None` where it owes none.
+    ///
+    /// A dial whose retransmissions ran out owes none: nothing at the far end
+    /// ever answered, so there is no connection for a reset to end, and a frame
+    /// sent anyway would only confirm to an address that said nothing that this
+    /// node is here. That is the same reason a segment for a port nothing listens
+    /// on is dropped in silence rather than answered.
+    pub(crate) fn abandonment(&self) -> Option<Reply> {
+        match self.state {
+            State::SynSent => None,
+            State::SynReceived
+            | State::Established
+            | State::CloseWait
+            | State::LastAck
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::Closed => Some(self.reset()),
         }
     }
 
@@ -595,7 +785,11 @@ impl Connection {
         let next = match self.state {
             State::Established => State::FinWait1,
             State::CloseWait => State::LastAck,
-            State::SynReceived
+            // A dial has nothing to close gracefully: its `SYN` may not even have
+            // arrived, so there is no stream for a `FIN` to end. A caller giving
+            // up on one tears it down instead.
+            State::SynSent
+            | State::SynReceived
             | State::LastAck
             | State::FinWait1
             | State::FinWait2
@@ -620,27 +814,54 @@ impl Connection {
     /// RFC 793 section 3.9's *SEGMENT ARRIVES* for one segment on an existing
     /// connection.
     pub(crate) fn receive<'a>(&mut self, now: Monotonic, segment: &Segment<'a>) -> Processed<'a> {
-        // A `SYN` at the initial receive sequence with no `ACK`, while still in
-        // `SYN_RECEIVED`, is the peer retransmitting its own handshake because
-        // this end's answer was lost. It is *outside* the receive window — the
-        // window starts one past it — so the acceptability test below would
-        // answer it with a bare acknowledgement the peer cannot use. Re-sending
-        // the `SYN-ACK` is what makes a lost one recoverable from either side.
+        // A dial has its own arrival processing and shares none of what follows:
+        // it has no receive window for the acceptability test to be stated over,
+        // and the answer it is waiting for is a segment that test would refuse.
+        if self.state == State::SynSent {
+            return self.receive_syn_sent(now, segment);
+        }
+
+        // A `SYN` at the initial receive sequence, while still in `SYN_RECEIVED`,
+        // is the peer's own handshake arriving again. It is *outside* the receive
+        // window — the window starts one past it — so the acceptability test
+        // below would refuse it, and what it means depends on whether it carries
+        // an acknowledgement.
         if self.state == State::SynReceived
             && segment.flags.contains(Flags::SYN)
-            && !segment.flags.contains(Flags::ACK)
             && !segment.flags.contains(Flags::RST)
             && segment.sequence == self.irs
         {
             self.last_activity = now;
-            return Processed {
-                data: &[],
-                reply: Some(self.syn_ack()),
-                refusal: None,
-                peer_closed: false,
-                finished: false,
-                established: false,
-                urgent: false,
+            if !segment.flags.contains(Flags::ACK) {
+                // This end's answer was lost, and re-sending it is what makes a
+                // lost `SYN-ACK` recoverable from either side.
+                return Processed {
+                    data: &[],
+                    reply: Some(self.syn_ack()),
+                    refusal: None,
+                    peer_closed: false,
+                    finished: false,
+                    established: false,
+                    urgent: false,
+                };
+            }
+            // The far half of a simultaneous open: both ends dialled, both
+            // answered, and this is the answer. Its sequence number is a byte
+            // already taken, so the only new thing in it is the acknowledgement —
+            // which is what completes this end's handshake. The acknowledgement
+            // sent back is what completes the peer's where its own answer to this
+            // end's `SYN-ACK` was the segment that went missing.
+            return match self.acknowledge(now, segment) {
+                Ok(established) => Processed {
+                    data: &[],
+                    reply: Some(self.acknowledgement()),
+                    refusal: None,
+                    peer_closed: false,
+                    finished: false,
+                    established,
+                    urgent: false,
+                },
+                Err(processed) => processed,
             };
         }
 
@@ -703,6 +924,123 @@ impl Connection {
         processed.established = established;
         processed.urgent = urgent;
         processed
+    }
+
+    /// RFC 793 p.66's *SYN-SENT* arrival processing: the four things one segment
+    /// can be to a dial the peer has not answered yet, in the order that section
+    /// tests them.
+    ///
+    /// The order is the security property. An acknowledgement is checked before a
+    /// reset is believed, so a reset a peer sends in the blind — one that names no
+    /// number this end has ever sent — cannot cancel a dial; and a `SYN` is acted
+    /// on only after both, so a segment that is neither this end's answer nor a
+    /// refusal of it moves nothing.
+    fn receive_syn_sent<'a>(&mut self, now: Monotonic, segment: &Segment<'a>) -> Processed<'a> {
+        // First: an acknowledgement of anything other than the `SYN` this end
+        // sent. RFC 793 answers it with a reset carrying the number the peer
+        // claimed and **leaves the dial where it is** — a segment acknowledging
+        // what was never sent is not evidence about the connection being opened,
+        // so tearing one down for it would let a single forged segment cancel a
+        // dial.
+        let acknowledged = if segment.flags.contains(Flags::ACK) {
+            let ack = segment.acknowledgement;
+            if ack.precedes_or_equals(self.snd_una) || ack.follows(self.snd_nxt) {
+                let reply = (!segment.flags.contains(Flags::RST)).then_some(Reply {
+                    flags: Flags::RST,
+                    sequence: ack,
+                    acknowledgement: SeqNumber::new(0),
+                    with_options: false,
+                });
+                return self.refuse(Refusal::UnacceptableAck, reply);
+            }
+            true
+        } else {
+            false
+        };
+
+        // Second: a reset, which ends the dial exactly where the acknowledgement
+        // above was acceptable. One without an acknowledgement names nothing and
+        // is dropped, which is RFC 5961 section 3.2's protection stated for the
+        // one state that has no window to state it over.
+        if segment.flags.contains(Flags::RST) {
+            if !acknowledged {
+                return self.refuse(Refusal::UnvalidatedReset, None);
+            }
+            self.close_hard();
+            return Processed {
+                data: &[],
+                reply: None,
+                refusal: None,
+                peer_closed: false,
+                finished: true,
+                established: false,
+                urgent: false,
+            };
+        }
+
+        if !segment.flags.contains(Flags::SYN) {
+            return self.refuse(Refusal::NotAHandshake, None);
+        }
+
+        // The answer, and the one point at which everything about the peer's
+        // sequence space becomes known.
+        self.irs = segment.sequence;
+        self.rcv_nxt = segment.sequence.add(1);
+        self.send_mss = negotiated_mss(segment.options.mss, self.send_mss);
+        self.sack_permitted = segment.options.sack_permitted;
+        match segment.options.window_scale {
+            Some(scale) => self.snd_scale = scale,
+            // RFC 7323 section 2.2: scaling holds only where both ends offered
+            // the option, so a peer that answered without it leaves this end
+            // unshifted — and the window it advertises has to be held back to
+            // what an unshifted field can express, or the number on the wire
+            // would mean something larger than this end can take.
+            None => {
+                self.rcv_scale = 0;
+                self.rcv_wnd = advertisable(self.rcv_wnd, 0);
+            }
+        }
+        self.snd_wnd = scaled_window(segment.window, self.snd_scale);
+        self.snd_wnd_max = self.snd_wnd;
+        self.snd_wl1 = segment.sequence;
+        self.last_activity = now;
+
+        if !acknowledged {
+            // A `SYN` with no acknowledgement is the peer dialling this end at the
+            // same time. Both ends are now answering a `SYN` they did not ask
+            // for, which is the state a passive open is already in — and the
+            // `SYN-ACK` re-uses the sequence number the outstanding `SYN` record
+            // already covers, so the timer that was arming for the `SYN` arms for
+            // the `SYN-ACK` and nothing else moves.
+            self.snd_wl2 = self.snd_una;
+            self.state = State::SynReceived;
+            return Processed {
+                data: &[],
+                reply: Some(self.syn_ack()),
+                refusal: None,
+                peer_closed: false,
+                finished: false,
+                established: false,
+                urgent: false,
+            };
+        }
+
+        self.snd_wl2 = segment.acknowledgement;
+        // The dial is answered. Retiring the `SYN` takes the one round-trip
+        // sample a connection has before it carries anything, which is what its
+        // first retransmission timeout rests on.
+        self.retire(now, segment.acknowledgement);
+        self.snd_una = segment.acknowledgement;
+        self.state = State::Established;
+        Processed {
+            data: &[],
+            reply: Some(self.acknowledgement()),
+            refusal: None,
+            peer_closed: false,
+            finished: false,
+            established: true,
+            urgent: false,
+        }
     }
 
     /// RFC 793 p.69's four-case acceptability test, over this end's window.
@@ -857,7 +1195,8 @@ impl Connection {
                 self.start_time_wait(now);
             }
             State::LastAck => self.close_hard(),
-            State::SynReceived
+            State::SynSent
+            | State::SynReceived
             | State::Established
             | State::CloseWait
             | State::FinWait2
@@ -919,7 +1258,8 @@ impl Connection {
                     self.state = State::TimeWait;
                     self.start_time_wait(now);
                 }
-                State::SynReceived
+                State::SynSent
+                | State::SynReceived
                 | State::CloseWait
                 | State::LastAck
                 | State::Closing
