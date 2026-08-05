@@ -182,13 +182,38 @@ fn run() -> Result<(), Box<dyn Error>> {
 /// the seL4 kernel build alone. What it does cost is the debug kernel's serial
 /// diagnostics on a failure, and [`diagnose`] buys those back for the one
 /// scenario that failed rather than for every scenario that did not.
+///
+/// # Why the debug image is assembled here and never booted here
+///
+/// Because [`diagnose`] cannot buy back diagnostics from an image that no
+/// longer assembles, and nothing else here would notice that it stopped. It
+/// once did stop — a target specification changed, the debug configuration's
+/// artifacts were not the ones anybody rebuilt, and every gate stayed green
+/// while every failing scenario reported that its re-run never reached a boot.
+/// Compiling the domains for the debug kernel, which the two-configuration
+/// lint pass already does, is not the same act as assembling and signing a
+/// disk from them. So the assembly runs, its output is proved by nothing, and
+/// that is the whole point: the diagnostic path is verified to exist before a
+/// failure needs it. It is assembled as a scenario disk under the build tree
+/// and never published: `dist/` holds the release disk the boots above just
+/// judged, and a debug disk written over it would destroy the artifact under
+/// judgement.
 fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
     host::test_host(root)?;
     host::fuzz(root)?;
     image::image(root, image::RELEASE_CONFIG)?;
     let system = qemu::test_system(root)?;
     let ab = ab_test::test_ab(root)?;
-    Ok(format!("{system}; and {ab}"))
+    let diagnostic = image::scenario_image(
+        root,
+        image::DEBUG_CONFIG,
+        Path::new(image::CONFIGURATION_DOCUMENT),
+        "diagnostic-path",
+    )?;
+    Ok(format!(
+        "{system}; and {ab}; the diagnostic image a failure would be re-run on assembles, at {}",
+        diagnostic.display()
+    ))
 }
 
 /// Run the full acceptance gate and publish what it proved.

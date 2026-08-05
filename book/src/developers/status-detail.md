@@ -2106,6 +2106,14 @@ directions: the disassembly check reads a binary still carrying instructions the
 longer enables, and nothing reads a binary quietly *missing* an acceleration the specification just
 gained.
 
+Two hazards of the same family are closed with it. Incremental compilation is off for every project
+command: the compiler crashed twice on a stale incremental tree, in crates the change under test had
+not touched, so a cache that may accelerate a build was deciding one. And `make ci` now assembles
+the debug image — as a scenario disk under the build tree, never published over the release disk the
+run just judged — so the configuration the diagnostic re-run needs is proved to assemble before a
+failure asks it to. Nothing boots it, and nothing should: what it owes the gate is existence, not a
+contract.
+
 **Two library choices were settled by what the build found, and the design now names what shipped.**
 
 *The post-quantum primitive is RustCrypto `ml-kem`.* `libcrux-ml-kem` — formally verified, and the

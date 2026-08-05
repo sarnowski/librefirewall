@@ -24,7 +24,8 @@ make test           # both fast gates: the ctrld gate (lock, format, warning-fre
                     #   configuration checks, and dependency policy)
 make test-system    # boot the QEMU system scenarios; the ones with a reachable endpoint judge
                     #   metrics, logs and captures against each other and against the wire
-make ci             # the complete gate (both fast gates + fuzz + release image + system + A/B)
+make ci             # the complete gate (both fast gates + fuzz + release image + system + A/B
+                    #   + the debug image the diagnostic re-run needs)
 ```
 
 The full command surface:
@@ -41,7 +42,8 @@ make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
 make test-system          # boot the QEMU system scenarios on the release image
 make test-ab              # boot the A/B state-machine scenarios on the release image
-make ci                   # the complete gate: both fast gates, fuzz, release image, system and A/B
+make ci                   # the complete gate: both fast gates, fuzz, release image, system and A/B,
+                          #   then the debug image, assembled and never booted
 make release              # run the full gate, then keep `datad/dist/` only if it proved what it holds
 make verify-reproducible  # build the release payload twice in isolation and compare artifacts
 make ctrld-image          # build the pinned BEAM builder and pull the two pinned databases
@@ -71,6 +73,14 @@ read-only container filesystem, no Linux capabilities, and only the workspace mo
 When the host exposes `/dev/kvm` it is passed through for accelerated QEMU; the harness falls back
 to emulation otherwise, and which of the two happened is printed and written into the run log, so a
 silent degradation to emulation cannot pass for an accelerated run.
+
+Incremental compilation is disabled for every project command. A cache may accelerate a build and
+must never decide one, and this one twice did: the compiler crashed on a stale incremental tree in
+crates the change under test had not touched. A gate whose verdict depends on what a previous run
+left behind is not a gate, so the runs depend on the sources and the pinned toolchain alone. Editing
+a target specification is the same hazard in another form and is handled the same way — the build
+records which specification each set of artifacts was compiled against, discards them when it
+changes, and says so, because cargo does not fingerprint a custom target.
 
 ### Adding an appliance dependency
 
@@ -290,15 +300,14 @@ kernel build, which is why "debug" is better read as "release plus kernel diagno
   failing scenario reports that the re-run never reached a boot, and the diagnosis is gone exactly
   when it is wanted.
 
-  Two different things stand behind it, and only one of them is in a gate. The two-configuration
-  Clippy pass compiles this configuration's protection domains on every `make test`, which is what
-  keeps the *compilation* from rotting; nothing in any gate *assembles* the debug image, so its
-  assembly is proved by running `make image-debug` and by nothing else. Treating the first as
-  standing in for the second is what once left `image-debug` broken with every gate green: the two
-  steps compile into separate artifact directories, and neither noticed that a target specification
-  had moved under it. Both are held to their specifications now, which removes that particular way
-  of losing the configuration and does not turn the Clippy pass into a proof that the image
-  assembles.
+  Two different things stand behind it, and both are now in a gate. The two-configuration Clippy
+  pass compiles this configuration's protection domains on every `make test`, which keeps the
+  *compilation* from rotting; and `make ci` *assembles* the debug image — as a scenario disk under
+  the build tree, never published over the release disk it just judged — and boots it not at all.
+  Treating the first as standing in for the second is what once left `image-debug` broken with every
+  gate green: the two steps compile into separate artifact directories, and neither noticed that a
+  target specification had moved under them. Assembling it proves nothing about the appliance and
+  everything about the diagnosis being available when a failure finally wants it.
 
 **The shipped profile is the tested profile.** *Every* end-to-end scenario boots the release
 configuration: `make ci` assembles it and holds that disk to the forwarding contract across the

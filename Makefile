@@ -219,6 +219,13 @@ endef
 # component below it: cargo then finds datad/Cargo.toml, the `xtask` alias in
 # datad/.cargo/config.toml, and datad/rust-toolchain.toml, while the book at
 # the repository root stays reachable one level up.
+#
+# Incremental compilation is off. A cache may accelerate a build and must never
+# decide one, and this cache twice decided one: the compiler crashed on a stale
+# incremental tree — twice, in crates the change under test did not touch — and
+# a gate whose verdict depends on what a previous run left behind is not a gate.
+# What it costs is compile time on a warm tree; what it buys is a run that
+# depends on the sources and the pinned toolchain alone.
 define container
 $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--network=none \
@@ -229,6 +236,7 @@ $(PODMAN) --cgroup-manager=cgroupfs run --rm \
 	--user $$(id -u):$$(id -g) \
 	--env HOME=/tmp \
 	--env CARGO_NET_OFFLINE=true \
+	--env CARGO_INCREMENTAL=0 \
 	--tmpfs /tmp:rw,nosuid,nodev \
 	--mount type=bind,src=$(CURDIR),dst=/workspace,rw=true \
 	--workdir /workspace/datad \
