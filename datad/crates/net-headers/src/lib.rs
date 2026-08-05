@@ -829,6 +829,105 @@ impl ArpReply {
     }
 }
 
+/// The ARP request an endpoint asks a next hop's hardware address with: our own
+/// pair as the sender, the address asked about as the target, and no target
+/// hardware address to name — that being the question.
+///
+/// It is the mirror of [`ArpReply`] and deliberately not a variant of it. A reply
+/// is composed *because* a station asked and is addressed to the station that
+/// did; a request is a frame this appliance originates on its own account and
+/// goes to every station on the link. Two types therefore make one thing
+/// unrepresentable: a request addressed to a unicast station it has not resolved
+/// yet, which is the frame a caller writes by mistake when one type carries an
+/// operation field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArpRequest {
+    /// Our own hardware address, which is both the Ethernet source and the
+    /// sender the payload claims: the two are compared by the endpoint that
+    /// receives them, so a request whose fields disagreed would be refused by an
+    /// end applying this crate's own rule.
+    pub mac: MacAddress,
+    /// Our own address, which is what the answer is addressed back to.
+    pub address: Ipv4Address,
+    /// The address whose hardware address is being asked for.
+    pub target_address: Ipv4Address,
+}
+
+impl ArpRequest {
+    /// Write this request into `out`, returning its length on the wire.
+    ///
+    /// The destination is [`MacAddress::BROADCAST`] and the target hardware
+    /// address is zero, which is RFC 826's own encoding of the unknown: a
+    /// caller cannot supply either, so no request can leave naming a station
+    /// this end has not resolved.
+    ///
+    /// # Errors
+    /// [`ReplyError::DoesNotFit`] for storage shorter than [`ARP_FRAME_LEN`].
+    /// Nothing is written.
+    pub fn write(&self, out: &mut [u8]) -> Result<usize, ReplyError> {
+        let Some(frame) = out.first_chunk_mut::<ARP_FRAME_LEN>() else {
+            return Err(ReplyError::DoesNotFit {
+                needed: ARP_FRAME_LEN,
+                capacity: out.len(),
+            });
+        };
+        let MacAddress([d0, d1, d2, d3, d4, d5]) = MacAddress::BROADCAST;
+        let MacAddress([s0, s1, s2, s3, s4, s5]) = self.mac;
+        let [ether_high, ether_low] = EtherType::ARP.0.to_be_bytes();
+        let [protocol_high, protocol_low] = EtherType::IPV4.0.to_be_bytes();
+        let [hardware_high, hardware_low] = ARP_HARDWARE_ETHERNET.to_be_bytes();
+        let [op_high, op_low] = ARP_REQUEST.to_be_bytes();
+        let [a0, a1, a2, a3] = self.address.octets();
+        let [t0, t1, t2, t3] = self.target_address.octets();
+        *frame = [
+            d0,
+            d1,
+            d2,
+            d3,
+            d4,
+            d5,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            ether_high,
+            ether_low,
+            hardware_high,
+            hardware_low,
+            protocol_high,
+            protocol_low,
+            ARP_HARDWARE_LEN,
+            ARP_PROTOCOL_LEN,
+            op_high,
+            op_low,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            a0,
+            a1,
+            a2,
+            a3,
+            // The target hardware address, unknown by construction.
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            t0,
+            t1,
+            t2,
+            t3,
+        ];
+        Ok(ARP_FRAME_LEN)
+    }
+}
+
 /// A running RFC 1071 ones' complement sum, for a transport whose checksum spans
 /// more than one block — the TCP pseudo-header, nowhere in memory, followed by the
 /// segment. One implementation serves the workspace: two that disagreed would
@@ -2882,6 +2981,76 @@ mod tests {
         assert_eq!(reply.target_address, PEER_ADDRESS);
         // Nothing past the frame is touched.
         assert!(out[len..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn an_arp_request_asks_the_whole_link_and_names_no_target_station() {
+        let mut out = [0u8; 64];
+        let len = ArpRequest {
+            mac: OUR_MAC,
+            address: OUR_ADDRESS,
+            target_address: PEER_ADDRESS,
+        }
+        .write(&mut out)
+        .expect("64 bytes hold a 42-byte request");
+        assert_eq!(len, ARP_FRAME_LEN);
+
+        let ethernet = Ethernet::parse(&out[..len]).expect("a request is a frame");
+        // Broadcast, because the station that would answer is the unknown.
+        assert_eq!(ethernet.header.destination, MacAddress::BROADCAST);
+        assert_eq!(ethernet.header.source, OUR_MAC);
+        assert_eq!(ethernet.header.ether_type, EtherType::ARP);
+        let request = ArpPacket::parse(ethernet.payload).expect("a request re-parses");
+        assert_eq!(request.operation, ArpOperation::Request);
+        // The sender the payload claims is the Ethernet source, which is the
+        // agreement a receiving endpoint refuses a request for lacking.
+        assert_eq!(request.sender_mac, OUR_MAC);
+        assert_eq!(request.sender_mac, ethernet.header.source);
+        assert_eq!(request.sender_address, OUR_ADDRESS);
+        assert_eq!(request.target_mac, MacAddress([0; 6]));
+        assert_eq!(request.target_address, PEER_ADDRESS);
+        assert!(out[len..].iter().all(|byte| *byte == 0));
+    }
+
+    /// The one thing a request must never be: a frame this end addressed to a
+    /// station it has not resolved. No field of [`ArpRequest`] can express one,
+    /// so the property is over every value it can hold.
+    #[test]
+    fn no_request_is_ever_addressed_to_a_named_station() {
+        for octet in 0u8..=255 {
+            let mut out = [0u8; ARP_FRAME_LEN];
+            ArpRequest {
+                mac: MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, octet]),
+                address: Ipv4Address::from_octets([10, 0, 0, octet]),
+                target_address: Ipv4Address::from_octets([10, 0, 0, octet ^ 0xff]),
+            }
+            .write(&mut out)
+            .expect("a request fits its own length");
+            let ethernet = Ethernet::parse(&out).expect("a frame");
+            assert!(ethernet.header.destination.is_broadcast());
+            let request = ArpPacket::parse(ethernet.payload).expect("a request");
+            assert_eq!(request.target_mac, MacAddress([0; 6]));
+        }
+    }
+
+    #[test]
+    fn a_request_that_does_not_fit_is_refused_with_nothing_written() {
+        for capacity in 0..ARP_FRAME_LEN {
+            let mut out = vec![0u8; capacity];
+            assert_eq!(
+                ArpRequest {
+                    mac: OUR_MAC,
+                    address: OUR_ADDRESS,
+                    target_address: PEER_ADDRESS,
+                }
+                .write(&mut out),
+                Err(ReplyError::DoesNotFit {
+                    needed: ARP_FRAME_LEN,
+                    capacity,
+                })
+            );
+            assert!(out.iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]

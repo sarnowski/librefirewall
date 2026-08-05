@@ -64,8 +64,9 @@
 "crates/http/src/request.rs" = 0.2944
 "crates/http/src/response.rs" = 0.3135
 "crates/ip-endpoint/src/http.rs" = 0.3402
-"crates/ip-endpoint/src/lib.rs" = 0.3180
+"crates/ip-endpoint/src/lib.rs" = 0.3177
 "crates/ip-endpoint/src/neighbour.rs" = 0.4247
+"crates/ip-endpoint/src/route.rs" = 0.5789
 "crates/log/src/console.rs" = 0.5084
 "crates/log/src/detail.rs" = 0.4859
 "crates/log/src/event.rs" = 0.2896
@@ -81,7 +82,7 @@
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
 "crates/metrics/src/sample.rs" = 0.0934
-"crates/net-headers/src/lib.rs" = 0.2117
+"crates/net-headers/src/lib.rs" = 0.2154
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
 "crates/nic-driver-core/src/port.rs" = 0.4521

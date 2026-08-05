@@ -1484,12 +1484,31 @@ not satisfy it.
   rather than the absence of a panic. **Missing:** the endpoint neither answers with a request nor
   feeds a reply into it, so no entry has ever been learned on a running node, and its counters reach
   no surface.
-- **No ARP request is ever sent.** A reply goes to the MAC its request arrived from. An RFC 5227
-  probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
-  address is not contradicted.
+- **An ARP request can be written and nothing sends one yet.** `net_headers::ArpRequest` composes the
+  question beside the reply that answers one, and the two are separate types rather than one carrying
+  an operation field: a request is a frame this appliance originates on its own account, so it always
+  goes to the broadcast address and names no target station — which makes the frame a caller writes by
+  mistake, one addressed to a station it has not resolved yet, unrepresentable rather than merely
+  wrong. **Missing:** the endpoint composes none, so no request has left a running node.
+- **A route decision exists and nothing consults it yet.** `lfw_ip_endpoint::route` answers which
+  station a datagram this appliance originates is handed to: the destination itself where it shares the
+  port's prefix, the port's stated gateway where it does not, and a typed refusal otherwise. Every
+  refusal is about this node's own configuration or its own choice of destination, never about a frame
+  somebody sent — a destination or gateway no frame may be addressed towards, a destination that is
+  this port's own address, a gateway off the port's link or equal to its address, and an off-link
+  destination with no gateway at all, which is refused rather than asked about on-link anyway. Two
+  properties are what the neighbour cache rests on and are held at property level: an address this
+  decision hands back is always a unicast station other than this port's own, and it is always inside
+  the port's own prefix — so no resolution can be started for a group address, and none can ask the
+  wrong link. What it deliberately is not, each with a reason in the module: no route table and so no
+  choice of interface, no metrics or route preference, no default-route election, no dynamic routing.
+  **Missing:** nothing supplies a gateway — the configuration schema has none — and nothing calls it,
+  so no route has been decided on a running node.
+- **An RFC 5227 probe (sender address 0.0.0.0) is refused rather than answered**, so a second station
+  claiming this address is not contradicted.
 - **A reply is only ever composed for a neighbour**: the sender must share the port's prefix, because
-  there is no route table and no gateway behind this endpoint. An off-link station is refused and
-  counted.
+  the route decision above is consulted by nothing and this endpoint holds no gateway. An off-link
+  station is refused and counted.
 - **The counters now reach a surface.** The console still carries only the port's cumulative
   `frames=`/`bytes=` pair, but every outcome the endpoint distinguishes — and every reply it could
   not send — is published as the `librefirewall_endpoint_*` families and scrapable; see
