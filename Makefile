@@ -291,6 +291,13 @@ endef
 # once without colliding, and the databases are addressed by the IP podman
 # assigns them because this host has no aardvark-dns and a network alias would
 # not resolve.
+# How long a database is given to answer before the gate calls it a failure.
+# Bounded, as every wait in this project is, and generous rather than tight: a
+# gate sharing eight cores with an appliance build has watched ClickHouse take
+# well over a minute to accept its first query, and a bound that expires under
+# load is a red gate that says nothing about the change.
+CTRLD_DATABASE_READY_SECONDS ?= 300
+
 define ctrld_gate
 @set -eu; \
 run="ctrld-gate-$$$$"; \
@@ -311,17 +318,17 @@ $(PODMAN) --cgroup-manager=cgroupfs run --detach --name "$$ch" --network "$$net"
 	--env CLICKHOUSE_USER=ctrld --env CLICKHOUSE_PASSWORD="$$password" --env CLICKHOUSE_DB=ctrld_gate \
 	--tmpfs /var/lib/clickhouse --ulimit nofile=262144:262144 \
 	$(CLICKHOUSE_IMAGE) >/dev/null; \
-for attempt in $$(seq 1 90); do \
+for attempt in $$(seq 1 $(CTRLD_DATABASE_READY_SECONDS)); do \
 	$(PODMAN) exec "$$pg" pg_isready -U ctrld -d ctrld_gate >/dev/null 2>&1 && break; sleep 1; \
 done; \
 $(PODMAN) exec "$$pg" pg_isready -U ctrld -d ctrld_gate >/dev/null 2>&1 || { \
-	echo "ctrld gate: Postgres never became ready — the gate needs a database and does not skip its tests"; \
+	echo "ctrld gate: Postgres was still not ready after $(CTRLD_DATABASE_READY_SECONDS)s — the gate needs a database and does not skip its tests"; \
 	$(PODMAN) logs "$$pg"; exit 1; }; \
-for attempt in $$(seq 1 90); do \
+for attempt in $$(seq 1 $(CTRLD_DATABASE_READY_SECONDS)); do \
 	$(PODMAN) exec "$$ch" clickhouse-client --user ctrld --password "$$password" --query 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; \
 done; \
 $(PODMAN) exec "$$ch" clickhouse-client --user ctrld --password "$$password" --query 'SELECT 1' >/dev/null 2>&1 || { \
-	echo "ctrld gate: ClickHouse never became ready — the gate needs a database and does not skip its tests"; \
+	echo "ctrld gate: ClickHouse was still not ready after $(CTRLD_DATABASE_READY_SECONDS)s — the gate needs a database and does not skip its tests"; \
 	$(PODMAN) logs "$$ch"; exit 1; }; \
 pgip=$$($(PODMAN) inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$$pg"); \
 chip=$$($(PODMAN) inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$$ch"); \
