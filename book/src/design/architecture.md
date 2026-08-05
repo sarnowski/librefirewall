@@ -275,19 +275,33 @@ which makes the XMM-based instruction sets — SSE through SSE4.2, AES-NI, PCLMU
 architecturally available to protection domains; what disables them today is a generated toolchain
 default, not the kernel. The work splits into three tiers, and only one touches the kernel:
 
-- **Free — no kernel implication.** ADX and BMI2: general-purpose-register instructions carrying no
-  XSAVE state, accelerating the big-integer arithmetic under P-256, X25519 and part of ML-KEM.
+- **Free — no kernel implication.** ADX: general-purpose-register instructions carrying no XSAVE
+  state, accelerating the big-integer arithmetic under P-256, X25519 and part of ML-KEM.
 - **Available now — no kernel change.** SSE through SSE4.2, **AES-NI**, **PCLMULQDQ**, and SHA-NI:
   all XMM-based, already covered by the saved state. This tier contains everything that decides
   whether 10 Gbit/s inspection is viable.
-- **Deferred — needs a kernel rebuild.** AVX and AVX2: YMM state is not in feature set 3, so
-  enabling them means raising the kernel's XSAVE feature set and building seL4 ourselves instead of
-  consuming the SDK's prebuilt kernel. It would buy ChaCha20, SHA-2 and ML-KEM a factor of two to
-  four; AES-NI is the large win and needs only SSE.
+- **Deferred — needs a kernel rebuild.** AVX, AVX2 and **BMI2**: none of them is usable while the
+  kernel saves only feature set 3, so having them means raising its XSAVE feature set and building
+  seL4 ourselves instead of consuming the SDK's prebuilt kernel. AVX and AVX2 would buy ChaCha20,
+  SHA-2 and ML-KEM a factor of two to four; AES-NI is the large win and needs only SSE.
 
-**The CPU baseline is a product requirement**, decided as such: **AES-NI, PCLMULQDQ, ADX and BMI2
-are mandatory and compile-time enabled**, together with SSE through SSE4.2 — universal on modern
-parts. **SHA-NI is never compile-time enabled**: it arrived with AMD Zen 1 and Intel Ice Lake, so
+**BMI2 was in the free tier, and putting it there was wrong.** The reasoning was that its
+instructions touch no vector register and so carry no saved state — sound about the register file
+and beside the point, because what ties an instruction to the vector state is its **encoding**, not
+its operands. BMI2 is VEX-encoded, and a VEX-encoded instruction — the general-purpose ones
+included — is refused unless the vector state has been *enabled*, meaning `CR4.OSXSAVE` set and the
+vector bit in `XCR0`, which a kernel saving only x87 and SSE state never does. Processors do not
+enforce that on the general-purpose subset, so the image ran on hardware; the emulator the appliance
+is also proved on does, so the same image faulted with an invalid opcode inside the P-256 scalar
+multiplication. The free tier therefore holds only what is legacy-encoded, which today is ADX
+alone.
+
+**The CPU baseline is a product requirement**, decided as such: **AES-NI, PCLMULQDQ and ADX are
+mandatory and compile-time enabled**, together with SSE through SSE4.2 — universal on modern parts.
+BMI2 was on that list and has been taken off it for the encoding reason above; the baseline
+therefore **relaxes**, which excludes no hardware that was admissible before and admits none that
+could not already run the rest of the tier. What it costs is speed, not compatibility, and the
+cryptography domain's own per-operation figures are where that cost is visible. **SHA-NI is never compile-time enabled**: it arrived with AMD Zen 1 and Intel Ice Lake, so
 enabling it unconditionally would exclude Haswell- and Skylake-era Xeons still in service — and this
 is not a preference, because compile-time-enabling a feature the CPU lacks is an illegal-instruction
 fault on first use, not a slow path. It is therefore a runtime-detected feature by design, and

@@ -431,8 +431,10 @@ fn assemble(
     // acceleration claim can be checked against them: the adopted
     // cryptography crates pick a backend at compile time, so whether the fast
     // one was compiled in is a fact about these bytes and about nothing in the
-    // source. The absence half matters more — a wide vector register in a
-    // protection domain is state the pinned kernel does not save.
+    // source. The absence half matters more, and it is two absences: a wide
+    // vector register in a protection domain is state the pinned kernel does
+    // not save, and a VEX- or EVEX-encoded instruction is one the emulator half
+    // of the gate will not execute at all while that saved state stays narrow.
     crate::crypto_profile::check_image(&build).map_err(crate::util::Error::Invalid)?;
 
     run_command(

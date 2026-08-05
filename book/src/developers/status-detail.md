@@ -2036,6 +2036,30 @@ mutually-authenticated TLS 1.3 session with itself** — `TLS_CHACHA20_POLY1305_
 ways, closed with an alert — before running a second, deliberately starved session that must be
 refused. It holds the appliance's only allocator: a 2 MiB region mapped into it and nothing else.
 
+**All of that is now proved on both accelerators, which it was not.** The harness prefers KVM and
+falls back to emulation, printing and logging which it took, and the image used to come up only
+under KVM: the SIMD target enabled BMI2, whose instructions are VEX-encoded, and an emulated
+processor refuses that encoding unless the guest has enabled the vector state — which the pinned
+kernel's XSAVE feature set, covering x87 and SSE only, never does. The fault was an invalid opcode
+on a `shrx` inside the P-256 scalar multiplication, on a guest whose `CPUID` advertised BMI2 and
+whose feature gate had passed, because hardware imposes no such condition on the general-purpose
+subset. BMI2 is therefore disabled in the target, absent from the guest CPU model, and gated for by
+neither domain; ADX remains, being legacy-encoded. What holds the decision is not the removed
+feature but the encoding: `crypto_profile::check_image` reads the raw bytes of every decoded
+instruction in the shipped protection domains and fails on a VEX or EVEX prefix, whatever the
+mnemonic — the half that cannot go stale, beside the `%ymm` operand scan that refuses the register
+file the kernel does not save. What it costs is a few per cent on X25519 and ML-KEM-768 and nothing
+measurable on ECDSA P-256; the per-operation regression ceilings moved with it, from twenty, twenty
+and sixty million cycles down to 5.5, 1.1 and 2.0 million, which is the four-times margin they were
+always documented as having.
+
+One caveat is worth recording, because it bites: **cargo does not fingerprint a custom target
+specification**, so editing `datad/support/targets/x86_64-sel4-simd.json` alone rebuilds nothing.
+The SIMD target directory has to be removed for the change to reach the binaries. The disassembly
+check catches the resulting stale image in the direction that matters here — an image still
+carrying instructions the specification no longer enables fails it — but a specification that
+*gained* a feature the build did not pick up would pass unnoticed.
+
 **Two library choices were settled by what the build found, and the design now names what shipped.**
 
 *The post-quantum primitive is RustCrypto `ml-kem`.* `libcrux-ml-kem` — formally verified, and the

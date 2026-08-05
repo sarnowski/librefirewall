@@ -25,7 +25,10 @@ rustflags = ["-Zunstable-options"]
 # specification with the softfloat ABI and the SSE disables dropped, enabling
 # exactly the XMM tier the pinned kernel's XSAVE feature set 3 already saves
 # and restores per thread (x87 plus SSE, 576 bytes) — SSE through SSE4.2,
-# AES-NI, PCLMULQDQ — plus ADX and BMI2, which carry no XSAVE state at all.
-# MMX stays disabled as unwanted, and AVX/AVX2 stay disabled because YMM state
-# is not in feature set 3.
+# AES-NI, PCLMULQDQ — plus ADX, which is legacy-encoded and carries no XSAVE
+# state at all. MMX stays disabled as unwanted; AVX/AVX2 stay disabled because
+# YMM state is not in feature set 3; and BMI/BMI2 stay disabled because they are
+# VEX-encoded, which the emulator the image is proved on will not execute while
+# the kernel's saved state excludes the vector state — an acceleration the gate
+# cannot exercise is one this build does not take.
 RUST_TARGET_PATH = { value = "support/targets", relative = true }

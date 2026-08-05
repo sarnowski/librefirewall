@@ -29,14 +29,29 @@
 //! the shipped instructions is the one check that cannot be satisfied by
 //! anything except the instructions being there.
 //!
-//! The absence half is the more important one. The pinned kernel saves x87 and
-//! SSE state per thread and *not* the wider vector state, so an AVX
-//! instruction executing in a protection domain is state the kernel will not
-//! preserve across a context switch — silent corruption rather than a fault.
-//! What keeps that tier out today is that the adopted crates' runtime
-//! detection compiles to a constant false on this target, which is a property
-//! of the target specification's operating-system field and not something any
-//! source file states. This check is what holds it.
+//! The absence half is the more important one, and it is two absences rather
+//! than one.
+//!
+//! The **register file**: the pinned kernel saves x87 and SSE state per thread
+//! and *not* the wider vector state, so an AVX instruction executing in a
+//! protection domain is state the kernel will not preserve across a context
+//! switch — silent corruption rather than a fault. What keeps that tier out
+//! today is that the adopted crates' runtime detection compiles to a constant
+//! false on this target, which is a property of the target specification's
+//! operating-system field and not something any source file states.
+//!
+//! The **encoding**: an instruction carrying a VEX or EVEX prefix does not
+//! execute under the emulator this image is proved on, whatever registers it
+//! names. The emulator refuses a vector-encoded instruction unless the vector
+//! state is enabled — `CR4.OSXSAVE` and the vector bit in `XCR0` — and the
+//! pinned kernel's XSAVE feature set covers x87 and SSE only, so it never
+//! enables it. Real hardware imposes no such condition on the VEX-encoded
+//! general-purpose instructions, which is why an image carrying them runs under
+//! KVM and takes an invalid-opcode fault under emulation. A shipped instruction
+//! the gate cannot exercise is one the gate's verdict does not cover, and this
+//! project's rule is that the shipped profile is the tested profile — so the
+//! encoding is forbidden outright rather than tolerated on the accelerator that
+//! happens to run it.
 //!
 //! # No adversary
 //!
@@ -73,6 +88,24 @@ const REQUIRED_INSTRUCTIONS: &[(&str, &str)] = &[("aesenc", "aes"), ("pclmul", "
 /// does not survive a context switch — and the failure would be silent
 /// corruption of a cipher's internals rather than a fault.
 const FORBIDDEN_OPERAND: &str = "%ymm";
+
+/// The first byte of every vector-encoded instruction: `c4` and `c5` are the
+/// three- and two-byte VEX prefixes, `62` is EVEX. In 64-bit code each of them
+/// is unambiguous — `c4`/`c5` are the 32-bit-only `les`/`lds` and `62` the
+/// 32-bit-only `bound`, none of which decode in long mode — so a decoded
+/// instruction whose bytes start with one of these *is* vector-encoded,
+/// whatever its mnemonic. That is why the check keys on the encoding and not on
+/// a list of mnemonics: a list goes stale the first time a compiler picks an
+/// instruction nobody wrote down, and `mulx`, `shrx`, `rorx` and `bzhi` are
+/// only the ones this image happened to contain.
+///
+/// This is one half of what keeps the deferred tier out; the [`FORBIDDEN_OPERAND`]
+/// scan below is the other. They forbid different things and neither implies
+/// the other: this one refuses an *encoding* the emulator will not execute,
+/// including the VEX-encoded general-purpose instructions that name no vector
+/// register at all, while that one refuses a *register file* the kernel does
+/// not save.
+const VECTOR_ENCODING_PREFIXES: &[&str] = &["c4", "c5", "62"];
 
 /// Hold the profile page to the target specification and to the primitive
 /// vocabulary.
@@ -194,6 +227,19 @@ pub(crate) fn check_image(build: &Path) -> Result<(), String> {
                 elf.display()
             ));
         }
+        if let Some((mnemonic, count)) = vector_encoded(&text) {
+            findings.push(format!(
+                "{} carries {count} vector-encoded instruction(s), `{mnemonic}` among them. The \
+                 emulator this image is proved on refuses a VEX- or EVEX-encoded instruction \
+                 unless the vector state is enabled, and the pinned kernel's XSAVE feature set \
+                 covers x87 and SSE only, so it never is: the instruction takes an invalid-opcode \
+                 fault under emulation and runs under KVM, which makes the gate's verdict depend \
+                 on the machine it ran on. The shipped profile is the tested profile, so this \
+                 encoding is refused rather than shipped on the accelerator that happens to \
+                 execute it — disable the target feature that produced it",
+                elf.display()
+            ));
+        }
     }
     if findings.is_empty() {
         return Ok(());
@@ -205,10 +251,47 @@ pub(crate) fn check_image(build: &Path) -> Result<(), String> {
     ))
 }
 
+/// The first vector-encoded instruction in a disassembly, with how many there
+/// are — the mnemonic so a reader knows what to look for, the count so a reader
+/// knows whether it is one stray instruction or a whole backend.
+///
+/// objdump lays out a disassembled line as address, raw bytes and text,
+/// tab-separated, which is why [`disassemble`] asks for the bytes: the leading
+/// byte of the middle field is the encoding itself, and reading it is what makes
+/// this check unable to go stale.
+fn vector_encoded(text: &str) -> Option<(String, usize)> {
+    let mut first = None;
+    let mut count = 0;
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let (Some(_address), Some(bytes), Some(instruction)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(leading) = bytes.split_whitespace().next() else {
+            continue;
+        };
+        if !VECTOR_ENCODING_PREFIXES.contains(&leading) {
+            continue;
+        }
+        count += 1;
+        if first.is_none() {
+            first = Some(
+                instruction
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(instruction)
+                    .to_owned(),
+            );
+        }
+    }
+    first.map(|mnemonic| (mnemonic, count))
+}
+
 fn disassemble(elf: &PathBuf) -> Result<String, String> {
     let output = Command::new("objdump")
         .arg("--disassemble")
-        .arg("--no-show-raw-insn")
         .arg(elf)
         .output()
         .map_err(|error| format!("disassemble {}: {error}", elf.display()))?;

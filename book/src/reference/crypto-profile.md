@@ -23,8 +23,7 @@ path. Every one of them has been universal on Intel and AMD server parts since r
 | `sse4.2` | carried by the same parts and enabled with the rest of the tier |
 | `aes` | AES-NI. Without it AES-256-GCM falls to a software backend several times slower, and the throughput assertion below is what refuses to ship that quietly |
 | `pclmulqdq` | carry-less multiply, which GHASH — the authentication half of AES-GCM — runs on |
-| `adx` | multi-precision add-with-carry, for the big-integer arithmetic under the elliptic-curve work |
-| `bmi2` | `mulx` and the bit-manipulation instructions the same arithmetic uses |
+| `adx` | multi-precision add-with-carry, for the big-integer arithmetic under the elliptic-curve work. Legacy-encoded, so it is unaffected by the encoding limit described below |
 
 **What is deliberately not enabled, and why it is not a preference.** AVX and AVX2 would roughly
 double ChaCha20 and SHA-2 throughput, and they are unavailable: the pinned kernel saves x87 and SSE
@@ -34,6 +33,27 @@ a cipher's internals rather than a fault anyone would see. Enabling the tier mea
 kernel with a wider save area instead of consuming the pinned one, which is a change to the trusted
 base and is out of scope here. The build asserts the absence: it disassembles the shipped protection
 domains and fails if any of them names a wide vector register at all.
+
+**BMI2 is no longer enabled either, and the reason is the encoding rather than the register file.**
+BMI2's instructions — `mulx`, `shrx`, `rorx`, `bzhi` and the rest — use only general-purpose
+registers and carry no saved state, which is why they were taken as free. What they do carry is a
+**VEX prefix**, and that is the whole of the problem: the emulator the appliance is proved on
+refuses a VEX-encoded instruction unless the guest has *enabled* the vector state — `CR4.OSXSAVE`
+set and the vector bit in `XCR0` — and the pinned kernel's XSAVE feature set covers x87 and SSE
+only, so it never enables it. Real hardware imposes no such condition on VEX-encoded
+general-purpose instructions. The consequence was an image that ran on a processor and took an
+invalid-opcode fault under emulation, in the middle of the P-256 scalar multiplication, on a part
+whose `CPUID` had advertised BMI2 and whose feature gate had passed.
+
+That makes it an acceleration this appliance cannot prove, and an unprovable acceleration is not one
+this project takes. Every claim on this page rests on the appliance demonstrating it on the artifact
+that ships, and the build proves that artifact on whichever accelerator the machine offers; an image
+that only comes up on one of them makes the verdict a fact about the runner. **The cost is real and
+deliberate** — the arithmetic under P-256, X25519 and ML-KEM is measurably slower without `mulx` and
+`rorx`, and the per-operation figures this page reports are the figures after the removal. The build
+asserts this absence the same way it asserts the other, and one step earlier: it reads the raw bytes
+of every decoded instruction in the shipped protection domains and fails on any that carries a VEX
+or EVEX prefix, whatever its mnemonic and whatever registers it names.
 
 **SHA-NI is not enabled either, and here the reason is different and worth stating plainly.** The
 product's position is that SHA-NI should be detected at runtime, because it arrived with AMD Zen 1
@@ -73,6 +93,23 @@ a *complete* operation as a handshake performs it — a signature generated and 
 agreement run from both sides, an encapsulation followed by its decapsulation — because half of one
 is a figure no path takes.
 
+**What they currently cost.** The figures below are this image's own, taken from every boot of one
+accelerated gate run rather than from a single one, so the spread is the run-to-run variation an
+operator should expect rather than a number polished by choosing a boot. They are also the cost
+*after* BMI2 was withdrawn, which is where the price of that decision is visible: it is a few per
+cent on two of the three and nothing measurable on the first, because what BMI2 bought here was a
+scattering of shifts and rotates rather than a different multiplication.
+
+| asymmetric primitive | cycles per complete operation | change on withdrawing BMI2 |
+|---|---|---|
+| `ecdsa-p256` | 1,296,165 – 1,345,903 | none measurable; the difference is inside the spread |
+| `x25519` | 259,948 – 263,496 | about 2 % slower |
+| `ml-kem-768` | 473,577 – 482,768 | about 3 % slower |
+
+The symmetric figures are unaffected — AES-NI, ChaCha20 and SHA-256 are legacy-encoded or scalar
+throughout — and this image measures AES-256-GCM at about 1.43, ChaCha20-Poly1305 at about 5.50 and
+SHA-256 at about 7.10 thousandths of a cycle per byte.
+
 The corpus is a curated subset and not the whole published files, which run to megabytes: what is
 kept is the adversarial shape of each — the boundary lengths where a padding or block loop changes
 behaviour, the empty inputs, the keys either side of a hash block, and for everything that
@@ -94,8 +131,8 @@ three must hold:
    set and refuses, naming the feature word, if a mandatory feature is missing. A node that reports
    ready has passed that gate.
 2. **The instructions are in the binary.** The build disassembles the shipped protection domains and
-   requires AES-NI and carry-less-multiply instructions to be present — and, as above, requires no
-   wide-vector register to appear anywhere.
+   requires AES-NI and carry-less-multiply instructions to be present — and, as above, requires that
+   no wide-vector register and no VEX- or EVEX-encoded instruction appear anywhere.
 3. **It is fast enough that nothing else could be running.** The domain measures each primitive on
    the part and reports thousandths of a cycle per byte. AES-256-GCM is held below **4.0 cycles per
    byte**, derived as follows: the published accelerated figure is about one cycle per byte
@@ -109,7 +146,7 @@ The other measured primitives carry ceilings too, but those are **regression bou
 assertions**: SHA-256 runs the portable path for the reason given above, so a figure below its
 ceiling says nothing about which backend answered, and the three asymmetric primitives run on
 general-purpose registers, where the acceleration that helps them is invisible as a code path. Each
-of those ceilings sits several times above what this image measures, so what it catches is a
+of those ceilings sits about four times above what this image measures, so what it catches is a
 several-fold regression rather than a slow part.
 
 **Measurements are asserted only on a run executing on real hardware.** Under emulation every guest

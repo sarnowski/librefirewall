@@ -200,7 +200,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the six tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
-the `recorder` domain raises, 12 the `hardware-probe` domain raises, and 34 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, and 33 the `crypto` domain
 raises. A token outside all six is a defect, not an extension. The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
@@ -319,7 +319,7 @@ always `false` on this domain: there is no device here to be told anything.
 | group | tokens |
 |---|---|
 | the XMM feature gate (`detail=` is `CPUID.01H:ECX`, except `sse2-not-supported`, whose word is `CPUID.01H:EDX`) | `ssse3-not-supported`, `sse41-not-supported`, `sse42-not-supported`, `aes-not-supported`, `pclmulqdq-not-supported`, `sse2-not-supported` |
-| the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the rest) | `cpuid-leaf-seven-unavailable`, `bmi2-not-supported`, `adx-not-supported` |
+| the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the second) | `cpuid-leaf-seven-unavailable`, `adx-not-supported` |
 | the probe (`detail=` is the observed value's two 64-bit halves, low first) | `aes-known-answer-mismatch`, `pclmul-known-answer-mismatch`, `xmm-pattern-corrupted` |
 
 **`crypto`.** The first two groups are the same CPUID feature gate the hardware probe runs, for the
@@ -335,7 +335,7 @@ of a vector's contents.
 | group | tokens |
 |---|---|
 | the XMM feature gate (`detail=` is `CPUID.01H:ECX`, except `sse2-not-supported`, whose word is `CPUID.01H:EDX`) | `ssse3-not-supported`, `sse41-not-supported`, `sse42-not-supported`, `aes-not-supported`, `pclmulqdq-not-supported`, `sse2-not-supported` |
-| the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the rest) | `cpuid-leaf-seven-unavailable`, `bmi2-not-supported`, `adx-not-supported` |
+| the structured-feature leaf (`detail=` is `CPUID.0H:EAX` for the first and `CPUID.07H.0H:EBX` for the second) | `cpuid-leaf-seven-unavailable`, `adx-not-supported` |
 | a published vector this build does not answer (`detail=` is the row's position in that primitive's table) | `sha-256-vector-mismatch`, `hmac-sha-256-vector-mismatch`, `hkdf-sha-256-vector-mismatch`, `chacha20-vector-mismatch`, `chacha20-poly1305-vector-mismatch`, `aes-256-gcm-vector-mismatch`, `chacha20-drbg-vector-mismatch`, `ecdsa-p256-vector-mismatch`, `x25519-vector-mismatch`, `ml-kem-768-vector-mismatch` |
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
 | the session the domain establishes against itself (none carries a `detail=`) | `tls-handshake-refused`, `tls-session-stalled`, `tls-peer-unauthenticated`, `tls-peer-certificate-wrong`, `tls-application-data-lost`, `tls-session-not-closed`, `tls-identity-unbuildable`, `tls-arena-exhausted` |

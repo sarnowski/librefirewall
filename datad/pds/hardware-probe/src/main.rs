@@ -7,8 +7,8 @@
 //! context switches. Then it parks.
 //!
 //! This binary is the one protection domain compiled with the SIMD target
-//! specification — hardfloat, SSE through SSE4.2, AES-NI, PCLMULQDQ, ADX and
-//! BMI2 enabled at compile time — where every other domain is built softfloat
+//! specification — hardfloat, SSE through SSE4.2, AES-NI, PCLMULQDQ and ADX
+//! enabled at compile time — where every other domain is built softfloat
 //! with the vector units disabled. The pinned kernel saves x87 and SSE state
 //! per thread (XSAVE feature set 3), so the XMM tier should be usable; whether
 //! it actually is, on this toolchain and this kernel, is what a boot of this
@@ -102,8 +102,8 @@ const TICK_BUDGET: u64 = 1 << 30;
 /// whose `RDTSC` is broken rather than spinning on a shared priority forever.
 const PASS_BUDGET: u64 = 1 << 28;
 
-/// `CPUID.0H:EAX` must reach this leaf for the structured-feature word the
-/// BMI2 and ADX bits live in to exist.
+/// `CPUID.0H:EAX` must reach this leaf for the structured-feature word the ADX
+/// bit lives in to exist.
 const FEATURE_LEAF: u32 = 1;
 const EXTENDED_FEATURE_LEAF: u32 = 7;
 
@@ -116,9 +116,12 @@ const SSE41_ECX_BIT: u32 = 1 << 19;
 const SSE42_ECX_BIT: u32 = 1 << 20;
 const AES_ECX_BIT: u32 = 1 << 25;
 
-/// `CPUID.07H.0H:EBX` bits for the two general-purpose-register extensions the
-/// target also enables at compile time.
-const BMI2_EBX_BIT: u32 = 1 << 8;
+/// `CPUID.07H.0H:EBX` bit for the one general-purpose-register extension the
+/// target also enables at compile time. BMI2 is not among them: it is
+/// VEX-encoded, and the emulator this image is proved on refuses that encoding
+/// while the kernel's saved state excludes the vector state, so the target
+/// disables it and gating on a bit nothing uses would refuse a part that runs
+/// this image perfectly.
 const ADX_EBX_BIT: u32 = 1 << 19;
 
 /// FIPS-197 Appendix B cipher example, block byte order as two little-endian
@@ -279,16 +282,11 @@ fn feature_gate() -> Result<(), ProbeError> {
         )));
     }
     let leaf7 = __cpuid_count(EXTENDED_FEATURE_LEAF, 0);
-    for (bit, cause) in [
-        (BMI2_EBX_BIT, "bmi2-not-supported"),
-        (ADX_EBX_BIT, "adx-not-supported"),
-    ] {
-        if leaf7.ebx & bit == 0 {
-            return Err(ProbeError(refusal(
-                cause,
-                RefusalDetail::One(u64::from(leaf7.ebx)),
-            )));
-        }
+    if leaf7.ebx & ADX_EBX_BIT == 0 {
+        return Err(ProbeError(refusal(
+            "adx-not-supported",
+            RefusalDetail::One(u64::from(leaf7.ebx)),
+        )));
     }
     Ok(())
 }

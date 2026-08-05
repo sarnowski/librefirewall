@@ -112,6 +112,82 @@ fn a_measured_column_that_disagrees_with_the_ceilings_is_reported_both_ways() {
     );
 }
 
+/// One objdump line as the tool lays it out: address, raw bytes, text, tab
+/// separated. The bytes are what this check reads, so a fixture that omitted
+/// them would exercise nothing.
+fn line(bytes: &str, instruction: &str) -> String {
+    format!("  2340a3:\t{bytes} \t{instruction}\n")
+}
+
+#[test]
+fn a_legacy_encoded_disassembly_carries_no_vector_encoding() {
+    let text = [
+        line("48 01 c8", "add    %rcx,%rax"),
+        line("66 0f 38 f6 c3", "adcx   %ebx,%eax"),
+        line("66 0f 38 dc c1", "aesenc %xmm1,%xmm0"),
+        line("66 0f 3a 44 c1 00", "pclmullqlqdq %xmm1,%xmm0"),
+    ]
+    .concat();
+    assert_eq!(vector_encoded(&text), None);
+}
+
+/// The three prefixes, each on an instruction that carries it, and each found.
+/// `shrx` is the one this check was written for: a VEX-encoded instruction
+/// naming no vector register at all, which the operand scan cannot see.
+#[test]
+fn every_vector_encoding_prefix_is_found_whatever_the_mnemonic() {
+    for (bytes, mnemonic) in [
+        ("c4 62 f3 f7 e8", "shrx"),
+        ("c5 fc 57 c0", "vxorps"),
+        ("62 f1 7c 48 28 c1", "vmovaps"),
+    ] {
+        let text = line("48 01 c8", "add    %rcx,%rax") + &line(bytes, mnemonic);
+        assert_eq!(
+            vector_encoded(&text),
+            Some((mnemonic.to_owned(), 1)),
+            "{bytes}"
+        );
+    }
+}
+
+/// The count is the whole backend and not the first line of it, so a reader
+/// learns whether one instruction strayed in or a crate changed its mind.
+#[test]
+fn the_finding_names_the_first_one_and_counts_them_all() {
+    let text = [
+        line("c4 e2 7b f7 c1", "mulx   %rcx,%rax,%rdx"),
+        line("48 01 c8", "add    %rcx,%rax"),
+        line("c4 e3 fb f0 c1 05", "rorx   $0x5,%rcx,%rax"),
+    ]
+    .concat();
+    assert_eq!(vector_encoded(&text), Some((String::from("mulx"), 2)));
+}
+
+/// A `c4` that is a byte of some other instruction rather than its first is not
+/// an encoding, and reading the leading byte alone is what tells them apart.
+#[test]
+fn a_prefix_byte_inside_an_instruction_is_not_read_as_its_encoding() {
+    let text = line("48 c7 c0 c4 c5 62 00", "mov    $0x62c5c4,%rax");
+    assert_eq!(vector_encoded(&text), None);
+}
+
+/// The check is only as good as the bytes objdump is asked for, and it is asked
+/// for them here rather than in a comment claiming so.
+#[test]
+fn the_shipped_specification_enables_no_vector_encoded_feature() {
+    let root = crate::util::workspace_root().expect("the workspace root");
+    let specification = std::fs::read_to_string(root.join(SPECIFICATION)).expect("the target");
+    let enabled = enabled_features(&specification).expect("a features string");
+    for vector_encoded in ["avx", "avx2", "bmi", "bmi2", "avx512f"] {
+        assert!(
+            !enabled.contains(vector_encoded),
+            "`{vector_encoded}` is VEX- or EVEX-encoded, and the emulator this image is proved on \
+             will not execute that encoding while the kernel's saved state excludes the vector \
+             state"
+        );
+    }
+}
+
 /// The page in the tree, against the specification in the tree: this is the
 /// check itself, run where a unit test can see both.
 #[test]

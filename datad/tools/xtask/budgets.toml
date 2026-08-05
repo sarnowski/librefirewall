@@ -142,9 +142,9 @@
 "pds/console/src/main.rs" = 0.4981
 "pds/crypto/src/arena.rs" = 0.4566
 "pds/crypto/src/entropy.rs" = 0.5450
-"pds/crypto/src/main.rs" = 0.2872
+"pds/crypto/src/main.rs" = 0.2929
 "pds/forwarder/src/main.rs" = 0.4667
-"pds/hardware-probe/src/main.rs" = 0.4108
+"pds/hardware-probe/src/main.rs" = 0.4226
 "pds/management/src/entropy.rs" = 0.6489
 "pds/management/src/main.rs" = 0.4988
 "pds/nic-driver/src/main.rs" = 0.4571

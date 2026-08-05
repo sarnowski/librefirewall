@@ -89,16 +89,26 @@ const KVM_DEVICE: &str = "/dev/kvm";
 /// target must too. It has been present on Intel parts since Ivy Bridge (2012)
 /// and on AMD since Excavator, so it costs no host compatibility either.
 ///
-/// The seven features after it are the appliance's compile-time CPU baseline on
+/// The six features after it are the appliance's compile-time CPU baseline on
 /// `rdrand`'s precedent: the hardware-probe domain is compiled with SSSE3
-/// through SSE4.2, AES-NI, PCLMULQDQ, BMI2 and ADX enabled, so on bare `qemu64`
+/// through SSE4.2, AES-NI, PCLMULQDQ and ADX enabled, so on bare `qemu64`
 /// — which exposes none of them — every boot would refuse the probe exactly as
-/// a below-baseline part would. TCG implements all seven, and every deployment
+/// a below-baseline part would. TCG implements all six, and every deployment
 /// target carries them (universal since roughly 2013 on Intel and AMD parts),
-/// so pinning them costs no host compatibility either. `popcnt` is deliberately
-/// not among them: the target specification does not enable it, so the
-/// compiler cannot emit it.
-const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand,+ssse3,+sse4.1,+sse4.2,+aes,+pclmulqdq,+bmi2,+adx";
+/// so pinning them costs no host compatibility either.
+///
+/// Two features are deliberately absent. `popcnt`, because the target
+/// specification does not enable it, so the compiler cannot emit it. And
+/// `bmi2`, for the same reason and a sharper one: the model advertising a
+/// feature is a claim about the part, and a CPUID bit no domain gates on and no
+/// instruction uses is a claim nothing keeps. It was advertised while the target
+/// enabled BMI2 — and TCG then refused the VEX-encoded instructions that
+/// produced, because it will not execute that encoding while the guest's
+/// `CR4.OSXSAVE` and `XCR0` leave the vector state disabled, which the pinned
+/// kernel's XSAVE feature set never enables. The target, this model and both
+/// domains' CPUID gates agree on that removal; disagreement between them is how
+/// an image comes to be provable on one accelerator only.
+const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand,+ssse3,+sse4.1,+sse4.2,+aes,+pclmulqdq,+adx";
 
 /// How QEMU will execute the guest and, when hardware acceleration was not
 /// taken, why. Carrying the reason (rather than a bare flag) is the point: a

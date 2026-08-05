@@ -70,21 +70,29 @@ const CEILINGS: &[(Primitive, u64)] = &[
 /// The most whole cycles one operation of an asymmetric primitive may cost.
 ///
 /// None of these is an accelerated-backend assertion and none could be: the
-/// arithmetic under them runs on general-purpose registers, which ADX and BMI2
-/// accelerate without any of it being visible as a different code path. They
+/// arithmetic under them runs on general-purpose registers, where ADX
+/// accelerates without any of it being visible as a different code path. They
 /// are regression bounds, set roughly four times above what this image
 /// measures so that a change which made one of them several times slower — a
 /// backend selection lost, a portable path taken where a tuned one was
 /// intended — fails rather than passes quietly.
+///
+/// The figures they are four times above are this image's own, taken across
+/// every boot of one accelerated gate run: ECDSA P-256 between 1.30 and 1.35
+/// million cycles, X25519 between 259 and 264 thousand, ML-KEM-768 between 474
+/// and 483 thousand. The ceilings had stood at twenty, twenty and sixty
+/// million, which is fifteen to a hundred and twenty-five times the measurement
+/// rather than four — a bound that loose catches a primitive that stopped
+/// working, not one that got slower, which is what a regression bound is for.
 ///
 /// Each figure is for a whole operation as a handshake performs it, not a
 /// half: a signature is generated *and* verified, a key agreement is run from
 /// both sides, and an encapsulation is followed by its decapsulation. A number
 /// for half of one would be a number no path takes.
 const OPERATION_CEILINGS: &[(Primitive, u64)] = &[
-    (Primitive::EcdsaP256, 20_000_000),
-    (Primitive::X25519, 20_000_000),
-    (Primitive::MlKem768, 60_000_000),
+    (Primitive::EcdsaP256, 5_500_000),
+    (Primitive::X25519, 1_100_000),
+    (Primitive::MlKem768, 2_000_000),
 ];
 
 /// The primitives a ceiling holds, whichever unit it is in, which is what the

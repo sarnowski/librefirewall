@@ -97,8 +97,8 @@ const MEASURE_BYTES: usize = 4096;
 const PASSES_PER_ROUND: u32 = 4;
 const ROUNDS: u32 = 8;
 
-/// `CPUID.0H:EAX` must reach this leaf for the structured-feature word BMI2
-/// and ADX live in to exist.
+/// `CPUID.0H:EAX` must reach this leaf for the structured-feature word ADX
+/// lives in to exist.
 const FEATURE_LEAF: u32 = 1;
 const EXTENDED_FEATURE_LEAF: u32 = 7;
 
@@ -111,9 +111,12 @@ const SSE41_ECX_BIT: u32 = 1 << 19;
 const SSE42_ECX_BIT: u32 = 1 << 20;
 const AES_ECX_BIT: u32 = 1 << 25;
 
-/// `CPUID.07H.0H:EBX` bits for the two general-purpose-register extensions the
-/// target also enables at compile time.
-const BMI2_EBX_BIT: u32 = 1 << 8;
+/// `CPUID.07H.0H:EBX` bit for the one general-purpose-register extension the
+/// target also enables at compile time. BMI2 is not among them: it is
+/// VEX-encoded, and the emulator this image is proved on refuses that encoding
+/// while the kernel's saved state excludes the vector state, so the target
+/// disables it and gating on a bit nothing uses would refuse a part that runs
+/// this image perfectly.
 const ADX_EBX_BIT: u32 = 1 << 19;
 
 /// One primitive's proof: the run that proves it and the token a disagreement
@@ -628,16 +631,11 @@ fn feature_gate() -> Result<u64, CryptoError> {
         )));
     }
     let leaf7 = __cpuid_count(EXTENDED_FEATURE_LEAF, 0);
-    for (bit, cause) in [
-        (BMI2_EBX_BIT, "bmi2-not-supported"),
-        (ADX_EBX_BIT, "adx-not-supported"),
-    ] {
-        if leaf7.ebx & bit == 0 {
-            return Err(CryptoError(refusal(
-                cause,
-                RefusalDetail::One(u64::from(leaf7.ebx)),
-            )));
-        }
+    if leaf7.ebx & ADX_EBX_BIT == 0 {
+        return Err(CryptoError(refusal(
+            "adx-not-supported",
+            RefusalDetail::One(u64::from(leaf7.ebx)),
+        )));
     }
     Ok(u64::from(leaf1.ecx) | (u64::from(leaf7.ebx) << 32))
 }
