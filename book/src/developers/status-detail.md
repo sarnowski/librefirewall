@@ -1469,8 +1469,22 @@ not satisfy it.
   not exist, so of the debug dump the
   [observability reference](../reference/observability.md) describes, the state half, the running
   document and the two recordings are what a node can be asked for and the retained records cannot be.
-- **No ARP cache and no ARP request is ever sent.** Nothing on the port originates a connection, so
-  there is nothing for a cache to serve; a reply goes to the MAC its request arrived from. An RFC 5227
+- **A neighbour cache exists and nothing on the port uses it yet.** `lfw_ip_endpoint::neighbour`
+  holds the hardware address of a next hop and decides when to ask for one, under three rules that
+  each remove a poisoning primitive rather than narrowing one: only a reply this end asked for is
+  ever learned, so an unsolicited or gratuitous reply is inert and a flood of distinct addresses
+  cannot insert a single entry; a resolved entry is immutable for its lifetime, so no later answer
+  can re-bind a live next hop, at the stated cost that a hardware address which genuinely changes
+  goes unnoticed for up to a minute; and a hardware address no frame may be addressed to is refused
+  before anything else is considered. The table is a fixed four entries, a resolution sends at most
+  three requests a second apart and is then *reported* as unreachable rather than left waiting, and
+  nothing is queued behind an unresolved next hop — a segment for one is dropped, because holding it
+  would mean owning a buffer this crate owns nowhere and the transport already re-sends. Held by unit
+  and property tests and by the `neighbour_cache` fuzz target, whose invariant is the poisoning one
+  rather than the absence of a panic. **Missing:** the endpoint neither answers with a request nor
+  feeds a reply into it, so no entry has ever been learned on a running node, and its counters reach
+  no surface.
+- **No ARP request is ever sent.** A reply goes to the MAC its request arrived from. An RFC 5227
   probe (sender address 0.0.0.0) is refused rather than answered, so a second station claiming this
   address is not contradicted.
 - **A reply is only ever composed for a neighbour**: the sender must share the port's prefix, because

@@ -64,7 +64,8 @@
 "crates/http/src/request.rs" = 0.2944
 "crates/http/src/response.rs" = 0.3135
 "crates/ip-endpoint/src/http.rs" = 0.3402
-"crates/ip-endpoint/src/lib.rs" = 0.3183
+"crates/ip-endpoint/src/lib.rs" = 0.3180
+"crates/ip-endpoint/src/neighbour.rs" = 0.4247
 "crates/log/src/console.rs" = 0.5084
 "crates/log/src/detail.rs" = 0.4859
 "crates/log/src/event.rs" = 0.2896

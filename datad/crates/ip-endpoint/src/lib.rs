@@ -96,6 +96,7 @@ use net_headers::{
 };
 
 pub mod http;
+pub mod neighbour;
 
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
 

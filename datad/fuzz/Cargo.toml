@@ -205,6 +205,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "neighbour_cache"
+path = "fuzz_targets/neighbour_cache.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tcp_segments"
 path = "fuzz_targets/tcp_segments.rs"
 test = false

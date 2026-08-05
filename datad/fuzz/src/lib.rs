@@ -12,6 +12,7 @@
 //! | [`virtqueue`] | `virtio::queue` descriptor lifecycle | a hostile or malfunctioning device |
 //! | [`frame`] | `net_headers` parsing and the `routing` decision above it | untrusted network traffic |
 //! | [`ip_endpoint`] | `lfw_ip_endpoint`'s ARP and ICMP-echo answers, and the `net_headers` parsers and builders under them | untrusted network traffic **and** a management-plane attacker |
+//! | [`neighbour`] | `lfw_ip_endpoint::neighbour`'s cache, the one endpoint structure a peer writes an entry into | untrusted network traffic **and** a management-plane attacker |
 //! | [`tcp`] | `lfw_tcp`'s segment parser, its option area and the state machine over them, driven as a stack | untrusted network traffic **and** a management-plane attacker |
 //! | [`flow`] | `lfw_flow`'s connection table: the TCP state machine and window checks over it, the UDP and ICMP pseudo-flows, and the quoted datagram inside an ICMP error | untrusted network traffic **and** a connection-flood attacker |
 //! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
@@ -144,6 +145,7 @@ pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
 pub mod metrics_render;
+pub mod neighbour;
 pub mod pcapng;
 pub mod pipeline;
 pub mod recording;
@@ -242,6 +244,7 @@ mod tests {
         ("free_list_ownership", crate::free_list::free_list_harness),
         ("route_frame", crate::frame::frame_routing_harness),
         ("ip_endpoint", crate::ip_endpoint::ip_endpoint_harness),
+        ("neighbour_cache", crate::neighbour::neighbour_cache_harness),
         ("tcp_segments", crate::tcp::tcp_segments_harness),
         ("flow_table", crate::flow::flow_table_harness),
         ("http_request", crate::http_request::http_request_harness),
