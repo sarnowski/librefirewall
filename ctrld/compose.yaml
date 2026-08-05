@@ -35,7 +35,6 @@ services:
     environment:
       CLICKHOUSE_USER: ctrld
       CLICKHOUSE_PASSWORD: ctrld-development
-      CLICKHOUSE_DB: ctrld_dev
       CLICKHOUSE_SKIP_USER_SETUP: "0"
     ports:
       - "127.0.0.1:8123:8123"

@@ -24,6 +24,21 @@ defmodule Ctrld.Telemetry.StoreTest do
       assert Store.migrate() == :ok
     end
 
+    test "creates its own database, so the container image need not" do
+      assert {:ok, [%{"name" => name}]} = Store.query("SELECT currentDatabase() AS name")
+      assert name == Application.get_env(:ctrld, Store)[:database]
+    end
+
+    test "refuses a configured database name that could not be one" do
+      configured = Application.get_env(:ctrld, Store)
+      on_exit(fn -> Application.put_env(:ctrld, Store, configured) end)
+
+      for name <- ["ctrld gate", "ctrld;DROP", "", "1st", String.duplicate("d", 64)] do
+        Application.put_env(:ctrld, Store, Keyword.put(configured, :database, name))
+        assert Store.migrate() == {:error, {:unusable_database, name}}
+      end
+    end
+
     test "holds every table the appliance produces for" do
       assert {:ok, rows} =
                Store.query("SELECT name FROM system.tables WHERE database = currentDatabase()")
@@ -220,7 +235,8 @@ defmodule Ctrld.Telemetry.StoreTest do
             :not_configured,
             {:http, 400, "bad"},
             {:transport, :econnrefused},
-            {:unknown_table, "x"}
+            {:unknown_table, "x"},
+            {:unusable_database, "not a name"}
           ] do
         assert is_binary(Store.describe(reason))
       end

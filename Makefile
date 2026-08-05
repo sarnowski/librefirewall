@@ -355,7 +355,7 @@ $(PODMAN) --cgroup-manager=cgroupfs run --detach --name "$$pg" --network "$$net"
 	--env PGDATA=/var/lib/postgresql/data/pgdata --tmpfs /var/lib/postgresql/data \
 	$(POSTGRES_IMAGE) >/dev/null; \
 $(PODMAN) --cgroup-manager=cgroupfs run --detach --name "$$ch" --network "$$net" \
-	--env CLICKHOUSE_USER=ctrld --env CLICKHOUSE_PASSWORD="$$password" --env CLICKHOUSE_DB=ctrld_gate \
+	--env CLICKHOUSE_USER=ctrld --env CLICKHOUSE_PASSWORD="$$password" \
 	--tmpfs /var/lib/clickhouse --ulimit nofile=262144:262144 \
 	$(CLICKHOUSE_IMAGE) >/dev/null; \
 for attempt in $$(seq 1 $(CTRLD_DATABASE_READY_SECONDS)); do \

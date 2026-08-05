@@ -24,15 +24,28 @@ defmodule Ctrld.Telemetry.Store do
 
   @type reason :: {:http, pos_integer(), String.t()} | {:transport, term()} | :not_configured
 
-  @doc "Apply the schema. Idempotent, because every statement is `IF NOT EXISTS`."
-  @spec migrate() :: :ok | {:error, reason()}
+  @doc """
+  Apply the schema, database included. Idempotent, because every statement is
+  `IF NOT EXISTS`.
+
+  The database is created here rather than by the container image's own
+  initialisation, and that is deliberate: the image creates a database by
+  starting a second, temporary server for the purpose, which was observed to
+  stall for minutes on a loaded machine and take the gate with it. Creating it
+  from here needs no extra server lifecycle, and it is a right this user must
+  hold anyway — the schema's tables are created the same way.
+  """
+  @spec migrate() :: :ok | {:error, reason() | {:unusable_database, String.t()}}
   def migrate do
-    Enum.reduce_while(Schema.statements(), :ok, fn statement, :ok ->
-      case execute(statement) do
-        {:ok, _body} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+    with {:ok, database} <- database_name(),
+         {:ok, _body} <- execute_outside_database("CREATE DATABASE IF NOT EXISTS #{database}") do
+      Enum.reduce_while(Schema.statements(), :ok, fn statement, :ok ->
+        case execute(statement) do
+          {:ok, _body} -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+    end
   end
 
   @doc "Whether the store answers at all — the readiness the gate insists on."
@@ -44,6 +57,32 @@ defmodule Ctrld.Telemetry.Store do
   @doc "Run a statement that returns nothing worth parsing."
   @spec execute(String.t()) :: {:ok, String.t()} | {:error, reason()}
   def execute(statement) when is_binary(statement), do: post(statement, nil)
+
+  # The configured database is the one thing interpolated into a statement
+  # here, so it is checked against the shape a name may have rather than
+  # trusted for coming from the environment: the same discipline `insert/2`
+  # applies to a table name.
+  defp database_name do
+    case configuration() do
+      {:ok, %{database: database}} ->
+        if Regex.match?(~r/\A[a-zA-Z_][a-zA-Z0-9_]{0,62}\z/, database) do
+          {:ok, database}
+        else
+          {:error, {:unusable_database, database}}
+        end
+
+      :error ->
+        {:error, :not_configured}
+    end
+  end
+
+  # A statement the database it would name does not exist for yet.
+  defp execute_outside_database(statement) do
+    case configuration() do
+      {:ok, settings} -> request(%{settings | database: "default"}, statement, nil)
+      :error -> {:error, :not_configured}
+    end
+  end
 
   @doc """
   Insert rows into one of the schema's tables.
@@ -78,11 +117,15 @@ defmodule Ctrld.Telemetry.Store do
   end
 
   @doc "A refusal in the words an operator reading it needs."
-  @spec describe(reason() | {:unknown_table, String.t()}) :: String.t()
+  @spec describe(reason() | {:unknown_table, String.t()} | {:unusable_database, String.t()}) ::
+          String.t()
   def describe(:not_configured), do: "CLICKHOUSE_URL is not set"
   def describe({:http, status, body}), do: "the store answered #{status}: #{String.trim(body)}"
   def describe({:transport, reason}), do: "the store could not be reached: #{inspect(reason)}"
   def describe({:unknown_table, table}), do: "#{table} is not a table of this schema"
+
+  def describe({:unusable_database, database}),
+    do: "CLICKHOUSE_DATABASE is not a name a database may have: #{inspect(database)}"
 
   defp decode_rows(body) do
     body
