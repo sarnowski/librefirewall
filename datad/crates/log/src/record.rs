@@ -38,8 +38,15 @@
 
 use wire::{
     CheckedBody, CheckedDetail, CheckedIdentifier, CheckedOperands, CheckedRecord, CheckedValue,
-    LogDetailKind, LogKind, LogRecord, LogStampKind, LogText, LogValueKind, LogWriter, ValueImage,
+    LOG_OPERANDS, LogDetailKind, LogKind, LogRecord, LogStampKind, LogText, LogValueKind,
+    LogWriter, ValueImage,
 };
+
+/// Bytes of the one digest this ABI carries, `lfw_crypto::DIGEST_LEN` restated
+/// rather than depended on: this crate reaches for no cryptography, and the
+/// assertion at the foot of the file is what holds the two numbers together
+/// through the type that does carry the digest.
+const DIGEST_BYTES: usize = 32;
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
@@ -368,47 +375,67 @@ impl Event<Cause> {
                     sectors,
                 } => {
                     record.detail = LogDetailKind::Extent.to_bits();
-                    record.operands = [*start_sector, *sectors];
+                    record.operands = [*start_sector, *sectors, 0, 0];
                 }
                 DomainDetail::Proven {
                     preemptions,
                     iterations,
                 } => {
                     record.detail = LogDetailKind::Proven.to_bits();
-                    record.operands = [*preemptions, *iterations];
+                    record.operands = [*preemptions, *iterations, 0, 0];
                 }
                 DomainDetail::Proved { primitive, vectors } => {
                     record.detail = LogDetailKind::Proved.to_bits();
-                    record.operands = [*primitive as u64, *vectors];
+                    record.operands = [*primitive as u64, *vectors, 0, 0];
                 }
                 DomainDetail::Measured {
                     primitive,
                     milli_cycles_per_byte,
                 } => {
                     record.detail = LogDetailKind::Measured.to_bits();
-                    record.operands = [*primitive as u64, *milli_cycles_per_byte];
+                    record.operands = [*primitive as u64, *milli_cycles_per_byte, 0, 0];
                 }
                 DomainDetail::Session { version, suite } => {
                     record.detail = LogDetailKind::Session.to_bits();
-                    record.operands = [u64::from(*version), u64::from(*suite)];
+                    record.operands = [u64::from(*version), u64::from(*suite), 0, 0];
                 }
                 DomainDetail::Exchange { group, echoed } => {
                     record.detail = LogDetailKind::Exchange.to_bits();
-                    record.operands = [u64::from(*group), *echoed];
+                    record.operands = [u64::from(*group), *echoed, 0, 0];
                 }
                 DomainDetail::Peer { device } => {
                     record.detail = LogDetailKind::Peer.to_bits();
                     // The identifier is wider than an operand, so it crosses
                     // as its two halves, most significant first.
-                    record.operands = [(*device >> 64) as u64, *device as u64];
+                    record.operands = [(*device >> 64) as u64, *device as u64, 0, 0];
                 }
                 DomainDetail::Arena { bytes, bound } => {
                     record.detail = LogDetailKind::Arena.to_bits();
-                    record.operands = [*bytes, *bound];
+                    record.operands = [*bytes, *bound, 0, 0];
                 }
                 DomainDetail::Operation { primitive, cycles } => {
                     record.detail = LogDetailKind::Operation.to_bits();
-                    record.operands = [*primitive as u64, *cycles];
+                    record.operands = [*primitive as u64, *cycles, 0, 0];
+                }
+                DomainDetail::Identity {
+                    device,
+                    generation,
+                    onboarded,
+                } => {
+                    record.detail = LogDetailKind::Identity.to_bits();
+                    // The identifier is wider than an operand, so it crosses as
+                    // its two halves, most significant first — the same order
+                    // `Peer` carries one in.
+                    record.operands = [
+                        (*device >> 64) as u64,
+                        *device as u64,
+                        *generation,
+                        u64::from(*onboarded),
+                    ];
+                }
+                DomainDetail::Fingerprint(digest) => {
+                    record.detail = LogDetailKind::Fingerprint.to_bits();
+                    record.operands = digest_words(digest);
                 }
                 DomainDetail::Refusal(Refusal {
                     cause,
@@ -422,11 +449,11 @@ impl Event<Cause> {
                         RefusalDetail::None => record.operand_count = 0,
                         RefusalDetail::One(value) => {
                             record.operand_count = 1;
-                            record.operands = [*value, 0];
+                            record.operands = [*value, 0, 0, 0];
                         }
                         RefusalDetail::Two(first, second) => {
                             record.operand_count = 2;
-                            record.operands = [*first, *second];
+                            record.operands = [*first, *second, 0, 0];
                         }
                     }
                 }
@@ -577,6 +604,20 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             primitive: primitive_of(*primitive)?,
             milli_cycles_per_byte: *milli_cycles_per_byte,
         },
+        // Total: `wire` ranged the flag, and an identifier and a generation are
+        // numbers every bit pattern of which a minted state could carry.
+        CheckedDetail::Identity {
+            high,
+            low,
+            generation,
+            onboarded,
+        } => DomainDetail::Identity {
+            device: (u128::from(*high) << 64) | u128::from(*low),
+            generation: *generation,
+            onboarded: *onboarded,
+        },
+        // And here: every bit pattern of four words is a digest.
+        CheckedDetail::Fingerprint { words } => DomainDetail::Fingerprint(digest_bytes(words)),
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -653,6 +694,16 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::Operation { primitive, cycles } => {
                         DomainDetail::Operation { primitive, cycles }
                     }
+                    DomainDetail::Identity {
+                        device,
+                        generation,
+                        onboarded,
+                    } => DomainDetail::Identity {
+                        device,
+                        generation,
+                        onboarded,
+                    },
+                    DomainDetail::Fingerprint(digest) => DomainDetail::Fingerprint(digest),
                     DomainDetail::Measured {
                         primitive,
                         milli_cycles_per_byte,
@@ -741,6 +792,31 @@ pub(crate) enum SendError {
     Unencodable(CauseError),
 }
 
+/// A 256-bit digest as the four operand words it crosses in, most significant
+/// first — the order a hexadecimal rendering reads in, so the words are the
+/// string's own halves rather than an encoding a reader has to undo.
+///
+/// Total over the array: `chunks_exact` yields whole eight-byte chunks and the
+/// zip stops at the shorter side, so neither index can leave either buffer.
+fn digest_words(digest: &[u8; DIGEST_BYTES]) -> [u64; LOG_OPERANDS] {
+    let mut words = [0_u64; LOG_OPERANDS];
+    for (word, chunk) in words.iter_mut().zip(digest.chunks_exact(8)) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(chunk);
+        *word = u64::from_be_bytes(bytes);
+    }
+    words
+}
+
+/// [`digest_words`]'s inverse, on the same terms.
+fn digest_bytes(words: &[u64; LOG_OPERANDS]) -> [u8; DIGEST_BYTES] {
+    let mut digest = [0_u8; DIGEST_BYTES];
+    for (chunk, word) in digest.chunks_exact_mut(8).zip(words) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
 // The two crates each hold a copy of every vocabulary's cardinality and of
 // every text field's width. Neither copy is derived from the other, so only a
 // place that has seen both can hold them equal — and the widths below are what
@@ -763,6 +839,11 @@ const _: () = {
     // would be a silent narrowing at every crossing.
     assert!(wire::LOG_IDENTIFIER_BYTES <= u8::MAX as usize);
     assert!(wire::LOG_CAUSE_BYTES <= u8::MAX as usize);
+
+    // A digest crosses as whole operand words, so its width must divide them
+    // exactly: a remainder would be bytes the record silently drops off a
+    // fingerprint an administrator is about to compare character for character.
+    assert!(DIGEST_BYTES == LOG_OPERANDS * 8);
 };
 
 #[cfg(test)]

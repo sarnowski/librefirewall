@@ -234,13 +234,17 @@ pub(crate) const SYSTEM_PDS: &[&str] = &[
 ];
 
 /// Protection-domain binaries built with the SIMD target rather than
-/// [`TARGET`], in a cargo invocation of their own: one target per invocation
-/// is cargo's shape, and mixing the two lists would build every domain with
-/// the vector units enabled — exactly what the softfloat specification exists
-/// to prevent for the dataplane. The same single-owner property as
+/// [`TARGET`], **one cargo invocation each**: one target per invocation is
+/// cargo's shape, and mixing the two lists would build every domain with the
+/// vector units enabled — exactly what the softfloat specification exists to
+/// prevent for the dataplane. One *feature world* per invocation is cargo's
+/// shape too, and that is why these three are not built together: the resolver
+/// unifies features across a selection, so one invocation would give the store
+/// domain the `alloc` features the cryptography domain's TLS stack asks for, in
+/// a domain that carries no allocator. The same single-owner property as
 /// [`SYSTEM_PDS`]: [`crate::host::test_host`] lints exactly these packages for
 /// the SIMD target.
-pub(crate) const SIMD_SYSTEM_PDS: &[&str] = &["hardware-probe", "crypto"];
+pub(crate) const SIMD_SYSTEM_PDS: &[&str] = &["hardware-probe", "crypto", "store"];
 
 /// The pinned SDK's include directory for one seL4 kernel configuration.
 ///
@@ -393,34 +397,46 @@ fn assemble(
         "build protection domains",
     )?;
 
-    // The SIMD protection domains, in an invocation of their own because a
-    // cargo build has one `--target`: same profile, same flags, same
-    // environment — only the specification differs.
-    run_command(
-        Command::new("cargo")
-            .current_dir(root)
-            .env("SEL4_INCLUDE_DIRS", board_include_dir(config))
-            .env("CARGO_TARGET_DIR", &target_root)
-            .env(CONFIG_PATH_VAR, root.join(document))
-            .args([
-                "build",
-                "--locked",
-                "--release",
-                // `alloc` and not only `core`, unlike the invocation above:
-                // the cryptography domain carries the appliance's one
-                // allocator, because a proven TLS implementation requires one.
-                // The dataplane domains keep having none, which is why the two
-                // invocations differ here rather than being unified.
-                "-Z",
-                "build-std=core,alloc",
-                "-Z",
-                "build-std-features=compiler-builtins-mem",
-                "--target",
-                SIMD_TARGET,
-            ])
-            .args(SIMD_SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd])),
-        "build SIMD protection domains",
-    )?;
+    // The SIMD protection domains, against their own target because a cargo
+    // build has one `--target`: same profile, same flags, same environment —
+    // only the specification differs.
+    //
+    // One cargo invocation per SIMD domain, and it is a correctness requirement
+    // rather than tidiness. Cargo's resolver unifies features across every
+    // package one invocation selects, so building these together turns on the
+    // `alloc` features of the shared cryptography dependency graph — the
+    // cryptography domain's TLS stack asks for them — in the store domain too,
+    // which carries no allocator and must not. Building each on its own is what
+    // keeps a domain's feature set the set its own manifest asks for, exactly as
+    // the two targets already need two invocations.
+    for pd in SIMD_SYSTEM_PDS {
+        run_command(
+            Command::new("cargo")
+                .current_dir(root)
+                .env("SEL4_INCLUDE_DIRS", board_include_dir(config))
+                .env("CARGO_TARGET_DIR", &target_root)
+                .env(CONFIG_PATH_VAR, root.join(document))
+                .args([
+                    "build",
+                    "--locked",
+                    "--release",
+                    // `alloc` and not only `core`, unlike the invocation above:
+                    // the cryptography domain carries the appliance's one
+                    // allocator, because a proven TLS implementation requires
+                    // one. The dataplane domains keep having none, which is why
+                    // the two target invocations differ here rather than being
+                    // unified.
+                    "-Z",
+                    "build-std=core,alloc",
+                    "-Z",
+                    "build-std-features=compiler-builtins-mem",
+                    "--target",
+                    SIMD_TARGET,
+                ])
+                .args(["-p", pd]),
+            &format!("build the {pd} SIMD protection domain"),
+        )?;
+    }
 
     let target_dir = target_root.join(TARGET).join("release");
     for pd in SYSTEM_PDS {

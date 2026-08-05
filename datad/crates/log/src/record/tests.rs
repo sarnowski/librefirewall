@@ -200,6 +200,17 @@ fn every_value_variant_survives_both_ends_of_a_change() {
     }
 }
 
+/// A digest whose every byte is distinct within its own word, so a word written
+/// at the wrong index or a byte order reversed inside one shows up as a
+/// different digest rather than surviving.
+fn counting_digest() -> [u8; 32] {
+    let mut digest = [0_u8; 32];
+    for (at, byte) in digest.iter_mut().enumerate() {
+        *byte = at as u8 + 1;
+    }
+    digest
+}
+
 /// Every detail shape and all three refusal widths, each with both
 /// `signalled` values and with the empty cause the ABI admits.
 #[test]
@@ -243,6 +254,46 @@ fn every_domain_detail_shape_survives_the_crossing() {
             primitive: Primitive::ChaCha20Poly1305,
             milli_cycles_per_byte: u64::MAX,
         },
+        DomainDetail::Session {
+            version: 0,
+            suite: u16::MAX,
+        },
+        DomainDetail::Exchange {
+            group: u16::MAX,
+            echoed: u64::MAX,
+        },
+        DomainDetail::Peer { device: 0 },
+        DomainDetail::Peer { device: u128::MAX },
+        DomainDetail::Arena {
+            bytes: 0,
+            bound: u64::MAX,
+        },
+        DomainDetail::Operation {
+            primitive: Primitive::EcdsaP256,
+            cycles: u64::MAX,
+        },
+        // The identifier at both extremes, because it crosses as two halves and
+        // a swap between them is invisible at any value that is symmetric.
+        DomainDetail::Identity {
+            device: 0,
+            generation: 0,
+            onboarded: false,
+        },
+        DomainDetail::Identity {
+            device: u128::MAX,
+            generation: u64::MAX,
+            onboarded: true,
+        },
+        DomainDetail::Identity {
+            device: 1,
+            generation: 7,
+            onboarded: false,
+        },
+        // And the digest at three, for the same reason over four words: a byte
+        // placed in the wrong word survives a symmetric pattern and not these.
+        DomainDetail::Fingerprint([0; 32]),
+        DomainDetail::Fingerprint([0xff; 32]),
+        DomainDetail::Fingerprint(counting_digest()),
     ];
     for operands in [
         RefusalDetail::None,
@@ -587,7 +638,7 @@ fn a_record_writes_only_the_fields_its_kind_names() {
     assert_eq!(record.generation, 3);
     assert_eq!(record.changes, 4);
     assert_eq!(record.features, 0);
-    assert_eq!(record.operands, [0, 0]);
+    assert_eq!(record.operands, [0, 0, 0, 0]);
     assert_eq!(record.sequence, 0);
     assert_eq!(record.reject_offset, 0);
     assert_eq!(record.receive_posted, 0);
@@ -719,6 +770,22 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
             primitive: Primitive::ALL[at],
             milli_cycles_per_byte: cost,
         }),
+        any::<(u16, u16)>().prop_map(|(version, suite)| DomainDetail::Session { version, suite }),
+        any::<(u16, u64)>().prop_map(|(group, echoed)| DomainDetail::Exchange { group, echoed }),
+        any::<u128>().prop_map(|device| DomainDetail::Peer { device }),
+        any::<(u64, u64)>().prop_map(|(bytes, bound)| DomainDetail::Arena { bytes, bound }),
+        (0..Primitive::ALL.len(), any::<u64>()).prop_map(|(at, cycles)| DomainDetail::Operation {
+            primitive: Primitive::ALL[at],
+            cycles,
+        }),
+        any::<(u128, u64, bool)>().prop_map(|(device, generation, onboarded)| {
+            DomainDetail::Identity {
+                device,
+                generation,
+                onboarded,
+            }
+        }),
+        any::<[u8; 32]>().prop_map(DomainDetail::Fingerprint),
         (
             any_cause(),
             prop_oneof![
@@ -862,7 +929,7 @@ proptest! {
     #[test]
     fn arbitrary_record_bytes_decode_or_refuse(
         features in any::<u64>(),
-        operands in any::<[u64; 2]>(),
+        operands in any::<[u64; wire::LOG_OPERANDS]>(),
         kind in any::<u32>(),
         numbers in any::<[u32; 5]>(),
         tokens in any::<[u8; 10]>(),

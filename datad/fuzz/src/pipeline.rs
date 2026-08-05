@@ -82,6 +82,8 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use arbitrary::Unstructured;
+use lfw_clock::Monotonic;
+use lfw_flow::FlowTable;
 use net_headers::{Ipv4Address, MacAddress, ParseFailure};
 use packet_buffer::CopyOutError;
 use pd_runtime::{
@@ -89,8 +91,6 @@ use pd_runtime::{
     Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
     descriptor_in_bounds,
 };
-use lfw_clock::Monotonic;
-use lfw_flow::FlowTable;
 use pipeline::{Pipeline, Rule, RuleAction, Ruleset, Tracking};
 use routing::{Interface, Neighbour, PortId, Router};
 

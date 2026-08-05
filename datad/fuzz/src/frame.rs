@@ -50,12 +50,12 @@
 
 use std::sync::LazyLock;
 
+use lfw_clock::Monotonic;
+use lfw_flow::FlowTable;
 use net_headers::{
     ETHERNET_HEADER_LEN, Frame, ICMP_HEADER_LEN, IPV4_HEADER_LEN, Ipv4Address, Ipv4Packet,
     MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
-use lfw_clock::Monotonic;
-use lfw_flow::FlowTable;
 use pipeline::{
     Configuration, DropReason, Inspection, Pipeline, Rule, RuleAction, Ruleset, Tracking, Verdict,
 };

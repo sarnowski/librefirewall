@@ -24,7 +24,7 @@ use lfw_metrics::{
     ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
     ManagementSample, PipelineSample, PolicySample, PolicySweepSample, PoolSample,
     ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS, SinkSample, Snapshot, StatsShard,
-    TapSample, TcpSample,
+    StoreSample, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
@@ -455,6 +455,59 @@ pub fn recorder_sample(
         records_unclocked: recording.records_unclocked,
         log,
     }
+}
+
+/// The store domain's whole shard: what it established about the appliance's
+/// identity, and what its device did.
+///
+/// The identity half is four flags and a position — **no key material and no
+/// identifier**. A private scalar has no representation on this surface and the
+/// 128-bit name is not a number a time series can carry; the console record is
+/// where an operator reads one, and this is where a fleet asks whether there is
+/// an identity at all.
+#[must_use]
+pub fn store_sample(
+    identity: StoreIdentity,
+    capacity_sectors: u64,
+    blocks: BlockCounters,
+    faults: RequestFaults,
+    log: LogSample,
+) -> StoreSample {
+    StoreSample {
+        established: identity.established,
+        minted: identity.minted,
+        generation: identity.generation,
+        onboarded: identity.onboarded,
+        capacity_sectors,
+        requests: [blocks.reads, blocks.writes],
+        bytes: [blocks.read_bytes, blocks.write_bytes],
+        device_faults: [
+            faults.device.completion_out_of_range,
+            faults.device.completion_not_posted,
+            faults.device.completion_length_over_reported,
+        ],
+        status_undecodable: faults.status_undecodable,
+        completion_unmapped: faults.completion_unmapped,
+        log,
+    }
+}
+
+/// What one boot established about the appliance's identity, as the four values
+/// its shard exposes.
+///
+/// A struct rather than four arguments because they are one answer: an
+/// appliance that is established and was minted this boot is a different node
+/// from one that is established and was not, and a caller passing them
+/// positionally is a caller that can swap them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreIdentity {
+    /// Whether this node holds an identity at all, minted or reloaded.
+    pub established: bool,
+    /// Whether this boot is the one that minted it.
+    pub minted: bool,
+    /// The generation of the state record in force, or zero where there is none.
+    pub generation: u64,
+    pub onboarded: bool,
 }
 
 #[cfg(test)]

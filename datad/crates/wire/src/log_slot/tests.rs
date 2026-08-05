@@ -18,7 +18,7 @@ fn record_from_bytes(bytes: [u8; RECORD_BYTES]) -> LogRecord {
 #[test]
 fn the_atomic_image_occupies_exactly_the_bytes_the_plain_one_does() {
     assert_eq!(size_of::<LogSlot>(), size_of::<LogRecord>());
-    assert_eq!(size_of::<LogSlot>(), 248);
+    assert_eq!(size_of::<LogSlot>(), 264);
     assert_eq!(align_of::<LogSlot>(), align_of::<LogRecord>());
     assert_eq!(align_of::<LogSlot>(), 8);
     assert_eq!(

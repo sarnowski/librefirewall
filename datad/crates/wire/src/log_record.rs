@@ -49,7 +49,17 @@ pub const LOG_IDENTIFIER_BYTES: usize = 16;
 pub const LOG_CAUSE_BYTES: usize = 40;
 
 /// How many protection domains a record may name — `lfw_log::Domain::ALL`.
-pub const LOG_DOMAIN_COUNT: u8 = 9;
+pub const LOG_DOMAIN_COUNT: u8 = 10;
+
+/// How many of [`LogRecord::operands`] a detail may name.
+///
+/// Four rather than two because a 256-bit digest is the widest single value any
+/// surface renders: an appliance's public-key fingerprint is compared character
+/// for character by an administrator, so it crosses whole and is rendered as one
+/// field. Splitting it over two records would make the administrator concatenate
+/// before comparing, which is exactly the second rendering the certificate
+/// profile refuses.
+pub const LOG_OPERANDS: usize = 4;
 
 /// How many cryptographic primitives a record may name —
 /// `lfw_log::Primitive::ALL`. A token rather than a name on the wire, on
@@ -166,6 +176,10 @@ pub enum LogDetailKind {
     Peer,
     Arena,
     Operation,
+    /// Appended, never inserted: a discriminant is the ABI, and one placed among
+    /// the existing values would re-read every record a peer already wrote.
+    Identity,
+    Fingerprint,
 }
 
 impl LogDetailKind {
@@ -188,6 +202,8 @@ impl LogDetailKind {
             Self::Peer => 13,
             Self::Arena => 14,
             Self::Operation => 15,
+            Self::Identity => 16,
+            Self::Fingerprint => 17,
         }
     }
 
@@ -210,6 +226,8 @@ impl LogDetailKind {
             13 => Some(Self::Peer),
             14 => Some(Self::Arena),
             15 => Some(Self::Operation),
+            16 => Some(Self::Identity),
+            17 => Some(Self::Fingerprint),
             _ => None,
         }
     }
@@ -401,11 +419,16 @@ pub struct LogRecord {
     /// [`LogDetailKind::Features`]. Which bit means what is `virtio`'s
     /// vocabulary and is not decoded anywhere on this path.
     pub features: u64,
-    /// The two numbers a detail names positionally: a refusal's, with
+    /// The numbers a detail names positionally: a refusal's, with
     /// `operand_count` saying how many are the value, or an extent's first
     /// sector and length. Shared, a record being one or the other, which keeps
     /// this ABI's size — and every log region — unchanged by a detail added.
-    pub operands: [u64; 2],
+    ///
+    /// [`LOG_OPERANDS`] wide, which is what carries a 256-bit digest whole.
+    /// Every detail below four words reads the prefix it names and leaves the
+    /// rest as storage this record does not claim, the same treatment a refusal's
+    /// `operand_count` already gave the second word.
+    pub operands: [u64; LOG_OPERANDS],
     /// The counter frequency in hertz, under [`LogDetailKind::Established`].
     /// Zero is refused: it is the divisor every later reading is scaled by.
     pub tsc_hz: u64,
@@ -449,7 +472,10 @@ pub struct LogRecord {
     pub state: u8,
     /// Which [`LogDetailKind`] a [`LogKind::Domain`] record carries, as raw bits.
     pub detail: u8,
-    /// How many of `operands` a refusal names: 0, 1 or 2, and refused otherwise.
+    /// How many of `operands` a refusal names: 0, 1 or 2, and refused otherwise. A
+    /// refusal names at most two even though the record holds [`LOG_OPERANDS`]:
+    /// the console line's budget is the pair, and the wider storage exists for a
+    /// digest rather than for a longer refusal.
     pub operand_count: u8,
     /// Whether the device was told to stop, or was left decoding nothing. 0 or
     /// 1 as raw bits, refused otherwise.
@@ -487,7 +513,7 @@ impl LogRecord {
     /// lets a reader come up against one before anything has been written.
     pub const ZERO: Self = Self {
         features: 0,
-        operands: [0; 2],
+        operands: [0; LOG_OPERANDS],
         tsc_hz: 0,
         unix_nanos: 0,
         frames: 0,
@@ -667,6 +693,22 @@ impl LogRecord {
                 primitive: primitive_token(self.operands[0])?,
                 cycles: self.operands[1],
             },
+            // Three unranged numbers: an identifier that is 128 bits of
+            // randomness, a generation, and a flag. The flag alone has a shape
+            // to refuse, and it is refused for the reason `signalled` is —
+            // anything but 0 or 1 is a word this writer would not have written.
+            Some(LogDetailKind::Identity) => CheckedDetail::Identity {
+                high: self.operands[0],
+                low: self.operands[1],
+                generation: self.operands[2],
+                onboarded: flag(self.operands[3])?,
+            },
+            // Four words of digest, and nothing to refuse: every bit pattern of
+            // a SHA-256 output is a digest, so a range check here would refuse a
+            // fingerprint the appliance really computed.
+            Some(LogDetailKind::Fingerprint) => CheckedDetail::Fingerprint {
+                words: self.operands,
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -676,10 +718,12 @@ impl LogRecord {
     }
 
     /// Reads `operands` positionally rather than by a length the writer may
-    /// inflate: the two are the whole array, so a count outside `0..=2` names
-    /// storage that does not exist and is refused for being one.
+    /// inflate: a refusal names at most the leading pair, so a count outside
+    /// `0..=2` names more than the console line can carry and is refused for
+    /// being one. The words past the pair are storage a refusal does not claim,
+    /// exactly as the second word is under a count of one.
     fn check_operands(&self) -> Result<CheckedOperands, LogRecordError> {
-        let [first, second] = self.operands;
+        let (first, second) = (self.operands[0], self.operands[1]);
         match self.operand_count {
             0 => Ok(CheckedOperands::None),
             1 => Ok(CheckedOperands::One(first)),
@@ -734,6 +778,19 @@ fn primitive_token(raw: u64) -> Result<u8, LogRecordError> {
     match u8::try_from(raw) {
         Ok(narrow) if narrow < LOG_PRIMITIVE_COUNT => Ok(narrow),
         _ => Err(LogRecordError::PrimitiveUnknown { primitive: raw }),
+    }
+}
+
+/// A boolean carried in an operand word rather than in a byte field.
+///
+/// Refused rather than coerced for `boolean`'s reason: the word is peer-written,
+/// and picking `false` for every other pattern would silently report an
+/// unowned appliance as unowned when the record said something else entirely.
+fn flag(raw: u64) -> Result<bool, LogRecordError> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(LogRecordError::OperandFlagNotBoolean { value }),
     }
 }
 
@@ -1079,6 +1136,21 @@ pub enum CheckedDetail {
         primitive: u8,
         milli_cycles_per_byte: u64,
     },
+    /// What a domain established about the appliance's own identity: the 128-bit
+    /// device identifier as its two halves, most significant first, the state
+    /// record's generation, and whether the appliance has an owner.
+    Identity {
+        high: u64,
+        low: u64,
+        generation: u64,
+        onboarded: bool,
+    },
+    /// A 256-bit digest as its four words, most significant first — the whole of
+    /// what a fingerprint is, so a renderer writes one field rather than two an
+    /// administrator would have to join.
+    Fingerprint {
+        words: [u64; LOG_OPERANDS],
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1169,6 +1241,10 @@ pub enum LogRecordError {
     DetailKindUnknown {
         detail: u8,
     },
+    /// An operand word carrying a flag held neither 0 nor 1.
+    OperandFlagNotBoolean {
+        value: u64,
+    },
     OperandCountUnknown {
         operands: u8,
     },
@@ -1236,6 +1312,9 @@ impl fmt::Display for LogRecordError {
             Self::CodePointTooWide { value } => {
                 write!(f, "protocol code point {value} does not fit sixteen bits")
             }
+            Self::OperandFlagNotBoolean { value } => {
+                write!(f, "operand flag {value} is neither 0 nor 1")
+            }
             Self::DomainUnknown { domain } => {
                 write!(f, "domain token {domain} is not below {LOG_DOMAIN_COUNT}")
             }
@@ -1247,7 +1326,10 @@ impl fmt::Display for LogRecordError {
                 write!(f, "detail kind {detail} names no payload")
             }
             Self::OperandCountUnknown { operands } => {
-                write!(f, "operand count {operands} exceeds the 2 the record holds")
+                write!(
+                    f,
+                    "operand count {operands} exceeds the 2 a refusal may name"
+                )
             }
             Self::SignalledNotBoolean { signalled } => {
                 write!(f, "signalled byte {signalled} is not 0 or 1")
@@ -1318,39 +1400,39 @@ const _: () = {
     assert!(offset_of!(ValueImage, _pad) == 11);
     assert!(offset_of!(ValueImage, id) == 12);
 
-    assert!(size_of::<LogRecord>() == 248);
+    assert!(size_of::<LogRecord>() == 264);
     assert!(align_of::<LogRecord>() == 8);
     assert!(offset_of!(LogRecord, features) == 0);
     assert!(offset_of!(LogRecord, operands) == 8);
-    assert!(offset_of!(LogRecord, tsc_hz) == 24);
-    assert!(offset_of!(LogRecord, unix_nanos) == 32);
-    assert!(offset_of!(LogRecord, frames) == 40);
-    assert!(offset_of!(LogRecord, frame_bytes) == 48);
-    assert!(offset_of!(LogRecord, capacity_sectors) == 56);
-    assert!(offset_of!(LogRecord, leading_word) == 64);
-    assert!(offset_of!(LogRecord, stamp_nanos) == 72);
-    assert!(offset_of!(LogRecord, kind) == 80);
-    assert!(offset_of!(LogRecord, generation) == 84);
-    assert!(offset_of!(LogRecord, sequence) == 88);
-    assert!(offset_of!(LogRecord, changes) == 92);
-    assert!(offset_of!(LogRecord, reject_offset) == 96);
-    assert!(offset_of!(LogRecord, receive_posted) == 100);
-    assert!(offset_of!(LogRecord, domain) == 104);
-    assert!(offset_of!(LogRecord, state) == 105);
-    assert!(offset_of!(LogRecord, detail) == 106);
-    assert!(offset_of!(LogRecord, operand_count) == 107);
-    assert!(offset_of!(LogRecord, signalled) == 108);
-    assert!(offset_of!(LogRecord, change) == 109);
-    assert!(offset_of!(LogRecord, object) == 110);
-    assert!(offset_of!(LogRecord, field) == 111);
-    assert!(offset_of!(LogRecord, outcome) == 112);
-    assert!(offset_of!(LogRecord, reason) == 113);
-    assert!(offset_of!(LogRecord, stamp_kind) == 114);
-    assert!(offset_of!(LogRecord, _pad) == 115);
-    assert!(offset_of!(LogRecord, cause) == 120);
-    assert!(offset_of!(LogRecord, key) == 164);
-    assert!(offset_of!(LogRecord, from) == 184);
-    assert!(offset_of!(LogRecord, to) == 216);
+    assert!(offset_of!(LogRecord, tsc_hz) == 40);
+    assert!(offset_of!(LogRecord, unix_nanos) == 48);
+    assert!(offset_of!(LogRecord, frames) == 56);
+    assert!(offset_of!(LogRecord, frame_bytes) == 64);
+    assert!(offset_of!(LogRecord, capacity_sectors) == 72);
+    assert!(offset_of!(LogRecord, leading_word) == 80);
+    assert!(offset_of!(LogRecord, stamp_nanos) == 88);
+    assert!(offset_of!(LogRecord, kind) == 96);
+    assert!(offset_of!(LogRecord, generation) == 100);
+    assert!(offset_of!(LogRecord, sequence) == 104);
+    assert!(offset_of!(LogRecord, changes) == 108);
+    assert!(offset_of!(LogRecord, reject_offset) == 112);
+    assert!(offset_of!(LogRecord, receive_posted) == 116);
+    assert!(offset_of!(LogRecord, domain) == 120);
+    assert!(offset_of!(LogRecord, state) == 121);
+    assert!(offset_of!(LogRecord, detail) == 122);
+    assert!(offset_of!(LogRecord, operand_count) == 123);
+    assert!(offset_of!(LogRecord, signalled) == 124);
+    assert!(offset_of!(LogRecord, change) == 125);
+    assert!(offset_of!(LogRecord, object) == 126);
+    assert!(offset_of!(LogRecord, field) == 127);
+    assert!(offset_of!(LogRecord, outcome) == 128);
+    assert!(offset_of!(LogRecord, reason) == 129);
+    assert!(offset_of!(LogRecord, stamp_kind) == 130);
+    assert!(offset_of!(LogRecord, _pad) == 131);
+    assert!(offset_of!(LogRecord, cause) == 136);
+    assert!(offset_of!(LogRecord, key) == 180);
+    assert!(offset_of!(LogRecord, from) == 200);
+    assert!(offset_of!(LogRecord, to) == 232);
 
     // Every byte of the record belongs to a declared field: the fields sum to
     // the whole size, so the compiler inserted no padding of its own. That is
@@ -1359,7 +1441,7 @@ const _: () = {
     // on.
     assert!(
         size_of::<LogRecord>()
-            == size_of::<[u64; 10]>()
+            == size_of::<[u64; 8 + LOG_OPERANDS]>()
                 + 6 * size_of::<u32>()
                 + 11
                 + 5

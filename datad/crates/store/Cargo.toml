@@ -1,0 +1,25 @@
+[package]
+# The appliance's own persistent state, as it sits on the store medium. Named
+# for what it is rather than for the device class under it, which is `lfw-blk`'s.
+name = "lfw-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# SHA-256 over a record that is security state, and the P-256 key the identity
+# it carries *is*. The formats themselves need only the digest; minting and
+# verifying an identity need the key, and both live here because both are
+# arithmetic over bytes a host test can hold.
+lfw-crypto = { path = "../crypto" }
+# The self-signed onboarding certificate, the `SubjectPublicKeyInfo` its
+# fingerprint is taken over, and the device identifier's one rendering. Reached
+# for rather than restated: a second X.509 writer would be a second profile to
+# keep in step with the one the management plane validates against.
+lfw-x509 = { path = "../x509" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

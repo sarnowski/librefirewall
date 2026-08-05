@@ -53,7 +53,7 @@ fn refusal_record() -> LogRecord {
     LogRecord {
         detail: LogDetailKind::Refusal.to_bits(),
         cause: text(b"not-virtio-net"),
-        operands: [0x1af4, 0x1000],
+        operands: [0x1af4, 0x1000, 0, 0],
         operand_count: 2,
         signalled: 1,
         ..domain_record()
@@ -88,7 +88,7 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
     assert_eq!(size_of::<IdentifierImage>(), 20);
     assert_eq!(size_of::<CauseImage>(), 44);
     assert_eq!(size_of::<ValueImage>(), 32);
-    assert_eq!(size_of::<LogRecord>(), 248);
+    assert_eq!(size_of::<LogRecord>(), 264);
     assert_eq!(align_of::<LogRecord>(), 8);
     assert_eq!(
         [
@@ -109,7 +109,7 @@ fn the_layout_the_console_domain_maps_is_the_recorded_one() {
             offset_of!(LogRecord, to),
         ],
         [
-            0, 8, 24, 32, 40, 48, 56, 64, 72, 80, 114, 120, 164, 184, 216
+            0, 8, 40, 48, 56, 64, 72, 80, 88, 96, 130, 136, 180, 200, 232
         ]
     );
 }
@@ -131,11 +131,11 @@ fn a_record_has_a_stable_little_endian_byte_image() {
         &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
     );
     assert_eq!(
-        &bytes[72..80],
+        &bytes[88..96],
         &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
     );
-    assert_eq!(&bytes[80..84], &[0xff, 0x00, 0x00, 0x00]);
-    assert_eq!(&bytes[114..115], &[0x01]);
+    assert_eq!(&bytes[96..100], &[0xff, 0x00, 0x00, 0x00]);
+    assert_eq!(&bytes[130..131], &[0x01]);
     assert_eq!(record_from_bytes(bytes), record);
 }
 
@@ -224,7 +224,7 @@ fn a_domain_record_carries_each_detail_shape() {
 
     let proven = LogRecord {
         detail: LogDetailKind::Proven.to_bits(),
-        operands: [3, 90_000],
+        operands: [3, 90_000, 0, 0],
         ..domain_record()
     };
     assert!(matches!(
@@ -240,7 +240,7 @@ fn a_domain_record_carries_each_detail_shape() {
 
     let proved = LogRecord {
         detail: LogDetailKind::Proved.to_bits(),
-        operands: [5, 22],
+        operands: [5, 22, 0, 0],
         ..domain_record()
     };
     assert!(matches!(
@@ -256,7 +256,7 @@ fn a_domain_record_carries_each_detail_shape() {
 
     let measured = LogRecord {
         detail: LogDetailKind::Measured.to_bits(),
-        operands: [0, 11_740],
+        operands: [0, 11_740, 0, 0],
         ..domain_record()
     };
     assert!(matches!(
@@ -265,6 +265,42 @@ fn a_domain_record_carries_each_detail_shape() {
             detail: CheckedDetail::Measured {
                 primitive: 0,
                 milli_cycles_per_byte: 11_740,
+            },
+            ..
+        })
+    ));
+
+    let identity = LogRecord {
+        detail: LogDetailKind::Identity.to_bits(),
+        operands: [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 7, 1],
+        ..domain_record()
+    };
+    assert!(matches!(
+        identity.body(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Identity {
+                high: 0x0123_4567_89ab_cdef,
+                low: 0xfedc_ba98_7654_3210,
+                generation: 7,
+                onboarded: true,
+            },
+            ..
+        })
+    ));
+
+    // The one detail that reads all four words, and the reason the array is
+    // four wide: a digest crosses whole rather than as two records a reader
+    // would have to join.
+    let fingerprint = LogRecord {
+        detail: LogDetailKind::Fingerprint.to_bits(),
+        operands: [1, 2, 3, 4],
+        ..domain_record()
+    };
+    assert!(matches!(
+        fingerprint.body(),
+        Ok(CheckedBody::Domain {
+            detail: CheckedDetail::Fingerprint {
+                words: [1, 2, 3, 4],
             },
             ..
         })
@@ -287,6 +323,52 @@ fn a_domain_record_carries_each_detail_shape() {
     assert!(!cause.is_empty());
     assert_eq!(operands, CheckedOperands::Two(0x1af4, 0x1000));
     assert!(signalled);
+}
+
+/// The identity detail's one refusable field: a flag word holding neither 0 nor
+/// 1 is a record this writer would not have written, so it is refused rather
+/// than read as "unowned" — which would report an appliance as having no owner
+/// on the strength of a word that said something else.
+#[test]
+fn an_identity_flag_outside_the_two_it_admits_is_refused() {
+    for value in [2, 3, u64::MAX] {
+        let record = LogRecord {
+            detail: LogDetailKind::Identity.to_bits(),
+            operands: [1, 2, 3, value],
+            ..domain_record()
+        };
+        assert_eq!(
+            record.body(),
+            Err(LogRecordError::OperandFlagNotBoolean { value })
+        );
+    }
+    for (value, onboarded) in [(0, false), (1, true)] {
+        let record = LogRecord {
+            detail: LogDetailKind::Identity.to_bits(),
+            operands: [1, 2, 3, value],
+            ..domain_record()
+        };
+        assert!(matches!(
+            record.body(),
+            Ok(CheckedBody::Domain {
+                detail: CheckedDetail::Identity { onboarded: got, .. },
+                ..
+            }) if got == onboarded
+        ));
+    }
+}
+
+/// A refusal names at most the leading pair whatever the array holds, so the
+/// two words past it are storage the record does not claim: a value in them
+/// cannot move what a refusal decodes to.
+#[test]
+fn the_operand_words_past_a_refusals_pair_are_storage_it_does_not_claim() {
+    let claimed = refusal_record().body();
+    let scribbled = LogRecord {
+        operands: [0x1af4, 0x1000, u64::MAX, u64::MAX],
+        ..refusal_record()
+    };
+    assert_eq!(scribbled.body(), claimed);
 }
 
 #[test]
@@ -693,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 16,
+                detail: 18,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 16 },
+            LogRecordError::DetailKindUnknown { detail: 18 },
         ),
         // The one operand word that is a token: a primitive past the set names
         // nothing a console line can spell, so it is refused rather than
@@ -704,7 +786,7 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         (
             LogRecord {
                 detail: LogDetailKind::Proved.to_bits(),
-                operands: [u64::from(LOG_PRIMITIVE_COUNT), 0],
+                operands: [u64::from(LOG_PRIMITIVE_COUNT), 0, 0, 0],
                 ..domain_record()
             },
             LogRecordError::PrimitiveUnknown {
@@ -714,7 +796,7 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         (
             LogRecord {
                 detail: LogDetailKind::Measured.to_bits(),
-                operands: [u64::MAX, 0],
+                operands: [u64::MAX, 0, 0, 0],
                 ..domain_record()
             },
             LogRecordError::PrimitiveUnknown {
@@ -988,11 +1070,11 @@ fn every_refusal_names_the_field_and_the_value() {
         rendered,
         [
             "record kind 9 names no event",
-            "domain token 4 is not below 9",
+            "domain token 4 is not below 10",
             "state token 4 is not below 4",
             "detail kind 7 names no payload",
             "the established counter frequency is zero, which scales no reading",
-            "operand count 3 exceeds the 2 the record holds",
+            "operand count 3 exceeds the 2 a refusal may name",
             "signalled byte 2 is not 0 or 1",
             "change token 3 is not below 3",
             "object token 3 is not below 4",
@@ -1040,10 +1122,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Peer,
         LogDetailKind::Arena,
         LogDetailKind::Operation,
+        LogDetailKind::Identity,
+        LogDetailKind::Fingerprint,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(16), None);
+    assert_eq!(LogDetailKind::from_bits(18), None);
 
     for value in [
         LogValueKind::Absent,

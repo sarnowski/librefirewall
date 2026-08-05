@@ -79,6 +79,17 @@ lfw-blk = { path = "../../crates/blk" }
 # `recording_contract` judges a downloaded body against the same snap lengths,
 # so the appliance's placement and the thing judging it are one statement.
 lfw-recorder = { path = "../../crates/recorder" }
+# The state record's magic and version, for the one thing the host may say about
+# the store medium without reading what it holds. Those two fields are the only
+# ones on that medium that are neither the appliance's secret nor derived from
+# it, and reaching for the constants rather than restating them is what keeps
+# this check and the writer one fact.
+lfw-store = { path = "../../crates/store" }
+# The two rendered widths the certificate profile defines, for the console
+# contract that holds the store domain's records to them. Reached for rather than
+# restated: an administrator compares two renderings character for character, and
+# a copy of a width here would be the second rendering the profile refuses.
+lfw-x509 = { path = "../../crates/x509" }
 # The superblock the recorder writes at the head of each extent, decoded off
 # the disk image with the appliance's own decoder rather than a copy of it.
 lfw-capture-ring = { path = "../../crates/capture-ring" }

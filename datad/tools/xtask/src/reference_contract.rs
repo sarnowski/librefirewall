@@ -139,6 +139,12 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         Vocabulary::Causes("hardware-probe"),
     ),
     ("pds/crypto/src/main.rs", Vocabulary::Causes("crypto")),
+    ("pds/store/src/main.rs", Vocabulary::Causes("store")),
+    // The identity's own refusals, raised by the store domain and named where
+    // the variants are: `lfw_store::IdentityError::cause` is the one place that
+    // knows what each disagreement means, so scanning the domain alone would
+    // leave half this vocabulary uncompared.
+    ("crates/store/src/identity.rs", Vocabulary::Causes("store")),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus
     // `Domain`'s and `Field`'s hyphenated ones. Every one of them is reachable
     // as an `ALL` array, so scanning this file would be the second copy.
@@ -183,7 +189,7 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     ),
 ];
 
-/// The six domains whose refusal tokens the console chapter tabulates, in the
+/// The seven domains whose refusal tokens the console chapter tabulates, in the
 /// order it presents them. Derived from [`LITERAL_SITES`] would be circular —
 /// the book's own headings are what this list is compared against.
 const REFUSING_DOMAINS: &[&str] = &[
@@ -193,6 +199,7 @@ const REFUSING_DOMAINS: &[&str] = &[
     "recorder",
     "hardware-probe",
     "crypto",
+    "store",
 ];
 
 /// Hold both reference chapters to the code.

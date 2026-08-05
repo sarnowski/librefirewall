@@ -87,7 +87,8 @@ pub use sample::{
     LogSample, MANAGEMENT_SLOTS, ManagementSample, PIPELINES, POLICY_SWEEP_OUTCOMES,
     POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS, PipelineSample, PolicySample,
     PolicySweepSample, PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS,
-    RULE_HITS_BASE, RecorderSample, SINKS, SinkSample, TapSample, TcpSample, UartSample,
+    RULE_HITS_BASE, RecorderSample, SINKS, STORE_SLOTS, SinkSample, StoreSample, TapSample,
+    TcpSample, UartSample,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table

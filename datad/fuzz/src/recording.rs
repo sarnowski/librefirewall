@@ -529,8 +529,7 @@ pub fn recording_pass(data: &[u8]) {
                 decision,
                 frame,
             } => {
-                let annotation =
-                    TapAnnotation::new(packet_id, timestamp, interface_id, decision);
+                let annotation = TapAnnotation::new(packet_id, timestamp, interface_id, decision);
                 // The wire length is the frame's own, which is the one field a
                 // first-party producer cannot get wrong; every other field
                 // above is the adversary's.

@@ -2699,6 +2699,29 @@ pub enum BootContract<'a> {
     /// capture — a domain that refused is a refusal to report rather than a
     /// boot that failed to complete.
     Cryptography,
+    /// **The store domain came up and established an identity**, and nothing else
+    /// is judged at all.
+    ///
+    /// [`Self::Cryptography`]'s shape and, for the pair of boots it belongs to,
+    /// its reasoning: the routed contract, the transcript and the management
+    /// port's count are statements about the image that the shipped boots already
+    /// make, and re-making them here would pay two whole boots for a second
+    /// verdict on the same fact. What only these two boots can settle is whether
+    /// the appliance's identity survives a reboot, which is a claim about a
+    /// medium and not about a boot.
+    ///
+    /// So the probes go out as on any other boot and no delivery is required, and
+    /// the one thing the run waits for is the store domain having said it
+    /// finished — its fingerprint record, or a refusal. Such a node keeps
+    /// running, so nothing else would end the boot.
+    ///
+    /// It owes the store medium's own verdict and not the recorder's, and that
+    /// asymmetry is deliberate: the store domain writes before it parks and the
+    /// run ends on its own last record, so the medium is settled by then. Nothing
+    /// orders that against the recorder's proof of its own path, which is why the
+    /// recorder's disk is not judged here — a witness asserted there would be
+    /// asserted on a race.
+    StoreIdentity,
     /// No injected packet may come back in any form (nothing bootable may have
     /// started) and the guest must emit `marker` on the serial channel. Used
     /// for the boot manager's halt path, where the absence of a dataplane is
@@ -4578,7 +4601,7 @@ fn run_boot(
                         // Drained and discarded rather than judged: the frame
                         // still has to leave the host socket buffer, or QEMU's
                         // transmit path blocks on it.
-                        BootContract::Cryptography => {}
+                        BootContract::Cryptography | BootContract::StoreIdentity => {}
                     }
                     continue;
                 }
@@ -4639,7 +4662,7 @@ fn run_boot(
                         // own the routed verdict on this image; asserting it a
                         // second time under emulation would state the same fact
                         // about the same bytes.
-                        BootContract::Cryptography => {}
+                        BootContract::Cryptography | BootContract::StoreIdentity => {}
                     }
                 }
             }
@@ -4967,6 +4990,15 @@ fn run_boot(
                         break 'run Ok(());
                     }
                 }
+                // And this node too, on the store domain's own last record: it
+                // establishes an identity once in `init` and parks, so its
+                // fingerprint record — or a refusal — means every record it owes
+                // is already in the capture.
+                BootContract::StoreIdentity => {
+                    if crate::store_contract::finished(&output) {
+                        break 'run Ok(());
+                    }
+                }
             }
             match child.try_wait() {
                 Ok(Some(status)) => match &test.contract {
@@ -5009,6 +5041,21 @@ fn run_boot(
                             log_path.display()
                         ));
                     }
+                    // The same reasoning again: every domain runs on this node
+                    // and none exits, so an exit before the store domain reported
+                    // is a fault. On this contract it is the interesting one — the
+                    // domain that owns the appliance's identity is the one holding
+                    // a device whose bytes are a physical attacker's.
+                    BootContract::StoreIdentity => {
+                        break 'run Err(format!(
+                            "QEMU exited ({status}) before the store domain reported an identity \
+                             or a refusal. The domain that owns the appliance's own medium is the \
+                             one that reads bytes somebody with the disk composed, so an exit \
+                             rather than a refusal is a path that faulted instead of saying no; \
+                             see {}",
+                            log_path.display()
+                        ));
+                    }
                 },
                 Ok(None) => {}
                 Err(error) => break 'run Err(format!("poll QEMU: {error}")),
@@ -5043,6 +5090,16 @@ fn run_boot(
                          `ready` or `refused` on the console. This boot forces emulation, so a \
                          domain that never finished here is one whose work the emulator would not \
                          execute{}; see {}",
+                        total_timeout.as_secs(),
+                        describe_injection_failures(&endpoints),
+                        log_path.display()
+                    ),
+                    BootContract::StoreIdentity => format!(
+                        "timed out after {}s waiting for the store domain to report an identity \
+                         or a refusal on the console. A domain that never finished is one whose \
+                         device never answered — every wait it makes is bounded by `lfw_blk`'s \
+                         own poll budget, so a silence here is the budget having been spent{}; \
+                         see {}",
                         total_timeout.as_secs(),
                         describe_injection_failures(&endpoints),
                         log_path.display()
@@ -5130,7 +5187,7 @@ fn run_boot(
     let forwarding = match &test.contract {
         BootContract::Routed | BootContract::Halted { .. } => Forwarding::UnderAPolicy,
         BootContract::FailedClosed { .. } => Forwarding::NothingCommitted,
-        BootContract::Cryptography => Forwarding::NotThisBootsSubject,
+        BootContract::Cryptography | BootContract::StoreIdentity => Forwarding::NotThisBootsSubject,
     };
     let traffic = TrafficReport::new(stations, &probes, &deliveries, broke, forwarding);
 

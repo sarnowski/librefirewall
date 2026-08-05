@@ -68,8 +68,8 @@
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_flow::{
-    Disposition, FlowCounters, FlowEntry, FlowId, FlowState, FlowTable, Outcome, Packet, Refusal,
-    REVISIT_BUCKETS, REVISIT_FLOWS, SWEEP_STRIDE,
+    Disposition, FlowCounters, FlowEntry, FlowId, FlowState, FlowTable, Outcome, Packet,
+    REVISIT_BUCKETS, REVISIT_FLOWS, Refusal, SWEEP_STRIDE,
 };
 use net_headers::{IcmpHeader, Ipv4Address, Protocol, TcpFlags, TcpHeader, Transport, UdpHeader};
 use std::num::NonZeroU64;
@@ -252,7 +252,10 @@ fn assert_occupancy<const N: usize>(table: &FlowTable<N>) {
         total = total.saturating_add(occupancy.get(state));
     }
     // Lossless: the capacity here is sixteen.
-    assert_eq!(total, N as u32, "the occupancy does not sum to the capacity");
+    assert_eq!(
+        total, N as u32,
+        "the occupancy does not sum to the capacity"
+    );
     assert_eq!(
         occupancy.occupied() as usize,
         table.len(),
@@ -476,7 +479,11 @@ fn quoting_error(unstructured: &mut Unstructured<'_>) -> Wire {
         }
     };
     write(&mut quoted, 0, version_and_length);
-    write(&mut quoted, 6, u8::arbitrary(unstructured).unwrap_or(0) & 0x1f);
+    write(
+        &mut quoted,
+        6,
+        u8::arbitrary(unstructured).unwrap_or(0) & 0x1f,
+    );
     write(&mut quoted, 9, protocol);
     for (index, octet) in quoted_source.octets().into_iter().enumerate() {
         write(&mut quoted, 12 + index, octet);
@@ -490,7 +497,9 @@ fn quoting_error(unstructured: &mut Unstructured<'_>) -> Wire {
     bytes.extend_from_slice(&sequence.to_be_bytes());
     // A share of the stream truncates the quote, which is the reader's own bound
     // rather than a shape a sender could not produce.
-    let keep = bytes.len().saturating_sub(usize::from(any_u16(unstructured) % 24));
+    let keep = bytes
+        .len()
+        .saturating_sub(usize::from(any_u16(unstructured) % 24));
     bytes.truncate(keep);
 
     Wire {
@@ -512,7 +521,12 @@ fn quoting_error(unstructured: &mut Unstructured<'_>) -> Wire {
 /// The one `Wire` whose ingress is fixed rather than arbitrary: this is the
 /// harness's *own* connection, composed so the synchronized paths are reachable at
 /// all, and every value in it is chosen for that.
-fn handshake_segment(from_server: u8, flags: TcpFlags, sequence: u32, acknowledgement: u32) -> Wire {
+fn handshake_segment(
+    from_server: u8,
+    flags: TcpFlags,
+    sequence: u32,
+    acknowledgement: u32,
+) -> Wire {
     let (source, destination, source_port, destination_port) = if from_server == 0 {
         (CLIENT, SERVER, CLIENT_PORT, SERVER_PORT)
     } else {

@@ -256,7 +256,7 @@ const POOL_WITHHELD: &str = "the receiving driver maps no pool of its own. It ha
      domain that rewrites a header must reach the bytes";
 
 /// As [`POOL_WITHHELD`], for the log transport — the exclusion that holds
-/// between the nine writing domains, and the one thing about a log region that
+/// between the ten writing domains, and the one thing about a log region that
 /// is a mapping rather than an authority.
 ///
 /// What each pair's *perms* withhold is a different argument and is not stated
@@ -323,6 +323,30 @@ const RECORDER_DEVICE_WITHHELD: &str = "the recorder is the only domain that map
      is withheld from the management domain deliberately rather than by omission: a download is \
      answered out of `dl_reply`, a bounded copy the recorder composed, because a read grant here \
      would expose whatever that domain happened to be staging at the time";
+
+/// As [`RECORDER_DEVICE_WITHHELD`], for the store device — and it is the
+/// strongest exclusion in this table, because what it withholds is the
+/// appliance's private key.
+///
+/// The scalar is plaintext on that medium, deliberately and for want of anywhere
+/// to keep a wrapping key, so physical possession of the store IS identity theft.
+/// This row is what makes possession the only way to it: the store domain maps
+/// the whole of the second block device and no other domain maps any part of it,
+/// so nothing else in this system can read the key or write another one. The
+/// RECORDER in particular is excluded, and that is the pair worth naming — two
+/// block devices, two domains, neither reaching the other's — because a shared
+/// grant would put the scalar within reach of the domain a download request
+/// reaches and the recording within reach of the domain that holds the scalar.
+const STORE_DEVICE_WITHHELD: &str = "the store domain is the only domain that maps any part of \
+     the appliance's own store device, and it maps no part of any other device. No other domain \
+     holds its ECAM page, its BAR window, its DMA region or its staging window — the RECORDER \
+     included, which owns the other block device and reaches none of this one — so nothing else \
+     in this system can read the appliance's private scalar or write an identity over it. And \
+     this domain holds no ecam0..3, no bar0..3, no blk_dma, no blk_io, no vq0..2, no buffer pool \
+     of either dataplane or management pipeline, no `ForwardRings`, no `ReturnRing`, no \
+     configuration region, no tap, no download region and no `<ioport>`, so an attacker who \
+     reaches the domain holding the device key reaches nothing else by doing so, and no packet \
+     has a path to those bytes at all";
 
 /// What the connection table's single mapper buys, quoted into the finding on it
 /// gaining a second one.
@@ -501,6 +525,51 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_write("recorder")],
         withheld: Some(RECORDER_DEVICE_WITHHELD),
+    },
+    // The store device's four regions — a SECOND block device, not a second view
+    // of the recorder's. Every rule names one domain, and the recorder is not
+    // it: that mutual exclusion is what keeps the private scalar out of reach of
+    // the domain a download request reaches, and the recording out of reach of
+    // the domain that holds the scalar.
+    RegionRule {
+        name: "ecam4",
+        size: ExpectedSize {
+            rust_name: "virtio::pci::PCI_CONFIG_LEN",
+            bytes: PCI_CONFIG_LEN,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("store")],
+        withheld: Some(STORE_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "bar4",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::BAR_WINDOW_SIZE",
+            bytes: BLK_BAR_WINDOW_SIZE,
+        },
+        cacheability: Cacheability::Uncached,
+        grants: &[read_write("store")],
+        withheld: Some(STORE_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "blk2_dma",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::DMA_REGION_SIZE",
+            bytes: BLK_DMA_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store")],
+        withheld: Some(STORE_DEVICE_WITHHELD),
+    },
+    RegionRule {
+        name: "blk2_io",
+        size: ExpectedSize {
+            rust_name: "lfw_blk::BLK_IO_REGION_SIZE",
+            bytes: BLK_IO_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store")],
+        withheld: Some(STORE_DEVICE_WITHHELD),
     },
     // The timer block, and the one region whose rule cites a constant that is
     // NOT the extent of the thing inside it. `lfw_hpet::MMIO_LENGTH` is the
@@ -763,6 +832,7 @@ const REGIONS: &[RegionRule] = &[
             read_only("nic_driver1"),
             read_only("nic_driver2"),
             read_only("recorder"),
+            read_only("store"),
         ],
         withheld: None,
     },
@@ -1081,6 +1151,26 @@ const REGIONS: &[RegionRule] = &[
         withheld: Some(LOG_WITHHELD),
     },
     RegionRule {
+        name: "log_store",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RECORDS_REGION_SIZE",
+            bytes: LOG_RECORDS_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store"), read_only("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
+        name: "log_store_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_CONSUME_REGION_SIZE",
+            bytes: LOG_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("store"), read_write("console")],
+        withheld: Some(LOG_WITHHELD),
+    },
+    RegionRule {
         name: "log_crypto_consume",
         size: ExpectedSize {
             rust_name: "wire::LOG_CONSUME_REGION_SIZE",
@@ -1177,6 +1267,13 @@ const REGIONS: &[RegionRule] = &[
         size: STATS_SIZE,
         cacheability: Cacheability::Cached,
         grants: &[read_write("crypto"), read_only("management")],
+        withheld: Some(STATS_WITHHELD),
+    },
+    RegionRule {
+        name: "stats_store",
+        size: STATS_SIZE,
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
     // The appliance's one allocator, and the one region with no structure.
@@ -1347,6 +1444,7 @@ const DOMAINS: &[&str] = &[
     "recorder",
     "hardware_probe",
     "crypto",
+    "store",
 ];
 
 /// Whether a protection domain may hold a send capability on one channel it is
@@ -3074,7 +3172,7 @@ mod tests {
         // LOG_RECORDS_REGION_SIZE and LOG_CONSUME_REGION_SIZE would still be
         // wrong the moment either type grew.
         for (region, size, constant) in [
-            ("log_forwarder", "0x4000", "wire::LOG_RECORDS_REGION_SIZE"),
+            ("log_forwarder", "0x5000", "wire::LOG_RECORDS_REGION_SIZE"),
             (
                 "log_config_consume",
                 "0x1000",

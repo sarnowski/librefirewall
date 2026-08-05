@@ -847,7 +847,7 @@ mod tests {
     fn every_byte_set_region_pair() -> Vec<u8> {
         let all_set = LogRecord {
             features: u64::MAX,
-            operands: [u64::MAX; 2],
+            operands: [u64::MAX; 4],
             stamp_nanos: u64::MAX,
             kind: u32::MAX,
             generation: u32::MAX,

@@ -197,14 +197,22 @@ fn the_committed_page_agrees_with_the_committed_specification() {
     check(&root, &repository).expect("the profile page and the build agree");
 }
 
-/// And the shipped binaries, when a build has produced them. Skipped rather
-/// than failed where it has not: `make test` runs before any image exists, and
-/// `image` calls the same function on the ELFs it just wrote.
+/// And the shipped binaries, when a build has produced them **all**. Skipped
+/// rather than failed where it has not: `make test` runs before any image exists,
+/// and `image` calls the same function on the ELFs it just wrote.
+///
+/// Every one of them, and not one of them: a tree carrying yesterday's binaries
+/// and not today's would otherwise fail here for the domain that had not been
+/// built yet rather than skipping, which reports a stale build tree as a defect in
+/// the image.
 #[test]
 fn the_built_protection_domains_carry_the_instructions_the_page_claims() {
     let root = crate::util::workspace_root().expect("the workspace root");
     let build = root.join("build/image").join(image::RELEASE_CONFIG);
-    if !build.join("crypto.elf").exists() {
+    if !image::SIMD_SYSTEM_PDS
+        .iter()
+        .all(|pd| build.join(format!("{pd}.elf")).exists())
+    {
         return;
     }
     check_image(&build).expect("the shipped domains carry the accelerated instructions");

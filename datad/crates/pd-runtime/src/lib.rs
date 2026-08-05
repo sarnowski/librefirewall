@@ -548,9 +548,9 @@ pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
 pub use pipeline::{Configuration, PolicySweep, Tracking};
 pub use stats::{
-    BlockCounters, ForwarderCounters, StatsRegions, SubmissionCounters, config_sample, flow_sample,
-    forwarder_sample, log_sample, management_sample, pipeline_sample, policy_sample,
-    policy_sweep_sample, recorder_sample,
+    BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, SubmissionCounters,
+    config_sample, flow_sample, forwarder_sample, log_sample, management_sample, pipeline_sample,
+    policy_sample, policy_sweep_sample, recorder_sample, store_sample,
 };
 pub use tap::{
     Observation, Revocation, Tap, TapCounters, tap_classification, tap_decision, tap_drop_reason,

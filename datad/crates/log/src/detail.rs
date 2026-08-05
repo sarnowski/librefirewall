@@ -229,6 +229,28 @@ pub enum DomainDetail<C = &'static str> {
         primitive: Primitive,
         cycles: u64,
     },
+    /// Which appliance this is, and how far its persistent state has advanced.
+    ///
+    /// The three travel together because none of them answers the operator's
+    /// question alone: an identifier without a generation cannot say whether the
+    /// appliance came back or was just minted, and a generation without an owner
+    /// flag cannot say whether it has been adopted. **No key material has a
+    /// representation here** — an identifier is a public name, and the scalar
+    /// that stands behind it reaches no surface at all.
+    Identity {
+        device: u128,
+        generation: u64,
+        onboarded: bool,
+    },
+    /// The appliance's public-key fingerprint: SHA-256 over the DER
+    /// `SubjectPublicKeyInfo`, carried whole as the digest it is.
+    ///
+    /// Its own detail rather than a field beside the identifier, because it is
+    /// rendered as one field of 64 hexadecimal characters and an administrator
+    /// compares it character for character. A digest split across two records is
+    /// two strings somebody has to join before comparing, and a fingerprint
+    /// joined by hand is a fingerprint compared carelessly.
+    Fingerprint([u8; 32]),
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

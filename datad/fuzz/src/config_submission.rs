@@ -72,7 +72,8 @@ const SECRET: [u8; 16] = [0x3c; 16];
 /// Statuses the management half can answer a submission with. A closed list
 /// rather than `Status::ALL`, because the point is that a *submission* reaches
 /// exactly these three and never, say, a `404`.
-const SUBMISSION_STATUSES: [Status; 3] = [Status::Ok, Status::BadRequest, Status::ServiceUnavailable];
+const SUBMISSION_STATUSES: [Status; 3] =
+    [Status::Ok, Status::BadRequest, Status::ServiceUnavailable];
 
 /// Documents one input may submit in a row, bounding the harness's own work. Not
 /// a bound on the adversary: a longer run adds nothing this does not already
@@ -270,7 +271,10 @@ fn assert_report(
 
 /// Every answer the management half composes is one a client can be sent.
 fn assert_answer(endpoint: &Endpoint, answer: ConfigAnswer, running: Generation) {
-    let (status, line) = endpoint.answered.last().expect("the submission was answered");
+    let (status, line) = endpoint
+        .answered
+        .last()
+        .expect("the submission was answered");
     assert!(
         SUBMISSION_STATUSES.contains(status),
         "a submission was answered {status:?}"
@@ -395,7 +399,8 @@ impl Submissions for Endpoint {
 
     fn refuse(&mut self, status: Status) {
         self.answered.push((status, Vec::from(&b"\n"[..])));
-        self.server.supply(status, None, |out| copy_into(out, b"\n"));
+        self.server
+            .supply(status, None, |out| copy_into(out, b"\n"));
     }
 }
 

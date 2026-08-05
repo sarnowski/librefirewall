@@ -51,12 +51,12 @@ use crate::{
     clock_contract,
     config_transcript::ConfigContract,
     crypto_contract,
-    data_disk::DataDisk,
+    data_disk::{DataDisk, StoreDisk},
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking, Traffic},
     image, management_contract, metrics_contract, probe_contract,
     recording_contract::{self, Download},
-    stamp_contract, surface_contract,
+    stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
     util::{copy_file, locate, require_file, run_command},
 };
@@ -226,6 +226,29 @@ struct Bench {
     accelerator: Accelerator,
     management: ManagementBacking,
     traffic: Traffic,
+    /// Which store medium this boot attaches: a fresh one, or the one an earlier
+    /// boot of the same run minted an identity on.
+    store: StoreMedium,
+}
+
+/// Which store medium a boot attaches at 00:06.0 — the appliance's own.
+///
+/// A property of the scenario rather than of the run, on [`Accelerator`]'s terms:
+/// almost every boot wants a medium of its own, and exactly one wants the medium
+/// an earlier boot left. Making it a field is what lets the scenario table say
+/// which is which, and what keeps the pair readable as a pair.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreMedium {
+    /// A fresh, zero-filled medium, so the boot mints an identity. Every scenario
+    /// whose subject is something else takes this: a medium carried between two
+    /// unrelated boots would let one pass on an identity another minted.
+    Fresh,
+    /// The medium the named scenario's *shipping* boot left behind.
+    ///
+    /// The source's shipping label rather than this run's, so a diagnostic re-run
+    /// of the reloading scenario reads the same medium the shipping run judged.
+    /// A reload writes nothing, so reading it twice is not a second commit.
+    CarriedFrom(&'static str),
 }
 
 /// What a boot owes the raw device at 00:05.0, which follows from its contract
@@ -252,6 +275,11 @@ struct Invocation {
     /// 00:05.0 and park the recorder on a refusal, which is a boot no shipped
     /// image would ever perform.
     data: DataDisk,
+    /// The store device this run attached — created fresh, or the one an earlier
+    /// boot left. Every invocation gets one for the reason every one gets a data
+    /// device: a domain staring at an absent device is a different boot from the
+    /// one the image was assembled for.
+    store: StoreDisk,
 }
 
 /// Which disk a scenario boots on a [`Run::Shipping`] run.
@@ -361,6 +389,16 @@ pub(crate) enum Console {
     /// rather than something this boot special-cases — and nothing else is
     /// re-proved.
     JudgedOnCryptographyAlone,
+    /// **The store domain's records, and nothing else at all.**
+    ///
+    /// [`Self::JudgedOnCryptographyAlone`]'s shape and its reasoning, for the one
+    /// other question a single boot cannot answer. Every other statement this
+    /// gate makes here is about the *image*, and the boots that carry it have
+    /// already made them; what only this boot and its partner can settle is
+    /// whether the identity on one medium survives a reboot. So the identity
+    /// records are judged, the pair is held to each other after the run, and
+    /// nothing else is re-proved.
+    JudgedOnTheStoredIdentityAlone,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -382,6 +420,10 @@ pub(crate) struct Scenario {
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
     accelerator: Accelerator,
+    /// Which store medium this boot attaches. All but one scenario take a fresh
+    /// one; the one that does not is what proves the appliance's identity
+    /// survives a reboot, which is a claim about a medium rather than a boot.
+    store: StoreMedium,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
@@ -465,6 +507,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "generation-swap",
@@ -474,6 +517,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "alternate-configuration",
@@ -483,6 +527,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "metrics-endpoint",
@@ -496,6 +541,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The same scrape against a disk built from the second document, and the
     // one thing the scenario above cannot show: that the identity the
@@ -517,6 +563,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The recording milestone's own scenario. It is no longer the only one
     // that pulls the recordings — every [`ManagementRole::Client`] scenario
@@ -535,6 +582,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The filter's own two scenarios, and the reason there are two of them
     // rather than one: the three outcomes have to be shown to follow from the
@@ -556,6 +604,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "policy-filter-alternate",
@@ -565,6 +614,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The one contract a stateless filter cannot meet, on both documents.
     //
@@ -591,6 +641,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "stateful-tracking-alternate",
@@ -600,6 +651,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The one thing a connection history needs that no other scenario can
     // produce: a conversation that **opens and closes**.
@@ -655,6 +707,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Reconfiguration,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The landing that closed the model's one real hole, and the only scenario
     // that states what a policy commit did to the conversations the appliance
@@ -692,6 +745,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Revocation,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The scenario that proves an ICMP error the tracker RELATES to a live
     // conversation is still the filter's to decide — which is what keeps
@@ -723,6 +777,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Related,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     Scenario {
         name: "connection-lifecycle",
@@ -732,6 +787,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Lifecycle,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The one scenario that puts a **flood** across the appliance, and the only
     // one whose contract is about how much state a burst of traffic can make
@@ -772,6 +828,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Flood,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The only scenario that boots a node onto **generation 0** — the fail-closed
     // empty configuration — and the only one whose contract is that the appliance
@@ -808,6 +865,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
     },
     // The only scenario that chooses its accelerator, and the only one whose
     // subject is the accelerator rather than the appliance.
@@ -847,6 +905,56 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // delivery is required of it.
         traffic: Traffic::Routed,
         accelerator: Accelerator::Emulated,
+        store: StoreMedium::Fresh,
+    },
+    // The two boots that are one scenario, and the only pair in this table whose
+    // contract neither of them can meet alone.
+    //
+    // An identity that did not survive a reboot is not an identity, so the claim
+    // is not about a boot at all — it is about a *medium*, read twice. The first
+    // boot finds it zeroed and mints: a 128-bit name, a P-256 keypair, a
+    // self-signed onboarding certificate binding the two, and the fingerprint an
+    // administrator authenticates the node by, all written durably behind a device
+    // barrier. The second boot attaches the same file and must report the same
+    // name and the same fingerprint under a generation that did not go backwards.
+    //
+    // A store domain that minted afresh on every boot satisfies every assertion
+    // the first boot makes, and it is the whole defect a persistent identity
+    // exists to prevent. Only the second boot sees it, and only because the medium
+    // outlived the first — which is why `StoreMedium` is a field on this table
+    // rather than a fresh file per invocation like the recorder's disk.
+    //
+    // Both judge the store domain alone, on the emulated boot's terms: the routed
+    // contract, the transcript and the management port's count are facts about the
+    // image that fifteen other boots state, and re-stating them here would pay two
+    // whole boots for a second verdict on the same fact. They reuse the shipped
+    // document and the published disk, so the whole cost is two boots and no
+    // second image build.
+    Scenario {
+        name: "store-identity-minted",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheStoredIdentityAlone,
+        // Socket-backed: this boot takes no client, the endpoint's surfaces being
+        // the `Client` scenarios' subject.
+        management: ManagementRole::Station,
+        // The shipped probe set, injected and left unjudged, so the boot keeps the
+        // shape of the ones it repeats rather than being an idle guest.
+        traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    Scenario {
+        name: "store-identity-reloaded",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheStoredIdentityAlone,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // The medium the boot above minted on. It must precede this one in this
+        // table, and `StoreDisk::carried` says so by name when it does not.
+        store: StoreMedium::CarriedFrom("store-identity-minted"),
     },
 ];
 
@@ -855,6 +963,10 @@ struct Observed {
     /// The initial sequence number the appliance answered this boot's one
     /// management connection with, where it opened one.
     management_tcp_isn: Option<u32>,
+    /// The identity the store domain reported, where the boot judged one.
+    /// Reported back rather than re-read, because the claim the pair makes is
+    /// between two boots and only the run has seen both.
+    store_identity: Option<store_contract::Identity>,
     /// Whether QEMU executed this boot on the host's own processor. Reported
     /// back rather than re-derived, because the run's summary states a *contrast*
     /// between the accelerators and a contrast asserted from a second probe of
@@ -884,11 +996,19 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
     // Which accelerator each boot actually got, which is what the run may claim
     // about them and nothing more.
     let mut accelerated: Vec<(&str, bool)> = Vec::new();
+    // The identity each boot that judged one reported. Kept for the same reason
+    // the sequence numbers are: no single boot can show that an identity SURVIVED
+    // a reboot, and a domain that minted afresh on every boot looks perfectly
+    // correct in one scenario.
+    let mut identities: Vec<(&str, store_contract::Identity)> = Vec::new();
     for scenario in scenarios {
         match run_scenario(root, scenario, Run::Shipping) {
             Ok(observed) => {
                 if let Some(isn) = observed.management_tcp_isn {
                     sequence_numbers.push((scenario.name, isn));
+                }
+                if let Some(identity) = observed.store_identity {
+                    identities.push((scenario.name, identity));
                 }
                 accelerated.push((scenario.name, observed.accelerated));
             }
@@ -904,15 +1024,67 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         }
     }
     let distinct = judge_sequence_numbers(&sequence_numbers)?;
+    let carried = judge_carried_media(scenarios, &identities)?;
     Ok(format!(
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
          configuration transcript, the clock record, the hardware probe's record and the \
          management port's count, and \
-         {scraped} scraped with curl against the document each was built from; {distinct}{}",
+         {scraped} scraped with curl against the document each was built from; {distinct}{carried}{}",
         scenarios.len(),
         Run::Shipping.config(),
         describe_the_emulated_boots(scenarios, &accelerated),
     ))
+}
+
+/// Hold every boot that reloaded a medium to the boot that minted the identity on
+/// it.
+///
+/// This is the half of the store contract no boot makes: the medium outlives one
+/// invocation deliberately, and only the run has seen both readings of it. A
+/// scenario naming a source whose identity the run does not hold is a finding
+/// rather than a skip — either the two are out of order in the table, or the
+/// source boot judged no identity, and both would leave the claim vacuously true.
+fn judge_carried_media(
+    scenarios: &[Scenario],
+    identities: &[(&str, store_contract::Identity)],
+) -> Result<String, String> {
+    let held = |name: &str| {
+        identities
+            .iter()
+            .find(|(observed, _)| *observed == name)
+            .map(|(_, identity)| identity)
+    };
+    let mut proved = Vec::new();
+    for scenario in scenarios {
+        let StoreMedium::CarriedFrom(source) = scenario.store else {
+            continue;
+        };
+        let Some(minted) = held(source) else {
+            return Err(format!(
+                "system scenario {} reloads the store medium the {source} boot minted, and this \
+                 run holds no identity for {source}. Either the two are out of order in the \
+                 scenario table — the minting boot must precede the reloading one — or {source} \
+                 does not judge the store domain at all, and either way the claim that an \
+                 identity survived a reboot would be vacuously true",
+                scenario.name
+            ));
+        };
+        let Some(returned) = held(scenario.name) else {
+            return Err(format!(
+                "system scenario {} reloads a store medium and judged no identity of its own, so \
+                 there is nothing to hold to the {source} boot's",
+                scenario.name
+            ));
+        };
+        proved.push(store_contract::hold_to_source(
+            (source, minted),
+            (scenario.name, returned),
+        )?);
+    }
+    if proved.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("; {}", proved.join("; ")))
 }
 
 /// What the run may say about the accelerators it used, from what the boots
@@ -1016,6 +1188,17 @@ fn scenario_log(root: &Path, scenario: &Scenario, run: Run) -> PathBuf {
 /// [`image::image`]: that publishes into `dist/`, which holds the release
 /// artifact the failing run was judging, and overwriting it with a debug disk
 /// would destroy the thing under assessment.
+/// The label one scenario's boot runs under: the stem of its run log, its OVMF
+/// variable store, its data disk and its store medium.
+///
+/// One place, because a **carried** store medium is looked up by the label its
+/// *source* boot filed it under — always that source's shipping label, so a
+/// diagnostic re-run of the reloading scenario reads the same medium the shipping
+/// run judged rather than a file no boot ever wrote.
+fn scenario_run_label(name: &str, run: Run) -> String {
+    format!("qemu-{name}{}", run.name_suffix())
+}
+
 fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, String> {
     let name = scenario.name;
     match (&scenario.image, run) {
@@ -1058,10 +1241,13 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         Console::JudgedOnCryptographyAlone => {
             return run_cryptography_scenario(root, scenario, run, &disk, &topology);
         }
+        Console::JudgedOnTheStoredIdentityAlone => {
+            return run_store_scenario(root, scenario, run, &disk, &topology);
+        }
         Console::Ignored | Console::Judged => {}
     }
 
-    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
+    let log_name = format!("{}.log", scenario_run_label(name, run));
     let backing = if scenario.management.user_network() {
         ManagementBacking::UserNetwork {
             host_port: forward_harness::reserve_host_port()
@@ -1070,8 +1256,16 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
     } else {
         ManagementBacking::Socket
     };
-    let booted = boot_and_forward(root, &disk, &log_name, &topology, backing, scenario.traffic)
-        .map_err(|error| format!("scenario {name}: {error}"))?;
+    let booted = boot_and_forward(
+        root,
+        &disk,
+        &log_name,
+        &topology,
+        backing,
+        scenario.traffic,
+        scenario.store,
+    )
+    .map_err(|error| format!("scenario {name}: {error}"))?;
 
     // The table before the verdict: what the two endpoints exchanged and what
     // the appliance refused is the thing a smoke run is run to see, and the
@@ -1178,9 +1372,10 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         // judged from here anyway — there is no transcript of an accepted
         // document on a node that accepted none, and this boot's contract is not
         // the one either of them owes.
-        Console::Ignored | Console::JudgedOnARefusal | Console::JudgedOnCryptographyAlone => {
-            String::new()
-        }
+        Console::Ignored
+        | Console::JudgedOnARefusal
+        | Console::JudgedOnCryptographyAlone
+        | Console::JudgedOnTheStoredIdentityAlone => String::new(),
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1227,6 +1422,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
     );
     Ok(Observed {
         management_tcp_isn: booted.management_tcp_isn,
+        store_identity: None,
         accelerated: booted.hardware_accelerated,
     })
 }
@@ -1263,7 +1459,7 @@ fn run_cryptography_scenario(
     topology: &Topology,
 ) -> Result<Observed, String> {
     let name = scenario.name;
-    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
+    let log_name = format!("{}.log", scenario_run_label(name, run));
     let booted = boot(
         root,
         disk,
@@ -1274,6 +1470,7 @@ fn run_cryptography_scenario(
             accelerator: scenario.accelerator,
             management: ManagementBacking::Socket,
             traffic: scenario.traffic,
+            store: scenario.store,
         },
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1287,6 +1484,57 @@ fn run_cryptography_scenario(
     );
     Ok(Observed {
         management_tcp_isn: None,
+        store_identity: None,
+        accelerated: booted.hardware_accelerated,
+    })
+}
+
+/// Boot one scenario and judge the **store domain** alone, which is the whole of
+/// what it is for.
+///
+/// [`run_cryptography_scenario`]'s shape, and every omission is deliberate on the
+/// same terms: this node has every surface, the boots that ran before it judged
+/// all of them, and re-judging any of it here would pay a boot for a second
+/// reading of a fact about the image. What only this boot can contribute is the
+/// identity on its medium — and even that is half a claim, the other half being
+/// the partner boot that reads the same medium back.
+///
+/// Answers no sequence number: nothing opens a connection to the management port.
+fn run_store_scenario(
+    root: &Path,
+    scenario: &Scenario,
+    run: Run,
+    disk: &Path,
+    topology: &Topology,
+) -> Result<Observed, String> {
+    let name = scenario.name;
+    let log_name = format!("{}.log", scenario_run_label(name, run));
+    let booted = boot(
+        root,
+        disk,
+        &log_name,
+        BootContract::StoreIdentity,
+        topology,
+        Bench {
+            accelerator: scenario.accelerator,
+            management: ManagementBacking::Socket,
+            traffic: scenario.traffic,
+            store: scenario.store,
+        },
+    )
+    .map_err(|error| format!("scenario {name}: {error}"))?;
+    let log = scenario_log(root, scenario, run);
+    let identity = store_contract::judge(&booted.serial, &log)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+    println!(
+        "  system scenario ok: {name} on the {} kernel ({}); QEMU output is in {}",
+        run.config(),
+        identity.summary(),
+        log.display()
+    );
+    Ok(Observed {
+        management_tcp_isn: None,
+        store_identity: Some(identity),
         accelerated: booted.hardware_accelerated,
     })
 }
@@ -1314,8 +1562,8 @@ fn run_fail_closed_scenario(
     let name = scenario.name;
     let transcript = crate::config_transcript::RefusedContract::from_document(document)
         .map_err(|error| format!("scenario {name}: {error}"))?;
-    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
-    let booted = boot_and_fail_closed(root, disk, &log_name, topology, &transcript)
+    let log_name = format!("{}.log", scenario_run_label(name, run));
+    let booted = boot_and_fail_closed(root, disk, &log_name, topology, &transcript, scenario.store)
         .map_err(|error| format!("scenario {name}: {error}"))?;
     // The table, which on this scenario is the evidence rather than the preamble:
     // every row is a probe the shipped document forwards, and every one of them
@@ -1331,6 +1579,7 @@ fn run_fail_closed_scenario(
     );
     Ok(Observed {
         management_tcp_isn: None,
+        store_identity: None,
         accelerated: booted.hardware_accelerated,
     })
 }
@@ -1348,6 +1597,7 @@ pub(crate) fn boot_and_forward(
     topology: &Topology,
     management: ManagementBacking,
     traffic: Traffic,
+    store: StoreMedium,
 ) -> Result<Booted, String> {
     boot(
         root,
@@ -1362,6 +1612,7 @@ pub(crate) fn boot_and_forward(
             accelerator: Accelerator::WhateverTheMachineOffers,
             management,
             traffic,
+            store,
         },
     )
 }
@@ -1552,6 +1803,7 @@ pub(crate) fn boot_and_fail_closed(
     log_name: &str,
     topology: &Topology,
     transcript: &crate::config_transcript::RefusedContract,
+    store: StoreMedium,
 ) -> Result<Booted, String> {
     boot(
         root,
@@ -1572,6 +1824,7 @@ pub(crate) fn boot_and_fail_closed(
             // mismatch. This document's addressing is the shipped one to the
             // byte, for exactly that.
             traffic: Traffic::Routed,
+            store,
         },
     )
 }
@@ -1601,6 +1854,7 @@ pub(crate) fn boot_and_halt(
             // the one thing it does decide — the frames put on the wire — the
             // same as every other halt scenario's.
             traffic: Traffic::Routed,
+            store: StoreMedium::Fresh,
         },
     )
 }
@@ -1617,6 +1871,7 @@ fn boot(
         accelerator,
         management,
         traffic,
+        store,
     } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
     // Whether this boot reads the recordings back follows from the backing
@@ -1629,7 +1884,8 @@ fn boot(
         mut command,
         acceleration,
         data,
-    } = qemu_base(root, "stdio", disk, run_label, accelerator)?;
+        store: store_disk,
+    } = qemu_base(root, "stdio", disk, run_label, accelerator, store)?;
     command.arg("-monitor").arg("none");
     backends.apply(&mut command, topology)?;
 
@@ -1665,6 +1921,28 @@ fn boot(
     let data_disk = match contract {
         BootContract::Halted { .. } => DataDiskVerdict::SectorUntouched,
         BootContract::Routed | BootContract::FailedClosed { .. } => DataDiskVerdict::WitnessWritten,
+        BootContract::Cryptography | BootContract::StoreIdentity => {
+            DataDiskVerdict::NotThisBootsSubject
+        }
+    };
+    // The store medium's own verdict, which is not the recorder's and is decided
+    // on different terms. A boot with no bootable slot must leave it as the
+    // zeroes it was made as; a boot that ran the appliance must have opened its
+    // first sector with the state record's magic — either because it minted one or
+    // because it reloaded the one already there. A boot whose subject is the
+    // *accelerator* owes neither, for the reason it owes neither of the
+    // recorder's: it ends the moment the cryptography domain finishes, which
+    // nothing orders against the store domain's own write.
+    //
+    // A carried medium is the one case where "written" is not this boot's doing,
+    // and asserting it anyway is the point: the file must still be a record after
+    // the second boot read it, because a reload that rewrote or cleared the medium
+    // would be an appliance losing its identity by looking at it.
+    let store_medium = match contract {
+        BootContract::Halted { .. } => DataDiskVerdict::SectorUntouched,
+        BootContract::Routed | BootContract::FailedClosed { .. } | BootContract::StoreIdentity => {
+            DataDiskVerdict::WitnessWritten
+        }
         BootContract::Cryptography => DataDiskVerdict::NotThisBootsSubject,
     };
     let booted = forward_harness::run_boot_test(
@@ -1696,6 +1974,16 @@ fn boot(
     if let Some(verdict) = verdict {
         println!("  data disk {run_label}: {verdict}");
     }
+    let store_verdict = match store_medium {
+        DataDiskVerdict::WitnessWritten => Some(store_disk.judge_written()),
+        DataDiskVerdict::SectorUntouched => Some(store_disk.judge_untouched()),
+        DataDiskVerdict::NotThisBootsSubject => None,
+    }
+    .transpose()
+    .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
+    if let Some(verdict) = store_verdict {
+        println!("  store medium {run_label}: {verdict}");
+    }
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {
@@ -1726,12 +2014,16 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
         mut command,
         acceleration,
         data: _,
+        store: _,
     } = qemu_base(
         root,
         "mon:stdio",
         &disk,
         "run",
         Accelerator::WhateverTheMachineOffers,
+        // A fresh medium, so an interactive run mints an identity rather than
+        // inheriting whichever scenario ran last.
+        StoreMedium::Fresh,
     )?;
     println!("QEMU run: {}", acceleration.describe());
     // Interactive runs have no harness peer to dial into, so back every NIC
@@ -1840,6 +2132,7 @@ fn qemu_base(
     disk: &Path,
     run_label: &str,
     accelerator: Accelerator,
+    store: StoreMedium,
 ) -> Result<Invocation, String> {
     require_file(disk)?;
 
@@ -1856,6 +2149,15 @@ fn qemu_base(
 
     let acceleration = Acceleration::choose(accelerator);
     let data = DataDisk::create(root, run_label)?;
+    // The appliance's own medium, created fresh or carried from the boot that
+    // minted an identity on it. Which one is the scenario's decision, so a boot
+    // cannot accidentally inherit an identity it was meant to mint.
+    let store = match store {
+        StoreMedium::Fresh => StoreDisk::create(root, run_label)?,
+        StoreMedium::CarriedFrom(source) => {
+            StoreDisk::carried(root, &scenario_run_label(source, Run::Shipping))?
+        }
+    };
 
     let mut command = Command::new("qemu-system-x86_64");
     command
@@ -1903,10 +2205,15 @@ fn qemu_base(
     // because a domain staring at an absent device is a different boot from the
     // one the image was assembled for.
     data.attach(&mut command);
+    // And the store device beside it, one PCI slot further on. Attached to every
+    // invocation for the reason the data device is, and after it so the two
+    // `-device` arguments read in the order the two ECAM pages do.
+    store.attach(&mut command);
     Ok(Invocation {
         command,
         acceleration,
         data,
+        store,
     })
 }
 

@@ -52,6 +52,9 @@ cargo-fuzz = true
 #                   completions all meet
 #   lfw-capture-ring the superblock read back off that medium, and the ring a
 #                   decoded one is resumed into
+#   lfw-store       the appliance's own state record, whose every byte is a
+#                   PHYSICAL attacker's: not merely chosen by one, but composed
+#                   offline with this decoder's source in hand
 #   lfw-pcapng      the block encoders those two write through: a frame's
 #                   length on the wire and an annotation's bytes are the
 #                   network's and a peer's, and both become a length field
@@ -91,6 +94,15 @@ lfw-capture-ring = { path = "../crates/capture-ring" }
 # to a block device from the one domain holding its capability, so it gets a
 # target of its own rather than being reached incidentally through the pass.
 lfw-pcapng = { path = "../crates/pcapng" }
+# The appliance's own persistent state. It is on this list for the strongest
+# reason any crate here is: the bytes are not merely an adversary's, they were
+# written by somebody holding the disk, at leisure, and the identity decoded out
+# of them is what the appliance signs with.
+lfw-store = { path = "../crates/store" }
+# The `SubjectPublicKeyInfo` a fingerprint is taken over, so the harness can hold
+# a verified identity's fingerprint to the digest over its own stored key rather
+# than to whatever the verification answered.
+lfw-x509 = { path = "../crates/x509" }
 
 # This workspace is standalone, so the root workspace's `[workspace.lints]` does
 # not reach it and its lint policy has to be stated here. `unused_must_use` is
@@ -251,6 +263,13 @@ bench = false
 [[bin]]
 name = "config_submission"
 path = "fuzz_targets/config_submission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_state"
+path = "fuzz_targets/store_state.rs"
 test = false
 doc = false
 bench = false

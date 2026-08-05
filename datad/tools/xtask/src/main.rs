@@ -94,6 +94,7 @@ mod reference_contract;
 mod reproducible;
 mod signing;
 mod stamp_contract;
+mod store_contract;
 mod surface_contract;
 mod sysdesc;
 mod target_spec;

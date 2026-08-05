@@ -42,10 +42,11 @@ use crate::catalog::{
     RECORDING_SEGMENTS_CLOSED, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
     RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
     RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
-    Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS,
-    TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS,
-    TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES,
-    UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
+    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, Series, TAP_OBSERVATIONS,
+    TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED,
+    TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED,
+    TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES,
+    UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 use crate::rules::MAX_RULE_SERIES;
 
@@ -1517,6 +1518,97 @@ impl HardwareProbeSample {
     }
 }
 
+/// Slots [`StoreSample`] occupies.
+pub const STORE_SLOTS: usize = 16;
+
+/// The store domain's whole shard: what it established about the appliance's
+/// identity, and what its device did.
+///
+/// **No key material has a representation here.** The identifier is not exposed
+/// either — a 128-bit name is not a number a time series can carry, and the
+/// console record is where an operator reads one. What is exposed is whether
+/// there *is* an identity, whether this boot had to mint it, and how far the
+/// record has advanced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreSample {
+    pub established: bool,
+    pub minted: bool,
+    pub generation: u64,
+    pub onboarded: bool,
+    pub capacity_sectors: u64,
+    /// Read then write, as [`RecorderSample`] orders them.
+    pub requests: [u64; 2],
+    pub bytes: [u64; 2],
+    pub device_faults: [u64; 3],
+    pub status_undecodable: u64,
+    pub completion_unmapped: u64,
+    pub log: LogSample,
+}
+
+impl StoreSample {
+    pub const SERIES: &'static [Series] = &[
+        plain(&STORE_IDENTITY),
+        plain(&STORE_MINTED),
+        plain(&STORE_GENERATION),
+        plain(&STORE_ONBOARDED),
+        plain(&BLOCK_CAPACITY_SECTORS),
+        s(&BLOCK_REQUESTS, &[Label::new("operation", "read")]),
+        s(&BLOCK_REQUESTS, &[Label::new("operation", "write")]),
+        s(&BLOCK_BYTES, &[Label::new("operation", "read")]),
+        s(&BLOCK_BYTES, &[Label::new("operation", "write")]),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_out_of_range"),
+            ],
+        ),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_not_posted"),
+            ],
+        ),
+        s(
+            &DEVICE_FAULTS,
+            &[
+                Label::new("queue", "request"),
+                Label::new("fault", "completion_length_over_reported"),
+            ],
+        ),
+        plain(&BLOCK_STATUS_UNDECODABLE),
+        s(
+            &INVARIANT_FAULTS,
+            &[Label::new("fault", "block_completion_unmapped")],
+        ),
+        plain(&LOG_RECORDS_DROPPED),
+        plain(&LOG_RECORDS_REFUSED),
+    ];
+
+    #[must_use]
+    pub fn values(&self) -> [u64; STORE_SLOTS] {
+        [
+            u64::from(self.established),
+            u64::from(self.minted),
+            self.generation,
+            u64::from(self.onboarded),
+            self.capacity_sectors,
+            self.requests[0],
+            self.requests[1],
+            self.bytes[0],
+            self.bytes[1],
+            self.device_faults[0],
+            self.device_faults[1],
+            self.device_faults[2],
+            self.status_undecodable,
+            self.completion_unmapped,
+            self.log.dropped,
+            self.log.refused,
+        ]
+    }
+}
+
 /// The primitives the cryptography domain proves and reports on, as label
 /// values.
 ///
@@ -1865,6 +1957,7 @@ const _: () = {
     assert!(RecorderSample::SERIES.len() == RECORDER_SLOTS);
     assert!(HardwareProbeSample::SERIES.len() == HARDWARE_PROBE_SLOTS);
     assert!(CryptoSample::SERIES.len() == CRYPTO_SLOTS);
+    assert!(StoreSample::SERIES.len() == STORE_SLOTS);
 
     // The per-rule block begins exactly where the named table ends, which is
     // what makes the two writers of a rule series — the domain that publishes by

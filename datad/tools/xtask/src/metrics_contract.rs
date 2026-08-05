@@ -141,6 +141,7 @@ const DOMAINS: &[&str] = &[
     "clock",
     "recorder",
     "hardware_probe",
+    "store",
 ];
 
 /// What a real client got out of the endpoint.

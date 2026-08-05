@@ -19,10 +19,11 @@ pub const P256_MAX_SIGNATURE_LEN: usize = 72;
 
 /// A P-256 signing key, and the one private-key type the appliance holds.
 ///
-/// No `Debug`, no `Clone` and no accessor for the scalar: the only things that
-/// leave are a public key and a signature. Key material has no representation
-/// on any surface, and a type that could print it would be the first step
-/// toward one.
+/// No `Debug` and no `Clone`: key material has no representation on any surface,
+/// and a type that could print it would be the first step toward one. There is
+/// one accessor for the scalar ([`Self::into_scalar`]) and it consumes the key,
+/// because an appliance that must still be itself after a reboot has to write
+/// its own key down somewhere.
 pub struct P256SecretKey(p256::ecdsa::SigningKey);
 
 /// Draws allowed before key generation gives up.
@@ -53,8 +54,9 @@ impl P256SecretKey {
         Err(CryptoError::InvalidSecretKey)
     }
 
-    /// A key from a fixed scalar, which is what a published signing vector
-    /// fixes and what the store domain will one day hand over.
+    /// A key from a fixed scalar, which is what a published signing vector fixes
+    /// and what the store domain hands over: the scalar it read back off its own
+    /// medium, on the way to holding the identity to itself.
     ///
     /// # Errors
     /// [`CryptoError::InvalidSecretKey`] for a scalar that is zero or is not
@@ -64,6 +66,32 @@ impl P256SecretKey {
         p256::ecdsa::SigningKey::from_bytes(scalar.into())
             .map(Self)
             .map_err(|_| CryptoError::InvalidSecretKey)
+    }
+
+    /// This key's scalar, for the one caller that must persist it: the domain
+    /// that owns the store medium, writing the identity a reboot has to restore.
+    ///
+    /// It **consumes** the key rather than borrowing it, which is the narrowest
+    /// shape that works. A `&self` accessor would let a caller hold a key and
+    /// take copies of its scalar at will, and the whole point of routing this
+    /// through one method is that a copy is an event with a place in the code.
+    /// The caller owns what it does with the bytes; [`from_scalar`] is the way
+    /// back.
+    ///
+    /// [`from_scalar`]: Self::from_scalar
+    #[must_use]
+    pub fn into_scalar(self) -> [u8; P256_SECRET_LEN] {
+        let mut scalar = [0_u8; P256_SECRET_LEN];
+        // `to_bytes` answers a `FieldBytes`, which is exactly a 32-byte array
+        // for this curve; the copy is bounded by the destination, so a width
+        // that ever disagreed would truncate rather than index out of bounds,
+        // and the assertion below is what stops it disagreeing.
+        let mut bytes = self.0.to_bytes();
+        for (slot, byte) in scalar.iter_mut().zip(bytes.iter()) {
+            *slot = *byte;
+        }
+        bytes.zeroize();
+        scalar
     }
 
     /// The uncompressed SEC1 point this key verifies under.
@@ -130,3 +158,12 @@ pub fn p256_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Resul
     key.verify(message, &parsed)
         .map_err(|_| CryptoError::NotAuthentic)
 }
+
+// The scalar the accessor above copies out is a `FieldBytes` of this curve, and
+// the copy is bounded by the destination array. Held equal here so a width that
+// disagreed is a build failure rather than a key silently truncated to the
+// shorter of the two.
+const _: () = assert!(
+    P256_SECRET_LEN == 32,
+    "a P-256 scalar is 32 bytes, and `into_scalar` copies into an array of that width"
+);

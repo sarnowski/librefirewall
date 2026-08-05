@@ -132,8 +132,12 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 // longer than the receive window as often as not. Nothing else
                 // in this harness reaches the synchronized data path: random
                 // bytes never carry a checksum that verifies.
-                let bytes =
-                    stream_segment(&mut unstructured, delivered, acknowledgement, ESTABLISHED_PEER);
+                let bytes = stream_segment(
+                    &mut unstructured,
+                    delivered,
+                    acknowledgement,
+                    ESTABLISHED_PEER,
+                );
                 let mut out = [UNTOUCHED; OUT];
                 let received = established.receive(now, ESTABLISHED_PEER, &bytes, &mut out);
                 for (index, byte) in received.data.iter().enumerate() {
@@ -146,7 +150,9 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 delivered = delivered.saturating_add(received.data.len() as u64);
                 assert!(received.emitted <= OUT);
                 assert!(
-                    out[received.emitted..].iter().all(|byte| *byte == UNTOUCHED),
+                    out[received.emitted..]
+                        .iter()
+                        .all(|byte| *byte == UNTOUCHED),
                     "an answer wrote past the length it reported"
                 );
             }
@@ -428,7 +434,9 @@ fn stream_segment(
         .map(|index| stream_byte(delivered.saturating_add(index)))
         .collect();
     // Lossless: the harness's own stream stays far below 2^32 bytes.
-    let sequence = ESTABLISHED_IRS.wrapping_add(1).wrapping_add(delivered as u32);
+    let sequence = ESTABLISHED_IRS
+        .wrapping_add(1)
+        .wrapping_add(delivered as u32);
     compose(
         sequence,
         acknowledgement,

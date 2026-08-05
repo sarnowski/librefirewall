@@ -108,15 +108,21 @@ crates that compile or link native code outright, denies build scripts by defaul
 allow-list, and denies two versions of one crate. A new build script needs an entry with a written
 reason beside it, and a crate that would compile C is rejected rather than allow-listed.
 
-**The two protection-domain builds are not one.** The dataplane domains are compiled for the
-softfloat target with `-Z build-std=core`; the two SIMD domains — the hardware probe and the
-cryptography domain — are compiled for the hardfloat, SSE-enabled target with
-`-Z build-std=core,alloc`, in an invocation of their own. The difference in the standard-library
-set is deliberate and is the whole allocator story in one line: the cryptography domain carries the
-appliance's only allocator, because a proven TLS implementation requires one, and the dataplane
-domains keep having none. Both invocations are in `xtask::image`, and the linting in `xtask::host`
-mirrors them exactly — a domain linted with a different standard-library set is a lint of a
-different binary.
+**The protection-domain builds are not one invocation, and not two.** The dataplane domains are
+compiled together for the softfloat target with `-Z build-std=core`; the three SIMD domains — the
+hardware probe, the cryptography domain and the store domain — are compiled for the hardfloat,
+SSE-enabled target with `-Z build-std=core,alloc`, **one invocation each**. The difference in the
+standard-library set is deliberate and is the whole allocator story in one line: the cryptography
+domain carries the appliance's only allocator, because a proven TLS implementation requires one, and
+every other domain keeps having none.
+
+One invocation per SIMD domain is a correctness requirement rather than tidiness. Cargo's resolver
+unifies features across every package one invocation selects, so building the three together turns
+on the `alloc` features of the shared cryptography dependency graph — the TLS stack asks for them —
+in the store domain too, which carries no allocator and must not. Building each on its own is what
+keeps a domain's feature set the set its own manifest asks for. Every invocation is in
+`xtask::image`, and the linting in `xtask::host` mirrors them exactly — a domain linted with a
+different standard-library set, or a different feature set, is a lint of a different binary.
 
 **Editing a target specification invalidates what was built against it.** The two specifications
 live in `datad/support/targets/`; cargo fingerprints the compiler, the profile, the features and

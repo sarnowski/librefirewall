@@ -312,6 +312,10 @@ fn run_scenario(
                 // manager said, so every one of them injects the set whose counts
                 // have not moved since before the filter existed.
                 Traffic::Routed,
+                // A fresh store medium: which slot boots says nothing about an
+                // identity, and a medium carried in from elsewhere would let one
+                // of these pass on an identity another boot minted.
+                crate::qemu::StoreMedium::Fresh,
             )
         }
         Outcome::Halts => boot_and_halt(root, &work, &log_name, HALT_RECORD, topology),

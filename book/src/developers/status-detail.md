@@ -537,8 +537,10 @@ record and its ring (see *[Engineering foundations](#engineering-foundations)*).
 ## virtio-blk driver
 
 **What exists.** A ninth protection domain, `recorder` — the seventh binary, the driver's three
-instances being one binary — owns a virtio-blk device at the pinned PCI function 00:05.0 and is the
-only domain in the system that can put a byte on persistent storage. The device class is
+instances being one binary — owns a virtio-blk device at the pinned PCI function 00:05.0. It is no
+longer the only domain that can put a byte on persistent storage: the store domain owns a **second**
+such device at 00:06.0 (below), and the two are separate authorities — neither maps any part of the
+other's ECAM page, BAR window, DMA region or staging window. The device class is
 `datad/crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
 state machine over one virtqueue (`request`), and the sector-addressed staging window every data
 segment names (`io`). The split is `nic-driver-core`'s — every decision is in the library where a
@@ -707,7 +709,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 12 of the 17 system
+**What the gate proves.** Every scenario whose management port is reachable — 12 of the 19 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -1226,7 +1228,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 17 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 19 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1448,7 +1450,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the 17 system scenarios additionally hold the console's own record to the frames and the bytes
+Two of the 19 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1705,7 +1707,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the 17 QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the 19 QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -1761,9 +1763,10 @@ calibration that is torn under the read or outside the band it accepts, having r
 
 ## Protection-domain decomposition
 
-**What exists.** Eleven protection domains from nine binaries (one forwarder, one configuration
+**What exists.** Twelve protection domains from ten binaries (one forwarder, one configuration
 domain, one console, one clock, one management domain, one recorder, one hardware probe, one
-cryptography domain, three driver instances of one driver binary) with real, verifiable least privilege: the forwarder holds no device capability
+cryptography domain, one store domain, three driver instances of one driver binary) with real,
+verifiable least privilege: the forwarder holds no device capability
 at all and neither dataplane pipeline's `free` ring — so it cannot hand a live DMA target back to
 be issued a second time — and each driver sees only its own ECAM page, BAR, virtqueue region, and
 its two pipelines. Each pipeline is three memory regions rather than one precisely so that those
@@ -1772,9 +1775,12 @@ must reach the bytes. It also maps the connection table, and that is the one reg
 domain holds **alone**: nothing else maps it in either direction, which is what makes the exclusive
 borrow of it sound rather than merely uncontended, and it carries no physical address so no device
 can be handed it either. The recorder is the mirror of that argument in the other direction: it is
-the only domain that reaches the block device — its ECAM page, BAR, DMA region and staging window
+the only domain that reaches its block device — its ECAM page, BAR, DMA region and staging window
 are mapped by nothing else — and it maps no pool, no ring, no NIC region and no port, so the
-domain that owns the disk reaches no frame and the domains that move frames reach no medium. What
+domain that owns that disk reaches no frame and the domains that move frames reach no medium. **The
+store domain is the same argument again, over a second block device**, and the pair of them is the
+sharper claim: neither reaches any part of the other's device, so the domain that answers a download
+cannot read the appliance's private key and the domain that holds the key cannot read a recording. What
 crosses between them is the tap ring, carrying the forwarder's own bounded copy of each frame it
 decided on and its decision about it — never a descriptor, a buffer index or any other way to reach
 a frame still in flight — mirrored in perms so neither end can forge the other's half. The configuration domain's entire grant is six mappings —
@@ -1856,10 +1862,11 @@ One grant is also wider than the code needs, and it is not closed:
 
 - **The `-m 1G` QEMU memory size is load-bearing and unasserted.** It is what keeps the virtqueue
   and pipeline regions inside RAM while leaving the BAR window above RAM in the q35 PCI hole. The
-  window either side is narrow, and each region added narrows it further: the recorder's 256 KiB
-  staging window was the last to do so, and RAM must now reach past 784.80 MiB where the three
-  ports alone needed 784.55 MiB. At 1280 MiB or more RAM swallows the BAR window instead. The
-  reasoning is recorded in the system description; no code enforces either end of it.
+  window either side is narrow, and each region added narrows it further: the store device's 256 KiB
+  staging window was the last to do so, and RAM must now reach past 785.05 MiB where the recorder's
+  device alone needed 784.80 MiB and the three ports alone 784.55 MiB. At 1280 MiB or more RAM
+  swallows the BAR window instead. The reasoning is recorded in the system description; no code
+  enforces either end of it.
 
 ## Untrusted-device hardening
 
@@ -2019,6 +2026,81 @@ image would fit it, reading the bound out of `grub.cfg` rather than restating it
 `BOOTX64.EFI` itself is unsigned in the Authenticode sense (no shim, MOK, or PK/KEK/db hierarchy).
 There is no TPM anywhere: no vTPM in the QEMU harness, no measured boot, no PCR policy, and no
 anti-rollback epoch. Production key management (HSM-backed signing) does not exist.
+
+## The appliance identity
+
+**What exists.** A tenth protection domain, `store` — the third built with the hardfloat SIMD target
+— owns a **second** virtio-blk device at the pinned PCI function 00:06.0 and, on it, the one thing a
+reboot must not change: which appliance this is.
+
+`datad/crates/store` is the format and the identity, and all of it is host-testable. The
+**state record** is two 4 KiB copies at fixed sectors, each carrying a magic, a version, a monotonic
+generation, the onboarding state, the device identifier, the private scalar, the public point, the
+management endpoint, the device certificate, the delivered trust anchor, the configuration slot table
+and a SHA-256 digest over everything before it. A change composes the *whole* new state into the copy
+the generation's parity selects, so the copy the appliance is relying on is never the copy being
+written and a power cut costs the newer one while the older still decodes. Both copies invalid is a
+fresh medium rather than an error, and `StateImage::check` is the typestate boundary: a record that
+decoded is not yet a record this build may act on until its slot count and slot size agree with the
+numbers this build compiled against.
+
+`identity` mints and verifies. On a fresh medium the domain draws 128 bits of device identifier from
+its **own** `RDRAND`-seeded generator, generates an ECDSA P-256 keypair, writes a self-signed
+onboarding certificate binding the two through the first-party DER writer in `datad/crates/x509`, and
+takes the SHA-256 over the DER `SubjectPublicKeyInfo` — all to the [certificate
+profile](../contracts/certificate-profile.md), reached for rather than restated, so the management
+server validates against the same page. On every later boot it holds the record to itself: the stored
+scalar is a private key at all, the stored point is the one that scalar derives, and the stored
+certificate binds that point. A record failing any of the three is **refused** with a typed cause
+token — never repaired from whichever half looks right, because an appliance signing under a key
+whose certificate names another cannot be authenticated and does not know it.
+
+Each domain that holds key material seeds **its own** generator from the hardware. The draw, its
+health check and the generator are `lfw-crypto`'s, so two domains do not each carry a copy of the
+rule for what a broken `RDRAND` looks like; the generator itself is not shared, because a seed that
+crossed a channel would let the domain at the other end reproduce the key. `RDRAND` and `CPUID` carry
+no capability, so the system description can neither grant nor withhold them, and a domain seeding
+itself is granted nothing.
+
+**What the write buys.** `VIRTIO_BLK_F_FLUSH` is in `lfw_blk::ACCEPTED_FEATURES`, so a device that
+does not offer it is refused at bring-up, and the store's commit is a whole-record write followed by
+a flush the domain **waits for**. That is the difference between written and durable, and everything
+a later boot believes about this appliance rests on it.
+
+**What it proves today**, as a machine-observable contract rather than a console line an operator
+reads: two QEMU scenarios share **one** store medium. The first finds it zeroed and mints; the second
+attaches the same file and must report the same 32-hexadecimal-character device identifier and the
+same 64-hexadecimal-character fingerprint under a generation that did not go backwards. A domain that
+minted afresh on every boot satisfies every assertion the first boot makes and fails here, and that
+defect is the whole reason a persistent identity exists. Nothing on the host side reads the medium's
+contents — it carries the private scalar in plaintext, and a harness that parsed it would be a second
+place that had to be trusted never to print one; what the gate compares is the two consoles, which is
+what an administrator compares. The host does read the medium's first sixteen bytes to hold the magic
+and the version to `lfw_store`'s own constants: a domain that composed a record and never got it past
+the staging window is caught by that rather than believed.
+
+**The capability topology is the substance.** One domain maps the store device and no other maps any
+part of it — the recorder included, which owns the other block device. That domain holds no network
+region, no configuration region, no tap, no download region, no `<ioport>` and **no channel in either
+direction**, so there is no path from a packet to the private scalar whatever a compromise reaches.
+The scalar is plaintext on the medium, deliberately and for want of anywhere to keep a wrapping key,
+so physical possession of the store *is* identity theft — and this topology is what makes possession
+the only way to it.
+
+**No key material reaches any surface.** The scalar is drawn, folded into a certificate and written to
+the medium, and that is the whole of where it goes. The two console records carry a public name and a
+public-key digest; `/metrics` says whether there *is* an identity, whether this boot had to mint one
+and how far the record has advanced, and never which identity it is; the committed fuzz corpus for the
+state record carries only fixed byte patterns, two of which are deliberately not private keys at all.
+
+**Missing, and in this order.** [Factory reset](../design/updates.md#factory-reset) — the request
+sector and its token exist in `lfw_store::reset` and nothing reads them, so an appliance cannot yet be
+told to give up its owner. Then the [signing delegation](../design/management.md) — the ABI is in
+`wire::signing` and has no consumer, so the cryptography domain still generates a key of its own for
+its own proof rather than asking this domain for a signature over the real one. After those: the CSR
+this domain's key would sign, the device certificate and trust anchor an owner delivers, the
+management endpoint beside them, and the configuration slot array — all four have a place in the
+record and nothing writes them.
 
 ## Cryptography and TLS
 
@@ -2216,9 +2298,9 @@ is *done* currently sits.
 | Foundation | Status | Notes |
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
-| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all nine protection-domain binaries — the hardware probe and the cryptography domain against their own SIMD target — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 27 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (17 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 28 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| QEMU end-to-end gate (19 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Two scenarios share ONE store medium so the second can be held to the identity the first minted on it, which is the only shape a persistence claim has. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

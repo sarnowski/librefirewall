@@ -914,6 +914,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-store"
+version = "0.1.0"
+dependencies = [
+ "lfw-crypto",
+ "lfw-x509",
+ "proptest",
+]
+
+[[package]]
 name = "lfw-tcp"
 version = "0.1.0"
 dependencies = [
@@ -1876,6 +1885,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "store"
+version = "0.1.0"
+dependencies = [
+ "lfw-blk",
+ "lfw-crypto",
+ "lfw-log",
+ "lfw-metrics",
+ "lfw-store",
+ "pd-runtime",
+ "sel4-microkit",
+ "virtio",
+ "wire",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2236,6 +2260,8 @@ dependencies = [
  "lfw-metrics",
  "lfw-recorder",
  "lfw-rtc",
+ "lfw-store",
+ "lfw-x509",
  "net-headers",
  "nic-driver-core",
  "pd-runtime",

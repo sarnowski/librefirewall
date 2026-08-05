@@ -109,10 +109,10 @@ use crate::log_slot::LogSlot;
 /// failed bring-up are the ones refused.
 ///
 /// It is what a wider record is spent against, and it wins: the shipped
-/// document's first generation alone is 16 change records. At 248 bytes a
-/// record, 64 of them plus the cursor and the drop count are 15 880 of the
-/// 16 384 the region already rounds to, so the growth costs neither the count
-/// nor the system description.
+/// document's first generation alone is 16 change records. At 264 bytes a
+/// record, 64 of them plus the cursor and the drop count are 16 904 bytes, so
+/// the region rounds to five pages rather than four — the count is what the
+/// width is spent against and the page is what the width costs.
 pub const LOG_RING_SLOTS: usize = 64;
 
 /// Bytes the system description reserves for one records region, derived rather

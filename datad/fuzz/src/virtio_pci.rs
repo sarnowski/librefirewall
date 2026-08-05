@@ -583,7 +583,10 @@ struct ScriptedBus {
 
 impl BusMaster for ScriptedBus {
     fn enable_dma(&self) {
-        self.record.borrow_mut().events.push(DeviceEvent::DmaEnabled);
+        self.record
+            .borrow_mut()
+            .events
+            .push(DeviceEvent::DmaEnabled);
     }
 }
 
@@ -832,7 +835,10 @@ fn assert_ordering(record: &DeviceRecord) {
     // reset is never granted it at all.
     match position(DeviceEvent::DmaEnabled) {
         Some(at) => {
-            assert_eq!(at, 1, "DMA was not granted right after the reset: {events:?}");
+            assert_eq!(
+                at, 1,
+                "DMA was not granted right after the reset: {events:?}"
+            );
             assert!(
                 !record.reset_refused,
                 "a device that refused its reset was granted DMA: {events:?}"

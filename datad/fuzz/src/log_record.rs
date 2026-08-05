@@ -93,7 +93,7 @@ use wire::{
 /// Restated from the ABI contract rather than taken from `size_of`, so a record
 /// that changed size would show up as a seed that no longer means what it was
 /// committed for rather than as a silently re-laid-out input.
-pub const RECORD_BYTES: usize = 248;
+pub const RECORD_BYTES: usize = 264;
 
 /// The four record kinds, as the ABI numbers them. Restated here rather than
 /// reached for through `LogKind::to_bits`, which is the code under test.
@@ -109,7 +109,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The eleven `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The eighteen `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -126,7 +126,9 @@ const DETAIL_EXCHANGE: u8 = 12;
 const DETAIL_PEER: u8 = 13;
 const DETAIL_ARENA: u8 = 14;
 const DETAIL_OPERATION: u8 = 15;
-const DETAIL_COUNT: u8 = 16;
+const DETAIL_IDENTITY: u8 = 16;
+const DETAIL_FINGERPRINT: u8 = 17;
+const DETAIL_COUNT: u8 = 18;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -145,9 +147,15 @@ const VALUE_SELECTOR: u8 = 9;
 const VALUE_PREFIX: u8 = 10;
 const VALUE_KIND_COUNT: u8 = 11;
 
-/// How many operands the record's array holds, which is what an
-/// `operand_count` past it names storage beyond.
+/// How many operand words a REFUSAL may name, which is what an `operand_count`
+/// past it names storage beyond. Two, and deliberately not the array's width:
+/// the console line's budget is the pair, and the wider storage exists for a
+/// digest rather than for a longer refusal.
 const MAX_OPERANDS: u8 = 2;
+
+/// How many operand words the record's array holds. Four, because a 256-bit
+/// fingerprint crosses whole; restated here on [`RECORD_BYTES`]'s terms.
+const OPERAND_WORDS: usize = 4;
 
 /// Octets of an IPv4 address, the prefix of the six a value slot carries.
 const IPV4_OCTETS: usize = 4;
@@ -188,6 +196,11 @@ fn narrow_discriminants(record: LogRecord) -> LogRecord {
     narrowed.state = record.state % (LOG_DOMAIN_STATE_COUNT + 2);
     narrowed.detail = record.detail % (DETAIL_COUNT + 1);
     narrowed.operand_count = record.operand_count % (MAX_OPERANDS + 2);
+    // The identity detail's flag word, folded to the band around the two values
+    // it admits so both the accepted and the refused side are reachable on a
+    // derived record. The other three words stay whole: they are unranged, and
+    // narrowing them would only make the accepted case narrower.
+    narrowed.operands[3] = record.operands[3] % 3;
     narrowed.signalled = record.signalled % 3;
     // Zero is the one value of this field a rule refuses and is unreachable by
     // chance over `u64`; one is the narrowest accepted frequency. The
@@ -439,7 +452,7 @@ fn assert_body_carries_only_what_its_kind_names(record: &LogRecord, body: &Check
 /// would be visible in the outcome whatever else the record held.
 const POISON: LogRecord = LogRecord {
     features: 0xAAAA_AAAA_AAAA_AAAA,
-    operands: [0xAAAA_AAAA_AAAA_AAAA; 2],
+    operands: [0xAAAA_AAAA_AAAA_AAAA; OPERAND_WORDS],
     kind: 0xAAAA_AAAA,
     generation: 0xAAAA_AAAA,
     sequence: 0xAAAA_AAAA,
@@ -542,15 +555,9 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // details join them for the same reason — their first word is
                 // a token rather than a count, but it is read from the same
                 // place and refused separately below.
-                DETAIL_EXTENT
-                | DETAIL_PROVEN
-                | DETAIL_PROVED
-                | DETAIL_MEASURED
-                | DETAIL_SESSION
-                | DETAIL_EXCHANGE
-                | DETAIL_PEER
-                | DETAIL_ARENA
-                | DETAIL_OPERATION => {
+                DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
+                | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
+                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -688,6 +695,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
     .or_else(|| match record.detail {
         // `Received`, `Medium`, `Extent` and `Proven` join these: two unranged
         // numbers each, so the detail carries nothing a rule can refuse it for.
+        // `Fingerprint` joins these: four unranged words, every bit pattern of
+        // which is a digest, so refusing one would refuse a fingerprint the
+        // appliance really computed.
         DETAIL_NONE
         | DETAIL_FEATURES
         | DETAIL_RECEIVE_POSTED
@@ -696,13 +706,24 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_EXTENT
         | DETAIL_PEER
         | DETAIL_ARENA
-        | DETAIL_PROVEN => None,
+        | DETAIL_PROVEN
+        | DETAIL_FINGERPRINT => None,
+        // The one detail whose fourth operand word is a flag rather than a
+        // number: an identifier and a generation are unranged, and a word that
+        // is neither 0 nor 1 would read as "unowned" on a record that said
+        // something else. Restated here as the two-value check it is.
+        DETAIL_IDENTITY => {
+            (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
+                value: record.operands[3],
+            })
+        }
         // The three details whose first operand word is a protocol registry
         // code point, which every TLS registry numbers in sixteen bits: a
         // wider word would render as a code point no registry has. Restated
         // here as the range check it is, on `DETAIL_PROVED`'s terms.
-        DETAIL_SESSION => wide_code_point(record.operands[0])
-            .or_else(|| wide_code_point(record.operands[1])),
+        DETAIL_SESSION => {
+            wide_code_point(record.operands[0]).or_else(|| wide_code_point(record.operands[1]))
+        }
         DETAIL_EXCHANGE => wide_code_point(record.operands[0]),
         // The two details whose first operand word is a token rather than a
         // count: it names a cryptographic primitive, so a word outside the set
@@ -812,9 +833,7 @@ fn value_refusal(value: &ValueImage, which: LogText) -> Option<LogRecordError> {
         VALUE_ABSENT | VALUE_IPV4 | VALUE_MAC | VALUE_GENERATION | VALUE_COUNT_KIND => None,
         // A prefix's length is narrowed exactly as a standalone one is: the same
         // byte on the console, so the same refusal for a word that does not fit.
-        VALUE_PORT | VALUE_PREFIX_LENGTH | VALUE_PREFIX => {
-            narrowing_refusal(value.number, which)
-        }
+        VALUE_PORT | VALUE_PREFIX_LENGTH | VALUE_PREFIX => narrowing_refusal(value.number, which),
         // The narrowing first and the boolean second: 256 does not fit the byte
         // a `Bool` is carried in, and 2 fits it and is still no boolean.
         VALUE_BOOL => narrowing_refusal(value.number, which).or_else(|| {
@@ -859,7 +878,12 @@ pub fn record_from_region(data: &[u8]) -> LogRecord {
 pub(crate) fn read_record(unstructured: &mut Unstructured<'_>) -> LogRecord {
     LogRecord {
         features: quad(unstructured),
-        operands: [quad(unstructured), quad(unstructured)],
+        operands: [
+            quad(unstructured),
+            quad(unstructured),
+            quad(unstructured),
+            quad(unstructured),
+        ],
         tsc_hz: quad(unstructured),
         unix_nanos: quad(unstructured),
         frames: quad(unstructured),
@@ -1049,7 +1073,7 @@ mod tests {
     /// operand count and the boolean at once.
     fn domain_record() -> LogRecord {
         LogRecord {
-            operands: [0x1af4, 0x1000],
+            operands: [0x1af4, 0x1000, 0, 0],
             kind: KIND_DOMAIN,
             domain: 1,
             state: 1,
@@ -1074,6 +1098,16 @@ mod tests {
             from: number_value(VALUE_PREFIX_LENGTH, 24),
             to: number_value(VALUE_PREFIX_LENGTH, 25),
             ..LogRecord::ZERO
+        }
+    }
+
+    /// A `Domain` record carrying the appliance's identity, with `onboarded` set
+    /// to whatever the caller asks — including a word that is no flag at all.
+    fn identity_record(onboarded: u64) -> LogRecord {
+        LogRecord {
+            detail: DETAIL_IDENTITY,
+            operands: [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 7, onboarded],
+            ..domain_record()
         }
     }
 
@@ -1187,6 +1221,35 @@ mod tests {
                     detail: DETAIL_RECEIVED,
                     frames: 4,
                     frame_bytes: 352,
+                    ..domain_record()
+                }),
+            ),
+            // The appliance's own identity, in the two shapes the flag word
+            // decides, and the fingerprint beside it. Committed rather than left
+            // to the fuzzer for the reason the clock's are: the identity detail
+            // is the only one whose refusal is a *word* outside a two-value set,
+            // and a uniform draw over `u64` never lands on 0 or 1.
+            (
+                "valid_domain_identity",
+                region_from_record(&identity_record(1)),
+            ),
+            (
+                "identity_flag_not_boolean",
+                region_from_record(&identity_record(2)),
+            ),
+            // Four operand words that are all a digest, which is what the array
+            // was widened for: a seed that reads them as two would leave the
+            // second half of every fingerprint uncovered.
+            (
+                "valid_domain_fingerprint",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_FINGERPRINT,
+                    operands: [
+                        0x0001_0203_0405_0607,
+                        0x0809_0a0b_0c0d_0e0f,
+                        0x1011_1213_1415_1617,
+                        0x1819_1a1b_1c1d_1e1f,
+                    ],
                     ..domain_record()
                 }),
             ),
@@ -1349,6 +1412,39 @@ mod tests {
             let line = assert_console_line_is_printable(at, &event);
             assert!(line.starts_with(b"LFW-"));
         }
+    }
+
+    /// The identity detail's flag word: one is a flag, two is not, and the
+    /// refusal names the word rather than coercing it to "unowned" — which would
+    /// report an appliance as having no owner on the strength of a word that said
+    /// something else.
+    #[test]
+    fn an_identity_flag_that_is_no_flag_is_refused_with_the_word_it_held() {
+        assert!(
+            record_from_region(&seed("valid_domain_identity"))
+                .check()
+                .is_ok()
+        );
+        assert_eq!(
+            record_from_region(&seed("identity_flag_not_boolean")).check(),
+            Err(LogRecordError::OperandFlagNotBoolean { value: 2 })
+        );
+    }
+
+    /// The four operand words a fingerprint occupies all survive the check, and
+    /// all four are read: a check that read two would accept a record whose
+    /// second half was another writer's bytes and render half a digest.
+    #[test]
+    fn all_four_operand_words_of_a_fingerprint_reach_the_decode() {
+        let record = record_from_region(&seed("valid_domain_fingerprint"));
+        let checked = record.check().expect("a digest refuses nothing");
+        assert!(matches!(
+            checked.body,
+            CheckedBody::Domain {
+                detail: CheckedDetail::Fingerprint { words },
+                ..
+            } if words == record.operands
+        ));
     }
 
     /// The seed that carries the whole reason this harness chains three crates:

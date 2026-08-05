@@ -217,6 +217,29 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
                 " primitive={primitive} cycles-per-operation={cycles}"
             )
         }
+        // The identifier the one way it is ever written: 32 lowercase
+        // hexadecimal characters, which is what an administrator compares
+        // against the onboarding page's rendering — the same rendering
+        // `peer-device=` above carries.
+        DomainDetail::Identity {
+            device,
+            generation,
+            onboarded,
+        } => write!(
+            cursor,
+            " device={device:032x} generation={generation} onboarded={onboarded}"
+        ),
+        // 64 lowercase hexadecimal characters, no separators, as one field.
+        // Written a nibble at a time rather than through a formatter over four
+        // words, because a `{:016x}` per word would silently shorten a word with
+        // a leading zero byte and produce a fingerprint that is not this one.
+        DomainDetail::Fingerprint(digest) => {
+            cursor.write_str(" fingerprint=")?;
+            for byte in digest {
+                write!(cursor, "{byte:02x}")?;
+            }
+            Ok(())
+        }
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -516,6 +539,68 @@ mod tests {
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=hardware-probe state=ready \
              aes=proven pclmul=proven preemptions=18446744073709551615 \
              iterations=18446744073709551615"
+        );
+    }
+
+    /// The two records the store domain makes about the appliance itself.
+    ///
+    /// The identifier is 32 hexadecimal characters and the fingerprint is 64, in
+    /// one field each and lowercase throughout: an administrator compares both
+    /// against another rendering character for character, and a second rendering
+    /// is what makes such a comparison careless.
+    #[test]
+    fn a_store_domain_renders_the_appliance_it_is_and_the_key_it_holds() {
+        let identity = |device, generation, onboarded| {
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::Identity {
+                    device,
+                    generation,
+                    onboarded,
+                },
+            })
+        };
+        assert_eq!(
+            identity(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, 1, false),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             device=0123456789abcdeffedcba9876543210 generation=1 onboarded=false"
+        );
+        // A leading zero nibble stays: an identifier is a fixed-width string,
+        // and one that shortened around a zero byte would be a different name.
+        assert_eq!(
+            identity(1, u64::MAX, true),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             device=00000000000000000000000000000001 \
+             generation=18446744073709551615 onboarded=true"
+        );
+
+        let mut digest = [0_u8; 32];
+        for (at, byte) in digest.iter_mut().enumerate() {
+            *byte = at as u8;
+        }
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::Fingerprint(digest),
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             fingerprint=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        // The all-zero digest, which is the one a per-word formatter would
+        // shorten to nothing at all.
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::Fingerprint([0; 32]),
+            }),
+            format!(
+                "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+                 fingerprint={}",
+                "0".repeat(64)
+            )
         );
     }
 
@@ -948,6 +1033,17 @@ mod tests {
                 primitive: Primitive::EcdsaP256,
                 cycles: u64::MAX,
             },
+            DomainDetail::Identity {
+                device: u128::MAX,
+                generation: u64::MAX,
+                onboarded: false,
+            },
+            DomainDetail::Identity {
+                device: u128::MAX,
+                generation: u64::MAX,
+                onboarded: true,
+            },
+            DomainDetail::Fingerprint([0xff; 32]),
         ];
         for detail in [
             RefusalDetail::None,
@@ -1015,6 +1111,14 @@ mod tests {
                     cycles,
                 }
             }),
+            any::<(u128, u64, bool)>().prop_map(|(device, generation, onboarded)| {
+                DomainDetail::Identity {
+                    device,
+                    generation,
+                    onboarded,
+                }
+            }),
+            any::<[u8; 32]>().prop_map(DomainDetail::Fingerprint),
             (
                 (0..causes.len()),
                 prop_oneof![

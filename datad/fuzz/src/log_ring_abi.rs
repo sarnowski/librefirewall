@@ -112,7 +112,7 @@ impl Width {
 /// location naturally aligned. A field that moved without this moving would
 /// fail there rather than silently putting a peer store in the wrong place.
 ///
-/// The runs, in order: `features`, the two `operands`, the two quads a measured
+/// The runs, in order: `features`, the FOUR `operands`, the two quads a measured
 /// clock carries, the two a terminal endpoint's counts do, the two a block
 /// medium's capacity and leading word do, and the record's own
 /// instant; the six `u32` counters from `kind` to `receive_posted`; the ten
@@ -120,17 +120,17 @@ impl Width {
 /// `cause` and `key`; `from.number`; the rest of `from`; `to.number`; the rest
 /// of `to`.
 const SEGMENTS: &[(usize, usize, usize, Width)] = &[
-    (0, 0, 10, Width::Quad),
-    (10, 80, 6, Width::Word),
-    (16, 104, 80, Width::Byte),
-    (96, 184, 1, Width::Word),
-    (97, 188, 28, Width::Byte),
-    (125, 216, 1, Width::Word),
-    (126, 220, 28, Width::Byte),
+    (0, 0, 12, Width::Quad),
+    (12, 96, 6, Width::Word),
+    (18, 120, 80, Width::Byte),
+    (98, 200, 1, Width::Word),
+    (99, 204, 28, Width::Byte),
+    (127, 232, 1, Width::Word),
+    (128, 236, 28, Width::Byte),
 ];
 
 /// How many separately writable atomics one slot holds.
-pub const LOCATION_COUNT: usize = 154;
+pub const LOCATION_COUNT: usize = 156;
 
 /// Which atomic of a slot a peer store lands in.
 ///
@@ -164,7 +164,7 @@ impl Location {
     /// Where this location sits within a slot, and how wide it is.
     ///
     /// Total by construction: `Location` is only ever built from a value
-    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..154`
+    /// reduced modulo [`LOCATION_COUNT`], and [`SEGMENTS`] covers `0..156`
     /// without a gap — which [`tests::the_segments_partition_the_whole_record`]
     /// is what proves. The fallback is the last run rather than a panic
     /// because a branch safe Rust cannot delete is not a failure to surface.
@@ -470,7 +470,7 @@ mod tests {
     fn a_record_round_trips_through_its_own_bytes() {
         let record = LogRecord {
             features: 0x0102_0304_0506_0708,
-            operands: [u64::MAX, 1],
+            operands: [u64::MAX, 1, 0, 0],
             kind: 1,
             generation: 0xDEAD_BEEF,
             reason: 29,

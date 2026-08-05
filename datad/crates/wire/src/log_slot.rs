@@ -26,8 +26,8 @@
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::log_record::{
-    CauseImage, IdentifierImage, LOG_CAUSE_BYTES, LOG_IDENTIFIER_BYTES, LogRecord, TextImage,
-    ValueImage,
+    CauseImage, IdentifierImage, LOG_CAUSE_BYTES, LOG_IDENTIFIER_BYTES, LOG_OPERANDS, LogRecord,
+    TextImage, ValueImage,
 };
 use crate::{load_bytes, store_bytes};
 
@@ -112,7 +112,7 @@ impl ValueSlot {
 #[repr(C)]
 pub(crate) struct LogSlot {
     features: AtomicU64,
-    operands: [AtomicU64; 2],
+    operands: [AtomicU64; LOG_OPERANDS],
     tsc_hz: AtomicU64,
     unix_nanos: AtomicU64,
     frames: AtomicU64,
@@ -148,7 +148,7 @@ impl LogSlot {
     pub(crate) const fn zero() -> Self {
         Self {
             features: AtomicU64::new(0),
-            operands: [const { AtomicU64::new(0) }; 2],
+            operands: [const { AtomicU64::new(0) }; LOG_OPERANDS],
             tsc_hz: AtomicU64::new(0),
             unix_nanos: AtomicU64::new(0),
             frames: AtomicU64::new(0),
@@ -225,7 +225,7 @@ impl LogSlot {
     }
 
     pub(crate) fn load(&self) -> LogRecord {
-        let mut operands = [0; 2];
+        let mut operands = [0; LOG_OPERANDS];
         for (value, cell) in operands.iter_mut().zip(&self.operands) {
             *value = cell.load(Ordering::Relaxed);
         }

@@ -28,6 +28,7 @@ members = [
     "crates/crypto",
     "crates/x509",
     "crates/tls",
+    "crates/store",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",
@@ -37,6 +38,7 @@ members = [
     "pds/recorder",
     "pds/hardware-probe",
     "pds/crypto",
+    "pds/store",
     "tools/xtask",
 ]
 default-members = ["tools/xtask"]

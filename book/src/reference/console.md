@@ -30,13 +30,14 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
 **`nic-driver`**, **`config`**, **`console`**, **`clock`**, **`management`**, **`recorder`**,
-**`hardware-probe`**, **`crypto`** — the domain names in the Microkit system description, nine
-tokens against eleven domains because the driver runs as three instances that share one token. **A `nic-driver` record therefore does not say
+**`hardware-probe`**, **`crypto`**, **`store`** — the domain names in the Microkit system
+description, ten tokens against twelve domains because the driver runs as three instances that
+share one token. **A `nic-driver` record therefore does not say
 which port it is about**, and nothing on this surface does: three instances publish into three rings
 the console interleaves, so the driver's records are not one port's transcript. `/metrics` is where
 the instances are separate, as `domain="nic_driver0"`, `1` and `2` (see
@@ -55,7 +56,8 @@ written waits forever:
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
 | `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
-| `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
+| `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
+| `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
 | `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; then two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
@@ -171,6 +173,33 @@ node: an operator holding a silent appliance still has only the external act.
   The key is `sectors=` on both records and it means two different things — a capacity on the first,
   an extent length on the rest — which is exactly why the pairing rule at the top of this section
   matters: read `sectors=` with the key beside it, `leading=` or `start=`, never alone.
+- `device=<32 hex> generation=<n> onboarded=<true|false>` — **which appliance this is**, and how
+  far its persistent state has advanced. The identifier is 128 bits the appliance drew for itself
+  on its first boot, rendered as exactly 32 lowercase hexadecimal characters — the certificate
+  profile's one rendering, the same string that is the subject common name of everything this
+  appliance's identity appears in. `generation=` is the state record's own counter, which advances
+  by one on every durable commit and never goes backwards; `onboarded=` says whether a management
+  plane has adopted the node.
+
+  The three travel together because none of them answers the operator's question alone: an
+  identifier without a generation cannot say whether the appliance came back or was just minted,
+  and a generation without the owner flag cannot say whether it has been adopted. **The same
+  identifier on two boots is the appliance having survived the reboot**, and it is the only place
+  that shows: nothing else on any surface carries the identifier, `/metrics` reporting whether there
+  *is* an identity and never which one.
+- `fingerprint=<64 hex>` — **the key this appliance authenticates with**: SHA-256 over the
+  DER-encoded `SubjectPublicKeyInfo` of its public key, rendered as exactly 64 lowercase hexadecimal
+  characters with no separators. It follows the `device=` record on the same `state=ready`.
+
+  This is the **one** rendering of a fingerprint anywhere: the onboarding page and the management
+  application display the same 64 characters, and an administrator compares two of them character
+  for character. A second rendering — colons, upper case, a truncation, or the digest split across
+  two records — is a defect and not a formatting choice, because two fingerprints that have to be
+  mentally normalised before comparing are two fingerprints that will be compared carelessly.
+
+  It is over the public *key* and not over a certificate, so the fingerprint verified at first
+  contact still names the appliance after a certificate is issued to it. **No private key material
+  appears here or on any other surface.**
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -198,10 +227,11 @@ node: an operator holding a silent appliance still has only the external act.
 
 ## `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the six tables together are the complete set: 23 the
+Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, and 33 the `crypto` domain
-raises. A token outside all six is a defect, not an extension. The `forwarder` and `console` domains raise none, having no
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 33 the `crypto` domain
+raises, and 36 the `store` domain raises. A token outside all seven is a defect, not an extension.
+The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
@@ -351,6 +381,44 @@ was answered no, which the session's own headroom check exists to make unreachab
 admitted it, which would mean the guard is not guarding; and `arena-starvation-unreachable` says
 the domain could not set up that starved case at all. All three are findings about the mechanism
 rather than about a cipher.
+
+**`store`.** Grouped by the step that refused, and the token's own prefix names it: `staging-` and
+`store-medium-` the device and the grant under it, `state-` a transfer of the record, `stored-` a
+record the medium carried that this build will not act on, `rdrand-` and `generator-` the randomness
+a key would descend from, and the rest the identity holding to itself. `signalled=` is `false` only
+on the first — every other refusal happens with the device live, having been told to run.
+
+| group | tokens |
+|---|---|
+| the staging grant (`detail=` is the rejected address, `0x0` meaning the `setvar` is missing or misspelled in the system description) | `staging-region-dma-base` |
+| the medium itself (`detail=` is the claimed capacity and the sectors this build's layout needs) | `store-medium-too-small` |
+| reading the record (`detail=` is the byte count on the short case and absent on the rest) | `state-read-refused`, `state-read-misattributed`, `state-read-failed`, `state-read-short`, `state-read-unanswered` |
+| writing it (same `detail=` rule) | `state-write-refused`, `state-write-misattributed`, `state-write-failed`, `state-write-short`, `state-write-unanswered` |
+| the barrier that makes the write durable (same `detail=` rule) | `state-barrier-refused`, `state-barrier-misattributed`, `state-barrier-failed`, `state-barrier-short`, `state-barrier-unanswered` |
+| a record this build will not act on (`detail=` is the length, the slot index, or the stored slot count and slot size, as the token names) | `stored-layout-mismatch`, `stored-certificate-too-long`, `stored-document-too-long`, `stored-slot-named-twice`, `stored-slot-outside-array`, `stored-named-slot-empty`, `stored-record-unusable` |
+| an identity that does not hold to itself (none carries a `detail=`) | `stored-scalar-unusable`, `stored-public-key-mismatch`, `stored-certificate-key-mismatch`, `stored-certificate-absent` |
+| minting one (none carries a `detail=`) | `device-key-ungenerable`, `onboarding-certificate-unwritable`, `public-key-unencodable`, `certificate-too-long-for-record` |
+| the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
+
+Every `stored-` token is a **physically present attacker's**, or a previous deployment's. This is the
+one domain whose input arrives on a disk somebody could have written at leisure, so a record that
+decodes is not yet a record this appliance may act on: it is checked against the layout this build
+compiles against, and then held to itself as an identity. A node refusing here is a node that
+declined to sign under a key it cannot prove is its own, which is the outcome to want.
+
+**`store` shares its four entropy tokens with `crypto` and `rdrand-exhausted` with `management`**,
+on the terms `nic-driver` and `recorder` share eighteen: each domain seeds its own generator from
+the same hardware by the same rules, so a broken `RDRAND` is the same fault in three places and
+renaming it per domain would make a reader learn three vocabularies for one part. **Read the token
+with the domain.** What differs is the consequence, and it is not the same at all: for `management`
+it is a per-boot sequence-number secret, for `crypto` the generator a session keys from, and for
+`store` the key this appliance's whole identity descends from.
+
+The three `state-*` groups are one fault three times and the group is what tells them apart, for the
+same reason. A refusal under `read` is a boot that learned nothing about the medium; under `write`, a
+boot that minted an identity and could not put it down; under `barrier`, one that put it down and
+could not make it durable — which is the case that would leave a power cut costing the identity, and
+the reason a barrier is issued and waited for rather than implied by the next transfer.
 
 The primitive names in `primitive=` are `sha-256`, `hmac-sha-256`, `hkdf-sha-256`, `chacha20`,
 `chacha20-poly1305`, `aes-256-gcm`, `chacha20-drbg`, `ecdsa-p256`, `x25519` and `ml-kem-768`. What

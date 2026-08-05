@@ -76,6 +76,7 @@ mod drbg;
 mod ecdsa;
 mod entropy;
 mod error;
+mod hardware;
 mod hash;
 mod kdf;
 mod mac;
@@ -94,6 +95,9 @@ pub use ecdsa::{
 };
 pub use entropy::Entropy;
 pub use error::CryptoError;
+pub use hardware::{
+    EntropyError, NodeEntropy, SEED_DRAWS, SEED_MATERIAL_LEN, fold_draws, hardware_seed, zeroize,
+};
 pub use hash::{DIGEST_LEN, Sha256, sha256};
 pub use kdf::{MAX_DERIVED_LEN, Prk, hkdf_expand, hkdf_extract};
 pub use mac::{HmacContext, HmacKey, MAC_LEN, hmac_sha256, hmac_sha256_verify};

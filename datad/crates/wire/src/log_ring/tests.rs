@@ -81,10 +81,10 @@ fn generation_of(record: &Result<CheckedRecord, LogRecordError>) -> Option<u32> 
 #[test]
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(LOG_RING_SLOTS, 64);
-    assert_eq!(size_of::<LogRecord>(), 248);
-    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 248);
-    assert_eq!(size_of::<LogRecords>(), 15_880);
-    assert_eq!(LOG_RECORDS_REGION_SIZE, 0x4000);
+    assert_eq!(size_of::<LogRecord>(), 264);
+    assert_eq!(size_of::<LogRecords>(), 8 + 64 * 264);
+    assert_eq!(size_of::<LogRecords>(), 16_904);
+    assert_eq!(LOG_RECORDS_REGION_SIZE, 0x5000);
     assert!(LOG_RECORDS_REGION_SIZE >= size_of::<LogRecords>());
     assert!(LOG_RECORDS_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
     assert_eq!(offset_of!(LogRecords, slots), 8);
@@ -149,7 +149,7 @@ fn a_record_survives_the_region_field_for_field() {
         domain: 2,
         state: 3,
         detail: LogDetailKind::Refusal.to_bits(),
-        operands: [0x1af4, 0x1000],
+        operands: [0x1af4, 0x1000, 0, 0],
         operand_count: 2,
         signalled: 1,
         ..LogRecord::ZERO

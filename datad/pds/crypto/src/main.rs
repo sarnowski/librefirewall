@@ -6,7 +6,7 @@
 //! what each costs on this part, seeds the node's random bit generator from
 //! hardware, and then parks.
 //!
-//! This is the second binary compiled with the SIMD target specification, and
+//! This is one of three binaries compiled with the SIMD target specification, and
 //! the reason that specification exists: with AES-NI and carry-less multiply
 //! enabled at compile time, the adopted cryptography crates' runtime backend
 //! detection folds to a constant and only the accelerated code is emitted. The
@@ -51,21 +51,30 @@
 //! consumed inside this file; the generator holds it, no record names it, and
 //! the raw draws are cleared before the buffer holding them goes out of scope.
 //! The only numbers that leave are counts and costs.
+//!
+//! # This domain seeds itself, and so does every other that holds a key
+//!
+//! The draw, its health check and the generator behind it are `lfw_crypto`'s, so
+//! two domains that each own key material do not each carry a copy of the rule
+//! for what a broken generator looks like. What they do not share is the
+//! generator: each seeds its own from the hardware, because a seed that crossed a
+//! channel would let the domain at the other end reproduce the key. `RDRAND` and
+//! `CPUID` are unprivileged and carried by no capability, so a domain seeding
+//! itself is granted nothing by this system description.
 
 extern crate alloc;
 
 mod arena;
-mod entropy;
 
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
 
 use lfw_crypto::{
-    Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, KEY_LEN, MlKem768DecapsulationKey,
-    MlKem768EncapsulationKey, NONCE_LEN, P256_MAX_SIGNATURE_LEN, P256SecretKey, Sha256,
-    VectorFailure, X25519Secret, prove_aes_256_gcm, prove_chacha20, prove_chacha20_poly1305,
-    prove_drbg, prove_ecdsa_p256, prove_hkdf_sha256, prove_hmac_sha256, prove_ml_kem_768,
-    prove_sha256, prove_x25519,
+    Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, EntropyError, KEY_LEN, MlKem768DecapsulationKey,
+    MlKem768EncapsulationKey, NONCE_LEN, NodeEntropy, P256_MAX_SIGNATURE_LEN, P256SecretKey,
+    SEED_MATERIAL_LEN, Sha256, VectorFailure, X25519Secret, hardware_seed, prove_aes_256_gcm,
+    prove_chacha20, prove_chacha20_poly1305, prove_drbg, prove_ecdsa_p256, prove_hkdf_sha256,
+    prove_hmac_sha256, prove_ml_kem_768, prove_sha256, prove_x25519, zeroize,
 };
 use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
@@ -77,7 +86,6 @@ use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
 use wire::{ClockCalibration, LogConsume, LogRecords};
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
-use entropy::{ENTROPY_LEN, EntropyError, NodeEntropy, draw_seed_material};
 
 /// The appliance's only allocator, and the one exception to the rule that a
 /// protection domain has none. It is here because a proven TLS implementation
@@ -541,8 +549,8 @@ fn session_refusal(error: SessionError) -> CryptoError {
 /// session below keys itself from this generator, so what proves the seeding
 /// and what keys the appliance are the same object.
 fn seed_generator() -> Result<Drbg, CryptoError> {
-    let mut raw = [0_u8; ENTROPY_LEN];
-    let drawn = draw_seed_material(&mut raw);
+    let mut raw = [0_u8; SEED_MATERIAL_LEN];
+    let drawn = hardware_seed(&mut raw);
     let outcome = drawn.map_err(|error| {
         CryptoError(match error {
             EntropyError::NotSupported { feature_word } => refusal(
@@ -574,17 +582,10 @@ fn seed_generator() -> Result<Drbg, CryptoError> {
         }
         Ok(generator)
     });
-    // Whatever happened above, the draws do not outlive this frame in
-    // readable form. Written through a volatile write so the compiler cannot
-    // remove a store to a value nothing reads again.
-    for byte in &mut raw {
-        // SAFETY: `write_volatile` requires a valid, aligned, writable pointer
-        // to a live value, and the guarantor is this function's own stack
-        // frame: `raw` is a local array still in scope, and the pointer comes
-        // from a mutable reference into it that the borrow checker proved
-        // unique. `u8` has alignment one, so no alignment obligation remains.
-        unsafe { core::ptr::write_volatile(byte, 0) };
-    }
+    // Whatever happened above, the draws do not outlive this frame in readable
+    // form. Through `lfw_crypto`, which is the one place in the appliance that
+    // clears key material, so the *how* is decided once rather than per caller.
+    zeroize(&mut raw);
     result
 }
 

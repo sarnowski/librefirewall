@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-101 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 383 counter and gauge series from the 11 shards,
+105 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 399 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 83 435 bytes — a worst case computed from
+declares, and the document they render into is bounded at 87 849 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -135,9 +135,9 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_device_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | `fault`&nbsp;(`completion_length_over_reported`, `completion_not_posted`, `completion_out_of_range`), `queue`&nbsp;(`receive`, `request`, `transmit`) | Virtqueue completions the device got wrong about its own protocol. **Each domain carries only the queues it has**: `receive` and `transmit` on a NIC driver, `request` on the recorder's block device. |
+| `librefirewall_device_faults_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | `fault`&nbsp;(`completion_length_over_reported`, `completion_not_posted`, `completion_out_of_range`), `queue`&nbsp;(`receive`, `request`, `transmit`) | Virtqueue completions the device got wrong about its own protocol. **Each domain carries only the queues it has**: `receive` and `transmit` on a NIC driver, `request` on the two block devices. |
 | `librefirewall_input_drops_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | `reason`&nbsp;(`rx_peer_ring_full`, `rx_runt`, `tx_discarded`, `tx_duplicate`, `tx_free_ring_full`, `tx_malformed`, `tx_verdict_undecodable`) | Frames this driver did not move for a reason outside itself: a peer or the wire. |
-| `librefirewall_invariant_faults_total` | counter | `forwarder`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | `fault`&nbsp;(`block_completion_unmapped`, `flow_slot_desync`, `rx_completion_unmapped`, `rx_slot_occupied`, `tx_completion_unmapped`, `tx_slot_occupied`) | A domain's own broken bookkeeping; ours, never traffic, expected to stay zero. **Each domain raises its own faults and no other's**: the four `rx_`/`tx_` faults are a NIC driver's, `block_completion_unmapped` the recorder's, and `flow_slot_desync` the forwarder's — the connection table finding no slot to allocate while believing it holds vacant ones. |
+| `librefirewall_invariant_faults_total` | counter | `forwarder`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | `fault`&nbsp;(`block_completion_unmapped`, `flow_slot_desync`, `rx_completion_unmapped`, `rx_slot_occupied`, `tx_completion_unmapped`, `tx_slot_occupied`) | A domain's own broken bookkeeping; ours, never traffic, expected to stay zero. **Each domain raises its own faults and no other's**: the four `rx_`/`tx_` faults are a NIC driver's, `block_completion_unmapped` either block domain's, and `flow_slot_desync` the forwarder's — the connection table finding no slot to allocate while believing it holds vacant ones. |
 | `librefirewall_pool_returns_refused_total` | counter | `management`, `nic_driver0`, `nic_driver1`, `nic_driver2` | `pool`&nbsp;(`receive`, `transmit`), `reason`&nbsp;(`ledger_refused`, `not_lent`) | Buffer returns a pool owner refused: forged, out of range, duplicated or never lent. **Each domain owns one pool**: `receive` on a NIC driver, `transmit` on the management port's endpoint. |
 | `librefirewall_receive_bytes_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Bytes those frames carried, after the device's own header. |
 | `librefirewall_receive_frames_total` | counter | `nic_driver0`, `nic_driver1`, `nic_driver2` | — | Frames this port's device delivered and the driver handed to its peer. |
@@ -198,17 +198,23 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_console_records_total` | counter | `console` | `outcome`&nbsp;(`malformed`, `printed`, `unknown`, `unrenderable`, `write_failed`) | Records the console path resolved, by outcome; each outcome accuses a different party. |
-| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain could not publish because its ring had no slot. |
-| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
+| `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain could not publish because its ring had no slot. |
+| `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
 | `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. Non-zero means this node has no console: the domain publishes its shard from the refusal path so that a scrape can say so. |
 | `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
 
-### The block device the recorder owns
+### The two block devices
+
+There are two, and the four families below carry both: the recorder's, which holds the recordings,
+and the store's, which holds the appliance's own persistent state. They are separate authorities
+rather than two views of one device — no domain maps any part of the other's — so `domain=` is what
+tells one device's numbers from the other's and reading either alone says nothing about the other.
 
 `librefirewall_block_capacity_sectors` is the device's own claim, taken once at bring-up and
 republished unchanged: it bounds every sector range the domain will name, so a device that came up
-smaller than the recording configured for it is visible in a scrape rather than only in a refusal.
+smaller than the recording — or the state layout — configured for it is visible in a scrape rather
+than only in a refusal.
 A sector is 512 bytes, fixed by the virtio 1.0 specification (its block-device section) regardless
 of the `blk_size` a device reports.
 
@@ -220,12 +226,12 @@ it reaches an operator as a console refusal rather than as a series.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_block_bytes_total` | counter | `recorder` | `operation`&nbsp;(`read`, `write`) | Bytes those requests moved, as the driver derived them rather than as the device claimed. |
-| `librefirewall_block_capacity_sectors` | gauge | `recorder` | — | Sectors the block device claimed at bring-up; the bound every range is judged against. |
-| `librefirewall_block_requests_total` | counter | `recorder` | `operation`&nbsp;(`read`, `write`) | Block requests the device completed successfully, by operation. |
-| `librefirewall_block_status_undecodable_total` | counter | `recorder` | — | Completions whose status byte was none of the three virtio-blk defines; the device's fault. |
+| `librefirewall_block_bytes_total` | counter | `recorder`, `store` | `operation`&nbsp;(`read`, `write`) | Bytes those requests moved, as the driver derived them rather than as the device claimed. |
+| `librefirewall_block_capacity_sectors` | gauge | `recorder`, `store` | — | Sectors the block device claimed at bring-up; the bound every range is judged against. |
+| `librefirewall_block_requests_total` | counter | `recorder`, `store` | `operation`&nbsp;(`read`, `write`) | Block requests the device completed successfully, by operation. |
+| `librefirewall_block_status_undecodable_total` | counter | `recorder`, `store` | — | Completions whose status byte was none of the three virtio-blk defines; the device's fault. |
 
-The recorder's virtqueue faults are **not** a family of their own: they are
+Either domain's virtqueue faults are **not** a family of their own: they are
 `librefirewall_device_faults_total{queue="request"}` and
 `librefirewall_invariant_faults_total{fault="block_completion_unmapped"}`, on the tables above. A
 virtqueue that lied about its own protocol is one kind of event whatever the queue carries, and an
@@ -424,6 +430,31 @@ parks, and never move again.
 | `librefirewall_crypto_vectors_proven_total` | counter | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Published NIST CAVP, RFC and Wycheproof vectors this node re-ran at bring-up and answered correctly, per primitive. |
 | `librefirewall_crypto_milli_cycles_per_byte` | gauge | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Thousandths of a timestamp-counter cycle per byte this node measured for a primitive at bring-up; 0 for a primitive it does not measure. |
 | `librefirewall_crypto_cycles_per_operation` | gauge | `crypto` | `primitive`&nbsp;(`sha_256`, `hmac_sha_256`, `hkdf_sha_256`, `chacha20`, `chacha20_poly1305`, `aes_256_gcm`, `chacha20_drbg`, `ecdsa_p256`, `x25519`, `ml_kem_768`) | Timestamp-counter cycles one operation of a primitive cost this node at bring-up, for the primitives whose work has one size rather than a length; 0 for a primitive measured per byte instead. |
+
+### The appliance's own identity
+
+The store domain reports here as well as on the console, so a scrape answers whether this node
+*has* an identity without a serial capture. The four families are written once, when the domain
+parks, and never move again.
+
+**The identifier itself is not here, and neither is any key.** A 128-bit name is not a number a time
+series can carry, and the private scalar has no representation on any surface at all; what this
+answers is whether there is an identity, whether this boot had to mint one, and how far the record
+has advanced. Which appliance it is, and which key it authenticates with, is on the
+[console](console.md) — the two places an administrator reads a rendering, and the only two.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_store_generation` | gauge | `store` | — | The generation of the state record this node is running on, which advances by one on every durable commit. A gauge rather than a counter: it is a position and not a rate. |
+| `librefirewall_store_identity` | gauge | `store` | — | 1 once this appliance's identity is established on the store medium — minted on a fresh medium or reloaded and verified from an existing one; 0 before, and forever on a node that refused. No key material is exposed here or anywhere else on this surface. |
+| `librefirewall_store_minted` | gauge | `store` | — | 1 where this boot minted a fresh identity because the medium carried none, 0 where it reloaded the one already there. A node whose value flips to 1 after a boot at 0 has lost its identity, which is the fleet's own alert rather than a fault of the boot. |
+| `librefirewall_store_onboarded` | gauge | `store` | — | 1 once a management plane has adopted this appliance, 0 while it is unowned. |
+
+**`librefirewall_store_minted` is the one to alert on.** An appliance mints exactly once in its life
+— on its first boot, and again only after a factory reset — so a node reporting 1 where a previous
+scrape reported 0 has lost the medium's contents, and every certificate issued to it now names a key
+it no longer holds. The generation beside it is the corroborating reading: a fresh mint is
+generation 1.
 
 **No series counts unsynchronized records, and that is deliberate.** Whether a domain has a
 calibration is visible on each record it emits — `time=unsynchronized` against an instant — so such

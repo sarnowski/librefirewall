@@ -15,14 +15,19 @@
          tap it may only read, and to the management domain by a download
          handover, and it holds no dataplane region of any kind. An eighth
          binary, the HARDWARE PROBE, holds no device and no channel at all: it
-         is one of the two domains compiled with the hardfloat SIMD target,
+         is one of the three domains compiled with the hardfloat SIMD target,
          proves the AES-NI/PCLMULQDQ/XMM profile once at boot, and parks. A
-         ninth, the CRYPTOGRAPHY domain, is the other: it holds no device and
+         ninth, the CRYPTOGRAPHY domain, is another: it holds no device and
          no channel either, proves every cryptographic primitive against its
          published vectors on this part, measures what each costs, seeds a
-         generator from RDRAND, and parks. The protection domains are
-         documented in pds/nic-driver, pds/forwarder, pds/management,
-         pds/recorder, pds/hardware-probe and pds/crypto. -->
+         generator from RDRAND, and parks. A tenth, the STORE domain, is the
+         third built with that target and the second to own a block device: it
+         holds the appliance's own persistent state on a device of its own,
+         mints an identity on a fresh medium or reloads and verifies the one
+         already there, reports which appliance this is, and parks. It holds no
+         channel either. The protection domains are documented in
+         pds/nic-driver, pds/forwarder, pds/management, pds/recorder,
+         pds/hardware-probe, pds/crypto and pds/store. -->
 
     <!-- ===================================================================
          The physical address map is a contract, and this is where it is
@@ -38,8 +43,9 @@
          Two opposite requirements, both satisfied today by one unstated
          quantity — the QEMU memory size:
 
-         * vq0..vq2 and blk_dma, the twelve pipeline regions and blk_io
-           (0x30000000..0x310CC000) must
+         * vq0..vq2, blk_dma and blk2_dma, the twelve pipeline regions and the
+           two staging windows blk_io and blk2_io
+           (0x30000000..0x3110D000) must
            lie INSIDE RAM. They are ordinary memory, and seL4 zeroes a frame
            retyped from a general-purpose untyped but not one retyped from a
            device untyped — which is what an address outside RAM yields. That
@@ -49,32 +55,36 @@
            first-party code re-checks it, and a region placed outside RAM would
            fail as unbacked reads at run time rather than as a build or boot
            error.
-         * bar0..bar3 (0x50000000..0x50010000) must lie OUTSIDE RAM, in the q35
+         * bar0..bar4 (0x50000000..0x50014000) must lie OUTSIDE RAM, in the q35
            32-bit PCI hole: each driver reprograms its device's 64-bit MMIO BAR
            to that address, so RAM underneath it would be shadowed by the
-           device's decode. The block device's BAR is the fourth and is placed on
-           exactly the terms the three NICs' are.
+           device's decode. The two block devices' BARs are the fourth and fifth
+           and are placed on exactly the terms the three NICs' are.
 
          Under `-m 1G` (tools/xtask/src/qemu.rs) low RAM is [0, 0x40000000),
          which puts the first group inside it and the second above it. The
          window either side is narrow and nothing checks it: RAM must now reach
-         past 0x310CC000 — 784.80 MiB rather than the 784.55 MiB the three ports
-         alone needed, so the recorder's staging region NARROWS the lower end of
-         that unasserted window by a further 256 KiB and every further device
-         narrows it again — while at 1280 MiB or more RAM reaches 0x50000000 and
-         swallows the BAR window. Changing `-m`, or targeting hardware with a
-         different memory map, means re-deriving this map. README's status
-         records the window as load-bearing and unasserted, and this is the
-         change that made it tighter rather than the change that closed it.
+         past 0x3110D000 — 785.05 MiB rather than the 784.80 MiB the recorder's
+         device alone needed and the 784.55 MiB the three ports alone did, so the
+         store device's staging region NARROWS the lower end of that unasserted
+         window by a further 256 KiB and every further device narrows it again —
+         while at 1280 MiB or more RAM reaches 0x50000000 and swallows the BAR
+         window. Changing `-m`, or targeting hardware with a different memory
+         map, means re-deriving this map. README's status records the window as
+         load-bearing and unasserted, and this is another change that made it
+         tighter rather than the change that closed it.
 
-         The staging region is by some way the largest single claim on that
-         window — 256 KiB where every other region added here costs four — and it
-         is the first thing to shrink if the window ever has to be given back:
-         nothing but how much the recorder can have in flight at once depends on
-         its size.
+         The two staging regions are by some way the largest single claims on
+         that window — 256 KiB each where every other region added here costs
+         four — and they are the first things to shrink if the window ever has to
+         be given back. For the recorder's, nothing but how much it can have in
+         flight at once depends on the size; for the store's, nothing at all
+         does, its whole record being eight sectors — but shrinking it means
+         giving one device class two staging bounds, which is a deliberate change
+         rather than a free one.
 
          The two configuration regions (cfg, cfgack) are the exception and are
-         deliberately NOT in the packed range, which now ends at 0x310CC000.
+         deliberately NOT in the packed range, which now ends at 0x3110D000.
          No device DMAs into them, so no driver needs their physical address, so
          no `setvar region_paddr` names them and the tool has no reason to
          demand a fixed one. Leaving it out is not a convenience: an unplaced
@@ -105,6 +115,14 @@
          topology and this page are one derivation rather than two numbers that
          happen to match. -->
     <memory_region name="ecam3" size="0x1000" phys_addr="0xE0028000" />
+    <!-- And the fifth, 00:06.0 — the virtio-blk device the STORE domain owns,
+         which is a second block device and not a second view of the recorder's.
+         Same derivation, one slot further on: 0xE0000000 + (6 << 15). The slot
+         is held to the guest topology from the other side exactly as the
+         recorder's is: `xtask::qemu` pins the store device at `addr=06.0`
+         beside the recorder's `addr=05.0`, so this page and the guest are one
+         derivation rather than two numbers that happen to match. -->
+    <memory_region name="ecam4" size="0x1000" phys_addr="0xE0030000" />
     <!-- Where each driver relocates its device's modern MMIO BAR (patched into
          the driver via region_paddr). Packed back to back from the base of the
          q35 32-bit PCI hole, so the three together are 0x50000000..0x5000C000.
@@ -121,6 +139,11 @@
          silently move the other. That the two numbers agree today is not a fact
          either crate promises. -->
     <memory_region name="bar3" size="0x4000" phys_addr="0x5000C000" />
+    <!-- The store device's BAR, packed immediately after the recorder's, so the
+         five together are 0x50000000..0x50014000. Its size is `lfw_blk`'s for
+         the reason `bar3`'s is: the two block devices are one device class, and
+         the NIC drivers' constant is a different crate's. -->
+    <memory_region name="bar4" size="0x4000" phys_addr="0x50010000" />
 
     <!-- The High Precision Event Timer's register block, and the third device
          region in this system.
@@ -291,6 +314,33 @@
          Size is `lfw_blk::BLK_IO_REGION_SIZE`, cached on the same footing as
          every DMA region above, and `xtask::sysdesc` compares both. -->
     <memory_region name="blk_io" size="0x40000" phys_addr="0x3108C000" />
+
+    <!-- The store device's two RAM regions, packed immediately after the
+         recorder's staging window, so the packed range now ends at 0x3110D000.
+
+         `blk2_dma` holds the request virtqueue for the second block device and
+         is one page for the reason `blk_dma` is: the queue, the per-slot request
+         headers and the status bytes fit it, and no payload crosses it.
+
+         `blk2_io` is where every byte of the appliance's own persistent state
+         crosses. It is `lfw_blk::BLK_IO_REGION_SIZE` — the same 256 KiB the
+         recorder's is — and that is the device class's grant rather than this
+         domain's appetite: the store's whole record is eight sectors, and a
+         narrower region would be a second staging bound for one device class,
+         which `IoRegion::attach`'s contract and `xtask::sysdesc`'s rule for the
+         region both hold to one number. It is the largest single claim this
+         change makes on the unasserted window above, and it is the first thing
+         to shrink if that window ever has to be given back — but shrinking it
+         means giving the block device class two staging bounds, which is a
+         change to make deliberately rather than to reach for.
+
+         BOTH ARE WITHHELD FROM EVERY OTHER DOMAIN, including the recorder. The
+         two block devices are separate authorities: the recorder cannot read or
+         write the appliance's identity, and the store domain cannot touch a
+         recording. A grant crossing that line would put the private scalar
+         within reach of the domain a download request reaches. -->
+    <memory_region name="blk2_dma" size="0x1000" phys_addr="0x310CC000" />
+    <memory_region name="blk2_io" size="0x40000" phys_addr="0x310CD000" />
 
     <!-- The configuration handover, one region per direction.
 
@@ -687,26 +737,28 @@
          a zeroed pair is a valid empty ring, so a domain may publish records
          during its own `init`, before the console domain has run at all, and
          they are still there when it comes up. -->
-    <memory_region name="log_forwarder" size="0x4000" />
+    <memory_region name="log_forwarder" size="0x5000" />
     <memory_region name="log_forwarder_consume" size="0x1000" />
-    <memory_region name="log_nic_driver0" size="0x4000" />
+    <memory_region name="log_nic_driver0" size="0x5000" />
     <memory_region name="log_nic_driver0_consume" size="0x1000" />
-    <memory_region name="log_nic_driver1" size="0x4000" />
+    <memory_region name="log_nic_driver1" size="0x5000" />
     <memory_region name="log_nic_driver1_consume" size="0x1000" />
-    <memory_region name="log_config" size="0x4000" />
+    <memory_region name="log_config" size="0x5000" />
     <memory_region name="log_config_consume" size="0x1000" />
-    <memory_region name="log_clock" size="0x4000" />
+    <memory_region name="log_clock" size="0x5000" />
     <memory_region name="log_clock_consume" size="0x1000" />
-    <memory_region name="log_nic_driver2" size="0x4000" />
+    <memory_region name="log_nic_driver2" size="0x5000" />
     <memory_region name="log_nic_driver2_consume" size="0x1000" />
-    <memory_region name="log_management" size="0x4000" />
+    <memory_region name="log_management" size="0x5000" />
     <memory_region name="log_management_consume" size="0x1000" />
-    <memory_region name="log_recorder" size="0x4000" />
+    <memory_region name="log_recorder" size="0x5000" />
     <memory_region name="log_recorder_consume" size="0x1000" />
-    <memory_region name="log_hardware_probe" size="0x4000" />
+    <memory_region name="log_hardware_probe" size="0x5000" />
     <memory_region name="log_hardware_probe_consume" size="0x1000" />
-    <memory_region name="log_crypto" size="0x4000" />
+    <memory_region name="log_crypto" size="0x5000" />
     <memory_region name="log_crypto_consume" size="0x1000" />
+    <memory_region name="log_store" size="0x5000" />
+    <memory_region name="log_store_consume" size="0x1000" />
 
     <!-- THE ARENA: the appliance's only allocator, and the only region in this
          system with no structure.
@@ -742,16 +794,16 @@
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
          that domain alone and read by the management domain alone.
 
-         WHY ELEVEN REGIONS AND NOT ONE. A region is the unit of grant, and the
+         WHY TWELVE REGIONS AND NOT ONE. A region is the unit of grant, and the
          property worth having here is that a domain's numbers are *its own
          testimony*: the management domain renders every one of them into the
-         exposition an operator scrapes, so it must read all eleven, and a single
-         shared region would make it a writer of all eleven too. It could then
+         exposition an operator scrapes, so it must read all twelve, and a single
+         shared region would make it a writer of all twelve too. It could then
          attribute a driver's dropped frames to another driver, or zero a count
          that accuses itself — and it is the domain that faces the
-         management-plane attacker. Eleven regions with eleven writers is what
+         management-plane attacker. Twelve regions with twelve writers is what
          makes each series a claim only its own domain can make, and it is the
-         same argument the twenty log regions make one step further: there the
+         same argument the twenty-two log regions make one step further: there the
          console cannot forge a *record*, here it cannot forge a *number*.
 
          PER-DOMAIN SERIES, NO TOTALS. Nothing in this node sums across shards.
@@ -817,6 +869,7 @@
     <memory_region name="stats_recorder" size="0x1000" />
     <memory_region name="stats_hardware_probe" size="0x1000" />
     <memory_region name="stats_crypto" size="0x1000" />
+    <memory_region name="stats_store" size="0x1000" />
 
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
@@ -1227,6 +1280,7 @@
         <map mr="stats_recorder" vaddr="0x5_008_000" perms="r" cached="true" setvar_vaddr="stats_recorder_vaddr" />
         <map mr="stats_hardware_probe" vaddr="0x5_009_000" perms="r" cached="true" setvar_vaddr="stats_hardware_probe_vaddr" />
         <map mr="stats_crypto" vaddr="0x5_00a_000" perms="r" cached="true" setvar_vaddr="stats_crypto_vaddr" />
+        <map mr="stats_store" vaddr="0x5_00b_000" perms="r" cached="true" setvar_vaddr="stats_store_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -1454,9 +1508,9 @@
         <setvar symbol="io_paddr" region_paddr="blk_io" />
     </protection_domain>
 
-    <!-- The hardware probe: the one domain compiled with the hardfloat SIMD
-         target. It proves at boot that such a domain loads and runs under this
-         kernel at all, that AES-NI and PCLMULQDQ answer their known answers,
+    <!-- The hardware probe: the FIRST domain compiled with the hardfloat SIMD
+         target, and the one the other two rest on. It proves at boot that such a
+         domain loads and runs under this kernel at all, that AES-NI and PCLMULQDQ answer their known answers,
          and that XMM state survives the kernel's context switches; it reports
          one record and parks. The protection domain is documented in
          pds/hardware-probe, and the cryptography domain is designed on what
@@ -1495,7 +1549,7 @@
         <map mr="stats_hardware_probe" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
-    <!-- The cryptography domain: the other binary compiled with the hardfloat
+    <!-- The cryptography domain: the second binary compiled with the hardfloat
          SIMD target, and the reason that target exists. It proves at boot that
          every cryptographic primitive this appliance owns answers its
          published NIST CAVP, RFC and Wycheproof vectors on this part, measures
@@ -1543,6 +1597,66 @@
         <map mr="log_crypto_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_crypto" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <map mr="arena_crypto" vaddr="0x6_000_000" perms="rw" cached="true" setvar_vaddr="arena_vaddr" />
+    </protection_domain>
+
+    <!-- The store domain: the one holder of the appliance's own identity, and
+         the third binary compiled with the hardfloat SIMD target.
+
+         WHAT IT IS FOR. It owns a SECOND virtio-blk device — function 00:06.0,
+         separate from the recorder's 00:05.0 — and on it the appliance's
+         persistent state: the device identifier, the P-256 keypair, the
+         self-signed onboarding certificate binding the two, the delivered trust
+         anchor and endpoint an owner leaves, and the configuration slot array.
+         On a fresh medium it mints that identity and writes it durably; on every
+         later boot it loads it, holds it to itself, reports which appliance
+         returned, and parks. The protection domain is documented in pds/store.
+
+         WHAT IT MAPS is the second block device and the four grants every
+         reporting domain here carries, and nothing else. Its ECAM page, its BAR
+         window, its DMA region and its staging window are `ecam4`, `bar4`,
+         `blk2_dma` and `blk2_io`, and NO other domain maps any of them — not the
+         recorder, which owns the other block device and no part of this one. It
+         maps NO ecam0..3, NO bar0..3, NO blk_dma and NO blk_io, so the domain
+         that holds the private scalar cannot read or write a recording and the
+         domain that answers a download cannot read the scalar. It maps NO
+         network region of any kind — no vq, no buffer pool of either dataplane
+         or management pipeline, no `ForwardRings`, no `ReturnRing` — NO
+         configuration region, NO tap, NO download region, and NO `<ioport>`.
+
+         WHY THAT MATTERS MORE HERE THAN ANYWHERE ELSE. The private scalar is
+         plaintext on this medium, deliberately and for want of anywhere to keep
+         a wrapping key, so physical possession of the store IS identity theft —
+         and this row is what makes possession the ONLY way to it. There is no
+         path from a packet to these bytes: no domain that terminates a
+         connection maps any part of this device, and this domain holds no
+         channel in either direction to any domain that does.
+
+         NO CHANNEL IN EITHER DIRECTION: it runs to completion in `init` and
+         parks where nothing can reach it, exactly as the clock, hardware-probe
+         and cryptography domains do. It draws its own randomness — `RDRAND` and
+         `CPUID` are unprivileged and carried by no capability, so this file can
+         neither grant nor withhold them — which is the point: a seed taken over a
+         channel would let the domain at the other end reproduce the device key.
+
+         PRIORITY 1, with the busy-loop domains, on the recorder's terms: it
+         polls its device for a completion rather than blocking on one, and a
+         higher priority would let it spin against domains that never yield. Its
+         waits are bounded by `lfw_blk`'s own poll budget and by nothing the
+         device controls, and it blocks for good the moment the identity is
+         established. -->
+    <protection_domain name="store" priority="1" stack_size="0x8000">
+        <program_image path="store.elf" />
+        <map mr="ecam4" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
+        <map mr="bar4" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
+        <map mr="blk2_dma" vaddr="0x10_200_000" perms="rw" cached="true" setvar_vaddr="dma_vaddr" />
+        <map mr="blk2_io" vaddr="0x10_300_000" perms="rw" cached="true" setvar_vaddr="io_vaddr" />
+        <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="log_store" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
+        <map mr="log_store_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="stats_store" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+        <setvar symbol="bar_paddr" region_paddr="bar4" />
+        <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
+        <setvar symbol="io_paddr" region_paddr="blk2_io" />
     </protection_domain>
 
     <!-- The console domain: the one holder of the serial controller.
@@ -1608,7 +1722,7 @@
          prints on boot and on faults, not per record — but it is the reason the
          single-writer claim is stated of the shipped profile.
 
-         WHAT IT MAPS: twenty log regions in ten pairs, and the perms are the
+         WHAT IT MAPS: twenty-two log regions in eleven pairs, and the perms are the
          whole of the argument, as they are for the forwarder's `cfg`/`cfgack`.
          Each `log_<domain>` is READ-ONLY here: this domain renders those
          records and must read them, and a console that could also write one
@@ -1618,7 +1732,8 @@
          domain that may make it. See the note beside those regions.
 
          It holds no pool, no dataplane ring, no configuration region, no ECAM
-         page and no BAR window, so a compromised console reaches no frame, no
+         page and no BAR window — neither block device's included — so a
+         compromised console reaches no frame, no
          NIC, and no configuration — the same shape of isolation the
          configuration domain has, in the other direction.
 
@@ -1666,6 +1781,8 @@
         <map mr="log_hardware_probe_consume" vaddr="0x4_810_000" perms="rw" cached="true" setvar_vaddr="log_hardware_probe_consume_vaddr" />
         <map mr="log_crypto" vaddr="0x4_900_000" perms="r" cached="true" setvar_vaddr="log_crypto_vaddr" />
         <map mr="log_crypto_consume" vaddr="0x4_910_000" perms="rw" cached="true" setvar_vaddr="log_crypto_consume_vaddr" />
+        <map mr="log_store" vaddr="0x4_a00_000" perms="r" cached="true" setvar_vaddr="log_store_vaddr" />
+        <map mr="log_store_consume" vaddr="0x4_a10_000" perms="rw" cached="true" setvar_vaddr="log_store_consume_vaddr" />
         <map mr="stats_console" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 

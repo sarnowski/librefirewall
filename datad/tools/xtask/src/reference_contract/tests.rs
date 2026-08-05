@@ -90,6 +90,8 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/management/src/main.rs", &["rdrand-exhausted"]),
         ("pds/hardware-probe/src/main.rs", &["aes-not-supported"]),
         ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
+        ("pds/store/src/main.rs", &["store-medium-too-small"]),
+        ("crates/store/src/identity.rs", &["stored-scalar-unusable"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/wire/src/lib.rs", &["source-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
@@ -114,6 +116,10 @@ fn sound_console() -> String {
         ),
         ("hardware-probe", &["aes-not-supported"]),
         ("crypto", &["rdrand-output-stuck"]),
+        (
+            "store",
+            &["store-medium-too-small", "stored-scalar-unusable"],
+        ),
     ])
 }
 
@@ -212,6 +218,10 @@ fn a_token_two_domains_share_is_not_a_finding() {
         ),
         ("hardware-probe", &["aes-not-supported"]),
         ("crypto", &["rdrand-output-stuck"]),
+        (
+            "store",
+            &["store-medium-too-small", "stored-scalar-unusable"],
+        ),
     ]);
     let findings = cause_findings(&sites, &console);
     assert!(findings.is_empty(), "{findings:#?}");
@@ -271,14 +281,14 @@ fn a_stated_per_domain_count_that_disagrees_with_its_own_table_is_a_finding() {
 #[test]
 fn a_stated_table_count_that_disagrees_with_the_tables_present_is_a_finding() {
     let console = sound_console().replace(
-        "six tables together are the complete set",
         "seven tables together are the complete set",
+        "eight tables together are the complete set",
     );
     let findings = cause_findings(&sound_sites(), &console);
     let joined = findings.join("\n");
-    assert!(joined.contains("6 refusal-cause table(s)"), "{joined}");
+    assert!(joined.contains("7 refusal-cause table(s)"), "{joined}");
     assert!(
-        joined.contains("the six tables together are the complete set"),
+        joined.contains("the seven tables together are the complete set"),
         "{joined}"
     );
 }

@@ -66,6 +66,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-crypto",
     "lfw-x509",
     "lfw-tls",
+    "lfw-store",
     "xtask",
 ];
 
@@ -106,6 +107,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-crypto",
     "lfw-x509",
     "lfw-tls",
+    "lfw-store",
 ];
 
 /// How many library crates carry the coverage floors.
@@ -191,6 +193,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "pd_runtime_pipeline",
     "nic_driver_paths",
     "find_virtio_caps",
+    "store_state",
 ];
 
 pub(crate) fn test_host(root: &Path) -> Result<(), String> {
@@ -368,33 +371,40 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
                 .args(["--", "-D", "warnings"]),
             &format!("lint protection domains for seL4 ({config} kernel configuration)"),
         )?;
-        // The SIMD protection domains, against their own target, exactly as
-        // `image::assemble` builds them: a lint of the softfloat compilation
-        // would prove nothing about the binary that ships.
-        run_command(
-            Command::new("cargo")
-                .current_dir(root)
-                .env("SEL4_INCLUDE_DIRS", &include_dir)
-                .env("CARGO_TARGET_DIR", &target_dir)
-                .env(
-                    image::CONFIG_PATH_VAR,
-                    root.join(image::CONFIGURATION_DOCUMENT),
-                )
-                .args([
-                    "clippy",
-                    "--locked",
-                    "--release",
-                    "-Z",
-                    "build-std=core,alloc",
-                    "-Z",
-                    "build-std-features=compiler-builtins-mem",
-                    "--target",
-                    image::SIMD_TARGET,
-                ])
-                .args(image::SIMD_SYSTEM_PDS.iter().flat_map(|pd| ["-p", pd]))
-                .args(["--", "-D", "warnings"]),
-            &format!("lint SIMD protection domains for seL4 ({config} kernel configuration)"),
-        )?;
+        // The SIMD protection domains, against their own target and one
+        // invocation each, exactly as `image::assemble` builds them: a lint of
+        // the softfloat compilation would prove nothing about the binary that
+        // ships, and a lint of all of them together would resolve a feature set
+        // no shipped domain is built with (`image::assemble` on why).
+        for pd in image::SIMD_SYSTEM_PDS {
+            run_command(
+                Command::new("cargo")
+                    .current_dir(root)
+                    .env("SEL4_INCLUDE_DIRS", &include_dir)
+                    .env("CARGO_TARGET_DIR", &target_dir)
+                    .env(
+                        image::CONFIG_PATH_VAR,
+                        root.join(image::CONFIGURATION_DOCUMENT),
+                    )
+                    .args([
+                        "clippy",
+                        "--locked",
+                        "--release",
+                        "-Z",
+                        "build-std=core,alloc",
+                        "-Z",
+                        "build-std-features=compiler-builtins-mem",
+                        "--target",
+                        image::SIMD_TARGET,
+                    ])
+                    .args(["-p", pd])
+                    .args(["--", "-D", "warnings"]),
+                &format!(
+                    "lint the {pd} SIMD protection domain for seL4 ({config} kernel \
+                     configuration)"
+                ),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1037,6 +1047,45 @@ mod tests {
                      coverage floor and tests each mismatch arm against a deliberately \
                      corrupted table. This file holds the hardware gate, the draw loop, the \
                      timing loop and the reporting, and nothing else.",
+                ),
+            },
+        ),
+        (
+            "store",
+            CoverageExclusion::OnlyObservableUnderSel4 {
+                qemu_evidence: "`xtask test-system` boots the deployable disk and \
+                                `store_contract.rs` judges the `LFW-PD domain=store` records its \
+                                serial output carries on the two scenarios whose subject is the \
+                                appliance's identity: exactly one record naming a device \
+                                identifier and exactly one naming a key fingerprint, each \
+                                rendered to the width and alphabet the certificate profile \
+                                defines. No boot can produce those records without this domain — \
+                                a third binary compiled with the hardfloat SIMD target — having \
+                                brought up a second virtio-blk device, read both copies of the \
+                                state record through its staging window, and either minted an \
+                                identity from its own `RDRAND`-seeded generator and written it \
+                                behind a device barrier or reloaded and verified the one already \
+                                there. Two of those boots share ONE medium, and the second must \
+                                report the identity the first minted — which is the claim this \
+                                domain exists for and which no host test can make, an identity \
+                                that did not survive a reboot not being an identity. `xtask \
+                                test-ab` boots the slot it selected through the same image.",
+                residue: Some(
+                    "The transfer refusals, the two record-refusal translations, the two `RDRAND` \
+                     refusals and the too-small-medium arm are reached by no QEMU test: the \
+                     harness attaches a correct device of the right size and every transfer \
+                     completes, so the paths that report a device or a medium misbehaving stay \
+                     unexecuted. That is first-party decision logic sitting in a PD where neither \
+                     the host floor nor the QEMU gate can measure it — a layering defect shared \
+                     with the other domains' refusal translations. What is *not* left here is the \
+                     identity itself: minting, verifying, every refusal they raise and the whole \
+                     on-medium format live in `lfw-store`, which carries the library coverage \
+                     floor and tests each refusal against a deliberately broken record — \
+                     including the two shapes a physical attacker would compose, a public point \
+                     that is not its scalar's and a certificate binding another key — nor the \
+                     hardware draw and its health check, which are `lfw-crypto`'s and carry that \
+                     crate's floor. This file holds the device bring-up, the transfers, the \
+                     seeding call and the reporting, and nothing else.",
                 ),
             },
         ),

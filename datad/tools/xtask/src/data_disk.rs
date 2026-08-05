@@ -399,3 +399,197 @@ fn diagnose(sector: &[u8; SECTOR_SIZE]) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+/// How large the store device is, in bytes.
+///
+/// One mebibyte, which is the medium `lfw_store`'s layout is sized against: the
+/// state record, the reset-request sector and the eight configuration slots come
+/// to [`lfw_store::STORE_SECTORS`], and everything past that is deliberately
+/// unused. Made exactly one mebibyte rather than exactly the layout, so a sector
+/// the appliance is *not* meant to touch exists to be found untouched.
+const STORE_DISK_BYTES: u64 = 1024 * 1024;
+
+/// One run's store device: the medium the appliance's own identity lives on.
+///
+/// # Why this is not a second [`DataDisk`]
+///
+/// The recorder's disk is created fresh for every invocation, and it must be: a
+/// scenario must not be able to pass on a witness sector some earlier guest
+/// wrote. The store's is the opposite kind of object. An identity that did not
+/// survive a reboot is not an identity, so the only way to judge one is to boot
+/// the *same medium* twice and hold the second boot's answer to the first's —
+/// which means one file outliving one invocation, deliberately, and a scenario
+/// saying so ([`StoreMedium`]).
+///
+/// Nothing on the host side reads this file's contents. That is deliberate and
+/// worth stating: it carries the appliance's private scalar in plaintext, and a
+/// harness that parsed it would be a second place that had to be trusted not to
+/// print one. What the gate compares is the console records the two boots
+/// produced — the public name and the public-key fingerprint — which is exactly
+/// what an administrator compares.
+pub(crate) struct StoreDisk {
+    path: PathBuf,
+}
+
+impl StoreDisk {
+    /// Create a fresh medium for `run_label`, replacing any file an earlier run
+    /// of the same label left.
+    ///
+    /// Zero-filled and nothing else — no seed pattern, unlike the recorder's
+    /// disk. A zeroed medium is what `lfw_store::decode_state` reads as "no
+    /// record", so this is the state a first boot must mint from, and putting a
+    /// recognisable pattern in sector 0 would put it inside the state record's
+    /// first copy and make the medium a *malformed* record rather than an absent
+    /// one. Those are two different boots.
+    ///
+    /// # Errors
+    /// Anything that stops the file being created at exactly its size.
+    pub(crate) fn create(root: &Path, run_label: &str) -> Result<Self, String> {
+        let path = Self::path_for(root, run_label);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let file =
+            File::create(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        file.set_len(STORE_DISK_BYTES)
+            .map_err(|error| format!("size {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("flush {}: {error}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    /// The medium an earlier boot left behind, for a scenario whose whole subject
+    /// is that an identity survives a reboot.
+    ///
+    /// # Errors
+    /// The file not being there, which names the boot that was supposed to leave
+    /// it. On a full run that is a scenario ordering defect; on a diagnostic
+    /// re-run of this scenario alone it is expected, because the boot that mints
+    /// the medium is a different scenario and was not re-run — so the message
+    /// says both.
+    pub(crate) fn carried(root: &Path, source_label: &str) -> Result<Self, String> {
+        let path = Self::path_for(root, source_label);
+        if !path.exists() {
+            return Err(format!(
+                "the store medium {} is not there, and this boot's whole subject is reloading the \
+                 identity the {source_label} boot minted on it. On a full run that means the two \
+                 scenarios are out of order — the boot that mints the medium must precede the one \
+                 that reloads it. On a diagnostic re-run of this scenario alone it is expected: \
+                 the minting boot is a different scenario and was not re-run, so run the pair",
+                path.display()
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn path_for(root: &Path, label: &str) -> PathBuf {
+        root.join("build/image").join(format!("store-{label}.img"))
+    }
+
+    /// Attach this image to a QEMU invocation as the modern virtio-blk device at
+    /// 00:06.0.
+    ///
+    /// The PCI address is the whole of what joins this to the appliance: the
+    /// system description grants `ecam4` at PCIEXBAR + (6 << 15), which is the
+    /// configuration page of exactly this function, and the store domain holds
+    /// that page and no other. One slot past the recorder's `05.0`, so the two
+    /// block devices are two authorities rather than two views of one.
+    pub(crate) fn attach(&self, command: &mut Command) {
+        command
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=store,format=raw,file={}",
+                self.path.display()
+            ))
+            .args([
+                "-device",
+                "virtio-blk-pci,drive=store,bus=pcie.0,addr=06.0,\
+                 disable-legacy=on,disable-modern=off",
+            ]);
+    }
+
+    /// Assert the medium is no longer the zeroes it was made as — the one thing
+    /// about it the host may say without reading what it holds.
+    ///
+    /// This is the counterpart of the recorder's witness assertion and it is
+    /// deliberately weaker: the recorder writes a *published constant* and the
+    /// store writes an identity, so there is nothing here to compare against.
+    /// What it establishes is the half a console record cannot: bytes reached the
+    /// medium at all, so a domain that composed a record and never got it past
+    /// the staging window is caught rather than believed. The record's *content*
+    /// is judged where an administrator judges it — on the console, across two
+    /// boots.
+    ///
+    /// It reads the first sixteen bytes and no more: the magic and the version,
+    /// which are the only fields of this medium that are not the appliance's
+    /// secret or derived from it.
+    ///
+    /// # Errors
+    /// The leading bytes being zero, which is a medium nothing wrote.
+    pub(crate) fn judge_written(&self) -> Result<String, String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|error| format!("open {}: {error}", self.path.display()))?;
+        let mut leading = [0u8; 16];
+        file.read_exact(&mut leading)
+            .map_err(|error| format!("read {}: {error}", self.path.display()))?;
+        let magic = lfw_store::STATE_MAGIC.to_le_bytes();
+        if leading[..8] != magic {
+            return Err(format!(
+                "the store medium's first sector does not open with the state record's magic, so \
+                 nothing the store domain composed reached the medium\n  \
+                 expected the first bytes {:02x?}\n  \
+                 found the first bytes    {:02x?}\n  image: {}",
+                magic,
+                &leading[..8],
+                self.path.display()
+            ));
+        }
+        let version = u32::from_le_bytes([leading[8], leading[9], leading[10], leading[11]]);
+        if version != lfw_store::STATE_VERSION {
+            return Err(format!(
+                "the store medium carries record version {version} and this build writes {}\n  \
+                 image: {}",
+                lfw_store::STATE_VERSION,
+                self.path.display()
+            ));
+        }
+        Ok(format!(
+            "the store medium's first sector opens with the state record's magic and version \
+             {version}, so the identity reached the medium ({})",
+            self.path.display()
+        ))
+    }
+
+    /// Assert the opposite: that nothing wrote the medium at all.
+    ///
+    /// What turns the assertion above from a check into evidence, on
+    /// [`DataDisk::judge_untouched`]'s terms: a halt scenario boots a disk with
+    /// no bootable slot, so no protection domain runs, and the same file attached
+    /// the same way must come back as the zeroes it was made as.
+    ///
+    /// # Errors
+    /// Any non-zero byte in the leading sector.
+    pub(crate) fn judge_untouched(&self) -> Result<String, String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|error| format!("open {}: {error}", self.path.display()))?;
+        let mut sector = [0u8; SECTOR_SIZE];
+        file.read_exact(&mut sector)
+            .map_err(|error| format!("read {}: {error}", self.path.display()))?;
+        if sector == [0u8; SECTOR_SIZE] {
+            return Ok(
+                "the store medium is untouched, as a boot with no bootable slot owes".to_owned(),
+            );
+        }
+        Err(format!(
+            "the store medium's first sector was written by a boot that reached no protection \
+             domain\n  found the first bytes {:02x?}\n  image: {}",
+            &sector[..16],
+            self.path.display()
+        ))
+    }
+}

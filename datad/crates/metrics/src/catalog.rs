@@ -36,7 +36,7 @@
 
 use crate::sample::{
     ClockSample, ConfigSample, ConsoleSample, CryptoSample, DriverSample, ForwarderSample,
-    HardwareProbeSample, ManagementSample, RecorderSample,
+    HardwareProbeSample, ManagementSample, RecorderSample, StoreSample,
 };
 
 /// Whether a series is a monotonic total or a value that may move in either
@@ -541,6 +541,37 @@ pub const CRYPTO_CYCLES_PER_OPERATION: Metric = metric(
      byte instead.",
 );
 
+// ── The appliance's own identity ─────────────────────────────────────────────
+
+pub const STORE_IDENTITY: Metric = metric(
+    "librefirewall_store_identity",
+    Kind::Gauge,
+    "1 once this appliance's identity is established on the store medium — minted on a fresh \
+     medium or reloaded and verified from an existing one; 0 before, and forever on a node that \
+     refused. No key material is exposed here or anywhere else on this surface.",
+);
+
+pub const STORE_MINTED: Metric = metric(
+    "librefirewall_store_minted",
+    Kind::Gauge,
+    "1 where this boot minted a fresh identity because the medium carried none, 0 where it \
+     reloaded the one already there. A node whose value flips to 1 after a boot at 0 has lost \
+     its identity, which is the fleet's own alert rather than a fault of the boot.",
+);
+
+pub const STORE_GENERATION: Metric = metric(
+    "librefirewall_store_generation",
+    Kind::Gauge,
+    "The generation of the state record this node is running on, which advances by one on every \
+     durable commit. A gauge rather than a counter: it is a position and not a rate.",
+);
+
+pub const STORE_ONBOARDED: Metric = metric(
+    "librefirewall_store_onboarded",
+    Kind::Gauge,
+    "1 once a management plane has adopted this appliance, 0 while it is unowned.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -900,6 +931,10 @@ pub const ALL_METRICS: &[&Metric] = &[
     &BLOCK_REQUESTS,
     &BLOCK_BYTES,
     &BLOCK_STATUS_UNDECODABLE,
+    &STORE_IDENTITY,
+    &STORE_MINTED,
+    &STORE_GENERATION,
+    &STORE_ONBOARDED,
     &RECORDING_RECORDS,
     &RECORDING_RECORD_BYTES,
     &RECORDING_RECORDS_DROPPED,
@@ -1008,12 +1043,16 @@ pub const SHARDS: [ShardSpec; SHARD_COUNT] = [
         domain: "crypto",
         series: CryptoSample::SERIES,
     },
+    ShardSpec {
+        domain: "store",
+        series: StoreSample::SERIES,
+    },
 ];
 
 /// How many shards a snapshot carries. A build fact — the system description
 /// declares one region per protection domain — and `xtask::sysdesc` holds the
 /// description to it from the other side.
-pub const SHARD_COUNT: usize = 11;
+pub const SHARD_COUNT: usize = 12;
 
 /// Where the forwarder's shard sits in [`SHARDS`], for the cross-check the QEMU
 /// gate makes against traffic it observed itself.

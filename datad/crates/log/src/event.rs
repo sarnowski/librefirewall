@@ -58,6 +58,7 @@ closed_vocabulary! {
         Recorder => "recorder",
         HardwareProbe => "hardware-probe",
         Crypto => "crypto",
+        Store => "store",
     }
 }
 

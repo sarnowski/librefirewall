@@ -132,8 +132,8 @@
 pub mod blk;
 pub mod config_submission;
 pub mod document;
-pub mod flow;
 pub mod driver;
+pub mod flow;
 pub mod frame;
 pub mod free_list;
 pub mod guard;
@@ -150,6 +150,7 @@ pub mod recording;
 pub mod region;
 pub mod ring_abi;
 pub mod spsc_ring;
+pub mod store_state;
 pub mod tcp;
 pub mod virtio_pci;
 pub mod virtqueue;
