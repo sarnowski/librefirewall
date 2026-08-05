@@ -2036,19 +2036,22 @@ mutually-authenticated TLS 1.3 session with itself** — `TLS_CHACHA20_POLY1305_
 ways, closed with an alert — before running a second, deliberately starved session that must be
 refused. It holds the appliance's only allocator: a 2 MiB region mapped into it and nothing else.
 
-**Two recorded deviations from the design chapters, both deliberate.**
+**Two library choices were settled by what the build found, and the design now names what shipped.**
 
-*The post-quantum crate is the second source, not the first.* `libcrux-ml-kem` builds for this
-target — that assumption is resolved and the answer is yes — but its transitive dependency graph
-puts a second major version of a random-number crate into the build, which the dependency policy
-denies, and pulls a libc binding into an appliance with no libc. RustCrypto `ml-kem`, the second
-source the same chapter names, costs no policy exception. The crate header records this at the
-deviation.
+*The post-quantum primitive is RustCrypto `ml-kem`.* `libcrux-ml-kem` — formally verified, and the
+first choice while it was still a hypothesis — builds for this target: that assumption is resolved
+and the answer is yes. What it costs is the dependency policy: a transitive crate of its own takes
+an unconditional dependency on a random-number crate a major version ahead of the one the
+elliptic-curve crates already use, which puts two versions in the graph, and it pulls a libc binding
+into an appliance with no libc. RustCrypto `ml-kem` is audited and FIPS 203 final and costs no
+exception at all, so it is what is adopted and what the architecture chapter now names. The
+formal-verification assurance is the price paid, and recovering it needs upstream to loosen that
+dependency.
 
-*Certificate generation is first-party, not `rcgen`.* `rcgen`'s ASN.1 back end is enabled with that
-crate's `std` feature unconditionally and no feature combination drops it, so it does not build for
-a target with no operating system whatever signing back end it is driven with. The four DER
-structures the profile fixes are written here instead; they carry no algorithm of their own.
+*Certificate generation is first-party.* `rcgen`'s ASN.1 back end is enabled with that crate's `std`
+feature unconditionally and no feature combination drops it, so it does not build for a target with
+no operating system whatever signing back end it is driven with. The four DER structures the profile
+fixes are written here instead; they carry no algorithm of their own.
 
 **Missing.** Nothing dials with any of this: the transport cannot open a connection, there is no
 channel and no onboarding server, and the cryptography domain holds no device and no channel of its

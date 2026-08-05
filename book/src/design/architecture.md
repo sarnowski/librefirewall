@@ -246,14 +246,13 @@ The stack, chosen for proven provenance, post-quantum readiness, and the hardwar
 | Layer | Choice | Why |
 |---|---|---|
 | TLS | **rustls**, `no_std` + `alloc` | Battle-proven; TLS 1.3, client and server, mutual TLS; custom provider is the expected shape |
-| Post-quantum key exchange | **libcrux-ml-kem** | Formally verified, portable path needs no AVX2, `no_std`; what Firefox ships for X25519MLKEM768 |
-| Post-quantum second source | RustCrypto `ml-kem` | Audited, FIPS 203 final |
+| Post-quantum key exchange | **RustCrypto `ml-kem`** | Audited, FIPS 203 final, `no_std`, and it adds nothing to the dependency graph the rest of the stack does not already carry |
 | AEAD | **ChaCha20-Poly1305** for the channel; AES-GCM via AES-NI | ChaCha20 is designed for scalar execution; with AES-NI present, AES-GCM is the fast path for the eventual inspection product |
 | Classical key exchange | X25519 | |
 | Signatures | ECDSA P-256 | Interoperates with any CA tooling and with the BEAM's certificate handling natively |
 | Hash, HMAC, HKDF | RustCrypto `sha2` family, SHA-NI when detected | |
 | Chain validation | `rustls-webpki` | rustls-family |
-| Certificate and CSR generation | `rcgen` | rustls-family, explicit CSR support |
+| Certificate and CSR generation | first-party | The rustls-family generator cannot be built for a freestanding target: it carries a DER library whose standard-library dependency is not optional. A certificate signing request and a self-signed certificate are small structures whose every field the certificate profile fixes, so the appliance writes them itself and is held to the profile |
 
 Several RustCrypto crates select a backend at runtime and fall back silently to a portable
 implementation when detection fails. The appliance therefore **positively asserts that the

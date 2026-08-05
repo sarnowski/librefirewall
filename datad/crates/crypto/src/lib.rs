@@ -30,19 +30,19 @@
 //! rate with has not moved, so ML-KEM is here for key exchange and nothing
 //! signs with anything but P-256.
 //!
-//! # Which ML-KEM, and the one place this departs from the stated design
+//! # Which ML-KEM, and why not the formally verified one
 //!
 //! The post-quantum primitive is the RustCrypto `ml-kem` crate and not
-//! `libcrux-ml-kem`, which the architecture names first for its formal
-//! verification. libcrux was investigated and builds cleanly for this target;
+//! `libcrux-ml-kem`, whose formal verification would have been the stronger
+//! assurance. libcrux was investigated and builds cleanly for this target;
 //! what it costs is the dependency policy. Its transitive `libcrux-traits`
 //! takes an unconditional dependency on a random-number crate a major version
 //! ahead of the one the elliptic-curve crates here use, which puts two
 //! versions of it in the graph — a duplicate the policy denies — and it pulls
-//! a libc binding into an appliance that has no libc. The second source the
-//! architecture names is what is adopted instead, on the same terms as every
-//! other crate here: pinned, and proved on the shipped image against the
-//! published known-answer tests rather than trusted.
+//! a libc binding into an appliance that has no libc. The crate adopted
+//! instead is audited and final against its standard, and stands on the same
+//! terms as every other crate here: pinned, and proved on the shipped image
+//! against the published known-answer tests rather than trusted.
 //!
 //! # Adversary
 //!
