@@ -437,6 +437,16 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Fingerprint.to_bits();
                     record.operands = digest_words(digest);
                 }
+                DomainDetail::Reset {
+                    generation,
+                    documents,
+                    was_owned,
+                } => {
+                    record.detail = LogDetailKind::Reset.to_bits();
+                    // The flag in the fourth word, which is where this ABI
+                    // carries every flag an operand holds.
+                    record.operands = [*generation, *documents, 0, u64::from(*was_owned)];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -618,6 +628,18 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
         },
         // And here: every bit pattern of four words is a digest.
         CheckedDetail::Fingerprint { words } => DomainDetail::Fingerprint(digest_bytes(words)),
+        // Total for `Identity`'s reason: `wire` ranged the flag, and a generation
+        // and a count are numbers every bit pattern of which a reset could have
+        // found.
+        CheckedDetail::Reset {
+            generation,
+            documents,
+            was_owned,
+        } => DomainDetail::Reset {
+            generation: *generation,
+            documents: *documents,
+            was_owned: *was_owned,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -704,6 +726,15 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         onboarded,
                     },
                     DomainDetail::Fingerprint(digest) => DomainDetail::Fingerprint(digest),
+                    DomainDetail::Reset {
+                        generation,
+                        documents,
+                        was_owned,
+                    } => DomainDetail::Reset {
+                        generation,
+                        documents,
+                        was_owned,
+                    },
                     DomainDetail::Measured {
                         primitive,
                         milli_cycles_per_byte,

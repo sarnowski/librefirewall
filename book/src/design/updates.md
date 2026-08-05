@@ -53,13 +53,52 @@ filesystem implementation exists in the appliance at all.
 
 Factory reset is **local-only and never remotely triggerable** — no channel operation, no
 configuration document, and no management-server action can invoke it, because it is the mechanism
-that revokes a management plane's ownership and must not be reachable by one. It wipes the device
-private key, the issued certificate, the trust anchor, the endpoint, the configuration history, and
-the recordings, returning the appliance to unowned — ready for
-[onboarding](management.md#onboarding) as if factory-fresh. It **overwrites** the stored bytes
-rather than marking them free, because the store medium holds the key in plaintext (see the
-[threat model](threat-model.md)) and a freed sector is a kept secret. It emits a console record, so
-the one surface an unowned appliance has states what happened.
+that revokes a management plane's ownership and must not be reachable by one. It returns the
+appliance to unowned, ready for [onboarding](management.md#onboarding) as if factory-fresh, and it
+**overwrites** the bytes it destroys rather than marking them free: the store medium holds the key
+in plaintext (see the [threat model](threat-model.md)) and a freed sector is a kept secret.
+
+**It is asked for by writing one sector of a medium**, which is the only path into a node that has
+no shell and no input surface. Every other candidate is either remote or absent: a channel operation
+and a configuration document are both the management plane's; the console is output-only, and giving
+it an input path would add an input surface to the domain that owns the serial controller; and a
+jumper has no representation in a virtual machine. Writing that sector requires physical possession
+of the medium, which is exactly the boundary
+[ownership already rests on](management.md#the-ownership-trust-model). The argument that it cannot be
+reached remotely is a capability argument rather than a claim about code: one protection domain in
+the system maps the store device at all, that domain holds no network region, no configuration
+region and no channel from any domain that terminates a connection, and nothing else anywhere writes
+that sector.
+
+**Each medium holding an owner's data carries its own request and its own overwrite.** That follows
+from the isolation rather than softening it: the node's own state lives on the store device and the
+recordings on the recorder's, owned by two protection domains neither of which maps a byte of the
+other's — which is what keeps the domain holding the private scalar unable to read a recording and
+the domain answering a download unable to read the scalar. A reset reaching across from one to the
+other would breach exactly the property that isolation exists for. So each medium is reset on its
+own terms, and the physical boundary stays exact, because the visit that writes the store's request
+sector reaches the recorder's medium too.
+
+**The request is cleared before anything is destroyed, and the order is deliberate.** A power cut
+between the two leaves an appliance whose identity is partly gone and which will not reset again on
+the next boot: a node an operator re-onboards, and recoverable. The opposite order leaves one that
+resets on every boot forever, which is a bricked appliance nobody can onboard. So the clearing write
+is made durable — a device flush, waited for — before the overwrite is submitted.
+
+A reset is honoured on the strength of that sector **alone**, before the state record is judged and
+whether or not it decodes. A record the appliance refuses is precisely the state a reset is the
+remedy for, and a node that demanded a coherent identity before it would give one up could never be
+recovered.
+
+On the store medium the reset overwrites every sector the layout claims — the state record's two
+copies, the request sector itself, and the whole configuration slot array — rather than the fields
+that happen to hold a secret, because the answer to "which sectors are the secret ones" would
+otherwise come from the record the step exists to destroy. The overwrite is made durable on its own
+before a fresh identity is minted over it, so a boot whose randomness turns out unusable refuses
+with the old key already gone. Then the appliance mints exactly as it would on a fresh medium: a
+reset node is immediately onboardable, which is what unowned means. It emits a console record naming
+what was cleared — the generation, how many configuration versions went with it, and whether there
+was an owner to give up — so the one surface an unowned appliance has states what happened.
 
 ## Boot manager and slot selection
 

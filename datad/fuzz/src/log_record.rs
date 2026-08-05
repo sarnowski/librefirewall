@@ -128,7 +128,8 @@ const DETAIL_ARENA: u8 = 14;
 const DETAIL_OPERATION: u8 = 15;
 const DETAIL_IDENTITY: u8 = 16;
 const DETAIL_FINGERPRINT: u8 = 17;
-const DETAIL_COUNT: u8 = 18;
+const DETAIL_RESET: u8 = 18;
+const DETAIL_COUNT: u8 = 19;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -196,10 +197,12 @@ fn narrow_discriminants(record: LogRecord) -> LogRecord {
     narrowed.state = record.state % (LOG_DOMAIN_STATE_COUNT + 2);
     narrowed.detail = record.detail % (DETAIL_COUNT + 1);
     narrowed.operand_count = record.operand_count % (MAX_OPERANDS + 2);
-    // The identity detail's flag word, folded to the band around the two values
-    // it admits so both the accepted and the refused side are reachable on a
-    // derived record. The other three words stay whole: they are unranged, and
-    // narrowing them would only make the accepted case narrower.
+    // The fourth operand word, which is where this ABI carries the one flag two
+    // details hold — the identity's owner flag and the reset's. Folded to the
+    // band around the two values it admits so both the accepted and the refused
+    // side are reachable on a derived record. The other three words stay whole:
+    // they are unranged, and narrowing them would only make the accepted case
+    // narrower.
     narrowed.operands[3] = record.operands[3] % 3;
     narrowed.signalled = record.signalled % 3;
     // Zero is the one value of this field a rule refuses and is unreachable by
@@ -557,7 +560,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // place and refused separately below.
                 DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
                 | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
-                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT => {
+                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT
+                | DETAIL_RESET => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -708,11 +712,13 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_ARENA
         | DETAIL_PROVEN
         | DETAIL_FINGERPRINT => None,
-        // The one detail whose fourth operand word is a flag rather than a
-        // number: an identifier and a generation are unranged, and a word that
-        // is neither 0 nor 1 would read as "unowned" on a record that said
-        // something else. Restated here as the two-value check it is.
-        DETAIL_IDENTITY => {
+        // The two details whose fourth operand word is a flag rather than a
+        // number: every other word they carry is unranged, and a flag that is
+        // neither 0 nor 1 would read as "unowned" — or as a reset of an unowned
+        // appliance — on a record that said something else. Restated here as the
+        // two-value check it is, once, because the ABI carries a flag in one
+        // position and this harness has one rule for it too.
+        DETAIL_IDENTITY | DETAIL_RESET => {
             (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
                 value: record.operands[3],
             })
@@ -1236,6 +1242,19 @@ mod tests {
             (
                 "identity_flag_not_boolean",
                 region_from_record(&identity_record(2)),
+            ),
+            // The reset detail, which reads the same fourth word as a flag and
+            // the first two as a position and a count. Committed for the identity
+            // seeds' reason, and in the accepted shape only: the refused shape is
+            // the *same* word in the same position, and the seed above already
+            // stands at it.
+            (
+                "valid_domain_reset",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_RESET,
+                    operands: [7, 3, 0, 1],
+                    ..domain_record()
+                }),
             ),
             // Four operand words that are all a digest, which is what the array
             // was widened for: a seed that reads them as two would leave the

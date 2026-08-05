@@ -478,6 +478,7 @@ pub fn store_sample(
         minted: identity.minted,
         generation: identity.generation,
         onboarded: identity.onboarded,
+        reset: identity.reset,
         capacity_sectors,
         requests: [blocks.reads, blocks.writes],
         bytes: [blocks.read_bytes, blocks.write_bytes],
@@ -492,7 +493,7 @@ pub fn store_sample(
     }
 }
 
-/// What one boot established about the appliance's identity, as the four values
+/// What one boot established about the appliance's identity, as the five values
 /// its shard exposes.
 ///
 /// A struct rather than four arguments because they are one answer: an
@@ -508,6 +509,10 @@ pub struct StoreIdentity {
     /// The generation of the state record in force, or zero where there is none.
     pub generation: u64,
     pub onboarded: bool,
+    /// Whether this boot honoured a factory-reset request. Beside `minted` and
+    /// not folded into it: both a first boot and a reset mint, and only this says
+    /// which of the two a scrape is looking at.
+    pub reset: bool,
 }
 
 #[cfg(test)]

@@ -33,8 +33,29 @@
 //! an operator must re-onboard, and is recoverable. The opposite order leaves a
 //! node that resets on every boot forever, which is a bricked appliance nobody
 //! can onboard.
+//!
+//! # The request alone decides, not the record
+//!
+//! A reset is honoured on the strength of this sector and nothing else — before
+//! the state record is judged, and whether or not it decodes. That is deliberate
+//! too: a record this build refuses is exactly the case an operator reaches for a
+//! reset to fix, and an appliance that demanded a coherent identity before it
+//! would give one up could never be recovered.
+//!
+//! # Each medium carries its own request
+//!
+//! This sector resets *this* medium, and no other. The appliance's persistent
+//! state and its recordings sit on two devices owned by two protection domains,
+//! neither of which maps a byte of the other's — which is what keeps the domain
+//! holding the private scalar unable to reach a recording and the domain
+//! answering a download unable to read the scalar. Reaching across from here
+//! would breach exactly that property, so it is not reached across: each medium
+//! holding an owner's data carries its own request and its own overwrite. The
+//! boundary stays exact, because the visit that writes this sector reaches every
+//! medium in the appliance.
 
 use crate::layout::SECTOR_SIZE;
+use crate::state::{Onboarding, State};
 
 /// Bytes the request occupies: one sector, because the sector is the unit the
 /// device promises to write whole.
@@ -111,6 +132,47 @@ impl ResetRequest {
     #[must_use]
     pub const fn is_requested(self) -> bool {
         matches!(self, Self::Requested)
+    }
+}
+
+/// What a factory reset destroyed, as the one console record of it reports.
+///
+/// Read off the state the medium carried *before* the overwrite, so the numbers
+/// describe the appliance being given up rather than the one minted over it.
+///
+/// Everything is zero or `false` where the medium carried no record this build
+/// could read — a reset runs on the request alone, and a store whose record is
+/// beyond use is the case a reset is the remedy for. Nothing here is key
+/// material: what is reported is a position, a count and a flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cleared {
+    /// The generation the destroyed record stood at, which is where this
+    /// appliance's state history ends.
+    pub generation: u64,
+    /// How many configuration slots that record named as holding a document.
+    /// **The whole array is overwritten regardless** — this is how many versions
+    /// were lost, not how many sectors were written.
+    pub documents: usize,
+    /// Whether the appliance had an owner, which is what says whether a delivered
+    /// certificate, a trust anchor and an endpoint were among the bytes
+    /// destroyed. An unowned appliance's reset destroys only what it minted for
+    /// itself.
+    pub was_owned: bool,
+}
+
+impl Cleared {
+    /// What a reset is about to destroy, from the state it found — or nothing,
+    /// where it found no state this build could read.
+    #[must_use]
+    pub fn of(state: Option<&State>) -> Self {
+        match state {
+            Some(state) => Self {
+                generation: state.generation(),
+                documents: state.slots().occupied(),
+                was_owned: matches!(state.onboarding(), Onboarding::Onboarded),
+            },
+            None => Self::default(),
+        }
     }
 }
 

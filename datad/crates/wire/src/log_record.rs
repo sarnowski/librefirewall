@@ -180,6 +180,7 @@ pub enum LogDetailKind {
     /// the existing values would re-read every record a peer already wrote.
     Identity,
     Fingerprint,
+    Reset,
 }
 
 impl LogDetailKind {
@@ -204,6 +205,7 @@ impl LogDetailKind {
             Self::Operation => 15,
             Self::Identity => 16,
             Self::Fingerprint => 17,
+            Self::Reset => 18,
         }
     }
 
@@ -228,6 +230,7 @@ impl LogDetailKind {
             15 => Some(Self::Operation),
             16 => Some(Self::Identity),
             17 => Some(Self::Fingerprint),
+            18 => Some(Self::Reset),
             _ => None,
         }
     }
@@ -425,9 +428,16 @@ pub struct LogRecord {
     /// this ABI's size — and every log region — unchanged by a detail added.
     ///
     /// [`LOG_OPERANDS`] wide, which is what carries a 256-bit digest whole.
-    /// Every detail below four words reads the prefix it names and leaves the
-    /// rest as storage this record does not claim, the same treatment a refusal's
+    /// Every detail below four words reads the words it names and leaves the rest
+    /// as storage this record does not claim, the same treatment a refusal's
     /// `operand_count` already gave the second word.
+    ///
+    /// **A flag is always the fourth word.** Both details that carry one put it
+    /// there — [`LogDetailKind::Identity`]'s owner flag and
+    /// [`LogDetailKind::Reset`]'s — so this ABI has one rule for a boolean in an
+    /// operand rather than one per detail, and one place a decode refuses a word
+    /// that is neither 0 nor 1. It is the reason a detail's words are not always
+    /// the leading run.
     pub operands: [u64; LOG_OPERANDS],
     /// The counter frequency in hertz, under [`LogDetailKind::Established`].
     /// Zero is refused: it is the divisor every later reading is scaled by.
@@ -708,6 +718,14 @@ impl LogRecord {
             // fingerprint the appliance really computed.
             Some(LogDetailKind::Fingerprint) => CheckedDetail::Fingerprint {
                 words: self.operands,
+            },
+            // A position, a count and a flag. The flag is refused on `Identity`'s
+            // terms and in the same word, which is what keeps one rule for a
+            // flag in this ABI rather than one per detail.
+            Some(LogDetailKind::Reset) => CheckedDetail::Reset {
+                generation: self.operands[0],
+                documents: self.operands[1],
+                was_owned: flag(self.operands[3])?,
             },
         };
         Ok(CheckedBody::Domain {
@@ -1150,6 +1168,14 @@ pub enum CheckedDetail {
     /// administrator would have to join.
     Fingerprint {
         words: [u64; LOG_OPERANDS],
+    },
+    /// What a factory reset destroyed: the generation of the record it
+    /// overwrote, how many configuration documents that record named, and
+    /// whether the appliance had an owner.
+    Reset {
+        generation: u64,
+        documents: u64,
+        was_owned: bool,
     },
 }
 

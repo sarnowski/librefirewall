@@ -718,6 +718,21 @@ fn decode_copy(copy: &[u8]) -> Option<StateImage> {
     })
 }
 
+/// The private scalar as the first copy of `bytes` carries it, for the one caller
+/// that must name the window a factory reset has to erase.
+///
+/// Positional and decoding nothing, because the proof it serves has to work on a
+/// medium whose record no longer decodes — and because the offset of that field
+/// is the one thing about this record only its own layout knows. **No production
+/// path calls this**: the appliance reaches a scalar through [`decode_state`],
+/// which holds the whole copy to its digest first.
+#[must_use]
+pub fn stored_secret_window(bytes: &[u8; 2 * STATE_COPY_BYTES]) -> [u8; SECRET_LEN] {
+    let mut secret = [0_u8; SECRET_LEN];
+    copy_from(bytes, SECRET_AT, &mut secret);
+    secret
+}
+
 fn stored_certificate(copy: &[u8], at: usize, len: usize) -> Option<StoredCertificate> {
     let mut bytes = [0_u8; MAX_STORED_CERTIFICATE];
     let source = copy.get(at..at.checked_add(len)?)?;

@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -57,7 +57,7 @@ written waits forever:
 | `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
-| `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
+| `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
 | `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; then two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
@@ -200,6 +200,25 @@ node: an operator holding a silent appliance still has only the external act.
   It is over the public *key* and not over a certificate, so the fingerprint verified at first
   contact still names the appliance after a certificate is issued to it. **No private key material
   appears here or on any other surface.**
+- `cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>` — **a factory reset
+  happened, and this is what it destroyed.** The record is written in the past tense throughout and
+  says nothing about the appliance that replaced the one it describes; the `device=` and
+  `fingerprint=` records that follow are that. It appears on no other boot at all, so a node showing
+  it is a node somebody asked to give up its owner — the request is one sector of a medium, and
+  writing it needs the medium in hand.
+
+  `cleared-generation=` is the generation the destroyed record stood at, which is where that
+  appliance's state history ends. `cleared-documents=` is how many configuration versions went with
+  it. `was-owned=` says whether there was an owner to give up, and so whether a delivered
+  certificate, a trust anchor and an endpoint were among the bytes destroyed — an unowned
+  appliance's reset destroys only what it minted for itself.
+
+  **All three read zero and `false` where the medium carried no record this build could read**, which
+  is a state a reset is honoured over rather than refused for: a record the appliance will not act on
+  is exactly the case an operator reaches for a reset to fix. The count describes the versions that
+  were lost and not the sectors that were written — the whole slot array is overwritten either way,
+  because deciding which sectors held a secret from the record being destroyed would be trusting it
+  one last time.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -230,7 +249,7 @@ node: an operator holding a silent appliance still has only the external act.
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 33 the `crypto` domain
-raises, and 36 the `store` domain raises. A token outside all seven is a defect, not an extension.
+raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
@@ -383,10 +402,11 @@ the domain could not set up that starved case at all. All three are findings abo
 rather than about a cipher.
 
 **`store`.** Grouped by the step that refused, and the token's own prefix names it: `staging-` and
-`store-medium-` the device and the grant under it, `state-` a transfer of the record, `stored-` a
-record the medium carried that this build will not act on, `rdrand-` and `generator-` the randomness
-a key would descend from, and the rest the identity holding to itself. `signalled=` is `false` only
-on the first — every other refusal happens with the device live, having been told to run.
+`store-medium-` the device and the grant under it, `state-` a transfer of the record, `reset-` a step
+of a factory reset, `stored-` a record the medium carried that this build will not act on, `rdrand-`
+and `generator-` the randomness a key would descend from, and the rest the identity holding to
+itself. `signalled=` is `false` only on the first — every other refusal happens with the device live,
+having been told to run.
 
 | group | tokens |
 |---|---|
@@ -394,7 +414,10 @@ on the first — every other refusal happens with the device live, having been t
 | the medium itself (`detail=` is the claimed capacity and the sectors this build's layout needs) | `store-medium-too-small` |
 | reading the record (`detail=` is the byte count on the short case and absent on the rest) | `state-read-refused`, `state-read-misattributed`, `state-read-failed`, `state-read-short`, `state-read-unanswered` |
 | writing it (same `detail=` rule) | `state-write-refused`, `state-write-misattributed`, `state-write-failed`, `state-write-short`, `state-write-unanswered` |
-| the barrier that makes the write durable (same `detail=` rule) | `state-barrier-refused`, `state-barrier-misattributed`, `state-barrier-failed`, `state-barrier-short`, `state-barrier-unanswered` |
+| the barrier that makes a write durable — **every flush this domain waits for**, whether it orders a minted record or a step of a factory reset (same `detail=` rule) | `state-barrier-refused`, `state-barrier-misattributed`, `state-barrier-failed`, `state-barrier-short`, `state-barrier-unanswered` |
+| reading the factory-reset request sector (same `detail=` rule) | `reset-read-refused`, `reset-read-misattributed`, `reset-read-failed`, `reset-read-short`, `reset-read-unanswered` |
+| clearing that request, which everything irreversible sits behind (same `detail=` rule) | `reset-clear-refused`, `reset-clear-misattributed`, `reset-clear-failed`, `reset-clear-short`, `reset-clear-unanswered` |
+| overwriting what the medium held (same `detail=` rule) | `reset-overwrite-refused`, `reset-overwrite-misattributed`, `reset-overwrite-failed`, `reset-overwrite-short`, `reset-overwrite-unanswered` |
 | a record this build will not act on (`detail=` is the length, the slot index, or the stored slot count and slot size, as the token names) | `stored-layout-mismatch`, `stored-certificate-too-long`, `stored-document-too-long`, `stored-slot-named-twice`, `stored-slot-outside-array`, `stored-named-slot-empty`, `stored-record-unusable` |
 | an identity that does not hold to itself (none carries a `detail=`) | `stored-scalar-unusable`, `stored-public-key-mismatch`, `stored-certificate-key-mismatch`, `stored-certificate-absent` |
 | minting one (none carries a `detail=`) | `device-key-ungenerable`, `onboarding-certificate-unwritable`, `public-key-unencodable`, `certificate-too-long-for-record` |
@@ -419,6 +442,17 @@ same reason. A refusal under `read` is a boot that learned nothing about the med
 boot that minted an identity and could not put it down; under `barrier`, one that put it down and
 could not make it durable — which is the case that would leave a power cut costing the identity, and
 the reason a barrier is issued and waited for rather than implied by the next transfer.
+
+The three `reset-*` groups are the same shape and the difference between them is what an operator is
+left holding. `reset-read-*` is a boot that could not learn whether a reset was even asked for, and
+it changed nothing: the appliance still has its identity and the request, if there was one, is still
+on the medium. `reset-clear-*` is the same — the request is still there, so the reset can simply be
+retried — and it is the group whose *absence of consequence* is the point, because the clearing write
+is what everything irreversible sits behind. `reset-overwrite-*` is the one that has cost something:
+the request is gone and the appliance keeps whatever of its identity survived, so it will not reset
+again on the next boot and the medium is to be replaced rather than re-onboarded. There is no
+`reset-barrier-*` group; a flush is one kind of failure whatever it orders, and the flushes a reset
+waits for report under `state-barrier-*` above.
 
 The primitive names in `primitive=` are `sha-256`, `hmac-sha-256`, `hkdf-sha-256`, `chacha20`,
 `chacha20-poly1305`, `aes-256-gcm`, `chacha20-drbg`, `ecdsa-p256`, `x25519` and `ml-kem-768`. What

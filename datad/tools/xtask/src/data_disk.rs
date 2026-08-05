@@ -421,14 +421,35 @@ const STORE_DISK_BYTES: u64 = 1024 * 1024;
 /// which means one file outliving one invocation, deliberately, and a scenario
 /// saying so ([`StoreMedium`]).
 ///
-/// Nothing on the host side reads this file's contents. That is deliberate and
-/// worth stating: it carries the appliance's private scalar in plaintext, and a
-/// harness that parsed it would be a second place that had to be trusted not to
-/// print one. What the gate compares is the console records the two boots
-/// produced — the public name and the public-key fingerprint — which is exactly
-/// what an administrator compares.
+/// # What the host may say about the contents, and what it may not
+///
+/// Almost nothing is read, and that is deliberate: the medium carries the
+/// appliance's private scalar in plaintext, and a harness that parsed it would be
+/// a second place that had to be trusted not to print one. What the gate compares
+/// is the console records the boots produced — the public name and the public-key
+/// fingerprint — which is exactly what an administrator compares.
+///
+/// The one exception is a **factory reset**, and it is an exception because no
+/// console record can stand in for it. A boot that reported a reset and left the
+/// old key on the medium produces the identical transcript, and the changed state
+/// record proves nothing either — re-minting changes it whatever the reset did. So
+/// the erasure is proved the only way it can be: the scalar's window is captured
+/// off the medium *before* the reset boot, and afterwards the whole medium is
+/// required to hold **zero** occurrences of it. That needle is a private key. It
+/// is held in memory for the length of one scenario, is never written anywhere,
+/// and is never rendered: a surviving occurrence is reported as an **offset**, and
+/// the failure message that names it carries no byte of it.
+///
+/// [`StoreMedium`]: crate::qemu::StoreMedium
 pub(crate) struct StoreDisk {
     path: PathBuf,
+    /// The private scalar this medium held before a factory-reset boot, which that
+    /// boot must leave nowhere on it. `None` on every other boot, which is every
+    /// boot that is not proving an erasure.
+    ///
+    /// **Never printed, never written, never derived from.** It exists to be
+    /// searched for and to be absent.
+    erased_secret: Option<[u8; lfw_store::SECRET_LEN]>,
 }
 
 impl StoreDisk {
@@ -456,7 +477,10 @@ impl StoreDisk {
             .map_err(|error| format!("size {}: {error}", path.display()))?;
         file.sync_all()
             .map_err(|error| format!("flush {}: {error}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            erased_secret: None,
+        })
     }
 
     /// The medium an earlier boot left behind, for a scenario whose whole subject
@@ -480,7 +504,63 @@ impl StoreDisk {
                 path.display()
             ));
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            erased_secret: None,
+        })
+    }
+
+    /// The medium an earlier boot left behind, with a **factory-reset request**
+    /// written onto it, for the one scenario whose subject is the appliance giving
+    /// up its owner.
+    ///
+    /// This is the whole of how a reset is asked for: there is no channel
+    /// operation, no configuration document and no console input that can invoke
+    /// one, because a reset revokes a management plane's ownership and must not be
+    /// reachable by one. What is left is possession of the medium, which for a
+    /// harness means a write to one sector of a file — and the request written is
+    /// `lfw_store::reset_token`, the appliance's own definition of it, so the two
+    /// sides cannot come to disagree about the pattern the way two copies of a
+    /// constant do.
+    ///
+    /// The scalar the medium currently holds is captured here, before the boot
+    /// that must destroy it. See the type's own header for why that capture is
+    /// necessary and what is done to keep it harmless.
+    ///
+    /// # Errors
+    /// The file not being there, on [`Self::carried`]'s terms; anything that stops
+    /// the sector being written; and a medium whose scalar window is all zeroes,
+    /// which would make the erasure proof vacuously true.
+    pub(crate) fn reset_requested(root: &Path, source_label: &str) -> Result<Self, String> {
+        let carried = Self::carried(root, source_label)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&carried.path)
+            .map_err(|error| format!("open {}: {error}", carried.path.display()))?;
+
+        let mut region = [0u8; 2 * lfw_store::STATE_COPY_BYTES];
+        read_at(&mut file, 0, &mut region)
+            .map_err(|error| format!("read the state record: {error}"))?;
+        let secret = lfw_store::stored_secret_window(&region);
+        if secret == [0u8; lfw_store::SECRET_LEN] {
+            return Err(format!(
+                "the store medium {} carries no scalar in its first copy of the state record, so                  requiring a reset to erase it would prove nothing — every byte of the window is                  already zero. Either the boot that was to mint on this medium did not, or the                  record's layout moved and this window is no longer the one that holds the key",
+                carried.path.display()
+            ));
+        }
+
+        let offset = lfw_store::RESET_REQUEST_SECTOR * SECTOR_SIZE as u64;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} to {offset}: {error}", carried.path.display()))?;
+        file.write_all(&lfw_store::reset_token())
+            .map_err(|error| format!("request a reset on {}: {error}", carried.path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("flush {}: {error}", carried.path.display()))?;
+        Ok(Self {
+            erased_secret: Some(secret),
+            ..carried
+        })
     }
 
     fn path_for(root: &Path, label: &str) -> PathBuf {
@@ -521,9 +601,10 @@ impl StoreDisk {
     /// is judged where an administrator judges it — on the console, across two
     /// boots.
     ///
-    /// It reads the first sixteen bytes and no more: the magic and the version,
-    /// which are the only fields of this medium that are not the appliance's
-    /// secret or derived from it.
+    /// It reads the first sixteen bytes: the magic and the version, which are the
+    /// only fields of this medium that are not the appliance's secret or derived
+    /// from it. On a boot proving a factory reset the whole medium is read as well,
+    /// and [`Self::judge_secret_erased`] is where that happens and why.
     ///
     /// # Errors
     /// The leading bytes being zero, which is a medium nothing wrote.
@@ -559,6 +640,62 @@ impl StoreDisk {
         Ok(format!(
             "the store medium's first sector opens with the state record's magic and version \
              {version}, so the identity reached the medium ({})",
+            self.path.display()
+        ))
+    }
+
+    /// Assert that the scalar this medium held before a factory-reset boot occurs
+    /// **nowhere on it** afterwards.
+    ///
+    /// `Ok(None)` on every boot that armed no capture, which is every boot that is
+    /// not proving an erasure.
+    ///
+    /// # Why a needle scan and not a comparison of the record
+    ///
+    /// Because the record proves nothing. A reset ends in a fresh mint, so the
+    /// state record is different whatever the reset did to the bytes before it —
+    /// and a domain that wrote a new record over the old one *without* overwriting
+    /// the copy the layout does not reach on that write, or the slot array behind
+    /// it, would satisfy every comparison of the record and leave the old key
+    /// readable a few sectors away. What is asked here is the only question worth
+    /// asking of the medium: is this key still on it, anywhere. Zero occurrences
+    /// is the whole answer, so the scan covers every byte of the file rather than
+    /// the sectors the layout claims — a copy left outside them is exactly the
+    /// defect that would otherwise pass.
+    ///
+    /// # Errors
+    /// Any occurrence, reported by **offset**: the needle is a private key, and it
+    /// reaches no message this function writes. Also anything that stops the file
+    /// being read whole.
+    pub(crate) fn judge_secret_erased(&self) -> Result<Option<String>, String> {
+        let Some(needle) = self.erased_secret else {
+            return Ok(None);
+        };
+        let medium = std::fs::read(&self.path)
+            .map_err(|error| format!("read {}: {error}", self.path.display()))?;
+        let found: Vec<usize> = medium
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, window)| *window == needle)
+            .map(|(at, _)| at)
+            .collect();
+        if found.is_empty() {
+            return Ok(Some(format!(
+                "the {}-byte private scalar the store medium held before this boot occurs at no \
+                 offset of it — {} bytes searched, zero matches — so the factory reset overwrote \
+                 the key rather than releasing the sectors that held it ({})",
+                needle.len(),
+                medium.len(),
+                self.path.display()
+            )));
+        }
+        Err(format!(
+            "the store medium still holds the private scalar it carried before this boot, at {} \
+             offset(s): {:?}. The appliance reported a factory reset and the key it was supposed \
+             to destroy is readable to anyone holding the medium, which is the one failure a \
+             reset must not have — a released sector is a kept secret\n  image: {}",
+            found.len(),
+            found,
             self.path.display()
         ))
     }

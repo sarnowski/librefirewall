@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-105 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 399 counter and gauge series from the 12 shards,
+106 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 400 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 87 849 bytes — a worst case computed from
+declares, and the document they render into is bounded at 88 195 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -434,7 +434,7 @@ parks, and never move again.
 ### The appliance's own identity
 
 The store domain reports here as well as on the console, so a scrape answers whether this node
-*has* an identity without a serial capture. The four families are written once, when the domain
+*has* an identity without a serial capture. The five families are written once, when the domain
 parks, and never move again.
 
 **The identifier itself is not here, and neither is any key.** A 128-bit name is not a number a time
@@ -449,12 +449,16 @@ has advanced. Which appliance it is, and which key it authenticates with, is on 
 | `librefirewall_store_identity` | gauge | `store` | — | 1 once this appliance's identity is established on the store medium — minted on a fresh medium or reloaded and verified from an existing one; 0 before, and forever on a node that refused. No key material is exposed here or anywhere else on this surface. |
 | `librefirewall_store_minted` | gauge | `store` | — | 1 where this boot minted a fresh identity because the medium carried none, 0 where it reloaded the one already there. A node whose value flips to 1 after a boot at 0 has lost its identity, which is the fleet's own alert rather than a fault of the boot. |
 | `librefirewall_store_onboarded` | gauge | `store` | — | 1 once a management plane has adopted this appliance, 0 while it is unowned. |
+| `librefirewall_store_reset` | gauge | `store` | — | 1 where this boot found a factory-reset request on the store medium and honoured it, 0 otherwise. It is what tells an intentional reset from a lost medium: both mint, and only this says which one was asked for. |
 
-**`librefirewall_store_minted` is the one to alert on.** An appliance mints exactly once in its life
-— on its first boot, and again only after a factory reset — so a node reporting 1 where a previous
-scrape reported 0 has lost the medium's contents, and every certificate issued to it now names a key
-it no longer holds. The generation beside it is the corroborating reading: a fresh mint is
-generation 1.
+**`librefirewall_store_minted` is the one to alert on, and
+`librefirewall_store_reset` is what the alert has to be read with.** An appliance mints exactly once
+in its life — on its first boot, and again only after a factory reset — so a node reporting 1 where a
+previous scrape reported 0 has lost the medium's contents, and every certificate issued to it now
+names a key it no longer holds. The reset gauge is what separates the two causes: `minted` and `reset`
+both at 1 is an ownership transfer somebody with the medium in their hands asked for, while `minted`
+at 1 with `reset` at 0 is a node that lost its identity and nobody asked it to. The generation is the
+corroborating reading either way: a fresh mint is generation 1.
 
 **No series counts unsynchronized records, and that is deliberate.** Whether a domain has a
 calibration is visible on each record it emits — `time=unsynchronized` against an instant — so such

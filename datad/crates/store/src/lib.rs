@@ -81,10 +81,10 @@ pub use layout::{
     STATE_A_SECTOR, STATE_B_SECTOR, STATE_COPY_BYTES, STATE_COPY_SECTORS, STORE_SECTORS,
     slot_sector,
 };
-pub use reset::{RESET_REQUEST_BYTES, ResetRequest, reset_token, write_reset_request};
+pub use reset::{Cleared, RESET_REQUEST_BYTES, ResetRequest, reset_token, write_reset_request};
 pub use slots::{DOCUMENT_BYTES, Reuse, SlotEntry, SlotIndex, Slots};
 pub use state::{
     CheckedState, Copies, DEVICE_ID_BYTES, ENDPOINT_LEN, MAX_STORED_CERTIFICATE, Onboarding,
     SECRET_LEN, STATE_MAGIC, STATE_VERSION, State, StateError, StateImage, StateWrite,
-    StoredCertificate, StoredEndpoint, decode_state, encode_state,
+    StoredCertificate, StoredEndpoint, decode_state, encode_state, stored_secret_window,
 };

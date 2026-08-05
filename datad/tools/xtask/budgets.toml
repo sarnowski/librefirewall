@@ -66,20 +66,20 @@
 "crates/ip-endpoint/src/http.rs" = 0.3402
 "crates/ip-endpoint/src/lib.rs" = 0.3183
 "crates/log/src/console.rs" = 0.5084
-"crates/log/src/detail.rs" = 0.4542
+"crates/log/src/detail.rs" = 0.4667
 "crates/log/src/event.rs" = 0.2896
 "crates/log/src/identifier.rs" = 0.2775
 "crates/log/src/lib.rs" = 0.4065
-"crates/log/src/record.rs" = 0.1533
-"crates/log/src/render.rs" = 0.1849
+"crates/log/src/record.rs" = 0.1536
+"crates/log/src/render.rs" = 0.1934
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
-"crates/metrics/src/catalog.rs" = 0.1314
+"crates/metrics/src/catalog.rs" = 0.1305
 "crates/metrics/src/interfaces.rs" = 0.3625
 "crates/metrics/src/lib.rs" = 0.5714
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
-"crates/metrics/src/sample.rs" = 0.0918
+"crates/metrics/src/sample.rs" = 0.0926
 "crates/net-headers/src/lib.rs" = 0.2117
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -92,7 +92,7 @@
 "crates/pd-runtime/src/endpoint.rs" = 0.4464
 "crates/pd-runtime/src/handover.rs" = 0.3606
 "crates/pd-runtime/src/lib.rs" = 0.5074
-"crates/pd-runtime/src/stats.rs" = 0.2168
+"crates/pd-runtime/src/stats.rs" = 0.2205
 "crates/pd-runtime/src/tap.rs" = 0.3727
 "crates/pipeline/src/lib.rs" = 0.4136
 "crates/queue/src/lib.rs" = 0.4260
@@ -103,9 +103,9 @@
 "crates/store/src/identity.rs" = 0.4926
 "crates/store/src/layout.rs" = 0.6170
 "crates/store/src/lib.rs" = 0.7386
-"crates/store/src/reset.rs" = 0.4715
+"crates/store/src/reset.rs" = 0.5297
 "crates/store/src/slots.rs" = 0.2922
-"crates/store/src/state.rs" = 0.2210
+"crates/store/src/state.rs" = 0.2266
 "crates/tcp/src/connection.rs" = 0.3133
 "crates/tcp/src/counters.rs" = 0.5183
 "crates/tcp/src/isn.rs" = 0.3564
@@ -132,7 +132,7 @@
 "crates/wire/src/download.rs" = 0.3633
 "crates/wire/src/image.rs" = 0.3106
 "crates/wire/src/lib.rs" = 0.2651
-"crates/wire/src/log_record.rs" = 0.2416
+"crates/wire/src/log_record.rs" = 0.2461
 "crates/wire/src/log_ring.rs" = 0.4271
 "crates/wire/src/log_slot.rs" = 0.1088
 "crates/wire/src/signing.rs" = 0.2978
@@ -156,7 +156,7 @@
 "pds/management/src/main.rs" = 0.4976
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3034
-"pds/store/src/main.rs" = 0.3754
+"pds/store/src/main.rs" = 0.3860
 
 [unsafe-blocks]
 "crates/blk" = 8

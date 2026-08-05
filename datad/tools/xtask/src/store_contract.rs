@@ -25,6 +25,14 @@
 //! medium must report the *same* identifier and the *same* fingerprint, under a
 //! generation that did not go backwards.
 //!
+//! A **factory reset** is the same claim inverted ([`hold_reset_to_source`]): the
+//! boot that honoured one must report a *different* identifier and a *different*
+//! fingerprint, unowned and at the generation a mint starts from, and must say on
+//! the console what it destroyed. Reversed rather than relaxed, because "the
+//! identity changed" is exactly what a reset owes and exactly what a reload must
+//! never do, and one function accepting both would accept a domain that confused
+//! them.
+//!
 //! # No adversary
 //!
 //! The capture is the appliance's own output on a wire only the harness is
@@ -32,7 +40,9 @@
 //! defends against is an appliance that forgot who it was. **Nothing here reads
 //! the medium**, deliberately: it carries the private scalar in plaintext, and a
 //! harness that parsed it would be a second place that had to be trusted never
-//! to print one.
+//! to print one. The one thing about a reset that no console record can settle —
+//! whether the key is really gone from the bytes — is proved where the medium is
+//! already open, by `crate::data_disk::StoreDisk::judge_secret_erased`.
 
 use std::path::Path;
 
@@ -55,13 +65,38 @@ pub(crate) struct Identity {
     pub fingerprint: String,
     pub generation: u64,
     pub onboarded: bool,
+    /// What this boot reported destroying, where it honoured a factory-reset
+    /// request. `None` on every ordinary boot, which is what makes an unasked-for
+    /// reset a finding rather than a variation.
+    pub reset: Option<Reset>,
+}
+
+/// What one boot said a factory reset destroyed.
+///
+/// Numbers about the appliance that is gone, and nothing about the one that
+/// replaced it: the identity records beside this one are where that is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reset {
+    pub generation: u64,
+    pub documents: u64,
+    pub was_owned: bool,
 }
 
 impl Identity {
     /// This identity as one line of a run summary.
     pub(crate) fn summary(&self) -> String {
+        let reset = match self.reset {
+            Some(reset) => format!(
+                ", after a factory reset that cleared generation {} with {} document(s) from an {} \
+                 appliance",
+                reset.generation,
+                reset.documents,
+                if reset.was_owned { "owned" } else { "unowned" }
+            ),
+            None => String::new(),
+        };
         format!(
-            "device {} at generation {} ({}), key fingerprint {}",
+            "device {} at generation {} ({}), key fingerprint {}{reset}",
             self.device,
             self.generation,
             if self.onboarded { "owned" } else { "unowned" },
@@ -185,7 +220,56 @@ pub(crate) fn judge(serial: &[u8], log: &Path) -> Result<Identity, String> {
         fingerprint,
         generation,
         onboarded,
+        reset: reset(&ours, log)?,
     })
+}
+
+/// The one record a boot that honoured a factory reset emits, or `None` on a boot
+/// that honoured none.
+///
+/// Several is a finding rather than a first-wins: a reset happens once, because
+/// the request is cleared before anything is destroyed, so two records mean the
+/// domain honoured a request it had already answered.
+fn reset(ours: &[&str], log: &Path) -> Result<Option<Reset>, String> {
+    let records: Vec<&&str> = ours
+        .iter()
+        .filter(|record| field_value(record, "cleared-generation").is_some())
+        .collect();
+    let record = match records[..] {
+        [] => return Ok(None),
+        [record] => record,
+        _ => {
+            return Err(format!(
+                "the console carried {} record(s) naming a factory reset for the store domain, and \
+                 a boot honours at most one: the request is cleared before anything is destroyed, \
+                 so a second record is a request answered twice\n  store records observed: \
+                 {ours:#?}\n  full run log: {}",
+                records.len(),
+                log.display()
+            ));
+        }
+    };
+    let number = |key: &str| -> Result<u64, String> {
+        value(record, key, log)?
+            .parse()
+            .map_err(|error| format!("{record:?}: {key} is no number: {error}"))
+    };
+    let was_owned = match value(record, "was-owned", log)? {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(format!(
+                "{record:?} reports was-owned={other:?}, and the field is a boolean\n  \
+                 full run log: {}",
+                log.display()
+            ));
+        }
+    };
+    Ok(Some(Reset {
+        generation: number("cleared-generation")?,
+        documents: number("cleared-documents")?,
+        was_owned,
+    }))
 }
 
 /// The value of `key` in `record`, or a verdict naming the field the record is
@@ -275,9 +359,97 @@ pub(crate) fn hold_to_source(
             returned.generation, minted.generation
         ));
     }
+    if returned.reset.is_some() {
+        return Err(format!(
+            "the {reloaded_name} boot reported a factory reset, and its whole subject is reloading \
+             the identity the {minted_name} boot minted. A reset destroys that identity, so this \
+             boot cannot be evidence of its survival — the medium carried a request no scenario \
+             wrote, or the domain honoured one that was not there"
+        ));
+    }
     Ok(format!(
         "the {reloaded_name} boot reloaded the identity the {minted_name} boot minted on the same \
          medium: {}",
+        returned.summary()
+    ))
+}
+
+/// Hold the identity a **factory-reset** boot reported to the one the medium
+/// carried before it.
+///
+/// The inverse of [`hold_to_source`] and deliberately not a relaxation of it. A
+/// reset owes four things at once, and each is a different way of failing: it must
+/// say on the console what it destroyed, it must come back under a *different*
+/// name and a *different* key, it must come back **unowned**, and it must come
+/// back at the generation a mint starts from. A domain that cleared the request
+/// and left the identity in place passes none of them; one that cleared the
+/// identity and kept the owner flag passes two.
+///
+/// What this cannot see is whether the old key is really gone from the bytes,
+/// because a re-mint changes the record whatever happened to the sectors around
+/// it. That half is `crate::data_disk::StoreDisk::judge_secret_erased`'s, and
+/// neither half stands in for the other.
+///
+/// # Errors
+/// Any of the four, each naming both boots and what it expected of the second.
+pub(crate) fn hold_reset_to_source(
+    source: (&str, &Identity),
+    reset: (&str, &Identity),
+) -> Result<String, String> {
+    let (previous_name, previous) = source;
+    let (reset_name, returned) = reset;
+    let Some(cleared) = returned.reset else {
+        return Err(format!(
+            "the {reset_name} boot was given a medium carrying a factory-reset request and its \
+             console names no reset at all. Either the domain read the request and did not act on \
+             it, or it acted and said nothing — and an appliance that gives up its owner silently \
+             leaves an operator with no way to know it happened, there being no shell and no CLI"
+        ));
+    };
+    if previous.device == returned.device {
+        return Err(format!(
+            "the {reset_name} boot honoured a factory reset and came back as device {}, which is \
+             the device the {previous_name} boot reported. A reset destroys the identity and mints \
+             a fresh one, so the same name means the key and the certificate the request was meant \
+             to revoke are still what this appliance authenticates with",
+            returned.device
+        ));
+    }
+    if previous.fingerprint == returned.fingerprint {
+        return Err(format!(
+            "the {reset_name} boot honoured a factory reset and came back under the key \
+             fingerprint the {previous_name} boot reported. That is the substance of a reset rather \
+             than a detail of it: an administrator who was told this appliance had been reset would \
+             be re-onboarding it onto the key its previous owner already holds"
+        ));
+    }
+    if returned.onboarded {
+        return Err(format!(
+            "the {reset_name} boot honoured a factory reset and reports itself owned. Unowned is \
+             what a reset returns an appliance to, and it is the whole of what makes it \
+             onboardable again"
+        ));
+    }
+    if returned.generation != 1 {
+        return Err(format!(
+            "the {reset_name} boot honoured a factory reset and reports generation {}, and a \
+             minted state starts at 1. A higher one means the record it is running on descends \
+             from the one that was destroyed rather than replacing it",
+            returned.generation
+        ));
+    }
+    if cleared.generation != previous.generation {
+        return Err(format!(
+            "the {reset_name} boot reports clearing generation {} and the {previous_name} boot ran \
+             on generation {}. The record a reset destroyed is the record the previous boot was \
+             running on, so a different number means the domain read one copy and overwrote \
+             another",
+            cleared.generation, previous.generation
+        ));
+    }
+    Ok(format!(
+        "the {reset_name} boot honoured a factory-reset request on the medium the {previous_name} \
+         boot ran on and came back a different, unowned appliance: {}",
         returned.summary()
     ))
 }
@@ -302,6 +474,13 @@ mod tests {
 
     fn fingerprint_record(fingerprint: &str) -> String {
         format!("LFW-PD time=unsynchronized domain=store state=ready fingerprint={fingerprint}")
+    }
+
+    fn reset_record(generation: u64, documents: u64, was_owned: bool) -> String {
+        format!(
+            "LFW-PD time=unsynchronized domain=store state=negotiated \
+             cleared-generation={generation} cleared-documents={documents} was-owned={was_owned}"
+        )
     }
 
     /// A capture of the shape a passing boot leaves.
@@ -330,6 +509,7 @@ mod tests {
     #[test]
     fn a_boot_that_established_an_identity_is_accepted_and_reports_it() {
         let identity = judge(passing().as_bytes(), log()).expect("a well-formed pair of records");
+        assert!(identity.reset.is_none());
         assert_eq!(identity.device, DEVICE);
         assert_eq!(identity.fingerprint, FINGERPRINT);
         assert_eq!(identity.generation, 1);
@@ -504,6 +684,7 @@ mod tests {
             fingerprint: fingerprint.to_owned(),
             generation,
             onboarded: false,
+            reset: None,
         }
     }
 
@@ -542,5 +723,162 @@ mod tests {
         let verdict = hold_to_source(("minted", &minted), ("reloaded", &older))
             .expect_err("a generation that went backwards");
         assert!(verdict.contains("only ever advances"), "{verdict}");
+    }
+    /// The reset record: parsed as its own shape, and never confused with the
+    /// identity beside it.
+    #[test]
+    fn a_boot_that_honoured_a_reset_reports_what_it_destroyed() {
+        let text = capture(&[
+            reset_record(4, 2, true),
+            identity_record(DEVICE, 1, false),
+            fingerprint_record(FINGERPRINT),
+        ]);
+        let identity = judge(text.as_bytes(), log()).expect("a reset boot's three records");
+        assert_eq!(
+            identity.reset,
+            Some(Reset {
+                generation: 4,
+                documents: 2,
+                was_owned: true,
+            })
+        );
+        assert!(identity.summary().contains("factory reset"), "{identity:?}");
+        // And a reset of an appliance whose record this build could not read,
+        // which reports zeroes rather than refusing.
+        let text = capture(&[
+            reset_record(0, 0, false),
+            identity_record(DEVICE, 1, false),
+            fingerprint_record(FINGERPRINT),
+        ]);
+        let identity = judge(text.as_bytes(), log()).expect("a reset over an unreadable record");
+        assert_eq!(
+            identity.reset,
+            Some(Reset {
+                generation: 0,
+                documents: 0,
+                was_owned: false,
+            })
+        );
+    }
+
+    #[test]
+    fn two_reset_records_are_refused_rather_than_read_as_one() {
+        let text = capture(&[
+            reset_record(4, 2, true),
+            reset_record(5, 0, false),
+            identity_record(DEVICE, 1, false),
+            fingerprint_record(FINGERPRINT),
+        ]);
+        let verdict = judge(text.as_bytes(), log()).expect_err("a doubled reset");
+        assert!(verdict.contains("answered twice"), "{verdict}");
+    }
+
+    #[test]
+    fn a_reset_record_whose_owner_field_is_no_boolean_is_refused() {
+        let text = capture(&[
+            "LFW-PD domain=store state=negotiated cleared-generation=4 cleared-documents=2 \
+             was-owned=perhaps"
+                .to_owned(),
+            identity_record(DEVICE, 1, false),
+            fingerprint_record(FINGERPRINT),
+        ]);
+        let verdict = judge(text.as_bytes(), log()).expect_err("no boolean");
+        assert!(verdict.contains("is a boolean"), "{verdict}");
+    }
+
+    fn after_reset(device: &str, fingerprint: &str, cleared: u64) -> Identity {
+        Identity {
+            reset: Some(Reset {
+                generation: cleared,
+                documents: 0,
+                was_owned: false,
+            }),
+            ..identity(device, fingerprint, 1)
+        }
+    }
+
+    #[test]
+    fn a_reset_that_came_back_a_different_unowned_appliance_is_accepted() {
+        let previous = identity(DEVICE, FINGERPRINT, 4);
+        let fresh = after_reset(&DEVICE.replace('0', "1"), &FINGERPRINT.replace('0', "1"), 4);
+        let proved = hold_reset_to_source(("reloaded", &previous), ("reset", &fresh))
+            .expect("a reset appliance");
+        assert!(proved.contains("different, unowned appliance"), "{proved}");
+    }
+
+    /// Every way a reset fails, and each one is a different defect rather than a
+    /// different field: the identity surviving, the key surviving, an owner
+    /// surviving, a record that descends from the destroyed one, and a reset that
+    /// happened without saying so.
+    #[test]
+    fn a_reset_that_did_not_give_the_appliance_up_is_refused() {
+        let previous = identity(DEVICE, FINGERPRINT, 4);
+        let other = DEVICE.replace('0', "1");
+        let other_key = FINGERPRINT.replace('0', "1");
+
+        let verdict = hold_reset_to_source(
+            ("reloaded", &previous),
+            ("reset", &identity(DEVICE, FINGERPRINT, 1)),
+        )
+        .expect_err("no reset record");
+        assert!(verdict.contains("names no reset at all"), "{verdict}");
+
+        let verdict = hold_reset_to_source(
+            ("reloaded", &previous),
+            ("reset", &after_reset(DEVICE, &other_key, 4)),
+        )
+        .expect_err("the same name");
+        assert!(verdict.contains("still what this appliance"), "{verdict}");
+
+        let verdict = hold_reset_to_source(
+            ("reloaded", &previous),
+            ("reset", &after_reset(&other, FINGERPRINT, 4)),
+        )
+        .expect_err("the same key");
+        assert!(
+            verdict.contains("previous owner already holds"),
+            "{verdict}"
+        );
+
+        let owned = Identity {
+            onboarded: true,
+            ..after_reset(&other, &other_key, 4)
+        };
+        let verdict =
+            hold_reset_to_source(("reloaded", &previous), ("reset", &owned)).expect_err("owned");
+        assert!(verdict.contains("Unowned is what a reset"), "{verdict}");
+
+        let advanced = Identity {
+            generation: 5,
+            ..after_reset(&other, &other_key, 4)
+        };
+        let verdict = hold_reset_to_source(("reloaded", &previous), ("reset", &advanced))
+            .expect_err("a generation past a mint's");
+        assert!(verdict.contains("starts at 1"), "{verdict}");
+
+        let verdict = hold_reset_to_source(
+            ("reloaded", &previous),
+            ("reset", &after_reset(&other, &other_key, 3)),
+        )
+        .expect_err("cleared a generation the previous boot did not run on");
+        assert!(verdict.contains("read one copy"), "{verdict}");
+    }
+
+    /// And the other direction: a boot whose subject is a *reload* must not have
+    /// reset anything.
+    #[test]
+    fn a_reload_that_reported_a_reset_is_refused() {
+        let minted = identity(DEVICE, FINGERPRINT, 1);
+        let reset = Identity {
+            reset: Some(Reset {
+                generation: 1,
+                documents: 0,
+                was_owned: false,
+            }),
+            ..identity(DEVICE, FINGERPRINT, 1)
+        };
+        let verdict = hold_to_source(("minted", &minted), ("reloaded", &reset))
+            .expect_err("a reload that reset");
+        assert!(verdict.contains("cannot be evidence"), "{verdict}");
     }
 }

@@ -251,6 +251,22 @@ pub enum DomainDetail<C = &'static str> {
     /// two strings somebody has to join before comparing, and a fingerprint
     /// joined by hand is a fingerprint compared carelessly.
     Fingerprint([u8; 32]),
+    /// What a factory reset destroyed: the generation the record it overwrote
+    /// stood at, how many configuration versions went with it, and whether the
+    /// appliance had an owner to give up.
+    ///
+    /// Appended, never inserted, on the two details above's terms. The three
+    /// travel together because they are the whole of what was lost: an owned
+    /// appliance's reset destroyed a delivered certificate, a trust anchor and an
+    /// endpoint besides what it minted for itself, and an unowned one's destroyed
+    /// only the latter. **No key material has a representation here** — what is
+    /// reported is a position, a count and a flag, and the bytes themselves are
+    /// gone rather than moved somewhere a record could carry them.
+    Reset {
+        generation: u64,
+        documents: u64,
+        was_owned: bool,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

@@ -13,6 +13,22 @@
 //! loads the same record, holds it to itself, and reports that the same
 //! appliance returned and how far its state has advanced. Then it parks.
 //!
+//! # It also gives that identity up
+//!
+//! One sector of the medium is a **factory-reset request**, and it is the only way
+//! into an appliance with no shell and no input path. Finding it, this domain
+//! clears the request and waits for the flush behind it, overwrites every sector
+//! the layout claims, reports what it destroyed, and mints afresh — a reset node is
+//! immediately onboardable, which is what unowned means.
+//!
+//! Two things about that sequence are decisions rather than consequences. The
+//! request is answered **before** the record is judged, because a record this build
+//! refuses is exactly the state a reset is the remedy for. And the request is
+//! cleared **first**: a power cut in that order leaves a node an operator
+//! re-onboards, and in the opposite order one that resets on every boot forever,
+//! which nobody can onboard at all. One outcome is recoverable and the other is a
+//! brick.
+//!
 //! # Adversary
 //!
 //! Two, and the second is the reason this domain exists at all.
@@ -108,7 +124,8 @@ use lfw_crypto::{Drbg, EntropyError, NodeEntropy, SEED_MATERIAL_LEN, hardware_se
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use lfw_store::{
-    Copies, IdentityError, Onboarding, STATE_A_SECTOR, STATE_COPY_BYTES, STORE_SECTORS, State,
+    CheckedState, Cleared, Copies, IdentityError, Onboarding, RESET_REQUEST_BYTES,
+    RESET_REQUEST_SECTOR, ResetRequest, STATE_A_SECTOR, STATE_COPY_BYTES, STORE_SECTORS, State,
     StateError, StateWrite, decode_state, encode_state, mint, verify,
 };
 use pd_runtime::{
@@ -139,6 +156,11 @@ const _: () = assert!(
 // backpressure. Stated as the assertion it is: a table of one would make the
 // barrier's own submission fail while the write it orders was still outstanding.
 const _: () = assert!(lfw_blk::request::SLOTS >= 2);
+
+/// Sectors one overwrite transfer covers: the whole staging window, so a factory
+/// reset erases the layout in the fewest transfers the grant allows. Three of
+/// them, for a store of [`STORE_SECTORS`].
+const OVERWRITE_SECTORS: u64 = (BLK_IO_REGION_SIZE / SECTOR_SIZE) as u64;
 
 /// Poll iterations one completion is waited for.
 ///
@@ -201,6 +223,13 @@ enum Step {
     Read,
     Write,
     Barrier,
+    /// Reading the factory-reset request sector.
+    ResetRead,
+    /// Clearing that request, which every irreversible step of a reset sits
+    /// behind.
+    ResetClear,
+    /// Overwriting what the medium held.
+    Overwrite,
 }
 
 impl Step {
@@ -224,6 +253,21 @@ impl Step {
             // short and the variant is answered rather than asserted.
             (Self::Barrier, TransferError::Short { .. }) => "state-barrier-short",
             (Self::Barrier, TransferError::Silent) => "state-barrier-unanswered",
+            (Self::ResetRead, TransferError::Refused) => "reset-read-refused",
+            (Self::ResetRead, TransferError::Misattributed) => "reset-read-misattributed",
+            (Self::ResetRead, TransferError::Failed) => "reset-read-failed",
+            (Self::ResetRead, TransferError::Short { .. }) => "reset-read-short",
+            (Self::ResetRead, TransferError::Silent) => "reset-read-unanswered",
+            (Self::ResetClear, TransferError::Refused) => "reset-clear-refused",
+            (Self::ResetClear, TransferError::Misattributed) => "reset-clear-misattributed",
+            (Self::ResetClear, TransferError::Failed) => "reset-clear-failed",
+            (Self::ResetClear, TransferError::Short { .. }) => "reset-clear-short",
+            (Self::ResetClear, TransferError::Silent) => "reset-clear-unanswered",
+            (Self::Overwrite, TransferError::Refused) => "reset-overwrite-refused",
+            (Self::Overwrite, TransferError::Misattributed) => "reset-overwrite-misattributed",
+            (Self::Overwrite, TransferError::Failed) => "reset-overwrite-failed",
+            (Self::Overwrite, TransferError::Short { .. }) => "reset-overwrite-short",
+            (Self::Overwrite, TransferError::Silent) => "reset-overwrite-unanswered",
         }
     }
 }
@@ -409,6 +453,12 @@ struct Established {
     /// cares about: a node reporting `minted` after a boot that did not has lost
     /// its identity.
     minted: bool,
+    /// What a factory reset destroyed on the way here, where this boot honoured
+    /// one. `Some` and `minted` always travel together — a reset leaves an
+    /// unowned medium and the next thing that happens is a mint — and they are
+    /// kept apart anyway, because a mint on a *first* boot is the same event with
+    /// an entirely different cause.
+    reset: Option<Cleared>,
 }
 
 #[protection_domain]
@@ -428,7 +478,22 @@ fn init() -> Store {
     let outcome = bring_up(&sink, wall_seconds(&clock));
     let identity = match &outcome.verdict {
         Ok(established) => {
-            // Which appliance this is, first, because it is what every other
+            // What was given up, before what replaced it: a reset is the one
+            // event on this surface that destroys rather than establishes, and an
+            // operator reading the identity below has to know whether it is the
+            // appliance that was here or the one that took its place.
+            if let Some(cleared) = established.reset {
+                announce(
+                    &sink,
+                    DomainState::Negotiated,
+                    DomainDetail::Reset {
+                        generation: cleared.generation,
+                        documents: cleared.documents as u64,
+                        was_owned: cleared.was_owned,
+                    },
+                );
+            }
+            // Which appliance this is, then, because it is what every other
             // record on this boot is about.
             announce(
                 &sink,
@@ -452,6 +517,7 @@ fn init() -> Store {
                 minted: established.minted,
                 generation: established.generation,
                 onboarded: matches!(established.onboarding, Onboarding::Onboarded),
+                reset: established.reset.is_some(),
             }
         }
         Err(cause) => {
@@ -523,8 +589,9 @@ impl From<StartupError> for EstablishError {
     }
 }
 
-/// Read the record; mint an identity where there is none, verify the one there
-/// is, and answer what the appliance is.
+/// Read the record; honour a factory-reset request where one is there, mint an
+/// identity where there is none, verify the one there is, and answer what the
+/// appliance is.
 fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, EstablishError> {
     let needed = STORE_SECTORS;
     let capacity = medium.requests.capacity_sectors();
@@ -534,6 +601,19 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
 
     let mut region = [0_u8; BOTH_COPIES];
     medium.read_state(&mut region)?;
+
+    // The request is answered *before* the record is judged, and that ordering is
+    // the decision rather than a consequence of one: a record this build refuses
+    // is exactly the state an operator reaches for a reset to fix, so an
+    // appliance that demanded a coherent identity before it would give one up
+    // could never be recovered. What the record is used for here is the report,
+    // and a record beyond use reports zeroes.
+    if medium.read_reset()?.is_requested() {
+        let cleared = medium.factory_reset(&mut region)?;
+        let mut minted = medium.mint_identity(&mut region, now)?;
+        minted.reset = Some(cleared);
+        return Ok(minted);
+    }
 
     match decode_state(&region) {
         // The medium already carries a record. It is checked against this
@@ -551,6 +631,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 generation: state.get().generation(),
                 onboarding: state.get().onboarding(),
                 minted: false,
+                reset: None,
             })
         }
         // A fresh medium — or one whose record is beyond use. Both are the same
@@ -558,22 +639,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
         // minted. That is deliberately not a repair of a damaged record: a
         // record that half-decoded is refused above, and only "neither copy is a
         // record at all" reaches here.
-        None => {
-            let minted = mint(medium.entropy_or_seed()?, now)
-                .map_err(|error| EstablishError::Other(StartupError::Identity(error)))?;
-            // Both copies, because there is no copy of *this* appliance's state
-            // to preserve and one left behind would be another appliance's. The
-            // barrier behind it is what makes the write durable rather than
-            // merely submitted.
-            medium.commit(&minted.state, Copies::Both)?;
-            Ok(Established {
-                device: device_word(minted.state.device_id()),
-                fingerprint: minted.identity.fingerprint,
-                generation: minted.state.generation(),
-                onboarding: minted.state.onboarding(),
-                minted: true,
-            })
-        }
+        None => medium.mint_identity(&mut region, now),
     }
 }
 
@@ -643,6 +709,145 @@ impl<'region> Medium<'region> {
         self.entropy.as_ref().ok_or(StartupError::GeneratorStalled)
     }
 
+    /// Mint an identity onto a medium that carries none of this appliance's.
+    ///
+    /// Both copies, because there is no copy of *this* appliance's state to
+    /// preserve and one left behind would be another appliance's. The barrier
+    /// behind it is what makes the write durable rather than merely submitted.
+    ///
+    /// `region` is the caller's — the same storage the record was read into, which
+    /// by here holds nothing this appliance needs. One buffer rather than two: it
+    /// is 4 KiB a copy and this domain's stack is not sized for holding the
+    /// record twice at once.
+    fn mint_identity(
+        &mut self,
+        region: &mut [u8; BOTH_COPIES],
+        now: i64,
+    ) -> Result<Established, EstablishError> {
+        let minted = mint(self.entropy_or_seed()?, now)
+            .map_err(|error| EstablishError::Other(StartupError::Identity(error)))?;
+        self.commit(region, &minted.state, Copies::Both)?;
+        Ok(Established {
+            device: device_word(minted.state.device_id()),
+            fingerprint: minted.identity.fingerprint,
+            generation: minted.state.generation(),
+            onboarding: minted.state.onboarding(),
+            minted: true,
+            reset: None,
+        })
+    }
+
+    /// Read the factory-reset request sector.
+    ///
+    /// A sector of the medium, so every byte is a physical attacker's — and there
+    /// is nothing here to parse: the answer is a comparison against one constant
+    /// pattern, which `lfw_store` owns. An absent request is the ordinary state of
+    /// this sector and is not an error.
+    fn read_reset(&mut self) -> Result<ResetRequest, EstablishError> {
+        let Some(span) = IoSpan::at_offset(0, RESET_REQUEST_BYTES as u32) else {
+            return Err(EstablishError::Step(
+                Step::ResetRead,
+                TransferError::Refused,
+            ));
+        };
+        self.transfer(Step::ResetRead, Operation::Read, RESET_REQUEST_SECTOR, span)?;
+        // Out of the staging window and into this domain's own storage, on
+        // `read_state`'s terms: a device that answered and kept writing must not
+        // be able to change the sector between the comparison and its answer.
+        let mut sector = [0_u8; RESET_REQUEST_BYTES];
+        let staged = self.io.staging(span);
+        for (slot, byte) in sector.iter_mut().zip(staged.iter()) {
+            *slot = *byte;
+        }
+        Ok(ResetRequest::read(&sector))
+    }
+
+    /// Honour a factory reset: clear the request, then destroy what the medium
+    /// held, and answer what that was.
+    ///
+    /// **The order is the whole of the decision.** The request is cleared and made
+    /// durable *first*: a power cut between the two steps then leaves an appliance
+    /// whose identity is partly gone and which will not reset again, which is a
+    /// node an operator re-onboards. The opposite order leaves one that resets on
+    /// every boot forever, which is a node nobody can onboard at all. One outcome
+    /// is recoverable and the other is a brick, so the flush behind the clear is
+    /// waited for rather than left to the next transfer to imply.
+    ///
+    /// `region` is this domain's copy of the record and is cleared here too: the
+    /// scalar it holds has no reason to outlive the medium's.
+    fn factory_reset(&mut self, region: &mut [u8; BOTH_COPIES]) -> Result<Cleared, EstablishError> {
+        // Read before anything is destroyed, because the report is about the
+        // appliance being given up. A record this build cannot read reports
+        // nothing rather than refusing the reset.
+        let checked = decode_state(region).and_then(|image| image.check().ok());
+        let cleared = Cleared::of(checked.as_ref().map(CheckedState::get));
+        self.clear_reset()?;
+        self.overwrite_store()?;
+        zeroize(region);
+        Ok(cleared)
+    }
+
+    /// Write zeroes over the request sector and wait for the flush behind them.
+    fn clear_reset(&mut self) -> Result<(), EstablishError> {
+        let Some(span) = IoSpan::at_offset(0, RESET_REQUEST_BYTES as u32) else {
+            return Err(EstablishError::Step(
+                Step::ResetClear,
+                TransferError::Refused,
+            ));
+        };
+        for byte in self.io.staging(span).iter_mut() {
+            *byte = 0;
+        }
+        self.transfer(
+            Step::ResetClear,
+            Operation::Write,
+            RESET_REQUEST_SECTOR,
+            span,
+        )?;
+        self.barrier()
+    }
+
+    /// Overwrite every sector this build's layout claims, and wait for the flush
+    /// behind it.
+    ///
+    /// **Overwritten, not marked free.** The medium holds the private scalar in
+    /// plaintext, so a sector released rather than written is a kept secret; and
+    /// the whole layout rather than the fields that hold one, because the answer
+    /// to "which sectors are the secret ones" would then come from the record this
+    /// step exists to destroy.
+    ///
+    /// It runs before the mint and is made durable on its own rather than left to
+    /// the mint's commit, which is not redundant: a boot whose generator turns out
+    /// broken refuses and parks *after* this point, and an appliance that kept a
+    /// readable key through a reset it reported would be the one failure this
+    /// whole step exists to prevent.
+    fn overwrite_store(&mut self) -> Result<(), EstablishError> {
+        // Zeroes across the whole window once, so every transfer below names a
+        // span of a window that already holds nothing.
+        let Some(whole) = IoSpan::at_offset(0, BLK_IO_REGION_SIZE as u32) else {
+            return Err(EstablishError::Step(
+                Step::Overwrite,
+                TransferError::Refused,
+            ));
+        };
+        for byte in self.io.staging(whole).iter_mut() {
+            *byte = 0;
+        }
+        let mut sector = 0;
+        while sector < STORE_SECTORS {
+            let sectors = STORE_SECTORS.saturating_sub(sector).min(OVERWRITE_SECTORS);
+            let Some(span) = IoSpan::at_offset(0, sectors_bytes(sectors)) else {
+                return Err(EstablishError::Step(
+                    Step::Overwrite,
+                    TransferError::Refused,
+                ));
+            };
+            self.transfer(Step::Overwrite, Operation::Write, sector, span)?;
+            sector = sector.saturating_add(sectors);
+        }
+        self.barrier()
+    }
+
     /// Read both copies of the record into `region`.
     fn read_state(&mut self, region: &mut [u8; BOTH_COPIES]) -> Result<(), EstablishError> {
         let span = self.whole_record();
@@ -667,9 +872,18 @@ impl<'region> Medium<'region> {
     /// flush says they will survive the power going away. Everything a later boot
     /// believes about this appliance rests on it, so it is issued here and waited
     /// for rather than left to the next transfer to imply.
-    fn commit(&mut self, state: &State, copies: Copies) -> Result<(), EstablishError> {
-        let mut image = [0_u8; BOTH_COPIES];
-        let StateWrite { sector, sectors } = encode_state(&mut image, state, copies);
+    ///
+    /// `image` is the caller's storage and is composed into rather than allocated
+    /// here — see [`Self::mint_identity`] on why the record crosses in one buffer
+    /// and not two. Only the copies `copies` names are written to the medium, so
+    /// bytes the compose leaves untouched reach no sector.
+    fn commit(
+        &mut self,
+        image: &mut [u8; BOTH_COPIES],
+        state: &State,
+        copies: Copies,
+    ) -> Result<(), EstablishError> {
+        let StateWrite { sector, sectors } = encode_state(image, state, copies);
         // The staging window is written from this domain's own storage rather
         // than composed in place, so a device reading the window mid-compose
         // sees a whole record or the previous contents and never a half-written

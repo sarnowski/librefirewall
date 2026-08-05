@@ -572,6 +572,14 @@ pub const STORE_ONBOARDED: Metric = metric(
     "1 once a management plane has adopted this appliance, 0 while it is unowned.",
 );
 
+pub const STORE_RESET: Metric = metric(
+    "librefirewall_store_reset",
+    Kind::Gauge,
+    "1 where this boot found a factory-reset request on the store medium and honoured it, 0 \
+     otherwise. It is what tells an intentional reset from a lost medium: both mint, and only \
+     this says which one was asked for.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -935,6 +943,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &STORE_MINTED,
     &STORE_GENERATION,
     &STORE_ONBOARDED,
+    &STORE_RESET,
     &RECORDING_RECORDS,
     &RECORDING_RECORD_BYTES,
     &RECORDING_RECORDS_DROPPED,

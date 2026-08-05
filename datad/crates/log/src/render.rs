@@ -240,6 +240,20 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             }
             Ok(())
         }
+        // What a reset destroyed, as three fields keyed to the past: the record
+        // this appliance no longer has, the versions that went with it, and
+        // whether there was an owner to give up. `cleared-generation=0` is a
+        // medium that carried no record this build could read, which is a state a
+        // reset is honoured over rather than refused for.
+        DomainDetail::Reset {
+            generation,
+            documents,
+            was_owned,
+        } => write!(
+            cursor,
+            " cleared-generation={generation} cleared-documents={documents} \
+             was-owned={was_owned}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -601,6 +615,41 @@ mod tests {
                  fingerprint={}",
                 "0".repeat(64)
             )
+        );
+    }
+
+    /// The record a factory reset leaves: what the appliance gave up, in the past
+    /// tense, and nothing about what replaced it.
+    #[test]
+    fn a_store_domain_renders_what_a_factory_reset_destroyed() {
+        let reset = |generation, documents, was_owned| {
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Reset {
+                    generation,
+                    documents,
+                    was_owned,
+                },
+            })
+        };
+        assert_eq!(
+            reset(7, 3, true),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=negotiated \
+             cleared-generation=7 cleared-documents=3 was-owned=true"
+        );
+        // The medium that carried no record this build could read, and the widest
+        // numbers the fields can hold.
+        assert_eq!(
+            reset(0, 0, false),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=negotiated \
+             cleared-generation=0 cleared-documents=0 was-owned=false"
+        );
+        assert_eq!(
+            reset(u64::MAX, u64::MAX, true),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=negotiated \
+             cleared-generation=18446744073709551615 \
+             cleared-documents=18446744073709551615 was-owned=true"
         );
     }
 
@@ -1044,6 +1093,16 @@ mod tests {
                 onboarded: true,
             },
             DomainDetail::Fingerprint([0xff; 32]),
+            DomainDetail::Reset {
+                generation: u64::MAX,
+                documents: u64::MAX,
+                was_owned: false,
+            },
+            DomainDetail::Reset {
+                generation: u64::MAX,
+                documents: u64::MAX,
+                was_owned: true,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -1119,6 +1178,13 @@ mod tests {
                 }
             }),
             any::<[u8; 32]>().prop_map(DomainDetail::Fingerprint),
+            any::<(u64, u64, bool)>().prop_map(|(generation, documents, was_owned)| {
+                DomainDetail::Reset {
+                    generation,
+                    documents,
+                    was_owned,
+                }
+            }),
             (
                 (0..causes.len()),
                 prop_oneof![

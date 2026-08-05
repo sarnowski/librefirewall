@@ -619,6 +619,73 @@ fn composing_a_request_over_a_dirty_sector_leaves_only_the_token() {
     assert_eq!(sector, reset_token());
 }
 
+/// What a reset reports is read off the state it is about to destroy: the
+/// generation that appliance stood at, how many configuration versions go with
+/// it, and whether there was an owner to give up.
+#[test]
+fn a_reset_reports_the_appliance_it_is_about_to_destroy() {
+    let mut state = minted();
+    assert_eq!(
+        Cleared::of(Some(&state)),
+        Cleared {
+            generation: 1,
+            documents: 0,
+            was_owned: false,
+        }
+    );
+
+    state.adopt(
+        StoredCertificate::new(&[0xCD; 400]).expect("inside the bound"),
+        StoredCertificate::new(&[0xEF; 500]).expect("inside the bound"),
+        endpoint(),
+    );
+    state.record_document(slot(0), entry(1, 4096), true);
+    state.record_document(slot(3), entry(2, 8192), false);
+    assert_eq!(
+        Cleared::of(Some(&state)),
+        Cleared {
+            generation: 4,
+            documents: 2,
+            was_owned: true,
+        }
+    );
+}
+
+/// And a medium carrying no record this build can read reports nothing rather
+/// than refusing the reset: a record the appliance will not act on is exactly the
+/// state a reset is the remedy for.
+#[test]
+fn a_reset_over_a_record_this_build_cannot_read_reports_nothing() {
+    assert_eq!(
+        Cleared::of(None),
+        Cleared {
+            generation: 0,
+            documents: 0,
+            was_owned: false,
+        }
+    );
+    assert_eq!(Cleared::of(None), Cleared::default());
+}
+
+/// The window a proof of erasure has to name, read positionally so it works on a
+/// region whose record no longer decodes.
+#[test]
+fn the_stored_secret_window_is_the_scalar_wherever_the_record_stands() {
+    let mut region = [0_u8; COPIES_BYTES];
+    encode_state(&mut region, &minted(), Copies::Both);
+    assert_eq!(stored_secret_window(&region), [0x22; SECRET_LEN]);
+
+    // A region neither copy of which decodes any more is still a region the
+    // window can be read out of, which is the whole reason this reads no fields.
+    region[0] ^= 0xFF;
+    region[STATE_COPY_BYTES] ^= 0xFF;
+    assert!(decode_state(&region).is_none());
+    assert_eq!(stored_secret_window(&region), [0x22; SECRET_LEN]);
+    // And a zeroed medium carries no scalar at all, which is what makes an
+    // all-zero window worth refusing as a proof.
+    assert_eq!(stored_secret_window(&[0; COPIES_BYTES]), [0; SECRET_LEN]);
+}
+
 // ---------------------------------------------------------------------------
 // Properties over arbitrary media
 // ---------------------------------------------------------------------------

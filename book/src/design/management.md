@@ -93,9 +93,19 @@ it is authenticated by the TLS session the administrator opened after verifying 
 of band.
 
 **Factory reset is the only ownership transfer.** It removes all ownership — the key, the delivered
-certificate and anchor, the endpoint, the configuration history, the recordings — and returns the
-appliance to unowned, ready to onboard again. It is local-only and never remotely triggerable; its
-mechanics are with the [store design](updates.md#factory-reset).
+certificate and anchor, the endpoint, the configuration history — and returns the appliance to
+unowned, ready to onboard again. It is local-only and never remotely triggerable, and it is asked for
+by writing one sector of a medium: the same physical possession that established ownership is what
+revokes it.
+
+**It is per-medium**, and that is a consequence of the isolation the design rests on rather than a
+limitation of it. The node's own state and its recordings sit on two devices owned by two protection
+domains, neither of which maps a byte of the other's; a reset reaching from one to the other would
+breach exactly the property that keeps the private key out of reach of the domain that answers a
+download. So each medium holding an owner's data carries its own request and its own overwrite, and
+the boundary stays exact — the visit that writes one medium's request sector reaches the others. The
+mechanics, the clearing order and what each medium gives up are with the
+[store design](updates.md#factory-reset).
 
 ## Lifecycle rules
 

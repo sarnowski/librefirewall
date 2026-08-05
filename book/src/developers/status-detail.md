@@ -709,7 +709,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 12 of the 19 system
+**What the gate proves.** Every scenario whose management port is reachable — 12 of the 20 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -1228,7 +1228,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 19 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 20 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1450,7 +1450,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the 19 system scenarios additionally hold the console's own record to the frames and the bytes
+Two of the 20 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -2067,17 +2067,47 @@ does not offer it is refused at bring-up, and the store's commit is a whole-reco
 a flush the domain **waits for**. That is the difference between written and durable, and everything
 a later boot believes about this appliance rests on it.
 
+**Factory reset exists on this medium.** The request is one sector, written by somebody holding the
+device, and it is the only path into a node with no shell and no input surface — the alternatives are
+each either remote or absent, and the [store design](../design/updates.md#factory-reset) records why.
+On boot the domain reads that sector before it judges the record, because a record the appliance
+refuses is exactly the state a reset is the remedy for. It then clears the request **and waits for the
+flush behind it** before destroying anything: a power cut in that order leaves a node an operator
+re-onboards, and in the opposite order one that resets on every boot forever. Then it overwrites every
+sector the layout claims — both copies of the record, the request sector, the whole slot array — rather
+than the fields that hold a secret, because the answer to which sectors those are would come from the
+record being destroyed; makes that durable on its own, so a boot whose generator turns out broken
+refuses with the old key already gone; reports on the console what was lost; and mints afresh, because
+a reset node is immediately onboardable and that is what unowned means.
+
+**Reset is per-medium, and that follows from the isolation rather than weakening it.** The recordings
+are on the recorder's device and this request is on the store's, owned by two domains neither of which
+maps a byte of the other's — the property that keeps the domain holding the scalar unable to read a
+recording. Reaching across from here would breach exactly that, so each medium holding an owner's data
+carries its own request and its own overwrite, and the physical boundary stays exact because one visit
+reaches every medium.
+
 **What it proves today**, as a machine-observable contract rather than a console line an operator
-reads: two QEMU scenarios share **one** store medium. The first finds it zeroed and mints; the second
+reads: three QEMU scenarios share **one** store medium. The first finds it zeroed and mints; the second
 attaches the same file and must report the same 32-hexadecimal-character device identifier and the
 same 64-hexadecimal-character fingerprint under a generation that did not go backwards. A domain that
 minted afresh on every boot satisfies every assertion the first boot makes and fails here, and that
-defect is the whole reason a persistent identity exists. Nothing on the host side reads the medium's
-contents — it carries the private scalar in plaintext, and a harness that parsed it would be a second
-place that had to be trusted never to print one; what the gate compares is the two consoles, which is
-what an administrator compares. The host does read the medium's first sixteen bytes to hold the magic
-and the version to `lfw_store`'s own constants: a domain that composed a record and never got it past
-the staging window is caught by that rather than believed.
+defect is the whole reason a persistent identity exists. The third has a factory-reset request written
+onto that medium between the boots and owes the inverse: a *different* identifier, a *different*
+fingerprint, unowned, at the generation a mint starts from, and a console record naming the generation
+it cleared — which must be the one the boot before it ran on.
+
+What the gate compares is the consoles, which is what an administrator compares, and the host reads
+the medium's first sixteen bytes besides to hold the magic and the version to `lfw_store`'s own
+constants: a domain that composed a record and never got it past the staging window is caught by that
+rather than believed. The reset scenario is the **one** place the host reads more, and it has to be:
+the console cannot say the old key left the medium, and neither can the state record, because
+re-minting rewrites it whatever happened to the sectors around it. So the scalar's window is captured
+off the medium before that boot and required to occur at **no offset** of the file afterwards — every
+byte searched, zero matches. That needle is a private key; it lives in the harness for the length of
+one scenario, is never written anywhere, and a surviving occurrence is reported as an offset, so no
+byte of it reaches a message. Everywhere else the rule holds unchanged: the medium's contents are not
+read, because a harness that parsed them would be a second place trusted never to print a key.
 
 **The capability topology is the substance.** One domain maps the store device and no other maps any
 part of it — the recorder included, which owns the other block device. That domain holds no network
@@ -2088,19 +2118,26 @@ so physical possession of the store *is* identity theft — and this topology is
 the only way to it.
 
 **No key material reaches any surface.** The scalar is drawn, folded into a certificate and written to
-the medium, and that is the whole of where it goes. The two console records carry a public name and a
-public-key digest; `/metrics` says whether there *is* an identity, whether this boot had to mint one
-and how far the record has advanced, and never which identity it is; the committed fuzz corpus for the
-state record carries only fixed byte patterns, two of which are deliberately not private keys at all.
+the medium, and that is the whole of where it goes. The console records carry a public name, a
+public-key digest, and — after a reset — a generation, a count and a flag; `/metrics` says whether
+there *is* an identity, whether this boot had to mint one, whether a reset was asked for and how far
+the record has advanced, and never which identity it is; the committed fuzz corpus for the state
+record carries only fixed byte patterns, two of which are deliberately not private keys at all.
 
-**Missing, and in this order.** [Factory reset](../design/updates.md#factory-reset) — the request
-sector and its token exist in `lfw_store::reset` and nothing reads them, so an appliance cannot yet be
-told to give up its owner. Then the [signing delegation](../design/management.md) — the ABI is in
-`wire::signing` and has no consumer, so the cryptography domain still generates a key of its own for
-its own proof rather than asking this domain for a signature over the real one. After those: the CSR
-this domain's key would sign, the device certificate and trust anchor an owner delivers, the
-management endpoint beside them, and the configuration slot array — all four have a place in the
-record and nothing writes them.
+**Missing, and in this order.** **Factory reset on the recorder's medium.** The store's half is
+above; the recorder's is not a repeat of it, and that is why it is not here. The store device has a
+fixed compiled-in layout with a spare sector between the record and the slot array, which is what the
+request sector is; the recorder's extent may be a whole device or a named partition resolved at boot,
+and its superblock occupies the first two sectors of whichever it turns out to be — so there is no
+free sector to claim without first deciding where a request lives in a layout that is not fully known
+until the extent is opened. That is a layout decision with a threat model attached (a sector an
+attacker can write inside a recording extent), not an extension of the code above.
+
+Then the [signing delegation](../design/management.md) — the ABI is in `wire::signing` and has no
+consumer, so the cryptography domain still generates a key of its own for its own proof rather than
+asking this domain for a signature over the real one. After those: the CSR this domain's key would
+sign, the device certificate and trust anchor an owner delivers, the management endpoint beside them,
+and the configuration slot array — all four have a place in the record and nothing writes them.
 
 ## Cryptography and TLS
 
@@ -2300,7 +2337,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 28 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (19 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Two scenarios share ONE store medium so the second can be held to the identity the first minted on it, which is the only shape a persistence claim has. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (20 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Three scenarios share ONE store medium: the second is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

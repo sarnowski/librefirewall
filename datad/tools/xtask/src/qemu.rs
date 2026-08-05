@@ -227,16 +227,16 @@ struct Bench {
     management: ManagementBacking,
     traffic: Traffic,
     /// Which store medium this boot attaches: a fresh one, or the one an earlier
-    /// boot of the same run minted an identity on.
+    /// boot of the same run minted an identity on — reset or not.
     store: StoreMedium,
 }
 
 /// Which store medium a boot attaches at 00:06.0 — the appliance's own.
 ///
 /// A property of the scenario rather than of the run, on [`Accelerator`]'s terms:
-/// almost every boot wants a medium of its own, and exactly one wants the medium
-/// an earlier boot left. Making it a field is what lets the scenario table say
-/// which is which, and what keeps the pair readable as a pair.
+/// almost every boot wants a medium of its own, and two want the medium an earlier
+/// boot left. Making it a field is what lets the scenario table say which is
+/// which, and what keeps a pair readable as a pair.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoreMedium {
     /// A fresh, zero-filled medium, so the boot mints an identity. Every scenario
@@ -249,6 +249,15 @@ pub(crate) enum StoreMedium {
     /// of the reloading scenario reads the same medium the shipping run judged.
     /// A reload writes nothing, so reading it twice is not a second commit.
     CarriedFrom(&'static str),
+    /// The same medium, with a **factory-reset request** written onto one sector
+    /// of it before the boot — which is the whole of how a reset is asked for,
+    /// there being no channel operation, no configuration document and no console
+    /// input that can invoke one.
+    ///
+    /// A separate variant rather than a flag on the one above, because the two
+    /// scenarios owe opposite things of the same medium: one must come back the
+    /// same appliance and the other must not come back that appliance at all.
+    ResetRequestedOn(&'static str),
 }
 
 /// What a boot owes the raw device at 00:05.0, which follows from its contract
@@ -276,9 +285,10 @@ struct Invocation {
     /// image would ever perform.
     data: DataDisk,
     /// The store device this run attached — created fresh, or the one an earlier
-    /// boot left. Every invocation gets one for the reason every one gets a data
-    /// device: a domain staring at an absent device is a different boot from the
-    /// one the image was assembled for.
+    /// boot left, with or without a factory-reset request written onto it. Every
+    /// invocation gets one for the reason every one gets a data device: a domain
+    /// staring at an absent device is a different boot from the one the image was
+    /// assembled for.
     store: StoreDisk,
 }
 
@@ -391,13 +401,14 @@ pub(crate) enum Console {
     JudgedOnCryptographyAlone,
     /// **The store domain's records, and nothing else at all.**
     ///
-    /// [`Self::JudgedOnCryptographyAlone`]'s shape and its reasoning, for the one
-    /// other question a single boot cannot answer. Every other statement this
+    /// [`Self::JudgedOnCryptographyAlone`]'s shape and its reasoning, for the two
+    /// other questions a single boot cannot answer. Every other statement this
     /// gate makes here is about the *image*, and the boots that carry it have
-    /// already made them; what only this boot and its partner can settle is
-    /// whether the identity on one medium survives a reboot. So the identity
-    /// records are judged, the pair is held to each other after the run, and
-    /// nothing else is re-proved.
+    /// already made them; what only these boots and their partners can settle is
+    /// whether the identity on one medium survives a reboot, and whether a factory
+    /// reset takes it away. So the identity records are judged, each boot is held
+    /// to the one whose medium it inherited after the run, and nothing else is
+    /// re-proved.
     JudgedOnTheStoredIdentityAlone,
 }
 
@@ -420,9 +431,10 @@ pub(crate) struct Scenario {
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
     accelerator: Accelerator,
-    /// Which store medium this boot attaches. All but one scenario take a fresh
-    /// one; the one that does not is what proves the appliance's identity
-    /// survives a reboot, which is a claim about a medium rather than a boot.
+    /// Which store medium this boot attaches. All but two scenarios take a fresh
+    /// one; the two that do not are what prove the appliance's identity survives a
+    /// reboot and is given up by a factory reset, both claims about a medium rather
+    /// than about a boot.
     store: StoreMedium,
 }
 
@@ -956,6 +968,36 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // table, and `StoreDisk::carried` says so by name when it does not.
         store: StoreMedium::CarriedFrom("store-identity-minted"),
     },
+    // And the third boot of that one medium: the only ownership transfer the
+    // appliance has.
+    //
+    // The harness writes the request onto one sector between the boots, which is
+    // the whole mechanism — a reset revokes a management plane's ownership, so
+    // nothing a running node could hear may invoke it, and what is left is
+    // possession of the medium. The appliance must then come back a *different*
+    // appliance: a different name, a different key, unowned, at the generation a
+    // mint starts from, having said on the console what it destroyed.
+    //
+    // Two halves, and neither is the other. The console says the identity changed;
+    // it cannot say the old key left the medium, because a re-mint rewrites the
+    // record whatever happened to the sectors around it. So the scalar is captured
+    // off the medium before this boot and required to occur nowhere on it after —
+    // a needle scan over every byte of the file, which is the only shape that
+    // proof has.
+    Scenario {
+        name: "store-identity-reset",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheStoredIdentityAlone,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // The medium the two boots above ran on, which by here carries an
+        // identity that has already been shown to survive a reboot — so what this
+        // boot takes away is an identity rather than a first mint nothing depended
+        // on.
+        store: StoreMedium::ResetRequestedOn("store-identity-minted"),
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -1056,30 +1098,35 @@ fn judge_carried_media(
     };
     let mut proved = Vec::new();
     for scenario in scenarios {
-        let StoreMedium::CarriedFrom(source) = scenario.store else {
-            continue;
+        let (source, reset) = match scenario.store {
+            StoreMedium::Fresh => continue,
+            StoreMedium::CarriedFrom(source) => (source, false),
+            StoreMedium::ResetRequestedOn(source) => (source, true),
         };
         let Some(minted) = held(source) else {
             return Err(format!(
-                "system scenario {} reloads the store medium the {source} boot minted, and this \
-                 run holds no identity for {source}. Either the two are out of order in the \
-                 scenario table — the minting boot must precede the reloading one — or {source} \
-                 does not judge the store domain at all, and either way the claim that an \
-                 identity survived a reboot would be vacuously true",
+                "system scenario {} inherits the store medium the {source} boot minted on, and \
+                 this run holds no identity for {source}. Either the two are out of order in the \
+                 scenario table — the minting boot must precede the one that inherits it — or \
+                 {source} does not judge the store domain at all, and either way the claim this \
+                 pair makes about that medium would be vacuously true",
                 scenario.name
             ));
         };
         let Some(returned) = held(scenario.name) else {
             return Err(format!(
-                "system scenario {} reloads a store medium and judged no identity of its own, so \
+                "system scenario {} inherits a store medium and judged no identity of its own, so \
                  there is nothing to hold to the {source} boot's",
                 scenario.name
             ));
         };
-        proved.push(store_contract::hold_to_source(
-            (source, minted),
-            (scenario.name, returned),
-        )?);
+        let pair = (source, minted);
+        let mine = (scenario.name, returned);
+        proved.push(if reset {
+            store_contract::hold_reset_to_source(pair, mine)?
+        } else {
+            store_contract::hold_to_source(pair, mine)?
+        });
     }
     if proved.is_empty() {
         return Ok(String::new());
@@ -1984,6 +2031,15 @@ fn boot(
     if let Some(verdict) = store_verdict {
         println!("  store medium {run_label}: {verdict}");
     }
+    // And, on the one boot that asked for a factory reset, the half no console
+    // record can settle: that the key the medium held before it is nowhere on the
+    // medium after it.
+    if let Some(verdict) = store_disk
+        .judge_secret_erased()
+        .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?
+    {
+        println!("  store medium {run_label}: {verdict}");
+    }
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {
@@ -2156,6 +2212,12 @@ fn qemu_base(
         StoreMedium::Fresh => StoreDisk::create(root, run_label)?,
         StoreMedium::CarriedFrom(source) => {
             StoreDisk::carried(root, &scenario_run_label(source, Run::Shipping))?
+        }
+        // The request is written here, on the host side of the emulation, because
+        // that is what the mechanism *is*: one sector of a medium somebody has in
+        // their hands.
+        StoreMedium::ResetRequestedOn(source) => {
+            StoreDisk::reset_requested(root, &scenario_run_label(source, Run::Shipping))?
         }
     };
 

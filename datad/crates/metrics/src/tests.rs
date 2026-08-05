@@ -611,15 +611,17 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     assert_eq!(config.values(), [7, 11, 13, 17, 19, 23, 29]);
     assert_eq!(config.values().len(), CONFIG_SLOTS);
 
-    // The store domain's, which is the only shard carrying three independent
+    // The store domain's, which is the only shard carrying four independent
     // booleans: a `values()` that wrote one of them into another's slot would
-    // report a node as owned because it had minted, or as having minted because
-    // it was owned.
+    // report a node as owned because it had minted, as having minted because it
+    // was owned, or as reset because it had minted — and that last pair is the
+    // one an alert reads together.
     let store = StoreSample {
         established: true,
         minted: false,
         generation: 3,
         onboarded: true,
+        reset: true,
         capacity_sectors: 2048,
         requests: [5, 7],
         bytes: [11, 13],
@@ -633,12 +635,14 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     };
     assert_eq!(
         store.values(),
-        [1, 0, 3, 1, 2048, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41]
+        [
+            1, 0, 3, 1, 1, 2048, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41
+        ]
     );
     assert_eq!(store.values().len(), STORE_SLOTS);
-    // And a node that established nothing, so the two flags are not one value
-    // read twice.
-    assert_eq!(StoreSample::default().values()[..4], [0, 0, 0, 0]);
+    // And a node that established nothing, so the flags are not one value read
+    // four times.
+    assert_eq!(StoreSample::default().values()[..5], [0, 0, 0, 0, 0]);
     assert_eq!(StoreSample::default().values().len(), STORE_SLOTS);
 }
 
@@ -1169,5 +1173,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 87_849);
+    assert_eq!(MAX_EXPOSITION_LEN, 88_195);
 }
