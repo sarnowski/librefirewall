@@ -50,7 +50,7 @@ use crate::{
     },
     disk, evidence, grub,
     pins::{self, Pins},
-    sysdesc,
+    sysdesc, target_spec,
     util::{Error, copy_file, recreate_dir, run_command},
 };
 
@@ -353,6 +353,11 @@ fn assemble(
     recreate_dir(&dist)?;
 
     let target_root = root.join("target").join(config);
+    // Cargo does not fingerprint the JSON specifications the two invocations
+    // below name, so each target's artifacts are held to the one now on disk
+    // before anything is compiled for either.
+    target_spec::reconcile(root, &target_root, TARGET)?;
+    target_spec::reconcile(root, &target_root, SIMD_TARGET)?;
     run_command(
         Command::new("cargo")
             .current_dir(root)

@@ -38,6 +38,8 @@
 //!   with.
 //! - [`reference_contract`] — the operator reference chapters held to the
 //!   catalogues they describe.
+//! - [`target_spec`] — artifacts held to the target specification they were
+//!   compiled against.
 //! - [`image`] — build the PDs and assemble the Microkit image.
 //! - [`disk`] — the signed A/B GPT disk: partition geometry and assembly.
 //! - [`signing`] — the development payload-signing trust anchor.
@@ -94,6 +96,7 @@ mod signing;
 mod stamp_contract;
 mod surface_contract;
 mod sysdesc;
+mod target_spec;
 mod topology;
 mod util;
 

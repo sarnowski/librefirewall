@@ -108,6 +108,16 @@ domains keep having none. Both invocations are in `xtask::image`, and the lintin
 mirrors them exactly — a domain linted with a different standard-library set is a lint of a
 different binary.
 
+**Editing a target specification invalidates what was built against it.** The two specifications
+live in `datad/support/targets/`; cargo fingerprints the compiler, the profile, the features and
+every source file it reads, and it does not fingerprint one of these. Left alone, an edited
+specification is a build reported up to date that goes on linking object code compiled under the old
+one. So every build that compiles for a seL4 target — both image configurations, every scenario disk
+a QEMU run assembles, and the two-configuration Clippy pass — records the specification beside the
+artifacts it produced and discards them when the two no longer agree, naming the lines that moved.
+Editing a specification therefore costs one cold build of the target that changed, announced on the
+build's own output rather than left to be wondered about; leaving them alone costs nothing.
+
 ## The management-server toolchain
 
 `ctrld` follows the same discipline with BEAM-shaped mechanics. The builder image pins the
@@ -275,9 +285,20 @@ kernel build, which is why "debug" is better read as "release plus kernel diagno
 - `debug` — a diagnostic tool, not a test target. The kernel prints, so a fault reports itself
   instead of vanishing into an empty serial log. Reached three ways: `make run`, `make image-debug`,
   and automatically when an end-to-end scenario fails — the harness re-runs that one scenario on it
-  and surfaces the result as evidence, never letting it change the verdict. The two-kernel-
-  configuration Clippy pass is the only thing keeping this configuration buildable, so it is
-  load-bearing rather than incidental.
+  and surfaces the result as evidence, never letting it change the verdict. That third way is why
+  the configuration is load-bearing rather than incidental: when it cannot be assembled, every
+  failing scenario reports that the re-run never reached a boot, and the diagnosis is gone exactly
+  when it is wanted.
+
+  Two different things stand behind it, and only one of them is in a gate. The two-configuration
+  Clippy pass compiles this configuration's protection domains on every `make test`, which is what
+  keeps the *compilation* from rotting; nothing in any gate *assembles* the debug image, so its
+  assembly is proved by running `make image-debug` and by nothing else. Treating the first as
+  standing in for the second is what once left `image-debug` broken with every gate green: the two
+  steps compile into separate artifact directories, and neither noticed that a target specification
+  had moved under it. Both are held to their specifications now, which removes that particular way
+  of losing the configuration and does not turn the Clippy pass into a proof that the image
+  assembles.
 
 **The shipped profile is the tested profile.** *Every* end-to-end scenario boots the release
 configuration: `make ci` assembles it and holds that disk to the forwarding contract across the

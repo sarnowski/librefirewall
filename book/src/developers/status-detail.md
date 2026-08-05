@@ -2083,12 +2083,28 @@ management burst, two scrapes and two downloads — so emulating every instructi
 almost nothing. On a machine with no usable KVM every boot is emulated already, and the run says so
 rather than claiming a contrast it did not draw.
 
-One caveat is worth recording, because it bites: **cargo does not fingerprint a custom target
-specification**, so editing `datad/support/targets/x86_64-sel4-simd.json` alone rebuilds nothing.
-The SIMD target directory has to be removed for the change to reach the binaries. The disassembly
-check catches the resulting stale image in the direction that matters here — an image still
-carrying instructions the specification no longer enables fails it — but a specification that
-*gained* a feature the build did not pick up would pass unnoticed.
+**Cargo does not fingerprint a custom target specification, and the build no longer depends on
+anyone remembering that.** Editing `datad/support/targets/x86_64-sel4-simd.json` used to rebuild
+nothing: cargo reported the tree up to date and went on linking object code compiled under the
+withdrawn specification, so the edit reached the binaries only once that target's artifact
+directory had been removed by hand — and the withdrawal above shipped a debug configuration nobody
+had cleared, which no gate boots and which therefore stayed broken until someone ran it. That is now
+mechanical. Every build that compiles for one of the two seL4 targets — both image configurations,
+every scenario disk a QEMU run assembles, and the two-kernel-configuration Clippy pass — records the
+specification text beside the artifacts it produced and compares the two before reusing them. A
+directory built against a different specification, or one recording none at all, is discarded, and
+the build says so on its output and names the lines that moved; an agreement is silent, so a warm
+build pays nothing. The record is the specification itself rather than a digest of it: an exact
+comparison needs no collision argument, and it is what lets the discard name what changed.
+
+Two properties of that shape are the point of it. It is keyed per target, so an edit costs a cold
+build of the edited target alone — the other seL4 target keeps its artifacts, and so do the
+host-side build scripts and procedural macros sitting beside them, which matters in the debug
+configuration because the image build writes into the same directory the host dev profile does. And
+it is keyed on the specification rather than on either symptom, which is what covers both
+directions: the disassembly check reads a binary still carrying instructions the specification no
+longer enables, and nothing reads a binary quietly *missing* an acceleration the specification just
+gained.
 
 **Two library choices were settled by what the build found, and the design now names what shipped.**
 

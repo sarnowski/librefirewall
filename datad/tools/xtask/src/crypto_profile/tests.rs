@@ -176,7 +176,7 @@ fn a_prefix_byte_inside_an_instruction_is_not_read_as_its_encoding() {
 #[test]
 fn the_shipped_specification_enables_no_vector_encoded_feature() {
     let root = crate::util::workspace_root().expect("the workspace root");
-    let specification = std::fs::read_to_string(root.join(SPECIFICATION)).expect("the target");
+    let specification = std::fs::read_to_string(root.join(specification())).expect("the target");
     let enabled = enabled_features(&specification).expect("a features string");
     for vector_encoded in ["avx", "avx2", "bmi", "bmi2", "avx512f"] {
         assert!(

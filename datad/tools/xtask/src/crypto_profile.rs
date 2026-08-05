@@ -68,13 +68,17 @@ use std::{
 
 use lfw_log::Primitive;
 
-use crate::{crypto_contract, image};
+use crate::{crypto_contract, image, target_spec};
 
 /// The page this module reads.
 const PAGE: &str = "book/src/reference/crypto-profile.md";
 
-/// The target specification the SIMD protection domains compile against.
-const SPECIFICATION: &str = "support/targets/x86_64-sel4-simd.json";
+/// The target specification the SIMD protection domains compile against, from
+/// the module that owns where a specification lives — the same file whose text
+/// decides whether their artifacts may be reused.
+fn specification() -> PathBuf {
+    target_spec::specification(image::SIMD_TARGET)
+}
 
 /// Mnemonics whose presence proves an accelerated backend was compiled in, and
 /// the feature each belongs to. `aesenc` and `aeskeygenassist` are AES-NI;
@@ -128,10 +132,11 @@ pub(crate) fn check(root: &Path, repository_root: &Path) -> Result<(), String> {
 
 /// The page's stated target features against the specification's own.
 fn check_features(root: &Path, page: &str, findings: &mut Vec<String>) -> Result<(), String> {
-    let path = root.join(SPECIFICATION);
-    let specification =
+    let relative = specification();
+    let path = root.join(&relative);
+    let text =
         fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let enabled = enabled_features(&specification).ok_or_else(|| {
+    let enabled = enabled_features(&text).ok_or_else(|| {
         format!(
             "{}: no \"features\" string, and it is what the page's feature table is compared \
              against",
@@ -141,15 +146,17 @@ fn check_features(root: &Path, page: &str, findings: &mut Vec<String>) -> Result
     let stated = table_column(page, "enabled target feature");
     for feature in enabled.difference(&stated) {
         findings.push(format!(
-            "{SPECIFICATION} enables `{feature}` and {PAGE} does not list it, so a deployment is \
-             never told its processor must provide it — and a part without it takes an \
-             invalid-opcode fault on the first instruction, not a slow path"
+            "{} enables `{feature}` and {PAGE} does not list it, so a deployment is never told \
+             its processor must provide it — and a part without it takes an invalid-opcode fault \
+             on the first instruction, not a slow path",
+            relative.display()
         ));
     }
     for feature in stated.difference(&enabled) {
         findings.push(format!(
-            "{PAGE} lists `{feature}` and {SPECIFICATION} does not enable it, so the page claims \
-             an acceleration the shipped binary was never compiled to use"
+            "{PAGE} lists `{feature}` and {} does not enable it, so the page claims an \
+             acceleration the shipped binary was never compiled to use",
+            relative.display()
         ));
     }
     Ok(())

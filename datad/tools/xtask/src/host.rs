@@ -31,7 +31,7 @@ use std::{
 };
 
 use crate::{
-    budgets, crypto_profile, image, reference_contract, sysdesc,
+    budgets, crypto_profile, image, reference_contract, sysdesc, target_spec,
     util::{repository_root, run_command},
 };
 
@@ -332,14 +332,18 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
                 include_dir.display()
             ));
         }
+        // The same two JSON targets `image` compiles, in this step's own tree,
+        // so this tree needs the same reconciliation: cargo fingerprints
+        // neither specification, and a lint against object code the
+        // specification no longer describes is a lint of a different binary.
+        let target_dir = root.join("target/lint-sel4").join(config);
+        target_spec::reconcile(root, &target_dir, image::TARGET)?;
+        target_spec::reconcile(root, &target_dir, image::SIMD_TARGET)?;
         run_command(
             Command::new("cargo")
                 .current_dir(root)
                 .env("SEL4_INCLUDE_DIRS", &include_dir)
-                .env(
-                    "CARGO_TARGET_DIR",
-                    root.join("target/lint-sel4").join(config),
-                )
+                .env("CARGO_TARGET_DIR", &target_dir)
                 // The configuration domain embeds this document through
                 // `include_bytes!(env!(…))`, so without it the lint would not
                 // reach a single lint — it would fail to expand. Named here
@@ -371,10 +375,7 @@ fn lint_protection_domains(root: &Path) -> Result<(), String> {
             Command::new("cargo")
                 .current_dir(root)
                 .env("SEL4_INCLUDE_DIRS", &include_dir)
-                .env(
-                    "CARGO_TARGET_DIR",
-                    root.join("target/lint-sel4").join(config),
-                )
+                .env("CARGO_TARGET_DIR", &target_dir)
                 .env(
                     image::CONFIG_PATH_VAR,
                     root.join(image::CONFIGURATION_DOCUMENT),

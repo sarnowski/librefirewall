@@ -303,7 +303,7 @@ impl DataDisk {
             // extent that overstated would send a reader into bytes that were
             // never written, which is the direction the barrier exists to make
             // impossible; understating costs a reader the last staging buffer.
-            if durable > parsed.consumed {
+            let Some(awaiting_checkpoint) = parsed.consumed.checked_sub(durable) else {
                 return Err(format!(
                     "the superblock at sector {start_sector} claims a durable end at payload byte \
                      {durable} and the block walk followed the extent's own lengths only to byte \
@@ -311,7 +311,7 @@ impl DataDisk {
                     parsed.consumed,
                     self.path.display()
                 ));
-            }
+            };
             // And the walk's end must be the end of what was written, not
             // wherever parsing gave up. Nothing seeded this image past the
             // superblock, so every byte beyond the written prefix is zero — a
@@ -339,12 +339,12 @@ impl DataDisk {
             lines.push(format!(
                 "  sector {start_sector}: superblock generation {}, {} section header(s), {} \
                  packet block(s); durable end at payload byte {durable}, written prefix ending at \
-                 {} ({} byte(s) awaiting a checkpoint), nothing written beyond it",
+                 {} ({awaiting_checkpoint} byte(s) awaiting a checkpoint), nothing written beyond \
+                 it",
                 state.write_generation(),
                 parsed.sections,
                 parsed.packets.len(),
                 parsed.consumed,
-                parsed.consumed - durable,
             ));
         }
         Ok(format!(
