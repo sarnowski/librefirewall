@@ -889,6 +889,11 @@ enum Seen {
     Delivered,
     Refused,
     Missing,
+    /// Absent, on a boot whose contract asks nothing about forwarding. Distinct
+    /// from [`Self::Missing`], which is the same observation where it *is* a
+    /// failure: a report that spelled both the same way would put failure words
+    /// on a row nothing was owed for.
+    Unjudged,
     Broke,
 }
 
@@ -898,6 +903,7 @@ impl Seen {
             Self::Delivered => "delivered",
             Self::Refused => "dropped",
             Self::Missing => "missing",
+            Self::Unjudged => "unjudged",
             Self::Broke => "failed",
         }
     }
@@ -935,6 +941,11 @@ pub enum Forwarding {
     /// The node refused its own configuration and is running generation 0, so
     /// nothing may cross whatever the probes are addressed to.
     NothingCommitted,
+    /// A generation is in force and the boot's contract says nothing about
+    /// forwarding, so neither a crossing nor an absence is a verdict. The rows
+    /// still say what happened; what they must not do is dress an absence the
+    /// contract never asked about as a failure.
+    NotThisBootsSubject,
 }
 
 impl TrafficReport {
@@ -988,6 +999,10 @@ impl TrafficReport {
                                 "the document this image carries forwards it, and this node \
                                  committed no generation, so nothing admitted it",
                             ),
+                        ),
+                        Forwarding::NotThisBootsSubject => (
+                            Seen::Unjudged,
+                            String::from("not judged: this boot's contract is not about routing"),
                         ),
                     },
                     (false, None, Expectation::Dropped { because }) => {
@@ -2656,12 +2671,34 @@ fn legacy_broadcast_frame(marker: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// What a boot must prove. Both variants inject the same packets into the same
+/// What a boot must prove. Every variant injects the same packets into the same
 /// ports; they differ in which observation is success.
 pub enum BootContract<'a> {
     /// Both routed packets must arrive on the far port rewritten exactly for
     /// their next hop, and no refused packet may arrive at all.
     Routed,
+    /// **The cryptography domain came up and finished**, and nothing else is
+    /// judged at all.
+    ///
+    /// The narrowest contract here, and deliberately so: it exists for a boot
+    /// whose only question is whether the shipped image's cryptography executes
+    /// on a *different* accelerator from the one the rest of the run used. Every
+    /// other statement this harness can make — the routed contract, the
+    /// configuration transcript, the management port's count, the recordings —
+    /// is a statement about the image and not about the accelerator, and the
+    /// boots that carry it already made all of them. Re-making them here would
+    /// buy a second verdict on the same fact and pay a whole boot for it.
+    ///
+    /// So the probes go out as on any other boot and no delivery is required;
+    /// nothing is injected on the management wire and nothing is expected back
+    /// from it. The one thing the run waits for is the cryptography domain
+    /// having said it finished, either way, which is also what ends the boot:
+    /// such a node keeps running, so nothing else would.
+    ///
+    /// The verdict itself is the caller's, from the records this leaves in the
+    /// capture — a domain that refused is a refusal to report rather than a
+    /// boot that failed to complete.
+    Cryptography,
     /// No injected packet may come back in any form (nothing bootable may have
     /// started) and the guest must emit `marker` on the serial channel. Used
     /// for the boot manager's halt path, where the absence of a dataplane is
@@ -4536,6 +4573,12 @@ fn run_boot(
                                 log_path.display()
                             ));
                         }
+                        // Nothing was put on this wire, so whatever the port
+                        // said is unsolicited and is not this boot's subject.
+                        // Drained and discarded rather than judged: the frame
+                        // still has to leave the host socket buffer, or QEMU's
+                        // transmit path blocks on it.
+                        BootContract::Cryptography => {}
                     }
                     continue;
                 }
@@ -4592,6 +4635,11 @@ fn run_boot(
                                 log_path.display()
                             ));
                         }
+                        // Neither required nor forbidden. The accelerated boots
+                        // own the routed verdict on this image; asserting it a
+                        // second time under emulation would state the same fact
+                        // about the same bytes.
+                        BootContract::Cryptography => {}
                     }
                 }
             }
@@ -4907,6 +4955,18 @@ fn run_boot(
                     Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
                     _ => {}
                 },
+                // This node keeps running too, and the record that ends the boot
+                // is the last one the cryptography domain writes: it runs to
+                // completion in `init` and parks, so a `ready` or a `refused`
+                // from it means every record it owes is already in the capture.
+                // No settle window follows, because nothing is being waited out
+                // — there is no absence in this contract for a late frame to
+                // spoil.
+                BootContract::Cryptography => {
+                    if crate::crypto_contract::finished(&output) {
+                        break 'run Ok(());
+                    }
+                }
             }
             match child.try_wait() {
                 Ok(Some(status)) => match &test.contract {
@@ -4931,6 +4991,21 @@ fn run_boot(
                             "QEMU exited ({status}) on a boot whose contract is that the node \
                              comes up and forwards nothing. Every domain runs on such a node — \
                              only its configuration was refused — so an exit is a fault; see {}",
+                            log_path.display()
+                        ));
+                    }
+                    // The same reasoning: every domain runs on this node and
+                    // none of them exits, so an exit before the cryptography
+                    // domain reported anything is a fault — and on this contract
+                    // it is the interesting one, an image that comes up on one
+                    // accelerator and dies on the other being exactly what the
+                    // boot is here to catch.
+                    BootContract::Cryptography => {
+                        break 'run Err(format!(
+                            "QEMU exited ({status}) before the cryptography domain reported \
+                             either `ready` or `refused`. This boot forces emulation, so an exit \
+                             here is the image executing on one accelerator and faulting on the \
+                             other — read the capture for the last domain that spoke; see {}",
                             log_path.display()
                         ));
                     }
@@ -4960,6 +5035,15 @@ fn run_boot(
                          refused its own document: {}{}; see {}",
                         total_timeout.as_secs(),
                         transcript.summary(),
+                        describe_injection_failures(&endpoints),
+                        log_path.display()
+                    ),
+                    BootContract::Cryptography => format!(
+                        "timed out after {}s waiting for the cryptography domain to report \
+                         `ready` or `refused` on the console. This boot forces emulation, so a \
+                         domain that never finished here is one whose work the emulator would not \
+                         execute{}; see {}",
+                        total_timeout.as_secs(),
                         describe_injection_failures(&endpoints),
                         log_path.display()
                     ),
@@ -5046,6 +5130,7 @@ fn run_boot(
     let forwarding = match &test.contract {
         BootContract::Routed | BootContract::Halted { .. } => Forwarding::UnderAPolicy,
         BootContract::FailedClosed { .. } => Forwarding::NothingCommitted,
+        BootContract::Cryptography => Forwarding::NotThisBootsSubject,
     };
     let traffic = TrafficReport::new(stations, &probes, &deliveries, broke, forwarding);
 

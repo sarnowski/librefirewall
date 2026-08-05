@@ -220,6 +220,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves — plus the counts the status detail chapter states about the gate: how many system scenarios there are, how many reach the management port, and how many library crates carry the coverage floor | `xtask test` (`reference_contract`) |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
 | Boot, forwarding and A/B contracts | `xtask test-system`, `xtask test-ab` |
+| One boot on the emulator whatever the machine offers, judging the cryptography domain alone — because a defect that only appears under emulation is otherwise unobserved on a machine that has acceleration, and every machine this gate runs on does | `xtask test-system` (the `cryptography-under-emulation` scenario) |
 | The management server's dependency lock, formatting, a warning-free compile, both schema migrations, and its whole suite against a real Postgres and a real ClickHouse | `make ctrld-test` |
 | That the management server's gate is genuinely offline: its container refuses to run if it holds a default route | `make ctrld-test`, before anything else it does |
 

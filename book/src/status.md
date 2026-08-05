@@ -385,7 +385,8 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
   [cryptography profile](reference/crypto-profile.md). The build now refuses the whole encoding
   rather than the feature: it reads the raw bytes of every instruction in the shipped protection
   domains and fails on any VEX or EVEX prefix, which cannot go stale the way a list of mnemonics
-  would.
+  would. And what keeps "proved on both" true is a boot rather than a check: one scenario is forced
+  onto the emulator whatever the machine offers, and judges this domain there.
 - **The physical address window is measured, and the cryptography domain costs none of it.**
   Seventeen regions carry a fixed physical address inside RAM, claiming 832 KiB and packed into
   `0x30000000..0x310CC000` — so RAM must reach past **784.80 MiB**, and under the harness's 1 GiB it

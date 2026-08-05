@@ -105,6 +105,29 @@ pub(crate) fn measured_primitives() -> Vec<Primitive> {
         .collect()
 }
 
+/// Whether the cryptography domain has finished, whichever way it went.
+///
+/// The domain runs to completion in `init` and then parks, and its `ready` and
+/// `refused` records are the last thing it writes — so either one in the capture
+/// means every record [`judge`] reads is already there. That is what makes this
+/// usable as the point a boot may stop: a node whose only subject is this domain
+/// keeps running afterwards, so nothing else would end it.
+///
+/// A refusal counts as finished on purpose. It is a verdict for [`judge`] to
+/// report, naming the cause token, and waiting past it would turn a domain that
+/// said exactly what went wrong into a timeout that says nothing.
+pub(crate) fn finished(capture: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(capture);
+    let ours = field("domain", Domain::Crypto.name());
+    let done = [
+        field("state", DomainState::Ready.name()),
+        field("state", DomainState::Refused.name()),
+    ];
+    lifecycle_records(&text)
+        .into_iter()
+        .any(|record| record.contains(&ours) && done.iter().any(|state| record.contains(state)))
+}
+
 /// Judge the cryptography domain's records in one boot's serial capture.
 ///
 /// # Errors

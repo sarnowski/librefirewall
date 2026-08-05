@@ -6,22 +6,28 @@
 //! attached as an explicit `ide-hd,bootindex=0` device so OVMF starts at GRUB
 //! rather than at the firmware's own network-boot options for the virtio NICs.
 //!
-//! Two properties keep a run's result independent of the machine it ran on.
+//! Three properties keep a run's result independent of the machine it ran on.
 //! The guest CPU model is [`GUEST_CPU`] whether or not KVM is available, so the
-//! asserted contract never varies with the runner's host CPU; and the
-//! [`Acceleration`] actually chosen — with the reason KVM was rejected — is
-//! printed and written into the run log, so an unnoticed degradation to
-//! emulation cannot pass for an accelerated run.
+//! asserted contract never varies with the runner's host CPU; the
+//! [`Acceleration`] actually chosen — with the reason KVM was rejected, or the
+//! reason emulation was asked for — is printed and written into the run log, so
+//! an unnoticed degradation to emulation cannot pass for an accelerated run; and
+//! one scenario is forced onto the emulator by its [`Accelerator`] whatever the
+//! machine offers, because an image proved only on the accelerator every runner
+//! happens to have is an image whose verdict is a fact about the runners.
 //!
 //! [`test_system`] is the black-box system gate. It boots one [`Scenario`] per
-//! contract the appliance owes, each asserting the machine-observable routed
-//! contract — a datagram sent from the host endpoint on each NIC port reaches the
-//! endpoint on the other rewritten for its next hop, and the packets the appliance
-//! must refuse reach nobody — driven by [`crate::forward_harness`]. Some
-//! additionally judge the `LFW-CFG` console channel through
-//! [`crate::config_transcript`], and every one whose management port a real client
-//! can reach ([`ManagementRole::Client`]) pulls every surface the endpoint serves
-//! and holds the three of them to each other ([`crate::surface_contract`]).
+//! contract the appliance owes, almost every one asserting the machine-observable
+//! routed contract — a datagram sent from the host endpoint on each NIC port
+//! reaches the endpoint on the other rewritten for its next hop, and the packets
+//! the appliance must refuse reach nobody — driven by
+//! [`crate::forward_harness`]. Some additionally judge the `LFW-CFG` console
+//! channel through [`crate::config_transcript`], and every one whose management
+//! port a real client can reach ([`ManagementRole::Client`]) pulls every surface
+//! the endpoint serves and holds the three of them to each other
+//! ([`crate::surface_contract`]). The exception is the forced-emulation boot,
+//! whose subject is the accelerator rather than a contract, and which therefore
+//! judges the cryptography domain alone ([`Console::JudgedOnCryptographyAlone`]).
 //!
 //! Every scenario boots the RELEASE kernel configuration, because that is the
 //! image a release publishes. A scenario that fails there is re-run
@@ -110,13 +116,40 @@ const KVM_DEVICE: &str = "/dev/kvm";
 /// an image comes to be provable on one accelerator only.
 const GUEST_CPU: &str = "qemu64,+fsgsbase,+pdpe1gb,+xsaveopt,+xsave,+rdrand,+ssse3,+sse4.1,+sse4.2,+aes,+pclmulqdq,+adx";
 
+/// Which accelerator a boot may use, decided by the scenario rather than by the
+/// machine.
+///
+/// A property of the boot and not a switch on the run, because the two states
+/// are not two ways of running the same gate: all but one scenario asks for
+/// whatever is fastest, and exactly one asks for the slow one on purpose. Making
+/// it a field is what lets the scenario table say which is which, and what keeps
+/// a reader from having to find out by running it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Accelerator {
+    /// Whatever the machine offers: hardware where this process can use KVM,
+    /// emulation where it cannot.
+    WhateverTheMachineOffers,
+    /// Emulation, whatever the machine offers.
+    ///
+    /// The image is one artifact and it has to execute under both, because a
+    /// defect that only appears under emulation is otherwise invisible on every
+    /// machine that has acceleration — and the machines that run this gate do.
+    Emulated,
+}
+
 /// How QEMU will execute the guest and, when hardware acceleration was not
 /// taken, why. Carrying the reason (rather than a bare flag) is the point: a
 /// gate run that silently fell back to emulation must not be indistinguishable
-/// from an accelerated one in its log.
+/// from an accelerated one in its log — nor from one that emulated on purpose,
+/// which is why a deliberate choice and a rejection are two variants and not one
+/// string.
 enum Acceleration {
     Kvm,
-    Tcg { kvm_rejected_because: String },
+    Tcg {
+        kvm_rejected_because: String,
+    },
+    /// Emulation because the boot asked for it, whatever the machine offers.
+    TcgByRequest,
 }
 
 impl Acceleration {
@@ -125,6 +158,18 @@ impl Acceleration {
     /// every instruction is being emulated is a figure about the emulator.
     const fn is_hardware(&self) -> bool {
         matches!(self, Self::Kvm)
+    }
+
+    /// What `accelerator` asks for, against what this machine can give.
+    ///
+    /// A request for emulation is honoured without probing the device at all: a
+    /// boot that exists to run the image on the emulator must not become an
+    /// accelerated one because the machine happened to offer KVM.
+    fn choose(accelerator: Accelerator) -> Self {
+        match accelerator {
+            Accelerator::Emulated => Self::TcgByRequest,
+            Accelerator::WhateverTheMachineOffers => Self::detect(),
+        }
     }
 
     /// Prefer hardware acceleration, but only when this process can actually
@@ -149,7 +194,7 @@ impl Acceleration {
     fn qemu_accel(&self) -> &'static str {
         match self {
             Self::Kvm => "kvm",
-            Self::Tcg { .. } => "tcg",
+            Self::Tcg { .. } | Self::TcgByRequest => "tcg",
         }
     }
 
@@ -161,8 +206,40 @@ impl Acceleration {
             Self::Tcg {
                 kvm_rejected_because,
             } => format!("accel=tcg cpu={GUEST_CPU} kvm-rejected: {kvm_rejected_because}"),
+            Self::TcgByRequest => format!(
+                "accel=tcg cpu={GUEST_CPU} emulation-requested: this boot proves the shipped \
+                 image on the emulator whatever the machine offers"
+            ),
         }
     }
+}
+
+/// How one boot is set up around the contract it must meet: which accelerator
+/// executes it, how its management port is attached, and which probe set goes
+/// out on the dataplane ports.
+///
+/// One struct rather than three parameters because they are one decision per
+/// boot and are always chosen together — and because the accelerator only became
+/// a choice at all once a boot existed whose subject was the accelerator, which
+/// is exactly the kind of addition an argument list absorbs silently.
+struct Bench {
+    accelerator: Accelerator,
+    management: ManagementBacking,
+    traffic: Traffic,
+}
+
+/// What a boot owes the raw device at 00:05.0, which follows from its contract
+/// and from nothing the run observed.
+enum DataDiskVerdict {
+    /// The appliance ran, so the recorder's witness pattern must be on the
+    /// medium: its absence is a domain that never started.
+    WitnessWritten,
+    /// No slot was bootable, so the sector must be exactly as it was made: a
+    /// witness here would be the host having written it.
+    SectorUntouched,
+    /// Neither, because the boot ends before the two are ordered against each
+    /// other. The only such boot is the one whose subject is the accelerator.
+    NotThisBootsSubject,
 }
 
 /// A prepared QEMU invocation together with the record of how it will execute.
@@ -270,10 +347,25 @@ pub(crate) enum Console {
     /// does come up, and holding it here would make a clock failure read as a
     /// fail-closed failure.
     JudgedOnARefusal,
+    /// **The cryptography domain's records, and nothing else at all** — neither
+    /// the four other channels [`Self::Judged`] reads nor the traffic.
+    ///
+    /// The narrow half of a deliberately narrow boot. Every other statement the
+    /// gate makes here is a statement about the *image*, and the boots that
+    /// carry it have already made them; what this one asks is whether the same
+    /// bytes execute on the other accelerator, which is a question only this
+    /// domain has ever answered no to. So the vectors and the session are
+    /// judged, the measured costs are reported without a verdict — a cycle count
+    /// taken while every instruction is a host function call is a figure about
+    /// the emulator, which [`crate::crypto_contract::judge`] already declines
+    /// rather than something this boot special-cases — and nothing else is
+    /// re-proved.
+    JudgedOnCryptographyAlone,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
-/// in it was built from, and what the boot must prove.
+/// in it was built from, which accelerator it runs on, and what the boot must
+/// prove.
 pub(crate) struct Scenario {
     name: &'static str,
     /// The document, relative to the workspace root. It is what the endpoints
@@ -286,6 +378,10 @@ pub(crate) struct Scenario {
     management: ManagementRole,
     /// Which probe set this boot injects into the two dataplane ports.
     traffic: Traffic,
+    /// Which accelerator QEMU must use. All but one scenario take whatever the
+    /// machine offers; the one that does not is what proves the shipped image
+    /// runs on the emulator as well as on a processor.
+    accelerator: Accelerator,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
@@ -355,10 +451,11 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
 ///    name the build carried, rather than one it read, would satisfy one and fail
 ///    the other.
 ///
-/// Every scenario additionally injects frames into the dedicated management port
-/// and holds that port to carrying nothing back, whatever else it judges; the
-/// two that read the console also hold the management domain's own count to the
-/// frames and bytes injected.
+/// Every scenario but the last additionally injects frames into the dedicated
+/// management port and holds that port to carrying nothing back, whatever else it
+/// judges; the two that read the console also hold the management domain's own
+/// count to the frames and bytes injected. The last injects none, its subject
+/// being the accelerator rather than any contract the appliance owes.
 pub(crate) const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "routed-forwarding",
@@ -367,6 +464,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "generation-swap",
@@ -375,6 +473,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Judged,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "alternate-configuration",
@@ -383,6 +482,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Judged,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "metrics-endpoint",
@@ -395,6 +495,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The same scrape against a disk built from the second document, and the
     // one thing the scenario above cannot show: that the identity the
@@ -415,6 +516,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The recording milestone's own scenario. It is no longer the only one
     // that pulls the recordings — every [`ManagementRole::Client`] scenario
@@ -432,6 +534,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The filter's own two scenarios, and the reason there are two of them
     // rather than one: the three outcomes have to be shown to follow from the
@@ -452,6 +555,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "policy-filter-alternate",
@@ -460,6 +564,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The one contract a stateless filter cannot meet, on both documents.
     //
@@ -485,6 +590,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "stateful-tracking-alternate",
@@ -493,6 +599,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The one thing a connection history needs that no other scenario can
     // produce: a conversation that **opens and closes**.
@@ -547,6 +654,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Reconfiguration,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The landing that closed the model's one real hole, and the only scenario
     // that states what a policy commit did to the conversations the appliance
@@ -583,6 +691,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Revocation,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The scenario that proves an ICMP error the tracker RELATES to a live
     // conversation is still the filter's to decide — which is what keeps
@@ -613,6 +722,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Related,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     Scenario {
         name: "connection-lifecycle",
@@ -621,6 +731,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Lifecycle,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The one scenario that puts a **flood** across the appliance, and the only
     // one whose contract is about how much state a burst of traffic can make
@@ -660,6 +771,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Flood,
+        accelerator: Accelerator::WhateverTheMachineOffers,
     },
     // The only scenario that boots a node onto **generation 0** — the fail-closed
     // empty configuration — and the only one whose contract is that the appliance
@@ -695,8 +807,61 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::JudgedOnARefusal,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+    },
+    // The only scenario that chooses its accelerator, and the only one whose
+    // subject is the accelerator rather than the appliance.
+    //
+    // Everything else here runs on whatever the machine offers, which on every
+    // machine that runs this gate is KVM — so the emulator was exercised only on
+    // a machine that had no choice, and "runs accelerated, faults emulated" was a
+    // class of defect the gate could not see. It has already cost one: a
+    // VEX-encoded instruction the compiler emitted into the cryptography domain,
+    // which real hardware executes and an emulator refuses while the kernel's
+    // saved state excludes the vector state. A build-time check now refuses that
+    // encoding outright ([`crate::crypto_profile::check_image`]), which makes
+    // that particular cause impossible; this boot is the defence behind it, and
+    // it holds for the next cause nobody has thought of.
+    //
+    // It reuses the shipped document and the published disk — the same artifact
+    // `generation-swap` boots — so the whole cost is one boot and neither a
+    // second document nor a second image build.
+    //
+    // And it judges the cryptography domain alone. That is not thrift: the
+    // routed contract, the transcript and the management count are facts about
+    // the image, the accelerated boots state all three, and a second verdict on
+    // them would be a second reading of the same fact at the price of the slower
+    // machine. The cryptography domain is the one that can only be settled here,
+    // being where the acceleration lives.
+    Scenario {
+        name: "cryptography-under-emulation",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnCryptographyAlone,
+        // Socket-backed, because a real client is what a scrape needs and this
+        // boot takes none: the endpoint's surfaces are the `Client` scenarios'
+        // subject, on the accelerator they already ran.
+        management: ManagementRole::Station,
+        // The shipped probe set, injected and left unjudged. It keeps this boot
+        // the same shape as the one it repeats rather than an idle guest, and no
+        // delivery is required of it.
+        traffic: Traffic::Routed,
+        accelerator: Accelerator::Emulated,
     },
 ];
+
+/// What one boot was observed to do, beyond meeting its contract.
+struct Observed {
+    /// The initial sequence number the appliance answered this boot's one
+    /// management connection with, where it opened one.
+    management_tcp_isn: Option<u32>,
+    /// Whether QEMU executed this boot on the host's own processor. Reported
+    /// back rather than re-derived, because the run's summary states a *contrast*
+    /// between the accelerators and a contrast asserted from a second probe of
+    /// the KVM device would be a claim about the device rather than about the
+    /// boots that ran.
+    accelerated: bool,
+}
 
 /// Boot every scenario in `scenarios` and answer what the run proved.
 fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> {
@@ -716,10 +881,17 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
     // adversary this port faces, and it looks perfectly correct in one
     // scenario.
     let mut sequence_numbers: Vec<(&str, u32)> = Vec::new();
+    // Which accelerator each boot actually got, which is what the run may claim
+    // about them and nothing more.
+    let mut accelerated: Vec<(&str, bool)> = Vec::new();
     for scenario in scenarios {
         match run_scenario(root, scenario, Run::Shipping) {
-            Ok(Some(isn)) => sequence_numbers.push((scenario.name, isn)),
-            Ok(None) => {}
+            Ok(observed) => {
+                if let Some(isn) = observed.management_tcp_isn {
+                    sequence_numbers.push((scenario.name, isn));
+                }
+                accelerated.push((scenario.name, observed.accelerated));
+            }
             Err(verdict) => {
                 return Err(diagnose::after_shipping_failure(
                     &format!("system scenario {}", scenario.name),
@@ -736,10 +908,50 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
          configuration transcript, the clock record, the hardware probe's record and the \
          management port's count, and \
-         {scraped} scraped with curl against the document each was built from; {distinct}",
+         {scraped} scraped with curl against the document each was built from; {distinct}{}",
         scenarios.len(),
         Run::Shipping.config(),
+        describe_the_emulated_boots(scenarios, &accelerated),
     ))
+}
+
+/// What the run may say about the accelerators it used, from what the boots
+/// actually got.
+///
+/// The clause exists because the emulated boot's whole value is a *contrast* —
+/// the shipped image proved on the emulator while the rest of the run proved it
+/// on a processor — and on a machine with no usable KVM there is no contrast to
+/// report: every boot was emulated, so the forced one repeated under emulation
+/// what all of them had already done there. Saying so is the point. A fixed
+/// sentence claiming the contrast would be false on exactly the machine where the
+/// claim matters least and would be believed anyway, which is how a run comes to
+/// assert a property of its runner as a property of the image.
+fn describe_the_emulated_boots(scenarios: &[Scenario], accelerated: &[(&str, bool)]) -> String {
+    let forced: Vec<&str> = scenarios
+        .iter()
+        .filter(|scenario| scenario.accelerator == Accelerator::Emulated)
+        .map(|scenario| scenario.name)
+        .collect();
+    if forced.is_empty() {
+        return String::new();
+    }
+    let named = forced.join(", ");
+    let others = accelerated
+        .iter()
+        .filter(|(name, was)| *was && !forced.contains(name))
+        .count();
+    if others == 0 {
+        return format!(
+            "; {named} asked for emulation on a machine that accelerated no boot of this run, so \
+             it drew no contrast: every scenario ran on the emulator, and the cryptography domain \
+             is proved there and nowhere else"
+        );
+    }
+    format!(
+        "; {named} ran on the emulator whatever the machine offered, proving the shipped image's \
+         published cryptographic vectors and its mutually-authenticated session there, against \
+         {others} boot(s) of the same image that ran on the processor"
+    )
 }
 
 /// Hold the initial sequence numbers the boots chose to being *pairwise*
@@ -823,7 +1035,7 @@ fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, 
     }
 }
 
-fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32>, String> {
+fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, String> {
     let name = scenario.name;
     let path = root.join(scenario.document);
     let document = fs::read(&path)
@@ -839,8 +1051,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
 
     let disk = scenario_disk(root, scenario, run)?;
 
-    if matches!(scenario.console, Console::JudgedOnARefusal) {
-        return run_fail_closed_scenario(root, scenario, run, &disk, &document, &topology);
+    match scenario.console {
+        Console::JudgedOnARefusal => {
+            return run_fail_closed_scenario(root, scenario, run, &disk, &document, &topology);
+        }
+        Console::JudgedOnCryptographyAlone => {
+            return run_cryptography_scenario(root, scenario, run, &disk, &topology);
+        }
+        Console::Ignored | Console::Judged => {}
     }
 
     let log_name = format!("qemu-{name}{}.log", run.name_suffix());
@@ -954,10 +1172,15 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
         }
     };
     let judged = match scenario.console {
-        // Unreachable: `run_scenario` hands a refusal scenario to
-        // `run_fail_closed_scenario` before reaching here, and there is no
-        // transcript of an accepted document to judge on a node that accepted none.
-        Console::Ignored | Console::JudgedOnARefusal => String::new(),
+        // Unreachable for the two narrow ones: `run_scenario` hands a refusal
+        // scenario to `run_fail_closed_scenario` and a cryptography-only one to
+        // `run_cryptography_scenario` before reaching here. Neither could be
+        // judged from here anyway — there is no transcript of an accepted
+        // document on a node that accepted none, and this boot's contract is not
+        // the one either of them owes.
+        Console::Ignored | Console::JudgedOnARefusal | Console::JudgedOnCryptographyAlone => {
+            String::new()
+        }
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1002,7 +1225,70 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
         booted.traffic.summary(),
         log.display()
     );
-    Ok(booted.management_tcp_isn)
+    Ok(Observed {
+        management_tcp_isn: booted.management_tcp_isn,
+        accelerated: booted.hardware_accelerated,
+    })
+}
+
+/// Boot one scenario on the **emulator** and judge the cryptography domain,
+/// which is the whole of what it is for.
+///
+/// The shortest of the three, and every omission is deliberate rather than a
+/// surface this node lacks — which is what separates it from its fail-closed
+/// sibling. This node has every surface: it committed the shipped document, it
+/// forwards, its management port answers. All of that is judged by the boots that
+/// ran on the processor, and re-judging it here would pay a whole emulated boot
+/// for a second reading of a fact about the image. What only this boot can settle
+/// is whether the shipped cryptography executes on an emulated processor at all,
+/// so the cryptography domain's records are read and nothing else is.
+///
+/// Its measured costs come back without a verdict, and that needs no arrangement
+/// here: the judge asserts a ceiling only on a boot executing on real hardware,
+/// because a cycle count taken while every instruction is a host function call is
+/// a figure about the emulator. This boot reaches that path rather than avoiding
+/// it.
+///
+/// Neither data-disk verdict is owed either, and for a reason worth stating: the
+/// run ends the moment the cryptography domain finishes, which may be before the
+/// recorder has proved its own path to the medium. A boot that asserted the
+/// witness pattern here would be asserting a race.
+///
+/// Answers no sequence number: nothing opens a connection to the management port.
+fn run_cryptography_scenario(
+    root: &Path,
+    scenario: &Scenario,
+    run: Run,
+    disk: &Path,
+    topology: &Topology,
+) -> Result<Observed, String> {
+    let name = scenario.name;
+    let log_name = format!("qemu-{name}{}.log", run.name_suffix());
+    let booted = boot(
+        root,
+        disk,
+        &log_name,
+        BootContract::Cryptography,
+        topology,
+        Bench {
+            accelerator: scenario.accelerator,
+            management: ManagementBacking::Socket,
+            traffic: scenario.traffic,
+        },
+    )
+    .map_err(|error| format!("scenario {name}: {error}"))?;
+    let log = scenario_log(root, scenario, run);
+    let crypto = crypto_contract::judge(&booted.serial, &log, booted.hardware_accelerated)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+    println!(
+        "  system scenario ok: {name} on the {} kernel ({crypto}); QEMU output is in {}",
+        run.config(),
+        log.display()
+    );
+    Ok(Observed {
+        management_tcp_isn: None,
+        accelerated: booted.hardware_accelerated,
+    })
 }
 
 /// Boot one scenario whose node comes up **forwarding nothing**, and report what
@@ -1015,8 +1301,8 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Option<u32
 /// names — the serial console, and the absence of any forwarded frame — and both
 /// are decided inside the boot contract, whose verdict is this function's.
 ///
-/// Answers `None`: no connection was opened to the management port, there being
-/// nothing there to open one to.
+/// Answers no sequence number: no connection was opened to the management port,
+/// there being nothing there to open one to.
 fn run_fail_closed_scenario(
     root: &Path,
     scenario: &Scenario,
@@ -1024,7 +1310,7 @@ fn run_fail_closed_scenario(
     disk: &Path,
     document: &[u8],
     topology: &Topology,
-) -> Result<Option<u32>, String> {
+) -> Result<Observed, String> {
     let name = scenario.name;
     let transcript = crate::config_transcript::RefusedContract::from_document(document)
         .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1043,7 +1329,10 @@ fn run_fail_closed_scenario(
         transcript.summary(),
         log.display()
     );
-    Ok(None)
+    Ok(Observed {
+        management_tcp_isn: None,
+        accelerated: booted.hardware_accelerated,
+    })
 }
 
 /// Boot `disk` through OVMF/GRUB with two socket-backed NICs and assert the
@@ -1066,8 +1355,14 @@ pub(crate) fn boot_and_forward(
         log_name,
         BootContract::Routed,
         topology,
-        management,
-        traffic,
+        Bench {
+            // The routed contract is a statement about the image, and every boot
+            // of it takes whatever the machine offers. The one boot that chooses
+            // is the one whose subject is the accelerator itself.
+            accelerator: Accelerator::WhateverTheMachineOffers,
+            management,
+            traffic,
+        },
     )
 }
 
@@ -1264,16 +1559,20 @@ pub(crate) fn boot_and_fail_closed(
         log_name,
         BootContract::FailedClosed { transcript },
         topology,
-        // Socket-backed, so the harness sees every frame that port emits and can
-        // hold it to emitting none. A real client would be pointless: there is
-        // nothing at the other end of the forward, the port being unaddressed until
-        // a generation commits.
-        ManagementBacking::Socket,
-        // The probes the shipped document forwards, injected between the same
-        // endpoints over the same ports — which is what makes their absence the
-        // policy having never been committed rather than a bench mismatch. This
-        // document's addressing is the shipped one to the byte, for exactly that.
-        Traffic::Routed,
+        Bench {
+            accelerator: Accelerator::WhateverTheMachineOffers,
+            // Socket-backed, so the harness sees every frame that port emits and
+            // can hold it to emitting none. A real client would be pointless:
+            // there is nothing at the other end of the forward, the port being
+            // unaddressed until a generation commits.
+            management: ManagementBacking::Socket,
+            // The probes the shipped document forwards, injected between the same
+            // endpoints over the same ports — which is what makes their absence
+            // the policy having never been committed rather than a bench
+            // mismatch. This document's addressing is the shipped one to the
+            // byte, for exactly that.
+            traffic: Traffic::Routed,
+        },
     )
 }
 
@@ -1294,12 +1593,15 @@ pub(crate) fn boot_and_halt(
         log_name,
         BootContract::Halted { marker },
         topology,
-        ManagementBacking::Socket,
-        // A halted slot forwards nothing, so which set would have been injected
-        // decides nothing about the verdict; the routed set keeps the one thing
-        // it does decide — the frames put on the wire — the same as every other
-        // halt scenario's.
-        Traffic::Routed,
+        Bench {
+            accelerator: Accelerator::WhateverTheMachineOffers,
+            management: ManagementBacking::Socket,
+            // A halted slot forwards nothing, so which set would have been
+            // injected decides nothing about the verdict; the routed set keeps
+            // the one thing it does decide — the frames put on the wire — the
+            // same as every other halt scenario's.
+            traffic: Traffic::Routed,
+        },
     )
 }
 
@@ -1309,9 +1611,13 @@ fn boot(
     log_name: &str,
     contract: BootContract,
     topology: &Topology,
-    management: ManagementBacking,
-    traffic: Traffic,
+    bench: Bench,
 ) -> Result<Booted, String> {
+    let Bench {
+        accelerator,
+        management,
+        traffic,
+    } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
     // Whether this boot reads the recordings back follows from the backing
     // rather than being a second decision beside it: a real client is exactly
@@ -1323,7 +1629,7 @@ fn boot(
         mut command,
         acceleration,
         data,
-    } = qemu_base(root, "stdio", disk, run_label)?;
+    } = qemu_base(root, "stdio", disk, run_label, accelerator)?;
     command.arg("-monitor").arg("none");
     backends.apply(&mut command, topology)?;
 
@@ -1349,7 +1655,18 @@ fn boot(
     // recorder's proof of the path to the medium is not a dataplane matter: it maps
     // no configuration at all. So the witness must be there, and its absence would
     // mean a domain never started rather than a policy never committed.
-    let ran_the_appliance = !matches!(contract, BootContract::Halted { .. });
+    //
+    // The cryptography boot owes neither, which is the one case where the answer
+    // is not one of the two. It stops the instant the cryptography domain
+    // finishes, and nothing orders that against the recorder's own proof of the
+    // medium: a witness asserted here would be asserted on a race, and the same
+    // sector asserted untouched would be asserted against a domain that was
+    // running.
+    let data_disk = match contract {
+        BootContract::Halted { .. } => DataDiskVerdict::SectorUntouched,
+        BootContract::Routed | BootContract::FailedClosed { .. } => DataDiskVerdict::WitnessWritten,
+        BootContract::Cryptography => DataDiskVerdict::NotThisBootsSubject,
+    };
     let booted = forward_harness::run_boot_test(
         command,
         backends,
@@ -1369,13 +1686,16 @@ fn boot(
     // the witness pattern on the medium, and a boot with no bootable slot must
     // have left the same sector untouched. A harness asserting only the first
     // would pass on a host that wrote the file itself.
-    let verdict = if ran_the_appliance {
-        data.judge_written()
-    } else {
-        data.judge_untouched()
+    let verdict = match data_disk {
+        DataDiskVerdict::WitnessWritten => Some(data.judge_written()),
+        DataDiskVerdict::SectorUntouched => Some(data.judge_untouched()),
+        DataDiskVerdict::NotThisBootsSubject => None,
     }
+    .transpose()
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
-    println!("  data disk {run_label}: {verdict}");
+    if let Some(verdict) = verdict {
+        println!("  data disk {run_label}: {verdict}");
+    }
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {
@@ -1406,7 +1726,13 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
         mut command,
         acceleration,
         data: _,
-    } = qemu_base(root, "mon:stdio", &disk, "run")?;
+    } = qemu_base(
+        root,
+        "mon:stdio",
+        &disk,
+        "run",
+        Accelerator::WhateverTheMachineOffers,
+    )?;
     println!("QEMU run: {}", acceleration.describe());
     // Interactive runs have no harness peer to dial into, so back every NIC
     // port with QEMU's self-contained user-mode stack instead. The management
@@ -1513,6 +1839,7 @@ fn qemu_base(
     serial: &str,
     disk: &Path,
     run_label: &str,
+    accelerator: Accelerator,
 ) -> Result<Invocation, String> {
     require_file(disk)?;
 
@@ -1527,7 +1854,7 @@ fn qemu_base(
     }
     copy_file(&vars_template, &vars)?;
 
-    let acceleration = Acceleration::detect();
+    let acceleration = Acceleration::choose(accelerator);
     let data = DataDisk::create(root, run_label)?;
 
     let mut command = Command::new("qemu-system-x86_64");
@@ -1634,7 +1961,96 @@ mod tests {
                 kvm_rejected_because.contains(KVM_DEVICE),
                 "the reason must name the device it probed: {kvm_rejected_because}"
             ),
+            // Unreachable: `detect` probes the device and reports what it found,
+            // and a request is the one thing it is never asked about.
+            Acceleration::TcgByRequest => {
+                unreachable!("detection cannot produce a boot's own request")
+            }
         }
+    }
+
+    /// A boot that asks for emulation gets it on every machine, and says which
+    /// of the two reasons it is emulating for. A run that reported "accel=tcg"
+    /// identically for a deliberate choice and for a machine that could not
+    /// accelerate would leave the log unable to tell a proof from a degradation.
+    #[test]
+    fn a_requested_emulation_is_taken_whatever_the_machine_offers() {
+        let requested = Acceleration::choose(Accelerator::Emulated);
+        assert_eq!(requested.qemu_accel(), "tcg");
+        assert!(!requested.is_hardware());
+        let described = requested.describe();
+        assert!(described.contains("accel=tcg") && described.contains(GUEST_CPU));
+        assert!(
+            described.contains("emulation-requested") && !described.contains("kvm-rejected"),
+            "a deliberate emulation must not read as a rejected accelerator: {described}"
+        );
+        // And the other request is the machine's answer, whatever this machine's
+        // answer is.
+        let offered = Acceleration::choose(Accelerator::WhateverTheMachineOffers);
+        assert!(!matches!(offered, Acceleration::TcgByRequest));
+    }
+
+    /// Exactly one scenario forces emulation, and it repeats a boot the run
+    /// already makes rather than adding a document or an image build. Both halves
+    /// are the cost argument the boot was accepted on: a second table entry that
+    /// quietly grew a second image would be a different bargain.
+    #[test]
+    fn one_scenario_forces_emulation_and_pays_for_one_boot() {
+        let forced: Vec<&Scenario> = SCENARIOS
+            .iter()
+            .filter(|scenario| scenario.accelerator == Accelerator::Emulated)
+            .collect();
+        let [emulated] = forced.as_slice() else {
+            panic!(
+                "{} scenarios force emulation and the run pays for one",
+                forced.len()
+            );
+        };
+        assert!(
+            matches!(emulated.console, Console::JudgedOnCryptographyAlone),
+            "the forced boot judges the cryptography domain and nothing else"
+        );
+        assert!(
+            matches!(emulated.image, ImageUnderTest::Published)
+                && SCENARIOS.iter().any(|scenario| {
+                    scenario.name != emulated.name
+                        && scenario.document == emulated.document
+                        && matches!(scenario.image, ImageUnderTest::Published)
+                }),
+            "the forced boot must reuse a published disk another scenario already boots"
+        );
+        // And it takes no client, so it pulls no surface: the endpoint's three
+        // are the accelerated scenarios' subject.
+        assert!(!emulated.reaches_the_management_port());
+    }
+
+    /// The run may only claim the contrast it actually drew. On a machine that
+    /// accelerated nothing there is none, and the clause says so instead of
+    /// asserting a property of the runner as one of the image.
+    #[test]
+    fn the_summary_claims_a_contrast_only_where_one_was_drawn() {
+        let names: Vec<(&str, bool)> = SCENARIOS
+            .iter()
+            .map(|scenario| {
+                (
+                    scenario.name,
+                    scenario.accelerator == Accelerator::WhateverTheMachineOffers,
+                )
+            })
+            .collect();
+        let accelerated = describe_the_emulated_boots(SCENARIOS, &names);
+        assert!(
+            accelerated.contains("cryptography-under-emulation")
+                && accelerated.contains("ran on the processor"),
+            "{accelerated}"
+        );
+
+        let emulated: Vec<(&str, bool)> = names.iter().map(|&(name, _)| (name, false)).collect();
+        let alone = describe_the_emulated_boots(SCENARIOS, &emulated);
+        assert!(
+            alone.contains("drew no contrast") && !alone.contains("ran on the processor"),
+            "{alone}"
+        );
     }
 
     /// The shipped bench, so a device argument is checked against the same

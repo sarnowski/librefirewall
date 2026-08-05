@@ -47,8 +47,10 @@ whose `CPUID` had advertised BMI2 and whose feature gate had passed.
 
 That makes it an acceleration this appliance cannot prove, and an unprovable acceleration is not one
 this project takes. Every claim on this page rests on the appliance demonstrating it on the artifact
-that ships, and the build proves that artifact on whichever accelerator the machine offers; an image
-that only comes up on one of them makes the verdict a fact about the runner. **The cost is real and
+that ships, and the build proves that artifact on both accelerators — the boots that judge the rest of
+the appliance take whatever the machine offers, and one of them is forced onto the emulator so that
+this domain is proved there on every run; an image that only comes up on one of the two makes the
+verdict a fact about the runner. **The cost is real and
 deliberate** — the arithmetic under P-256, X25519 and ML-KEM is measurably slower without `mulx` and
 `rorx`, and the per-operation figures this page reports are the figures after the removal. The build
 asserts this absence the same way it asserts the other, and one step earlier: it reads the raw bytes

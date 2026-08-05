@@ -557,7 +557,10 @@ it against `lfw_blk::smoke::witness_pattern` — the appliance's own definition,
 copied. Every scenario that boots the appliance must show the pattern, and the two A/B halt
 scenarios, where no
 slot is bootable and no domain runs, must show the sector still zeroed. That pair is what makes
-either verdict evidence.
+either verdict evidence. The one exception is the forced-emulation boot, which owes neither verdict:
+it ends the moment the cryptography domain reports, and nothing orders that against the recorder's
+own proof of the medium — so a witness asserted there would be asserted on a race, and the same
+sector asserted untouched would be asserted against a domain that was running.
 
 The console record carries what the device said and what came back:
 
@@ -695,7 +698,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 12 of the 16 system
+**What the gate proves.** Every scenario whose management port is reachable — 12 of the 17 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -957,7 +960,7 @@ Held by the tests in `datad/crates/config` and `datad/crates/log`, by the handov
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the 16 QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the 17 QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -1214,7 +1217,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 16 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 17 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1412,10 +1415,11 @@ one producer and one consumer and a forged return is refused by a ledger rather 
 spans, a stalled return ring, an exhausted transmit pool, a duplicate return on the reply pipeline,
 and a pool-sized run proving every buffer comes back.
 
-The QEMU gate asserts all of it on the release image. Every system scenario injects six frames into
-the management port once the capture proves every port is up — four opaque frames of four different
-lengths, an ARP request and an ICMP echo request — then opens a TCP connection with a minimal
-deterministic client of its own, and then requires:
+The QEMU gate asserts all of it on the release image. Every system scenario except the
+forced-emulation boot — which injects nothing on that wire, its subject being the accelerator rather
+than this port — puts six frames into the management port once the capture proves every port is up:
+four opaque frames of four different lengths, an ARP request and an ICMP echo request. It then opens
+a TCP connection with a minimal deterministic client of its own, and then requires:
 
 - a **well-formed ARP reply** carrying the configured MAC, decoded and compared field by field;
 - a **well-formed ICMP echo reply** with matching identifier, sequence and payload and a valid
@@ -1435,7 +1439,7 @@ deterministic client of its own, and then requires:
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the 16 system scenarios additionally hold the console's own record to the frames and the bytes
+Two of the 17 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1692,7 +1696,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the 16 QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the 17 QEMU system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -2053,6 +2057,23 @@ measurable on ECDSA P-256; the per-operation regression ceilings moved with it, 
 and sixty million cycles down to 5.5, 1.1 and 2.0 million, which is the four-times margin they were
 always documented as having.
 
+**And one scenario now boots on the emulator whatever the machine offers, which is why that class of
+defect is no longer invisible.** The build-time check makes the particular cause impossible; what it
+cannot do is make the next cause visible, and nothing in the gate ever ran the image on an emulator
+on a machine that had acceleration — which is every machine this gate runs on. So the defect was
+found by hand rather than by the gate, and a second one of its kind would have been too. The
+seventeenth scenario is the answer: it reuses the shipped document and the published disk another
+scenario already boots, forces emulation, and judges the cryptography domain alone — every primitive
+against its published vectors and the session established. It asserts none of the measured costs, a
+cycle count under emulation being a figure about the emulator, and none of the routed, transcript or
+management contracts either: those are statements about the image, the accelerated boots make all of
+them, and a second reading of the same fact is not worth a boot. The narrowness pays for itself twice:
+measured on this bench the boot costs about **five seconds**, no more than an accelerated scenario
+does, because it ends the moment the domain reports rather than waiting out the settle window, the
+management burst, two scrapes and two downloads — so emulating every instruction in it costs the gate
+almost nothing. On a machine with no usable KVM every boot is emulated already, and the run says so
+rather than claiming a contrast it did not draw.
+
 One caveat is worth recording, because it bites: **cargo does not fingerprint a custom target
 specification**, so editing `datad/support/targets/x86_64-sel4-simd.json` alone rebuilds nothing.
 The SIMD target directory has to be removed for the change to reach the binaries. The disassembly
@@ -2164,7 +2185,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all nine protection-domain binaries — the hardware probe and the cryptography domain against their own SIMD target — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 27 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (16 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (17 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. A second raw disk at 00:05.0 is attached on every invocation, and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off that disk besides ([detail](#recording-and-download)). Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
