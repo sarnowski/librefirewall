@@ -33,10 +33,33 @@ fn capture() -> String {
              cycles-per-operation=900000\r\n"
         );
     }
+    text.push_str(DELEGATION_BEFORE);
     text.push_str(SESSION);
+    text.push_str(DELEGATION_AFTER);
     text.push_str("LFW-PD domain=crypto state=ready\r\n");
+    // The store domain's own rendering of the same appliance, which the
+    // delegation's records are held against: the claim is that two domains name
+    // one node, so a capture with only one side of it proves nothing.
+    text.push_str(STORE_IDENTITY);
     text
 }
+
+/// The appliance the key holder names, as both domains render it.
+const DEVICE: &str = "3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c";
+
+/// The direct proof's record: the holder answered, signed, and the signature
+/// verified under the key it named.
+const DELEGATION_BEFORE: &str = "LFW-PD domain=crypto state=negotiated \
+     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=1\r\n";
+
+/// The same tally after a session whose server half ran on the delegated key. It
+/// has moved by the handshake's own `CertificateVerify`.
+const DELEGATION_AFTER: &str = "LFW-PD domain=crypto state=negotiated \
+     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=2\r\n";
+
+/// The key holder's own record, on the same boot.
+const STORE_IDENTITY: &str = "LFW-PD domain=store state=ready \
+     device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c generation=1 onboarded=false\r\n";
 
 /// What the session and the arena leave behind on a passing boot.
 const SESSION: &str = "LFW-PD domain=crypto state=negotiated tls-version=0x0304 \
@@ -152,6 +175,49 @@ fn a_boot_that_never_finished_and_one_that_finished_twice_are_both_refused() {
     let doubled = format!("{}LFW-PD domain=crypto state=ready\r\n", capture());
     let verdict = judge(doubled.as_bytes(), log(), true).expect_err("a doubled record");
     assert!(verdict.contains("carried 2"), "{verdict}");
+}
+
+/// The delegation's own claims, each refused for the reason it exists.
+#[test]
+fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused() {
+    // Only the direct proof, so nothing says the session ran on the delegated
+    // key.
+    let once = capture().replace(DELEGATION_AFTER, "");
+    let verdict = judge(once.as_bytes(), log(), true).expect_err("one delegation record");
+    assert!(verdict.contains("exactly two"), "{verdict}");
+
+    // Two records and a tally that did not move: the handshake signed some other
+    // way, which is exactly what the pair exists to catch.
+    let still = capture().replace("delegated-signatures=2", "delegated-signatures=1");
+    let verdict = judge(still.as_bytes(), log(), true).expect_err("an unmoved tally");
+    assert!(verdict.contains("signed some other way"), "{verdict}");
+
+    // A holder that reports no signature at all after the direct proof.
+    let zero = capture().replace("delegated-signatures=1", "delegated-signatures=0");
+    let verdict = judge(zero.as_bytes(), log(), true).expect_err("a zero tally");
+    assert!(verdict.contains("0 signatures"), "{verdict}");
+
+    // The two domains naming two appliances, which is the delegation having
+    // reached a key that is not this node's.
+    let stranger = capture().replace(
+        &format!("device={DEVICE} generation=1"),
+        "device=00000000000000000000000000000001 generation=1",
+    );
+    let verdict = judge(stranger.as_bytes(), log(), true).expect_err("two identities");
+    assert!(verdict.contains("is not this appliance's"), "{verdict}");
+
+    // And the two records themselves disagreeing.
+    let drifted = capture().replace(
+        &format!("delegated-device={DEVICE} delegated-signatures=2"),
+        "delegated-device=00000000000000000000000000000001 delegated-signatures=2",
+    );
+    let verdict = judge(drifted.as_bytes(), log(), true).expect_err("a drifting identifier");
+    assert!(verdict.contains("a boot has one identity"), "{verdict}");
+
+    // A capture with no store record to hold the claim against.
+    let alone = capture().replace(STORE_IDENTITY, "");
+    let verdict = judge(alone.as_bytes(), log(), true).expect_err("no holder record");
+    assert!(verdict.contains("no `device=` record"), "{verdict}");
 }
 
 #[test]

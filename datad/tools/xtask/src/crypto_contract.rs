@@ -22,6 +22,19 @@
 //! [`CEILINGS`] is where the figure that separates them is written down with
 //! the reasoning that produced it.
 //!
+//! # The delegation, which is a claim about two domains and not one
+//!
+//! This domain authenticates under a key it does not hold, so two of its records
+//! are about the domain that does. Both carry `delegated-device=` — the appliance
+//! the key holder named — and `delegated-signatures=`, that holder's own tally.
+//! [`delegation_records`] holds them to three things no single record can say:
+//! that the identifier is the *same* on both, that it is the same one the
+//! `domain=store` records report on the same boot, and that the tally **moved**
+//! between them. The last is what proves the session's server half really ran on
+//! the delegated key: its `CertificateVerify` was computed in the other domain, so
+//! a number that stayed put would mean the handshake signed some other way and
+//! the seam was never on the path.
+//!
 //! # Why the verdict is only asserted on an accelerated run
 //!
 //! Under emulation every instruction is a host function call and the guest's
@@ -267,9 +280,112 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
         "unasserted, this boot being emulated rather than accelerated"
     };
     let session = session_records(&steps, log)?;
+    let delegation = delegation_records(&text, &steps, log)?;
     Ok(format!(
-        "the cryptography domain proved {}vectors on this part, measured {}({verdict}), and {}",
-        proved, costs, session
+        "the cryptography domain proved {}vectors on this part, measured {}({verdict}), {}, and \
+         {}",
+        proved, costs, session, delegation
+    ))
+}
+
+/// Judge the two records this domain leaves about the key it does not hold.
+///
+/// Three claims, and none of them is available from one record. The identifier
+/// must be the same on both and must be the one the **store domain** reports on
+/// the same boot, because that is what says the channel reached the appliance's
+/// own key holder rather than answering out of a zeroed region. And the tally must
+/// have moved, because that is what says the handshake between the two records
+/// signed through the delegation rather than beside it.
+///
+/// The store domain's own `device=` is read out of the same capture rather than
+/// through [`crate::store_contract`]: what is being compared is two domains'
+/// renderings of one value, so both sides have to come off the wire.
+fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String, String> {
+    let observed: Vec<(&str, &str)> = steps
+        .iter()
+        .filter_map(|record| {
+            Some((
+                field_value(record, "delegated-device")?,
+                field_value(record, "delegated-signatures")?,
+            ))
+        })
+        .collect();
+    let [(first_device, first_count), (second_device, second_count)] = observed[..] else {
+        return Err(format!(
+            "the cryptography domain published {} `delegated-device=` record(s) and a boot \
+             produces exactly two: the direct proof that a signature made in the key holder's \
+             domain verifies under the key that domain named, and the same tally read again after \
+             a TLS session whose server half ran under that key. One means the session never ran \
+             on the delegated key; none means the delegation never answered at all\n  records \
+             observed: {steps:#?}\n  full run log: {}",
+            observed.len(),
+            log.display()
+        ));
+    };
+    if first_device != second_device {
+        return Err(format!(
+            "the cryptography domain named appliance {first_device:?} before the session and \
+             {second_device:?} after it, and a boot has one identity. Two values mean the key \
+             holder answered as two different appliances\n  full run log: {}",
+            log.display()
+        ));
+    }
+    // The store domain's own rendering of the same value, off the same wire. A
+    // disagreement here is the delegation reaching something other than this
+    // node's key holder, which no amount of correct signing would make right.
+    let held = lifecycle_records(text)
+        .into_iter()
+        .filter(|record| record.contains(&field("domain", Domain::Store.name())))
+        .find_map(|record| field_value(record, "device"))
+        .ok_or_else(|| {
+            format!(
+                "the store domain published no `device=` record, so there is nothing to hold the \
+                 cryptography domain's `delegated-device=` to. The delegation's whole claim is \
+                 that the two domains name one appliance\n  full run log: {}",
+                log.display()
+            )
+        })?;
+    if first_device != held {
+        return Err(format!(
+            "the cryptography domain signs for appliance {first_device:?} and the store domain \
+             reports being {held:?}. The two are one node, so a difference means the delegation \
+             reached a key that is not this appliance's — or a region nobody wired\n  full run \
+             log: {}",
+            log.display()
+        ));
+    }
+    let number = |text: &str, which: &str| -> Result<u64, String> {
+        text.parse::<u64>().map_err(|error| {
+            format!(
+                "the {which} `delegated-signatures={text}` is no number: {error}\n  full run log: \
+                 {}",
+                log.display()
+            )
+        })
+    };
+    let before = number(first_count, "first")?;
+    let after = number(second_count, "second")?;
+    if before == 0 {
+        return Err(format!(
+            "the key holder reported having produced 0 signatures after the direct proof, and the \
+             proof itself is one: a zero tally means the count is not the holder's own\n  full \
+             run log: {}",
+            log.display()
+        ));
+    }
+    if after <= before {
+        return Err(format!(
+            "the key holder's signature tally was {before} before the TLS session and {after} \
+             after it, and a session whose server half runs under the delegated key must move it: \
+             the `CertificateVerify` is computed in that domain. A tally that did not move means \
+             the handshake signed some other way, so the seam was never on the path this proof \
+             exists to exercise\n  full run log: {}",
+            log.display()
+        ));
+    }
+    Ok(format!(
+        "signed for appliance {first_device} under a key it does not hold, the holder's tally \
+         moving {before} -> {after} across a session whose server half ran on that key"
     ))
 }
 

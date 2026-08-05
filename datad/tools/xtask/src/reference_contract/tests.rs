@@ -90,6 +90,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/management/src/main.rs", &["rdrand-exhausted"]),
         ("pds/hardware-probe/src/main.rs", &["aes-not-supported"]),
         ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
+        ("pds/crypto/src/delegate.rs", &["delegated-key-refused"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         ("crates/store/src/identity.rs", &["stored-scalar-unusable"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
@@ -115,7 +116,7 @@ fn sound_console() -> String {
             ],
         ),
         ("hardware-probe", &["aes-not-supported"]),
-        ("crypto", &["rdrand-output-stuck"]),
+        ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
         (
             "store",
             &["store-medium-too-small", "stored-scalar-unusable"],
@@ -217,7 +218,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
             ],
         ),
         ("hardware-probe", &["aes-not-supported"]),
-        ("crypto", &["rdrand-output-stuck"]),
+        ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
         (
             "store",
             &["store-medium-too-small", "stored-scalar-unusable"],

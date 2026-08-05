@@ -4,7 +4,8 @@
 //! Cryptography protection domain: it proves, on the booted image, that every
 //! primitive the appliance owns answers its published test vectors, measures
 //! what each costs on this part, seeds the node's random bit generator from
-//! hardware, and then parks.
+//! hardware, proves it can authenticate under a key it does not hold, and then
+//! parks.
 //!
 //! This is one of three binaries compiled with the SIMD target specification, and
 //! the reason that specification exists: with AES-NI and carry-less multiply
@@ -29,6 +30,15 @@
 //!    every measured primitive reports thousandths of a cycle per byte, and
 //!    the gate holds AES-256-GCM's below a figure no portable implementation
 //!    reaches. This is the claim that would otherwise go quietly untrue.
+//! 4. **The appliance can authenticate under a key it does not hold.** The
+//!    device key belongs to the domain that owns the medium it is written on,
+//!    and this domain is not that one. So it asks: which key do you hold, and
+//!    sign these bytes — and then verifies the signature against the key it was
+//!    given, which is a claim about the delegation and not about ECDSA. The
+//!    session below then runs its **server half under that same delegated key**,
+//!    because that is the only thing that proves the seam where it will actually
+//!    be used: `sign` is called synchronously, deep inside a rustls handshake,
+//!    at the point a server produces its `CertificateVerify`.
 //!
 //! # Why the measurement takes the minimum of several rounds
 //!
@@ -40,17 +50,37 @@
 //!
 //! # Adversary
 //!
-//! The **byzantine neighbour protection domain**, in one place: the clock
+//! The **byzantine neighbour protection domain**, in two places now. The clock
 //! calibration region this domain maps read-only to stamp its records, whose
-//! triple is peer-written and ranged by `pd_runtime::PdClock` before a stamp
-//! is derived from it. No device, no network byte and no frame reaches this
-//! domain, and nothing it computes here comes from outside it — every input to
-//! every primitive is a compile-time constant or a hardware draw.
+//! triple is peer-written and ranged by `pd_runtime::PdClock` before a stamp is
+//! derived from it. And the **delegation's reply region**, every word of which is
+//! the key holder's: `wire::signing` ranges it before a byte is copied, and what
+//! survives that is a byte string this domain hands to a verifier or to the TLS
+//! library, both of which judge it against a public key rather than believing it.
+//! A holder that never answers is bounded rather than trusted — see `delegate`.
 //!
-//! **No surface here carries key material.** The seed is drawn, folded and
-//! consumed inside this file; the generator holds it, no record names it, and
-//! the raw draws are cleared before the buffer holding them goes out of scope.
-//! The only numbers that leave are counts and costs.
+//! No device, no network byte and no frame reaches this domain, and no input to
+//! any primitive comes from outside it: every one is a compile-time constant, a
+//! hardware draw, or a value this domain produced itself.
+//!
+//! **No surface here carries key material, and this domain now holds none at
+//! all for the identity it authenticates under.** The seed is drawn, folded and
+//! consumed inside this file; the generator holds it, no record names it, and the
+//! raw draws are cleared before the buffer holding them goes out of scope. The
+//! device key is never here in any form: what crosses the delegation is a public
+//! point, a public name, and signatures, because those are the only shapes the
+//! ABI has fields for. The only numbers that leave are counts and costs.
+//!
+//! # Two keys, and only one of them is this domain's
+//!
+//! The session it proves has two ends, and they are keyed differently on purpose.
+//! The **client** end and the certification authority above both are generated
+//! here from this domain's own generator, because what they stand in for — a
+//! management server and the anchor it was issued under — is not this appliance.
+//! The **server** end is the appliance, so it authenticates under the appliance's
+//! own key: the certificate binds the public point the holder answered with, and
+//! the `CertificateVerify` is computed in the holder's domain. The one thing this
+//! arrangement cannot prove is a session across a wire, there being none yet.
 //!
 //! # This domain seeds itself, and so does every other that holds a key
 //!
@@ -64,7 +94,10 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
+
 mod arena;
+mod delegate;
 
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
@@ -80,12 +113,13 @@ use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
-use lfw_tls::{Negotiated, SessionError, prove_session};
+use lfw_tls::{Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{PdClock, attach_region, log_sample, read_timestamp_counter};
-use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
-use wire::{ClockCalibration, LogConsume, LogRecords};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
+use wire::{ClockCalibration, LogConsume, LogRecords, SignReply, SignRequest};
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
+use delegate::{Delegated, DelegationError, HeldKey};
 
 /// The appliance's only allocator, and the one exception to the rule that a
 /// protection domain has none. It is here because a proven TLS implementation
@@ -225,6 +259,25 @@ const OPERATIONS_PER_ROUND: u32 = 2;
 /// directions, and a longer payload would measure the pump.
 const SESSION_PAYLOAD: &[u8] = b"librefirewall management channel";
 
+/// The domain that holds the device key, as this domain's channel to it.
+///
+/// One direction only: this domain wakes the holder, and the holder answers by
+/// publishing rather than by signalling back. There is nothing for a reverse
+/// capability to do — `sign` is called from inside a handshake and has no
+/// continuation a notification could resume — and it would be a wakeup capability
+/// held by the domain that owns the appliance's identity on the domain that runs
+/// adopted protocol code.
+const KEY_HOLDER: Channel = Channel::new(0);
+
+/// The bytes the direct proof signs.
+///
+/// A fixed string and not a digest of anything: what is being proved is that a
+/// signature made in another domain verifies under the key that domain named, and
+/// any message settles that. It is deliberately not the session payload — a
+/// message that appeared in two proofs would let one of them pass on the other's
+/// work.
+const DELEGATION_CHALLENGE: &[u8] = b"librefirewall device key delegation";
+
 /// How much of the arena a starved session is left with.
 ///
 /// A little more than a phase is required to have, deliberately: the session
@@ -311,9 +364,23 @@ fn init() -> Crypto {
     // domain and no other, and nothing else in this system names it.
     let region: &'static ArenaRegion = attach_region!(arena_vaddr: ArenaRegion);
     ARENA.attach(region.bytes.as_ptr().cast_mut().cast());
+    // The delegation's two regions, whose directions are the system
+    // description's: the request is this domain's to write and the holder's to
+    // read, and the reply is the reverse. Nothing here restates that — the handle
+    // `wire::signing` hands back reaches the reply only through a view with no
+    // store on it, so this domain cannot forge the signature it then verifies.
+    let sign_request: &'static SignRequest = attach_region!(sign_request_vaddr: SignRequest);
+    let sign_reply: &'static SignReply = attach_region!(sign_reply_vaddr: SignReply);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
-    let outcome = bring_up(&sink, wall_seconds(&clock));
+    // One requester for the whole boot, and behind an `Arc` because the library's
+    // certificate resolver takes a share of it: a second would restart at sequence
+    // zero and reuse numbers the first has outstanding
+    // (`wire::SignRequest::requester`). Allocated here, before the arena's mark is
+    // taken, so it sits outside every session's reset.
+    let delegated: Arc<Delegated> =
+        Arc::new(Delegated::attach(sign_request, sign_reply, KEY_HOLDER));
+    let outcome = bring_up(&sink, wall_seconds(&clock), &delegated);
     match &outcome.verdict {
         Ok(()) => announce(&sink, DomainState::Ready, DomainDetail::None),
         Err(CryptoError(cause)) => {
@@ -340,7 +407,7 @@ fn init() -> Crypto {
 /// Gate on the part, prove every primitive, measure the three that are
 /// measured, and seed the generator — reporting each step as it happens, so a
 /// refusal halfway through leaves the steps that did hold on the console.
-fn bring_up(sink: &dyn Sink, now: u64) -> Outcome {
+fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
     let mut outcome = Outcome {
         verdict: Ok(()),
         vectors: [0; CRYPTO_PRIMITIVES.len()],
@@ -430,24 +497,133 @@ fn bring_up(sink: &dyn Sink, now: u64) -> Outcome {
         );
     }
 
-    if let Err(error) = prove_tls(sink, entropy, now) {
+    // Before the session, because the session's server half runs under the key
+    // this establishes: a handshake that failed on an unanswered delegation would
+    // report a TLS refusal and say nothing about which half was at fault.
+    let held = match prove_delegation(sink, delegated) {
+        Ok(held) => held,
+        Err(error) => {
+            outcome.verdict = Err(error);
+            return outcome;
+        }
+    };
+
+    if let Err(error) = prove_tls(sink, entropy, now, delegated, &held) {
         outcome.verdict = Err(error);
     }
     outcome
 }
 
-/// Establish one session, report what it negotiated, and then prove that a
-/// session which runs out of arena refuses rather than faults.
+/// Ask the key holder which key it holds, have it sign a fixed challenge, and
+/// verify that signature against that key.
+///
+/// **This proves the delegation and not ECDSA**, which the vector run above has
+/// already settled. What it establishes is that the two regions carry a request
+/// and an answer, that the answer is this request's, and that the bytes coming
+/// back are a signature under the point the holder named — so a channel wired to
+/// the wrong region, a holder answering the wrong question, and a public key
+/// paired with somebody else's scalar are each a refusal here rather than a
+/// handshake failure three steps later.
+///
+/// The record it leaves names the appliance and the holder's own tally. Reported
+/// before the session, so a boot whose session then fails still shows the
+/// delegation having worked.
+fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<HeldKey, CryptoError> {
+    let held = delegated.held_key().map_err(delegation_refusal)?;
+    // An all-zero point is what a zeroed region reads as, so it is the one shape
+    // that would let a channel nobody wired pass this proof.
+    if held.public_key.iter().all(|byte| *byte == 0) || held.device == 0 {
+        return Err(CryptoError(refusal(
+            "delegated-key-absent",
+            RefusalDetail::None,
+        )));
+    }
+    let mut signature = [0_u8; P256_MAX_SIGNATURE_LEN];
+    let len = lfw_tls::SignOperation::sign(delegated, DELEGATION_CHALLENGE, &mut signature)
+        .map_err(|_| CryptoError(refusal("delegated-signature-refused", RefusalDetail::None)))?;
+    // The whole point of the exercise: the bytes are held to the key the *other*
+    // domain named, so a holder signing under anything else fails here rather
+    // than in a peer's validator.
+    lfw_crypto::p256_verify(
+        &held.public_key,
+        DELEGATION_CHALLENGE,
+        signature.get(..len).unwrap_or_default(),
+    )
+    .map_err(|_| {
+        CryptoError(refusal(
+            "delegated-signature-invalid",
+            RefusalDetail::One(len as u64),
+        ))
+    })?;
+    report_delegation(sink, delegated, &held);
+    Ok(held)
+}
+
+/// What the delegation has come to: the appliance this domain signs for, and the
+/// holder's own signature tally.
+///
+/// The tally is the holder's number rather than a count of calls made here, which
+/// is what makes a second record after the handshake meaningful: the number
+/// moving is the holder having signed again.
+fn report_delegation(sink: &dyn Sink, delegated: &Delegated, held: &HeldKey) {
+    announce(
+        sink,
+        DomainState::Negotiated,
+        DomainDetail::Delegated {
+            device: held.device,
+            signatures: delegated.signatures(),
+        },
+    );
+}
+
+/// Why the delegation refused, as a cause token an operator can act on.
+fn delegation_refusal(error: DelegationError) -> CryptoError {
+    CryptoError(refusal(error.cause(), RefusalDetail::None))
+}
+
+/// Establish one session **under the delegated key**, report what it negotiated,
+/// and then prove that a session which runs out of arena refuses rather than
+/// faults.
 ///
 /// Both halves are here because they are one claim: the allocator this domain
 /// carries is bounded, and what makes that acceptable is that reaching the
 /// bound is an answer. A boot that showed only the first half would have shown
 /// a working TLS stack and nothing about what happens when it runs out.
-fn prove_tls(sink: &dyn Sink, entropy: &'static dyn Entropy, now: u64) -> Result<(), CryptoError> {
+///
+/// **The server half's key is the appliance's own and lives in another domain.**
+/// That is what takes the seam the whole way: the delegation is exercised where
+/// it will be used, synchronously inside a handshake, rather than as a call this
+/// file makes on its own terms. A second record afterwards carries the holder's
+/// tally, which has moved by the handshake's own `CertificateVerify` — that
+/// movement is the proof, because a session that had quietly signed with a local
+/// key would leave the number where it was.
+///
+/// The starved session that follows keeps a **local** key deliberately: what it
+/// proves is the arena's bound, and a session that also depended on another
+/// domain answering would fail for two reasons at once with one record to say so.
+fn prove_tls(
+    sink: &dyn Sink,
+    entropy: &'static dyn Entropy,
+    now: u64,
+    delegated: &Arc<Delegated>,
+    held: &HeldKey,
+) -> Result<(), CryptoError> {
     let arena = ARENA.bump();
     let mark = arena.mark();
-    let negotiated =
-        prove_session(entropy, arena, now, SESSION_PAYLOAD).map_err(session_refusal)?;
+    // A share of the one requester rather than a second one: the resolver holds it
+    // for as long as the configuration lives, and two requesters on one channel
+    // would each claim the other's replies.
+    let negotiated = prove_session(
+        entropy,
+        arena,
+        now,
+        SESSION_PAYLOAD,
+        &ServerKey::Delegated {
+            operation: Arc::clone(delegated) as Arc<dyn lfw_tls::SignOperation>,
+            public_key: held.public_key,
+        },
+    )
+    .map_err(session_refusal)?;
     report_session(sink, &negotiated);
     announce(
         sink,
@@ -458,6 +634,10 @@ fn prove_tls(sink: &dyn Sink, entropy: &'static dyn Entropy, now: u64) -> Result
         },
     );
     arena.reset_to(mark);
+    // The holder's tally again, after the handshake. It must have moved: the
+    // server's `CertificateVerify` was computed in the holder's domain, and a
+    // number that stayed put would mean the handshake signed some other way.
+    report_delegation(sink, delegated, held);
 
     // The same session with the arena all but full. It must refuse, and the
     // refusal must be the arena's rather than any other — a session that
@@ -466,7 +646,7 @@ fn prove_tls(sink: &dyn Sink, entropy: &'static dyn Entropy, now: u64) -> Result
     let filler = arena
         .allocate(starve, 16)
         .map_err(|_| CryptoError(refusal("arena-starvation-unreachable", RefusalDetail::None)))?;
-    let starved = prove_session(entropy, arena, now, SESSION_PAYLOAD);
+    let starved = prove_session(entropy, arena, now, SESSION_PAYLOAD, &ServerKey::Local);
     arena.release(filler, starve);
     arena.reset_to(mark);
     match starved {

@@ -181,6 +181,7 @@ pub enum LogDetailKind {
     Identity,
     Fingerprint,
     Reset,
+    Delegated,
 }
 
 impl LogDetailKind {
@@ -206,6 +207,7 @@ impl LogDetailKind {
             Self::Identity => 16,
             Self::Fingerprint => 17,
             Self::Reset => 18,
+            Self::Delegated => 19,
         }
     }
 
@@ -231,6 +233,7 @@ impl LogDetailKind {
             16 => Some(Self::Identity),
             17 => Some(Self::Fingerprint),
             18 => Some(Self::Reset),
+            19 => Some(Self::Delegated),
             _ => None,
         }
     }
@@ -727,6 +730,15 @@ impl LogRecord {
                 documents: self.operands[1],
                 was_owned: flag(self.operands[3])?,
             },
+            // An identifier in its two halves and a count, on `Identity`'s terms
+            // for the halves and with nothing to refuse: a count of signatures a
+            // peer produced is unranged, and the fourth word is not a flag here,
+            // so this detail names three words and leaves the last unclaimed.
+            Some(LogDetailKind::Delegated) => CheckedDetail::Delegated {
+                high: self.operands[0],
+                low: self.operands[1],
+                signatures: self.operands[2],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -1176,6 +1188,14 @@ pub enum CheckedDetail {
         generation: u64,
         documents: u64,
         was_owned: bool,
+    },
+    /// Which appliance a domain that holds no key was told it signs for, and how
+    /// many signatures the holder has produced. The identifier crosses in its two
+    /// halves, on [`Self::Identity`]'s terms.
+    Delegated {
+        high: u64,
+        low: u64,
+        signatures: u64,
     },
 }
 

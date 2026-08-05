@@ -580,6 +580,24 @@ pub const STORE_RESET: Metric = metric(
      this says which one was asked for.",
 );
 
+pub const STORE_SIGNATURES: Metric = metric(
+    "librefirewall_store_signatures_total",
+    Kind::Counter,
+    "Signatures this domain has produced under the device key on behalf of a domain that holds no \
+     key. It is the only operator-visible sign that the delegation is working, and it is a count \
+     rather than anything about a signature: no message, no signature and no key is exposed here \
+     or anywhere else on this surface.",
+);
+
+pub const STORE_SIGN_REFUSALS: Metric = metric(
+    "librefirewall_store_sign_refusals_total",
+    Kind::Counter,
+    "Signing requests this domain answered with a refusal rather than a signature — an appliance \
+     with no established identity, an operation it has none of, or a message longer than a \
+     request may carry. A non-zero value beside a zero \
+     `librefirewall_store_signatures_total` is a peer asking for something this node cannot give.",
+);
+
 // ── The transport ───────────────────────────────────────────────────────────
 
 pub const TCP_SEGMENTS: Metric = metric(
@@ -944,6 +962,8 @@ pub const ALL_METRICS: &[&Metric] = &[
     &STORE_GENERATION,
     &STORE_ONBOARDED,
     &STORE_RESET,
+    &STORE_SIGNATURES,
+    &STORE_SIGN_REFUSALS,
     &RECORDING_RECORDS,
     &RECORDING_RECORD_BYTES,
     &RECORDING_RECORDS_DROPPED,

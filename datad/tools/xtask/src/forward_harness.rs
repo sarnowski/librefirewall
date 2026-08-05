@@ -2698,6 +2698,12 @@ pub enum BootContract<'a> {
     /// The verdict itself is the caller's, from the records this leaves in the
     /// capture — a domain that refused is a refusal to report rather than a
     /// boot that failed to complete.
+    ///
+    /// It waits for the **store domain** to have finished too, which is not a
+    /// second contract but the same one: this domain authenticates under a key
+    /// that domain holds, and the claim that the two name one appliance can only
+    /// be checked with both renderings in the capture. That domain establishes its
+    /// identity before this one's first vector runs, so the wait is free.
     Cryptography,
     /// **The store domain came up and established an identity**, and nothing else
     /// is judged at all.
@@ -4978,15 +4984,24 @@ fn run_boot(
                     Some(since) if since.elapsed() >= SETTLE_WINDOW => break 'run Ok(()),
                     _ => {}
                 },
-                // This node keeps running too, and the record that ends the boot
-                // is the last one the cryptography domain writes: it runs to
-                // completion in `init` and parks, so a `ready` or a `refused`
-                // from it means every record it owes is already in the capture.
-                // No settle window follows, because nothing is being waited out
-                // — there is no absence in this contract for a late frame to
-                // spoil.
+                // This node keeps running too, and the records that end the boot
+                // are the last ones the cryptography domain and the STORE domain
+                // write: each runs to completion in `init`, so a `ready` or a
+                // `refused` from one means every record it owes is already in the
+                // capture. Both are waited for because the cryptography domain's
+                // contract is no longer about one domain: it signs under a key the
+                // store domain holds, and holding its `delegated-device=` to that
+                // domain's own `device=` needs both renderings on the wire. It
+                // costs nothing — the store domain establishes its identity before
+                // the cryptography domain's first vector runs, sitting above it —
+                // and what it removes is a race in which the console had drained
+                // one ring and not the other. No settle window follows either way,
+                // because nothing is being waited out: there is no absence in this
+                // contract for a late frame to spoil.
                 BootContract::Cryptography => {
-                    if crate::crypto_contract::finished(&output) {
+                    if crate::crypto_contract::finished(&output)
+                        && crate::store_contract::finished(&output)
+                    {
                         break 'run Ok(());
                     }
                 }

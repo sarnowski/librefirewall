@@ -622,6 +622,8 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
         generation: 3,
         onboarded: true,
         reset: true,
+        signatures: 43,
+        sign_refusals: 47,
         capacity_sectors: 2048,
         requests: [5, 7],
         bytes: [11, 13],
@@ -636,7 +638,7 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     assert_eq!(
         store.values(),
         [
-            1, 0, 3, 1, 1, 2048, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41
+            1, 0, 3, 1, 1, 43, 47, 2048, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41
         ]
     );
     assert_eq!(store.values().len(), STORE_SLOTS);
@@ -1173,5 +1175,5 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 88_195);
+    assert_eq!(MAX_EXPOSITION_LEN, 89_178);
 }

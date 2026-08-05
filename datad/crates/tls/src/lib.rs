@@ -60,6 +60,6 @@ mod tests;
 pub use arena::{ArenaExhausted, Bump, MAX_ALIGN};
 pub use identity::{Identity, IdentityError};
 pub use provider::{Clock, provider};
-pub use session::{Negotiated, STEP_RESERVE, SessionError, prove_session};
+pub use session::{Negotiated, STEP_RESERVE, ServerKey, SessionError, prove_session};
 pub use sign::{EcdsaP256SigningKey, LocalKey, SignOperation, SignRefused};
 pub use suite::TLS13_CHACHA20_POLY1305_SHA256;

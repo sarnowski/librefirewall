@@ -126,7 +126,18 @@ const REQUIRED: &[&str] = &[
     "librefirewall_configuration_generation",
     "librefirewall_clock_frequency_hertz",
     "librefirewall_log_records_dropped_total",
+    STORE_SIGNATURES,
 ];
+
+/// The store domain's signature tally, named here because it is the one series in
+/// this contract whose value proves a *shard moved after `init`*.
+///
+/// Every other series in the exposition is written once by a domain that then
+/// parks, or repeatedly by one that never stops. This one is written by a domain
+/// that establishes an identity, publishes, blocks, and publishes again when it is
+/// woken — so a scrape reading it above zero is the only evidence on this surface
+/// that the second publish happens at all.
+const STORE_SIGNATURES: &str = "librefirewall_store_signatures_total";
 
 /// Every protection domain must appear as a `domain` label value, or one shard
 /// is not reaching the exposition at all.
@@ -1134,6 +1145,24 @@ fn judge_one(
         }
     }
 
+    // The store domain's tally, which every scraped boot has already moved: the
+    // cryptography domain proves the delegation and then runs a session under the
+    // delegated key before it parks, so two signatures are behind any scrape. A
+    // zero here is a store shard that was published once at the end of `init` and
+    // never again, which would mean the domain is not serving the delegation at
+    // all — a defect this surface would otherwise be silent about, the console
+    // records being the cryptography domain's rather than this domain's.
+    let signatures = one(&exposition, STORE_SIGNATURES, &[("domain", "store")])?;
+    if signatures.value < 2 {
+        return Err(format!(
+            "{STORE_SIGNATURES} reads {} and a scraped boot has at least two signatures behind \
+             it — the delegation's own proof and the session that ran under the delegated key. A \
+             lower value means the store domain either is not answering the delegation or is not \
+             republishing its shard after it does",
+            signatures.value
+        ));
+    }
+
     // The cross-check. Summed *here*, over the two labelled series, because the
     // node publishes no total on purpose.
     let per_pipeline = exposition.select(FORWARDED_FRAMES, &[]);
@@ -1165,6 +1194,7 @@ fn judge_one(
     }
 
     let mut asserted: Vec<&Sample> = per_pipeline;
+    asserted.push(signatures);
     // Beside it, the same traffic seen from the drivers: the two dataplane
     // ports' transmit totals must sum to the same number, which is the same
     // claim made by three different domains.

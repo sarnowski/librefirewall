@@ -447,6 +447,13 @@ impl Event<Cause> {
                     // carries every flag an operand holds.
                     record.operands = [*generation, *documents, 0, u64::from(*was_owned)];
                 }
+                DomainDetail::Delegated { device, signatures } => {
+                    record.detail = LogDetailKind::Delegated.to_bits();
+                    // The identifier in its two halves, most significant first,
+                    // exactly as `Identity` and `Peer` carry one: three
+                    // renderings of one value must not be three orders.
+                    record.operands = [(*device >> 64) as u64, *device as u64, *signatures, 0];
+                }
                 DomainDetail::Refusal(Refusal {
                     cause,
                     detail,
@@ -640,6 +647,17 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             documents: *documents,
             was_owned: *was_owned,
         },
+        // Total for the same reason with nothing ranged at all: an identifier is
+        // 128 bits of randomness and a signature count is a tally, so every bit
+        // pattern of the three words is one a delegating domain could have read.
+        CheckedDetail::Delegated {
+            high,
+            low,
+            signatures,
+        } => DomainDetail::Delegated {
+            device: (u128::from(*high) << 64) | u128::from(*low),
+            signatures: *signatures,
+        },
         CheckedDetail::Refusal {
             cause,
             operands,
@@ -735,6 +753,9 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         documents,
                         was_owned,
                     },
+                    DomainDetail::Delegated { device, signatures } => {
+                        DomainDetail::Delegated { device, signatures }
+                    }
                     DomainDetail::Measured {
                         primitive,
                         milli_cycles_per_byte,

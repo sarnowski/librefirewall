@@ -1,7 +1,7 @@
 use alloc::{format, sync::Arc, vec, vec::Vec};
 
-use lfw_crypto::{DIGEST_LEN, Entropy, sha256};
-use lfw_x509::CertificateKind;
+use lfw_crypto::{DIGEST_LEN, Entropy, P256_PUBLIC_LEN, sha256};
+use lfw_x509::{Certificate, CertificateKind};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     client::{UnbufferedClientConnection, WebPkiServerVerifier},
@@ -16,7 +16,7 @@ use crate::{
     arena::{ArenaExhausted, Bump},
     identity::{Identity, IdentityError},
     provider::{Clock, provider},
-    sign::{EcdsaP256SigningKey, LocalKey},
+    sign::{EcdsaP256SigningKey, LocalKey, SignOperation},
 };
 
 /// Bytes of arena headroom a session must have before each of its allocating
@@ -110,6 +110,33 @@ pub struct Negotiated {
     pub peer_certificate: [u8; DIGEST_LEN],
 }
 
+/// Where the private key the server end authenticates with lives.
+///
+/// The whole reason [`prove_session`] takes one: the two variants are the same
+/// handshake over the same profile, and what differs is who computes the
+/// `CertificateVerify` signature. That is the substitution [`SignOperation`] was
+/// declared for, and running it inside a real handshake is the only thing that
+/// proves it — `sign` is called synchronously, deep in the protocol, at a point
+/// no unit test reaches by hand.
+///
+/// The client end is deliberately not offered the choice. One delegated end is
+/// what proves the seam; two would prove it twice and would make the session
+/// depend on the other domain answering in both directions.
+pub enum ServerKey {
+    /// Generated here, which is what proves the stack against itself with no
+    /// second domain involved.
+    Local,
+    /// Held by another protection domain and reached through a signing
+    /// capability. `public_key` is the half the certificate binds, and it must be
+    /// the one that capability signs under — a mismatch is a handshake the client
+    /// refuses, which is the failure this pairing exists to make visible rather
+    /// than to prevent.
+    Delegated {
+        operation: Arc<dyn SignOperation>,
+        public_key: [u8; P256_PUBLIC_LEN],
+    },
+}
+
 /// The address the endpoint certificate names and the client dials.
 ///
 /// A literal and not a name, because that is what the channel contract fixes:
@@ -141,6 +168,7 @@ pub fn prove_session(
     arena: &Bump,
     now: u64,
     payload: &[u8],
+    server_key: &ServerKey,
 ) -> Result<Negotiated, SessionError> {
     // Before the setup and not only before the steps: building the two ends
     // allocates more than any single step afterwards does, and it is a span
@@ -153,14 +181,34 @@ pub fn prove_session(
         CertificateKind::ManagementCa,
         AUTHORITY_NAME,
     )?;
-    let server = Identity::issued_by(
-        &authority,
-        entropy,
-        seconds,
-        CertificateKind::ChannelEndpoint { address: ENDPOINT },
-        ENDPOINT_NAME,
-        AUTHORITY_NAME,
-    )?;
+    // The server's certified key, under whichever private half `server_key`
+    // names. The profile, the names and the validity are the same either way:
+    // what a delegated run changes is who can produce the signature the client
+    // then checks against the key inside this certificate.
+    let server = match server_key {
+        ServerKey::Local => certified(Identity::issued_by(
+            &authority,
+            entropy,
+            seconds,
+            CertificateKind::ChannelEndpoint { address: ENDPOINT },
+            ENDPOINT_NAME,
+            AUTHORITY_NAME,
+        )?),
+        ServerKey::Delegated {
+            operation,
+            public_key,
+        } => certified_by(
+            authority.certify(
+                entropy,
+                seconds,
+                CertificateKind::ChannelEndpoint { address: ENDPOINT },
+                ENDPOINT_NAME,
+                AUTHORITY_NAME,
+                *public_key,
+            )?,
+            Arc::clone(operation),
+        ),
+    };
     let client = Identity::issued_by(
         &authority,
         entropy,
@@ -170,7 +218,12 @@ pub fn prove_session(
         AUTHORITY_NAME,
     )?;
     let expected_client = sha256(client.certificate());
-    let expected_server = sha256(server.certificate());
+    // Read off the certified key rather than off an `Identity`, there being no
+    // identity on the delegated path to read it off.
+    let expected_server = server
+        .end_entity_cert()
+        .map(|certificate| sha256(certificate))
+        .map_err(|_| SessionError::NoPeerCertificate)?;
 
     let mut anchors = RootCertStore::empty();
     anchors.add(CertificateDer::from(authority.certificate().to_vec()))?;
@@ -185,7 +238,7 @@ pub fn prove_session(
                 .build()
                 .map_err(unbuildable)?,
         )
-        .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified(server))));
+        .with_cert_resolver(Arc::new(SingleCertAndKey::from(server)));
 
     let client_config = ClientConfig::builder_with_details(Arc::clone(&shared), clock)
         .with_protocol_versions(&[&TLS13])?
@@ -306,6 +359,18 @@ fn certified(identity: Identity) -> CertifiedKey {
             identity.into_key(),
         )))),
     )
+}
+
+/// A certificate paired with a signing capability that is not a key this process
+/// holds.
+///
+/// [`certified`] with the key half taken from outside, which is the whole of the
+/// difference the delegation makes at this level: `CertifiedKey` asks for
+/// something that signs, and neither it nor anything above it can tell where the
+/// scalar is.
+fn certified_by(certificate: Certificate, operation: Arc<dyn SignOperation>) -> CertifiedKey {
+    let chain = vec![CertificateDer::from(certificate.as_bytes().to_vec())];
+    CertifiedKey::new(chain, Arc::new(EcdsaP256SigningKey::new(operation)))
 }
 
 /// One end of the session: its connection, the bytes its peer has sent that it

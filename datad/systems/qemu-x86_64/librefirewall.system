@@ -659,6 +659,53 @@
     <memory_region name="dl_request" size="0x1000" />
     <memory_region name="dl_reply" size="0x9000" />
 
+    <!-- THE SIGNING DELEGATION, one region per direction, and the ONE handover in
+         this description whose whole purpose is that something CANNOT cross it.
+
+         `sign_request` carries what the cryptography domain is asking for — sign
+         these bytes, or tell me which key you hold — and `sign_reply` carries the
+         answer. The CRYPTOGRAPHY domain maps `sign_request` READ-WRITE and
+         `sign_reply` READ-ONLY; the STORE domain maps `sign_request` READ-ONLY and
+         `sign_reply` READ-WRITE. Each writes exactly the direction it speaks in,
+         which is `dl_request`/`dl_reply`'s split with the roles exchanged.
+
+         WHY THE ASYMMETRY IS LOAD-BEARING HERE AND NOT MERELY TIDY. A domain that
+         could write the reply could publish a signature the device key never
+         produced and then present it as the appliance's — a forged authentication
+         rather than a wrong answer. So the domain that authenticates cannot write
+         the region it reads its own signatures out of, and the domain that holds
+         the key cannot write the region that states the question.
+
+         THE KEY CANNOT CROSS, AND THAT NEEDS BOTH HALVES OF THIS ROW. `wire`'s
+         `SignRequest` and `SignReply` have NO FIELD FOR A PRIVATE KEY in either
+         direction: there is a message, a signature, a public point, a device name,
+         a status and a sequence, and nothing a 32-byte scalar has a place in. That
+         is the ABI half, and it would not be enough on its own — an ABI that could
+         carry a key would carry it through perfectly correct grants. The grants are
+         the other half: the store domain is the only writer of `sign_reply`, so the
+         only bytes the cryptography domain can read are ones that domain chose to
+         publish, and it publishes what the ABI has fields for. Neither property
+         alone establishes it; together they do, and the sysdesc checker holds the
+         grants while the type system holds the fields.
+
+         EVERY OTHER DOMAIN MAPS NEITHER, in either direction — no driver, no
+         forwarder, no recorder, no management domain, no console. The forwarder in
+         particular: a dataplane domain able to write `sign_request` could have the
+         appliance's key sign bytes of its own choosing, which is the one thing a
+         signing oracle must not be. The management domain is excluded too, and that
+         is deliberate rather than pending: when it terminates sessions it will ask
+         over a channel of its own, granted then and reviewed then.
+
+         Sizes are `wire::SIGN_REQUEST_REGION_SIZE` and
+         `wire::SIGN_REPLY_REGION_SIZE`, each its type's `size_of` rounded up to the
+         mapping granularity, on the same footing as every constant above. Both fit
+         one page: a request is a 256-byte message and four words, and a reply is a
+         72-byte signature, a 65-byte point, a 16-byte name and five words.
+
+         Neither carries phys_addr, for the reason `cfg` does not. -->
+    <memory_region name="sign_request" size="0x1000" />
+    <memory_region name="sign_reply" size="0x1000" />
+
     <!-- The log transport: one ring per WRITING domain, and TWO REGIONS PER
          RING, one for each direction.
 
@@ -1557,39 +1604,50 @@
          generator from RDRAND, reports all of it, and parks. The protection
          domain is documented in pds/crypto.
 
-         WHAT IT MAPS is the same reporting minimum the hardware probe holds:
-         its own log ring read-write with its consume cursor read-only, its own
-         statistics shard read-write, and the clock calibration read-only to
-         stamp its records. NO device region of any kind — no ECAM page, no BAR
-         window, no virtqueue, no block region — NO pool, NO dataplane or
-         management ring, NO configuration region, NO tap, NO download region
-         and NO `<ioport>`. `RDRAND`, `CPUID` and `RDTSC` are unprivileged and
-         carried by no capability, exactly as the management domain's `RDRAND`
-         and every domain's `RDTSC` are, so nothing in this file could grant or
-         withhold them; what this row grants is only the means to say what
-         happened.
+         WHAT IT MAPS is the reporting minimum the hardware probe holds, its
+         allocator, and the delegation: its own log ring read-write with its
+         consume cursor read-only, its own statistics shard read-write, the clock
+         calibration read-only to stamp its records, `arena_crypto` read-write,
+         `sign_request` read-write and `sign_reply` READ-ONLY. NO device region of
+         any kind — no ECAM page, no BAR window, no virtqueue, no block region —
+         NO pool, NO dataplane or management ring, NO configuration region, NO
+         tap, NO download region and NO `<ioport>`. `RDRAND`, `CPUID` and `RDTSC`
+         are unprivileged and carried by no capability, exactly as the management
+         domain's `RDRAND` and every domain's `RDTSC` are, so nothing in this file
+         could grant or withhold them; what this row grants is only the means to
+         say what happened, to allocate inside its own bound, and to ask.
 
-         WHY IT HOLDS NO STORE DEVICE, though it is the domain that seeds the
-         generator keys will be drawn from: the device private key must never
-         leave the domain that owns the medium, so the store domain is the
-         identity domain and this one hands it randomness rather than keys.
-         That channel does not exist yet and neither does that domain; until
-         they do, this domain generates nothing that outlives its own frame,
-         which is why it holds no channel in either direction and parks where
-         nothing can reach it, exactly as the clock domain does.
+         WHY IT HOLDS NO STORE DEVICE, though it authenticates under the key that
+         medium carries: the device private key must never leave the domain that
+         owns the medium, because a key in two domains is a key whose custody
+         nobody can state. So this domain holds NONE of `ecam4`, `bar4`,
+         `blk2_dma` or `blk2_io`, and reaches the key only as a capability to USE
+         it — the two `sign_*` rows above, whose ABI has no field a scalar fits in
+         and whose grants make the holder the only writer of the answer. What this
+         domain can do with the delegation is ask for a signature; what it cannot
+         do is learn what produced one.
 
-         PRIORITY 2, ABOVE THE BUSY-LOOP DOMAINS AND BELOW THE CLOCK, and both
-         halves are deliberate. Above priority 1, because the throughput figure
-         this domain reports is a measurement and a domain that never yields
-         would otherwise be measured along with the cipher — the reported
-         figure is the least any round spent, so a preemption can only inflate
-         it, but not competing for the slice in the first place is what makes
-         the number worth reporting. Below the clock at priority 3, because
-         this domain stamps its records against a calibration that domain
-         publishes, and a stamp is worth more than the few milliseconds of
-         ordering it costs. Its work is bounded by its own compile-time
-         constants — a fixed vector corpus and a fixed number of timing rounds
-         — and the domain then blocks for good. -->
+         AND IT MAY WAKE THE HOLDER, which is the one send capability this row
+         grants: `sign` is called synchronously from inside a handshake and has no
+         continuation a reply could be delivered to, so the holder is signalled
+         and the answer is read. The reverse direction is refused below.
+
+         PRIORITY 2, ABOVE THE BUSY-LOOP DOMAINS AND BELOW BOTH THE CLOCK AND THE
+         KEY HOLDER, and every part of that is deliberate. Above priority 1,
+         because the throughput figure this domain reports is a measurement and a
+         domain that never yields would otherwise be measured along with the
+         cipher — the reported figure is the least any round spent, so a
+         preemption can only inflate it, but not competing for the slice in the
+         first place is what makes the number worth reporting. Below the clock at
+         priority 3, because this domain stamps its records against a calibration
+         that domain publishes, and a stamp is worth more than the few
+         milliseconds of ordering it costs. BELOW THE STORE DOMAIN, also at 3, for
+         a reason that is a correctness premise rather than a preference: this
+         domain reads for a reply in a bounded spin, and a holder at or below its
+         own priority would never run to write one. See the store domain's row.
+         Its work is bounded by its own compile-time constants — a fixed vector
+         corpus, a fixed number of timing rounds, and the delegation's own read
+         budget — and the domain then blocks for good. -->
     <protection_domain name="crypto" priority="2" stack_size="0x20000">
         <program_image path="crypto.elf" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
@@ -1597,6 +1655,8 @@
         <map mr="log_crypto_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_crypto" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <map mr="arena_crypto" vaddr="0x6_000_000" perms="rw" cached="true" setvar_vaddr="arena_vaddr" />
+        <map mr="sign_request" vaddr="0x7_000_000" perms="rw" cached="true" setvar_vaddr="sign_request_vaddr" />
+        <map mr="sign_reply" vaddr="0x7_100_000" perms="r" cached="true" setvar_vaddr="sign_reply_vaddr" />
     </protection_domain>
 
     <!-- The store domain: the one holder of the appliance's own identity, and
@@ -1611,40 +1671,82 @@
          later boot it loads it, holds it to itself, reports which appliance
          returned, and parks. The protection domain is documented in pds/store.
 
-         WHAT IT MAPS is the second block device and the four grants every
-         reporting domain here carries, and nothing else. Its ECAM page, its BAR
-         window, its DMA region and its staging window are `ecam4`, `bar4`,
-         `blk2_dma` and `blk2_io`, and NO other domain maps any of them — not the
-         recorder, which owns the other block device and no part of this one. It
-         maps NO ecam0..3, NO bar0..3, NO blk_dma and NO blk_io, so the domain
-         that holds the private scalar cannot read or write a recording and the
-         domain that answers a download cannot read the scalar. It maps NO
-         network region of any kind — no vq, no buffer pool of either dataplane
-         or management pipeline, no `ForwardRings`, no `ReturnRing` — NO
-         configuration region, NO tap, NO download region, and NO `<ioport>`.
+         AND IT SIGNS UNDER THAT IDENTITY, which is what it gained and the whole
+         reason its priority moved. The domain that terminates a
+         mutually-authenticated session needs a signature under this key on every
+         handshake and must never hold the key, so this domain keeps the keypair
+         after establishing it and answers a signing delegation over
+         `sign_request`/`sign_reply`. It no longer parks beyond reach: it parks in
+         the Microkit event loop and the asking domain wakes it.
+
+         WHAT IT MAPS is the second block device, the four grants every reporting
+         domain here carries, and the delegation's two regions, and nothing else.
+         Its ECAM page, its BAR window, its DMA region and its staging window are
+         `ecam4`, `bar4`, `blk2_dma` and `blk2_io`, and NO other domain maps any of
+         them — not the recorder, which owns the other block device and no part of
+         this one. It maps NO ecam0..3, NO bar0..3, NO blk_dma and NO blk_io, so
+         the domain that holds the private scalar cannot read or write a recording
+         and the domain that answers a download cannot read the scalar. It maps NO
+         network region of any kind — no vq, no buffer pool of either dataplane or
+         management pipeline, no `ForwardRings`, no `ReturnRing` — NO configuration
+         region, NO tap, NO download region, and NO `<ioport>`.
 
          WHY THAT MATTERS MORE HERE THAN ANYWHERE ELSE. The private scalar is
          plaintext on this medium, deliberately and for want of anywhere to keep
          a wrapping key, so physical possession of the store IS identity theft —
-         and this row is what makes possession the ONLY way to it. There is no
-         path from a packet to these bytes: no domain that terminates a
-         connection maps any part of this device, and this domain holds no
-         channel in either direction to any domain that does.
+         and this row is what makes possession the ONLY way to it. There is still
+         no path from a packet to these bytes: no domain that terminates a
+         connection maps any part of this device, and this domain's ONE channel
+         goes to the cryptography domain, which holds no network region either. A
+         compromise would have to traverse a domain no frame reaches, to arrive at
+         an ABI with no field for a key.
 
-         NO CHANNEL IN EITHER DIRECTION: it runs to completion in `init` and
-         parks where nothing can reach it, exactly as the clock, hardware-probe
-         and cryptography domains do. It draws its own randomness — `RDRAND` and
-         `CPUID` are unprivileged and carried by no capability, so this file can
-         neither grant nor withhold them — which is the point: a seed taken over a
-         channel would let the domain at the other end reproduce the device key.
+         ONE CHANNEL, RECEIVE ONLY, and both halves are stated where they are
+         granted below. It is woken by the domain that asks, and it holds NO send
+         capability on anything: it answers by publishing into a region that domain
+         reads, so there is nothing a reverse signal would tell it. It still draws
+         its own randomness — `RDRAND` and `CPUID` are unprivileged and carried by
+         no capability, so this file can neither grant nor withhold them — which is
+         the point: a seed taken over a channel would let the domain at the other
+         end reproduce the device key. That is the difference between the channel
+         it now has and the one it must never have: a request to USE the key, and
+         never a path to the material behind it.
 
-         PRIORITY 1, with the busy-loop domains, on the recorder's terms: it
-         polls its device for a completion rather than blocking on one, and a
-         higher priority would let it spin against domains that never yield. Its
-         waits are bounded by `lfw_blk`'s own poll budget and by nothing the
-         device controls, and it blocks for good the moment the identity is
-         established. -->
-    <protection_domain name="store" priority="1" stack_size="0x8000">
+         PRIORITY 3, WITH THE RUN-TO-COMPLETION-THEN-PARK DOMAINS, AND IT WAS 1.
+         The old argument was the recorder's — it polls its device for a completion
+         rather than blocking on one, and a higher priority would let it spin
+         against domains that never yield — and it was written when this domain
+         held no channel and served nobody. WHAT CHANGED is that it now answers a
+         request from a domain at priority 2. A responder BELOW its requester
+         cannot answer it: the cryptography domain reads for the reply in a bounded
+         spin, because `sign` is called synchronously inside a handshake and has no
+         continuation a notification could resume, and a holder at priority 1 would
+         not be scheduled until that spin gave up. The delegation would refuse on
+         every boot, deterministically. So the holder sits ABOVE the asker: a
+         notification then preempts into this domain immediately, it computes and
+         publishes, and the asker's next read finds the answer — the spin
+         terminating on its first iteration in practice, with its budget there for
+         the byzantine case.
+
+         WHAT THE HIGHER PRIORITY COSTS, stated rather than waved past: while this
+         domain polls its device it now preempts the dataplane. That happens at
+         boot, during onboarding, and on a configuration commit, each a bounded
+         transfer of a few kilobytes; the dataplane keeps forwarding the last
+         committed configuration either side of it, because a table is switched
+         between polls and is never half-applied. It is NOT a protected call and
+         this description grows no message-passing IPC: notification plus shared
+         memory under a strict protocol is the pattern here, and a synchronous call
+         would hand the caller's scheduling context to the domain that owns the
+         appliance's identity.
+
+         WHAT STILL BOUNDS IT is unchanged and is what makes the cost payable:
+         `lfw_blk`'s own poll budget and nothing the device controls, so a hostile
+         or dead device cannot hold the higher priority for longer than that budget
+         however it misbehaves. The serving path waits on nothing at all — a demand
+         is taken, answered and published in one pass — and the number of demands
+         one wakeup answers is a constant of `pds/store` rather than of how fast a
+         peer writes. -->
+    <protection_domain name="store" priority="3" stack_size="0x8000">
         <program_image path="store.elf" />
         <map mr="ecam4" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
         <map mr="bar4" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
@@ -1654,6 +1756,8 @@
         <map mr="log_store" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_store_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_store" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+        <map mr="sign_request" vaddr="0x7_000_000" perms="r" cached="true" setvar_vaddr="sign_request_vaddr" />
+        <map mr="sign_reply" vaddr="0x7_100_000" perms="rw" cached="true" setvar_vaddr="sign_reply_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar4" />
         <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
         <setvar symbol="io_paddr" region_paddr="blk2_io" />
@@ -1908,6 +2012,50 @@
     <channel>
         <end pd="config" id="1" notify="true" />
         <end pd="management" id="2" notify="true" />
+    </channel>
+
+    <!-- The signing delegation's channel, granted in ONE direction: the
+         CRYPTOGRAPHY domain may wake the STORE domain, and the store domain may
+         signal nothing at all.
+
+         WHY THE ASKER MUST BE ABLE TO SIGNAL. The store domain has no polling
+         loop. It establishes an identity in `init` and then blocks in the Microkit
+         event loop, which is why it costs nothing at a priority above the
+         dataplane's, and a request written into `sign_request` is invisible to it
+         until something wakes it. The only party that knows a request exists is
+         the domain that wrote it. Making the store domain poll instead would burn
+         the highest-but-one priority in the system forever to catch a handshake.
+
+         WHY THE HOLDER MAY NOT SIGNAL BACK, and that end states notify="false"
+         rather than leaning on Microkit's default of true. The asking domain calls
+         `sign` synchronously from inside a handshake: there is no continuation for
+         a notification to resume and no loop for it to be observed in, so the
+         reply is read rather than waited for — a bounded read, whose first
+         iteration succeeds precisely because the holder sits at a higher priority
+         and has already run. A send capability would therefore be authority no
+         path consumes. It would also be a wakeup capability held by the domain
+         that owns the appliance's identity on the domain that runs adopted
+         protocol code, which is worth refusing on its own terms.
+
+         WHAT THAT SEND CAPABILITY IS WORTH TO AN ATTACKER WHO REACHES THE ASKER,
+         stated plainly because it is the one authority this landing hands over: a
+         wakeup, at whatever rate they choose, on a domain whose answer to one is
+         bounded by a constant of its own — at most four demands, each of which
+         `wire::SignResponder::take` will only yield once per change of the
+         requester's sequence. What they get for it is a signature over bytes they
+         chose, which is what a signing oracle is; what they do not get is the key,
+         because the reply region's ABI has no field for one and they cannot write
+         that region in any case. The domain they can reach is also the one that
+         holds no network region, so this capability is not reachable from a
+         packet.
+
+         THIS IS THE STORE DOMAIN'S FIRST CHANNEL AND ITS ONLY ONE, in either
+         direction, which is what STORE_CHANNEL_RECEIVE_ONLY claims: id 0 is this,
+         it is the receiver, and it holds no send capability anywhere in this
+         system. -->
+    <channel>
+        <end pd="crypto" id="0" notify="true" />
+        <end pd="store" id="0" notify="false" />
     </channel>
 
     <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS

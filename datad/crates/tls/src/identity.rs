@@ -112,6 +112,45 @@ impl Identity {
     pub fn into_key(self) -> P256SecretKey {
         self.key
     }
+
+    /// A certificate this authority issues over a public key **whose private
+    /// half it does not hold**, and which nothing here can hold.
+    ///
+    /// A certificate and not an [`Self`], and that absence is the whole point:
+    /// the type above pairs a certificate with a key, and there is no key on this
+    /// path to pair one with. The private half lives in another protection
+    /// domain, reached through a [`crate::SignOperation`] the caller supplies, so
+    /// what comes back is the binding alone.
+    ///
+    /// Everything else is [`Self::issued_by`]'s: the same profile, the same
+    /// validity, the same authority signing it. Only the subject's key comes
+    /// from outside — which is exactly the substitution the signing seam exists
+    /// for.
+    ///
+    /// # Errors
+    /// [`IdentityError`] where the certificate could not be written. Never
+    /// [`IdentityError::KeyGeneration`]: no key is generated here.
+    pub fn certify(
+        &self,
+        entropy: &dyn Entropy,
+        now: i64,
+        kind: CertificateKind,
+        subject: &[u8],
+        issuer: &[u8],
+        subject_public_key: [u8; P256_PUBLIC_LEN],
+    ) -> Result<Certificate, IdentityError> {
+        Ok(write_certificate(
+            &Profile {
+                kind,
+                subject,
+                issuer,
+                serial: serial(entropy),
+                validity: Validity::ten_years_from(now),
+                subject_public_key,
+            },
+            &self.key,
+        )?)
+    }
 }
 
 /// A serial number drawn from the node's generator, which is what the profile

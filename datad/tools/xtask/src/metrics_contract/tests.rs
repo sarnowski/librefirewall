@@ -301,6 +301,15 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
             "librefirewall_log_records_dropped_total{{domain=\"{domain}\"}} 0\n"
         ));
     }
+    // The store domain's tally, above the two a scraped boot has behind it: the
+    // delegation's own proof, and the session that ran under the delegated key.
+    family(
+        &mut text,
+        "librefirewall_store_signatures_total",
+        "counter",
+        "Signed.",
+    );
+    text.push_str("librefirewall_store_signatures_total{domain=\"store\"} 2\n");
     text
 }
 
@@ -539,6 +548,21 @@ fn a_shard_that_is_not_published_is_named_by_its_domain() {
     let text = body((5, 4), (4, 5)).replace("domain=\"clock\"", "domain=\"forwarder\"");
     let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no clock shard");
     assert!(verdict.contains("domain=\"clock\""), "{verdict}");
+}
+
+/// The store domain's tally is what says its shard moved after `init`, so a scrape
+/// reading it below the two signatures a boot has behind it is refused.
+#[test]
+fn a_store_shard_that_never_republished_after_a_signature_is_refused() {
+    for value in ["0", "1"] {
+        let text = body((5, 4), (4, 5)).replace(
+            "librefirewall_store_signatures_total{domain=\"store\"} 2",
+            &format!("librefirewall_store_signatures_total{{domain=\"store\"}} {value}"),
+        );
+        let verdict =
+            judge(&only(text), 9, witness(), &topology()).expect_err("an unmoved store tally");
+        assert!(verdict.contains("at least two signatures"), "{verdict}");
+    }
 }
 
 /// The parser is the assertion: a body that is not exposition fails as

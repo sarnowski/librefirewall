@@ -85,7 +85,8 @@ use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
     DOWNLOAD_REQUEST_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
-    TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
+    SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
+    TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -345,8 +346,36 @@ const STORE_DEVICE_WITHHELD: &str = "the store domain is the only domain that ma
      this domain holds no ecam0..3, no bar0..3, no blk_dma, no blk_io, no vq0..2, no buffer pool \
      of either dataplane or management pipeline, no `ForwardRings`, no `ReturnRing`, no \
      configuration region, no tap, no download region and no `<ioport>`, so an attacker who \
-     reaches the domain holding the device key reaches nothing else by doing so, and no packet \
-     has a path to those bytes at all";
+     reaches the domain holding the device key reaches nothing else by doing so. The one thing \
+     it now holds beyond the device is the signing delegation, whose peer is the cryptography \
+     domain — which holds no network region of any kind — so there is still no path from a \
+     packet to those bytes: a compromise would have to traverse a domain no frame reaches, to \
+     arrive at an ABI with no field for a key";
+
+/// What the signing delegation's two regions withhold, and it is the one claim in
+/// this table whose subject is a thing that must *not* be able to cross.
+///
+/// The property is a conjunction and neither half establishes it: `wire::signing`
+/// has no field for a private key in either direction, so there is nothing to put
+/// one in; and the store domain is the only writer of the reply, so the only bytes
+/// the cryptography domain can read are ones that domain chose to publish. An ABI
+/// that could carry a key would carry it through perfectly correct grants, and
+/// grants alone would leave a domain free to write one into a region it shares.
+/// This rule is the half a checker can hold — the type system holds the other —
+/// and it is quoted into the finding on either region gaining a mapper.
+const SIGNING_WITHHELD: &str = "exactly two domains map the signing delegation, and no third \
+     maps either half in either direction. The FORWARDER above all: a dataplane domain able to \
+     write `sign_request` would have the appliance's own key sign bytes of its choosing, which \
+     is the one thing a signing oracle must not be. No driver, no recorder, no console, and — \
+     deliberately rather than pending — not the management domain: when it terminates sessions \
+     it asks over a channel granted and reviewed then. Between the two that do map it the \
+     withholding is in the perms, and it is what makes a forged authentication \
+     unrepresentable: the cryptography domain states the request and CANNOT WRITE THE REPLY, so \
+     it cannot publish a signature the device key never produced and then present it as the \
+     appliance's; and the store domain answers and cannot write the question. The key itself \
+     cannot cross either region, which is a property of this row TOGETHER WITH the ABI — \
+     `wire::signing` has no field a 32-byte scalar fits in, in either direction, and this row is \
+     what makes the holder the only party that chooses what the asking domain reads";
 
 /// What the connection table's single mapper buys, quoted into the finding on it
 /// gaining a second one.
@@ -937,6 +966,29 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("management"), read_write("recorder")],
         withheld: Some(DOWNLOAD_WITHHELD),
     },
+    // The signing delegation, the download handover's split with the roles
+    // exchanged: the domain that asks writes the question and reads the answer,
+    // and the domain that holds the key writes the answer and reads the question.
+    RegionRule {
+        name: "sign_request",
+        size: ExpectedSize {
+            rust_name: "wire::SIGN_REQUEST_REGION_SIZE",
+            bytes: SIGN_REQUEST_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto"), read_only("store")],
+        withheld: Some(SIGNING_WITHHELD),
+    },
+    RegionRule {
+        name: "sign_reply",
+        size: ExpectedSize {
+            rust_name: "wire::SIGN_REPLY_REGION_SIZE",
+            bytes: SIGN_REPLY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("crypto"), read_write("store")],
+        withheld: Some(SIGNING_WITHHELD),
+    },
     // The log transport: one ring per writing domain, split into two regions so
     // the two directions can carry opposite authority. Every pair below is the
     // same two rows twice over, and the pattern is the whole of the design:
@@ -1494,6 +1546,21 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
 /// holds none at all.
 const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY ONE send      capability in this system — on the configuration domain, where a submitted document is      otherwise invisible to a peer that never polls — and this is an end that says it is not      this one. It is a notified-driven consumer here: it is woken, it drains, it returns. A send      capability on this end would be one on a driver that never leaves `init` and so could never      observe it — authority for nothing — and it would make pds/nic-driver's claim that its      `notified` entrypoint is unreachable by *capability* false for the third instance while      staying true for the other two";
 
+/// As [`MANAGEMENT_CHANNEL_ONE_WAY`], for the store domain's one and only end. A
+/// claim of its own rather than a third use of that one, because what it protects
+/// is different again: the management domain's ends are about a domain that must
+/// hold no send capability *among several channels*, and this is about the domain
+/// that owns the appliance's identity holding none *at all*.
+const STORE_CHANNEL_RECEIVE_ONLY: &str = "the store domain holds NO send capability anywhere in \
+     this system, on this channel or any other — this is the only channel it has, and it is the \
+     receiver on it. It needs none: it answers a signing request by publishing into a region the \
+     asking domain reads, and that domain reads for the reply in a bounded spin rather than \
+     waiting for a signal, because `sign` is called synchronously inside a handshake and has no \
+     continuation a notification could resume. So a send capability here would be authority no \
+     path consumes — and it would be a wakeup capability held by the domain that owns the \
+     appliance's private key on the domain that runs adopted protocol code, which is worth \
+     refusing on its own terms even if the asker ever did block";
+
 /// Every `<end>` the description may declare, and the direction that one
 /// channel is granted in. An end absent from this table fails the gate, and so
 /// does a row here that matches no `<end>` — the second is what stops a rule
@@ -1596,6 +1663,23 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         domain: "management",
         id: "2",
         notification: Notification::MaySend,
+    },
+    // The signing delegation, one-directional. The asker must be able to signal:
+    // the holder blocks in the Microkit event loop, so a request written into
+    // `sign_request` is invisible to it until it is woken, and making it poll
+    // instead would burn the highest-but-one priority in the system to catch a
+    // handshake. The holder may not signal back, for the reason below it.
+    ChannelEnd {
+        domain: "crypto",
+        id: "0",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "store",
+        id: "0",
+        notification: Notification::MayNotSend {
+            claim: STORE_CHANNEL_RECEIVE_ONLY,
+        },
     },
 ];
 

@@ -267,6 +267,25 @@ pub enum DomainDetail<C = &'static str> {
         documents: u64,
         was_owned: bool,
     },
+    /// What a domain that holds no private key learned by asking the domain that
+    /// does: which appliance it signs for, and how many signatures that holder
+    /// has produced since it started.
+    ///
+    /// Appended, never inserted, on the three details above's terms. The pair is
+    /// what makes either number worth reading. The identifier alone would say
+    /// only that a channel answered; the count alone would say that something
+    /// signed and not what for. Together they are the delegation working: a
+    /// domain naming an appliance it cannot have generated, under a count that
+    /// moves when it asks again.
+    ///
+    /// **No key material has a representation here**, and that is the whole
+    /// point of the record: what a delegating domain can report is a public name
+    /// and a tally, because a public name and a tally are all the channel it
+    /// asked over is able to carry.
+    Delegated {
+        device: u128,
+        signatures: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

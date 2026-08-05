@@ -254,6 +254,15 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " cleared-generation={generation} cleared-documents={documents} \
              was-owned={was_owned}"
         ),
+        // The appliance a domain holding no key signs for, and the holder's own
+        // tally. The identifier is rendered exactly as `device=` and
+        // `peer-device=` are, so an operator comparing this line against the
+        // holder's own is comparing one string against another rather than two
+        // formats.
+        DomainDetail::Delegated { device, signatures } => write!(
+            cursor,
+            " delegated-device={device:032x} delegated-signatures={signatures}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -650,6 +659,39 @@ mod tests {
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=negotiated \
              cleared-generation=18446744073709551615 \
              cleared-documents=18446744073709551615 was-owned=true"
+        );
+    }
+
+    /// The record a domain that holds no key leaves about the one that does: the
+    /// appliance it signs for, and how many signatures that holder has produced.
+    /// The identifier's rendering is the identity record's, character for
+    /// character, which is what makes the two lines comparable at all.
+    #[test]
+    fn a_delegating_domain_renders_the_appliance_it_signs_for_and_the_holders_tally() {
+        let delegated = |device, signatures| {
+            rendered(&Event::Domain {
+                domain: Domain::Crypto,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::Delegated { device, signatures },
+            })
+        };
+        assert_eq!(
+            delegated(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef, 1),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-device=0123456789abcdef0123456789abcdef delegated-signatures=1"
+        );
+        // A leading zero nibble survives, which is the whole reason the width is
+        // fixed: an identifier rendered short is not this appliance's.
+        assert_eq!(
+            delegated(1, 0),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-device=00000000000000000000000000000001 delegated-signatures=0"
+        );
+        assert_eq!(
+            delegated(u128::MAX, u64::MAX),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-device=ffffffffffffffffffffffffffffffff \
+             delegated-signatures=18446744073709551615"
         );
     }
 
@@ -1103,6 +1145,10 @@ mod tests {
                 documents: u64::MAX,
                 was_owned: true,
             },
+            DomainDetail::Delegated {
+                device: u128::MAX,
+                signatures: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -1185,6 +1231,8 @@ mod tests {
                     was_owned,
                 }
             }),
+            any::<(u128, u64)>()
+                .prop_map(|(device, signatures)| DomainDetail::Delegated { device, signatures }),
             (
                 (0..causes.len()),
                 prop_oneof![

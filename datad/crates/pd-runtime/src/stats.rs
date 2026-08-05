@@ -468,6 +468,7 @@ pub fn recorder_sample(
 #[must_use]
 pub fn store_sample(
     identity: StoreIdentity,
+    signing: StoreSigning,
     capacity_sectors: u64,
     blocks: BlockCounters,
     faults: RequestFaults,
@@ -479,6 +480,8 @@ pub fn store_sample(
         generation: identity.generation,
         onboarded: identity.onboarded,
         reset: identity.reset,
+        signatures: signing.signatures,
+        sign_refusals: signing.refusals,
         capacity_sectors,
         requests: [blocks.reads, blocks.writes],
         bytes: [blocks.read_bytes, blocks.write_bytes],
@@ -513,6 +516,22 @@ pub struct StoreIdentity {
     /// not folded into it: both a first boot and a reset mint, and only this says
     /// which of the two a scrape is looking at.
     pub reset: bool,
+}
+
+/// What the delegation this domain answers has come to, as the two counts its
+/// shard exposes.
+///
+/// Its own struct beside [`StoreIdentity`] rather than two more fields inside it,
+/// because they answer a different question and change on a different schedule:
+/// an identity is established once in a boot and never moves, and these move
+/// every time a peer asks. A caller that had to pass all seven positionally is a
+/// caller that can swap two `u64`s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreSigning {
+    /// Signatures produced under the device key.
+    pub signatures: u64,
+    /// Requests answered with a typed refusal instead of a signature.
+    pub refusals: u64,
 }
 
 #[cfg(test)]

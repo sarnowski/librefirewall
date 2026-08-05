@@ -42,11 +42,12 @@ use crate::catalog::{
     RECORDING_SEGMENTS_CLOSED, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
     RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
     RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
-    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET, Series,
-    TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES, TCP_CHALLENGE_ACKS,
-    TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS,
-    TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES, TRANSMIT_FRAMES,
-    UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
+    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET,
+    STORE_SIGN_REFUSALS, STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST,
+    TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED,
+    TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED,
+    TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES,
+    UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 use crate::rules::MAX_RULE_SERIES;
 
@@ -1519,7 +1520,7 @@ impl HardwareProbeSample {
 }
 
 /// Slots [`StoreSample`] occupies.
-pub const STORE_SLOTS: usize = 17;
+pub const STORE_SLOTS: usize = 19;
 
 /// The store domain's whole shard: what it established about the appliance's
 /// identity, and what its device did.
@@ -1538,6 +1539,11 @@ pub struct StoreSample {
     /// Whether this boot honoured a factory-reset request, which is what tells an
     /// intentional reset from a lost medium: both mint.
     pub reset: bool,
+    /// Signatures produced under the device key for a domain that holds no key,
+    /// and requests answered with a refusal instead. Counts and nothing else: the
+    /// message, the signature and the key have no representation here.
+    pub signatures: u64,
+    pub sign_refusals: u64,
     pub capacity_sectors: u64,
     /// Read then write, as [`RecorderSample`] orders them.
     pub requests: [u64; 2],
@@ -1555,6 +1561,8 @@ impl StoreSample {
         plain(&STORE_GENERATION),
         plain(&STORE_ONBOARDED),
         plain(&STORE_RESET),
+        plain(&STORE_SIGNATURES),
+        plain(&STORE_SIGN_REFUSALS),
         plain(&BLOCK_CAPACITY_SECTORS),
         s(&BLOCK_REQUESTS, &[Label::new("operation", "read")]),
         s(&BLOCK_REQUESTS, &[Label::new("operation", "write")]),
@@ -1598,6 +1606,8 @@ impl StoreSample {
             self.generation,
             u64::from(self.onboarded),
             u64::from(self.reset),
+            self.signatures,
+            self.sign_refusals,
             self.capacity_sectors,
             self.requests[0],
             self.requests[1],

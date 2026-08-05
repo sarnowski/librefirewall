@@ -139,6 +139,11 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         Vocabulary::Causes("hardware-probe"),
     ),
     ("pds/crypto/src/main.rs", Vocabulary::Causes("crypto")),
+    // The delegation's own refusals, raised by the cryptography domain and named
+    // where the variants are: `DelegationError::cause` is the one place that knows
+    // what each way of failing to reach the key holder means, so scanning the
+    // domain alone would leave half this group uncompared.
+    ("pds/crypto/src/delegate.rs", Vocabulary::Causes("crypto")),
     ("pds/store/src/main.rs", Vocabulary::Causes("store")),
     // The identity's own refusals, raised by the store domain and named where
     // the variants are: `lfw_store::IdentityError::cause` is the one place that

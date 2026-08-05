@@ -775,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 19,
+                detail: 20,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 19 },
+            LogRecordError::DetailKindUnknown { detail: 20 },
         ),
         // The one operand word that is a token: a primitive past the set names
         // nothing a console line can spell, so it is refused rather than
@@ -1125,10 +1125,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Identity,
         LogDetailKind::Fingerprint,
         LogDetailKind::Reset,
+        LogDetailKind::Delegated,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(19), None);
+    assert_eq!(LogDetailKind::from_bits(20), None);
 
     for value in [
         LogValueKind::Absent,

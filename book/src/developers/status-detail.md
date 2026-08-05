@@ -2133,11 +2133,35 @@ free sector to claim without first deciding where a request lives in a layout th
 until the extent is opened. That is a layout decision with a threat model attached (a sector an
 attacker can write inside a recording extent), not an extension of the code above.
 
-Then the [signing delegation](../design/management.md) — the ABI is in `wire::signing` and has no
-consumer, so the cryptography domain still generates a key of its own for its own proof rather than
-asking this domain for a signature over the real one. After those: the CSR this domain's key would
-sign, the device certificate and trust anchor an owner delivers, the management endpoint beside them,
-and the configuration slot array — all four have a place in the record and nothing writes them.
+After that: the CSR this domain's key would sign, the device certificate and trust anchor an owner
+delivers, the management endpoint beside them, and the configuration slot array — all four have a
+place in the record and nothing writes them.
+
+**The signing delegation is done, and it is what ended the domain's parking.** The domain keeps the
+keypair after establishing it and answers `wire::signing`'s two regions: the cryptography domain
+writes a request and reads an answer, this domain does the reverse, and there is no field a private
+scalar fits in either direction. It parks in the Microkit event loop and is woken by the asking
+domain, serving at most four demands per wakeup — `SignResponder::take` already yields one demand per
+change of the requester's sequence, so a peer that storms the channel costs one reply each and never
+a loop — and republishing its shard afterwards, which is why that shard now moves after `init` where
+it used to be written once.
+
+*Two counters and no console record.* `librefirewall_store_signatures_total` and
+`librefirewall_store_sign_refusals_total` are the surface; a refusal produces no console line
+deliberately, because this domain's log ring is bounded and single-producer, so a record per refusal
+would let the asking domain choose the rate at which the identity and fingerprint records an
+operator needs are pushed out of it. The domain that asked is the one that reports what it made of
+the answer, and it is the one that can tell.
+
+*Its priority moved from 1 to 3, and that was a capability decision.* A responder below its
+requester cannot answer it: the cryptography domain reads for the reply in a bounded spin, because
+`sign` is called synchronously inside a handshake and has no continuation a notification could
+resume, so a holder at priority 1 would not be scheduled until that spin gave up and the delegation
+would refuse on every boot. Above it, a notification preempts into this domain immediately and the
+asker's next read finds the answer. What it costs is that while this domain polls its device it now
+preempts the dataplane — at boot, during onboarding, and on a commit, each a bounded transfer — and
+what still bounds it is `lfw_blk`'s own poll budget and nothing the device controls. It is not a
+protected call and this system grows no message-passing IPC.
 
 ## Cryptography and TLS
 
@@ -2250,15 +2274,34 @@ feature unconditionally and no feature combination drops it, so it does not buil
 no operating system whatever signing back end it is driven with. The four DER structures the profile
 fixes are written here instead; they carry no algorithm of their own.
 
+**The delegation landed, and the substitution cost nothing above the seam.** `SignOperation` has a
+second implementation — `pds/crypto`'s `Delegated` — which writes a request into a shared region,
+wakes the store domain, and copies back the bytes it published. It lives in that protection domain
+rather than in `wire` because it is the only place that sees both the TLS trait and the channel ABI,
+and `wire`'s zero `unsafe` is worth keeping; it is `Sync` behind an `UnsafeCell` and an `AtomicBool`
+whose SAFETY comment names the flag rather than the thread count, on `NodeEntropy`'s terms. The
+provider's `KeyProvider` refusing to load a key from an encoding is what kept this a substitution:
+nothing above the seam could have been holding one.
+
+The boot proves it twice over. Directly: ask which key the holder has, have it sign a fixed
+challenge, and verify that signature against that key — which settles the delegation rather than
+ECDSA, the vector run having settled that already. And where it will actually be used: the session's
+**server half runs under the delegated key**, so `sign` is reached synchronously deep inside the
+handshake at the `CertificateVerify`. The gate holds the identifier this domain reports to the store
+domain's own, and requires the holder's tally to have moved across the session — a number that
+stayed put would mean the handshake signed some other way.
+
+*The read is bounded rather than trusted.* 1024 reads of the reply region and then a typed refusal,
+which is what keeps a handshake from becoming a domain that never returns. It terminates on the first
+read in practice, and that is a scheduling fact: the holder sits at priority 3 and this domain at 2,
+so a notification preempts into it immediately.
+
 **Missing.** Nothing dials with any of this: the transport cannot open a connection, there is no
-channel and no onboarding server, and the cryptography domain holds no device and no channel of its
-own. The device key is generated in that domain and dropped with the proof rather than being held
-by the store domain that will own it — the signing interface is a trait with one local
-implementation precisely so that delegation is a substitution, but the store domain does not exist.
-There is no persisted device identifier, no CSR served anywhere, and no fingerprint on the console.
-The session is proved against this same build on both ends, so nothing about interoperating with a
-second implementation is established. SHA-NI stays unreachable for the reason the
-[status page](../status.md) records.
+channel and no onboarding server, and the cryptography domain holds no device. The session is proved
+against this same build on both ends, so nothing about interoperating with a second implementation is
+established — and the client end and the certification authority above both are still generated here,
+standing in for a management server and an anchor this appliance has never seen. There is no CSR
+served anywhere. SHA-NI stays unreachable for the reason the [status page](../status.md) records.
 
 ## Management server
 

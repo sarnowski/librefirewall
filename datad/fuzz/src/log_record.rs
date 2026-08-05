@@ -129,7 +129,8 @@ const DETAIL_OPERATION: u8 = 15;
 const DETAIL_IDENTITY: u8 = 16;
 const DETAIL_FINGERPRINT: u8 = 17;
 const DETAIL_RESET: u8 = 18;
-const DETAIL_COUNT: u8 = 19;
+const DETAIL_DELEGATED: u8 = 19;
+const DETAIL_COUNT: u8 = 20;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -561,7 +562,7 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
                 | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
                 | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT
-                | DETAIL_RESET => {
+                | DETAIL_RESET | DETAIL_DELEGATED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -711,7 +712,11 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_PEER
         | DETAIL_ARENA
         | DETAIL_PROVEN
-        | DETAIL_FINGERPRINT => None,
+        | DETAIL_FINGERPRINT
+        // The delegation detail reads three unranged words — an identifier's two
+        // halves and a signature count — and deliberately not the fourth, so the
+        // flag rule below does not reach it and there is nothing here to refuse.
+        | DETAIL_DELEGATED => None,
         // The two details whose fourth operand word is a flag rather than a
         // number: every other word they carry is unranged, and a flag that is
         // neither 0 nor 1 would read as "unowned" — or as a reset of an unowned
@@ -1253,6 +1258,27 @@ mod tests {
                 region_from_record(&LogRecord {
                     detail: DETAIL_RESET,
                     operands: [7, 3, 0, 1],
+                    ..domain_record()
+                }),
+            ),
+            // The delegation detail, which reads the first three words and leaves
+            // the fourth unclaimed. Committed because it is the one detail whose
+            // *fourth* word is deliberately not a flag: a seed here is what keeps
+            // the flag rule from creeping onto it, and a uniform draw over a
+            // discriminant plus four words does not reach the shape.
+            (
+                "valid_domain_delegated",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DELEGATED,
+                    operands: [
+                        0x0123_4567_89ab_cdef,
+                        0xfedc_ba98_7654_3210,
+                        2,
+                        // Neither 0 nor 1, which is what makes this seed prove
+                        // the fourth word is unread here: a rule that treated it
+                        // as a flag would refuse this record.
+                        u64::MAX,
+                    ],
                     ..domain_record()
                 }),
             ),

@@ -2040,6 +2040,17 @@ fn boot(
     {
         println!("  store medium {run_label}: {verdict}");
     }
+    // And, on the one boot that reloads a live key and lends it to a second
+    // protection domain, the surface: that the scalar it signed with twice reached
+    // no console record. The regions the two domains share are guest RAM and are
+    // not readable from here, so what the key cannot cross is argued from the
+    // grants and the ABI; what it visibly did not reach is checked.
+    if let Some(verdict) = store_disk
+        .judge_secret_off_the_console(&booted.serial)
+        .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?
+    {
+        println!("  store medium {run_label}: {verdict}");
+    }
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {

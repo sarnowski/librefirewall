@@ -2,7 +2,10 @@ use std::{boxed::Box, sync::Mutex, vec, vec::Vec};
 
 use lfw_crypto::{Drbg, Entropy, SEED_LEN};
 
-use crate::{Bump, SessionError, arena::ArenaExhausted, prove_session, session::STEP_RESERVE};
+use crate::{
+    Bump, ServerKey, SessionError, SignOperation, SignRefused, arena::ArenaExhausted,
+    prove_session, session::STEP_RESERVE,
+};
 
 /// The node's generator behind the shared-borrow interface. On the appliance
 /// the protection domain supplies this shape; a host test reaches for the
@@ -36,8 +39,8 @@ const ROOM: usize = 1 << 20;
 fn a_mutually_authenticated_session_completes_and_carries_data_both_ways() {
     let arena = Bump::new(ROOM);
     let payload = b"librefirewall management channel";
-    let negotiated =
-        prove_session(entropy(0x11), &arena, NOW, payload).expect("the session establishes");
+    let negotiated = prove_session(entropy(0x11), &arena, NOW, payload, &ServerKey::Local)
+        .expect("the session establishes");
     // TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768: the three code
     // points the channel contract fixes, as the registries number them.
     assert_eq!(negotiated.version, 0x0304);
@@ -47,13 +50,130 @@ fn a_mutually_authenticated_session_completes_and_carries_data_both_ways() {
     assert_ne!(negotiated.peer_certificate, [0; 32]);
 }
 
+/// A signing capability that is not the session's own key, standing in for the
+/// domain that holds one.
+///
+/// Two things it proves that no direct call can. The first is that the seam
+/// composes: `sign` is reached synchronously from inside the handshake, at the
+/// `CertificateVerify` the client then checks against the certificate's key, and
+/// a signer wired in wrongly fails the handshake rather than a unit assertion.
+/// The second is on the refusing side, below.
+struct Delegate {
+    key: lfw_crypto::P256SecretKey,
+    /// Signing calls this capability has answered, so a test can assert the
+    /// handshake actually reached it rather than signing some other way.
+    calls: Mutex<u32>,
+    /// Whether to refuse instead of signing, which is what a peer that has no
+    /// identity — or a channel that timed out — looks like from here.
+    refuse: bool,
+}
+
+impl SignOperation for Delegate {
+    fn sign(&self, message: &[u8], out: &mut [u8]) -> Result<usize, SignRefused> {
+        *self.calls.lock().expect("no test panics holding this") += 1;
+        if self.refuse {
+            return Err(SignRefused);
+        }
+        self.key.sign(message, out).map_err(|_| SignRefused)
+    }
+}
+
+fn delegate(fill: u8, refuse: bool) -> std::sync::Arc<Delegate> {
+    std::sync::Arc::new(Delegate {
+        key: lfw_crypto::P256SecretKey::generate(entropy(fill)).expect("a usable key"),
+        calls: Mutex::new(0),
+        refuse,
+    })
+}
+
+/// The delegated seam inside a real handshake: the server end authenticates
+/// under a key this function holds only a signing capability for, and the client
+/// validates the chain and the signature against the certificate's own key.
+///
+/// This is the claim the protection-domain split rests on, made where it can be
+/// made cheaply. The appliance's own version of it substitutes a channel for the
+/// capability and nothing else.
+#[test]
+fn a_session_whose_server_key_is_delegated_completes_under_the_delegated_signature() {
+    let arena = Bump::new(ROOM);
+    let signer = delegate(0x21, false);
+    let public_key = signer.key.public_key();
+    let negotiated = prove_session(
+        entropy(0x22),
+        &arena,
+        NOW,
+        b"delegated",
+        &ServerKey::Delegated {
+            operation: signer.clone(),
+            public_key,
+        },
+    )
+    .expect("the session establishes under the delegated key");
+    assert_eq!(negotiated.version, 0x0304);
+    assert_eq!(negotiated.echoed, b"delegated".len() as u32);
+    // Exactly one `CertificateVerify`, which is what a TLS 1.3 server signs. A
+    // zero here would mean the handshake completed some other way and the seam
+    // was never on the path.
+    assert_eq!(*signer.calls.lock().expect("not poisoned"), 1);
+}
+
+/// A delegated signer that refuses fails the handshake as a value rather than a
+/// fault, which is what a bound that expired on the far side of a channel must
+/// look like from here.
+#[test]
+fn a_delegated_signer_that_refuses_fails_the_handshake_and_never_panics() {
+    let arena = Bump::new(ROOM);
+    let signer = delegate(0x23, true);
+    let public_key = signer.key.public_key();
+    let outcome = prove_session(
+        entropy(0x24),
+        &arena,
+        NOW,
+        b"delegated",
+        &ServerKey::Delegated {
+            operation: signer.clone(),
+            public_key,
+        },
+    );
+    assert!(
+        matches!(outcome, Err(SessionError::Tls(_))),
+        "a refusing signer must end the session as a typed error: {outcome:?}"
+    );
+    assert!(*signer.calls.lock().expect("not poisoned") >= 1);
+}
+
+/// The pairing the delegated variant asks the caller to get right: a certificate
+/// that binds one key and a capability that signs under another is a handshake
+/// the client refuses, and it refuses it as a value.
+#[test]
+fn a_delegated_key_whose_public_half_is_not_the_signers_is_refused_by_the_client() {
+    let arena = Bump::new(ROOM);
+    let signer = delegate(0x25, false);
+    let stranger = delegate(0x26, false);
+    let outcome = prove_session(
+        entropy(0x27),
+        &arena,
+        NOW,
+        b"delegated",
+        &ServerKey::Delegated {
+            operation: signer,
+            public_key: stranger.key.public_key(),
+        },
+    );
+    assert!(
+        matches!(outcome, Err(SessionError::Tls(_))),
+        "a signature under a key the certificate does not bind must not establish: {outcome:?}"
+    );
+}
+
 #[test]
 fn two_sessions_from_one_generator_differ_in_their_identities() {
     let arena = Bump::new(ROOM);
     let source = entropy(0x12);
-    let first = prove_session(source, &arena, NOW, b"one").expect("establishes");
+    let first = prove_session(source, &arena, NOW, b"one", &ServerKey::Local).expect("establishes");
     arena.reset_to(0);
-    let second = prove_session(source, &arena, NOW, b"one").expect("establishes");
+    let second =
+        prove_session(source, &arena, NOW, b"one", &ServerKey::Local).expect("establishes");
     assert_ne!(
         first.peer_certificate, second.peer_certificate,
         "two sessions issued the same certificate, so the generator did not advance"
@@ -64,7 +184,8 @@ fn two_sessions_from_one_generator_differ_in_their_identities() {
 #[test]
 fn an_empty_payload_still_establishes_a_session() {
     let arena = Bump::new(ROOM);
-    let negotiated = prove_session(entropy(0x13), &arena, NOW, b"").expect("establishes");
+    let negotiated =
+        prove_session(entropy(0x13), &arena, NOW, b"", &ServerKey::Local).expect("establishes");
     assert_eq!(negotiated.echoed, 0);
     assert_eq!(negotiated.version, 0x0304);
 }
@@ -73,7 +194,8 @@ fn an_empty_payload_still_establishes_a_session() {
 fn a_record_sized_payload_makes_the_round_trip() {
     let arena = Bump::new(ROOM);
     let payload: Vec<u8> = (0..8192_u32).map(|byte| byte as u8).collect();
-    let negotiated = prove_session(entropy(0x14), &arena, NOW, &payload).expect("establishes");
+    let negotiated = prove_session(entropy(0x14), &arena, NOW, &payload, &ServerKey::Local)
+        .expect("establishes");
     assert_eq!(negotiated.echoed as usize, payload.len());
 }
 
@@ -87,7 +209,7 @@ fn an_arena_below_the_step_reserve_refuses_the_session_and_leaves_nothing_runnin
     // check refuses: the session ends as a value, not as a fault, and the
     // arena is untouched.
     let arena = Bump::new(STEP_RESERVE - 1);
-    let outcome = prove_session(entropy(0x15), &arena, NOW, b"payload");
+    let outcome = prove_session(entropy(0x15), &arena, NOW, b"payload", &ServerKey::Local);
     assert_eq!(
         outcome,
         Err(SessionError::ArenaExhausted(ArenaExhausted {
@@ -136,7 +258,7 @@ fn an_arena_that_runs_out_part_way_refuses_the_session_rather_than_the_allocatio
         arena,
         per_draw: 16384,
     }));
-    let outcome = prove_session(draining, arena, NOW, b"payload");
+    let outcome = prove_session(draining, arena, NOW, b"payload", &ServerKey::Local);
     match outcome {
         Err(SessionError::ArenaExhausted(exhausted)) => {
             assert_eq!(exhausted.requested, STEP_RESERVE);
@@ -162,9 +284,9 @@ fn a_session_runs_again_after_the_arena_is_reset_under_it() {
     let arena = Bump::new(ROOM);
     let source = entropy(0x17);
     let mark = arena.mark();
-    prove_session(source, &arena, NOW, b"first").expect("establishes");
+    prove_session(source, &arena, NOW, b"first", &ServerKey::Local).expect("establishes");
     arena.reset_to(mark);
-    prove_session(source, &arena, NOW, b"second").expect("establishes");
+    prove_session(source, &arena, NOW, b"second", &ServerKey::Local).expect("establishes");
     assert_eq!(arena.used(), mark);
     assert_eq!(arena.refusals(), 0);
 }
@@ -179,13 +301,13 @@ fn a_drained_arena_recovers_across_a_reset_and_the_next_session_establishes() {
         arena,
         per_draw: 4096,
     }));
-    prove_session(draining, arena, NOW, b"payload").expect("establishes");
+    prove_session(draining, arena, NOW, b"payload", &ServerKey::Local).expect("establishes");
     let needed = arena.high_water();
     assert!(needed > 0, "a session that consumed nothing is not one");
     assert!(needed < ROOM, "the session used the whole arena");
     arena.reset_to(0);
     assert_eq!(arena.used(), 0);
-    prove_session(draining, arena, NOW, b"payload").expect("establishes again");
+    prove_session(draining, arena, NOW, b"payload", &ServerKey::Local).expect("establishes again");
 }
 
 #[test]
@@ -193,7 +315,8 @@ fn a_payload_that_does_not_come_back_is_a_refusal_and_not_a_success() {
     // Nothing in the pump can produce this today, so the arm is reached by
     // comparing the answer to a payload the session was never given.
     let arena = Bump::new(ROOM);
-    let negotiated = prove_session(entropy(0x1a), &arena, NOW, b"sent").expect("establishes");
+    let negotiated =
+        prove_session(entropy(0x1a), &arena, NOW, b"sent", &ServerKey::Local).expect("establishes");
     assert_ne!(negotiated.echoed, 5);
     assert_eq!(negotiated.echoed, 4);
 }
@@ -222,7 +345,7 @@ fn the_reserve_is_larger_than_anything_one_step_allocates() {
     // reserve it checked for. A session's whole high-water mark is the
     // pessimistic stand-in for one step's, and it fits.
     let arena = Bump::new(ROOM);
-    prove_session(entropy(0x1b), &arena, NOW, b"payload").expect("establishes");
+    prove_session(entropy(0x1b), &arena, NOW, b"payload", &ServerKey::Local).expect("establishes");
     assert!(
         arena.high_water() < STEP_RESERVE * 8,
         "a session's whole footprint is far past the per-step reserve"
@@ -233,12 +356,12 @@ fn the_reserve_is_larger_than_anything_one_step_allocates() {
 fn a_leftover_allocation_does_not_stop_a_later_session() {
     let arena = Bump::new(ROOM);
     let source = entropy(0x1c);
-    prove_session(source, &arena, NOW, b"one").expect("establishes");
+    prove_session(source, &arena, NOW, b"one", &ServerKey::Local).expect("establishes");
     let stranded = arena
         .allocate(1024, 16)
         .expect("the arena has room for this");
     arena.release(stranded, 1024);
-    prove_session(source, &arena, NOW, b"two").expect("establishes");
+    prove_session(source, &arena, NOW, b"two", &ServerKey::Local).expect("establishes");
 }
 
 #[test]
@@ -247,7 +370,13 @@ fn a_session_at_the_far_end_of_the_datable_range_still_establishes() {
     // name, and ten years past it is not — so the validity's far end is what
     // this exercises.
     let arena = Bump::new(ROOM);
-    let outcome = prove_session(entropy(0x1d), &arena, 2_366_000_000, b"late");
+    let outcome = prove_session(
+        entropy(0x1d),
+        &arena,
+        2_366_000_000,
+        b"late",
+        &ServerKey::Local,
+    );
     match outcome {
         Ok(negotiated) => assert_eq!(negotiated.version, 0x0304),
         Err(SessionError::Identity(_)) => {}
@@ -282,7 +411,7 @@ use rustls::{
     time_provider::TimeProvider,
 };
 
-use crate::{Clock, EcdsaP256SigningKey, LocalKey, SignOperation, SignRefused, provider};
+use crate::{Clock, EcdsaP256SigningKey, LocalKey, provider};
 
 #[test]
 fn the_provider_offers_exactly_one_suite_one_group_and_one_signature_algorithm() {

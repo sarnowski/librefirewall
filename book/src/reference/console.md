@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -58,7 +58,7 @@ written waits forever:
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; then two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` with `delegated-signatures=` records, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -219,6 +219,25 @@ node: an operator holding a silent appliance still has only the external act.
   were lost and not the sectors that were written — the whole slot array is overwritten either way,
   because deciding which sectors held a secret from the record being destroyed would be trusting it
   one last time.
+- `delegated-device=<32 hex> delegated-signatures=<n>` — **a domain that holds no private key
+  reporting the one that does.** This appliance's device key belongs to the domain that owns the
+  medium it is written on, and the domain that authenticates to the network is not that one: it asks
+  for a signature over a channel whose two regions have no field a private key fits in, and this is
+  what it learned by asking.
+
+  `delegated-device=` is the appliance the key holder named, rendered exactly as the `device=` field
+  of that holder's own record — **compare the two character for character**, because two different
+  values on one boot mean the asking domain is authenticating as an appliance this one is not.
+  `delegated-signatures=` is the *holder's* count of signatures it has produced since it started, not
+  a count of requests this domain made: a number this domain incremented itself would say only that
+  it asked.
+
+  **The record appears twice on a boot and the pair is the claim.** The first is the direct proof —
+  the holder answered which key it holds, signed a fixed challenge, and the signature verified under
+  that key. The second follows a completed TLS session whose server half ran under the delegated key,
+  and its count must be higher: the handshake's own signature was computed in the other domain, so a
+  number that did not move would mean the session signed some other way. Neither record carries a
+  signature, a message or a key — a public name and a tally are all the channel can carry.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -248,7 +267,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 33 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 39 the `crypto` domain
 raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -389,9 +408,25 @@ of a vector's contents.
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
 | the session the domain establishes against itself (none carries a `detail=`) | `tls-handshake-refused`, `tls-session-stalled`, `tls-peer-unauthenticated`, `tls-peer-certificate-wrong`, `tls-application-data-lost`, `tls-session-not-closed`, `tls-identity-unbuildable`, `tls-arena-exhausted` |
 | the bounded allocator's own proof (`detail=` is the refusal count for the first and the headroom that was left for the last; the middle carries none) | `arena-allocation-refused`, `arena-starvation-unreachable`, `starved-session-established` |
+| the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid` |
 
-**The last two groups are what a boot's TLS proof says when it does not hold**, and they divide the
-same way the proof does. A `tls-*` token means the session itself did not establish or did not stay
+**The `delegated-*` group is about the other domain**, and it is the one group here whose subject is
+not this domain's own code. This appliance's private key lives in the domain that owns the medium it
+is written on, so this domain asks that domain for a signature rather than holding one. The first
+three name what the exchange did: `delegated-key-unanswered` is a holder that published nothing
+within the read budget — not running, not scheduled, or refusing to come up;
+`delegated-key-refused` is a holder that answered and produced nothing, most often an appliance
+whose own identity did not establish, which its `domain=store` records say why of; and
+`delegated-reply-faulted` is an answer that could not be believed at all. The last three are about
+what came back: `delegated-key-absent` is an all-zero public key or name, which is what an unwired
+channel reads as; `delegated-signature-refused` is a holder that would not sign; and
+`delegated-signature-invalid` is the grave one — a signature that does not verify under the very key
+the holder named, which means the two halves of that appliance's identity disagree. Read every one of
+them beside the `domain=store` records on the same boot: this domain reports what it was given, and
+that domain reports what it has.
+
+**The two groups before it are what a boot's TLS proof says when it does not hold**, and they divide
+the same way the proof does. A `tls-*` token means the session itself did not establish or did not stay
 established — a handshake the library refused, a peer whose certificate was not the one this domain
 issued it, application data that did not come back, a stream that ended without its closing alert.
 An `arena-*` token means the *bound* did not behave: `arena-allocation-refused` says an allocation

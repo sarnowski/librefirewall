@@ -11,7 +11,41 @@
 //! administrator authenticates the node by. It writes all of that durably and
 //! reports the name and the fingerprint on the console. On every later boot it
 //! loads the same record, holds it to itself, and reports that the same
-//! appliance returned and how far its state has advanced. Then it parks.
+//! appliance returned and how far its state has advanced.
+//!
+//! # And then it signs, which is why it no longer parks alone
+//!
+//! The domain that terminates a mutually-authenticated session needs a signature
+//! under this key on every handshake, and must never hold the key: a key in two
+//! domains is a key whose custody nobody can state. So this domain keeps the
+//! keypair after establishing it and answers a **signing delegation** — sign
+//! these bytes, or tell me which key you hold — over the two shared regions
+//! `wire::signing` defines. It parks in the Microkit event loop rather than
+//! beyond reach, and a notification from the asking domain wakes it.
+//!
+//! **The key still cannot cross, and that is a property of two things at once.**
+//! The ABI has no field for a scalar in either direction, so there is nothing to
+//! put one in; and the reply region is this domain's to write and the asker's to
+//! read only, so a compromised asker cannot even name a byte of it. Neither
+//! property alone would do — an ABI that could carry a key would carry it
+//! through correct grants, and grants alone would leave a domain free to write
+//! one into a region it shares.
+//!
+//! What it answers is bounded by construction rather than by trust in the peer.
+//! `wire::SignResponder::take` yields **at most one demand per change of the
+//! requester's sequence**, so a peer rewriting that word as fast as it likes
+//! costs one reply each; [`DEMANDS_PER_WAKEUP`] bounds one wakeup regardless,
+//! and a wakeup that spends it returns to the event loop rather than looping. A
+//! request this domain cannot serve is answered with a typed refusal — never
+//! ignored, because a requester left waiting cannot tell a refusal from a hang.
+//!
+//! Those refusals reach the **metrics shard and not the console**, deliberately.
+//! This domain's log ring is single-producer and bounded, so a console record
+//! per refusal would let the asking domain choose the rate at which the records
+//! an operator actually needs — the identity and the fingerprint — are pushed out
+//! of it. A count is the surface that a hostile peer cannot use to hide
+//! anything, and the domain that asked is the one that reports what it made of
+//! the answer.
 //!
 //! # It also gives that identity up
 //!
@@ -54,10 +88,20 @@
 //! certificate names a different one cannot be authenticated and does not know
 //! it.
 //!
-//! There is no third adversary, and that is a property of the system
-//! description rather than of this file: this domain holds no network region, no
-//! configuration region and no channel to any other domain, so no packet has a
-//! path to these bytes whatever a compromise reaches.
+//! And a **byzantine neighbour protection domain** on the delegation channel,
+//! which is new and is the whole of what this domain gained: every word of the
+//! request region is the asking domain's, so the sequence, the operation and the
+//! length are claims. `wire::signing` is what ranges them — an operation outside
+//! its set is refused by name rather than coerced, and a stated length past what
+//! a request can carry yields no message at all rather than a short one this
+//! domain would happily sign.
+//!
+//! There is still no path from a packet to these bytes, and that remains a
+//! property of the system description rather than of this file: this domain holds
+//! no network region and no configuration region, and its one channel goes to the
+//! cryptography domain, which holds none either. A compromise would have to
+//! traverse a domain that no frame reaches to arrive at a channel whose ABI has
+//! no field for a key.
 //!
 //! # This domain seeds its own generator, and that is the point
 //!
@@ -94,24 +138,26 @@
 //! | `io_vaddr` | the `lfw_blk::BLK_IO_REGION_SIZE` staging window the record crosses in |
 //! | `bar_paddr`, `dma_paddr`, `io_paddr` | those physical bases, for the device |
 //!
-//! # It runs once and parks
+//! # It establishes once and then serves
 //!
-//! Unlike the recorder there is no poll loop: establishing an identity is a
-//! thing that happens once, and this domain has no peer to serve. It runs to
-//! completion in `init` and parks where nothing can reach it — no channel in
-//! either direction — exactly as the clock, hardware-probe and cryptography
-//! domains do. What it waits on inside that run is bounded by `lfw_blk`'s own
-//! poll budget and by nothing the device controls.
+//! There is still no poll loop: establishing an identity is a thing that happens
+//! once, and it happens to completion in `init`. What follows is not polling
+//! either — the domain blocks in the Microkit event loop and does work only when
+//! woken. Every wait inside the establishing run is bounded by `lfw_blk`'s own
+//! poll budget and by nothing the device controls, and nothing in the serving
+//! path waits at all: a demand is taken, answered and published in one pass.
 //!
 //! # No key material reaches any surface
 //!
-//! The private scalar is drawn, folded into a certificate and written to the
-//! medium, and that is the whole of where it goes. No console record, no metric
-//! and no `Debug` in this file names it; the two records this domain emits carry
-//! a public name and a public-key digest. The medium's copy is plaintext there
-//! deliberately and for want of anywhere to keep a wrapping key, which is why
-//! physical possession of the store *is* identity theft and why that boundary is
-//! the one the ownership model rests on.
+//! The private scalar is drawn, folded into a certificate, written to the medium,
+//! and kept in this domain's own memory to sign with. That is the whole of where
+//! it goes. No console record, no metric, no `Debug` in this file and **no field
+//! of the delegation ABI** names it; the two records this domain emits carry a
+//! public name and a public-key digest, and what it publishes to the asking
+//! domain is a public point, a public name, and signatures. The medium's copy is
+//! plaintext there deliberately and for want of anywhere to keep a wrapping key,
+//! which is why physical possession of the store *is* identity theft and why that
+//! boundary is the one the ownership model rests on.
 
 use lfw_blk::bringup::{self, BringUpError, Live, MappedBlkDevice};
 use lfw_blk::io::{IoRegion, IoRegionUnusable, IoSpan};
@@ -120,7 +166,9 @@ use lfw_blk::{
     BLK_IO_REGION_SIZE, BlkVirtqueue, Refusal as BlkRefusal, RefusalDetail as BlkRefusalDetail,
     SECTOR_SIZE,
 };
-use lfw_crypto::{Drbg, EntropyError, NodeEntropy, SEED_MATERIAL_LEN, hardware_seed, zeroize};
+use lfw_crypto::{
+    Drbg, EntropyError, NodeEntropy, P256SecretKey, SEED_MATERIAL_LEN, hardware_seed, zeroize,
+};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use lfw_store::{
@@ -129,14 +177,17 @@ use lfw_store::{
     StateError, StateWrite, decode_state, encode_state, mint, verify,
 };
 use pd_runtime::{
-    BlockCounters, PdClock, StoreIdentity, attach_region, log_sample, read_timestamp_counter,
-    store_sample,
+    BlockCounters, PdClock, StoreIdentity, StoreSigning, attach_region, log_sample,
+    read_timestamp_counter, store_sample,
 };
 use sel4_microkit::{
     ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain, var,
 };
 use virtio::pci::PciConfig;
-use wire::{ClockCalibration, LogConsume, LogRecords};
+use wire::{
+    ClockCalibration, DeviceIdentity, LogConsume, LogRecords, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,
+    SignDemand, SignOperation, SignRefusal, SignReply, SignRequest, SignResponder,
+};
 
 /// Bytes both copies of the state record occupy, and so the one transfer this
 /// domain ever makes.
@@ -169,6 +220,37 @@ const OVERWRITE_SECTORS: u64 = (BLK_IO_REGION_SIZE / SECTOR_SIZE) as u64;
 /// request — and a second number would be a second thing to justify. Reaching it
 /// is a device that has stopped answering, which is a refusal and not a retry.
 const POLL_BUDGET: u32 = lfw_blk::smoke::POLL_BUDGET;
+
+/// Demands one wakeup answers before returning to the event loop.
+///
+/// The protocol admits one outstanding request, so a peer keeping to it produces
+/// exactly one demand per wakeup and this bound is never reached. It is here for
+/// the peer that does not: `wire::SignResponder::take` already costs one reply
+/// per change of the requester's sequence rather than one per read, so a request
+/// storm cannot loop this domain — and this makes the *number* of replies one
+/// wakeup can be made to write a first-party constant rather than a consequence
+/// of how fast the peer writes. Exhausting it is not a refusal and not an error:
+/// the domain returns to the event loop, and the notification the peer sends for
+/// its next request brings it straight back.
+///
+/// Four rather than one, because Microkit coalesces notifications: two requests
+/// issued either side of one wakeup are one signal, and a bound of one would
+/// leave the second waiting for a third.
+const DEMANDS_PER_WAKEUP: u32 = 4;
+
+// The signature buffer this domain writes into and the channel's own field are
+// two crates' numbers for one thing, held equal here because this is the one
+// place both are visible. `wire::signing` declines to depend on the cryptography
+// for an integer and says so; this is the domain it names.
+const _: () = assert!(
+    MAX_SIGNATURE_LEN == lfw_crypto::P256_MAX_SIGNATURE_LEN,
+    "the reply region cannot hold the longest signature this profile produces"
+);
+
+// The same, for the public point: a reply that could not carry the whole of it
+// would publish a truncated key a peer would then fail every handshake under.
+const _: () = assert!(wire::PUBLIC_KEY_LEN == lfw_crypto::P256_PUBLIC_LEN);
+const _: () = assert!(wire::DEVICE_ID_LEN == lfw_store::DEVICE_ID_BYTES);
 
 /// Why this domain could not establish the appliance's identity.
 enum StartupError {
@@ -443,12 +525,71 @@ struct BootOutcome {
     faults: lfw_blk::request::RequestFaults,
 }
 
+/// The keypair this domain holds after establishing an identity, and the two
+/// public values a delegation answers with.
+///
+/// One struct rather than three fields on the handler, because they are one
+/// answer and must never come apart: a public point paired with another
+/// appliance's name, or with a scalar it does not derive, is an identity no peer
+/// can use and no operator can diagnose. `verify` and `mint` are what establish
+/// that they belong together; this carries the result.
+///
+/// **No `Debug`, and that is deliberate**: the whole point of the type is that
+/// the scalar inside it has no rendering anywhere in this domain.
+struct DeviceKey {
+    key: P256SecretKey,
+    public_key: [u8; wire::PUBLIC_KEY_LEN],
+    device_id: [u8; wire::DEVICE_ID_LEN],
+}
+
+impl DeviceKey {
+    /// Read the keypair out of a state record this domain has already held to
+    /// itself.
+    ///
+    /// The scalar is read into this frame, turned into a key, and cleared before
+    /// the frame ends — through `lfw_crypto`, the one place in the appliance that
+    /// clears key material. What survives is the key, which is what this domain
+    /// signs with.
+    ///
+    /// `None` where the scalar is not a private key. Unreachable on the reload
+    /// path, `verify` having answered exactly that question, and answered rather
+    /// than asserted because nothing about establishing an identity may fault
+    /// this domain.
+    fn of(state: &State) -> Option<Self> {
+        let mut scalar = state.secret_scalar();
+        let key = P256SecretKey::from_scalar(&scalar);
+        zeroize(&mut scalar);
+        let key = key.ok()?;
+        Some(Self {
+            public_key: key.public_key(),
+            key,
+            device_id: state.device_id(),
+        })
+    }
+
+    /// The two public values a `SignOperation::PublicKey` request is answered
+    /// with. `Copy`, so a caller holds no borrow of the key while it publishes
+    /// them.
+    const fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity {
+            public_key: self.public_key,
+            device_id: self.device_id,
+        }
+    }
+}
+
 /// The identity this boot established, and how it came by it.
 struct Established {
     device: u128,
     fingerprint: [u8; 32],
     generation: u64,
     onboarding: Onboarding,
+    /// The keypair, kept for the delegation to sign with. `None` where the record
+    /// held to itself and the scalar then would not rebuild — a state `verify`
+    /// makes unreachable, carried rather than asserted away, and one that leaves
+    /// the domain answering every signing request with a typed refusal instead of
+    /// faulting.
+    key: Option<DeviceKey>,
     /// Whether this boot is the one that minted it. The difference an operator
     /// cares about: a node reporting `minted` after a boot that did not has lost
     /// its identity.
@@ -473,10 +614,26 @@ fn init() -> Store {
     let calibration: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
     let clock = PdClock::new(calibration);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(calibration));
+    // The delegation's two regions, and the direction of each is the system
+    // description's: the request is the asking domain's to write and this
+    // domain's to read, and the reply is the reverse. Nothing here restates that
+    // — the handles `wire::signing` hands back reach the other side only through
+    // a view with no store on it.
+    let request: &'static SignRequest = attach_region!(sign_request_vaddr: SignRequest);
+    let reply: &'static SignReply = attach_region!(sign_reply_vaddr: SignReply);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     let outcome = bring_up(&sink, wall_seconds(&clock));
-    let identity = match &outcome.verdict {
+    let BootOutcome {
+        verdict,
+        capacity_sectors,
+        blocks,
+        faults,
+    } = outcome;
+    // The keypair is moved out of the verdict rather than borrowed from it: what
+    // signs after this function returns is the handler's, and a copy left behind
+    // would be a second holder of the scalar inside this domain.
+    let (identity, key) = match verdict {
         Ok(established) => {
             // What was given up, before what replaced it: a reset is the one
             // event on this surface that destroys rather than establishes, and an
@@ -512,34 +669,43 @@ fn init() -> Store {
                 DomainState::Ready,
                 DomainDetail::Fingerprint(established.fingerprint),
             );
-            StoreIdentity {
-                established: true,
-                minted: established.minted,
-                generation: established.generation,
-                onboarded: matches!(established.onboarding, Onboarding::Onboarded),
-                reset: established.reset.is_some(),
-            }
+            (
+                StoreIdentity {
+                    established: true,
+                    minted: established.minted,
+                    generation: established.generation,
+                    onboarded: matches!(established.onboarding, Onboarding::Onboarded),
+                    reset: established.reset.is_some(),
+                },
+                established.key,
+            )
         }
         Err(cause) => {
             // The whole reason, not a summary: with no shell and no CLI on the
             // appliance, this record is all an operator gets.
-            announce(&sink, DomainState::Refused, DomainDetail::Refusal(*cause));
-            StoreIdentity::default()
+            announce(&sink, DomainState::Refused, DomainDetail::Refusal(cause));
+            // No key, so the delegation is answered with `NoIdentity` rather than
+            // being unreachable: a domain waiting on a signature it will never get
+            // cannot tell that from a domain that is merely slow.
+            (StoreIdentity::default(), None)
         }
     };
-    // Last, and once: this domain runs to completion and parks with no channel
-    // to wake it, so its shard is written here and never moves again.
-    stats.publish(
-        &store_sample(
-            identity,
-            outcome.capacity_sectors,
-            outcome.blocks,
-            outcome.faults,
-            log_sample(sink.dropped(), sink.refused()),
-        )
-        .values(),
-    );
-    Store
+    let store = Store {
+        sink,
+        stats,
+        responder: reply.responder(request),
+        key,
+        identity,
+        capacity_sectors,
+        blocks,
+        faults,
+        signing: StoreSigning::default(),
+    };
+    // The shard as this boot established it, before a signature has been asked
+    // for. It moves again on every wakeup that serves one, which is the change
+    // this delegation makes to a shard that used to be written once.
+    store.publish();
+    store
 }
 
 /// Map this domain's device regions, bring the device up, and establish the
@@ -630,6 +796,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 fingerprint: identity.fingerprint,
                 generation: state.get().generation(),
                 onboarding: state.get().onboarding(),
+                key: DeviceKey::of(state.get()),
                 minted: false,
                 reset: None,
             })
@@ -727,11 +894,16 @@ impl<'region> Medium<'region> {
         let minted = mint(self.entropy_or_seed()?, now)
             .map_err(|error| EstablishError::Other(StartupError::Identity(error)))?;
         self.commit(region, &minted.state, Copies::Both)?;
+        // After the commit, so a record that could not be made durable leaves this
+        // domain with nothing to sign under: an appliance signing under a key no
+        // later boot can reload would authenticate once and never again, and
+        // nobody would learn that from a handshake.
         Ok(Established {
             device: device_word(minted.state.device_id()),
             fingerprint: minted.identity.fingerprint,
             generation: minted.state.generation(),
             onboarding: minted.state.onboarding(),
+            key: DeviceKey::of(&minted.state),
             minted: true,
             reset: None,
         })
@@ -1085,17 +1257,148 @@ fn attach(sink: &dyn Sink) -> Result<Medium<'static>, StartupError> {
     })
 }
 
-/// Returned by `init` in every case: this domain runs once and then parks in the
-/// Microkit event loop, whether it established an identity or refused to.
-struct Store;
+/// Returned by `init` in every case: what this domain holds after establishing
+/// an identity, and what it answers a signing delegation out of.
+///
+/// It carries the boot's counters unchanged — the device is finished with by the
+/// time this exists, so a capacity and a block tally are settled facts — and the
+/// two that are not: the signatures produced and the requests refused, which move
+/// on every wakeup.
+struct Store {
+    sink: RingSink<'static, PdClock<'static>>,
+    stats: &'static StatsShard,
+    responder: SignResponder<'static>,
+    /// The keypair, or `None` on a boot that established no identity. The one
+    /// field of this struct with no rendering anywhere: see [`DeviceKey`].
+    key: Option<DeviceKey>,
+    identity: StoreIdentity,
+    capacity_sectors: u64,
+    blocks: BlockCounters,
+    faults: lfw_blk::request::RequestFaults,
+    signing: StoreSigning,
+}
+
+impl Store {
+    /// Answer one demand, and exactly one: every path below consumes it, because
+    /// a demand taken and dropped leaves the requester polling a sequence nothing
+    /// will publish.
+    fn answer(&mut self, demand: SignDemand) {
+        match demand.operation() {
+            // The word named an operation this build has none of. Refused by name
+            // rather than ignored, on the channel's own terms.
+            None => self.refuse(demand, SignRefusal::NoSuchOperation),
+            // The public half and the name, copied out of the key before the reply
+            // is written so no borrow of the key is live across the publish.
+            Some(SignOperation::PublicKey) => match self.key.as_ref().map(DeviceKey::identity) {
+                Some(identity) => self.responder.identity(demand, &identity),
+                None => self.refuse(demand, SignRefusal::NoIdentity),
+            },
+            Some(SignOperation::Sign) => self.sign(demand),
+        }
+    }
+
+    /// Sign what the request carries, or say why not.
+    fn sign(&mut self, demand: SignDemand) {
+        // Out of the shared region and into this domain's own storage in one
+        // statement, so what is signed is a snapshot the peer cannot rewrite
+        // between the length being checked and the bytes being hashed. `None` is
+        // the stated length being past what a request can hold, which is a
+        // request to refuse and not one to shorten.
+        let mut message = [0_u8; MAX_SIGN_MESSAGE];
+        let Some(len) = demand
+            .message(&self.responder, &mut message)
+            .map(<[u8]>::len)
+        else {
+            self.refuse(demand, SignRefusal::MessageTooLong);
+            return;
+        };
+        if self.key.is_none() {
+            self.refuse(demand, SignRefusal::NoIdentity);
+            return;
+        }
+        let mut signature = [0_u8; MAX_SIGNATURE_LEN];
+        // The borrow of the key ends with this statement, which is what lets the
+        // reply be published — or refused — below.
+        let produced = self.key.as_ref().and_then(|holder| {
+            holder
+                .key
+                .sign(message.get(..len).unwrap_or_default(), &mut signature)
+                .ok()
+        });
+        match produced {
+            Some(bytes) => {
+                self.responder
+                    .signed(demand, signature.get(..bytes).unwrap_or_default());
+                self.signing.signatures = self.signing.signatures.saturating_add(1);
+            }
+            // The signing itself failed, which a usable key does not reach. Its
+            // own refusal rather than `NoIdentity`, because an operator acts on
+            // the two differently: one is a node still coming up, the other a node
+            // that cannot use the key it has.
+            None => self.refuse(demand, SignRefusal::SigningFailed),
+        }
+    }
+
+    /// Answer a demand with nothing, saying why, and count it.
+    ///
+    /// The count is the surface and there is no console record here, deliberately:
+    /// this domain's log ring is single-producer and bounded, so a record per
+    /// refusal would let the asking domain choose the rate at which the identity
+    /// and fingerprint records an operator needs are pushed out of it. What a
+    /// refusal means is decided by the domain that asked, which is the one that
+    /// knows what it wanted the signature for.
+    fn refuse(&mut self, demand: SignDemand, reason: SignRefusal) {
+        self.responder.refuse(demand, reason);
+        self.signing.refusals = self.signing.refusals.saturating_add(1);
+    }
+
+    /// Publish this domain's shard.
+    ///
+    /// Called at the end of `init` and after every wakeup that served something.
+    /// The counters other than the two signing ones are settled by then and are
+    /// republished unchanged, because a shard is a whole snapshot rather than a
+    /// set of independently writable slots.
+    fn publish(&self) {
+        self.stats.publish(
+            &store_sample(
+                self.identity,
+                self.signing,
+                self.capacity_sectors,
+                self.blocks,
+                self.faults,
+                log_sample(self.sink.dropped(), self.sink.refused()),
+            )
+            .values(),
+        );
+    }
+}
 
 impl Handler for Store {
     type Error = Infallible;
 
-    /// Unreachable by capability: nothing in this system holds a notification
-    /// capability on this domain, so the event loop it parks in has no sender.
-    /// It exists because [`Handler`] requires it.
+    /// The asking domain has issued a signing request.
+    ///
+    /// Microkit coalesces notifications and a wakeup names no request, so the
+    /// question is asked of the region rather than of the wakeup — and asked at
+    /// most [`DEMANDS_PER_WAKEUP`] times, which is what makes the work one signal
+    /// can provoke a constant of this file. `take` answering `None` ends the pass:
+    /// there is nothing outstanding, which is the ordinary state of a channel
+    /// whose peer is between requests.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
+        let mut served = 0;
+        while served < DEMANDS_PER_WAKEUP {
+            let Some(demand) = self.responder.take() else {
+                break;
+            };
+            self.answer(demand);
+            served += 1;
+        }
+        // Only where something happened: a wakeup that found nothing has nothing
+        // new to say, and republishing an unchanged shard would put a writer on
+        // the region for every spurious signal a peer chooses to send.
+        if served > 0 {
+            self.publish();
+        }
         Ok(())
     }
 }

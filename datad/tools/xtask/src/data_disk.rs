@@ -450,6 +450,15 @@ pub(crate) struct StoreDisk {
     /// **Never printed, never written, never derived from.** It exists to be
     /// searched for and to be absent.
     erased_secret: Option<[u8; lfw_store::SECRET_LEN]>,
+    /// The scalar the medium holds going *into* this boot, on a boot that is
+    /// meant to keep it and use it.
+    ///
+    /// [`Self::erased_secret`]'s opposite question, and its own field for that
+    /// reason: one boot must destroy this key and one must sign with it, so a
+    /// single field would have one verdict standing in for two claims. What this
+    /// one is scanned against is not the medium — the key belongs there — but the
+    /// **console**, which is the one surface the domain that borrows it writes.
+    live_secret: Option<[u8; lfw_store::SECRET_LEN]>,
 }
 
 impl StoreDisk {
@@ -480,6 +489,7 @@ impl StoreDisk {
         Ok(Self {
             path,
             erased_secret: None,
+            live_secret: None,
         })
     }
 
@@ -504,10 +514,34 @@ impl StoreDisk {
                 path.display()
             ));
         }
+        // The key this boot will reload and sign with, captured for the console
+        // scan below. A medium whose window is all zeroes is not refused here,
+        // unlike the reset path's: this boot's subject is the reload, and the scan
+        // reports having proved nothing rather than failing a boot for it.
+        let live = Self::secret_window(&path)
+            .ok()
+            .filter(|secret| *secret != [0u8; lfw_store::SECRET_LEN]);
         Ok(Self {
             path,
             erased_secret: None,
+            live_secret: live,
         })
+    }
+
+    /// The 32-byte private-scalar window of the first copy of the state record.
+    ///
+    /// Positional rather than decoded, on `lfw_store::stored_secret_window`'s
+    /// terms: it must work on a medium whose record this build would refuse, since
+    /// that is one of the states a proof about the bytes has to cover.
+    fn secret_window(path: &Path) -> Result<[u8; lfw_store::SECRET_LEN], String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let mut region = [0u8; 2 * lfw_store::STATE_COPY_BYTES];
+        read_at(&mut file, 0, &mut region)
+            .map_err(|error| format!("read the state record: {error}"))?;
+        Ok(lfw_store::stored_secret_window(&region))
     }
 
     /// The medium an earlier boot left behind, with a **factory-reset request**
@@ -559,6 +593,9 @@ impl StoreDisk {
             .map_err(|error| format!("flush {}: {error}", carried.path.display()))?;
         Ok(Self {
             erased_secret: Some(secret),
+            // Not both: this boot destroys the key rather than signing with it, so
+            // the console scan below has no live key to be asked about.
+            live_secret: None,
             ..carried
         })
     }
@@ -642,6 +679,68 @@ impl StoreDisk {
              {version}, so the identity reached the medium ({})",
             self.path.display()
         ))
+    }
+
+    /// Assert that the scalar this boot **signs with** occurs nowhere in what it
+    /// said.
+    ///
+    /// `Ok(None)` on every boot that captured no live key, which is every boot but
+    /// the one that reloads a medium an earlier boot minted.
+    ///
+    /// # What this proves and what it deliberately does not
+    ///
+    /// The appliance's private key is held by one protection domain and *borrowed*
+    /// by another: the domain that authenticates asks for a signature over two
+    /// shared regions rather than holding the scalar. Two things establish that the
+    /// scalar cannot cross — the ABI has no field it fits in, and the reply region
+    /// has exactly one writer — and both are compile-time and build-time facts
+    /// rather than observations. Neither is checkable from here, because those
+    /// regions are guest RAM: nothing writes them to a file this harness can read,
+    /// and QEMU is not asked to dump memory. So the region argument stands on the
+    /// grants (`xtask::sysdesc`) and the types (`wire::signing`), and is not
+    /// restated here.
+    ///
+    /// **What is checkable is the surface**, and it is worth checking on exactly
+    /// this boot: the key is live, the delegation runs, and the borrowing domain
+    /// signs with it twice — once for its own proof and once inside a handshake —
+    /// and then writes records about having done so. If any of that leaked the
+    /// scalar to an operator-visible place, this is the boot and the console is the
+    /// place. Zero occurrences over the whole capture is the whole answer.
+    ///
+    /// # Errors
+    /// Any occurrence, reported by **offset**: the needle is a private key and
+    /// reaches no message this function writes.
+    pub(crate) fn judge_secret_off_the_console(
+        &self,
+        serial: &[u8],
+    ) -> Result<Option<String>, String> {
+        let Some(needle) = self.live_secret else {
+            return Ok(None);
+        };
+        let found: Vec<usize> = serial
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, window)| *window == needle)
+            .map(|(at, _)| at)
+            .collect();
+        if !found.is_empty() {
+            return Err(format!(
+                "the {}-byte private scalar this appliance signs with occurs in its own serial \
+                 capture, at offset(s) {found:?} of {} bytes. The key is borrowed by a second \
+                 protection domain over a channel whose ABI has no field for one, so a copy on the \
+                 console is a leak by some other route entirely — and the console is the surface an \
+                 operator reads",
+                needle.len(),
+                serial.len()
+            ));
+        }
+        Ok(Some(format!(
+            "the {}-byte private scalar this boot signed with twice — once for the delegation's own \
+             proof and once inside a TLS handshake — occurs at no offset of the {} bytes it wrote to \
+             the console, so borrowing the key put none of it on the one surface an operator reads",
+            needle.len(),
+            serial.len()
+        )))
     }
 
     /// Assert that the scalar this medium held before a factory-reset boot occurs

@@ -164,6 +164,15 @@ client half and server half both inside the domain, over a transport that is two
 reports what it settled on. It needs no network and no configuration, which is why it can be proved
 before the appliance can dial anything.
 
+**Both halves are here; the server half's private key is not.** It is the appliance's own device
+key, which lives in the domain that owns the medium it is written on, and the server end reaches it
+through a signing capability that forwards over a channel — so the `CertificateVerify` a TLS 1.3
+server signs is computed in another protection domain, synchronously, in the middle of the
+handshake. That is deliberate rather than incidental: it is the only arrangement that proves the
+delegation where it will actually be used. The client half and the certification authority above
+both are still generated in this domain, standing in for a management server and an anchor this
+appliance has never spoken to.
+
 One session exercises, in one go, everything the management channel's own handshake will: the
 hybrid key exchange, an ECDSA signature over the transcript, a certificate chain validated against
 a trust anchor, the key schedule, and the record layer in both directions. It is
@@ -178,10 +187,15 @@ reports it has proved that a peer can be authenticated and not merely that a han
 | key exchange group | `X25519MLKEM768` (`0x11ec`) |
 | application data echoed | non-zero, in both directions |
 | peer identity | the authenticated peer's certificate, named by its digest |
+| the key the server half authenticated under | the appliance's own, held by another domain and named by the identifier that domain reports |
 
 The build fails on any of the three code points differing, on no application data having moved, and
 on the peer identity being absent. A session that ends without its closing alert is refused too: a
-stream delimited by the connection going quiet is one a truncation is indistinguishable from.
+stream delimited by the connection going quiet is one a truncation is indistinguishable from. And it
+fails where the delegation did not carry the session: the domain reports the key holder's own
+signature tally before the session and again after it, and a tally that did not move means the
+handshake signed some other way — the identifier on both records having to be, character for
+character, the one the key holder itself reports on the same boot.
 
 ## The allocator, and why reaching its bound is a report rather than a fault
 
