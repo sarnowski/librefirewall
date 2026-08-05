@@ -305,6 +305,7 @@ fn modified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::Gateway;
     use crate::rule::{
         AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
         TrackingMatch,
@@ -523,6 +524,7 @@ mod tests {
             mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
             address: Ipv4Address::from_octets([10, 0, 2, last]),
             prefix_length: 24,
+            gateway: Gateway::Stated(Ipv4Address::from_octets([10, 0, 2, 1])),
         }
     }
 
@@ -549,7 +551,7 @@ mod tests {
 
         // Appearing and disappearing, on the terms every other object is held to.
         let (added, _) = records(&Model::EMPTY, &before);
-        assert_eq!(added.len(), 4);
+        assert_eq!(added.len(), 5);
         assert!(added.iter().all(|change| change.kind == ChangeKind::Added
             && change.object == ObjectKind::Management
             && change.from.is_none()));
@@ -559,7 +561,8 @@ mod tests {
                 Field::Enabled,
                 Field::Mac,
                 Field::Address,
-                Field::PrefixLength
+                Field::PrefixLength,
+                Field::Gateway
             ]
         );
         let (removed, _) = records(&before, &Model::EMPTY);
@@ -781,7 +784,7 @@ mod tests {
                 text.push_str("</neighbours><rules/>");
                 text.push_str(
                     "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" \
-                     address=\"192.168.42.15\" prefix-length=\"24\"/>",
+                     address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
                 );
                 text.push_str("</configuration>");
                 text
@@ -943,6 +946,7 @@ mod tests {
             mac: MacAddress([0; 6]),
             address: Ipv4Address::from_octets([0, 0, 0, 0]),
             prefix_length: 0,
+            gateway: Gateway::None,
         });
         let mut rebuilt = Model::EMPTY;
         for interface in model.interfaces() {
@@ -952,11 +956,20 @@ mod tests {
             rebuilt.push_neighbour(*neighbour).expect("capacity");
         }
         if change.kind != ChangeKind::Removed {
-            match change.to {
-                Some(Value::Bool(enabled)) => entry.enabled = enabled,
-                Some(Value::Mac(mac)) => entry.mac = mac,
-                Some(Value::Ipv4(address)) => entry.address = address,
-                Some(Value::PrefixLength(length)) => entry.prefix_length = length,
+            // Keyed on the field rather than on the value's shape: the
+            // management element carries two `Ipv4` values now, so the shape
+            // alone no longer says which one a record is about.
+            match (change.field, change.to) {
+                (Field::Enabled, Some(Value::Bool(enabled))) => entry.enabled = enabled,
+                (Field::Mac, Some(Value::Mac(mac))) => entry.mac = mac,
+                (Field::Address, Some(Value::Ipv4(address))) => entry.address = address,
+                (Field::PrefixLength, Some(Value::PrefixLength(length))) => {
+                    entry.prefix_length = length;
+                }
+                (Field::Gateway, Some(Value::Ipv4(address))) => {
+                    entry.gateway = Gateway::Stated(address);
+                }
+                (Field::Gateway, Some(Value::Selector(_))) => entry.gateway = Gateway::None,
                 _ => {}
             }
             rebuilt.set_management(entry).expect("one");

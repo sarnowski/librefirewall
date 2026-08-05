@@ -233,7 +233,7 @@ mod tests {
     const EMPTY: &str = concat!(
         "<configuration><interfaces/><neighbours/><rules/>",
         "<management enabled=\"false\" mac=\"52:54:00:12:34:52\" ",
-        "address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
         "</configuration>"
     );
 
@@ -248,7 +248,7 @@ mod tests {
         "</interfaces><neighbours>",
         "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>",
         "</neighbours><rules/>",
-        "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
         "</configuration>"
     );
 
@@ -383,7 +383,7 @@ mod tests {
             ("<configuration>", RejectReason::Malformed),
             ("<!DOCTYPE x><configuration/>", RejectReason::Doctype),
             (
-                "<configuration><interfaces/><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/><extra/></configuration>",
+                "<configuration><interfaces/><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/><extra/></configuration>",
                 RejectReason::UnknownElement,
             ),
         ];

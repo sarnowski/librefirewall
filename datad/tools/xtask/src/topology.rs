@@ -704,7 +704,7 @@ mod tests {
     /// interface claims and with room for a station at host 2.
     const MANAGEMENT: &str = concat!(
         "<management mac=\"52:54:00:12:34:52\" address=\"10.0.2.15\" ",
-        "prefix-length=\"24\" enabled=\"true\"/>"
+        "prefix-length=\"24\" enabled=\"true\" gateway=\"10.0.2.2\"/>"
     );
 
     const NEIGHBOURS: &str = concat!(
@@ -850,8 +850,8 @@ mod tests {
 
         let text = String::from_utf8(whole()).expect("ASCII");
         let disabled = text.replacen(
-            "prefix-length=\"24\" enabled=\"true\"/>",
-            "prefix-length=\"24\" enabled=\"false\"/>",
+            "prefix-length=\"24\" enabled=\"true\"",
+            "prefix-length=\"24\" enabled=\"false\"",
             1,
         );
         let error = Topology::from_document(disabled.as_bytes())
@@ -866,10 +866,16 @@ mod tests {
     fn a_management_prefix_with_no_room_for_a_station_is_refused() {
         let text = String::from_utf8(whole()).expect("ASCII");
         for (prefix_length, address) in [(31u8, "10.0.2.15"), (32, "10.0.2.15")] {
+            // The gateway goes with the prefix: 10.0.2.2 is off a /31 or /32
+            // around this address, so leaving it stated would have the
+            // configuration refused for the gateway before the bench ever got
+            // to say the prefix has no station — which is the refusal under
+            // test.
             let narrow = text.replacen(
-                "address=\"10.0.2.15\" prefix-length=\"24\" enabled=\"true\"",
+                "address=\"10.0.2.15\" prefix-length=\"24\" enabled=\"true\" gateway=\"10.0.2.2\"",
                 &format!(
-                    "address=\"{address}\" prefix-length=\"{prefix_length}\" enabled=\"true\""
+                    "address=\"{address}\" prefix-length=\"{prefix_length}\" \
+                     enabled=\"true\" gateway=\"none\""
                 ),
                 1,
             );
@@ -883,8 +889,13 @@ mod tests {
             );
         }
         // And an appliance sitting *on* host 2 leaves the station talking to
-        // itself, which is refused rather than nudged elsewhere.
-        let collides = text.replacen("address=\"10.0.2.15\"", "address=\"10.0.2.2\"", 1);
+        // itself, which is refused rather than nudged elsewhere. The gateway
+        // moves out of the way for the reason above: host 2 is what it names,
+        // and a gateway equal to the port's own address is refused before the
+        // bench is consulted at all.
+        let collides = text
+            .replacen("address=\"10.0.2.15\"", "address=\"10.0.2.2\"", 1)
+            .replacen("gateway=\"10.0.2.2\"", "gateway=\"none\"", 1);
         assert_eq!(
             Topology::from_document(collides.as_bytes()),
             Err(TopologyError::ManagementPrefixHasNoStation {

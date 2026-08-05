@@ -103,7 +103,7 @@ fn a_neighbour_reports_the_interface_it_names_and_a_management_entry_has_no_id()
 
     let management = element_of(
         "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"10.9.0.1\" \
-         prefix-length=\"24\"/>",
+         prefix-length=\"24\" gateway=\"none\"/>",
         ManagementEntry::read,
     )
     .expect("a sound element");

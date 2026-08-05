@@ -51,10 +51,17 @@ pub fn image_from(model: &Model, generation: Generation) -> Result<ConfigImage, 
             Some(entry) => ManagementImage {
                 enabled: u8::from(entry.enabled),
                 prefix_length: entry.prefix_length,
-                _pad: [0; 2],
+                gateway_stated: u8::from(entry.gateway.stated().is_some()),
+                _pad: [0; 1],
                 mac: entry.mac.0,
                 _pad2: [0; 2],
                 address: entry.address.octets(),
+                // Zero where none is stated, which is what the zeroed region
+                // says and what the reader leaves uninterpreted.
+                gateway: match entry.gateway.stated() {
+                    Some(address) => address.octets(),
+                    None => [0; 4],
+                },
             },
             // A configuration describing no management port leaves the zeroed
             // entry, which is what the reader decodes as "no addressing".
@@ -199,7 +206,7 @@ fn port_of(model: &Model, entry: &NeighbourEntry) -> Result<u8, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PORT_COUNT, entity::InterfaceEntry, load, validate};
+    use crate::{PORT_COUNT, entity::InterfaceEntry, gateway::Gateway, load, validate};
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String};
@@ -219,7 +226,7 @@ mod tests {
         "mac=\"52:54:00:00:00:0a\"/>",
         "</neighbours><rules/>",
         "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
-        "address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
         "</configuration>"
     );
 
@@ -227,7 +234,7 @@ mod tests {
     /// none of their interfaces claims.
     const MANAGEMENT: &str = concat!(
         "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
-        "address=\"192.168.42.15\" prefix-length=\"24\"/>"
+        "address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>"
     );
 
     fn id(text: &str) -> Identifier {
@@ -445,6 +452,10 @@ mod tests {
                     mac: MacAddress(entry.mac()),
                     address: Ipv4Address::from_octets(entry.address()),
                     prefix_length: entry.prefix_length(),
+                    gateway: match entry.gateway() {
+                        Some(address) => Gateway::Stated(Ipv4Address::from_octets(address)),
+                        None => Gateway::None,
+                    },
                 })
                 .ok()?;
         }

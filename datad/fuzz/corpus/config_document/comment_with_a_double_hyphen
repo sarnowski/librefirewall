@@ -1,3 +1,3 @@
 <!-- a -- b -->
 <?xml version="1.0" encoding="UTF-8"?>
-<configuration><interfaces><interface id="dataplane-0" port="0" enabled="true" mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/></interfaces><neighbours></neighbours><management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true"/></configuration>
+<configuration><interfaces><interface id="dataplane-0" port="0" enabled="true" mac="52:54:00:12:34:50" address="10.0.0.1" prefix-length="24"/></interfaces><neighbours></neighbours><management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true" gateway="10.0.2.2"/></configuration>

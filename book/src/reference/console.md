@@ -514,13 +514,15 @@ the volume of a commit is the size of its diff.
   a record about it reads `key=management`: the two keys are the same word and neither is derived from
   the other. A **`rule`** is the exception and is keyed by its **position**, `key=0` upward.
 - `field=` is spelled as the document's own attribute, and is one of **`port`**, **`enabled`**,
-  **`mac`**, **`address`**, **`prefix-length`**, **`interface`**, **`id`**, **`ingress`**,
-  **`egress`**, **`source`**, **`destination`**, **`protocol`**, **`source-port`**,
+  **`mac`**, **`address`**, **`prefix-length`**, **`gateway`**, **`interface`**, **`id`**,
+  **`ingress`**, **`egress`**, **`source`**, **`destination`**, **`protocol`**, **`source-port`**,
   **`destination-port`**, **`icmp-type`**, **`tracking`** or **`action`**. Not every field belongs to
   every object: an `interface` carries `port`, `enabled`, `mac`, `address`, `prefix-length`; a
   `neighbour` carries `mac`, `address`, `interface`; `management` carries `enabled`, `mac`, `address`,
-  `prefix-length` — it has no `port`, being no part of the router's port set; and a `rule` carries the
-  remaining eleven, which are its `id` and its ten criteria. A pairing outside those is not written.
+  `prefix-length`, `gateway` — it has no `port`, being no part of the router's port set, and it is the
+  only object with a `gateway`, being the only port this appliance dials out of; and a `rule` carries
+  the remaining eleven, which are its `id` and its ten criteria. A pairing outside those is not
+  written.
 - **A `rule` reports its own `id` as a field**, which no other object does. Its records are filed
   under its position, because a policy is an ordered list and position is precedence — so the id is
   something a rule *says* rather than what it is, and renaming one is a change to report like any
@@ -528,7 +530,9 @@ the volume of a commit is the size of its diff.
 - `from=` is absent exactly when the object was added, `to=` exactly when it was removed. A
   `modified` record carries both.
 - Values render by their type: `port` and `prefix-length` decimal, `enabled` `true|false`, `mac` as
-  `52:54:00:12:34:50` (lower case), `address` as a dotted quad, `interface` as the referenced id.
+  `52:54:00:12:34:50` (lower case), `address` as a dotted quad, `interface` as the referenced id, and
+  `gateway` as a dotted quad or the word `none` — the document's own two spellings, so a record reads
+  back as the text an operator wrote.
 - Records are ordered interfaces first, then neighbours, then the `management` object, by id within
   each, then by the field order listed above. Two runs over one pair of configurations produce
   byte-identical output.
@@ -541,12 +545,12 @@ nothing was staged, or the counter is exhausted). `refused` carries no reason to
 about the configuration is wrong; a *document* that is wrong is the third shape.
 
 **Rejection** — a document or an offered image was refused, naming where and why and never the
-bytes. `rejected=` is one of 36 reasons:
+bytes. `rejected=` is one of 38 reasons:
 
 | group | reasons |
 |---|---|
 | document syntax and hardening bounds (17) | `malformed`, `doctype`, `entity-declaration`, `unknown-entity-reference`, `invalid-character-reference`, `document-too-large`, `depth-exceeded`, `too-many-attributes`, `name-too-long`, `value-too-long`, `unexpected-character-data`, `duplicate-attribute`, `unknown-element`, `unknown-attribute`, `missing-element`, `missing-attribute`, `malformed-value` |
-| semantic validation over the parsed model (13) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `capacity-exceeded` |
+| semantic validation over the parsed model (15) | `duplicate-identifier`, `duplicate-port`, `port-out-of-range`, `prefix-length-out-of-range`, `address-not-a-host-address`, `address-not-unicast`, `mac-not-unicast`, `overlapping-prefixes`, `unknown-interface-reference`, `neighbour-outside-prefix`, `neighbour-is-interface-address`, `duplicate-neighbour-address`, `gateway-not-on-link`, `gateway-is-the-local-address`, `capacity-exceeded` |
 | a filter rule that would match nothing (4) | `prefix-not-canonical`, `port-range-reversed`, `port-criterion-on-icmp`, `icmp-type-on-non-icmp` |
 | a configuration the appliance could not state back (1) | `rendering-too-large` |
 | an offered image that is not one publication (1) | `handover-not-one-publication` |
@@ -554,6 +558,14 @@ bytes. `rejected=` is one of 36 reasons:
 `capacity-exceeded` sits in the second group and not the first, which is where a reader expects a
 bound to be: a document naming more interfaces, neighbours or rules than the handover image holds
 passed every bound its *bytes* are held to, and does not fit the model they parse into.
+
+`gateway-not-on-link` and `gateway-is-the-local-address` are about the management port's `gateway`,
+the station it hands everything off its own prefix to. A gateway outside that prefix is one no
+station on the link can answer for, so the only reply it could ever draw is from a station claiming
+an address it does not hold; a gateway equal to the port's own address would hand every off-prefix
+datagram straight back to this node. A gateway that is not a unicast address is reported as
+`address-not-unicast`, which is the same fact about the same kind of value and already had a word.
+A port that reaches only its own link writes `gateway="none"` and is held to none of the three.
 
 The third group is its own because those four refusals are not about a value being wrong but about
 a rule being *inert*. A port range whose ends run backwards, a port criterion on a rule that names

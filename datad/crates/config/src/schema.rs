@@ -24,13 +24,20 @@
 //!           destination-port="443" icmp-type="any" action="accept"/>
 //!   </rules>
 //!   <management mac="52:54:00:12:34:52" address="10.0.2.15"
-//!               prefix-length="24" enabled="true"/>
+//!               prefix-length="24" enabled="true" gateway="10.0.2.2"/>
 //! </configuration>
 //! ```
 //!
 //! `<management>` is a sibling of `<interfaces>`, not an entry inside it: that
 //! port is not a dataplane one — no `port` number, not in the router's set.
 //! Required like the other three; `enabled="false"` means no address.
+//!
+//! It is also the one element with a `gateway`, and the asymmetry is deliberate.
+//! A gateway is read only by the outbound dial of the port that holds it, and
+//! this is the only port that dials; a gateway on an `<interface>` would be a
+//! value nothing in this build could read. A port that reaches only its own
+//! link writes `gateway="none"` — the absence is a word, on `any`'s terms and
+//! for `enabled`'s reason.
 //!
 //! `<rules>` is required and may be empty, and an empty one is not the absence
 //! of a policy: the appliance is default-deny, so `<rules/>` forwards nothing.
@@ -255,7 +262,7 @@ mod tests {
         () => {
             concat!(
                 "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" ",
-                "address=\"192.168.42.15\" prefix-length=\"24\"/>"
+                "address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>"
             )
         };
     }
@@ -277,7 +284,7 @@ mod tests {
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
         "  </neighbours>\n  <rules/>\n",
         "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" ",
-        "prefix-length=\"24\" enabled=\"true\"/>\n",
+        "prefix-length=\"24\" enabled=\"true\" gateway=\"none\"/>\n",
         "</configuration>\n"
     );
 
@@ -474,7 +481,8 @@ mod tests {
             ("mac=\"52:54:00:12:34:52\" ", ""),
             ("address=\"192.168.42.15\" ", ""),
             ("prefix-length=\"24\" enabled", "enabled"),
-            (" enabled=\"true\"/>", "/>"),
+            (" enabled=\"true\" gateway", " gateway"),
+            (" gateway=\"none\"/>", "/>"),
         ] {
             assert_eq!(
                 fault_of(&edited(removed, replacement)),
@@ -490,7 +498,11 @@ mod tests {
                 "prefix-length=\"24\" enabled",
                 "prefix-length=\"x\" enabled",
             ),
-            ("enabled=\"true\"/>", "enabled=\"1\"/>"),
+            ("enabled=\"true\" gateway", "enabled=\"1\" gateway"),
+            // Neither an address nor the one word that stands for its
+            // absence, so it is the wrong shape rather than a wrong value.
+            ("gateway=\"none\"", "gateway=\"any\""),
+            ("gateway=\"none\"", "gateway=\"10.0.0\""),
         ] {
             let document = edited(from, to);
             let error = parse(document.as_bytes()).expect_err(to);
@@ -504,8 +516,8 @@ mod tests {
         // A child inside it is a nesting the grammar does not admit.
         assert_eq!(
             fault_of(&edited(
-                "enabled=\"true\"/>",
-                "enabled=\"true\"><x/></management>"
+                "gateway=\"none\"/>",
+                "gateway=\"none\"><x/></management>"
             )),
             DocumentFault::UnknownElement
         );

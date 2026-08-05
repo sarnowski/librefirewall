@@ -73,7 +73,15 @@
      user-mode (SLIRP) stack places the guest at 10.0.2.15 with the gateway at
      10.0.2.2, so `make run` reaches this port with no extra configuration, and
      the /24 it sits in is disjoint from both dataplane prefixes above — which
-     `config`'s validation refuses to let it stop being. -->
+     `config`'s validation refuses to let it stop being.
+
+     Its `gateway` is that same 10.0.2.2, and it is the one attribute here that
+     no `<interface>` carries. A gateway is read by the outbound dial of the
+     port that holds it, and this is the only port that dials: the dataplane
+     originates no traffic of its own, so a gateway beside an interface above
+     would be a value nothing in this build reads. A port that reaches only its
+     own link writes `gateway="none"` rather than leaving the attribute out,
+     because an omission and a misspelling look the same to an operator. -->
 <configuration>
     <interfaces>
         <interface id="dataplane-0" port="0" enabled="true"
@@ -96,5 +104,5 @@
               source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
     </rules>
     <management mac="52:54:00:12:34:52" address="10.0.2.15"
-                prefix-length="24" enabled="true"/>
+                prefix-length="24" enabled="true" gateway="10.0.2.2"/>
 </configuration>

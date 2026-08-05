@@ -711,12 +711,12 @@ mod tests {
     fn the_shipped_document_produces_a_record_for_every_value_it_names() {
         let contract = ConfigContract::from_document(SHIPPED).expect("the shipped document");
         // Two interfaces of five fields, two neighbours of three, two rules of
-        // eleven, and the management interface's four: the document's own
+        // eleven, and the management interface's five: the document's own
         // content, counted rather than restated. A rule reports its own `id` as a
         // field because a rule's records are keyed by its position rather than by
         // its name, so an eleven-attribute rule is eleven records.
-        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 2 * 11 + 4);
-        assert!(contract.summary().contains("42"));
+        assert_eq!(contract.changes.len(), 2 * 5 + 2 * 3 + 2 * 11 + 5);
+        assert!(contract.summary().contains("43"));
         for record in &contract.changes {
             assert!(record.starts_with("LFW-CFG generation=1 seq="), "{record}");
             assert!(record.contains("change=added"), "{record}");
@@ -741,6 +741,8 @@ mod tests {
             // not have.
             "object=management key=management field=mac to=52:54:00:12:34:52",
             "object=management key=management field=address to=10.0.2.15",
+            // The management port's own next hop, which no interface carries.
+            "object=management key=management field=gateway to=10.0.2.2",
         ] {
             assert!(joined.contains(value), "{value} missing from:\n{joined}");
         }

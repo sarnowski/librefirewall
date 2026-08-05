@@ -272,7 +272,7 @@ mod tests {
             "<configuration><interfaces>\
              <interface id=\"wan\" port=\"{port}\" enabled=\"{enabled}\" \
              mac=\"52:54:00:00:00:01\" address=\"10.0.{variant}.1\" prefix-length=\"24\"/>\
-             </interfaces><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
+             </interfaces><neighbours/><rules/><management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/></configuration>"
         )
     }
 
@@ -391,9 +391,9 @@ mod tests {
         let first = store.commit(&mut changes).expect("a candidate");
         assert_eq!(first.generation(), Generation::from_bits(1));
         assert_eq!(first.outcome(), GenerationOutcome::Applied);
-        // Five interface fields and the management element's four.
-        assert_eq!(first.changes(), 9);
-        assert_eq!(changes.0.len(), 9);
+        // Five interface fields and the management element's five.
+        assert_eq!(first.changes(), 10);
+        assert_eq!(changes.0.len(), 10);
 
         let mut second_changes = Collected::default();
         store.stage(document(1, true).as_bytes()).expect("sound");
@@ -479,7 +479,7 @@ mod tests {
                 "<configuration><interfaces>{first}{second}</interfaces>\
                  <neighbours/><rules/><management enabled=\"true\" \
                  mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" \
-                 prefix-length=\"24\"/></configuration>"
+                 prefix-length=\"24\" gateway=\"none\"/></configuration>"
             )
         };
         let (aaa, zzz) = (interface("aaa", 0), interface("zzz", 1));
@@ -520,14 +520,18 @@ mod tests {
         store.stage(one().as_bytes()).expect("sound");
         assert_eq!(
             store.commit(&mut changes).expect("a candidate").changes(),
-            9
+            10
         );
-        assert_eq!(changes.0.len(), 9);
+        assert_eq!(changes.0.len(), 10);
 
         store.stage(one().as_bytes()).expect("sound");
         let outcome = store.commit(&mut changes).expect("a candidate");
         assert_eq!(outcome.outcome(), GenerationOutcome::Unchanged);
-        assert_eq!(changes.0.len(), 9, "nothing was added by the second commit");
+        assert_eq!(
+            changes.0.len(),
+            10,
+            "nothing was added by the second commit"
+        );
     }
 
     #[test]
@@ -594,14 +598,14 @@ mod tests {
             "<neighbour id=\"gw\" interface=\"wan\" address=\"10.0.0.2\" ",
             "mac=\"52:54:00:00:00:02\"/>",
             "</neighbours><rules/>",
-            "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\"/>",
+            "<management enabled=\"true\" mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
             "</configuration>"
         );
         let mut changes = Collected::default();
         store.stage(text.as_bytes()).expect("sound");
         let outcome = store.commit(&mut changes).expect("a candidate");
 
-        assert_eq!(outcome.changes(), 12);
+        assert_eq!(outcome.changes(), 13);
         let kinds: Vec<ObjectKind> = changes.0.iter().map(|change| change.object).collect();
         assert_eq!(
             kinds
@@ -622,7 +626,7 @@ mod tests {
                 .iter()
                 .filter(|kind| **kind == ObjectKind::Management)
                 .count(),
-            4
+            5
         );
     }
 

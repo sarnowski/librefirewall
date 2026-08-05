@@ -864,19 +864,20 @@ model — so a syntax rule cannot come to depend on an address and a topology ru
 depend on where in the file something was written. Each configurable object is declared once —
 its value, the attributes a reader accepts for it, the change records it produces and the bytes it
 folds into a content hash all come from that one list, so an attribute cannot be added to the
-reader and forgotten by the hash. Forty-two semantic rules then run over the
+reader and forgotten by the hash. Forty-six semantic rules then run over the
 model: a duplicate interface id, neighbour id, port or interface MAC; a port the build does not
 have; a prefix length past 32; an address that is its own prefix's network or broadcast address, on
 an interface or on a neighbour; a non-unicast address or MAC on either object; overlapping
 prefixes; a neighbour naming an unknown interface, or sitting outside its interface's prefix, or
-equal to the interface's own address; a duplicate neighbour address on one interface; six over
+equal to the interface's own address; a duplicate neighbour address on one interface; nine over
 the `<management>` element, which is held to the same field rules as an interface *and* to
 colliding with no dataplane prefix and no dataplane MAC —
 because one address reachable both by routing and by local termination is not something the grant set
-can express; and twelve over the `<rules>` section, which are described with
+can express — *and* to three about its `gateway`, which must be a unicast station on that port's own
+link and not the port itself; and twelve over the `<rules>` section, which are described with
 *[Stateful filtering](#stateful-filtering)*. A document naming more objects than the handover ABI can carry is refused by the reader
 rather than truncated. Every refusal is a typed error naming a **location** and never the offending
-bytes, so attacker-supplied content never reaches an observability surface. A forty-second rule sits
+bytes, so attacker-supplied content never reaches an observability surface. A forty-sixth rule sits
 beside them and is about the appliance rather than the document: a configuration whose canonical form
 outgrows the document bound is refused, because the appliance must be able to state back what it is
 running.
@@ -1391,7 +1392,7 @@ pool, decide, and where a reply was composed take a transmit buffer, write the r
 it to the driver.
 
 The addressing is **configured, not compiled in**. `datad/systems/qemu-x86_64/configuration.xml` gained a
-`<management mac= address= prefix-length= enabled=/>` element — a sibling of `<interfaces>`, because
+`<management mac= address= prefix-length= enabled= gateway=/>` element — a sibling of `<interfaces>`, because
 the port is not a dataplane port and `config::PORT_COUNT` is still 2 — which the schema requires, the
 validator holds to its own rules *and* to not colliding with any dataplane prefix or MAC, and the
 handover image carries to the domain. QEMU takes that MAC for the guest NIC, and the harness derives
@@ -1502,13 +1503,27 @@ not satisfy it.
   the port's own prefix — so no resolution can be started for a group address, and none can ask the
   wrong link. What it deliberately is not, each with a reason in the module: no route table and so no
   choice of interface, no metrics or route preference, no default-route election, no dynamic routing.
-  **Missing:** nothing supplies a gateway — the configuration schema has none — and nothing calls it,
-  so no route has been decided on a running node.
+  **The configuration schema now supplies the gateway it reads.** `<management>` carries a
+  `gateway` attribute — an address, or the word `none` for a port that reaches only its own link,
+  written rather than omitted like every other value in this schema. It sits on `<management>` and
+  not on `<interface>` because the only thing that reads a gateway is the outbound dial of the port
+  that holds it, and the management domain is the only one that dials: it holds one addressed port,
+  no dataplane region, no device capability and no I/O port. A gateway beside a dataplane interface
+  would be a value nothing in this build could read, so `<interface>` gains one when the forwarder
+  needs one and not before. A stated gateway is refused at load time if it is not unicast, if it is
+  the port's own address, or if it lies outside the port's prefix — the first as
+  `address-not-unicast`, the other two under `gateway-is-the-local-address` and
+  `gateway-not-on-link`. The route decision re-judges all three where it composes a frame, as it
+  re-judges everything: this is the early refusal that names the attribute while an operator is
+  still editing it, not the only one. The gateway crosses the handover image as a stated flag and
+  four octets, and the image side re-decides the same three rules.
+  **Missing:** nothing calls the route decision, so no route has been decided on a running node —
+  the gateway is now statable, committed and readable, and has no consumer.
 - **An RFC 5227 probe (sender address 0.0.0.0) is refused rather than answered**, so a second station
   claiming this address is not contradicted.
 - **A reply is only ever composed for a neighbour**: the sender must share the port's prefix, because
-  the route decision above is consulted by nothing and this endpoint holds no gateway. An off-link
-  station is refused and counted.
+  the route decision above is consulted by nothing — the endpoint does not read the configured
+  gateway even now that a document can state one. An off-link station is refused and counted.
 - **The counters now reach a surface.** The console still carries only the port's cumulative
   `frames=`/`bytes=` pair, but every outcome the endpoint distinguishes — and every reply it could
   not send — is published as the `librefirewall_endpoint_*` families and scrapable; see

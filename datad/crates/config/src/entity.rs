@@ -29,6 +29,7 @@ use lfw_log::{Field, Identifier, ObjectKind, Value};
 use net_headers::{Ipv4Address, MacAddress};
 
 use crate::{
+    gateway::Gateway,
     rule::{
         AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
         TrackingMatch,
@@ -51,6 +52,7 @@ macro_rules! value_type {
     (prefix_length) => { u8 };
     (ipv4)          => { Ipv4Address };
     (mac)           => { MacAddress };
+    (gateway)       => { Gateway };
     (interface_match) => { InterfaceMatch };
     (address_match)   => { AddressMatch };
     (protocol_match)  => { ProtocolMatch };
@@ -71,6 +73,7 @@ macro_rules! value_record {
     (prefix_length, $value:expr) => { Value::PrefixLength($value) };
     (ipv4, $value:expr)          => { Value::Ipv4($value) };
     (mac, $value:expr)           => { Value::Mac($value) };
+    (gateway, $value:expr)       => { $value.record() };
     (interface_match, $value:expr) => { $value.record() };
     (address_match, $value:expr)   => { $value.record() };
     (protocol_match, $value:expr)  => { $value.record() };
@@ -92,6 +95,7 @@ macro_rules! value_fold {
     (prefix_length, $hash:expr, $value:expr) => { $crate::hash::fold($hash, &[$value]) };
     (ipv4, $hash:expr, $value:expr)          => { $crate::hash::fold($hash, &$value.octets()) };
     (mac, $hash:expr, $value:expr)           => { $crate::hash::fold($hash, &$value.0) };
+    (gateway, $hash:expr, $value:expr)       => { $value.fold($hash) };
     (interface_match, $hash:expr, $value:expr) => { $value.fold($hash) };
     (address_match, $hash:expr, $value:expr)   => { $value.fold($hash) };
     (protocol_match, $hash:expr, $value:expr)  => { $value.fold($hash) };
@@ -278,12 +282,21 @@ configuration_entity! {
     /// one such port, not in the router's set, so neither has anything to
     /// select, and its records are keyed by the name the vocabulary reserves
     /// for it.
+    ///
+    /// It carries a `gateway`, which an [`InterfaceEntry`] does not: this is the
+    /// only port that originates traffic, so it is the only one whose next hop
+    /// anything reads.
     ManagementEntry reads b"management" as ObjectKind::Management,
         keyed by reserved(Identifier::MANAGEMENT), marked 0x03 {
         @field(Enabled) enabled: boolean,
         @field(PrefixLength) prefix_length: prefix_length,
         @field(Mac) mac: mac,
         @field(Address) address: ipv4,
+        /// The station this port hands everything off its own prefix to, or
+        /// `none`. The one attribute no `<interface>` carries: a gateway is
+        /// read only by the outbound dial of the port that holds it, and no
+        /// dataplane port originates traffic to dial with.
+        @field(Gateway) gateway: gateway,
     }
 }
 

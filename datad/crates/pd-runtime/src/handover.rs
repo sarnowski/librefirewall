@@ -363,6 +363,22 @@ fn refusal(error: ConfigImageError) -> (RejectReason, u32) {
         ConfigImageError::ManagementMacCollidesWithInterface { index } => {
             (RejectReason::MacNotUnicast, index as u32)
         }
+        // The gateway's four, located by the value refused on the same terms:
+        // one entry, so there is no index, and the address is what an operator
+        // goes and edits.
+        ConfigImageError::ManagementGatewayStatedNotBoolean { stated } => {
+            (RejectReason::MalformedValue, u32::from(stated))
+        }
+        ConfigImageError::ManagementGatewayNotUnicast { gateway } => {
+            (RejectReason::AddressNotUnicast, u32::from_be_bytes(gateway))
+        }
+        ConfigImageError::ManagementGatewayIsTheAddress { gateway } => (
+            RejectReason::GatewayIsTheLocalAddress,
+            u32::from_be_bytes(gateway),
+        ),
+        ConfigImageError::ManagementGatewayOffLink { gateway } => {
+            (RejectReason::GatewayNotOnLink, u32::from_be_bytes(gateway))
+        }
     }
 }
 
@@ -953,10 +969,12 @@ mod tests {
         wire::ManagementImage {
             enabled: 1,
             prefix_length: 24,
-            _pad: [0; 2],
+            gateway_stated: 1,
+            _pad: [0; 1],
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
             _pad2: [0; 2],
             address: [10, 0, 2, 15],
+            gateway: [10, 0, 2, 2],
         }
     }
 

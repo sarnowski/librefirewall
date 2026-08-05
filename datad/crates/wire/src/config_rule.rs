@@ -106,6 +106,15 @@ config_rules! {
         ManagementAddressIsAHostAddress,
         ManagementPrefixDoesNotCollideWithInterface,
         ManagementMacDoesNotCollideWithInterface,
+        /// A gateway is stated or it is not; there is no third byte.
+        ManagementGatewayIsStatedOrNot,
+        ManagementGatewayIsUnicast,
+        /// A stated gateway is on the management port's own link, which is the
+        /// only place a station could answer for it.
+        ManagementGatewayIsOnLink,
+        /// A stated gateway is not the management port's own address, which
+        /// would route every off-prefix datagram back to this node.
+        ManagementGatewayIsNotTheAddress,
 
         /// More filter rules than the image has slots for.
         RuleCountWithinCapacity,
@@ -196,7 +205,15 @@ impl ConfigRule {
             | Self::ManagementAddressIsUnicast
             | Self::ManagementAddressIsAHostAddress
             | Self::ManagementPrefixDoesNotCollideWithInterface
-            | Self::ManagementMacDoesNotCollideWithInterface => Enforcement::RefusesWhenEnabled,
+            | Self::ManagementMacDoesNotCollideWithInterface
+            // The gateway's own four, conditional for the same reason and one
+            // step further: a disabled entry leaves the address uninterpreted,
+            // and every rule below is about a gateway's relationship to that
+            // address rather than about the gateway alone.
+            | Self::ManagementGatewayIsStatedOrNot
+            | Self::ManagementGatewayIsUnicast
+            | Self::ManagementGatewayIsOnLink
+            | Self::ManagementGatewayIsNotTheAddress => Enforcement::RefusesWhenEnabled,
 
             // A neighbour's identity is absent from the image — the entry
             // carries a port, a MAC and an address — so two neighbours under

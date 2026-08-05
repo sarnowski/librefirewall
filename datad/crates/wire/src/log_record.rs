@@ -78,13 +78,13 @@ pub const LOG_CHANGE_KIND_COUNT: u8 = 3;
 pub const LOG_OBJECT_KIND_COUNT: u8 = 4;
 
 /// `lfw_log::Field::ALL`.
-pub const LOG_FIELD_COUNT: u8 = 17;
+pub const LOG_FIELD_COUNT: u8 = 18;
 
 /// `lfw_log::GenerationOutcome::ALL`.
 pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
 
 /// `lfw_log::RejectReason::ALL`.
-pub const LOG_REJECT_REASON_COUNT: u8 = 36;
+pub const LOG_REJECT_REASON_COUNT: u8 = 38;
 
 /// Whether a record's instant is one or is the absence of one.
 ///

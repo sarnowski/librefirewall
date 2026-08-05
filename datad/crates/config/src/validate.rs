@@ -57,6 +57,9 @@ pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
         | ConfigRule::InterfaceEnabledIsBoolean
         | ConfigRule::InterfaceIdIsWellFormed
         | ConfigRule::ManagementEnabledIsBoolean
+        // Parsed into a two-armed enum: a document either writes an address or
+        // writes `none`, and neither reading leaves a third byte to refuse.
+        | ConfigRule::ManagementGatewayIsStatedOrNot
         // A neighbour names an interface, never a port: the port it ends up on
         // is the one that interface holds, and that one is already a port this
         // build has by `InterfacePortExists`.
@@ -95,6 +98,9 @@ pub const fn model_enforcement(rule: ConfigRule) -> Enforcement {
         | ConfigRule::ManagementAddressIsAHostAddress
         | ConfigRule::ManagementPrefixDoesNotCollideWithInterface
         | ConfigRule::ManagementMacDoesNotCollideWithInterface
+        | ConfigRule::ManagementGatewayIsUnicast
+        | ConfigRule::ManagementGatewayIsOnLink
+        | ConfigRule::ManagementGatewayIsNotTheAddress
         | ConfigRule::RuleIdIsUnique
         | ConfigRule::RuleIngressResolves
         | ConfigRule::RuleEgressResolves
@@ -219,6 +225,15 @@ pub enum SemanticError {
     ManagementMacCollidesWithInterface {
         other: Identifier,
     },
+    /// A gateway no frame may be addressed towards, on
+    /// [`Self::ManagementAddressNotUnicast`]'s terms.
+    ManagementGatewayNotUnicast,
+    /// A gateway equal to the management port's own address, which would hand
+    /// every off-prefix datagram back to this node.
+    ManagementGatewayIsTheAddress,
+    /// A gateway outside the management port's prefix, which no station on that
+    /// link can answer for.
+    ManagementGatewayNotOnLink,
     DuplicateRuleId {
         id: Identifier,
     },
@@ -300,7 +315,10 @@ impl SemanticError {
             | Self::ManagementAddressNotAHostAddress
             | Self::ManagementMacNotUnicast
             | Self::ManagementPrefixCollidesWithInterface { .. }
-            | Self::ManagementMacCollidesWithInterface { .. } => Identifier::MANAGEMENT,
+            | Self::ManagementMacCollidesWithInterface { .. }
+            | Self::ManagementGatewayNotUnicast
+            | Self::ManagementGatewayIsTheAddress
+            | Self::ManagementGatewayNotOnLink => Identifier::MANAGEMENT,
         }
     }
 
@@ -341,6 +359,13 @@ impl SemanticError {
                 RejectReason::MacNotUnicast
             }
             Self::ManagementPrefixCollidesWithInterface { .. } => RejectReason::OverlappingPrefixes,
+            // The vocabulary already had the word for an address no frame may
+            // be addressed towards, and a gateway is one; the other two are
+            // about a gateway's relationship to its port and have no older
+            // token that would point at the right edit.
+            Self::ManagementGatewayNotUnicast => RejectReason::AddressNotUnicast,
+            Self::ManagementGatewayIsTheAddress => RejectReason::GatewayIsTheLocalAddress,
+            Self::ManagementGatewayNotOnLink => RejectReason::GatewayNotOnLink,
             Self::RenderingTooLarge { .. } => RejectReason::RenderingTooLarge,
         }
     }
@@ -511,6 +536,26 @@ fn management(model: &Model) -> Result<(), SemanticError> {
             });
         }
     }
+    // Last, because every rule about a gateway is a rule about its
+    // relationship to the address above: judging one against an address that
+    // is not yet known to be a host address on a legal prefix would report the
+    // gateway for a fault the address has.
+    //
+    // The route decision judges the same three again where it composes a frame,
+    // and the duplication is deliberate — this is the early refusal, naming the
+    // attribute an operator edits while they are still editing it, not the only
+    // check standing between a bad gateway and a frame.
+    if let Some(gateway) = entry.gateway.stated() {
+        if !gateway.is_unicast() {
+            return Err(SemanticError::ManagementGatewayNotUnicast);
+        }
+        if gateway == entry.address {
+            return Err(SemanticError::ManagementGatewayIsTheAddress);
+        }
+        if !gateway.shares_prefix(entry.address, entry.prefix_length) {
+            return Err(SemanticError::ManagementGatewayNotOnLink);
+        }
+    }
     Ok(())
 }
 
@@ -666,6 +711,7 @@ fn overlaps(left: Ipv4Address, left_len: u8, right: Ipv4Address, right_len: u8) 
 mod tests {
     use super::*;
     use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
+    use crate::gateway::Gateway;
     use crate::rule::RuleAction;
     use net_headers::MacAddress;
     use proptest::prelude::*;
@@ -735,6 +781,7 @@ mod tests {
                 mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
                 address: Ipv4Address::from_octets([192, 168, 42, 15]),
                 prefix_length: 24,
+                gateway: Gateway::Stated(Ipv4Address::from_octets([192, 168, 42, 1])),
             })
             .expect("one");
         model
@@ -748,6 +795,7 @@ mod tests {
             mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
             address: Ipv4Address::from_octets([192, 168, 42, 15]),
             prefix_length: 24,
+            gateway: Gateway::Stated(Ipv4Address::from_octets([192, 168, 42, 1])),
         }
     }
 
@@ -1196,6 +1244,59 @@ mod tests {
         }
     }
 
+    /// The gateway's three, each one about the gateway's relationship to the
+    /// port that would use it rather than about the address on its own.
+    #[test]
+    fn a_gateway_the_management_port_could_not_reach_is_refused_by_its_own_rule() {
+        // Stating none is the other legal answer, not a lesser one.
+        validate(&with_management(ManagementEntry {
+            gateway: Gateway::None,
+            ..management_entry()
+        }))
+        .expect("a port that reaches only its own link");
+
+        let cases: [(Ipv4Address, SemanticError, RejectReason); 5] = [
+            (
+                Ipv4Address::from_octets([224, 0, 0, 1]),
+                SemanticError::ManagementGatewayNotUnicast,
+                RejectReason::AddressNotUnicast,
+            ),
+            (
+                Ipv4Address::from_octets([255, 255, 255, 255]),
+                SemanticError::ManagementGatewayNotUnicast,
+                RejectReason::AddressNotUnicast,
+            ),
+            (
+                // The port's own address: every off-prefix datagram would come
+                // straight back to this node.
+                Ipv4Address::from_octets([192, 168, 42, 15]),
+                SemanticError::ManagementGatewayIsTheAddress,
+                RejectReason::GatewayIsTheLocalAddress,
+            ),
+            (
+                Ipv4Address::from_octets([192, 168, 43, 1]),
+                SemanticError::ManagementGatewayNotOnLink,
+                RejectReason::GatewayNotOnLink,
+            ),
+            (
+                // On a dataplane interface's link, which is no better: this
+                // port cannot reach that one.
+                Ipv4Address::from_octets([10, 0, 0, 1]),
+                SemanticError::ManagementGatewayNotOnLink,
+                RejectReason::GatewayNotOnLink,
+            ),
+        ];
+        for (gateway, expected, reason) in cases {
+            let error = refusal(&with_management(ManagementEntry {
+                gateway: Gateway::Stated(gateway),
+                ..management_entry()
+            }));
+            assert_eq!(error, expected, "{gateway}");
+            assert_eq!(error.id(), Identifier::MANAGEMENT);
+            assert_eq!(error.reason(), reason);
+        }
+    }
+
     /// A disabled management interface is held to every one of those rules: the
     /// port is unaddressed today and the document is what an operator will
     /// enable tomorrow, so a collision refused only when enabled is a collision
@@ -1284,6 +1385,9 @@ mod tests {
             SemanticError::ManagementMacNotUnicast,
             SemanticError::ManagementPrefixCollidesWithInterface { other: two },
             SemanticError::ManagementMacCollidesWithInterface { other: two },
+            SemanticError::ManagementGatewayNotUnicast,
+            SemanticError::ManagementGatewayIsTheAddress,
+            SemanticError::ManagementGatewayNotOnLink,
         ] {
             assert_eq!(variant.id(), Identifier::MANAGEMENT, "{variant:?}");
             assert!(RejectReason::ALL.contains(&variant.reason()), "{variant:?}");
@@ -1312,6 +1416,7 @@ mod tests {
             | ConfigRule::InterfaceEnabledIsBoolean
             | ConfigRule::InterfaceIdIsWellFormed
             | ConfigRule::ManagementEnabledIsBoolean
+            | ConfigRule::ManagementGatewayIsStatedOrNot
             | ConfigRule::NeighbourPortExists => return None,
 
             ConfigRule::InterfacePortExists => {
@@ -1407,6 +1512,18 @@ mod tests {
             }
             ConfigRule::ManagementPrefixDoesNotCollideWithInterface => {
                 management.address = first.address;
+                with_management(management)
+            }
+            ConfigRule::ManagementGatewayIsUnicast => {
+                management.gateway = Gateway::Stated(Ipv4Address::from_octets([224, 0, 0, 1]));
+                with_management(management)
+            }
+            ConfigRule::ManagementGatewayIsOnLink => {
+                management.gateway = Gateway::Stated(Ipv4Address::from_octets([10, 9, 9, 1]));
+                with_management(management)
+            }
+            ConfigRule::ManagementGatewayIsNotTheAddress => {
+                management.gateway = Gateway::Stated(management.address);
                 with_management(management)
             }
             ConfigRule::ManagementMacDoesNotCollideWithInterface => {
@@ -1536,6 +1653,7 @@ mod tests {
                 prefix_length: 24,
                 mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x5f]),
                 address: Ipv4Address::from_octets([192, 168, 42, 15]),
+                gateway: Gateway::Stated(Ipv4Address::from_octets([192, 168, 42, 1])),
             })
             .expect("the first");
         loop {

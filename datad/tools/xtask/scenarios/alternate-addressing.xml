@@ -45,5 +45,5 @@
               source-port="any" destination-port="5000" icmp-type="any" tracking="opening" action="accept"/>
     </rules>
     <management mac="52:54:00:ab:cd:e2" address="172.20.7.20"
-                prefix-length="25" enabled="true"/>
+                prefix-length="25" enabled="true" gateway="172.20.7.2"/>
 </configuration>

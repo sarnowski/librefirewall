@@ -10,9 +10,12 @@
 use lfw_log::Identifier;
 use net_headers::{Ipv4Address, MacAddress, Protocol};
 
-use crate::rule::{
-    AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
-    TrackingMatch,
+use crate::{
+    gateway::{self, Gateway},
+    rule::{
+        AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction,
+        TrackingMatch,
+    },
 };
 
 /// Why a value is not the thing its attribute names.
@@ -105,6 +108,17 @@ pub fn mac(bytes: &[u8]) -> Result<MacAddress, ValueError> {
 /// `enabled` is: a rule that matches everything is the widest thing an operator
 /// can write, and it is written rather than inferred from an omission.
 const ANY: &[u8] = b"any";
+
+/// # Errors
+/// [`ValueError`] for anything but `none` or one dotted quad. Whether the
+/// address is one the port that holds it could reach is decided later against
+/// the model; the shape is well formed either way.
+pub fn gateway(bytes: &[u8]) -> Result<Gateway, ValueError> {
+    if bytes == gateway::NONE.as_str().as_bytes() {
+        return Ok(Gateway::None);
+    }
+    ipv4(bytes).map(Gateway::Stated)
+}
 
 /// # Errors
 /// [`ValueError::Malformed`] for anything but `any` or an identifier.
@@ -305,6 +319,27 @@ mod tests {
         }
     }
 
+    /// The absence is a word, not an omission and not a reserved address: no
+    /// IPv4 address is spare to mean "no gateway", and an attribute left out
+    /// reads the same as one misspelled.
+    #[test]
+    fn a_gateway_is_an_address_or_the_word_for_having_none() {
+        assert_eq!(gateway(b"none"), Ok(Gateway::None));
+        assert_eq!(
+            gateway(b"10.0.2.2"),
+            Ok(Gateway::Stated(Ipv4Address::from_octets([10, 0, 2, 2])))
+        );
+        // 0.0.0.0 parses as an address and is refused later as one, rather
+        // than being a second spelling of `none` here.
+        assert_eq!(
+            gateway(b"0.0.0.0"),
+            Ok(Gateway::Stated(Ipv4Address::from_octets([0, 0, 0, 0])))
+        );
+        for text in [&b""[..], b"any", b"NONE", b"none ", b"10.0.2", b"-"] {
+            assert_eq!(gateway(text), Err(ValueError::Malformed), "{text:?}");
+        }
+    }
+
     #[test]
     fn a_boolean_is_spelled_out_in_full() {
         assert_eq!(boolean(b"true"), Ok(true));
@@ -410,6 +445,7 @@ mod tests {
             let _ = prefix_length(&bytes);
             let _ = ipv4(&bytes);
             let _ = mac(&bytes);
+            let _ = gateway(&bytes);
         }
 
         /// Everything the grammars admit is accepted, so the refusal set is

@@ -48,6 +48,7 @@
 
 pub mod diff;
 pub mod entity;
+pub mod gateway;
 pub mod hash;
 pub mod model;
 pub mod render;
@@ -64,6 +65,7 @@ use lfw_log::RejectReason;
 
 pub use diff::{Change, Records, diff};
 pub use entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
+pub use gateway::Gateway;
 pub use hash::{ContentHash, content_hash};
 pub use lfw_log::Identifier;
 pub use model::{Full, Model};
@@ -138,7 +140,7 @@ mod tests {
         "               address=\"10.0.0.2\" mac=\"52:54:00:00:00:0a\"/>\n",
         "  </neighbours>\n  <rules/>\n",
         "  <management mac=\"52:54:00:12:34:52\" address=\"192.168.42.15\"\n",
-        "              prefix-length=\"24\" enabled=\"true\"/>\n",
+        "              prefix-length=\"24\" enabled=\"true\" gateway=\"none\"/>\n",
         "</configuration>\n"
     );
 

@@ -46,6 +46,14 @@ configuration pushed over the channel can never change the endpoint. Keeping the
 document's schema makes that structural: a pushed document cannot even *express* an endpoint change,
 which is stronger than any validation rule that would have to reject one.
 
+The management port's **gateway** is in the document, and the two are not in tension. A gateway is a
+routing fact — which station on this link carries traffic off it — and it changes with the site an
+appliance is installed at, so it belongs with the rest of the addressing an operator maintains. An
+endpoint is an ownership fact: which management server this appliance answers to. A pushed document
+may move the appliance's traffic onto a different first hop, and the reachability that gives it is
+the point; it may not change *who it is talking to*, and it cannot, because there is no attribute
+for one.
+
 `configuration.xml` is an ordinary configuration document, validated by the same reader and the same
 rules as any other, and it may carry substantial inherited configuration — the management server
 composes it so a freshly onboarded appliance comes up with the connectivity it needs to dial out.

@@ -131,7 +131,7 @@ fn an_empty_section_is_stated_as_the_empty_element() {
     let bare = concat!(
         "<configuration><interfaces/><neighbours/><rules/>",
         "<management enabled=\"false\" mac=\"52:54:00:12:34:52\" ",
-        "address=\"192.168.42.15\" prefix-length=\"24\"/>",
+        "address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/>",
         "</configuration>"
     );
     let stated = rendered(&load(bare.as_bytes()).expect("an empty configuration"));
@@ -222,7 +222,7 @@ mod widest {
             "<configuration><interfaces>{interfaces}</interfaces>\
              <neighbours>{neighbours}</neighbours><rules>{policy}</rules>\
              <management enabled=\"true\" mac=\"52:54:00:12:34:5f\" \
-             address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
+             address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/></configuration>"
         )
     }
 }
@@ -317,7 +317,7 @@ proptest! {
             "<configuration><interfaces>{ifaces}</interfaces>\
              <neighbours>{neigh}</neighbours><rules/>\
              <management enabled=\"true\" mac=\"52:54:00:12:34:52\" \
-             address=\"192.168.42.15\" prefix-length=\"24\"/></configuration>"
+             address=\"192.168.42.15\" prefix-length=\"24\" gateway=\"none\"/></configuration>"
         );
         // A port used twice is refused, which is a fixture limit rather than a
         // property: only the documents that read are about anything here.

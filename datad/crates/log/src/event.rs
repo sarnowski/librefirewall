@@ -120,6 +120,10 @@ closed_vocabulary! {
         Mac => "mac",
         Address => "address",
         PrefixLength => "prefix-length",
+        /// The station the management port hands its own outbound traffic to
+        /// for anything off its prefix. `none` where the operator stated no
+        /// gateway, spelled rather than omitted like every other value here.
+        Gateway => "gateway",
         Interface => "interface",
         /// A rule's own name. A field rather than the key its records are
         /// filed under, unlike every other object: a rule is identified by
@@ -227,6 +231,20 @@ closed_vocabulary! {
         /// coarser than the fault tree it summarises — it may not point away from
         /// the thing at fault.
         HandoverNotOnePublication => "handover-not-one-publication",
+        /// A gateway outside the prefix of the port that would use it, so no
+        /// station on that link can answer for it. Its own token rather than
+        /// `neighbour-outside-prefix`: that one names an object with an id to
+        /// go and edit, and this names an attribute of the management port.
+        ///
+        /// Appended here rather than filed beside the other semantic reasons,
+        /// which is what the order above is for: a token's position is the wire
+        /// encoding, so a reason inserted among them would renumber every one
+        /// that followed it.
+        GatewayNotOnLink => "gateway-not-on-link",
+        /// A gateway equal to the address of the port that would use it, which
+        /// would hand every off-prefix datagram back to this node. Appended for
+        /// the reason above.
+        GatewayIsTheLocalAddress => "gateway-is-the-local-address",
     }
 }
 

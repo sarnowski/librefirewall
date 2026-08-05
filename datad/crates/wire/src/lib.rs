@@ -296,17 +296,34 @@ shared_image! {
     /// It carries no port, unlike an [`InterfaceImage`]: the management port is
     /// not in the router's port set and no number in this image can put it
     /// there.
-    ManagementImage mirrored by ManagementSlot, 16 bytes aligned 1 {
+    ///
+    /// It carries a gateway, which an [`InterfaceImage`] does not. The
+    /// asymmetry is the point rather than an omission: the only thing that
+    /// reads a gateway is the outbound dial of the port it belongs to, and no
+    /// dataplane port has one — the forwarder decides an egress from the
+    /// prefixes it holds and hands the frame to a neighbour, never to a next
+    /// hop of its own. A gateway beside an interface would be a field nothing
+    /// in this build can read.
+    ManagementImage mirrored by ManagementSlot, 20 bytes aligned 1 {
         /// 0 or 1 as raw bits, on [`InterfaceImage::enabled`]'s terms. A zero
         /// here is what a zeroed region says, and it is why every other field
         /// below is left uninterpreted in that case.
         @0 enabled: byte,
         @1 prefix_length: byte,
-        @2 _pad: padding(2),
+        /// Whether `gateway` states one at all, 0 or 1 as raw bits, on
+        /// [`RuleImage`]'s terms and for its reason: no address is reserved to
+        /// mean "none", so a port that reaches only its own link says so in a
+        /// byte of its own rather than by holding an address an operator could
+        /// also have meant.
+        @2 gateway_stated: byte,
+        @3 _pad: padding(1),
         @4 mac: bytes(6),
         @10 _pad2: padding(2),
         /// Network order, as the address appears in a header.
         @12 address: bytes(4),
+        /// The station everything outside `address`'s prefix is handed to.
+        /// Uninterpreted where `gateway_stated` is 0, on `enabled`'s terms.
+        @16 gateway: bytes(4),
     }
 }
 
@@ -375,7 +392,7 @@ shared_image! {
     /// neighbours — so a zeroed region is already the fail-closed
     /// configuration, which is what lets a domain come up before anything has
     /// been written to it.
-    ConfigImage mirrored by ConfigSlot, 14660 bytes aligned 4 {
+    ConfigImage mirrored by ConfigSlot, 14664 bytes aligned 4 {
         @0 generation: word,
         /// How many of `interfaces` the writer filled, as raw bits:
         /// peer-written, so it may name more than the array holds.
@@ -388,13 +405,13 @@ shared_image! {
         /// either of them wrote.
         @12 digest: digest,
         @16 management: nested(ManagementImage, ManagementSlot),
-        @32 interfaces: array(InterfaceImage, InterfaceSlot, MAX_INTERFACES),
-        @320 neighbours: array(NeighbourImage, NeighbourSlot, MAX_NEIGHBOURS),
-        @832 rule_count: word,
+        @36 interfaces: array(InterfaceImage, InterfaceSlot, MAX_INTERFACES),
+        @324 neighbours: array(NeighbourImage, NeighbourSlot, MAX_NEIGHBOURS),
+        @836 rule_count: word,
         /// **In document order**, which is the one order that is a decision
         /// rather than a layout: a ruleset is first-match-wins, so a writer
         /// that reordered these would be rewriting the policy.
-        @836 rules: array(RuleImage, RuleSlot, MAX_RULES),
+        @840 rules: array(RuleImage, RuleSlot, MAX_RULES),
     }
 }
 
@@ -437,9 +454,11 @@ impl ConfigImage {
     /// the two counts, then each interface's own fields in index order, then the
     /// rules between two interfaces, then each neighbour against the interface
     /// its port names, then the rules between two neighbours, then the
-    /// management entry and finally the two that hold it apart from the
-    /// dataplane. An image breaking several rules is attributed to the first,
-    /// so a refusal sends its reader to one place.
+    /// management entry, then the two that hold it apart from the dataplane,
+    /// and finally its gateway — last because every rule about a gateway is a
+    /// rule about its relationship to the address checked above it. An image
+    /// breaking several rules is attributed to the first, so a refusal sends
+    /// its reader to one place.
     ///
     /// # Two rules this cannot re-decide
     ///
@@ -921,6 +940,27 @@ pub enum ConfigImageError {
     ManagementMacCollidesWithInterface {
         index: usize,
     },
+    /// A gateway's stated flag that is neither 0 nor 1, on
+    /// [`Self::RuleCriterionStatedNotBoolean`]'s terms.
+    ManagementGatewayStatedNotBoolean {
+        stated: u8,
+    },
+    /// A gateway no frame may be addressed towards, so a port holding one
+    /// reaches nothing off its own link and reports the wrong reason for it.
+    ManagementGatewayNotUnicast {
+        gateway: [u8; 4],
+    },
+    /// A gateway equal to the management port's own address, which would hand
+    /// every off-prefix datagram back to this node.
+    ManagementGatewayIsTheAddress {
+        gateway: [u8; 4],
+    },
+    /// A gateway outside the management port's own prefix. No station on that
+    /// link can legitimately answer for it, so the only reply it could draw is
+    /// one from a station claiming an address it does not hold.
+    ManagementGatewayOffLink {
+        gateway: [u8; 4],
+    },
     RuleCountExceedsCapacity {
         count: u32,
     },
@@ -1163,6 +1203,24 @@ impl fmt::Display for ConfigImageError {
             ),
             Self::ManagementMacCollidesWithInterface { index } => {
                 write!(f, "management shares its MAC with interface {index}")
+            }
+            Self::ManagementGatewayStatedNotBoolean { stated } => {
+                write!(f, "management gateway stated byte {stated} is not 0 or 1")
+            }
+            Self::ManagementGatewayNotUnicast { gateway } => {
+                f.write_str("management gateway ")?;
+                write_address(f, *gateway)?;
+                f.write_str(" is not a unicast address")
+            }
+            Self::ManagementGatewayIsTheAddress { gateway } => {
+                f.write_str("management gateway ")?;
+                write_address(f, *gateway)?;
+                f.write_str(" is the management address itself")
+            }
+            Self::ManagementGatewayOffLink { gateway } => {
+                f.write_str("management gateway ")?;
+                write_address(f, *gateway)?;
+                f.write_str(" is outside the management prefix")
             }
             Self::RuleCountExceedsCapacity { count } => write!(
                 f,
@@ -1484,8 +1542,10 @@ fn check_management(
     let ManagementImage {
         enabled,
         prefix_length,
+        gateway_stated,
         mac,
         address,
+        gateway,
         ..
     } = *raw;
 
@@ -1519,10 +1579,31 @@ fn check_management(
             return Err(ConfigImageError::ManagementMacCollidesWithInterface { index });
         }
     }
+    // Last, and judged against the address above rather than on its own: every
+    // rule here is about the gateway's relationship to the port that would use
+    // it, so an image whose address is not yet known to be a host address on a
+    // legal prefix has nothing to judge a gateway against.
+    let gateway = match gateway_stated {
+        0 => None,
+        1 => Some(gateway),
+        stated => return Err(ConfigImageError::ManagementGatewayStatedNotBoolean { stated }),
+    };
+    if let Some(gateway) = gateway {
+        if !is_unicast_address(gateway) {
+            return Err(ConfigImageError::ManagementGatewayNotUnicast { gateway });
+        }
+        if gateway == address {
+            return Err(ConfigImageError::ManagementGatewayIsTheAddress { gateway });
+        }
+        if !inside_prefix(gateway, address, prefix_length) {
+            return Err(ConfigImageError::ManagementGatewayOffLink { gateway });
+        }
+    }
     Ok(Some(CheckedManagement {
         prefix_length,
         mac,
         address,
+        gateway,
     }))
 }
 
@@ -1796,6 +1877,12 @@ checked_value! {
         mac: [u8; 6],
         /// Network order, as the address appears in a header.
         address: [u8; 4],
+        /// The station everything outside this port's prefix is handed to, or
+        /// `None` where the operator stated none — then the port reaches its
+        /// own link and nothing else. Holding a `Some` is the proof that the
+        /// address is unicast, is not this port's own, and is on this port's
+        /// link.
+        gateway: Option<[u8; 4]>,
     }
 }
 
@@ -1951,7 +2038,7 @@ impl<'image> CheckedConfig<'image> {
 // does, and no declaration above covers them: `ConfigHandover` is the image
 // plus a header rather than an image of its own.
 const _: () = {
-    assert!(size_of::<ConfigHandover>() == 14_672);
+    assert!(size_of::<ConfigHandover>() == 14_676);
     assert!(align_of::<ConfigHandover>() == 4);
     assert!(offset_of!(ConfigHandover, offered) == 0);
     assert!(offset_of!(ConfigHandover, committed) == 4);
@@ -2688,6 +2775,88 @@ mod tests {
         }
     }
 
+    /// The gateway's own four, which are the only rules here about one field's
+    /// relationship to another: every one of them is judged against the address
+    /// above rather than on the gateway alone.
+    #[test]
+    fn a_gateway_the_management_port_could_not_reach_is_refused_by_its_own_rule() {
+        let enabled = ManagementImage {
+            enabled: 1,
+            prefix_length: 24,
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x52],
+            address: [10, 0, 2, 15],
+            ..ManagementImage::ZERO
+        };
+        let with = |management: ManagementImage| {
+            let mut raw = image(1, 1);
+            raw.management = management;
+            resealed(&mut raw).check(PORTS).map(|_| ())
+        };
+
+        // Stating none is not stating a bad one: the zeroed gateway beside a
+        // zero flag is exactly what a zeroed region holds.
+        with(enabled).expect("no gateway is a gateway rule breaks nothing");
+        with(ManagementImage {
+            gateway_stated: 1,
+            gateway: [10, 0, 2, 2],
+            ..enabled
+        })
+        .expect("a station on this port's own link");
+
+        for stated in [2u8, 3, 0xff] {
+            assert_eq!(
+                with(ManagementImage {
+                    gateway_stated: stated,
+                    gateway: [10, 0, 2, 2],
+                    ..enabled
+                }),
+                Err(ConfigImageError::ManagementGatewayStatedNotBoolean { stated })
+            );
+        }
+        for gateway in [[224, 0, 0, 1], [127, 0, 0, 1], [0; 4], [255; 4]] {
+            assert_eq!(
+                with(ManagementImage {
+                    gateway_stated: 1,
+                    gateway,
+                    ..enabled
+                }),
+                Err(ConfigImageError::ManagementGatewayNotUnicast { gateway }),
+                "{gateway:?}"
+            );
+        }
+        assert_eq!(
+            with(ManagementImage {
+                gateway_stated: 1,
+                gateway: [10, 0, 2, 15],
+                ..enabled
+            }),
+            Err(ConfigImageError::ManagementGatewayIsTheAddress {
+                gateway: [10, 0, 2, 15]
+            })
+        );
+        for gateway in [[10, 0, 3, 1], [192, 168, 0, 1]] {
+            assert_eq!(
+                with(ManagementImage {
+                    gateway_stated: 1,
+                    gateway,
+                    ..enabled
+                }),
+                Err(ConfigImageError::ManagementGatewayOffLink { gateway }),
+                "{gateway:?}"
+            );
+        }
+
+        // A disabled entry leaves the gateway uninterpreted like every other
+        // field, so none of the four can refuse one.
+        with(ManagementImage {
+            enabled: 0,
+            gateway_stated: 0xff,
+            gateway: [255; 4],
+            ..enabled
+        })
+        .expect("a disabled entry has no gateway to be about");
+    }
+
     /// The two rules the capability grants cannot express, and so the two a
     /// compromised writer would otherwise have had entirely to itself: one
     /// address the appliance would both route towards and terminate on, and one
@@ -2743,7 +2912,7 @@ mod tests {
         raw.interfaces[0]._pad2 = [0xbb; 2];
         raw.neighbours[0]._pad = [0xcc; 3];
         raw.neighbours[0]._pad2 = [0xdd; 2];
-        raw.management._pad = [0xee; 2];
+        raw.management._pad = [0xee; 1];
         raw.management._pad2 = [0xff; 2];
         assert_eq!(resealed(&mut raw).check(PORTS), image(1, 1).check(PORTS));
     }
@@ -2752,16 +2921,16 @@ mod tests {
     fn the_layout_the_reading_domain_maps_is_the_recorded_one() {
         assert_eq!(size_of::<InterfaceImage>(), 36);
         assert_eq!(size_of::<NeighbourImage>(), 16);
-        assert_eq!(size_of::<ManagementImage>(), 16);
+        assert_eq!(size_of::<ManagementImage>(), 20);
         assert_eq!(size_of::<RuleImage>(), 54);
-        assert_eq!(size_of::<ConfigImage>(), 14_660);
-        assert_eq!(size_of::<ConfigHandover>(), 14_672);
+        assert_eq!(size_of::<ConfigImage>(), 14_664);
+        assert_eq!(size_of::<ConfigHandover>(), 14_676);
         assert_eq!(size_of::<ConfigAck>(), 8);
         assert_eq!(offset_of!(ConfigImage, management), 16);
-        assert_eq!(offset_of!(ConfigImage, interfaces), 32);
-        assert_eq!(offset_of!(ConfigImage, neighbours), 320);
-        assert_eq!(offset_of!(ConfigImage, rule_count), 832);
-        assert_eq!(offset_of!(ConfigImage, rules), 836);
+        assert_eq!(offset_of!(ConfigImage, interfaces), 36);
+        assert_eq!(offset_of!(ConfigImage, neighbours), 324);
+        assert_eq!(offset_of!(ConfigImage, rule_count), 836);
+        assert_eq!(offset_of!(ConfigImage, rules), 840);
         assert_eq!(offset_of!(ConfigHandover, publishing), 8);
         assert_eq!(offset_of!(ConfigHandover, image), 12);
         // The handover region is reserved past what it holds, so its size is
@@ -3309,15 +3478,20 @@ mod tests {
             any::<[u8; 6]>(),
             any::<[u8; 2]>(),
             any::<[u8; 4]>(),
+            any::<[u8; 4]>(),
         )
             .prop_map(
-                |([enabled, prefix_length, pad0, pad1], mac, pad2, address)| ManagementImage {
-                    enabled,
-                    prefix_length,
-                    _pad: [pad0, pad1],
-                    mac,
-                    _pad2: pad2,
-                    address,
+                |([enabled, prefix_length, gateway_stated, pad0], mac, pad2, address, gateway)| {
+                    ManagementImage {
+                        enabled,
+                        prefix_length,
+                        gateway_stated,
+                        _pad: [pad0],
+                        mac,
+                        _pad2: pad2,
+                        address,
+                        gateway,
+                    }
                 },
             )
             .boxed()
@@ -3725,6 +3899,32 @@ mod tests {
                 }
                 if interface.mac == management.mac {
                     return Some(ConfigImageError::ManagementMacCollidesWithInterface { index });
+                }
+            }
+            if management.gateway_stated > 1 {
+                return Some(ConfigImageError::ManagementGatewayStatedNotBoolean {
+                    stated: management.gateway_stated,
+                });
+            }
+            if management.gateway_stated == 1 {
+                if !is_unicast_address(management.gateway) {
+                    return Some(ConfigImageError::ManagementGatewayNotUnicast {
+                        gateway: management.gateway,
+                    });
+                }
+                if management.gateway == management.address {
+                    return Some(ConfigImageError::ManagementGatewayIsTheAddress {
+                        gateway: management.gateway,
+                    });
+                }
+                if !inside_prefix(
+                    management.gateway,
+                    management.address,
+                    management.prefix_length,
+                ) {
+                    return Some(ConfigImageError::ManagementGatewayOffLink {
+                        gateway: management.gateway,
+                    });
                 }
             }
         }

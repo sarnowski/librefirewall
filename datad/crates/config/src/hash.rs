@@ -95,6 +95,7 @@ pub(crate) fn fold_identifier(hash: u32, id: Identifier) -> u32 {
 mod tests {
     use super::*;
     use crate::entity::{InterfaceEntry, NeighbourEntry};
+    use crate::gateway::Gateway;
     use net_headers::{Ipv4Address, MacAddress};
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
@@ -184,6 +185,7 @@ mod tests {
                 mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
                 address: Ipv4Address::from_octets([10, 0, 2, 15]),
                 prefix_length: 24,
+                gateway: Gateway::Stated(Ipv4Address::from_octets([10, 0, 2, 1])),
             };
             change(&mut entry);
             model.set_management(entry).expect("one");

@@ -97,8 +97,9 @@ const RULE_BYTES: usize = 54;
 const RULE_COUNT_BYTES: usize = 4;
 
 /// Bytes of the management entry, which sits between the header and the
-/// interfaces.
-const MANAGEMENT_BYTES: usize = 16;
+/// interfaces: the enable and prefix bytes, the gateway's stated flag, a pad,
+/// the MAC and its pad, the address, and the gateway.
+const MANAGEMENT_BYTES: usize = 20;
 
 /// Bytes of the four header words the management entry follows.
 const HEADER_BYTES: usize = 16;
@@ -611,6 +612,34 @@ fn refusal(image: &ConfigImage, port_count: u8) -> Option<ConfigImageError> {
                 return Some(ConfigImageError::ManagementMacCollidesWithInterface { index });
             }
         }
+        // The gateway last, and every one of these is about its relationship
+        // to the address above rather than about the gateway alone.
+        if management.gateway_stated > 1 {
+            return Some(ConfigImageError::ManagementGatewayStatedNotBoolean {
+                stated: management.gateway_stated,
+            });
+        }
+        if management.gateway_stated == 1 {
+            if !is_unicast_address(management.gateway) {
+                return Some(ConfigImageError::ManagementGatewayNotUnicast {
+                    gateway: management.gateway,
+                });
+            }
+            if management.gateway == management.address {
+                return Some(ConfigImageError::ManagementGatewayIsTheAddress {
+                    gateway: management.gateway,
+                });
+            }
+            if !inside_prefix(
+                management.gateway,
+                management.address,
+                management.prefix_length,
+            ) {
+                return Some(ConfigImageError::ManagementGatewayOffLink {
+                    gateway: management.gateway,
+                });
+            }
+        }
     }
 
     None
@@ -946,10 +975,12 @@ pub fn image_from_region(data: &[u8]) -> ConfigImage {
         management: wire::ManagementImage {
             enabled: byte(&mut unstructured),
             prefix_length: byte(&mut unstructured),
-            _pad: bytes(&mut unstructured),
+            gateway_stated: byte(&mut unstructured),
+            _pad: [byte(&mut unstructured); 1],
             mac: bytes(&mut unstructured),
             _pad2: bytes(&mut unstructured),
             address: bytes(&mut unstructured),
+            gateway: bytes(&mut unstructured),
         },
         ..ConfigImage::ZERO
     };

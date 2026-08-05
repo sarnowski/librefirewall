@@ -12,6 +12,8 @@ use lfw_log::Identifier;
 use wire::{MAX_INTERFACES, MAX_NEIGHBOURS, MAX_RULES};
 
 use crate::entity::{InterfaceEntry, ManagementEntry, NeighbourEntry, RuleEntry};
+#[cfg(test)]
+use crate::gateway::Gateway;
 
 /// The handover image has a fixed number of slots and there is no allocator, so
 /// an object past the last of them cannot be stored and is not truncated away
@@ -377,6 +379,7 @@ mod tests {
             mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
             address: Ipv4Address::from_octets([10, 0, 2, 15]),
             prefix_length: 24,
+            gateway: Gateway::Stated(Ipv4Address::from_octets([10, 0, 2, 1])),
         }
     }
 

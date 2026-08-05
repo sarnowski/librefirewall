@@ -128,8 +128,10 @@ pub const TCP_MSS: u16 = 1460;
 const _: () = assert!(Ipv4Frame::PAYLOAD_AT + 20 + TCP_MSS as usize <= 2036);
 
 /// Why a configured pair cannot be an endpoint's: the same three rules
-/// `config::validate` holds a `<management>` element to, re-checked because an
-/// image crosses a protection-domain boundary between the two.
+/// `config::validate` holds a `<management>` element's address and prefix to,
+/// re-checked because an image crosses a protection-domain boundary between the
+/// two. The gateway beside them is not among these — this endpoint does not
+/// read one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointError {
     MacNotUnicast { mac: MacAddress },

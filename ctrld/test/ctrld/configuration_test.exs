@@ -27,7 +27,7 @@ defmodule Ctrld.ConfigurationTest do
         <interfaces/>
         <neighbours/>
         <rules/>
-        <management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true"/>
+        <management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true" gateway="10.0.2.2"/>
       </configuration>
       """
 
