@@ -32,11 +32,12 @@
 //! layer, so [`Refusal`] is declared here and a protection domain converts it.
 //! Page granularity is likewise a literal rather than a `wire` dependency.
 //!
-//! The driver accepts exactly one feature bit while *observing* two more. The
-//! two are not the same act: accepting a bit changes what the device is
-//! permitted to produce, whereas observing one tells the caller a fact about
-//! the device it must not guess. [`bringup::ACCEPTED_FEATURES`] and
-//! [`bringup::Live::flush_supported`] are the two halves.
+//! The driver accepts two feature bits while *observing* one more. The two are
+//! not the same act: accepting a bit changes what the device is permitted to
+//! produce — or, for the flush, what it is obliged to honour — whereas observing
+//! one tells the caller a fact about the device it must not guess.
+//! [`bringup::ACCEPTED_FEATURES`] and [`bringup::Live::flush_supported`] are the
+//! two halves.
 
 #![cfg_attr(not(test), no_std)]
 

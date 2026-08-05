@@ -174,15 +174,21 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
     })
 }
 
-/// A job the device may claim to be answering, which is any of the five this
+/// A job the device may claim to be answering, which is any of the seven this
 /// recorder ever submits.
+///
+/// The barrier is among them deliberately: a forged barrier completion is how a
+/// device would try to release a superblock the payload is not yet behind, which
+/// is exactly the authority the ordering exists to deny it.
 fn forged_job(bits: u8) -> Job {
     use lfw_recorder::Which;
-    match bits % 5 {
+    match bits % 7 {
         0 => Job::Flush(Which::Log),
         1 => Job::Flush(Which::Capture),
         2 => Job::Checkpoint(Which::Log),
         3 => Job::Checkpoint(Which::Capture),
+        4 => Job::Barrier(Which::Log),
+        5 => Job::Barrier(Which::Capture),
         _ => Job::Fetch,
     }
 }
@@ -253,6 +259,34 @@ impl Medium for Disk {
         self.window
             .get_mut(offset..offset + len)
             .expect("the window holds every area the layout names")
+    }
+
+    /// A device that negotiated a flush, which is the side of the branch the
+    /// barrier is on. The other side skips the barrier entirely, so it exercises
+    /// strictly less of the pass and is covered by the crate's own suite rather
+    /// than spent on fuzz budget here.
+    fn orders_writes(&self) -> bool {
+        true
+    }
+
+    /// A barrier under the same refusal and failure schedule every other
+    /// submission is under: the input decides, so a device that refuses or fails
+    /// exactly the barrier — the one submission whose failure must stop a
+    /// superblock — is a schedule the corpus can reach.
+    fn barrier(&mut self, job: Job) -> Result<(), Refused> {
+        if self.refuse > 0 {
+            self.refuse -= 1;
+            return Err(Refused);
+        }
+        let ended = if self.fail > 0 {
+            self.fail -= 1;
+            Ended::Failed
+        } else {
+            Ended::Ok { delivered: 0 }
+        };
+        self.ready
+            .push_back((Polled::Settled(Completion { job, ended }), false));
+        Ok(())
     }
 
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused> {

@@ -575,6 +575,37 @@ impl Medium for BlockMedium<'_> {
         }
     }
 
+    /// Whether `VIRTIO_BLK_F_FLUSH` was negotiated with this device. The
+    /// question is the driver's to answer and not this domain's to assume: a
+    /// flush submitted to a device that never negotiated one is a request
+    /// virtio does not define.
+    fn orders_writes(&self) -> bool {
+        self.live.flush_supported()
+    }
+
+    fn barrier(&mut self, job: Job) -> Result<(), Refused> {
+        let Some(slot) = self.outstanding.iter().position(Option::is_none) else {
+            return Err(Refused);
+        };
+        // A flush addresses no range and carries no data segment, so the sector,
+        // address and length below are not part of the request and are not read
+        // (`lfw_blk::request::Operation::Flush`). Zero rather than a plausible
+        // number, so a driver that started reading them would fail visibly.
+        let token = match self.requests.submit(Operation::Flush, 0, 0, 0) {
+            Ok(token) => token,
+            Err(_) => return Err(Refused),
+        };
+        if let Some(entry) = self.outstanding.get_mut(slot) {
+            *entry = Some(Outstanding {
+                token,
+                job,
+                operation: Operation::Flush,
+            });
+        }
+        self.live.ring();
+        Ok(())
+    }
+
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused> {
         let Some(slot) = self.outstanding.iter().position(Option::is_none) else {
             return Err(Refused);

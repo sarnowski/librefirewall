@@ -2,6 +2,14 @@
 //! window is carved into, and the whole of the pass a protection domain runs —
 //! completions, tap records, flushes and downloads.
 //!
+//! # A superblock never becomes visible before the payload it describes
+//!
+//! A device is free to commit writes in any order and to hold earlier ones in a
+//! cache, so a power cut can leave a superblock whose durable cursor points into
+//! payload bytes that never reached the medium — and a reader holding the disk
+//! follows that cursor. A [`Job::Barrier`] between the two removes the
+//! reordering; the [`Checkpointing`] states remove the remembering.
+//!
 //! # The adversary
 //!
 //! Two adversaries at once. The **byzantine neighbour** is on both
@@ -243,6 +251,10 @@ impl Which {
 pub enum Job {
     /// A recording's staged sectors going to the medium.
     Flush(Which),
+    /// A device barrier between a recording's payload reaching the medium and the
+    /// superblock that claims it. It names its recording, so a completion cannot
+    /// release the other one's superblock.
+    Barrier(Which),
     /// A checkpoint superblock going to a recording's extent.
     Checkpoint(Which),
     /// A download's sectors coming back.
@@ -302,13 +314,27 @@ pub struct Refused;
 
 /// The block device, as a recording needs it.
 ///
-/// Three methods and no state machine: submission is asynchronous because the
-/// device is, and hiding that behind a blocking call would put an unbounded
-/// wait on the one domain that must keep draining a tap.
+/// No state machine: submission is asynchronous because the device is, and
+/// hiding that behind a blocking call would put an unbounded wait on the one
+/// domain that must keep draining a tap.
+///
+/// [`barrier`](Self::barrier) is a method rather than a fifth field of a
+/// [`Transfer`], because a barrier addresses no range: as a transfer it would
+/// need a sector and a length nothing reads, which every fake here asserts
+/// containment on.
 pub trait Medium {
     /// The bytes of one staging area — the source or destination of a transfer
     /// naming it. Always exactly `area.extent().1` bytes long.
     fn staging(&mut self, area: Area) -> &mut [u8];
+
+    /// Whether the device honours a barrier.
+    ///
+    /// Where it does not, a checkpoint is written **without** one and durability
+    /// is the device's to decide — a weaker recording, not a refusal, these rings
+    /// being deliberately temporary. Waiting for a barrier such a device never
+    /// completes would leave every extent claiming nothing durable forever, which
+    /// is worse than an unordered checkpoint.
+    fn orders_writes(&self) -> bool;
 
     /// Publish one transfer, answered later by [`poll`](Self::poll) under
     /// `job`.
@@ -316,6 +342,13 @@ pub trait Medium {
     /// # Errors
     /// [`Refused`] when the device cannot take it now; nothing is published.
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused>;
+
+    /// Publish a barrier, answered later by [`poll`](Self::poll) under `job`. It
+    /// completes only once everything already written is on the medium.
+    ///
+    /// # Errors
+    /// [`Refused`] when the device cannot take it now; nothing is published.
+    fn barrier(&mut self, job: Job) -> Result<(), Refused>;
 
     /// Take one completion, or `None` once the device has nothing more. One per
     /// call, so the caller bounds its own drain and a device flooding its used
@@ -507,10 +540,29 @@ pub struct Deck {
     /// The calibration the last pass was given, or `None` while the clock
     /// domain has published nothing this side would use.
     clock: Option<Calibration>,
-    /// The recording whose checkpoint the medium is carrying. One at a time,
-    /// because both share one staging area.
-    checkpointing: Option<Which>,
+    /// How far the one checkpoint in progress has got. One at a time, because
+    /// both recordings share one staging area.
+    checkpointing: Checkpointing,
     counters: RecorderCounters,
+}
+
+/// Where the checkpoint being taken has reached.
+///
+/// What the states buy is that a superblock is submitted only from
+/// [`Checkpointing::Ordered`], which nothing but a settled barrier — or a device
+/// that negotiated none — reaches. The ordering is therefore unskippable rather
+/// than remembered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checkpointing {
+    /// Nothing in progress; a recording with one due arms the next.
+    Idle,
+    /// A barrier is outstanding, so the payload a superblock would claim is not
+    /// yet known to be on the medium.
+    Barrier(Which),
+    /// The payload is ordered against what follows it, so the superblock may go.
+    Ordered(Which),
+    /// The superblock itself is outstanding.
+    Written(Which),
 }
 
 impl Deck {
@@ -545,7 +597,7 @@ impl Deck {
             pinned: None,
             download: Download::Idle,
             clock: None,
-            checkpointing: None,
+            checkpointing: Checkpointing::Idle,
             counters: RecorderCounters::default(),
         })
     }
@@ -605,11 +657,12 @@ impl Deck {
                 .filter(|recording| recording.submitted)
                 .and_then(|recording| recording.in_flight.as_ref())
                 .map(Flush::len),
+            // A barrier moves no bytes, so there is no length to fall short of.
+            Job::Barrier(_) => None,
             // The smaller length a `SuperblockWrite` names, so both copies
             // replaced and one moved still reads as short.
-            Job::Checkpoint(which) => {
-                (self.checkpointing == Some(which)).then_some(SUPERBLOCK_COPY_BYTES)
-            }
+            Job::Checkpoint(which) => (self.checkpointing == Checkpointing::Written(which))
+                .then_some(SUPERBLOCK_COPY_BYTES),
             Job::Fetch => match self.download {
                 Download::Fetching {
                     sectors,
@@ -673,9 +726,25 @@ impl Deck {
                     }
                 }
             }
+            Job::Barrier(which) => {
+                if self.checkpointing == Checkpointing::Barrier(which) {
+                    // A failed barrier writes no superblock: an extent claiming
+                    // bytes the device may not hold is worse than one claiming
+                    // none. The next data flush arms `checkpoint_due` again,
+                    // which bounds the retries to actual progress.
+                    self.checkpointing = if failed {
+                        Checkpointing::Idle
+                    } else {
+                        Checkpointing::Ordered(which)
+                    };
+                } else {
+                    self.counters.completions_unexpected =
+                        self.counters.completions_unexpected.saturating_add(1);
+                }
+            }
             Job::Checkpoint(which) => {
-                if self.checkpointing == Some(which) {
-                    self.checkpointing = None;
+                if self.checkpointing == Checkpointing::Written(which) {
+                    self.checkpointing = Checkpointing::Idle;
                     if !failed && let Some(recording) = self.recordings.get_mut(which.index()) {
                         recording.sink.acknowledge_checkpoint();
                     }
@@ -880,28 +949,74 @@ impl Deck {
         }
     }
 
-    /// Compose and submit one checkpoint superblock, if one is due and the
-    /// shared staging area is free.
+    /// Advance the one checkpoint in progress by a step, or arm one where a
+    /// recording has one due and the shared staging area is free.
     fn checkpoint(&mut self, medium: &mut impl Medium) {
-        if self.checkpointing.is_some() {
-            return;
+        match self.checkpointing {
+            Checkpointing::Idle => self.order_checkpoint(medium),
+            Checkpointing::Ordered(which) => self.write_superblock(which, medium),
+            // Outstanding at the device: the pass has nothing to add until a
+            // completion moves it on.
+            Checkpointing::Barrier(_) | Checkpointing::Written(_) => {}
         }
-        let Some((which, sector)) = self
+    }
+
+    /// Take the barrier one recording's due checkpoint has to sit behind.
+    fn order_checkpoint(&mut self, medium: &mut impl Medium) {
+        let Some(which) = self
             .recordings
             .iter()
             .find(|recording| recording.checkpoint_due)
-            .map(|recording| (recording.which, recording.sink.superblock_sector()))
+            .map(|recording| recording.which)
         else {
             return;
         };
+        if !medium.orders_writes() {
+            // Straight through rather than a pass later: a device with no flush
+            // must not also be one whose extents checkpoint half as often.
+            self.checkpointing = Checkpointing::Ordered(which);
+            self.write_superblock(which, medium);
+            return;
+        }
+        match medium.barrier(Job::Barrier(which)) {
+            Ok(()) => {
+                self.checkpointing = Checkpointing::Barrier(which);
+                if let Some(recording) = self.recordings.get_mut(which.index()) {
+                    recording.checkpoint_due = false;
+                }
+            }
+            Err(Refused) => {
+                self.counters.medium_refusals = self.counters.medium_refusals.saturating_add(1);
+            }
+        }
+    }
+
+    /// Compose and submit `which`'s checkpoint superblock, the payload it
+    /// describes already ordered against it.
+    fn write_superblock(&mut self, which: Which, medium: &mut impl Medium) {
+        let Some(sector) = self
+            .recordings
+            .get(which.index())
+            .map(|recording| recording.sink.superblock_sector())
+        else {
+            self.checkpointing = Checkpointing::Idle;
+            return;
+        };
         let staging = medium.staging(Area::Superblock);
+        // The three below are unreachable — the window holds every area the
+        // layout names and a `Which` indexes both recordings — and each abandons
+        // the checkpoint: a state left `Ordered` would stop the deck
+        // checkpointing at all.
         let Some(image) = staging.get_mut(..SUPERBLOCK_BYTES) else {
+            self.checkpointing = Checkpointing::Idle;
             return;
         };
         let Ok(image) = <&mut [u8; SUPERBLOCK_BYTES]>::try_from(image) else {
+            self.checkpointing = Checkpointing::Idle;
             return;
         };
         let Some(recording) = self.recordings.get_mut(which.index()) else {
+            self.checkpointing = Checkpointing::Idle;
             return;
         };
         let Ok(write) = recording.sink.superblock(image) else {
@@ -909,6 +1024,7 @@ impl Deck {
             // the checkpoint is simply not written, which is what an
             // unidentified extent already looks like to a reader.
             recording.checkpoint_due = false;
+            self.checkpointing = Checkpointing::Idle;
             return;
         };
         let transfer = Transfer {
@@ -920,11 +1036,13 @@ impl Deck {
         };
         match medium.submit(Job::Checkpoint(which), transfer) {
             Ok(()) => {
-                self.checkpointing = Some(which);
+                self.checkpointing = Checkpointing::Written(which);
                 if let Some(recording) = self.recordings.get_mut(which.index()) {
                     recording.checkpoint_due = false;
                 }
             }
+            // Left `Ordered`, so the next pass offers the same superblock behind
+            // the barrier already taken rather than ordering those bytes twice.
             Err(Refused) => {
                 self.counters.medium_refusals = self.counters.medium_refusals.saturating_add(1);
             }

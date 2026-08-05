@@ -16,9 +16,9 @@
 # first `unsafe` fails the gate.
 
 [comment-ratio]
-"crates/blk/src/bringup.rs" = 0.3362
+"crates/blk/src/bringup.rs" = 0.3442
 "crates/blk/src/io.rs" = 0.4591
-"crates/blk/src/lib.rs" = 0.5912
+"crates/blk/src/lib.rs" = 0.5934
 "crates/blk/src/request.rs" = 0.4013
 "crates/blk/src/smoke.rs" = 0.3659
 "crates/capture-ring/src/lib.rs" = 0.4233
@@ -95,7 +95,7 @@
 "crates/pd-runtime/src/tap.rs" = 0.3727
 "crates/pipeline/src/lib.rs" = 0.4136
 "crates/queue/src/lib.rs" = 0.4260
-"crates/recorder/src/deck.rs" = 0.2565
+"crates/recorder/src/deck.rs" = 0.2770
 "crates/recorder/src/lib.rs" = 0.2326
 "crates/routing/src/lib.rs" = 0.3270
 "crates/rtc/src/lib.rs" = 0.5119

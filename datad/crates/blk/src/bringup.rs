@@ -24,15 +24,20 @@
 //!
 //! # Accepting a feature is not observing one
 //!
-//! [`ACCEPTED_FEATURES`] is one bit, for the reason `nic_driver_core`'s is:
+//! [`ACCEPTED_FEATURES`] is two bits, for the reason `nic_driver_core`'s is one:
 //! accepting a bit widens what the device is *permitted to produce*, and no
-//! code here handles a discard, a write-zeroes or a multi-queue layout. Two
-//! further bits are read out of the offer and never accepted, because they are
-//! facts about the device rather than requests to it — whether it will take a
-//! write at all ([`features::VIRTIO_BLK_F_RO`], which is refused by name), and
-//! whether a flush is honoured rather than silently dropped
-//! ([`features::VIRTIO_BLK_F_FLUSH`], reported through
-//! [`Live::flush_supported`]).
+//! code here handles a discard, a write-zeroes or a multi-queue layout. The
+//! second accepted bit is [`features::VIRTIO_BLK_F_FLUSH`], and accepting it is
+//! what makes `VIRTIO_BLK_T_FLUSH` a request the device is obliged to honour
+//! rather than one it may answer and drop — virtio 1.0 permits the command only
+//! under a negotiated flush feature, so a driver that observed the bit and never
+//! set it could not order a write against a power cut at all. It is masked
+//! against the offer like the first, so a device without it negotiates nothing
+//! and [`Live::flush_supported`] says so.
+//!
+//! One further bit is read out of the offer and never accepted, because it is a
+//! fact about the device rather than a request to it: whether it will take a
+//! write at all ([`features::VIRTIO_BLK_F_RO`], which is refused by name).
 
 use virtio::pci::{
     self, BarError, CapError, CommonCfg, Doorbell, NotifyError, PciConfig, QueueSetupError,
@@ -53,14 +58,18 @@ pub mod features {
     /// driver exists to persist, and a medium that cannot be written must fail
     /// bring-up by name rather than fail every write later.
     pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-    /// The device honours `VIRTIO_BLK_T_FLUSH`. Observed and reported, never
-    /// accepted: it changes nothing about the buffers the device may produce,
-    /// and a caller must not guess whether its flush reached the medium.
+    /// The device honours `VIRTIO_BLK_T_FLUSH`. Accepted where offered, because
+    /// virtio 1.0 section 5.2.5 admits the command only under a negotiated flush
+    /// feature: a driver that read the bit and left it unset would be submitting
+    /// a request the specification does not define, and the durability of every
+    /// ordered write would rest on the device being generous. Reported through
+    /// [`Live::flush_supported`], because a caller must not guess whether its
+    /// flush reached the medium.
     pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 }
 
-/// The one bit this driver accepts if the device offers it.
-pub const ACCEPTED_FEATURES: u64 = features::VIRTIO_F_VERSION_1;
+/// The bits this driver accepts where the device offers them.
+pub const ACCEPTED_FEATURES: u64 = features::VIRTIO_F_VERSION_1 | features::VIRTIO_BLK_F_FLUSH;
 
 /// Byte offset of `capacity` within the virtio-blk device-configuration
 /// structure, and the extent and alignment reading it needs. Fixed by virtio
@@ -697,12 +706,13 @@ impl<D: BlkDevice> Negotiated<D> {
         self.offered & ACCEPTED_FEATURES
     }
 
-    /// Whether the device offered [`features::VIRTIO_BLK_F_FLUSH`]: observed,
-    /// not accepted, and the difference is the point — a flush issued to a
-    /// device without it is answered but commits nothing.
+    /// Whether `VIRTIO_BLK_T_FLUSH` was negotiated, and so whether a flush this
+    /// driver submits commits rather than being answered and dropped. It is the
+    /// offer masked to [`ACCEPTED_FEATURES`], which is the same question: this
+    /// driver accepts the bit exactly where it is offered.
     #[must_use]
     pub fn flush_supported(&self) -> bool {
-        self.offered & features::VIRTIO_BLK_F_FLUSH != 0
+        self.features() & features::VIRTIO_BLK_F_FLUSH != 0
     }
 
     #[must_use]
@@ -812,7 +822,7 @@ impl<D: BlkDevice> Live<D> {
     /// [`Negotiated::flush_supported`].
     #[must_use]
     pub fn flush_supported(&self) -> bool {
-        self.offered & features::VIRTIO_BLK_F_FLUSH != 0
+        self.offered & ACCEPTED_FEATURES & features::VIRTIO_BLK_F_FLUSH != 0
     }
 }
 
@@ -1415,7 +1425,7 @@ mod tests {
     #[test]
     fn the_feature_mask_accepts_only_what_this_driver_implements() {
         // A device offering every bit but read-only must still be told this
-        // driver accepts exactly one: accepting a bit no code handles licences
+        // driver accepts exactly two: accepting a bit no code handles licences
         // the device to produce buffers this driver cannot service.
         let log = Log::new();
         let offered = !features::VIRTIO_BLK_F_RO;
@@ -1425,19 +1435,28 @@ mod tests {
             log.events()
                 .contains(&Event::DriverFeatures(ACCEPTED_FEATURES))
         );
-        assert_eq!(ACCEPTED_FEATURES, features::VIRTIO_F_VERSION_1);
+        assert_eq!(
+            ACCEPTED_FEATURES,
+            features::VIRTIO_F_VERSION_1 | features::VIRTIO_BLK_F_FLUSH
+        );
         assert!(
             live.flush_supported(),
-            "the bit was offered, so it is a fact"
+            "the bit was offered, so it was accepted"
         );
     }
 
     #[test]
     fn a_device_that_does_not_offer_flush_says_so_rather_than_letting_a_caller_guess() {
         let log = Log::new();
-        let live = bring_up(FakeBlkDevice::conforming(&log).offering(ACCEPTED_FEATURES))
+        let live = bring_up(FakeBlkDevice::conforming(&log).offering(features::VIRTIO_F_VERSION_1))
             .expect("virtio 1.0 alone is enough to run");
+        // The bit was never offered, so it was never accepted and no flush this
+        // driver submits would be obliged to commit.
         assert!(!live.flush_supported());
+        assert!(
+            log.events()
+                .contains(&Event::DriverFeatures(features::VIRTIO_F_VERSION_1))
+        );
         assert_eq!(live.capacity_sectors(), 2048);
     }
 
@@ -1659,7 +1678,11 @@ mod tests {
             .expect("a zeroed status register reads back as an acknowledged reset")
             .negotiate_features()
             .expect("virtio 1.0, one queue and a capacity");
-        assert_eq!(negotiated.features(), ACCEPTED_FEATURES);
+        // The fixture's device-features register reads back virtio 1.0 alone,
+        // so the negotiated set is the intersection and not the whole of
+        // `ACCEPTED_FEATURES`: the flush bit is accepted where offered and this
+        // device offers none.
+        assert_eq!(negotiated.features(), features::VIRTIO_F_VERSION_1);
         assert_eq!(
             negotiated.capacity_sectors(),
             4096,

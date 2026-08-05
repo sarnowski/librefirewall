@@ -566,7 +566,7 @@ The console record carries what the device said and what came back:
 
 ```
 LFW-PD time=… domain=recorder state=starting
-LFW-PD time=… domain=recorder state=negotiated features=0x100000000
+LFW-PD time=… domain=recorder state=negotiated features=0x100000200
 LFW-PD time=… domain=recorder state=ready sectors=131072 leading=0x444545532d57464c
 ```
 
@@ -576,12 +576,21 @@ that the *read* crossed to the medium and not merely to the driver's own staging
 
 **Missing.**
 
-- **No flush, no ordering guarantee, and no retry.** `lfw_blk` observes `VIRTIO_BLK_F_FLUSH` and
-  reports whether the device offered it, deliberately without accepting it, and issues no
-  `VIRTIO_BLK_T_FLUSH` at all — so nothing written here is durable across a power cut. The smoke
-  proof refuses and parks rather than retrying a device that answered badly, and a recording whose
-  write the medium failed **acknowledges the loss and advances**: stalling every later record behind
-  a fault that retrying cannot clear would be the worse recording.
+- **The checkpoint is ordered; the payload is not, and there is no retry.** `lfw_blk` now accepts
+  `VIRTIO_BLK_F_FLUSH` where the device offers it, and the recording pass takes one
+  `VIRTIO_BLK_T_FLUSH` between a recording's payload write completing and the checkpoint superblock
+  that claims those bytes — so an extent read straight off the medium never names payload the device
+  had not committed, whatever it cached or reordered. What is *not* ordered is the payload against
+  itself: records within a segment are written as staging fills and nothing flushes between them, so
+  a power cut still loses whatever the device was holding, and only the last checkpointed position is
+  durable. Because the barrier costs a device round trip, the written prefix is routinely one flush
+  ahead of the checkpoint — the harness reads and reports that lag off the disk rather than requiring
+  the two to be equal. Where the barrier fails or the device refuses one, the checkpoint is abandoned
+  rather than written unordered; where the device offered no flush feature, the checkpoint is written
+  without a barrier and its ordering is the device's. The smoke proof refuses and parks rather than
+  retrying a device that answered badly, and a recording whose write the medium failed
+  **acknowledges the loss and advances**: stalling every later record behind a fault that retrying
+  cannot clear would be the worse recording.
 - **A failed transfer reaches no surface.** That loss is counted inside the recorder as
   `medium_failures`, and that counter is published nowhere — no metric family carries it, no console
   record states it, and the recording itself says nothing about the sectors it lost, because

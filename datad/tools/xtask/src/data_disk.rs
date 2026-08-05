@@ -296,12 +296,35 @@ impl DataDisk {
                     self.path.display()
                 )
             })?;
-            if parsed.consumed != durable {
+            // The superblock must never claim more than is there, and it may
+            // claim less: a checkpoint sits behind a device barrier, so between
+            // a payload write completing and its superblock going out the
+            // written prefix is legitimately ahead of the durable cursor. An
+            // extent that overstated would send a reader into bytes that were
+            // never written, which is the direction the barrier exists to make
+            // impossible; understating costs a reader the last staging buffer.
+            if durable > parsed.consumed {
                 return Err(format!(
-                    "the superblock at sector {start_sector} places the recording's durable end \
-                     at payload byte {durable} and the block walk followed the extent's own \
-                     lengths to byte {}, so what is on the medium is not the recording the \
-                     superblock describes\n  image: {}",
+                    "the superblock at sector {start_sector} claims a durable end at payload byte \
+                     {durable} and the block walk followed the extent's own lengths only to byte \
+                     {}, so the superblock names bytes that never reached the medium\n  image: {}",
+                    parsed.consumed,
+                    self.path.display()
+                ));
+            }
+            // And the walk's end must be the end of what was written, not
+            // wherever parsing gave up. Nothing seeded this image past the
+            // superblock, so every byte beyond the written prefix is zero — a
+            // recorder that wrote one valid segment and then garbage stops the
+            // walk at the segment and is caught here rather than passing.
+            if let Some(tail) = payload.get(parsed.consumed..)
+                && let Some(at) = tail.iter().position(|byte| *byte != 0)
+            {
+                return Err(format!(
+                    "the extent at sector {start_sector} holds a non-zero byte at payload offset \
+                     {} — past the byte {} the block walk reached — so what is on the medium is \
+                     not one walkable recording\n  image: {}",
+                    parsed.consumed + at,
                     parsed.consumed,
                     self.path.display()
                 ));
@@ -315,10 +338,13 @@ impl DataDisk {
             }
             lines.push(format!(
                 "  sector {start_sector}: superblock generation {}, {} section header(s), {} \
-                 packet block(s) walked to the durable end at payload byte {durable}",
+                 packet block(s); durable end at payload byte {durable}, written prefix ending at \
+                 {} ({} byte(s) awaiting a checkpoint), nothing written beyond it",
                 state.write_generation(),
                 parsed.sections,
-                parsed.packets.len()
+                parsed.packets.len(),
+                parsed.consumed,
+                parsed.consumed - durable,
             ));
         }
         Ok(format!(

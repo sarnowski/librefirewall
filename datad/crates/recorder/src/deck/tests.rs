@@ -42,6 +42,18 @@ struct Fake {
     /// Completions still to be answered as attributable to no job at all — a
     /// device replaying entries of its used ring.
     unattributed: usize,
+    /// Whether this device negotiated a flush, and so whether the deck may order
+    /// a checkpoint behind one.
+    orders_writes: bool,
+    /// Barriers still to be failed. Separate from `fail` because a device that
+    /// takes every write and honours no flush is a device in its own right, and
+    /// it is the one whose checkpoint must not go out.
+    fail_barriers: usize,
+    /// Every job this device was handed, in the order it was handed them —
+    /// barriers included. What a checkpoint owes is an *order* and not a count, so
+    /// a test that only tallied barriers would pass on a superblock written
+    /// before one.
+    order: Vec<Job>,
 }
 
 impl Fake {
@@ -54,6 +66,18 @@ impl Fake {
             fail: 0,
             short_reads: 0,
             unattributed: 0,
+            orders_writes: true,
+            fail_barriers: 0,
+            order: Vec::new(),
+        }
+    }
+
+    /// The same device without a negotiated flush, which is what a virtio-blk
+    /// that never offered `VIRTIO_BLK_F_FLUSH` looks like from here.
+    fn without_flush() -> Self {
+        Self {
+            orders_writes: false,
+            ..Self::new()
         }
     }
 
@@ -91,6 +115,34 @@ impl Medium for Fake {
         self.window
             .get_mut(offset..offset + len)
             .expect("the window holds every area")
+    }
+
+    fn orders_writes(&self) -> bool {
+        self.orders_writes
+    }
+
+    fn barrier(&mut self, job: Job) -> Result<(), Refused> {
+        if self.refuse > 0 {
+            self.refuse -= 1;
+            return Err(Refused);
+        }
+        self.order.push(job);
+        if self.fail_barriers > 0 {
+            self.fail_barriers -= 1;
+            self.ready.push_back(Polled::Settled(Completion {
+                job,
+                ended: Ended::Failed,
+            }));
+            return Ok(());
+        }
+        // A real barrier moves nothing and commits everything already written.
+        // This fake writes through, so there is nothing to commit — what it
+        // models is the completion, which is the whole of what the deck waits on.
+        self.ready.push_back(Polled::Settled(Completion {
+            job,
+            ended: Ended::Ok { delivered: 0 },
+        }));
+        Ok(())
     }
 
     fn submit(&mut self, job: Job, transfer: Transfer) -> Result<(), Refused> {
@@ -135,6 +187,7 @@ impl Medium for Fake {
             at + transfer.len <= self.disk.len(),
             "a transfer stays inside the device"
         );
+        self.order.push(job);
         for byte in 0..moved {
             if transfer.write {
                 self.disk[at + byte] = self.window[offset + byte];
@@ -1197,4 +1250,145 @@ fn drop_counts(bytes: &[u8]) -> Vec<u64> {
         at += total;
     }
     counts
+}
+
+/// The positions in `order` a job of exactly this shape was handed over at.
+fn positions(order: &[Job], wanted: Job) -> Vec<usize> {
+    order
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| **job == wanted)
+        .map(|(at, _)| at)
+        .collect()
+}
+
+#[test]
+fn every_superblock_is_submitted_behind_a_barrier_and_the_payload_it_describes() {
+    // The whole of what the barrier buys, and it is an ordering rather than a
+    // count: a device is free to commit writes out of order and to hold earlier
+    // ones in a cache, so a superblock published before the payload's write is on
+    // the medium leaves an extent whose own durable cursor points into bytes that
+    // were never written. Asserting that a barrier merely happened would pass on
+    // exactly that.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 200, 8);
+
+    for which in [Which::Log, Which::Capture] {
+        let checkpoints = positions(&medium.order, Job::Checkpoint(which));
+        let barriers = positions(&medium.order, Job::Barrier(which));
+        let flushes = positions(&medium.order, Job::Flush(which));
+        assert!(
+            !checkpoints.is_empty(),
+            "{which:?} never checkpointed, so the ordering is untested"
+        );
+        let first_checkpoint = checkpoints[0];
+        let barrier_before = barriers
+            .iter()
+            .copied()
+            .find(|at| *at < first_checkpoint)
+            .expect("a superblock went out with no barrier ahead of it");
+        assert!(
+            flushes.iter().any(|at| *at < barrier_before),
+            "the barrier at {barrier_before} ordered nothing: no payload write preceded it"
+        );
+        for at in &checkpoints {
+            assert!(
+                barriers.iter().any(|barrier| barrier < at),
+                "the superblock at {at} was submitted with no barrier ahead of it"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_barrier_the_device_fails_leaves_the_superblock_unwritten_rather_than_unordered() {
+    // An extent claiming bytes the device may not hold is worse than one claiming
+    // none, so the checkpoint is abandoned. The recording itself keeps going.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    // Every write is taken and every flush is refused, which is the device this
+    // separation exists for: the payload reaches the medium and nothing orders
+    // the superblock against it.
+    medium.fail_barriers = usize::MAX;
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 200, 8);
+
+    assert!(
+        medium
+            .order
+            .iter()
+            .any(|job| matches!(job, Job::Barrier(_))),
+        "no barrier was attempted, so nothing about failing one is tested"
+    );
+    assert!(
+        !medium
+            .order
+            .iter()
+            .any(|job| matches!(job, Job::Checkpoint(_))),
+        "a superblock went out behind a barrier the device had failed"
+    );
+    assert!(
+        deck.counters().medium_failures > 0,
+        "a failed barrier is counted like every other failed transfer"
+    );
+    // And the recording itself is unaffected: an unwritten checkpoint costs the
+    // extent its statement of where it ends, never a record.
+    assert!(
+        deck.counters().sinks[0].records > 0,
+        "the recording stopped because a checkpoint could not be ordered"
+    );
+}
+
+#[test]
+fn a_device_that_negotiated_no_flush_still_checkpoints_without_one() {
+    // The rings are deliberately temporary, so a device with no flush gets a
+    // weaker recording rather than none: waiting for a barrier it will never
+    // complete would leave every extent claiming nothing durable forever.
+    let mut medium = Fake::without_flush();
+    let (log_start, _) = Deck::extents()[0];
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 200, 8);
+
+    assert!(
+        positions(&medium.order, Job::Barrier(Which::Log)).is_empty(),
+        "a barrier was submitted to a device that never negotiated one"
+    );
+    let image = medium.extent(log_start, (SUPERBLOCK_BYTES / SECTOR_SIZE) as u64);
+    let image: &[u8; SUPERBLOCK_BYTES] = image.try_into().expect("two sectors");
+    let found = lfw_capture_ring::decode_superblock(image).expect("a decodable superblock");
+    assert!(
+        found.writer().offset > 0,
+        "no checkpoint reached a device with no flush, so its extent says nothing durable"
+    );
+}
+
+#[test]
+fn a_forged_barrier_completion_releases_no_superblock() {
+    // The device's one route to publishing a superblock ahead of its payload:
+    // answer a barrier nothing took. It is counted and changes nothing, on the
+    // same terms as every other unattributable completion.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    medium.forge(Job::Barrier(Which::Log));
+    medium.forge(Job::Barrier(Which::Capture));
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+
+    assert_eq!(
+        deck.counters().completions_unexpected,
+        2,
+        "a barrier nothing awaited must be counted, not acted on"
+    );
+    assert!(
+        positions(&medium.order, Job::Checkpoint(Which::Log)).is_empty(),
+        "a forged barrier released a superblock"
+    );
 }

@@ -254,27 +254,62 @@ fn a_recording_the_walk_stops_short_of_the_durable_end_is_a_finding() {
     );
 }
 
-/// And the other direction: bytes past the durable end are not the recording
-/// the superblock describes either.
+/// The other direction is not a finding, and that is the barrier's doing: a
+/// checkpoint goes out behind a device flush, so between a payload write
+/// completing and its superblock landing the written prefix is ahead of the
+/// durable cursor. An extent that understates sends no reader anywhere wrong, so
+/// the lag is reported rather than refused.
 #[test]
-fn a_recording_the_walk_runs_past_the_durable_end_is_a_finding() {
-    let scratch = Scratch::new("long-walk");
-    let disk = DataDisk::create(&scratch.root, "long-walk").expect("created");
+fn a_superblock_one_flush_behind_the_written_prefix_is_reported_and_not_refused() {
+    let scratch = Scratch::new("lagging");
+    let disk = DataDisk::create(&scratch.root, "lagging").expect("created");
     let payload = crate::recording_contract::tests::recording(3, 64);
-    let short = payload.len() - crate::recording_contract::tests::enhanced_packet(64).len();
+    let behind = payload.len() - crate::recording_contract::tests::enhanced_packet(64).len();
     both_extents_record(
         &disk,
         Cursor {
             sequence: 0,
-            offset: short,
+            offset: behind,
+        },
+        &payload,
+    );
+    let verdict = disk
+        .judge_recordings()
+        .expect("a checkpoint behind the payload is the ordinary state");
+    assert!(
+        verdict.contains(&format!("durable end at payload byte {behind}")),
+        "{verdict}"
+    );
+    assert!(verdict.contains("awaiting a checkpoint"), "{verdict}");
+}
+
+/// What the equality used to close and the zero tail closes now: one walkable
+/// recording followed by bytes that are not part of it. The walk stops where the
+/// stream stops being walkable, so without this the stop reads as a clean end.
+#[test]
+fn bytes_past_the_written_prefix_are_a_finding() {
+    let scratch = Scratch::new("trailing-rubbish");
+    let disk = DataDisk::create(&scratch.root, "trailing-rubbish").expect("created");
+    let good = crate::recording_contract::tests::recording(3, 64);
+    let mut payload = good.clone();
+    // A block whose trailing length disagrees with its head: the walk gives up
+    // at it, and the bytes are on the medium all the same.
+    payload.extend_from_slice(&crate::recording_contract::tests::enhanced_packet(32));
+    let at = payload.len() - 4;
+    payload[at] ^= 0xFF;
+    both_extents_record(
+        &disk,
+        Cursor {
+            sequence: 0,
+            offset: good.len(),
         },
         &payload,
     );
     let error = disk
         .judge_recordings()
-        .expect_err("more is on the medium than the superblock accounts for");
+        .expect_err("bytes past the walkable prefix are not the recording");
     assert!(
-        error.contains("not the recording the superblock describes"),
+        error.contains("holds a non-zero byte at payload offset"),
         "{error}"
     );
 }

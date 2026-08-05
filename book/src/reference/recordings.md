@@ -47,6 +47,24 @@ the next window is asked for at the byte after what arrived, and the span behind
 up. A reader of a segmented ring runs short at every extent boundary, so a short window is the
 ordinary case rather than a failure, and it is neither an early end to the body nor a shorter one.
 
+**An extent taken off the disk never describes itself further than it was written.** This matters to
+anyone who reads the medium directly rather than downloading — a recovered disk, a forensic copy —
+because such a reader has only the extent's own header to go by. Each extent carries a checkpoint
+record stating where the recording durably ends, and that record is written **behind a device
+barrier**: the appliance asks the block device to commit everything already written, waits for the
+device to say it did, and only then writes the header claiming those bytes. So the two cannot appear
+out of order however the device caches or reorders, and a power cut at any instant leaves a header
+that either has not moved yet or names bytes that are genuinely there. It never names bytes that are
+not.
+
+Two consequences are worth stating plainly. Where the barrier fails, or the device refuses one, the
+checkpoint is **not written**: the extent goes on holding an older statement of where the recording
+ends, which understates it, rather than a newer one that might overstate it. And where the block
+device never offered a flush feature at all, there is no barrier to take — the checkpoint is written
+without one and its ordering is then the device's to decide, which is the weaker guarantee of the two
+and the reason the feature is negotiated rather than assumed. What is never affected is the recording
+itself: an unwritten checkpoint costs the extent its statement of where it ends, never a record.
+
 ## When it goes wrong
 
 There is no error body, and **where the failure falls decides what a client sees**:
