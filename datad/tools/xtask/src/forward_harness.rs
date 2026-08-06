@@ -2000,6 +2000,28 @@ fn related_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
                 denied.build(),
             ),
         )),
+        // The conversation, re-opened under the submitted generation.
+        //
+        // Not a duplicate of the first wave's request and not tuning: what the
+        // second half of this scenario asks is whether the *submitted* policy
+        // admits an error related to a live conversation, so the conversation
+        // has to be live when the error arrives. Between the two waves the
+        // harness commits a configuration and waits out a settle window, and
+        // this bench is otherwise silent for the whole of it — so on a slow
+        // enough machine the tracker ages the first wave's flow out and the
+        // error that follows is unrelated to anything, refused for a reason
+        // this scenario is not about. Re-opening makes the second half depend
+        // on the policy rather than on how fast the machine ran, which is the
+        // only thing it was ever meant to state. It is a routed request under a
+        // policy that admits it, so it is immediate: the error below defers
+        // behind it and therefore behind the flow it needs.
+        after_the_commit(on_a_flow_it_may_or_may_not_open(routed(
+            "related-reopen",
+            b"LFW-PROBE/related-reopen",
+            a,
+            b,
+            request(b"LFW-PROBE/related-reopen"),
+        ))),
         // And after the commit, the same error on the same flow. It opens no
         // conversation — an error reports on one somebody else opened — so its
         // record names no lifecycle event and the whole of what it proves is the
@@ -2029,6 +2051,24 @@ fn related_probes(topology: &Topology, policy: PortPolicy) -> Vec<Probe> {
 fn deferred_probe(probe: Probe) -> Probe {
     Probe {
         deferred: true,
+        ..probe
+    }
+}
+
+/// A probe whose delivery is the contract and whose effect on the connection
+/// history deliberately is not.
+///
+/// The one shape that needs this is a request re-sent onto a conversation an
+/// earlier phase opened: whether it *opens* a flow or *advances* one depends on
+/// whether the earlier flow is still there, which depends on how long the phase
+/// between them took, which is a property of the machine and not of the
+/// appliance. Asserting either lifecycle event would make the scenario state
+/// something it does not mean; asserting neither leaves exactly what it does —
+/// that the frame was routed. Every other probe still names its event, so this
+/// is a hole in one probe's contract and not a weakening of the check.
+fn on_a_flow_it_may_or_may_not_open(probe: Probe) -> Probe {
+    Probe {
+        event: None,
         ..probe
     }
 }
