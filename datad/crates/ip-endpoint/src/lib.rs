@@ -55,27 +55,44 @@
 //! the appliance forwards. `GET /logs` is absent and answers 404 rather than being
 //! stubbed. The gap is recorded.
 //!
+//! # It reaches out as well as answering
+//!
+//! One [`outbound::Session`] at a time, driven by [`Endpoint::poll_outbound`]:
+//! the [`route`] decision picks the next hop out of this port's own address,
+//! prefix and gateway, the [`neighbour`] cache learns that next hop's hardware
+//! address by asking, and the transport dials. A segment for a next hop that is
+//! not resolved yet is **dropped** under a typed reason rather than queued — the
+//! transport recorded it and re-sends it under RFC 6298's backoff, and the
+//! resolution runs while that timer is armed.
+//!
+//! An ARP *reply* is therefore taken as well as an ARP request answered, and the
+//! cache's own three rules are what keep that from being a way to aim this
+//! node's outbound traffic: only a reply this end asked for is learned, a
+//! resolved entry is immutable for its lifetime, and the sender is judged before
+//! the payload is read. The last of those is applied here, before anything
+//! reaches the cache.
+//!
 //! # Deliberate narrowness, and what each exclusion costs
 //!
 //! Every refusal below is a variant of [`Unhandled`], where it is documented;
 //! what the variants do not say is why the narrowness is deliberate. There is
-//! **no ARP cache and no request is ever sent**, a reply going to the MAC its
-//! request arrived from and a connection's return path being remembered with the
-//! connection ([`ReturnPath`]). There is **no address defence**: an RFC 5227
-//! probe is refused rather than answered, because contradicting a second station
-//! needs conflict state that does not exist. **A reply is only ever composed for
-//! a neighbour and only for a unicast one** — with no route table and no gateway
-//! an off-link reply would leave under a next hop nothing chose, and a reply
+//! **no address defence**: an RFC 5227 probe is refused rather than answered,
+//! because contradicting a second station needs conflict state that does not
+//! exist. **A reply is only ever composed for a neighbour and only for a unicast
+//! one** — a reply to an off-link station would leave under a next hop nothing
+//! chose, the gateway being for traffic this node *originates*, and a reply
 //! addressed to a group is a reflector. And there is **one TCP port and no UDP**:
 //! one service, one port.
 //!
-//! # No allocator, and no buffer this crate owns
+//! # No allocator, and every buffer a fixed array
 //!
 //! [`Endpoint::handle`] writes its reply into storage the caller owns, so the
 //! caller decides where a reply is composed — in the protection domain that runs
-//! this, a buffer it has just taken from a pool. The connection table, each
-//! connection's request slot and the one response staging buffer are fixed
-//! arrays sized by the constants below and in [`http`].
+//! this, a buffer it has just taken from a pool. Nothing here is allocated and
+//! nothing here is sized by anything a peer sends: the connection table, each
+//! connection's request slot, the one response staging buffer and the outbound
+//! session's request and answer are fixed arrays sized by the constants below,
+//! in [`http`] and in [`outbound`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -83,23 +100,27 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_tcp::{Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
+use lfw_tcp::{Connection, Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
 
 /// Re-exported rather than restated: the per-boot secret is obtained by the
 /// protection domain and the segment types are what a *test* composes one out
 /// of, and all reach this crate rather than the transport under it.
-pub use lfw_tcp::{ConnectionId, Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber};
+pub use lfw_tcp::{ConnectionId, Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber, State};
 use net_headers::{
-    ArpError, ArpOperation, ArpPacket, ArpReply, EchoReply, EtherType, Ethernet, IcmpEcho,
-    IcmpError, Ipv4Address, Ipv4Frame, Ipv4Packet, MAX_PREFIX_LENGTH, MacAddress, ParseError,
-    Protocol, ReplyError,
+    ArpError, ArpOperation, ArpPacket, ArpReply, ArpRequest, EchoReply, EtherType, Ethernet,
+    IcmpEcho, IcmpError, Ipv4Address, Ipv4Frame, Ipv4Packet, MAX_PREFIX_LENGTH, MacAddress,
+    ParseError, Protocol, ReplyError,
 };
 
 pub mod http;
 pub mod neighbour;
+pub mod outbound;
 pub mod route;
 
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
+use neighbour::{Learned, NeighbourCache, NeighbourCounters, Resolution};
+use outbound::{Ended, OpenError, OutboundCounters, Phase, Session};
+use route::Port;
 
 /// Re-exported because a caller committing to a streamed body names one, and
 /// the bound behind it is `lfw_http`'s rather than this crate's.
@@ -130,8 +151,10 @@ const _: () = assert!(Ipv4Frame::PAYLOAD_AT + 20 + TCP_MSS as usize <= 2036);
 /// Why a configured pair cannot be an endpoint's: the same three rules
 /// `config::validate` holds a `<management>` element's address and prefix to,
 /// re-checked because an image crosses a protection-domain boundary between the
-/// two. The gateway beside them is not among these — this endpoint does not
-/// read one.
+/// two. The gateway beside them is not among these, and that is not an omission:
+/// what makes a gateway usable depends on the destination as well as on the
+/// gateway, so it is judged on every dial by [`route::next_hop`] rather than
+/// once here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointError {
     MacNotUnicast { mac: MacAddress },
@@ -166,8 +189,6 @@ pub enum Unhandled {
     /// stands for its counter slot rather than for a frame (see
     /// [`ALL`](Self::ALL)).
     EtherType(Option<EtherType>),
-    /// An ARP reply, or an operation this endpoint does not answer.
-    ArpNotARequest,
     /// IPv4, but not ICMP. `None` on [`ALL`](Self::ALL)'s terms.
     Protocol(Option<Protocol>),
     /// An ICMP message that is not an echo request.
@@ -190,10 +211,9 @@ impl Unhandled {
     /// The two reasons that carry the value they refused appear here carrying
     /// **none**: a table entry names a slot, and an invented `EtherType(0)`
     /// would read as a frame somebody sent.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::VlanTagged,
         Self::EtherType(None),
-        Self::ArpNotARequest,
         Self::Protocol(None),
         Self::NotAnEchoRequest,
         Self::Fragmented,
@@ -208,7 +228,6 @@ impl Unhandled {
         match self {
             Self::VlanTagged => "vlan_tagged",
             Self::EtherType(_) => "ethertype_not_handled",
-            Self::ArpNotARequest => "arp_not_a_request",
             Self::Protocol(_) => "protocol_not_handled",
             Self::NotAnEchoRequest => "not_an_echo_request",
             Self::Fragmented => "fragmented",
@@ -225,13 +244,12 @@ impl Unhandled {
         match self {
             Self::VlanTagged => 0,
             Self::EtherType(_) => 1,
-            Self::ArpNotARequest => 2,
-            Self::Protocol(_) => 3,
-            Self::NotAnEchoRequest => 4,
-            Self::Fragmented => 5,
-            Self::SourceNotUnicast => 6,
-            Self::SourceOffLink => 7,
-            Self::ArpSenderMacMismatch => 8,
+            Self::Protocol(_) => 2,
+            Self::NotAnEchoRequest => 3,
+            Self::Fragmented => 4,
+            Self::SourceNotUnicast => 5,
+            Self::SourceOffLink => 6,
+            Self::ArpSenderMacMismatch => 7,
         }
     }
 }
@@ -274,13 +292,22 @@ pub enum Outcome {
     ArpReply { len: usize },
     /// An ICMP echo reply of `len` bytes was written into the caller's storage.
     EchoReply { len: usize },
+    /// An ARP reply was taken to the neighbour cache, and what the cache decided
+    /// about it. Nothing is composed in answer: a reply is the end of an
+    /// exchange this end began, and every refusal below is a reply this end did
+    /// not begin one for.
+    Neighbour(Learned),
     /// A TCP segment was processed. `len` is what the transport composed in answer,
     /// zero where it composed nothing; what became of the segment is in
     /// [`Outcome::tcp`] and every cause is counted in [`Endpoint::tcp_counters`].
     Tcp { len: usize, outcome: TcpOutcome },
-    /// A TCP segment arrived before this node had established a time. **Ours**, not
-    /// the sender's: a node that has not finished booting is not a peer
-    /// misbehaving. ARP and ICMP need no clock and are unaffected.
+    /// A TCP segment or an ARP reply arrived before this node had established a
+    /// time. **Ours**, not the sender's: a node that has not finished booting is
+    /// not a peer misbehaving. An ARP reply is among them because a cache entry
+    /// has a lifetime and an outstanding request has a deadline, neither of
+    /// which a node with no clock can judge — and a node with no clock has sent
+    /// no request either, so such a reply answers nothing in any case. An ARP
+    /// *request* and an ICMP echo need no clock and are unaffected.
     Unclocked,
     /// Addressed to somebody else, at L2 or L3: the commonest outcome on a shared
     /// segment, and never a fault.
@@ -304,6 +331,7 @@ impl Outcome {
             Self::ArpReply { len } | Self::EchoReply { len } => Some(len),
             Self::Tcp { len, .. } if len > 0 => Some(len),
             Self::Tcp { .. }
+            | Self::Neighbour(_)
             | Self::Unclocked
             | Self::NotForUs
             | Self::Unhandled(_)
@@ -329,6 +357,10 @@ impl Outcome {
 pub struct EndpointCounters {
     /// ARP requests for our address, answered.
     pub arp_replies: u64,
+    /// ARP replies handed to the neighbour cache, whatever it made of them.
+    /// What each became is counted in [`Endpoint::neighbour_counters`], one
+    /// field per decision, on `tcp_segments`' terms exactly.
+    pub neighbour_replies: u64,
     /// Echo requests for our address, answered.
     pub echo_replies: u64,
     /// Frames addressed to somebody else.
@@ -354,6 +386,7 @@ impl EndpointCounters {
     pub const fn new() -> Self {
         Self {
             arp_replies: 0,
+            neighbour_replies: 0,
             echo_replies: 0,
             not_for_us: 0,
             malformed: 0,
@@ -392,6 +425,7 @@ impl EndpointCounters {
     #[must_use]
     pub fn total(&self) -> u64 {
         self.replies()
+            .saturating_add(self.neighbour_replies)
             .saturating_add(self.not_for_us)
             .saturating_add(self.malformed)
             .saturating_add(self.reply_refused)
@@ -405,6 +439,9 @@ impl EndpointCounters {
     fn record(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::ArpReply { .. } => self.arp_replies = self.arp_replies.saturating_add(1),
+            Outcome::Neighbour(_) => {
+                self.neighbour_replies = self.neighbour_replies.saturating_add(1);
+            }
             Outcome::EchoReply { .. } => self.echo_replies = self.echo_replies.saturating_add(1),
             Outcome::NotForUs => self.not_for_us = self.not_for_us.saturating_add(1),
             Outcome::Malformed(_) => self.malformed = self.malformed.saturating_add(1),
@@ -433,10 +470,18 @@ pub struct Endpoint {
     mac: MacAddress,
     address: Ipv4Address,
     prefix_length: u8,
+    /// The station everything off this port's prefix is handed to, or `None`
+    /// where the operator stated none — then this port reaches its own link and
+    /// nothing else. Read by [`route::next_hop`] and by nothing that answers a
+    /// frame: a reply is addressed to the station that sent it.
+    gateway: Option<Ipv4Address>,
     counters: EndpointCounters,
     tcp: TcpStack<TCP_CONNECTIONS>,
     http: Server<TCP_CONNECTIONS>,
     paths: [Option<ReturnPath>; TCP_CONNECTIONS],
+    neighbours: NeighbourCache,
+    outbound: Option<Session>,
+    outbound_counters: OutboundCounters,
 }
 
 /// Where one connection's frames arrive from, and so the only pair a segment this
@@ -448,6 +493,26 @@ struct ReturnPath {
     connection: ConnectionId,
     mac: MacAddress,
     address: Ipv4Address,
+}
+
+/// Where the outbound session's next hop stands, as the step that asked about
+/// it must act on.
+///
+/// Four answers rather than an `Option<MacAddress>`, because "not yet" and "not
+/// ever" are different facts and the step in between — a request this end has to
+/// put on the wire — is a frame rather than a state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextHop {
+    /// Resolved; a frame may be addressed to it.
+    At(MacAddress),
+    /// A request of `len` bytes is in the caller's storage. Send it.
+    Asked(usize),
+    /// A request is outstanding and its answer is not due. A segment composed
+    /// now cannot be addressed and is dropped.
+    Waiting,
+    /// The session is over — nothing on this link answers for the next hop, or
+    /// there was no room to ask.
+    Over,
 }
 
 /// The connection a timeout concerns, whichever kind it is.
@@ -503,6 +568,7 @@ impl Endpoint {
         mac: MacAddress,
         address: Ipv4Address,
         prefix_length: u8,
+        gateway: Option<Ipv4Address>,
         secret: IsnSecret,
     ) -> Result<Self, EndpointError> {
         if !mac.is_unicast() {
@@ -518,6 +584,11 @@ impl Endpoint {
             mac,
             address,
             prefix_length,
+            // Not checked here, and deliberately: what a gateway has to be is a
+            // statement about a *destination* as well as about the gateway, so
+            // it is judged at the one place both are known — `route::next_hop`,
+            // on every dial rather than once at construction.
+            gateway,
             counters: EndpointCounters::new(),
             // The window starts at a request slot's whole capacity and is kept
             // equal to its free space from then on, which is what makes it mean
@@ -531,6 +602,9 @@ impl Endpoint {
             ),
             http: Server::new(),
             paths: [None; TCP_CONNECTIONS],
+            neighbours: NeighbourCache::new(),
+            outbound: None,
+            outbound_counters: OutboundCounters::new(),
         })
     }
 
@@ -549,9 +623,104 @@ impl Endpoint {
         self.prefix_length
     }
 
+    /// The station everything off this port's prefix is handed to, where the
+    /// operator stated one.
+    #[must_use]
+    pub const fn gateway(&self) -> Option<Ipv4Address> {
+        self.gateway
+    }
+
     #[must_use]
     pub const fn counters(&self) -> EndpointCounters {
         self.counters
+    }
+
+    /// What the neighbour cache has decided, one field per decision. It is where
+    /// a station trying to place an entry is counted.
+    #[must_use]
+    pub const fn neighbour_counters(&self) -> NeighbourCounters {
+        self.neighbours.counters()
+    }
+
+    /// What the outbound half has done, one field per decision.
+    #[must_use]
+    pub const fn outbound_counters(&self) -> OutboundCounters {
+        self.outbound_counters
+    }
+
+    /// The session this port is running, if any.
+    #[must_use]
+    pub const fn outbound(&self) -> Option<&Session> {
+        self.outbound.as_ref()
+    }
+
+    /// Open a connection to `destination` on `port`, carrying `request` and
+    /// keeping what comes back.
+    ///
+    /// Nothing leaves here: the next hop is chosen and the session recorded, and
+    /// [`poll_outbound`](Self::poll_outbound) is what puts a frame on the wire.
+    /// That split is what lets an open be refused for a reason of this node's own
+    /// — an unreachable destination, a request too long — before a peer has been
+    /// given the chance to say anything.
+    ///
+    /// # Errors
+    /// [`OpenError`], for a session already running, a destination this port
+    /// cannot reach, or a request longer than the room for one.
+    pub fn open_outbound(
+        &mut self,
+        destination: Ipv4Address,
+        port: u16,
+        request: &[u8],
+    ) -> Result<(), OpenError> {
+        if let Some(running) = self.outbound.as_ref() {
+            OutboundCounters::bump(&mut self.outbound_counters.open_refused);
+            return Err(OpenError::Busy {
+                destination: running.destination(),
+                port: running.port(),
+            });
+        }
+        let next_hop = match route::next_hop(self.port_addressing(), destination) {
+            Ok(next_hop) => next_hop,
+            Err(refusal) => {
+                OutboundCounters::bump(&mut self.outbound_counters.open_refused);
+                return Err(OpenError::Unroutable(refusal));
+            }
+        };
+        let session = match Session::new(destination, port, next_hop, request) {
+            Ok(session) => session,
+            Err(error) => {
+                OutboundCounters::bump(&mut self.outbound_counters.open_refused);
+                return Err(error);
+            }
+        };
+        self.outbound = Some(session);
+        OutboundCounters::bump(&mut self.outbound_counters.opened);
+        Ok(())
+    }
+
+    /// Forget a finished session, so another may be opened.
+    ///
+    /// A session that has not finished is left alone and `false` answered: a
+    /// caller that could drop a running one would leave the transport holding a
+    /// connection nothing would ever read.
+    pub fn close_outbound(&mut self) -> bool {
+        let finished = self
+            .outbound
+            .as_ref()
+            .is_some_and(|session| session.phase().ended().is_some());
+        if finished {
+            self.outbound = None;
+        }
+        finished
+    }
+
+    /// This port's addressing, as a route decision sees it.
+    const fn port_addressing(&self) -> Port {
+        Port {
+            address: self.address,
+            prefix_length: self.prefix_length,
+            gateway: self.gateway,
+        }
     }
 
     /// What the transport has seen, one field per cause.
@@ -626,9 +795,16 @@ impl Endpoint {
         // Read before the answer, because a connection the transport abandoned or
         // reaped is already gone from its table by the time it says so.
         let path = self.path_of(connection);
-        let len = out
-            .get_mut(Ipv4Frame::PAYLOAD_AT..)
-            .and_then(|segment| self.http.answer(&mut self.tcp, now, timeout, segment));
+        // A range of the outbound request is this end's to re-supply, and the
+        // server above the transport holds no slot for a connection it did not
+        // accept — so a timeout for the dial is answered here or it is answered
+        // by nothing.
+        let len = if self.is_outbound(connection) {
+            self.answer_outbound(now, timeout, out)
+        } else {
+            out.get_mut(Ipv4Frame::PAYLOAD_AT..)
+                .and_then(|segment| self.http.answer(&mut self.tcp, now, timeout, segment))
+        };
         self.reconcile();
         match (path, len) {
             (Some(path), Some(len)) => Polled::Frame {
@@ -764,7 +940,7 @@ impl Endpoint {
             Err(error) => return Outcome::Malformed(Malformed::Frame(error)),
         };
         match ethernet.header.ether_type {
-            EtherType::ARP => self.arp(&ethernet, out),
+            EtherType::ARP => self.arp(now, &ethernet, out),
             EtherType::IPV4 => self.ipv4(now, &ethernet, out),
             EtherType::VLAN => Outcome::Unhandled(Unhandled::VlanTagged),
             other => Outcome::Unhandled(Unhandled::EtherType(Some(other))),
@@ -773,37 +949,376 @@ impl Endpoint {
 
     /// An ARP request is broadcast, so this is the one path that accepts a frame
     /// not addressed to our own MAC.
-    fn arp(&self, ethernet: &Ethernet<'_>, out: &mut [u8]) -> Outcome {
+    ///
+    /// A reply is the other operation this port reads. It is judged by the same
+    /// three rules a request is — addressed to us, its claimed sender agreeing
+    /// with the frame that carried it, and that sender a unicast station on this
+    /// link — and only then handed to the cache, which decides the one question
+    /// those cannot: whether this end asked.
+    fn arp(&mut self, now: Option<Monotonic>, ethernet: &Ethernet<'_>, out: &mut [u8]) -> Outcome {
         let destination = ethernet.header.destination;
         if destination != self.mac && !destination.is_broadcast() {
             return Outcome::NotForUs;
         }
-        let request = match ArpPacket::parse(ethernet.payload) {
+        let packet = match ArpPacket::parse(ethernet.payload) {
             Ok(packet) => packet,
             Err(error) => return Outcome::Malformed(Malformed::Arp(error)),
         };
-        if request.operation != ArpOperation::Request {
-            return Outcome::Unhandled(Unhandled::ArpNotARequest);
+        if packet.operation == ArpOperation::Reply {
+            return self.arp_reply(now, ethernet, &packet);
         }
-        if request.target_address != self.address {
+        if packet.target_address != self.address {
             return Outcome::NotForUs;
         }
-        if request.sender_mac != ethernet.header.source {
+        if packet.sender_mac != ethernet.header.source {
             return Outcome::Unhandled(Unhandled::ArpSenderMacMismatch);
         }
-        if let Some(refusal) = self.refuse_sender(request.sender_mac, request.sender_address) {
+        if let Some(refusal) = self.refuse_sender(packet.sender_mac, packet.sender_address) {
             return refusal;
         }
         let reply = ArpReply {
             mac: self.mac,
             address: self.address,
-            target_mac: request.sender_mac,
-            target_address: request.sender_address,
+            target_mac: packet.sender_mac,
+            target_address: packet.sender_address,
         };
         match reply.write(out) {
             Ok(len) => Outcome::ArpReply { len },
             Err(error) => Outcome::ReplyRefused(error),
         }
+    }
+
+    /// Take one ARP reply to the neighbour cache.
+    ///
+    /// A reply is unicast to the station that asked, so — unlike a request — one
+    /// addressed to the broadcast address is **not** ours: it is a station
+    /// announcing itself to the whole link, which is the gratuitous reply the
+    /// cache would refuse in any case and which is refused here without being
+    /// counted as a reply to anything.
+    fn arp_reply(
+        &mut self,
+        now: Option<Monotonic>,
+        ethernet: &Ethernet<'_>,
+        packet: &ArpPacket,
+    ) -> Outcome {
+        if ethernet.header.destination != self.mac || packet.target_address != self.address {
+            return Outcome::NotForUs;
+        }
+        if packet.sender_mac != ethernet.header.source {
+            return Outcome::Unhandled(Unhandled::ArpSenderMacMismatch);
+        }
+        if let Some(refusal) = self.refuse_sender(packet.sender_mac, packet.sender_address) {
+            return refusal;
+        }
+        let Some(now) = now else {
+            return Outcome::Unclocked;
+        };
+        Outcome::Neighbour(
+            self.neighbours
+                .learn(now, packet.sender_address, packet.sender_mac),
+        )
+    }
+
+    /// Drive the outbound session one step, writing whatever it owes into `out`.
+    ///
+    /// Called in a loop until it answers [`Polled::Idle`], as the two polls
+    /// beside it are. Each answer either moves the session's phase, hands a range
+    /// to the transport, or puts a resolution request on the wire, so the loop
+    /// terminates; [`Polled::Handled`] is a step that produced no frame and is
+    /// never the end of a pass, because the step after it may.
+    pub fn poll_outbound(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        // Before the phase is read: the transport frees a connection on its own
+        // — an abandoned dial, a reset — and a session reading a handle the table
+        // no longer holds would sit in `Dialling` for the life of the domain.
+        self.reconcile();
+        let Some(session) = self.outbound.as_ref() else {
+            return Polled::Idle;
+        };
+        if session.phase().ended().is_some() {
+            return Polled::Idle;
+        }
+        match session.phase() {
+            Phase::Resolving => self.resolve_outbound(now, out),
+            Phase::Dialling | Phase::Sending | Phase::Reading | Phase::Closing => {
+                self.advance_outbound(now, out)
+            }
+            // Unreachable: an ended phase left above. A value rather than an
+            // assertion, this being a path a peer's traffic paces.
+            Phase::Ended(_) => Polled::Idle,
+        }
+    }
+
+    /// Where this session's next hop stands, asking about it if it must.
+    ///
+    /// A hardware address already held is answered without the cache being
+    /// consulted at all: an entry is immutable for its lifetime, and a session
+    /// that re-read it would follow a rebinding the cache itself refuses.
+    fn next_hop(&mut self, now: Monotonic, out: &mut [u8]) -> NextHop {
+        let Some(session) = self.outbound.as_ref() else {
+            return NextHop::Over;
+        };
+        if let Some(mac) = session.peer_mac() {
+            return NextHop::At(mac);
+        }
+        let next_hop = session.next_hop();
+        match self.neighbours.resolve(now, next_hop) {
+            Resolution::Known(mac) => {
+                if let Some(session) = self.outbound.as_mut() {
+                    session.resolved_to(mac);
+                }
+                NextHop::At(mac)
+            }
+            Resolution::Ask => {
+                let request = ArpRequest {
+                    mac: self.mac,
+                    address: self.address,
+                    target_address: next_hop,
+                };
+                match request.write(out) {
+                    Ok(len) => NextHop::Asked(len),
+                    // The cache has already recorded that a request was handed
+                    // over, so it answers `Ask` again once its own timeout has
+                    // passed rather than waiting on a frame that never left.
+                    Err(_) => NextHop::Waiting,
+                }
+            }
+            Resolution::Waiting => NextHop::Waiting,
+            Resolution::Unreachable => {
+                self.end_outbound(Ended::NextHopUnreachable);
+                NextHop::Over
+            }
+            Resolution::NoRoom => {
+                self.end_outbound(Ended::NoRoomToResolve);
+                NextHop::Over
+            }
+        }
+    }
+
+    /// Ask about the next hop, and dial once there is a `SYN` to compose.
+    ///
+    /// The dial happens **whether or not the hardware address is known**, and
+    /// that is the decision the neighbour cache is built around: the `SYN` is
+    /// recorded by the transport and re-sent under RFC 6298's backoff, so a
+    /// segment dropped for want of an address costs one retransmission timeout,
+    /// while a queue would cost a buffer, a bound, and a second answer to what
+    /// happens when that bound is reached.
+    fn resolve_outbound(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        match self.next_hop(now, out) {
+            // A request is outstanding and its answer is not due. The dial goes
+            // ahead regardless, so the transport's timer is armed while the
+            // resolution runs and the retransmission finds the entry resolved.
+            NextHop::At(_) | NextHop::Waiting => self.dial(now, out),
+            NextHop::Asked(len) => Polled::Frame { len },
+            NextHop::Over => Polled::Handled,
+        }
+    }
+
+    /// Compose the `SYN`, and address it if this end can.
+    fn dial(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        let Some((destination, port)) = self
+            .outbound
+            .as_ref()
+            .map(|session| (session.destination(), session.port()))
+        else {
+            return Polled::Idle;
+        };
+        let dialled = {
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Polled::Handled;
+            };
+            self.tcp.connect(now, destination, port, segment)
+        };
+        let dialled = match dialled {
+            Ok(dialled) => dialled,
+            Err(error) => return self.end_outbound(Ended::Refused(error)),
+        };
+        OutboundCounters::bump(&mut self.outbound_counters.dialled);
+        let mac = self.outbound.as_ref().and_then(Session::peer_mac);
+        if let Some(session) = self.outbound.as_mut() {
+            session.dialled(dialled.connection);
+        }
+        let Some(mac) = mac else {
+            // Dropped, not queued, and typed: the record the transport just made
+            // is what re-sends it.
+            OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
+            return Polled::Handled;
+        };
+        // The return path is installed from the *resolution* rather than from a
+        // frame, there being no frame yet — and it is never re-learned from one,
+        // so whoever answers cannot redirect what this end sends next.
+        self.remember(dialled.connection, mac, destination);
+        Polled::Frame {
+            len: self.frame_around((mac, destination), dialled.len, out),
+        }
+    }
+
+    /// Carry a dialled session forward: send the request, read the answer, close.
+    fn advance_outbound(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
+            return self.end_outbound(Ended::Lost);
+        };
+        let Some(state) = self.tcp.connection(connection).map(Connection::state) else {
+            // The transport no longer holds it: the peer reset the connection,
+            // the retransmission limit was reached, or the exchange finished and
+            // the slot was reaped. Which of those it was is in the transport's
+            // own counters; what a session can say is that it did or did not
+            // read an answer.
+            let answered = self
+                .outbound
+                .as_ref()
+                .is_some_and(|session| session.peer_closed());
+            return self.end_outbound(if answered {
+                Ended::Answered
+            } else {
+                Ended::Lost
+            });
+        };
+        // The resolution may only have completed after the `SYN` was dropped, so
+        // it is carried on here — and it is what ends a session whose next hop
+        // never answers, the dial itself having nothing to time out against
+        // beyond the transport's own silence.
+        match self.next_hop(now, out) {
+            NextHop::At(mac) => {
+                let destination = self
+                    .outbound
+                    .as_ref()
+                    .map_or(self.address, Session::destination);
+                self.remember(connection, mac, destination);
+            }
+            NextHop::Asked(len) => return Polled::Frame { len },
+            NextHop::Waiting => {}
+            NextHop::Over => return Polled::Handled,
+        }
+        let path = self.path_of(connection);
+        match state {
+            // The handshake is not done. Nothing is owed: the transport's own
+            // retransmission is what re-sends the `SYN`, and a segment composed
+            // here would be a second one.
+            State::SynSent | State::SynReceived => Polled::Idle,
+            State::Established | State::CloseWait => self.drive_outbound(now, path, out),
+            // This end has closed and owes nothing but the last acknowledgement,
+            // which the transport composes on the segment that arrives.
+            State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::LastAck
+            | State::Closed => {
+                if let Some(session) = self.outbound.as_mut() {
+                    session.enter(Phase::Closing);
+                }
+                Polled::Idle
+            }
+        }
+    }
+
+    /// Send whatever an established session owes: the rest of its request, then
+    /// its own close once the peer has finished.
+    fn drive_outbound(
+        &mut self,
+        now: Monotonic,
+        path: Option<(MacAddress, Ipv4Address)>,
+        out: &mut [u8],
+    ) -> Polled {
+        let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
+            return Polled::Idle;
+        };
+        let request_out = self.outbound.as_ref().is_some_and(Session::request_out);
+        if !request_out {
+            let sent = {
+                let Self { outbound, tcp, .. } = self;
+                let Some(session) = outbound.as_ref() else {
+                    return Polled::Idle;
+                };
+                let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                    return Polled::Idle;
+                };
+                tcp.send(now, connection, session.unsent(), segment)
+            };
+            let Ok(sent) = sent else {
+                // The peer's window is closed or every record slot is taken.
+                // Neither is a failure and neither is answered by composing
+                // anything: an acknowledgement is what opens the window again.
+                return Polled::Idle;
+            };
+            self.outbound_counters.request_bytes = self
+                .outbound_counters
+                .request_bytes
+                .saturating_add(sent.bytes as u64);
+            // The oldest range the transport still holds, read straight after
+            // the first send: the handshake's `SYN` is acknowledged by the time
+            // a connection can carry data, so that range is the request's own
+            // beginning and nothing else.
+            let oldest = self
+                .tcp
+                .connection(connection)
+                .and_then(Connection::oldest_range);
+            if let Some(session) = self.outbound.as_mut() {
+                if let Some((sequence, _)) = oldest {
+                    session.note_base(sequence);
+                }
+                session.took(sent.bytes);
+                session.enter(if session.request_out() {
+                    Phase::Reading
+                } else {
+                    Phase::Sending
+                });
+            }
+            return match path {
+                Some(path) => Polled::Frame {
+                    len: self.frame_around(path, sent.len, out),
+                },
+                None => {
+                    OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
+                    Polled::Handled
+                }
+            };
+        }
+        // The request is out. This end closes once the peer has, which is what
+        // makes the exchange one request and one answer rather than a stream
+        // whose end nobody states.
+        let peer_closed = self.outbound.as_ref().is_some_and(Session::peer_closed);
+        if !peer_closed {
+            if let Some(session) = self.outbound.as_mut() {
+                session.enter(Phase::Reading);
+            }
+            return Polled::Idle;
+        }
+        let closed = {
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Polled::Idle;
+            };
+            self.tcp.close(now, connection, segment)
+        };
+        let Ok(len) = closed else {
+            return Polled::Idle;
+        };
+        if let Some(session) = self.outbound.as_mut() {
+            session.enter(Phase::Closing);
+        }
+        match path {
+            Some(path) => Polled::Frame {
+                len: self.frame_around(path, len, out),
+            },
+            None => {
+                OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
+                Polled::Handled
+            }
+        }
+    }
+
+    /// End the session under `ended`, counting it.
+    fn end_outbound(&mut self, ended: Ended) -> Polled {
+        if let Some(session) = self.outbound.as_mut() {
+            session.enter(Phase::Ended(ended));
+        }
+        let count = if ended.succeeded() {
+            &mut self.outbound_counters.answered
+        } else {
+            &mut self.outbound_counters.failed
+        };
+        OutboundCounters::bump(count);
+        Polled::Handled
     }
 
     /// Unlike ARP, an IPv4 datagram is answered only when it was addressed to
@@ -908,15 +1423,31 @@ impl Endpoint {
                 outcome,
             };
         };
-        // The return path, because there is no ARP cache: a segment sent unprompted
-        // can only be addressed to the pair its frames arrive from.
-        self.remember(connection, peer_mac, source);
-
-        if !received.data.is_empty() {
-            self.http.take(now, connection, received.data);
+        // A connection this end dialled keeps the path the *resolution* chose:
+        // its frames' Ethernet source is whatever answered, so learning from one
+        // would let a station on the link take over a conversation this node
+        // began by answering it once. A connection a peer opened has no other
+        // source of a path, and this is it.
+        if !self.is_outbound(connection) {
+            self.remember(connection, peer_mac, source);
         }
-        if received.peer_closed {
-            self.http.note_peer_closed(connection);
+
+        if self.is_outbound(connection) {
+            if !received.data.is_empty() {
+                self.take_outbound(received.data);
+            }
+            if received.peer_closed
+                && let Some(session) = self.outbound.as_mut()
+            {
+                session.note_peer_closed();
+            }
+        } else {
+            if !received.data.is_empty() {
+                self.http.take(now, connection, received.data);
+            }
+            if received.peer_closed {
+                self.http.note_peer_closed(connection);
+            }
         }
         if let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..)
             && let Some(composed) = self.http.drive(&mut self.tcp, now, connection, segment)
@@ -925,15 +1456,78 @@ impl Endpoint {
             // would have, so replacing the transport's answer loses nothing.
             len = composed;
         }
+        // Read before the reconciliation, which frees the path of a connection
+        // the exchange just ended.
+        let path = self.path_of(connection).unwrap_or((peer_mac, source));
         self.reconcile();
         self.http.sweep(&self.tcp);
         if len == 0 {
             return Outcome::Tcp { len: 0, outcome };
         }
         Outcome::Tcp {
-            len: self.frame_around((peer_mac, source), len, out),
+            len: self.frame_around(path, len, out),
             outcome,
         }
+    }
+
+    /// Answer one of the outbound connection's own timers.
+    ///
+    /// A re-composed control segment is already in `out` and needs nothing; a
+    /// range of the request is re-supplied out of the session, which is why the
+    /// session holds it. A dial the transport gave up on produces no segment
+    /// here — an unanswered dial is abandoned in silence — and is reported to the
+    /// caller by the next poll, which finds the connection gone.
+    fn answer_outbound(
+        &mut self,
+        now: Monotonic,
+        timeout: Timeout,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        match timeout {
+            Timeout::Resent { len, .. } | Timeout::Abandoned { len, .. } => {
+                (len > 0).then_some(len)
+            }
+            Timeout::Reaped { .. } => None,
+            Timeout::Retransmit {
+                connection,
+                sequence,
+                len,
+            } => {
+                let at = self
+                    .outbound
+                    .as_ref()
+                    .and_then(|session| session.offset_of(sequence))?;
+                let Self { outbound, tcp, .. } = self;
+                let payload = outbound.as_ref()?.range(at, usize::from(len))?;
+                let segment = out.get_mut(Ipv4Frame::PAYLOAD_AT..)?;
+                tcp.retransmit(now, connection, sequence, payload, segment)
+                    .ok()
+            }
+        }
+    }
+
+    /// Whether `connection` is the one the outbound session dialled.
+    fn is_outbound(&self, connection: ConnectionId) -> bool {
+        self.outbound
+            .as_ref()
+            .and_then(Session::connection)
+            .is_some_and(|dialled| dialled == connection)
+    }
+
+    /// Keep what the peer said, counting what there was no room for.
+    fn take_outbound(&mut self, data: &[u8]) {
+        let Some(session) = self.outbound.as_mut() else {
+            return;
+        };
+        let (kept, dropped) = session.take(data);
+        self.outbound_counters.answer_bytes = self
+            .outbound_counters
+            .answer_bytes
+            .saturating_add(kept as u64);
+        self.outbound_counters.answer_overflowed = self
+            .outbound_counters
+            .answer_overflowed
+            .saturating_add(dropped as u64);
     }
 
     /// Stamp the Ethernet and IPv4 headers in front of a segment already written at

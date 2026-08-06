@@ -70,6 +70,11 @@ const OUR_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]);
 const OUR_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 15]);
 const PREFIX_LENGTH: u8 = 24;
 
+/// The next hop the same document states, so a frame this endpoint originates
+/// leaves under the addressing the appliance would use. Nothing here dials, but
+/// the endpoint holds it either way and an arbitrary frame must not become one.
+const GATEWAY: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
+
 /// The per-boot secret the transport's initial sequence numbers are derived from.
 /// Fixed here because this harness is about the endpoint's *framing* decisions:
 /// the transport's own surface, the secret included, is
@@ -102,6 +107,7 @@ fn assert_one_frame_is_answered(data: &[u8]) {
         OUR_MAC,
         OUR_ADDRESS,
         PREFIX_LENGTH,
+        Some(GATEWAY),
         IsnSecret::from_bytes(SECRET),
     )
     .expect("a unicast pair on a /24");
@@ -251,6 +257,7 @@ fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
         OUR_MAC,
         OUR_ADDRESS,
         PREFIX_LENGTH,
+        Some(GATEWAY),
         IsnSecret::from_bytes(SECRET),
     )
     .expect("a unicast pair on a /24");
@@ -446,6 +453,15 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
         Outcome::Tcp { .. } => {
             let ethernet = Ethernet::parse(data).expect("a segment needs a header");
             assert_eq!(ethernet.header.ether_type, EtherType::IPV4);
+        }
+        // An ARP reply taken to the neighbour cache. It composes nothing by
+        // construction — a reply is the end of an exchange this end began — and
+        // what the cache made of it is `NeighbourCounters`' surface rather than
+        // a framing decision to re-derive here. What *is* re-derivable is that
+        // the frame really was an ARP one.
+        Outcome::Neighbour(_) => {
+            let ethernet = Ethernet::parse(data).expect("an ARP reply needs a header");
+            assert_eq!(ethernet.header.ether_type, EtherType::ARP);
         }
         Outcome::Unclocked => panic!("a clock was supplied"),
         Outcome::ArpReply { .. } | Outcome::EchoReply { .. } => {

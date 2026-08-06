@@ -1570,6 +1570,23 @@ several instances run on several cores with no coordination and the compiler is 
 capacity is a const generic, so a shard's memory is fixed at compile time and sized by its caller.
 There is no allocator and no `alloc`.
 
+**The endpoint reaches out as well as answering.** `lfw_ip_endpoint` holds one outbound session at
+a time: the route decision picks the next hop out of the management port's own address, prefix and
+gateway; the neighbour cache learns that next hop's hardware address by asking, and learns nothing
+else — only a reply this end asked for is taken, a resolved entry is immutable for its lifetime, and
+a reply whose claimed sender contradicts the frame that carried it never reaches the cache at all.
+The dial is composed **whether or not the address is known**: a segment that cannot be addressed is
+dropped under a typed reason rather than queued, because the transport already recorded it and
+re-sends it under RFC 6298's backoff, so the cost of dropping the first one is a retransmission
+timeout while the cost of a queue would be a buffer, a bound, and a second answer to what happens
+when that bound is reached. The resolution runs while that timer is armed. The path a dialled
+connection's frames take is installed from the resolution and never re-learned from an arriving
+frame, so a station that answers cannot take over a conversation this node began; and a next hop
+nothing on the link answers for ends the session under its own reason rather than leaving a caller
+waiting on a channel that will never come up. The session's request and answer are fixed arrays
+sized by constants in the crate, on its request slots' terms: an answer past the room for one is
+counted and dropped rather than allowed to displace what came before it.
+
 **One port, in both directions.** A stack answers on one port and dials from that same port: a
 segment is matched to a connection by the peer's address and port alone, so a second local port
 would be a second key the table does not carry, and a dial from an ephemeral one would arrive back
@@ -1661,6 +1678,11 @@ established one.
 - **No dataplane consumer.** The only caller is the management domain. Nothing proxies, nothing
   terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
   is untouched (see the [status table](../status.md)).
+- **Nothing dials.** The endpoint above the stack now resolves a next hop and drives a whole
+  outbound session — dial, carry a fixed request, read the answer, close — but no protection domain
+  opens one, so no connection has left a running node. The outbound half's counters are held in
+  `lfw_ip_endpoint` and reach no surface: the exposition gains them with the caller that makes them
+  move.
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
   the management domain outright, so that node has no management port for the boot. The QEMU bench had
   to be told to expose it (`datad/tools/xtask/src/qemu.rs`); every deployment target must have it. There is

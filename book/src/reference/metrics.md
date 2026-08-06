@@ -59,7 +59,7 @@ in the *next* one.
 ## Metric inventory
 
 108 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 404 counter and gauge series from the 12 shards,
+domains publishing that family. A scrape is 403 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 89 178 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -161,7 +161,7 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 | `librefirewall_endpoint_tcp_segments_total` | counter | `management` | — | Segments the endpoint handed to its transport. |
 | `librefirewall_endpoint_timer_segments_total` | counter | `management` | — | Segments the transport composed out of its own timers rather than in answer to a frame. |
 | `librefirewall_endpoint_unclocked_total` | counter | `management` | — | Segments that arrived before this node had established a time; ours, not the sender's. |
-| `librefirewall_endpoint_unhandled_total` | counter | `management` | `reason`&nbsp;(`arp_not_a_request`, `arp_sender_mac_mismatch`, `ethertype_not_handled`, `fragmented`, `not_an_echo_request`, `protocol_not_handled`, `source_not_unicast`, `source_off_link`, `vlan_tagged`) | Well-formed frames for this endpoint that it deliberately does not answer, by reason. |
+| `librefirewall_endpoint_unhandled_total` | counter | `management` | `reason`&nbsp;(`arp_sender_mac_mismatch`, `ethertype_not_handled`, `fragmented`, `not_an_echo_request`, `protocol_not_handled`, `source_not_unicast`, `source_off_link`, `vlan_tagged`) | Well-formed frames for this endpoint that it deliberately does not answer, by reason. |
 
 ### The management port: the TCP transport
 

@@ -219,6 +219,7 @@ pub fn endpoint_from(
         MacAddress(management.mac()),
         Ipv4Address::from_octets(management.address()),
         management.prefix_length(),
+        management.gateway().map(Ipv4Address::from_octets),
         secret,
     )
     .map(Some)

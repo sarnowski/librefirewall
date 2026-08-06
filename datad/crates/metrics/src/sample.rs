@@ -1064,7 +1064,7 @@ pub struct EndpointSample {
     pub reply_refused: u64,
     pub tcp_segments: u64,
     pub unclocked: u64,
-    pub unhandled: [u64; 9],
+    pub unhandled: [u64; 8],
 }
 
 /// The transport's twenty-nine causes, in `lfw_tcp::TcpCounters` declaration
@@ -1119,7 +1119,7 @@ pub struct HttpSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 87;
+pub const MANAGEMENT_SLOTS: usize = 86;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1203,10 +1203,6 @@ impl ManagementSample {
         s(
             &ENDPOINT_UNHANDLED,
             &[Label::new("reason", "ethertype_not_handled")],
-        ),
-        s(
-            &ENDPOINT_UNHANDLED,
-            &[Label::new("reason", "arp_not_a_request")],
         ),
         s(
             &ENDPOINT_UNHANDLED,

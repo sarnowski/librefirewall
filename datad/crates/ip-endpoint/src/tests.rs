@@ -17,6 +17,10 @@ const PREFIX: u8 = 24;
 const STATION_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0c]);
 const STATION_ADDRESS: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
 const OFF_LINK: Ipv4Address = Ipv4Address::from_octets([10, 0, 9, 2]);
+/// The next hop this port hands everything off its own prefix to, and the MAC
+/// the station holding it answers with.
+const GATEWAY: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 1]);
+const GATEWAY_MAC: MacAddress = MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x01]);
 
 /// Storage a reply always fits in, so a test that did not set out to exercise
 /// the refusal path does not.
@@ -112,7 +116,8 @@ impl Recording {
 }
 
 fn endpoint() -> Endpoint {
-    Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, secret()).expect("a unicast pair on a /24")
+    Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, Some(GATEWAY), secret())
+        .expect("a unicast pair on a /24")
 }
 
 /// An endpoint that also answers [`RECORDING_TARGET`] by streaming.
@@ -223,6 +228,19 @@ fn arp_request(
     frame.extend_from_slice(&sender_address.octets());
     frame.extend_from_slice(&[0; 6]);
     frame.extend_from_slice(&target.octets());
+    frame
+}
+
+/// One ARP reply, unicast to the station that asked, as the wire carries it.
+fn arp_reply(
+    destination: MacAddress,
+    sender_mac: MacAddress,
+    sender_address: Ipv4Address,
+    target: Ipv4Address,
+) -> Vec<u8> {
+    let mut frame = arp_request(destination, sender_mac, sender_address, target);
+    frame[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8].copy_from_slice(&2u16.to_be_bytes());
+    frame[ETHERNET_HEADER_LEN + 18..ETHERNET_HEADER_LEN + 24].copy_from_slice(&destination.0);
     frame
 }
 
@@ -340,13 +358,27 @@ fn handle(frame: &[u8]) -> (Outcome, Vec<u8>, EndpointCounters) {
 #[test]
 fn a_configured_pair_no_endpoint_can_answer_under_is_refused() {
     assert_eq!(
-        Endpoint::new(MacAddress::BROADCAST, OUR_ADDRESS, PREFIX, secret()).err(),
+        Endpoint::new(
+            MacAddress::BROADCAST,
+            OUR_ADDRESS,
+            PREFIX,
+            Some(GATEWAY),
+            secret()
+        )
+        .err(),
         Some(EndpointError::MacNotUnicast {
             mac: MacAddress::BROADCAST
         })
     );
     assert_eq!(
-        Endpoint::new(MacAddress([0; 6]), OUR_ADDRESS, PREFIX, secret()).err(),
+        Endpoint::new(
+            MacAddress([0; 6]),
+            OUR_ADDRESS,
+            PREFIX,
+            Some(GATEWAY),
+            secret()
+        )
+        .err(),
         Some(EndpointError::MacNotUnicast {
             mac: MacAddress([0; 6])
         })
@@ -359,18 +391,18 @@ fn a_configured_pair_no_endpoint_can_answer_under_is_refused() {
     ] {
         let address = Ipv4Address::from_octets(octets);
         assert_eq!(
-            Endpoint::new(OUR_MAC, address, PREFIX, secret()).err(),
+            Endpoint::new(OUR_MAC, address, PREFIX, Some(GATEWAY), secret()).err(),
             Some(EndpointError::AddressNotUnicast { address })
         );
     }
     for prefix_length in [33u8, 64, 255] {
         assert_eq!(
-            Endpoint::new(OUR_MAC, OUR_ADDRESS, prefix_length, secret()).err(),
+            Endpoint::new(OUR_MAC, OUR_ADDRESS, prefix_length, Some(GATEWAY), secret()).err(),
             Some(EndpointError::PrefixLengthOutOfRange { prefix_length })
         );
     }
-    let endpoint =
-        Endpoint::new(OUR_MAC, OUR_ADDRESS, 32, secret()).expect("a host route is a prefix");
+    let endpoint = Endpoint::new(OUR_MAC, OUR_ADDRESS, 32, Some(GATEWAY), secret())
+        .expect("a host route is a prefix");
     assert_eq!(endpoint.mac(), OUR_MAC);
     assert_eq!(endpoint.address(), OUR_ADDRESS);
     assert_eq!(endpoint.prefix_length(), 32);
@@ -445,15 +477,24 @@ fn a_frame_addressed_to_another_station_is_never_answered() {
     assert_eq!(handle(&broadcast).0, Outcome::NotForUs);
 }
 
+/// An ARP reply is taken rather than answered, and one nothing asked for
+/// changes nothing at all — which is what makes the classic unsolicited reply
+/// inert here rather than merely suspicious.
 #[test]
-fn an_arp_reply_is_not_a_request_and_is_answered_by_nothing() {
-    let mut frame = arp();
-    frame[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8].copy_from_slice(&2u16.to_be_bytes());
-    let (outcome, reply, counters) = handle(&frame);
-    assert_eq!(outcome, Outcome::Unhandled(Unhandled::ArpNotARequest));
-    assert!(reply.is_empty());
-    assert_eq!(counters.unhandled(Unhandled::ArpNotARequest), 1);
-    assert_eq!(counters.unhandled_total(), 1);
+fn an_unsolicited_arp_reply_is_taken_and_learns_nothing() {
+    let mut endpoint = endpoint();
+    let mut out = [0u8; ROOMY];
+    let outcome = endpoint.handle(
+        Some(at(0)),
+        &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+        &mut out,
+    );
+    assert_eq!(outcome, Outcome::Neighbour(Learned::Unsolicited));
+    assert_eq!(outcome.reply(), None);
+    assert_eq!(endpoint.counters().neighbour_replies, 1);
+    assert_eq!(endpoint.counters().unhandled_total(), 0);
+    assert_eq!(endpoint.neighbour_counters().unsolicited, 1);
+    assert_eq!(endpoint.neighbour_counters().learned, 0);
 }
 
 #[test]
@@ -842,6 +883,7 @@ fn a_point_to_point_endpoint_answers_only_the_station_its_prefix_admits() {
         OUR_MAC,
         Ipv4Address::from_octets([10, 0, 2, 14]),
         31,
+        None,
         secret(),
     )
     .expect("a /31");
@@ -867,7 +909,8 @@ fn a_point_to_point_endpoint_answers_only_the_station_its_prefix_admits() {
         Outcome::Unhandled(Unhandled::SourceOffLink)
     );
 
-    let mut host_route = Endpoint::new(OUR_MAC, OUR_ADDRESS, 32, secret()).expect("a /32");
+    let mut host_route =
+        Endpoint::new(OUR_MAC, OUR_ADDRESS, 32, Some(GATEWAY), secret()).expect("a /32");
     assert_eq!(
         host_route.handle(Some(at(0)), &arp(), &mut out),
         Outcome::Unhandled(Unhandled::SourceOffLink),
@@ -3641,4 +3684,616 @@ fn an_expired_body_ends_the_connection_with_a_reset() {
     );
     assert!(reset, "the connection was not reset");
     assert_eq!(endpoint.http_counters().bodies_timed_out, 1);
+}
+
+// ---------------------------------------------------------------------------
+// The outbound half: this port reaching out rather than answering
+// ---------------------------------------------------------------------------
+
+use crate::neighbour::{ENTRY_LIFETIME, MAX_REQUESTS, NEIGHBOURS, REQUEST_TIMEOUT};
+use crate::outbound::{ANSWER_CAPACITY, Ended, OpenError, Phase, REQUEST_CAPACITY as PROBE_ROOM};
+use crate::route::RouteRefusal;
+
+/// The port the appliance dials, and the fixed probe it carries. Both stand in
+/// for the first-party pair a management channel is built on: neither is
+/// anything a peer chooses.
+const PEER_PORT: u16 = 4433;
+const PROBE: &[u8] = b"librefirewall-probe";
+
+/// `base` plus `elapsed`, built through the one path a `Monotonic` is reachable
+/// by, so a test states an instant the way a caller of this crate would.
+fn after(base: Monotonic, elapsed: lfw_clock::Duration) -> Monotonic {
+    at(base
+        .since(at(0))
+        .as_nanos()
+        .saturating_add(elapsed.as_nanos()))
+}
+
+/// `unit` taken `count` times, `Duration` having no multiplication of its own.
+fn times(unit: lfw_clock::Duration, count: u64) -> lfw_clock::Duration {
+    lfw_clock::Duration::from_nanos(unit.as_nanos().saturating_mul(count))
+}
+
+/// Drive the outbound half until it has nothing left to do, answering with every
+/// frame it composed in order.
+///
+/// Bounded rather than looped to a fixed point: each answer either moves a phase
+/// or hands a range to the transport, so a pass that did not settle inside the
+/// bound is a defect this reports rather than a test that hangs.
+fn pump(endpoint: &mut Endpoint, now: Monotonic) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for _ in 0..64 {
+        let mut out = vec![0u8; ROOMY];
+        match endpoint.poll_outbound(now, &mut out) {
+            Polled::Frame { len } => {
+                out.truncate(len);
+                frames.push(out);
+            }
+            Polled::Handled => {}
+            Polled::Idle => return frames,
+        }
+    }
+    panic!("the outbound poll did not settle inside its own bound")
+}
+
+/// The address an ARP request asks about, and the station it was sent from.
+fn asked_about(frame: &[u8]) -> Ipv4Address {
+    let ethernet = Ethernet::parse(frame).expect("a frame");
+    assert_eq!(ethernet.header.destination, MacAddress::BROADCAST);
+    assert_eq!(ethernet.header.source, OUR_MAC);
+    assert_eq!(ethernet.header.ether_type, EtherType::ARP);
+    let request = ArpPacket::parse(ethernet.payload).expect("an ARP packet");
+    assert_eq!(request.operation, ArpOperation::Request);
+    assert_eq!(request.sender_mac, OUR_MAC);
+    assert_eq!(request.sender_address, OUR_ADDRESS);
+    assert_eq!(request.target_mac, MacAddress([0; 6]));
+    request.target_address
+}
+
+/// Answer for `address` at `mac`, then let the port install what it learned and
+/// take the `SYN` its own retransmission owes.
+///
+/// Two steps rather than one: the return path is installed from the resolution,
+/// so a poll of the outbound half has to run between the answer arriving and the
+/// transport being asked for the segment it is holding.
+fn resolve_and_take_syn(
+    endpoint: &mut Endpoint,
+    now: Monotonic,
+    mac: MacAddress,
+    address: Ipv4Address,
+) -> Vec<u8> {
+    endpoint.handle(
+        Some(now),
+        &arp_reply(OUR_MAC, mac, address, OUR_ADDRESS),
+        &mut vec![0u8; ROOMY],
+    );
+    assert!(
+        pump(endpoint, now).is_empty(),
+        "nothing composes a second SYN"
+    );
+    let mut out = vec![0u8; ROOMY];
+    let len = endpoint
+        .poll_timeouts(after(now, lfw_tcp::INITIAL_RTO), &mut out)
+        .frame()
+        .expect("the transport re-sends the SYN it was holding");
+    out.truncate(len);
+    out
+}
+
+/// Answer the station's segment into the endpoint, returning what came back.
+fn deliver(endpoint: &mut Endpoint, now: Monotonic, frame: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; ROOMY];
+    let outcome = endpoint.handle(Some(now), frame, &mut out);
+    outcome.reply().map(|len| {
+        out.truncate(len);
+        out
+    })
+}
+
+/// A whole session against a station that answers everything: the one path a
+/// management channel takes when nothing goes wrong.
+#[test]
+fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination and a probe that fits");
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Resolving)
+    );
+
+    // The port asks about the destination itself, it being on this port's own
+    // prefix, and the SYN it composed alongside is dropped for want of an
+    // address rather than queued.
+    let asked = pump(&mut endpoint, now);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
+    assert_eq!(endpoint.outbound_counters().dropped_unresolved, 1);
+    assert_eq!(endpoint.outbound_counters().dialled, 1);
+    assert_eq!(endpoint.neighbour_counters().requested, 1);
+
+    // The station answers for itself, and the entry resolves.
+    let outcome = endpoint.handle(
+        Some(now),
+        &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+        &mut vec![0u8; ROOMY],
+    );
+    assert_eq!(outcome, Outcome::Neighbour(Learned::Resolved));
+    assert_eq!(endpoint.neighbour_counters().learned, 1);
+
+    // The dropped SYN is the transport's to re-send, and it now has somewhere to
+    // go. Nothing here composes a second one.
+    assert!(pump(&mut endpoint, now).is_empty());
+    let later = after(now, lfw_tcp::INITIAL_RTO);
+    let mut out = vec![0u8; ROOMY];
+    let polled = endpoint.poll_timeouts(later, &mut out);
+    let len = polled.frame().expect("the SYN is re-sent");
+    out.truncate(len);
+
+    let mut station = Station::new(PEER_PORT, 0x5000_0000);
+    let (flags, _, _) = station.read(&out);
+    assert!(flags.contains(lfw_tcp::Flags::SYN));
+    assert!(!flags.contains(lfw_tcp::Flags::ACK));
+
+    // The handshake, then the probe, then the answer, then both closes.
+    let synack = station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]);
+    deliver(&mut endpoint, later, &synack);
+    let sent = pump(&mut endpoint, later);
+    assert_eq!(sent.len(), 1, "the probe goes out in one segment");
+    let (flags, _, payload) = station.read(&sent[0]);
+    assert!(flags.contains(lfw_tcp::Flags::ACK));
+    assert_eq!(payload, PROBE);
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Reading)
+    );
+
+    let answer = b"librefirewall-answer";
+    let reply = station.frame(
+        lfw_tcp::Flags::ACK
+            .with(lfw_tcp::Flags::PSH)
+            .with(lfw_tcp::Flags::FIN),
+        answer,
+    );
+    deliver(&mut endpoint, later, &reply);
+    assert_eq!(endpoint.outbound().map(Session::answer), Some(&answer[..]));
+
+    // This end closes once the peer has, and the exchange ends where the peer's
+    // acknowledgement of that close arrives.
+    let closing = pump(&mut endpoint, later);
+    assert_eq!(closing.len(), 1);
+    let (flags, _, _) = station.read(&closing[0]);
+    assert!(flags.contains(lfw_tcp::Flags::FIN));
+    let last = station.frame(lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, later, &last);
+    pump(&mut endpoint, later);
+
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::Answered))
+    );
+    assert_eq!(endpoint.outbound_counters().answered, 1);
+    assert_eq!(endpoint.outbound_counters().failed, 0);
+    assert_eq!(
+        endpoint.outbound_counters().request_bytes,
+        PROBE.len() as u64
+    );
+    assert_eq!(
+        endpoint.outbound_counters().answer_bytes,
+        answer.len() as u64
+    );
+    assert!(endpoint.close_outbound());
+    assert!(endpoint.outbound().is_none());
+}
+
+/// A destination off this port's prefix is reached *through the gateway*: the
+/// question on the wire is about the gateway, and the datagram still names the
+/// destination.
+#[test]
+fn a_destination_off_this_ports_prefix_is_asked_about_as_the_gateway() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(OFF_LINK, PEER_PORT, PROBE)
+        .expect("a gateway is stated");
+    assert_eq!(
+        endpoint.outbound().map(Session::next_hop),
+        Some(GATEWAY),
+        "the next hop is the gateway and not the destination"
+    );
+    let asked = pump(&mut endpoint, at(0));
+    assert_eq!(asked_about(&asked[0]), GATEWAY);
+
+    let out = resolve_and_take_syn(&mut endpoint, at(0), GATEWAY_MAC, GATEWAY);
+    let ethernet = Ethernet::parse(&out).expect("a frame");
+    assert_eq!(
+        ethernet.header.destination, GATEWAY_MAC,
+        "the frame is addressed to the gateway"
+    );
+    let packet = Ipv4Packet::parse(ethernet.payload).expect("a datagram");
+    assert_eq!(
+        packet.header().destination,
+        OFF_LINK,
+        "and the datagram still names the destination"
+    );
+}
+
+/// Every open refused before a frame leaves, and each under its own reason.
+#[test]
+fn an_open_this_port_cannot_honour_is_refused_before_anything_is_composed() {
+    let mut without = Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, None, secret())
+        .expect("a port that reaches its own link");
+    assert_eq!(
+        without.open_outbound(OFF_LINK, PEER_PORT, PROBE),
+        Err(OpenError::Unroutable(RouteRefusal::Unroutable))
+    );
+    assert_eq!(without.outbound_counters().open_refused, 1);
+    assert!(without.outbound().is_none());
+    assert!(pump(&mut without, at(0)).is_empty());
+
+    let mut endpoint = endpoint();
+    assert_eq!(
+        endpoint.open_outbound(OUR_ADDRESS, PEER_PORT, PROBE),
+        Err(OpenError::Unroutable(RouteRefusal::DestinationIsOurs))
+    );
+    assert_eq!(
+        endpoint.open_outbound(
+            Ipv4Address::from_octets([255, 255, 255, 255]),
+            PEER_PORT,
+            PROBE
+        ),
+        Err(OpenError::Unroutable(RouteRefusal::DestinationNotUnicast))
+    );
+    let long = vec![0u8; PROBE_ROOM + 1];
+    assert_eq!(
+        endpoint.open_outbound(STATION_ADDRESS, PEER_PORT, &long),
+        Err(OpenError::RequestTooLong { len: long.len() })
+    );
+    assert_eq!(endpoint.outbound_counters().opened, 0);
+    assert_eq!(endpoint.outbound_counters().open_refused, 3);
+
+    // And a second open while one runs names the session that already exists,
+    // so a caller that lost track of one does not start a second channel.
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("the first opens");
+    assert_eq!(
+        endpoint.open_outbound(STATION_ADDRESS, PEER_PORT + 1, PROBE),
+        Err(OpenError::Busy {
+            destination: STATION_ADDRESS,
+            port: PEER_PORT
+        })
+    );
+    assert!(
+        !endpoint.close_outbound(),
+        "a running session is not dropped"
+    );
+}
+
+/// A next hop nothing on the link answers for ends the session under its own
+/// reason, rather than leaving a caller waiting on a channel that will never
+/// come up.
+#[test]
+fn a_next_hop_nothing_answers_for_ends_the_session_naming_the_neighbour() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    // One request per timeout, and the budget is this end's own.
+    let mut asked = 0usize;
+    for step in 0..=u64::from(MAX_REQUESTS) {
+        let now = after(at(0), times(REQUEST_TIMEOUT, step));
+        asked += pump(&mut endpoint, now).len();
+    }
+    assert_eq!(asked, MAX_REQUESTS as usize);
+    assert_eq!(endpoint.neighbour_counters().requested, MAX_REQUESTS as u64);
+    assert_eq!(endpoint.neighbour_counters().abandoned, 1);
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::NextHopUnreachable))
+    );
+    assert_eq!(endpoint.outbound_counters().failed, 1);
+    // Nothing was ever put on the wire but the requests themselves: a segment
+    // that could not be addressed was dropped rather than sent somewhere.
+    assert!(endpoint.outbound_counters().dropped_unresolved >= 1);
+    assert!(endpoint.close_outbound());
+}
+
+/// The one thing the cache exists to refuse, driven through the endpoint: a
+/// reply for the address this end asked about, from a station that is not the
+/// frame's own source, is not learned — and the dial then reports the next hop
+/// unreachable rather than trusting it.
+#[test]
+fn a_reply_from_a_sender_the_frame_contradicts_is_never_learned() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, at(0));
+
+    // The payload claims the address this end asked about; the frame that
+    // carried it says somebody else sent it.
+    let mut forged = arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS);
+    forged[MAC_PAIR_LEN / 2..MAC_PAIR_LEN].copy_from_slice(&[0x52, 0x54, 0x00, 0xbe, 0xef, 0x01]);
+    let outcome = endpoint.handle(Some(at(0)), &forged, &mut vec![0u8; ROOMY]);
+    assert_eq!(outcome, Outcome::Unhandled(Unhandled::ArpSenderMacMismatch));
+    assert_eq!(endpoint.neighbour_counters().learned, 0);
+
+    // A reply addressed to the whole link is not ours either: it is the
+    // gratuitous announcement, and this end asked nobody for it.
+    let gratuitous = arp_reply(
+        MacAddress::BROADCAST,
+        STATION_MAC,
+        STATION_ADDRESS,
+        OUR_ADDRESS,
+    );
+    assert_eq!(
+        endpoint.handle(Some(at(0)), &gratuitous, &mut vec![0u8; ROOMY]),
+        Outcome::NotForUs
+    );
+    assert_eq!(endpoint.neighbour_counters().learned, 0);
+
+    for step in 1..=u64::from(MAX_REQUESTS) {
+        pump(&mut endpoint, after(at(0), times(REQUEST_TIMEOUT, step)));
+    }
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::NextHopUnreachable)),
+        "an unlearned reply leaves the next hop unresolved rather than trusted"
+    );
+}
+
+/// A reply arriving before this node has a time is refused rather than learned:
+/// a node with no clock has sent no request, so such a reply answers nothing.
+#[test]
+fn an_arp_reply_with_no_clock_is_refused_and_learns_nothing() {
+    let mut endpoint = endpoint();
+    let outcome = endpoint.handle(
+        None,
+        &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+        &mut vec![0u8; ROOMY],
+    );
+    assert_eq!(outcome, Outcome::Unclocked);
+    assert_eq!(endpoint.counters().unclocked, 1);
+    assert_eq!(endpoint.neighbour_counters().learned, 0);
+    // An ARP *request* is unaffected, needing no clock to answer.
+    assert!(matches!(
+        endpoint.handle(None, &arp(), &mut vec![0u8; ROOMY]),
+        Outcome::ArpReply { .. }
+    ));
+}
+
+/// A peer that answers past the room for one gets its head kept and its tail
+/// counted: which of its own bytes this end judges is not a peer's choice.
+#[test]
+fn an_answer_past_the_room_for_one_keeps_the_head_and_counts_the_rest() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, now);
+    let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    let mut station = Station::new(PEER_PORT, 0x6000_0000);
+    station.read(&syn);
+    deliver(
+        &mut endpoint,
+        now,
+        &station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]),
+    );
+    let sent = pump(&mut endpoint, now);
+    station.read(&sent[0]);
+
+    // More than the session keeps, in segments the transport will take.
+    let flood: Vec<u8> = (0..ANSWER_CAPACITY + 64).map(|byte| byte as u8).collect();
+    for chunk in flood.chunks(TCP_MSS as usize) {
+        let frame = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), chunk);
+        deliver(&mut endpoint, now, &frame);
+        pump(&mut endpoint, now);
+    }
+    let kept = endpoint.outbound().map(Session::answer).unwrap_or_default();
+    assert_eq!(kept.len(), ANSWER_CAPACITY);
+    assert_eq!(kept, &flood[..ANSWER_CAPACITY]);
+    assert_eq!(
+        endpoint.outbound_counters().answer_bytes,
+        ANSWER_CAPACITY as u64
+    );
+    assert!(endpoint.outbound_counters().answer_overflowed > 0);
+}
+
+/// A peer that resets ends the session under a reason of its own, and the port
+/// goes on answering everything else — a channel that failed is not a port that
+/// stopped.
+#[test]
+fn a_reset_ends_the_session_and_leaves_the_port_answering() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, now);
+    let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    let mut station = Station::new(PEER_PORT, 0x7000_0000);
+    let (_, acknowledgement, _) = station.read(&syn);
+    // A reset that acknowledges what this end sent is the one a dial believes.
+    station.next = acknowledgement;
+    let reset = station.frame(lfw_tcp::Flags::RST.with(lfw_tcp::Flags::ACK), &[]);
+    deliver(&mut endpoint, now, &reset);
+    pump(&mut endpoint, now);
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::Lost))
+    );
+    assert_eq!(endpoint.outbound_counters().failed, 1);
+
+    // The port is unchanged: an ARP request for its own address is still
+    // answered, and a station can still open a connection to it.
+    assert!(matches!(
+        endpoint.handle(Some(now), &arp(), &mut vec![0u8; ROOMY]),
+        Outcome::ArpReply { .. }
+    ));
+    assert!(endpoint.close_outbound());
+}
+
+proptest! {
+    /// A resolved entry is immutable for its lifetime, so no later reply — from
+    /// any station, claiming any hardware address — re-binds a next hop this port
+    /// is using.
+    #[test]
+    fn a_resolved_next_hop_is_never_rebound_by_a_later_reply(
+        octets in prop::array::uniform6(any::<u8>()),
+    ) {
+        let mut endpoint = endpoint();
+        let now = at(0);
+        endpoint
+            .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+            .expect("an on-link destination");
+        pump(&mut endpoint, now);
+        endpoint.handle(
+            Some(now),
+            &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+            &mut vec![0u8; ROOMY],
+        );
+        prop_assert_eq!(endpoint.neighbour_counters().learned, 1);
+
+        let claimed = MacAddress(octets);
+        let second = arp_reply(OUR_MAC, claimed, STATION_ADDRESS, OUR_ADDRESS);
+        let outcome = endpoint.handle(Some(now), &second, &mut vec![0u8; ROOMY]);
+        // Whatever the second reply was refused for, it was refused: a
+        // non-unicast claimant never reaches the cache at all, and a unicast one
+        // meets an entry that is already resolved.
+        prop_assert_ne!(outcome, Outcome::Neighbour(Learned::Resolved));
+        prop_assert_eq!(endpoint.neighbour_counters().learned, 1);
+
+        // And the frame the session sends still goes to the station that
+        // answered first.
+        prop_assert!(pump(&mut endpoint, now).is_empty());
+        let mut out = vec![0u8; ROOMY];
+        let len = endpoint
+            .poll_timeouts(after(now, lfw_tcp::INITIAL_RTO), &mut out)
+            .frame()
+            .expect("the SYN is re-sent");
+        let ethernet = Ethernet::parse(&out[..len]).expect("a frame");
+        prop_assert_eq!(ethernet.header.destination, STATION_MAC);
+    }
+
+    /// Whatever a station puts on this wire, a session only ever stands in a
+    /// phase a session can reach, the cache never holds more than it has room
+    /// for, and nothing panics.
+    #[test]
+    fn an_arbitrary_frame_stream_never_moves_a_session_where_it_cannot_go(
+        frames in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..80), 0..24),
+        elapsed in prop::collection::vec(0u64..4_000, 0..24),
+    ) {
+        let mut endpoint = endpoint();
+        endpoint
+            .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+            .expect("an on-link destination");
+        let mut clock = 0u64;
+        for (index, frame) in frames.iter().enumerate() {
+            clock = clock.saturating_add(elapsed.get(index).copied().unwrap_or(0));
+            let now = at(clock * 1_000_000);
+            let mut out = vec![0u8; ROOMY];
+            endpoint.handle(Some(now), frame, &mut out);
+            for _ in 0..8 {
+                let mut scratch = vec![0u8; ROOMY];
+                if !endpoint.poll_outbound(now, &mut scratch).goes_on() {
+                    break;
+                }
+            }
+            for _ in 0..8 {
+                let mut scratch = vec![0u8; ROOMY];
+                if !endpoint.poll_timeouts(now, &mut scratch).goes_on() {
+                    break;
+                }
+            }
+            let phase = endpoint.outbound().map(Session::phase);
+            prop_assert!(phase.is_some(), "a session nobody closed disappeared");
+            // A session that never reached a hardware address cannot have
+            // answered, and one that never dialled cannot be reading.
+            if matches!(phase, Some(Phase::Ended(Ended::Answered))) {
+                prop_assert_eq!(endpoint.neighbour_counters().learned, 1);
+            }
+            prop_assert!(endpoint.return_paths() <= endpoint.connections());
+            prop_assert_eq!(
+                endpoint.counters().total(),
+                (index + 1) as u64,
+                "every frame handed over is counted exactly once"
+            );
+        }
+    }
+}
+
+/// The cache holds what this end asked about and nothing a peer chose, so a link
+/// full of stations announcing themselves cannot fill it.
+#[test]
+fn unsolicited_replies_cannot_fill_the_neighbour_table() {
+    let mut endpoint = endpoint();
+    for last in 100u8..(100 + NEIGHBOURS as u8 * 4) {
+        let address = Ipv4Address::from_octets([10, 0, 2, last]);
+        let mac = MacAddress([0x52, 0x54, 0x00, 0x00, 0x01, last]);
+        endpoint.handle(
+            Some(at(0)),
+            &arp_reply(OUR_MAC, mac, address, OUR_ADDRESS),
+            &mut vec![0u8; ROOMY],
+        );
+    }
+    assert_eq!(endpoint.neighbour_counters().learned, 0);
+    assert_eq!(endpoint.neighbour_counters().no_room, 0);
+    // And a dial opened afterwards still finds room to ask.
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    let asked = pump(&mut endpoint, at(0));
+    assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
+}
+
+/// An entry is used for its lifetime and no longer, which is what bounds the
+/// cost of a resolved entry being immutable: a next hop whose hardware address
+/// genuinely moved is followed once the old answer has expired.
+#[test]
+fn a_resolved_entry_stops_being_an_answer_once_its_lifetime_runs_out() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, at(0));
+    endpoint.handle(
+        Some(at(0)),
+        &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+        &mut vec![0u8; ROOMY],
+    );
+    assert_eq!(endpoint.neighbour_counters().learned, 1);
+    assert_eq!(endpoint.neighbour_counters().requested, 1);
+
+    // Inside the lifetime the entry is the answer, so a second reply for it is
+    // refused as a rebinding rather than taken.
+    let inside = after(at(0), lfw_tcp::INITIAL_RTO);
+    assert_eq!(
+        endpoint.handle(
+            Some(inside),
+            &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+            &mut vec![0u8; ROOMY],
+        ),
+        Outcome::Neighbour(Learned::AlreadyResolved)
+    );
+    assert_eq!(endpoint.neighbour_counters().rebinding_refused, 1);
+
+    // Past it the entry is gone: the same reply answers nothing, and the next
+    // question about the address is a fresh request rather than a stale answer.
+    let past = after(at(0), ENTRY_LIFETIME);
+    assert_eq!(
+        endpoint.handle(
+            Some(past),
+            &arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS),
+            &mut vec![0u8; ROOMY],
+        ),
+        Outcome::Neighbour(Learned::Unsolicited)
+    );
+    assert_eq!(endpoint.neighbour_counters().expired, 1);
+    let asked = pump(&mut endpoint, past);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
+    assert_eq!(endpoint.neighbour_counters().requested, 2);
 }
