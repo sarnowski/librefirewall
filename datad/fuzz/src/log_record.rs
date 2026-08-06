@@ -84,8 +84,8 @@ use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
-    LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LogRecord, LogRecordError,
-    LogText, TextImage, ValueImage,
+    LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
+    LogRecord, LogRecordError, LogText, TextImage, ValueImage,
 };
 
 /// Bytes one record occupies, and so what one corpus entry is.
@@ -109,7 +109,8 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The eighteen `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
+/// The twenty-five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s
+/// terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -131,7 +132,11 @@ const DETAIL_FINGERPRINT: u8 = 17;
 const DETAIL_RESET: u8 = 18;
 const DETAIL_DELEGATED: u8 = 19;
 const DETAIL_DIALLED: u8 = 20;
-const DETAIL_COUNT: u8 = 21;
+const DETAIL_DIAL_ROUTE: u8 = 21;
+const DETAIL_DIAL_UNLEARNED: u8 = 22;
+const DETAIL_DIAL_SEGMENTS: u8 = 23;
+const DETAIL_DIAL_SEQUENCE: u8 = 24;
+const DETAIL_COUNT: u8 = 25;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -563,7 +568,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
                 | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
                 | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
-                | DETAIL_DELEGATED | DETAIL_DIALLED => {
+                | DETAIL_DELEGATED | DETAIL_DIALLED | DETAIL_DIAL_ROUTE
+                | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -714,6 +720,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_ARENA
         | DETAIL_PROVEN
         | DETAIL_FINGERPRINT
+        // The channel's refused-reply counts join them: four unranged tallies of
+        // what a link answered, and no shape a rule can turn away.
+        | DETAIL_DIAL_UNLEARNED
         // The delegation detail reads three unranged words — an identifier's two
         // halves and a signature count — and deliberately not the fourth, so the
         // flag rule below does not reach it and there is nothing here to refuse.
@@ -724,7 +733,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // appliance — on a record that said something else. Restated here as the
         // two-value check it is, once, because the ABI carries a flag in one
         // position and this harness has one rule for it too.
-        DETAIL_IDENTITY | DETAIL_RESET => {
+        // The channel's segment counts join them: their fourth word is the one
+        // flag they carry, in the one position this ABI puts a flag in.
+        DETAIL_IDENTITY | DETAIL_RESET | DETAIL_DIAL_SEGMENTS => {
             (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
                 value: record.operands[3],
             })
@@ -765,6 +776,26 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
                 )
             })
             .or_else(|| wide_code_point(record.operands[2])),
+        // The channel's route detail reads four words and ranges two: a token
+        // naming which of the port's two answers chose the next hop, and the
+        // address itself. The two counts behind them are unranged.
+        DETAIL_DIAL_ROUTE => (record.operands[0] >= u64::from(LOG_NEXT_HOP_VIA_COUNT))
+            .then_some(LogRecordError::NextHopViaUnknown {
+                via: record.operands[0],
+            })
+            .or_else(|| {
+                (record.operands[1] > u64::from(u32::MAX)).then_some(
+                    LogRecordError::AddressTooWide {
+                        value: record.operands[1],
+                    },
+                )
+            }),
+        // And its sequence detail reads two, each thirty-two bits wide wherever
+        // TCP names one — the peer's own claim included, which is ranged for
+        // being rendered rather than for being believed. Left to right, so the
+        // first refusal a record earns is the one this harness expects.
+        DETAIL_DIAL_SEQUENCE => wide_sequence(record.operands[0])
+            .or_else(|| wide_sequence(record.operands[1])),
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.
@@ -829,6 +860,11 @@ fn vocabulary(raw: u8, count: u8, error: LogRecordError) -> Option<LogRecordErro
 /// A code point wider than the sixteen bits a TLS registry numbers one in.
 fn wide_code_point(value: u64) -> Option<LogRecordError> {
     (value > u64::from(u16::MAX)).then_some(LogRecordError::CodePointTooWide { value })
+}
+
+/// A word wider than the thirty-two bits a TCP sequence number has.
+fn wide_sequence(value: u64) -> Option<LogRecordError> {
+    (value > u64::from(u32::MAX)).then_some(LogRecordError::SequenceTooWide { value })
 }
 
 fn text_refusal<const N: usize>(
@@ -1301,6 +1337,56 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The four records a channel that did not come up adds after its
+            // outcome, in the accepted shape. Committed for `valid_domain_dialled`'s
+            // reason and one more: three of the four have nothing a rule can
+            // refuse at all, so a cold run reaches their *accepted* shape only
+            // by drawing the discriminant, and the render path over them is
+            // never walked otherwise.
+            (
+                "valid_domain_dial_route",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIAL_ROUTE,
+                    operands: [
+                        u64::from(LOG_NEXT_HOP_VIA_COUNT - 1),
+                        u64::from(u32::from_be_bytes([10, 0, 2, 2])),
+                        9,
+                        0,
+                    ],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_dial_unlearned",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIAL_UNLEARNED,
+                    // No two alike, so a count read out of the wrong operand
+                    // word is visible rather than symmetric.
+                    operands: [9, 1, 2, 3],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_dial_segments",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIAL_SEGMENTS,
+                    // Three counts and, in the fourth word, the flag — at 1, the
+                    // value a uniform draw over `u64` never lands on.
+                    operands: [15, 0, 15, 1],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_dial_sequence",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIAL_SEQUENCE,
+                    // Both at the widest a sequence number can be, which is the
+                    // value a check written with `>=` instead of `>` would
+                    // wrongly refuse.
+                    operands: [u64::from(u32::MAX), u64::from(u32::MAX), 0, 0],
+                    ..domain_record()
+                }),
+            ),
             // The delegation detail, which reads the first three words and leaves
             // the fourth unclaimed. Committed because it is the one detail whose
             // *fourth* word is deliberately not a flag: a seed here is what keeps
@@ -1424,6 +1510,41 @@ mod tests {
                 ..config_rejected_record()
             },
         );
+        // The two vocabularies an *operand word* carries rather than a byte
+        // field. They need the pair as much as the byte ones do and are reached
+        // even less readily: a token past the set is one of 2^64 values and the
+        // token at the edge is exactly one of them, so neither end of the
+        // off-by-one happens by chance.
+        pair(
+            "dial_outcome_at_its_last_token",
+            "dial_outcome_one_past_its_last_token",
+            LOG_DIAL_OUTCOME_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_DIALLED,
+                operands: [
+                    u64::from(token),
+                    u64::from(u32::from_be_bytes([10, 0, 2, 2])),
+                    4433,
+                    3,
+                ],
+                ..domain_record()
+            },
+        );
+        pair(
+            "next_hop_via_at_its_last_token",
+            "next_hop_via_one_past_its_last_token",
+            LOG_NEXT_HOP_VIA_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_DIAL_ROUTE,
+                operands: [
+                    u64::from(token),
+                    u64::from(u32::from_be_bytes([10, 0, 2, 2])),
+                    9,
+                    0,
+                ],
+                ..domain_record()
+            },
+        );
         seeds
     }
 
@@ -1538,6 +1659,63 @@ mod tests {
                 outcome: u64::from(LOG_DIAL_OUTCOME_COUNT),
             })
         );
+    }
+
+    /// The three records a failed channel adds after its outcome, and the fourth
+    /// an unacceptable acknowledgement adds after those: each reaches the decode
+    /// in its accepted shape, and each is refused at the one boundary it has.
+    ///
+    /// Their reason for being seeds is the opposite of the dialled record's and
+    /// just as strong: two of the four can be refused for **nothing at all**, so
+    /// a cold run reaches them only by drawing their discriminant out of
+    /// twenty-five, and the render path over them would otherwise go unwalked.
+    #[test]
+    fn every_record_a_failed_channel_adds_reaches_the_decode_and_its_own_boundary() {
+        for name in [
+            "valid_domain_dial_route",
+            "valid_domain_dial_unlearned",
+            "valid_domain_dial_segments",
+            "valid_domain_dial_sequence",
+        ] {
+            record_from_region(&seed(name))
+                .check()
+                .unwrap_or_else(|error| panic!("seed {name} was refused: {error}"));
+        }
+
+        // The route's token, at the edge and one past it.
+        let route = record_from_region(&seed("valid_domain_dial_route"));
+        assert_eq!(route.operands[0], u64::from(LOG_NEXT_HOP_VIA_COUNT - 1));
+        let mut past = route;
+        past.operands[0] = u64::from(LOG_NEXT_HOP_VIA_COUNT);
+        assert_eq!(
+            past.check(),
+            Err(LogRecordError::NextHopViaUnknown {
+                via: u64::from(LOG_NEXT_HOP_VIA_COUNT),
+            })
+        );
+
+        // The segment counts' flag, which is the fourth word and nothing else.
+        let mut segments = record_from_region(&seed("valid_domain_dial_segments"));
+        segments.operands[3] = 2;
+        assert_eq!(
+            segments.check(),
+            Err(LogRecordError::OperandFlagNotBoolean { value: 2 })
+        );
+
+        // And both sequence words, each at the widest value one can be and each
+        // refused one past it.
+        let sequence = record_from_region(&seed("valid_domain_dial_sequence"));
+        for word in 0..2 {
+            assert_eq!(sequence.operands[word], u64::from(u32::MAX));
+            let mut past = sequence;
+            past.operands[word] = u64::from(u32::MAX) + 1;
+            assert_eq!(
+                past.check(),
+                Err(LogRecordError::SequenceTooWide {
+                    value: u64::from(u32::MAX) + 1,
+                })
+            );
+        }
     }
 
     /// The four operand words a fingerprint occupies all survive the check, and

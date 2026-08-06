@@ -267,6 +267,19 @@ The decisions that constrain all observability code:
 
 - The **console** carries system state only — the startup sequence and its outcome, and runtime
   configuration changes — never traffic or per-request data.
+- **A failure to establish the connection to the management server is diagnosable from the console
+  alone.** The console is the only debug surface a deployed node has, so a record saying only *that*
+  the connection failed costs a physical visit and a guess. Every distinct cause therefore has a
+  token of its own — a token covering three causes names none of them — and the record set carries
+  the technical facts that place the fault without the wire: where the frames were sent and which
+  part of the addressing chose that, what the link answered and what it refused, and what the
+  connection itself did. Where a fact tells two causes apart, it is on the console. This holds for
+  the transport dial today and for the TLS channel above it when that arrives. Two bounds keep it
+  honest: no packet payload, secret or key reaches these records — counts, addresses, ports and
+  sequence numbers are system state and belong there, and a byte the peer sent does not — and the
+  record count is bounded by the shape of the outcome rather than by anything that happened on the
+  wire, so a channel that failed many times over reports the same few lines as one that failed
+  once.
 - **Logs** are structured typed events with one transport — today the OpenTelemetry log stream, and
   under the [management-plane redesign](../design/management.md) the channel — never syslog, and
   never two transports at once.

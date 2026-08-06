@@ -82,28 +82,84 @@ closed_vocabulary! {
 
 closed_vocabulary! {
     /// How a connection this appliance *originated* finished. A mirror of
-    /// `lfw_ip_endpoint::outbound::Ended`, held to it by the one call site that
-    /// maps the two, and here for the reason [`Primitive`] is: a console
-    /// vocabulary lives where the console's own tokens live, and this crate
-    /// reaches for no transport.
+    /// `lfw_ip_endpoint::outbound::Ended` and of the two refusal sets beside it,
+    /// held to them by the one call site that maps them, and here for the reason
+    /// [`Primitive`] is: a console vocabulary lives where the console's own
+    /// tokens live, and this crate reaches for no transport.
     ///
-    /// Every variant is terminal, and each names a different thing to go and look
-    /// at: nothing on the link claims the next hop, as against a station that
-    /// claimed it and then refused the connection. The order is the wire
-    /// encoding, so a variant is appended and never inserted.
+    /// **One token per distinct cause, and that is the whole design of this
+    /// list.** A deployed node has no shell and no debugger, so a failure to
+    /// reach the management server is diagnosable from the console or not at
+    /// all — and a token covering three causes is one that names none of them.
+    /// The three the peer can produce are three tokens, the three this node's
+    /// transport can produce are three more, and the three its own addressing
+    /// can produce are three again, because each of the nine sends somebody to a
+    /// different place. The order is the wire encoding, so a variant is appended
+    /// and never inserted.
     DialOutcome {
         Answered => "answered",
+
+        // The link: nothing this end sent could be addressed at all.
         NextHopUnreachable => "next-hop-unreachable",
         NoRoomToResolve => "no-room-to-resolve",
-        DialRefused => "dial-refused",
+
+        // The peer: a connection was dialled and something, or nothing, came
+        // back.
+        /// The retransmission budget ran out with **nothing arriving at all**.
+        Unanswered => "unanswered",
+        /// A reset from the peer ended the connection: somebody is there and is
+        /// refusing this port.
+        ResetByPeer => "reset-by-peer",
+        /// The peer acknowledged a number this end never sent, which draws a
+        /// reset and leaves the dial standing, so the channel then runs its
+        /// attempts out. The two numbers are on the record beside this token.
+        UnacceptableAcknowledgement => "unacceptable-acknowledgement",
+        /// The connection went away and none of the three above explains it.
+        /// The residual, and named as one: what makes it readable is that the
+        /// three causes it used to swallow are now their own tokens.
         ConnectionLost => "connection-lost",
-        /// This end refused the open before a frame was composed: no next hop
-        /// could be chosen for the destination, a session was already running,
-        /// or the probe was longer than the room for one. One token for the
-        /// three because they share an operator's answer — the record names the
-        /// destination, and what is wrong is this node's own addressing rather
-        /// than anything a peer did.
-        NotOpened => "not-opened",
+
+        // This node's own transport, which refused the dial before a `SYN`
+        // could be composed.
+        /// Its table was full and nothing in it could be taken back.
+        NoRoomToDial => "no-room-to-dial",
+        /// It already holds a connection on this very peer address and port.
+        ConnectionAlreadyOpen => "connection-already-open",
+        /// The `SYN` did not fit the storage offered for it. **This node's own
+        /// defect**, expected never to appear.
+        SynDidNotFit => "syn-did-not-fit",
+
+        // This node's own addressing and state, which refused the open before
+        // the transport was asked.
+        /// A session was already running on this port.
+        SessionAlreadyRunning => "session-already-running",
+        /// No next hop could be chosen: the destination, the prefix or the
+        /// gateway is wrong.
+        DestinationUnroutable => "destination-unroutable",
+        /// The probe was longer than the room a session holds for one.
+        ProbeTooLong => "probe-too-long",
+    }
+}
+
+closed_vocabulary! {
+    /// Which of an addressed port's two answers chose a next hop. A mirror of
+    /// `lfw_ip_endpoint::route::Via`, on [`DialOutcome`]'s terms.
+    ///
+    /// It travels beside the address because the address alone cannot say: a
+    /// gateway that happens to be the destination reads exactly like an on-link
+    /// destination, and the two send an operator to different halves of the
+    /// configuration document.
+    NextHopVia {
+        /// Inside the port's own prefix, reached as itself.
+        Prefix => "prefix",
+        /// Outside it, so the frame goes to the port's stated gateway.
+        Gateway => "gateway",
+        /// **No next hop was chosen at all** — the address beside this token is
+        /// where the appliance meant to go and not a station it picked. Its own
+        /// token rather than one of the two above because saying a frame went
+        /// on-link when no route was found is precisely the kind of false
+        /// signal this vocabulary exists to be rid of.
+        None => "none",
     }
 }
 
@@ -428,6 +484,7 @@ mod tests {
         check_vocabulary!(GenerationOutcome);
         check_vocabulary!(RejectReason);
         check_vocabulary!(DialOutcome);
+        check_vocabulary!(NextHopVia);
     }
 
     #[test]

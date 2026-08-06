@@ -24,14 +24,38 @@ fn a_destination_on_this_link_is_reached_as_itself() {
     // travels through one, which is the property that keeps a dial to a station
     // on this link from depending on a gateway being right.
     for gateway in [None, Some(GATEWAY)] {
-        assert_eq!(next_hop(port(gateway), station), Ok(station));
+        assert_eq!(
+            next_hop(port(gateway), station),
+            Ok(Hop {
+                address: station,
+                via: Via::Prefix
+            })
+        );
     }
 }
 
 #[test]
 fn a_destination_off_this_link_is_reached_through_the_gateway() {
     let elsewhere = address([192, 168, 7, 4]);
-    assert_eq!(next_hop(port(Some(GATEWAY)), elsewhere), Ok(GATEWAY));
+    assert_eq!(
+        next_hop(port(Some(GATEWAY)), elsewhere),
+        Ok(Hop {
+            address: GATEWAY,
+            via: Via::Gateway
+        })
+    );
+}
+
+/// The two answers name themselves distinctly, because the name is what a
+/// console line carries and a duplicate would collapse "reached on this link"
+/// and "reached through the gateway" into one thing to go and look at.
+#[test]
+fn each_way_a_next_hop_is_chosen_names_itself_distinctly() {
+    assert_ne!(Via::Prefix.name(), Via::Gateway.name());
+    for via in [Via::Prefix, Via::Gateway] {
+        assert_eq!(std::format!("{via}"), via.name());
+        assert!(!via.name().is_empty());
+    }
 }
 
 #[test]
@@ -146,7 +170,10 @@ fn a_zero_prefix_reaches_everything_on_link() {
             },
             station,
         ),
-        Ok(station)
+        Ok(Hop {
+            address: station,
+            via: Via::Prefix
+        })
     );
 }
 
@@ -187,8 +214,8 @@ proptest! {
             gateway: gateway.map(Ipv4Address::from_octets),
         };
         if let Ok(hop) = next_hop(port, Ipv4Address::from_octets(destination)) {
-            prop_assert!(hop.is_unicast());
-            prop_assert_ne!(hop, port.address);
+            prop_assert!(hop.address.is_unicast());
+            prop_assert_ne!(hop.address, port.address);
         }
     }
 
@@ -209,7 +236,15 @@ proptest! {
             gateway: gateway.map(Ipv4Address::from_octets),
         };
         if let Ok(hop) = next_hop(port, Ipv4Address::from_octets(destination)) {
-            prop_assert!(hop.shares_prefix(port.address, prefix_length));
+            prop_assert!(hop.address.shares_prefix(port.address, prefix_length));
+            // And the answer says which of the two chose it, which is the half
+            // the address alone cannot carry: a gateway equal to the
+            // destination reads exactly like an on-link destination.
+            prop_assert_eq!(
+                hop.via == Via::Prefix,
+                Ipv4Address::from_octets(destination)
+                    .shares_prefix(port.address, prefix_length)
+            );
         }
     }
 
@@ -228,7 +263,8 @@ proptest! {
         let destination = Ipv4Address::from_octets(destination);
         match next_hop(port, destination) {
             Ok(hop) => {
-                prop_assert_eq!(hop, destination);
+                prop_assert_eq!(hop.address, destination);
+                prop_assert_eq!(hop.via, Via::Prefix);
                 prop_assert!(destination.shares_prefix(OURS, prefix_length));
             }
             Err(refusal) => prop_assert_ne!(refusal, RouteRefusal::GatewayOffLink),

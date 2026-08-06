@@ -549,7 +549,10 @@ pub use handover::{
 /// are part of it.
 pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
-pub use lfw_ip_endpoint::outbound::{Ended, OpenError, REQUEST_CAPACITY as DIAL_REQUEST_CAPACITY};
+pub use lfw_ip_endpoint::outbound::{
+    DialFacts, Ended, OpenError, REQUEST_CAPACITY as DIAL_REQUEST_CAPACITY, Resolutions,
+};
+pub use lfw_ip_endpoint::route::{RouteRefusal, Via};
 pub use net_headers::Ipv4Address;
 pub use pipeline::{Configuration, PolicySweep, Tracking};
 pub use stats::{

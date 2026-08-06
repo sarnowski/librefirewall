@@ -21,7 +21,10 @@
 //! gateway's hardware address while the datagram still names the destination.
 //! Both come out of [`next_hop`] as the address to resolve, because that is the
 //! only thing the caller does with the answer — the datagram's destination is
-//! never the question.
+//! never the question. Which of the two it was travels with it as a [`Via`],
+//! because the address alone cannot say: a next hop equal to the destination
+//! and a gateway that happens to be the destination read the same, and the two
+//! send an operator to different halves of the configuration.
 //!
 //! # What this deliberately is not
 //!
@@ -64,6 +67,50 @@ pub struct Port {
     /// operator stated none — then this port reaches its own link and nothing
     /// else.
     pub gateway: Option<Ipv4Address>,
+}
+
+/// Which of the port's two answers a next hop came out of.
+///
+/// A statement about the *decision* and not about the address, which is why it
+/// travels beside one rather than being derived from it: an operator reading
+/// that a frame went to the gateway looks at `<management>`'s gateway, and one
+/// reading that it went on-link looks at the address and the prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// The destination is inside this port's own prefix and is reached as
+    /// itself.
+    Prefix,
+    /// The destination is outside it, so the frame goes to the port's gateway.
+    Gateway,
+}
+
+impl Via {
+    /// A stable short name, hyphenated: this one *is* a console token, unlike
+    /// [`RouteRefusal::name`] beside it, so it is spelled the way the console
+    /// spells one.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Gateway => "gateway",
+        }
+    }
+}
+
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The station a frame is handed to, and which of the port's two answers chose
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hop {
+    /// The address to resolve. Never a datagram field: the datagram names the
+    /// destination whichever answer this is.
+    pub address: Ipv4Address,
+    pub via: Via,
 }
 
 /// Why no next hop was chosen.
@@ -130,14 +177,13 @@ impl fmt::Display for RouteRefusal {
 
 /// The station a datagram for `destination` is handed to, leaving `port`.
 ///
-/// The destination itself where it is on-link, the gateway where it is not. The
-/// answer is an address to *resolve*, never a datagram field: the datagram names
-/// `destination` in either case.
+/// The destination itself where it is on-link, the gateway where it is not, and
+/// the answer says which.
 ///
 /// # Errors
 /// [`RouteRefusal`], for a destination this end may not address, a destination
 /// this port cannot reach at all, or a gateway that could not be a next hop.
-pub fn next_hop(port: Port, destination: Ipv4Address) -> Result<Ipv4Address, RouteRefusal> {
+pub fn next_hop(port: Port, destination: Ipv4Address) -> Result<Hop, RouteRefusal> {
     if port.prefix_length > MAX_PREFIX_LENGTH {
         return Err(RouteRefusal::PrefixLengthOutOfRange);
     }
@@ -148,7 +194,10 @@ pub fn next_hop(port: Port, destination: Ipv4Address) -> Result<Ipv4Address, Rou
         return Err(RouteRefusal::DestinationIsOurs);
     }
     if destination.shares_prefix(port.address, port.prefix_length) {
-        return Ok(destination);
+        return Ok(Hop {
+            address: destination,
+            via: Via::Prefix,
+        });
     }
     let Some(gateway) = port.gateway else {
         return Err(RouteRefusal::Unroutable);
@@ -166,7 +215,10 @@ pub fn next_hop(port: Port, destination: Ipv4Address) -> Result<Ipv4Address, Rou
     if !gateway.shares_prefix(port.address, port.prefix_length) {
         return Err(RouteRefusal::GatewayOffLink);
     }
-    Ok(gateway)
+    Ok(Hop {
+        address: gateway,
+        via: Via::Gateway,
+    })
 }
 
 #[cfg(test)]

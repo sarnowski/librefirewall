@@ -131,14 +131,15 @@ mod entropy;
 use entropy::EntropyError;
 use lfw_clock::Monotonic;
 use lfw_log::{
-    DialOutcome, Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink,
+    DialOutcome, Domain, DomainDetail, DomainState, Event, NextHopVia, Refusal, RefusalDetail,
+    RingSink, Sink,
 };
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
-    Configurations, DIAL_REQUEST_CAPACITY, Downloads, Ended, EndpointRegions, EndpointStage,
-    ForwardRings, Ipv4Address, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region,
-    log_sample, read_timestamp_counter,
+    Configurations, DIAL_REQUEST_CAPACITY, DialFacts, Downloads, Ended, EndpointRegions,
+    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, OpenError, PdClock, Pool, Resolutions,
+    ReturnRing, StatsRegions, Via, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
@@ -234,10 +235,28 @@ struct Dial {
     attempts: u64,
     /// Whether one of them is running now.
     running: bool,
-    /// Whether the one record this channel owes has been made. It is what makes
-    /// the record exactly one: a channel is reported when it is decided, and a
-    /// decided channel is never re-opened.
+    /// Whether the outcome record this channel owes has been made. It is what
+    /// makes that record exactly one: a channel is reported when it is decided,
+    /// and a decided channel is never re-opened.
     reported: bool,
+    /// Every session's frames, folded together. A channel spends more than one
+    /// session and what an operator reads is the channel, so a station that
+    /// answered none of them is reported as every handshake it ignored rather
+    /// than as the last session's share of them.
+    facts: DialFacts,
+    /// The station the last session's frames were handed to, and which of the
+    /// port's two answers chose it. The last rather than a fold: every session
+    /// of one channel routes the same way, so there is one answer and not three,
+    /// and `None` is a channel refused before a route was ever chosen.
+    hop: Option<(Ipv4Address, Via)>,
+    /// The port's resolution counts as they stood when this channel opened its
+    /// first session. Subtracted at the report, which is what turns a running
+    /// total of the port into an account of the channel.
+    resolutions_before: Option<Resolutions>,
+    /// The sequence numbers a station claimed against what this end had sent,
+    /// where one did. Kept beside the outcome because the token names the fault
+    /// and these two are the whole of what places it.
+    acknowledged: Option<(u32, u32)>,
 }
 
 impl Dial {
@@ -246,6 +265,10 @@ impl Dial {
             attempts: 0,
             running: false,
             reported: false,
+            facts: DialFacts::new(),
+            hop: None,
+            resolutions_before: None,
+            acknowledged: None,
         }
     }
 
@@ -259,6 +282,11 @@ impl Dial {
             return;
         }
         if !self.running {
+            // Read before the first session opens anything, so the subtraction
+            // at the report covers the channel and not the boot.
+            if self.resolutions_before.is_none() {
+                self.resolutions_before = Some(stage.resolutions());
+            }
             match stage.open_dial(DIAL_DESTINATION, DIAL_PORT, DIAL_PROBE) {
                 // Unaddressed: there is no source address to open a session
                 // from, and one will arrive with the next committed generation.
@@ -269,9 +297,10 @@ impl Dial {
                 }
                 // This end refused before a frame was composed, and no further
                 // attempt would be answered differently: nothing a peer does
-                // changes a destination this node cannot route to.
-                Some(Err(_)) => {
-                    self.report(sink, DialOutcome::NotOpened);
+                // changes a destination this node cannot route to, a probe this
+                // node cannot fit, or a session this node is already running.
+                Some(Err(error)) => {
+                    self.report(stage, sink, refused_open(error));
                     return;
                 }
             }
@@ -280,15 +309,40 @@ impl Dial {
         let Some(ended) = stage.dial_ended() else {
             return;
         };
+        // Before the close, which drops the session and everything it watched:
+        // the counts are the evidence beside the token, and a token with no
+        // evidence is the record this change exists to be rid of.
+        if let Some((hop, facts)) = stage.dial_facts() {
+            self.facts = self.facts.joined(facts);
+            self.hop = Some((hop.address, hop.via));
+        }
+        // The two numbers travel with the ending that carries them and with no
+        // other: a pair kept from a session that ended some other way would be
+        // numbers reported beside a fault they did not belong to.
+        if let Ended::UnacceptableAcknowledgement { claimed, expected } = ended {
+            self.acknowledged = Some((claimed, expected));
+        }
         stage.close_dial();
         self.running = false;
         if ended.succeeded() || self.attempts >= DIAL_ATTEMPTS {
-            self.report(sink, outcome_of(ended));
+            self.report(stage, sink, outcome_of(ended));
         }
     }
 
-    /// The one record the channel owes, whichever way it went.
-    fn report(&mut self, sink: &dyn Sink, outcome: DialOutcome) {
+    /// What the channel owes the console, whichever way it went.
+    ///
+    /// **One record on a channel that came up, and four or five on one that did
+    /// not.** A deployed node has no shell, so the counts that place a failure
+    /// have to be on the console or nowhere — and they are more facts than the
+    /// four operand words a record carries, which makes them further records
+    /// rather than a wider one. A healthy boot stays quiet because there is
+    /// nothing to place.
+    ///
+    /// The number of records is bounded by the shape of the outcome and never by
+    /// anything that happened on the wire: a channel that spent every attempt it
+    /// had and a great many handshakes reports the same lines as one that spent
+    /// a single attempt and one handshake.
+    fn report(&mut self, stage: &EndpointStage<'static>, sink: &dyn Sink, outcome: DialOutcome) {
         self.reported = true;
         announce(
             sink,
@@ -300,19 +354,107 @@ impl Dial {
                 outcome,
             },
         );
+        if outcome == DialOutcome::Answered {
+            return;
+        }
+        // The route the frames really took. Where an open was refused before one
+        // was chosen there is none, and the record says so rather than naming
+        // one of the two real answers: the address then stands for where this
+        // domain meant to go, and a next hop of zero would name a station.
+        let (next_hop, via) = self
+            .hop
+            .map_or((DIAL_DESTINATION, NextHopVia::None), |(address, via)| {
+                (address, chosen_via(via))
+            });
+        // The resolution's own account, over the life of the channel rather than
+        // over the boot: the port asks about nothing else, but a subtraction says
+        // so rather than assuming it.
+        let resolutions = stage
+            .resolutions()
+            .since(self.resolutions_before.unwrap_or_default());
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::DialRoute {
+                next_hop,
+                via,
+                requests: resolutions.requested,
+                learned: resolutions.learned,
+            },
+        );
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::DialUnlearned {
+                unsolicited: resolutions.unsolicited,
+                rebinding: resolutions.rebinding,
+                not_unicast: resolutions.not_unicast,
+                contradicted: resolutions.contradicted,
+            },
+        );
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::DialSegments {
+                syns: self.facts.syns,
+                resets_received: self.facts.resets_received,
+                resets_sent: self.facts.resets_sent,
+                answered: self.facts.answered,
+            },
+        );
+        // Only where a station claimed one: the numbers exist exactly then, and
+        // a record carrying two zeroes would be a pair this domain invented.
+        if let Some((claimed, expected)) = self.acknowledged {
+            announce(
+                sink,
+                DomainState::Ready,
+                DomainDetail::DialSequence { claimed, expected },
+            );
+        }
     }
 }
 
 /// A finished session in the vocabulary a console line speaks. The two sets are
 /// separate copies facing different readers — one is the transport's, one is the
 /// operator's — and this is the single place that maps them.
+///
+/// One arm per ending and no arm covering two, which is the whole obligation
+/// this function carries: a fold here would put back on the console exactly the
+/// ambiguity the endpoint went to the trouble of resolving.
 const fn outcome_of(ended: Ended) -> DialOutcome {
     match ended {
         Ended::Answered => DialOutcome::Answered,
         Ended::NextHopUnreachable => DialOutcome::NextHopUnreachable,
         Ended::NoRoomToResolve => DialOutcome::NoRoomToResolve,
-        Ended::Refused(_) => DialOutcome::DialRefused,
+        Ended::Unanswered => DialOutcome::Unanswered,
+        Ended::ResetByPeer => DialOutcome::ResetByPeer,
+        Ended::UnacceptableAcknowledgement { .. } => DialOutcome::UnacceptableAcknowledgement,
         Ended::Lost => DialOutcome::ConnectionLost,
+        Ended::NoRoomToDial => DialOutcome::NoRoomToDial,
+        Ended::ConnectionAlreadyOpen => DialOutcome::ConnectionAlreadyOpen,
+        Ended::SynDidNotFit => DialOutcome::SynDidNotFit,
+    }
+}
+
+/// An open this end refused before a frame was composed, in the same
+/// vocabulary. Its own function because the two sets it maps from are different
+/// — one is a session that ran and one is a session that never began — and each
+/// of these three is a different line of this node's own configuration to go and
+/// read.
+const fn refused_open(error: OpenError) -> DialOutcome {
+    match error {
+        OpenError::Busy { .. } => DialOutcome::SessionAlreadyRunning,
+        OpenError::Unroutable(_) => DialOutcome::DestinationUnroutable,
+        OpenError::RequestTooLong { .. } => DialOutcome::ProbeTooLong,
+    }
+}
+
+/// The route decision's answer in the console's own vocabulary, on
+/// [`outcome_of`]'s terms.
+const fn chosen_via(via: Via) -> NextHopVia {
+    match via {
+        Via::Prefix => NextHopVia::Prefix,
+        Via::Gateway => NextHopVia::Gateway,
     }
 }
 

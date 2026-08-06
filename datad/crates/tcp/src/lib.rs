@@ -225,6 +225,20 @@ pub struct Received<'a> {
     /// The peer has closed its half. A caller with nothing more to send answers
     /// with [`TcpStack::close`].
     pub peer_closed: bool,
+    /// The peer's `RST` ended this connection, and the slot is already back.
+    ///
+    /// Beside `peer_closed` because it answers the same question about the same
+    /// segment and answers it differently: a close is an exchange finishing and
+    /// a reset is a peer refusing one. Without it a caller sees only that the
+    /// table stopped holding the connection, which is the same observation a
+    /// retransmission budget running out produces — and telling those two apart
+    /// is the difference between a station that refused this node and one that
+    /// was never there.
+    pub peer_reset: bool,
+    /// This end answered with a `RST`, whether or not the connection survived
+    /// it. What it accuses is the peer: every reset composed here answers a
+    /// segment RFC 793 says must be refused that way.
+    pub reset_sent: bool,
 }
 
 /// What became of one segment. Every variant is counted.
@@ -1052,6 +1066,10 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                 connection: None,
                 emitted,
                 peer_closed: false,
+                peer_reset: false,
+                // The one reply this arm composes is the reset itself, so a
+                // segment that left is a reset that left.
+                reset_sent: emitted > 0,
             };
         }
 
@@ -1102,6 +1120,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                     connection: id,
                     emitted: 0,
                     peer_closed: false,
+                    peer_reset: false,
+                    reset_sent: false,
                 };
             }
         };
@@ -1111,6 +1131,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             connection: id,
             emitted,
             peer_closed: false,
+            peer_reset: false,
+            reset_sent: false,
         }
     }
 
@@ -1150,14 +1172,18 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
                 Refusal::UnvalidatedReset | Refusal::UnexpectedSyn => {
                     &mut self.counters.challenge_acks
                 }
-                Refusal::UnacceptableAck => &mut self.counters.refused_unacceptable_ack,
+                Refusal::UnacceptableAck { .. } => &mut self.counters.refused_unacceptable_ack,
                 Refusal::OutOfOrder => &mut self.counters.refused_out_of_order,
                 Refusal::NoAcknowledgement => &mut self.counters.refused_no_acknowledgement,
                 Refusal::NotAHandshake => &mut self.counters.refused_not_a_handshake,
             };
             TcpCounters::bump(count);
         }
-        if reset && processed.refusal.is_none() {
+        // A reset the connection *acted on*, which is the one that ended it: a
+        // refusal means the arrival rules rejected the segment before it could,
+        // and RFC 5961's blind-reset protection is exactly that case.
+        let accepted_reset = reset && processed.refusal.is_none();
+        if accepted_reset {
             TcpCounters::bump(&mut self.counters.resets_received);
         }
         if matches!(state, State::Closed) && processed.finished {
@@ -1183,12 +1209,14 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             other => other,
         };
 
+        let mut reset_sent = false;
         let emitted = match answer {
             Some(reply) => match self.write(source, port, window, scale, &reply, out) {
                 Ok(len) => {
                     TcpCounters::bump(&mut self.counters.segments_sent);
                     if reply.flags.contains(Flags::RST) {
                         TcpCounters::bump(&mut self.counters.resets_sent);
+                        reset_sent = true;
                     }
                     len
                 }
@@ -1212,6 +1240,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             connection: id,
             emitted,
             peer_closed: processed.peer_closed,
+            peer_reset: accepted_reset,
+            reset_sent,
         }
     }
 
@@ -1282,6 +1312,8 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             connection: None,
             emitted: 0,
             peer_closed: false,
+            peer_reset: false,
+            reset_sent: false,
         }
     }
 

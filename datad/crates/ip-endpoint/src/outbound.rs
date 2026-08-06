@@ -37,7 +37,7 @@
 use lfw_tcp::{ConnectionId, DialError, SeqNumber};
 use net_headers::{Ipv4Address, MacAddress};
 
-use crate::route::RouteRefusal;
+use crate::route::{Hop, RouteRefusal};
 
 /// The longest request one session carries.
 ///
@@ -76,32 +76,78 @@ pub enum OpenError {
 
 /// How one session finished.
 ///
-/// Every variant is terminal and every variant is *reported*: a caller that was
-/// left with a session in no particular state would have nothing to say on a
-/// console about a channel that did not come up.
+/// Every variant is terminal, every variant is *reported*, and — the whole point
+/// of the list being this long — **every variant is a different thing to go and
+/// look at**. A caller left with a session in no particular state would have
+/// nothing to say on a console about a channel that did not come up; a caller
+/// told only that the connection "was lost" would have something to say and no
+/// way to act on it, which is worse, because a station that never answered, one
+/// that refused the port, and one that is not speaking TCP correctly send an
+/// operator to three different places.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ended {
     /// The peer answered and both halves closed. The answer is in
     /// [`Session::answer`].
     Answered,
     /// Every request for the next hop's hardware address went unanswered, so no
-    /// frame of this session could be addressed at all. Distinct from
-    /// [`Lost`](Self::Lost) because the two are different things to go and look
-    /// at: nothing on this link claims the next hop, as against a station that
-    /// claimed it and then refused the connection.
+    /// frame of this session could be addressed at all. Nothing on this link
+    /// claims the next hop.
     NextHopUnreachable,
     /// The neighbour table held only live entries, so this next hop could not
     /// even be asked about.
     NoRoomToResolve,
-    /// The transport refused the dial: no room in its table, a connection on the
-    /// 4-tuple already, or storage too small.
-    Refused(DialError),
-    /// The connection went away before the answer did — a reset, or the
-    /// retransmission limit reached with nothing at the far end answering.
+    /// The retransmission budget ran out and **nothing arrived at all**: not a
+    /// reset, not a bad handshake, nothing. Either no station holds the address
+    /// the resolution answered with, or one does and nothing is listening on the
+    /// port in a way that says so.
+    Unanswered,
+    /// The peer's reset ended the connection. Somebody is at that address and is
+    /// refusing this port, which is the fastest and clearest refusal there is.
+    ResetByPeer,
+    /// The peer acknowledged a number this end never sent, which draws a reset
+    /// and leaves the dial standing, so the session then runs its budget out.
+    ///
+    /// The two numbers travel because the gap between them is the diagnosis: a
+    /// station replaying an old exchange, one composing a handshake it never
+    /// received, or a middlebox rewriting the field. `claimed` is **the peer's
+    /// number** — it is reported, and it is never one this end computes with.
+    UnacceptableAcknowledgement {
+        /// The acknowledgement number the peer's segment carried, raw.
+        claimed: u32,
+        /// The next sequence number this end had sent, raw.
+        expected: u32,
+    },
+    /// The connection went away and none of the three above explains it:
+    /// segments arrived that advanced nothing, or this node's own table took the
+    /// slot back. The residual and not a class — carving those three out of it is
+    /// exactly what stops this reading as "something went wrong somewhere".
     Lost,
+    /// The transport's table was full and nothing in it could be taken back.
+    /// This node's own state, and a table under pressure is a flood.
+    NoRoomToDial,
+    /// The transport already holds a connection on this very peer address and
+    /// port. This node's own table, and the one case it cannot tell two
+    /// connections apart in.
+    ConnectionAlreadyOpen,
+    /// The `SYN` did not fit the storage the caller offered, so nothing was
+    /// opened. **This node's own defect**, expected never to appear.
+    SynDidNotFit,
 }
 
 impl Ended {
+    /// The transport's refusal of a dial, in this vocabulary. Its own function
+    /// rather than a variant holding a [`DialError`], because a caller that had
+    /// to reach inside one to know what to look at would be reading a fold this
+    /// list exists to be rid of.
+    #[must_use]
+    pub const fn refused(error: DialError) -> Self {
+        match error {
+            DialError::TableFull => Self::NoRoomToDial,
+            DialError::AlreadyOpen { .. } => Self::ConnectionAlreadyOpen,
+            DialError::Write(_) => Self::SynDidNotFit,
+        }
+    }
+
     /// A stable short name, for a metric label or a report line. Underscored,
     /// as [`RouteRefusal::name`] is: these are label values rather than console
     /// tokens, and the two spellings are what tell the surfaces apart.
@@ -111,8 +157,13 @@ impl Ended {
             Self::Answered => "answered",
             Self::NextHopUnreachable => "next_hop_unreachable",
             Self::NoRoomToResolve => "no_room_to_resolve",
-            Self::Refused(_) => "dial_refused",
+            Self::Unanswered => "unanswered",
+            Self::ResetByPeer => "reset_by_peer",
+            Self::UnacceptableAcknowledgement { .. } => "unacceptable_acknowledgement",
             Self::Lost => "connection_lost",
+            Self::NoRoomToDial => "no_room_to_dial",
+            Self::ConnectionAlreadyOpen => "connection_already_open",
+            Self::SynDidNotFit => "syn_did_not_fit",
         }
     }
 
@@ -120,6 +171,62 @@ impl Ended {
     #[must_use]
     pub const fn succeeded(self) -> bool {
         matches!(self, Self::Answered)
+    }
+}
+
+/// What one session's own frames did, as the counts an operator places a
+/// failure with.
+///
+/// Every field is a fact this end observed about **this session's own
+/// connection**, which is the one thing a session genuinely owns: the resolution
+/// beside it is the port's and is counted as the port's ([`Resolutions`]). That
+/// attribution is the whole value — a port-wide total of segments would fold in
+/// whatever else the management port was carrying and send somebody to look at
+/// the wrong connection.
+///
+/// Saturating and never reset, on [`OutboundCounters`]' terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialFacts {
+    /// `SYN`s the transport composed for this session, retransmissions
+    /// included. Zero means no frame of the connection ever reached the wire,
+    /// which is the resolution having ended the session first.
+    pub syns: u64,
+    /// Whether **any** segment at all arrived on this session's connection.
+    /// The one fact that separates silence from a peer that answered badly, and
+    /// so the one that makes [`Ended::Unanswered`] mean what it says.
+    pub answered: bool,
+    /// Resets from the peer that this connection acted on.
+    pub resets_received: u64,
+    /// Resets this end composed on it, each answering a segment RFC 793 says
+    /// must be refused that way.
+    pub resets_sent: u64,
+}
+
+impl DialFacts {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            syns: 0,
+            answered: false,
+            resets_received: 0,
+            resets_sent: 0,
+        }
+    }
+
+    /// This session's facts folded into a channel's running account of several.
+    ///
+    /// The channel spends more than one session, and what an operator reads is
+    /// the channel: every handshake a station ignored, and not the last
+    /// session's share of them. Reporting one session's would understate the
+    /// evidence by as many times as the channel had attempts.
+    #[must_use]
+    pub const fn joined(self, later: Self) -> Self {
+        Self {
+            syns: self.syns.saturating_add(later.syns),
+            answered: self.answered || later.answered,
+            resets_received: self.resets_received.saturating_add(later.resets_received),
+            resets_sent: self.resets_sent.saturating_add(later.resets_sent),
+        }
     }
 }
 
@@ -221,6 +328,70 @@ impl OutboundCounters {
     }
 }
 
+/// What asking about a next hop produced: the requests that went out, the
+/// replies that became an entry, and the replies that became none.
+///
+/// **Port facts rather than session ones, and named as such.** A reply naming an
+/// address nobody asked about belongs to no session by definition, and an entry
+/// outlives the session that learned it — a later session finds the next hop
+/// already resolved and asks nothing. Attributing either to one session would be
+/// inventing the attribution, and it is what once made a channel report three
+/// replies to one request. What makes these the channel's evidence anyway is a
+/// subtraction: a caller reads them when the channel opens and again when it is
+/// reported, and the difference is what the link did while it was running.
+///
+/// Saturating and never reset, on [`OutboundCounters`]' terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resolutions {
+    /// Requests for a next hop's hardware address, retries included.
+    pub requested: u64,
+    /// Replies that answered one and became an entry.
+    pub learned: u64,
+    /// Replies nothing was waiting on.
+    pub unsolicited: u64,
+    /// Replies for an address already resolved: an attempt to move a next hop
+    /// this appliance is using.
+    pub rebinding: u64,
+    /// Replies whose sender hardware address no frame may be addressed to.
+    pub not_unicast: u64,
+    /// Replies whose own claim about their sender the frame carrying them
+    /// disagreed with.
+    pub contradicted: u64,
+}
+
+impl Resolutions {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            requested: 0,
+            learned: 0,
+            unsolicited: 0,
+            rebinding: 0,
+            not_unicast: 0,
+            contradicted: 0,
+        }
+    }
+
+    /// What happened since `earlier`, field by field.
+    ///
+    /// Saturating rather than wrapping, so a counter that saturated reads as no
+    /// further movement instead of as an enormous one; and a later reading
+    /// *behind* an earlier one is zero rather than a complement, because these
+    /// counts only ever rise and a pair that says otherwise is a caller holding
+    /// the two the wrong way round.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            requested: self.requested.saturating_sub(earlier.requested),
+            learned: self.learned.saturating_sub(earlier.learned),
+            unsolicited: self.unsolicited.saturating_sub(earlier.unsolicited),
+            rebinding: self.rebinding.saturating_sub(earlier.rebinding),
+            not_unicast: self.not_unicast.saturating_sub(earlier.not_unicast),
+            contradicted: self.contradicted.saturating_sub(earlier.contradicted),
+        }
+    }
+}
+
 /// One outbound connection, from the address it is to and the bytes it carries
 /// through to what it read back.
 ///
@@ -233,8 +404,10 @@ pub struct Session {
     port: u16,
     /// The station a frame of this session is handed to, chosen once by the
     /// route decision and never re-chosen: a next hop that moved mid-session
-    /// would be a redirection this end took on a peer's word.
-    next_hop: Ipv4Address,
+    /// would be a redirection this end took on a peer's word. It carries which
+    /// of the port's two answers chose it, because the address alone cannot
+    /// say and the two are different halves of a configuration to go and read.
+    next_hop: Hop,
     /// The hardware address that next hop resolved to. Learned once and kept:
     /// re-reading it from the frames the answer arrives in would let whoever
     /// answers redirect everything after it.
@@ -255,6 +428,14 @@ pub struct Session {
     answer: [u8; ANSWER_CAPACITY],
     answered: usize,
     peer_closed: bool,
+    /// What this session's own frames did, which is what an operator reads
+    /// beside the token when the channel does not come up.
+    facts: DialFacts,
+    /// The first acknowledgement of something never sent, if one arrived. The
+    /// first rather than the last: a station that keeps sending them sends the
+    /// same one, and the first is the one that happened before this end had
+    /// answered anything.
+    misacknowledged: Option<(u32, u32)>,
 }
 
 impl Session {
@@ -266,7 +447,7 @@ impl Session {
     pub(crate) fn new(
         destination: Ipv4Address,
         port: u16,
-        next_hop: Ipv4Address,
+        next_hop: Hop,
         request: &[u8],
     ) -> Result<Self, OpenError> {
         let mut held = [0u8; REQUEST_CAPACITY];
@@ -288,6 +469,8 @@ impl Session {
             answer: [0; ANSWER_CAPACITY],
             answered: 0,
             peer_closed: false,
+            facts: DialFacts::new(),
+            misacknowledged: None,
         })
     }
 
@@ -301,10 +484,39 @@ impl Session {
         self.port
     }
 
-    /// The station this session's frames are handed to.
+    /// The station this session's frames are handed to, and which of the port's
+    /// two answers chose it.
     #[must_use]
-    pub const fn next_hop(&self) -> Ipv4Address {
+    pub const fn next_hop(&self) -> Hop {
         self.next_hop
+    }
+
+    /// What this session's own frames did.
+    #[must_use]
+    pub const fn facts(&self) -> DialFacts {
+        self.facts
+    }
+
+    /// How this session ended, given everything it observed, for the moment the
+    /// transport stops holding its connection.
+    ///
+    /// The order is the attribution and not a preference: a reset the connection
+    /// acted on is what ended it, whatever else arrived first; an acknowledgement
+    /// of what was never sent does not end a dial but is what an operator must
+    /// look at when the budget then runs out; silence is silence; and what is
+    /// left is a disappearance this end cannot attribute, which is named as one
+    /// rather than folded into the three above.
+    pub(crate) fn ending(&self) -> Ended {
+        if self.facts.resets_received > 0 {
+            return Ended::ResetByPeer;
+        }
+        if let Some((claimed, expected)) = self.misacknowledged {
+            return Ended::UnacceptableAcknowledgement { claimed, expected };
+        }
+        if !self.facts.answered {
+            return Ended::Unanswered;
+        }
+        Ended::Lost
     }
 
     #[must_use]
@@ -363,6 +575,34 @@ impl Session {
     pub(crate) fn resolved_to(&mut self, mac: MacAddress) {
         if self.peer_mac.is_none() {
             self.peer_mac = Some(mac);
+        }
+    }
+
+    /// One `SYN` was composed, whether it reached the wire or was dropped for
+    /// want of an address. Composed and not sent, deliberately: the transport
+    /// re-sends what it recorded, so the count an operator reads against a
+    /// silent station is the count of handshake attempts this end made.
+    pub(crate) fn dialled_once(&mut self) {
+        OutboundCounters::bump(&mut self.facts.syns);
+    }
+
+    /// A segment arrived on this session's connection, whatever the transport
+    /// made of it, and whichever resets it carried or drew.
+    pub(crate) fn segment_arrived(&mut self, peer_reset: bool, reset_sent: bool) {
+        self.facts.answered = true;
+        if peer_reset {
+            OutboundCounters::bump(&mut self.facts.resets_received);
+        }
+        if reset_sent {
+            OutboundCounters::bump(&mut self.facts.resets_sent);
+        }
+    }
+
+    /// The peer acknowledged a number this end never sent. Kept once: a station
+    /// that repeats itself is one fault and not several.
+    pub(crate) fn note_misacknowledged(&mut self, claimed: u32, expected: u32) {
+        if self.misacknowledged.is_none() {
+            self.misacknowledged = Some((claimed, expected));
         }
     }
 

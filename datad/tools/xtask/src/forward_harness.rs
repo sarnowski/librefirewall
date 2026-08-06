@@ -3749,6 +3749,20 @@ impl DialStation {
         self.step == DialStep::Closed
     }
 
+    /// The pair this station claimed against what the appliance had really
+    /// sent, where it claims one at all.
+    ///
+    /// It is the harness's own arithmetic — the number it chose, and one past
+    /// the initial sequence number it read off the appliance's `SYN` — so
+    /// comparing the appliance's console against it is two independent accounts
+    /// of one exchange rather than the appliance agreeing with itself.
+    fn claim(&self) -> Option<(u32, u32)> {
+        (self.misbehaviour == DialMisbehaviour::AcknowledgesTheWrongSequence)
+            .then_some(())
+            .and(self.peer_isn)
+            .map(|isn| (UNSENT_ACKNOWLEDGEMENT, isn.wrapping_add(1)))
+    }
+
     /// Whether the appliance is waiting on a timer of its own that only a frame
     /// can run.
     ///
@@ -5227,6 +5241,15 @@ pub struct Booted {
     /// unpredictable one a security property, and one boot's number alone cannot
     /// show that it is not a constant.
     pub management_tcp_isn: Option<u32>,
+    /// What a station that acknowledges the wrong sequence number claimed, and
+    /// what the appliance had really sent — the harness's own reading of both,
+    /// from the last handshake it saw.
+    ///
+    /// Returned so the appliance's console can be held to it: the two numbers on
+    /// that record are the whole diagnosis of this fault, and a console agreeing
+    /// with itself about them would prove nothing. `None` on every boot whose
+    /// station claims nothing.
+    pub dial_claim: Option<(u32, u32)>,
     /// One line per reply the management port owed and gave, in the order they
     /// were accepted. Empty exactly when the run had no routed contract to meet:
     /// a routed run that reached its verdict answered both, the wait for them
@@ -5361,6 +5384,11 @@ fn run_boot(
     // observed the number.
     let mut tcp_isn: Option<u32> = None;
     let mut observed_isn: Option<u32> = None;
+    // The *last* claim rather than the first: the appliance reports the session
+    // its own attempt count ended on, and every session opens a fresh sequence
+    // space, so the pair on its console belongs to the newest handshake this
+    // station saw.
+    let mut observed_claim: Option<(u32, u32)> = None;
     // What the harness saw come back on the two dataplane ports, and what a real
     // client got out of the management endpoint. Both live outside the run block
     // so they survive every exit path.
@@ -6275,6 +6303,9 @@ fn run_boot(
                 last_management_inject = Instant::now();
                 client_pending.pop_front();
             }
+            if let Some(claim) = management.as_ref().and_then(|wire| wire.station.claim()) {
+                observed_claim = Some(claim);
+            }
             if settling_since.is_none() && last_injection.elapsed() >= REINJECT_INTERVAL {
                 last_injection = Instant::now();
                 inject_probes(&mut endpoints, &probes, |probe| {
@@ -6376,6 +6407,7 @@ fn run_boot(
         traffic,
         management: injected,
         management_tcp_isn: tcp_isn,
+        dial_claim: observed_claim,
         management_replies: answered,
         scrapes,
         dataplane_frames,

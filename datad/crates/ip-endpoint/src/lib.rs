@@ -100,7 +100,9 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_tcp::{Connection, Outcome as TcpOutcome, Released, TcpCounters, TcpStack, Timeout};
+use lfw_tcp::{
+    Connection, Outcome as TcpOutcome, Refusal, Rejection, Released, TcpCounters, TcpStack, Timeout,
+};
 
 /// Re-exported rather than restated: the per-boot secret is obtained by the
 /// protection domain and the segment types are what a *test* composes one out
@@ -119,7 +121,7 @@ pub mod route;
 
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
 use neighbour::{Learned, NeighbourCache, NeighbourCounters, Resolution};
-use outbound::{Ended, OpenError, OutboundCounters, Phase, Session};
+use outbound::{Ended, OpenError, OutboundCounters, Phase, Resolutions, Session};
 use route::Port;
 
 /// Re-exported because a caller committing to a streamed body names one, and
@@ -644,6 +646,23 @@ impl Endpoint {
         self.neighbours.counters()
     }
 
+    /// What asking about a next hop has produced on this port, gathered from the
+    /// two places that decide it: the cache, which asks and decides whether this
+    /// end asked for a reply, and this endpoint, which decides whether the frame
+    /// agreed with its own payload before the cache is consulted at all.
+    #[must_use]
+    pub fn resolutions(&self) -> Resolutions {
+        let neighbours = self.neighbours.counters();
+        Resolutions {
+            requested: neighbours.requested,
+            learned: neighbours.learned,
+            unsolicited: neighbours.unsolicited,
+            rebinding: neighbours.rebinding_refused,
+            not_unicast: neighbours.not_unicast,
+            contradicted: self.counters.unhandled(Unhandled::ArpSenderMacMismatch),
+        }
+    }
+
     /// What the outbound half has done, one field per decision.
     #[must_use]
     pub const fn outbound_counters(&self) -> OutboundCounters {
@@ -1062,7 +1081,7 @@ impl Endpoint {
         if let Some(mac) = session.peer_mac() {
             return NextHop::At(mac);
         }
-        let next_hop = session.next_hop();
+        let next_hop = session.next_hop().address;
         match self.neighbours.resolve(now, next_hop) {
             Resolution::Known(mac) => {
                 if let Some(session) = self.outbound.as_mut() {
@@ -1128,12 +1147,13 @@ impl Endpoint {
         };
         let dialled = match dialled {
             Ok(dialled) => dialled,
-            Err(error) => return self.end_outbound(Ended::Refused(error), out),
+            Err(error) => return self.end_outbound(Ended::refused(error), out),
         };
         OutboundCounters::bump(&mut self.outbound_counters.dialled);
         let mac = self.outbound.as_ref().and_then(Session::peer_mac);
         if let Some(session) = self.outbound.as_mut() {
             session.dialled(dialled.connection);
+            session.dialled_once();
         }
         let Some(mac) = mac else {
             // Dropped, not queued, and typed: the record the transport just made
@@ -1156,23 +1176,20 @@ impl Endpoint {
             return self.end_outbound(Ended::Lost, out);
         };
         let Some(state) = self.tcp.connection(connection).map(Connection::state) else {
-            // The transport no longer holds it: the peer reset the connection,
-            // the retransmission limit was reached, or the exchange finished and
-            // the slot was reaped. Which of those it was is in the transport's
-            // own counters; what a session can say is that it did or did not
-            // read an answer.
-            let answered = self
-                .outbound
-                .as_ref()
-                .is_some_and(|session| session.peer_closed());
-            return self.end_outbound(
-                if answered {
+            // The transport no longer holds it, and **which of the ways it can go
+            // this was is the session's own to say**: it watched every segment
+            // that arrived on this connection, so a reset, an acknowledgement of
+            // what was never sent, and a budget that ran out in silence are three
+            // endings here rather than one. Only a disappearance none of those
+            // explains reaches the residual.
+            let ended = self.outbound.as_ref().map_or(Ended::Lost, |session| {
+                if session.peer_closed() {
                     Ended::Answered
                 } else {
-                    Ended::Lost
-                },
-                out,
-            );
+                    session.ending()
+                }
+            });
+            return self.end_outbound(ended, out);
         };
         // The resolution may only have completed after the `SYN` was dropped, so
         // it is carried on here — and it is what ends a session whose next hop
@@ -1471,6 +1488,25 @@ impl Endpoint {
         }
 
         if self.is_outbound(connection) {
+            // Before anything is made of the segment: that one arrived at all is
+            // the fact separating a station that said nothing from one that
+            // answered badly, and the two resets beside it are what name which
+            // way it answered badly. Recorded here rather than derived from the
+            // transport's own totals, because those span every connection on
+            // this port and would attribute somebody else's reset to the dial.
+            let misacknowledged = match outcome {
+                TcpOutcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+                    claimed,
+                    expected,
+                })) => Some((claimed.raw(), expected.raw())),
+                _ => None,
+            };
+            if let Some(session) = self.outbound.as_mut() {
+                session.segment_arrived(received.peer_reset, received.reset_sent);
+                if let Some((claimed, expected)) = misacknowledged {
+                    session.note_misacknowledged(claimed, expected);
+                }
+            }
             if !received.data.is_empty() {
                 self.take_outbound(received.data);
             }
@@ -1523,6 +1559,17 @@ impl Endpoint {
     ) -> Option<usize> {
         match timeout {
             Timeout::Resent { len, .. } | Timeout::Abandoned { len, .. } => {
+                // A control segment re-composed while the session is still
+                // dialling is its `SYN` going out again, and nothing else: the
+                // phase leaves `Dialling` the moment the handshake completes.
+                // That count is what an operator reads against a station that
+                // answered none of them.
+                if let Some(session) = self.outbound.as_mut()
+                    && matches!(timeout, Timeout::Resent { .. })
+                    && session.phase() == Phase::Dialling
+                {
+                    session.dialled_once();
+                }
                 (len > 0).then_some(len)
             }
             Timeout::Reaped { .. } => None,

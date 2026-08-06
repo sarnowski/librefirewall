@@ -1683,7 +1683,9 @@ established one.
   is untouched (see the [status table](../status.md)).
 - **The appliance dials, to a constant.** The management domain opens one outbound session per boot
   — resolve the next hop, dial, carry a fixed probe, read the answer, close — and reports the
-  outcome in exactly one console record whichever way it goes. The destination and the port are
+  outcome in exactly one console record whichever way it goes, and — where the channel did not come
+  up — the counts that place the failure in three further records beside it, four where a station
+  claimed a sequence number that was never sent. The destination and the port are
   **first-party constants compiled into that domain** rather than anything the appliance was told:
   the store holds no endpoint yet, and replacing the constant with the one it holds is the next
   step. So the channel goes where this build was written to take it, and an image whose management
@@ -1702,12 +1704,32 @@ established one.
   `SYN` it received; one answers a `SYN` by acknowledging a number that was never sent — which draws
   a reset and, per RFC 793's arrival order, leaves the dial standing rather than cancelling it, so
   that channel too runs out its attempts; and one answers the resolution for an address nothing
-  asked about, which this end does not learn from. The first three end `connection-lost`, each after
-  three sessions, and what tells them apart is the wire the station judged field by field rather
-  than the token; the fourth ends `next-hop-unreachable`, also after three. **In every one the node stays healthy**: its routed contract is met in the same boot, its management port reports every frame
+  asked about, which this end does not learn from. They end `unanswered`, `reset-by-peer`,
+  `unacceptable-acknowledgement` and `next-hop-unreachable`, each after three sessions.
+  **In every one the node stays healthy**: its routed contract is met in the same boot, its
+  management port reports every frame
   put on that wire to the byte, and the station holds the appliance to the arithmetic of its own
   constants — at most three sessions, at most five re-sends of an unanswered `SYN`, at most three
   requests per resolution — and calls a node past any of them broken.
+- **A channel that does not come up is diagnosable from the console alone**, which is what the four
+  boots above now assert rather than merely produce. The first three of them once shared one token,
+  `connection-lost`, so an operator reading it could not tell a dead server from one refusing the
+  port from one that is not speaking TCP correctly, and `not-opened` folded three refusals about
+  this node's own addressing the same way. The vocabulary is now 13 outcomes, one per distinct
+  cause: one for a channel that came up, two for the link and this node's neighbour table, four for
+  what a peer did, three for what this node's own transport refused, and three for what its own
+  addressing or state refused.
+  Beside the outcome a failing channel emits three further records — the station its frames were
+  handed to and whether the prefix or the gateway chose it, with the requests the resolution spent
+  and what it learned; the replies the port turned away, one count per reason; and the handshakes
+  composed, the resets in each direction, and whether anything came back at all — and a fourth
+  where a station claimed a sequence number, carrying that number against the one really sent. Four
+  records rather than a wider one because a record carries four numbers and this is more than four
+  facts, and widening the array would grow every log region by a page and still not hold them. A
+  channel that came up emits none of them. The scenarios assert the counts and not only the tokens,
+  which is what keeps the un-folding from quietly folding back; and the claimed sequence pair is
+  compared against what the station on the far end read off the wire rather than against anything
+  the appliance also supplied.
 - **Ending a session gives its connection back to the transport**, which is what keeps every attempt
   after the first a statement about the link. A session that ends at the resolution has left a `SYN`
   on the transport's books — that segment was dropped for want of a hardware address, so nothing at

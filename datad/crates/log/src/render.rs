@@ -13,7 +13,12 @@ use crate::stamp::Stamp;
 /// `the_widest_line_of_each_shape_fits_the_maximum`, which renders the widest
 /// value of every field of every shape against it, a refusal's `cause` at
 /// [`crate::MAX_CAUSE_LEN`] — which [`Cause`](crate::Cause) now holds it to.
-pub const MAX_LINE_LEN: usize = 228;
+///
+/// It is a bound on what any *representable* event renders to and not on what a
+/// domain would really emit: the widest line is a channel's four refused-reply
+/// counts under the longest domain name this vocabulary has, a pairing no
+/// appliance produces and a byzantine writing domain can put in a record.
+pub const MAX_LINE_LEN: usize = 256;
 
 /// The buffer could not hold the line.
 ///
@@ -279,6 +284,47 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " dial-destination={destination} dial-port={port} dial-attempts={attempts} \
              dial-outcome={outcome}"
         ),
+        // The three records a failed channel adds, each one line of counts. The
+        // keys all begin `dial-` so a reader picking the channel's story out of
+        // a boot transcript picks it out by one prefix, and none of them repeats
+        // a key another record carries.
+        DomainDetail::DialRoute {
+            next_hop,
+            via,
+            requests,
+            learned,
+        } => write!(
+            cursor,
+            " dial-next-hop={next_hop} dial-next-hop-via={via} dial-requests={requests} \
+             dial-learned={learned}"
+        ),
+        DomainDetail::DialUnlearned {
+            unsolicited,
+            rebinding,
+            not_unicast,
+            contradicted,
+        } => write!(
+            cursor,
+            " dial-reply-unsolicited={unsolicited} dial-reply-rebinding={rebinding} \
+             dial-reply-not-unicast={not_unicast} dial-reply-contradicted={contradicted}"
+        ),
+        DomainDetail::DialSegments {
+            syns,
+            resets_received,
+            resets_sent,
+            answered,
+        } => write!(
+            cursor,
+            " dial-syns={syns} dial-resets-received={resets_received} \
+             dial-resets-sent={resets_sent} dial-answered={answered}"
+        ),
+        // Decimal, unlike a refusal's hexadecimal numbers below: these are
+        // sequence numbers, and a peer's own capture and this appliance's
+        // console are compared digit for digit.
+        DomainDetail::DialSequence { claimed, expected } => write!(
+            cursor,
+            " dial-acknowledged={claimed} dial-expected={expected}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -336,8 +382,8 @@ mod tests {
     use crate::detail::{Cause, MAX_CAUSE_LEN};
     use crate::event::Primitive;
     use crate::event::{
-        ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, ObjectKind,
-        RejectReason, Value,
+        ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, NextHopVia,
+        ObjectKind, RejectReason, Value,
     };
     use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
     use net_headers::{Ipv4Address, MacAddress};
@@ -754,6 +800,89 @@ mod tests {
         );
     }
 
+    /// The three records a channel that did not come up adds after its outcome,
+    /// and the fourth an unacceptable acknowledgement adds after those.
+    ///
+    /// One line each and every key prefixed `dial-`, so an operator picks the
+    /// whole story of a channel out of a boot transcript by one prefix and reads
+    /// it in the order the appliance found it out: where the frames went, what
+    /// the link answered, what the connection did, and — where a peer claimed a
+    /// number — which number.
+    #[test]
+    fn a_channel_that_failed_renders_the_counts_that_place_the_fault() {
+        let reported = |detail| {
+            rendered(&Event::Domain {
+                domain: Domain::Management,
+                state: DomainState::Ready,
+                detail,
+            })
+        };
+        assert_eq!(
+            reported(DomainDetail::DialRoute {
+                next_hop: Ipv4Address::from_octets([10, 0, 2, 2]),
+                via: NextHopVia::Gateway,
+                requests: 9,
+                learned: 0,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-next-hop=10.0.2.2 dial-next-hop-via=gateway dial-requests=9 dial-learned=0"
+        );
+        // The same three requests answered by a station holding the address, so
+        // the difference between this line and the one above is the whole of
+        // what `next-hop-unreachable` means.
+        assert_eq!(
+            reported(DomainDetail::DialRoute {
+                next_hop: Ipv4Address::from_octets([10, 0, 2, 99]),
+                via: NextHopVia::Prefix,
+                requests: 3,
+                learned: 1,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-next-hop=10.0.2.99 dial-next-hop-via=prefix dial-requests=3 dial-learned=1"
+        );
+        assert_eq!(
+            reported(DomainDetail::DialUnlearned {
+                unsolicited: 9,
+                rebinding: 0,
+                not_unicast: 0,
+                contradicted: 1,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-reply-unsolicited=9 dial-reply-rebinding=0 dial-reply-not-unicast=0 \
+             dial-reply-contradicted=1"
+        );
+        assert_eq!(
+            reported(DomainDetail::DialSegments {
+                syns: 15,
+                resets_received: 0,
+                resets_sent: 15,
+                answered: true,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-syns=15 dial-resets-received=0 dial-resets-sent=15 dial-answered=true"
+        );
+        assert_eq!(
+            reported(DomainDetail::DialSegments {
+                syns: 15,
+                resets_received: 0,
+                resets_sent: 0,
+                answered: false,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-syns=15 dial-resets-received=0 dial-resets-sent=0 dial-answered=false"
+        );
+        // Decimal, and both numbers whole: an operator compares them against a
+        // capture of the same exchange digit for digit.
+        assert_eq!(
+            reported(DomainDetail::DialSequence {
+                claimed: 3_735_928_559,
+                expected: 1,
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-acknowledged=3735928559 dial-expected=1"
+        );
+    }
+
     /// The two records the cryptography domain makes about a primitive: what
     /// it proved and what it cost. The name is the vocabulary's own, so a
     /// primitive renamed there moves both lines rather than one.
@@ -1069,9 +1198,15 @@ mod tests {
                 offset: u32::MAX,
             },
         ];
-        for shape in shapes {
+        // The curated widest of each *shape*, and every shape the vocabularies
+        // can spell beside them. Both, because neither reaches the other's
+        // widest line: the curated set holds the widest value of every field,
+        // and the enumeration holds the widest domain and state to put in front
+        // of one — and the widest line this grammar has is a detail from the
+        // first under a name from the second.
+        for shape in shapes.iter().chain(every_shape().iter()) {
             let mut buffer = [0u8; MAX_LINE_LEN];
-            let written = render(AT, &shape, &mut buffer);
+            let written = render(AT, shape, &mut buffer);
             assert!(
                 matches!(written, Ok(len) if len <= MAX_LINE_LEN),
                 "{shape:?} did not fit MAX_LINE_LEN"
@@ -1214,6 +1349,34 @@ mod tests {
                 device: u128::MAX,
                 signatures: u64::MAX,
             },
+            DomainDetail::DialRoute {
+                next_hop: Ipv4Address::from_octets([255, 255, 255, 255]),
+                via: NextHopVia::Gateway,
+                requests: u64::MAX,
+                learned: u64::MAX,
+            },
+            DomainDetail::DialUnlearned {
+                unsolicited: u64::MAX,
+                rebinding: u64::MAX,
+                not_unicast: u64::MAX,
+                contradicted: u64::MAX,
+            },
+            DomainDetail::DialSegments {
+                syns: u64::MAX,
+                resets_received: u64::MAX,
+                resets_sent: u64::MAX,
+                answered: false,
+            },
+            DomainDetail::DialSegments {
+                syns: u64::MAX,
+                resets_received: u64::MAX,
+                resets_sent: u64::MAX,
+                answered: true,
+            },
+            DomainDetail::DialSequence {
+                claimed: u32::MAX,
+                expected: u32::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -1306,6 +1469,34 @@ mod tests {
             ),
             any::<(u128, u64)>()
                 .prop_map(|(device, signatures)| DomainDetail::Delegated { device, signatures }),
+            (any::<([u8; 4], u64, u64)>(), (0..NextHopVia::ALL.len()),).prop_map(
+                |((octets, requests, learned), via)| DomainDetail::DialRoute {
+                    next_hop: Ipv4Address::from_octets(octets),
+                    via: NextHopVia::ALL[via],
+                    requests,
+                    learned,
+                }
+            ),
+            any::<(u64, u64, u64, u64)>().prop_map(
+                |(unsolicited, rebinding, not_unicast, contradicted)| {
+                    DomainDetail::DialUnlearned {
+                        unsolicited,
+                        rebinding,
+                        not_unicast,
+                        contradicted,
+                    }
+                }
+            ),
+            any::<(u64, u64, u64, bool)>().prop_map(
+                |(syns, resets_received, resets_sent, answered)| DomainDetail::DialSegments {
+                    syns,
+                    resets_received,
+                    resets_sent,
+                    answered,
+                }
+            ),
+            any::<(u32, u32)>()
+                .prop_map(|(claimed, expected)| DomainDetail::DialSequence { claimed, expected }),
             (
                 (0..causes.len()),
                 prop_oneof![

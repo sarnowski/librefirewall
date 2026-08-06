@@ -68,7 +68,8 @@ use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monoton
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
     http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
-    outbound::{Ended, OpenError},
+    outbound::{DialFacts, Ended, OpenError, Resolutions},
+    route::Hop,
 };
 use lfw_log::RejectReason;
 use lfw_metrics::{InterfaceInventory, LogSample, RuleInventory};
@@ -920,10 +921,39 @@ impl<'ring> EndpointStage<'ring> {
             .and_then(|session| session.phase().ended())
     }
 
+    /// What the outbound session's own frames did, and the station they were
+    /// handed to.
+    ///
+    /// Read **before** [`close_dial`](Self::close_dial), which drops the session
+    /// and everything it observed with it: a caller that reported the token and
+    /// then asked for the counts would report a channel with no evidence beside
+    /// it. `None` where there is no session.
+    #[must_use]
+    pub fn dial_facts(&self) -> Option<(Hop, DialFacts)> {
+        self.endpoint
+            .as_ref()
+            .and_then(Endpoint::outbound)
+            .map(|session| (session.next_hop(), session.facts()))
+    }
+
     /// Forget a finished session, so another may be opened. `false` where the
     /// session is still running or there is none.
     pub fn close_dial(&mut self) -> bool {
         self.endpoint.as_mut().is_some_and(Endpoint::close_outbound)
+    }
+
+    /// What asking about a next hop has produced on this port: requests, what
+    /// they learned, and the replies that became no entry, by reason.
+    ///
+    /// The port's own running totals, so a caller reporting a channel reads them
+    /// when it opens and again when it reports, and states the difference. Zero
+    /// where the port has no addressing yet, which is a port that has asked
+    /// about nothing.
+    #[must_use]
+    pub fn resolutions(&self) -> Resolutions {
+        self.endpoint
+            .as_ref()
+            .map_or_else(Resolutions::new, Endpoint::resolutions)
     }
 
     /// The addressing in force, for a caller that reports what the port answers

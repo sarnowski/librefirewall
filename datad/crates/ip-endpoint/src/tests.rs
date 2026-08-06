@@ -3691,8 +3691,11 @@ fn an_expired_body_ends_the_connection_with_a_reset() {
 // ---------------------------------------------------------------------------
 
 use crate::neighbour::{ENTRY_LIFETIME, MAX_REQUESTS, NEIGHBOURS, REQUEST_TIMEOUT};
-use crate::outbound::{ANSWER_CAPACITY, Ended, OpenError, Phase, REQUEST_CAPACITY as PROBE_ROOM};
-use crate::route::RouteRefusal;
+use crate::outbound::{
+    ANSWER_CAPACITY, DialFacts, Ended, OpenError, Phase, REQUEST_CAPACITY as PROBE_ROOM,
+    Resolutions,
+};
+use crate::route::{Hop, RouteRefusal, Via};
 
 /// The port the appliance dials, and the fixed probe it carries. Both stand in
 /// for the first-party pair a management channel is built on: neither is
@@ -3899,8 +3902,11 @@ fn a_destination_off_this_ports_prefix_is_asked_about_as_the_gateway() {
         .expect("a gateway is stated");
     assert_eq!(
         endpoint.outbound().map(Session::next_hop),
-        Some(GATEWAY),
-        "the next hop is the gateway and not the destination"
+        Some(Hop {
+            address: GATEWAY,
+            via: Via::Gateway
+        }),
+        "the next hop is the gateway and not the destination, and says so"
     );
     let asked = pump(&mut endpoint, at(0));
     assert_eq!(asked_about(&asked[0]), GATEWAY);
@@ -4102,6 +4108,276 @@ fn an_answer_past_the_room_for_one_keeps_the_head_and_counts_the_rest() {
     assert!(endpoint.outbound_counters().answer_overflowed > 0);
 }
 
+/// Run an unanswered dial's whole retransmission budget out, answering with the
+/// instant it was exhausted at.
+///
+/// The budget is the transport's, so the deadlines are read off its own
+/// backoff rather than guessed: a fixed step would either stop short of the
+/// abandonment or step past a retransmission the test is counting.
+fn exhaust_the_dial(endpoint: &mut Endpoint, from: Monotonic, answer: impl Fn(&[u8]) -> Vec<u8>) {
+    let mut now = from;
+    // One pass more than the budget: the last is the one that abandons, and a
+    // pass that produced nothing is the poll settling rather than a step lost.
+    for _ in 0..=lfw_tcp::MAX_RETRANSMITS {
+        now = after(now, times(lfw_tcp::MAX_RTO, 1));
+        let mut out = vec![0u8; ROOMY];
+        while let Some(len) = endpoint.poll_timeouts(now, &mut out).frame() {
+            let reply = answer(&out[..len]);
+            if !reply.is_empty() {
+                deliver(endpoint, now, &reply);
+            }
+            out = vec![0u8; ROOMY];
+        }
+        pump(endpoint, now);
+    }
+}
+
+/// A station that answers the resolution and never the `SYN` ends the session as
+/// **unanswered** — not as a connection that "was lost", which is what a station
+/// that refused it produces and is a different thing to go and look at.
+///
+/// The counts beside the token are what make it actionable without the wire: the
+/// handshakes this end composed, and the fact that nothing at all came back.
+#[test]
+fn a_station_that_answers_nothing_ends_the_session_as_unanswered() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, now);
+    resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    exhaust_the_dial(&mut endpoint, now, |_| Vec::new());
+    pump(&mut endpoint, now);
+
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::Unanswered)),
+        "silence and a refusal must not read alike"
+    );
+    let facts = endpoint.outbound().map(Session::facts).expect("a session");
+    assert!(
+        !facts.answered,
+        "a session nothing answered reported an answer"
+    );
+    assert_eq!(facts.resets_received, 0);
+    assert_eq!(facts.resets_sent, 0);
+    // The whole budget: the dial itself and every re-send of it. Stated as the
+    // transport's own constant rather than as a number, so a budget that moves
+    // moves this too.
+    assert_eq!(facts.syns, u64::from(lfw_tcp::MAX_RETRANSMITS) + 1);
+    // And the resolution's own half, which says the link was fine: one request,
+    // one answer. It is the port's account rather than the session's, because a
+    // resolved entry outlives the session that learned it.
+    let resolutions = endpoint.resolutions();
+    assert_eq!(resolutions.requested, 1);
+    assert_eq!(resolutions.learned, 1);
+}
+
+/// A station that answers the `SYN` by acknowledging a number that was never
+/// sent ends the session as **that**, carrying both numbers — and the dial is
+/// not cancelled by it, so the session runs its budget out exactly as a silent
+/// one does. The two are told apart by the token and by the counts, and by
+/// nothing on the wire.
+#[test]
+fn a_station_acknowledging_what_was_never_sent_ends_the_session_naming_both_numbers() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, now);
+    let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    let mut station = Station::new(PEER_PORT, 0x7200_0000);
+    station.read(&syn);
+    // What this end really sent — its `SYN`, so one past its initial sequence
+    // number — and a claim five hundred past that, which acknowledges nothing.
+    let expected = station.expect.raw();
+    let claimed = station.expect.add(500).raw();
+
+    // Answer every handshake this end composes with the same bogus one, which
+    // is what a station of this kind does.
+    exhaust_the_dial(&mut endpoint, now, |frame| {
+        // A fresh station per answer: the number it claims is fixed, so nothing
+        // it learned from the last handshake is carried into the next.
+        let mut answering = Station::new(PEER_PORT, 0x7200_0000);
+        answering.read(frame);
+        answering.expect = lfw_tcp::SeqNumber::new(claimed);
+        answering.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[])
+    });
+    pump(&mut endpoint, now);
+
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::UnacceptableAcknowledgement {
+            claimed,
+            expected
+        })),
+        "the peer's claim and this end's own number are the diagnosis"
+    );
+    let facts = endpoint.outbound().map(Session::facts).expect("a session");
+    assert!(facts.answered, "something did arrive, and it was refused");
+    assert_eq!(facts.resets_received, 0, "this end's dial was cancelled");
+    assert!(
+        facts.resets_sent > 0,
+        "a refusal RFC 793 answers with a reset composed none"
+    );
+    assert_eq!(facts.syns, u64::from(lfw_tcp::MAX_RETRANSMITS) + 1);
+}
+
+/// A reset carries the counts that separate it from the two above: something
+/// arrived, it was a reset, and this end composed none in answer.
+#[test]
+fn a_reset_session_reports_the_reset_it_received_and_none_it_sent() {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, now);
+    let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    let mut station = Station::new(PEER_PORT, 0x7300_0000);
+    let (_, acknowledgement, _) = station.read(&syn);
+    station.next = acknowledgement;
+    let reset = station.frame(lfw_tcp::Flags::RST.with(lfw_tcp::Flags::ACK), &[]);
+    deliver(&mut endpoint, now, &reset);
+    pump(&mut endpoint, now);
+
+    let facts = endpoint.outbound().map(Session::facts).expect("a session");
+    assert!(facts.answered);
+    assert_eq!(facts.resets_received, 1);
+    assert_eq!(
+        facts.resets_sent, 0,
+        "RFC 793 section 3.4 forbids answering a reset with another"
+    );
+    // Two handshakes and no more: the first was composed before the next hop
+    // resolved and dropped for want of an address, the transport re-sent it, and
+    // the station refused that one at once. A refusal is the fastest ending
+    // there is, and this count beside a budget-length one is what says so.
+    assert_eq!(facts.syns, 2);
+}
+
+/// A next hop nothing answers for carries the resolution's own story: every
+/// request this end spent, and nothing learned from any of them. That pair is
+/// what an operator reads instead of going to the wire.
+#[test]
+fn an_unreachable_next_hop_reports_the_requests_it_spent_and_nothing_learned() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(OFF_LINK, PEER_PORT, PROBE)
+        .expect("a gateway is stated");
+    for step in 0..=u64::from(MAX_REQUESTS) {
+        pump(&mut endpoint, after(at(0), times(REQUEST_TIMEOUT, step)));
+    }
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Ended(Ended::NextHopUnreachable))
+    );
+    let session = endpoint.outbound().expect("a session");
+    // The station the frames were really handed to, and which of the port's two
+    // answers chose it: an operator reading `gateway` goes to the gateway line
+    // of the document and not to the address or the prefix.
+    assert_eq!(
+        session.next_hop(),
+        Hop {
+            address: GATEWAY,
+            via: Via::Gateway
+        }
+    );
+    let facts = session.facts();
+    // A handshake was composed and dropped for want of an address, which is why
+    // the count is one and not zero: the transport held it and nothing on this
+    // link could carry it.
+    assert_eq!(facts.syns, 1);
+    assert!(!facts.answered);
+    // Every request the budget allows, and nothing learned from any of them.
+    let resolutions = endpoint.resolutions();
+    assert_eq!(resolutions.requested, u64::from(MAX_REQUESTS));
+    assert_eq!(resolutions.learned, 0);
+}
+
+/// The replies a port turned away, gathered by reason, and the subtraction that
+/// makes them a channel's story rather than a boot's.
+#[test]
+fn the_replies_a_port_refused_are_counted_by_reason_and_read_as_a_difference() {
+    let mut endpoint = endpoint();
+    let before = endpoint.resolutions();
+    assert_eq!(before, Resolutions::new());
+
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .expect("an on-link destination");
+    pump(&mut endpoint, at(0));
+
+    // A reply for an address nobody asked about: nothing was waiting on it.
+    endpoint.handle(
+        Some(at(0)),
+        &arp_reply(OUR_MAC, GATEWAY_MAC, GATEWAY, OUR_ADDRESS),
+        &mut vec![0u8; ROOMY],
+    );
+    // And one the frame that carried it contradicts.
+    let mut forged = arp_reply(OUR_MAC, STATION_MAC, STATION_ADDRESS, OUR_ADDRESS);
+    forged[MAC_PAIR_LEN / 2..MAC_PAIR_LEN].copy_from_slice(&[0x52, 0x54, 0x00, 0xbe, 0xef, 0x01]);
+    endpoint.handle(Some(at(0)), &forged, &mut vec![0u8; ROOMY]);
+
+    let after_two = endpoint.resolutions();
+    assert_eq!(after_two.requested, 1, "the session's own request");
+    assert_eq!(after_two.learned, 0);
+    assert_eq!(after_two.unsolicited, 1);
+    assert_eq!(after_two.contradicted, 1);
+    assert_eq!(after_two.rebinding, 0);
+    assert_eq!(after_two.not_unicast, 0);
+    // The difference is the channel's, and a reading taken twice with nothing
+    // between is zero rather than a repetition of the total.
+    assert_eq!(after_two.since(before), after_two);
+    assert_eq!(after_two.since(after_two), Resolutions::new());
+    // A later reading behind an earlier one is zero and never a complement,
+    // which is what keeps a caller holding the pair the wrong way round from
+    // reading an enormous count.
+    assert_eq!(before.since(after_two), Resolutions::new());
+}
+
+/// A channel spends more than one session, so what an operator reads is the sum
+/// — and `answered` is the one field that is an *any* rather than a total: a
+/// station that answered once and then went silent is a station that answered.
+///
+/// The resolution's counts are deliberately not here. An entry outlives the
+/// session that learned it, so a later session finds the next hop resolved and
+/// asks nothing — and summing per-session answers would report three replies to
+/// one request. Those are the port's, and are read as a difference instead.
+#[test]
+fn a_channels_sessions_fold_into_one_account() {
+    let first = DialFacts {
+        syns: 6,
+        answered: false,
+        resets_received: 0,
+        resets_sent: 0,
+    };
+    let second = DialFacts {
+        syns: 6,
+        answered: true,
+        resets_received: 1,
+        resets_sent: 3,
+    };
+    let joined = first.joined(second);
+    assert_eq!(joined.syns, 12);
+    assert!(joined.answered);
+    assert_eq!(joined.resets_received, 1);
+    assert_eq!(joined.resets_sent, 3);
+    // Empty is the identity, which is what lets a caller start from one.
+    assert_eq!(DialFacts::new().joined(first), first);
+    assert_eq!(first.joined(DialFacts::new()), first);
+    // And every field saturates rather than wrapping, so a channel a peer kept
+    // failing does not read as a small number.
+    let full = DialFacts {
+        syns: u64::MAX,
+        answered: true,
+        resets_received: u64::MAX,
+        resets_sent: u64::MAX,
+    };
+    assert_eq!(full.joined(full), full);
+}
+
 /// A peer that resets ends the session under a reason of its own, and the port
 /// goes on answering everything else — a channel that failed is not a port that
 /// stopped.
@@ -4121,9 +4397,12 @@ fn a_reset_ends_the_session_and_leaves_the_port_answering() {
     let reset = station.frame(lfw_tcp::Flags::RST.with(lfw_tcp::Flags::ACK), &[]);
     deliver(&mut endpoint, now, &reset);
     pump(&mut endpoint, now);
+    // The reset is its own ending and not a connection that "was lost": a
+    // station that refuses this port and one that was never there are two
+    // different places to go and look.
     assert_eq!(
         endpoint.outbound().map(Session::phase),
-        Some(Phase::Ended(Ended::Lost))
+        Some(Phase::Ended(Ended::ResetByPeer))
     );
     assert_eq!(endpoint.outbound_counters().failed, 1);
 
@@ -4234,7 +4513,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
     pump(&mut refused, now);
     assert_eq!(
         refused.outbound().map(Session::phase),
-        Some(Phase::Ended(Ended::Lost))
+        Some(Phase::Ended(Ended::ResetByPeer))
     );
     assert_eq!(refused.connections(), 0);
     assert_eq!(refused.return_paths(), 0);
@@ -4324,8 +4603,16 @@ fn each_ending_and_each_phase_names_itself_distinctly() {
         Ended::Answered,
         Ended::NextHopUnreachable,
         Ended::NoRoomToResolve,
-        Ended::Refused(lfw_tcp::DialError::TableFull),
+        Ended::Unanswered,
+        Ended::ResetByPeer,
+        Ended::UnacceptableAcknowledgement {
+            claimed: 0,
+            expected: 0,
+        },
         Ended::Lost,
+        Ended::NoRoomToDial,
+        Ended::ConnectionAlreadyOpen,
+        Ended::SynDidNotFit,
     ];
     let mut names: Vec<&str> = endings.iter().map(|ended| ended.name()).collect();
     names.sort_unstable();
@@ -4336,21 +4623,45 @@ fn each_ending_and_each_phase_names_itself_distinctly() {
         names.iter().all(|name| !name.contains('-')),
         "a label value is underscored, a console token hyphenated"
     );
-    // The one ending an operator reads as the channel working, and the four that
+    // The one ending an operator reads as the channel working, and the nine that
     // are each a different thing to go and look at.
     assert!(Ended::Answered.succeeded());
     assert!(endings.iter().filter(|ended| ended.succeeded()).count() == 1);
-    // A refusal's own cause does not change the name: the token names what
-    // became of the session, and which refusal it was is the transport's to
-    // report.
+    // The two numbers an unacceptable acknowledgement carries do not change what
+    // it is called: the token names the fault and the numbers are the evidence
+    // beside it.
     assert_eq!(
-        Ended::Refused(lfw_tcp::DialError::TableFull).name(),
-        Ended::Refused(lfw_tcp::DialError::Write(lfw_tcp::WriteError::DoesNotFit {
-            needed: 1,
-            capacity: 0
-        }))
+        Ended::UnacceptableAcknowledgement {
+            claimed: 0,
+            expected: 0
+        }
+        .name(),
+        Ended::UnacceptableAcknowledgement {
+            claimed: u32::MAX,
+            expected: 7
+        }
         .name()
     );
+    // And each of the transport's three refusals is its own ending rather than
+    // one carrying a cause a reader has to open: an operator reading the name
+    // knows whether to look at a flood, a four-tuple, or this build.
+    // The third, `AlreadyOpen`, names a connection and so cannot be built
+    // without one; it is proved end to end by
+    // `a_four_tuple_another_connection_holds_refuses_the_dial_and_opens_nothing`,
+    // which reaches it through a table that really holds one.
+    let refusals = [
+        (lfw_tcp::DialError::TableFull, Ended::NoRoomToDial),
+        (
+            lfw_tcp::DialError::Write(lfw_tcp::WriteError::DoesNotFit {
+                needed: 1,
+                capacity: 0,
+            }),
+            Ended::SynDidNotFit,
+        ),
+    ];
+    for (error, expected) in refusals {
+        assert_eq!(Ended::refused(error), expected, "{error:?}");
+    }
 
     let phases = [
         Phase::Resolving,
@@ -4411,9 +4722,7 @@ fn a_four_tuple_another_connection_holds_refuses_the_dial_and_opens_nothing() {
     assert!(
         matches!(
             endpoint.outbound().map(Session::phase),
-            Some(Phase::Ended(Ended::Refused(
-                lfw_tcp::DialError::AlreadyOpen { .. }
-            )))
+            Some(Phase::Ended(Ended::ConnectionAlreadyOpen))
         ),
         "the session ends naming the connection that holds the four-tuple"
     );

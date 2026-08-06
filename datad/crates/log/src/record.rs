@@ -50,8 +50,8 @@ const DIGEST_BYTES: usize = 32;
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
-    ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind,
-    Primitive, RejectReason, Value,
+    ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
+    ObjectKind, Primitive, RejectReason, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -95,6 +95,7 @@ pub enum Vocabulary {
     RejectReason,
     Primitive,
     DialOutcome,
+    NextHopVia,
 }
 
 impl Vocabulary {
@@ -112,6 +113,7 @@ impl Vocabulary {
             Self::RejectReason => RejectReason::ALL.len(),
             Self::Primitive => Primitive::ALL.len(),
             Self::DialOutcome => DialOutcome::ALL.len(),
+            Self::NextHopVia => NextHopVia::ALL.len(),
         }
     }
 
@@ -129,6 +131,7 @@ impl Vocabulary {
             // refusal is written with ("dial outcome token 9 …") and not a
             // console `cause=`, and the spelling is what keeps the two apart.
             Self::DialOutcome => "dial outcome",
+            Self::NextHopVia => "next hop choice",
         }
     }
 }
@@ -175,6 +178,11 @@ fn primitive_of(token: u8) -> Result<Primitive, DecodeError> {
 /// A dial outcome token as the member it selects, on [`primitive_of`]'s terms.
 fn dial_outcome_of(token: u8) -> Result<DialOutcome, DecodeError> {
     variant(DialOutcome::ALL, Vocabulary::DialOutcome, token)
+}
+
+/// A next-hop-choice token as the member it selects, on the same terms.
+fn next_hop_via_of(token: u8) -> Result<NextHopVia, DecodeError> {
+    variant(NextHopVia::ALL, Vocabulary::NextHopVia, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -474,6 +482,42 @@ impl Event<Cause> {
                         *attempts,
                     ];
                 }
+                DomainDetail::DialRoute {
+                    next_hop,
+                    via,
+                    requests,
+                    learned,
+                } => {
+                    record.detail = LogDetailKind::DialRoute.to_bits();
+                    // The token first, where every detail whose leading word
+                    // names a vocabulary carries it — `Dialled`'s own order.
+                    record.operands =
+                        [*via as u64, u64::from(next_hop.bits()), *requests, *learned];
+                }
+                DomainDetail::DialUnlearned {
+                    unsolicited,
+                    rebinding,
+                    not_unicast,
+                    contradicted,
+                } => {
+                    record.detail = LogDetailKind::DialUnlearned.to_bits();
+                    record.operands = [*unsolicited, *rebinding, *not_unicast, *contradicted];
+                }
+                DomainDetail::DialSegments {
+                    syns,
+                    resets_received,
+                    resets_sent,
+                    answered,
+                } => {
+                    record.detail = LogDetailKind::DialSegments.to_bits();
+                    // The flag in the fourth word, which is where this ABI
+                    // carries every flag an operand holds.
+                    record.operands = [*syns, *resets_received, *resets_sent, u64::from(*answered)];
+                }
+                DomainDetail::DialSequence { claimed, expected } => {
+                    record.detail = LogDetailKind::DialSequence.to_bits();
+                    record.operands = [u64::from(*claimed), u64::from(*expected), 0, 0];
+                }
                 DomainDetail::Delegated { device, signatures } => {
                     record.detail = LogDetailKind::Delegated.to_bits();
                     // The identifier in its two halves, most significant first,
@@ -688,6 +732,52 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             attempts: *attempts,
             outcome: dial_outcome_of(*outcome)?,
         },
+        // The token was ranged when the record was checked, as was the address,
+        // so what is left is naming the member the token selected.
+        CheckedDetail::DialRoute {
+            via,
+            next_hop,
+            requests,
+            learned,
+        } => DomainDetail::DialRoute {
+            next_hop: net_headers::Ipv4Address::from_octets(next_hop.to_be_bytes()),
+            via: next_hop_via_of(*via)?,
+            requests: *requests,
+            learned: *learned,
+        },
+        // Total: four counts of replies this port turned away, every bit
+        // pattern of each a tally a link under a flood could have produced.
+        CheckedDetail::DialUnlearned {
+            unsolicited,
+            rebinding,
+            not_unicast,
+            contradicted,
+        } => DomainDetail::DialUnlearned {
+            unsolicited: *unsolicited,
+            rebinding: *rebinding,
+            not_unicast: *not_unicast,
+            contradicted: *contradicted,
+        },
+        // Total for `Reset`'s reason: `wire` ranged the flag, and three counts
+        // of segments are tallies whatever they hold.
+        CheckedDetail::DialSegments {
+            syns,
+            resets_received,
+            resets_sent,
+            answered,
+        } => DomainDetail::DialSegments {
+            syns: *syns,
+            resets_received: *resets_received,
+            resets_sent: *resets_sent,
+            answered: *answered,
+        },
+        // Total: both words were ranged to the width a sequence number has, and
+        // every value inside it is one — the peer's claim included, which is
+        // reported and never judged.
+        CheckedDetail::DialSequence { claimed, expected } => DomainDetail::DialSequence {
+            claimed: *claimed,
+            expected: *expected,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and a signature count is a tally, so every bit
         // pattern of the three words is one a delegating domain could have read.
@@ -796,6 +886,42 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     },
                     DomainDetail::Delegated { device, signatures } => {
                         DomainDetail::Delegated { device, signatures }
+                    }
+                    DomainDetail::DialRoute {
+                        next_hop,
+                        via,
+                        requests,
+                        learned,
+                    } => DomainDetail::DialRoute {
+                        next_hop,
+                        via,
+                        requests,
+                        learned,
+                    },
+                    DomainDetail::DialUnlearned {
+                        unsolicited,
+                        rebinding,
+                        not_unicast,
+                        contradicted,
+                    } => DomainDetail::DialUnlearned {
+                        unsolicited,
+                        rebinding,
+                        not_unicast,
+                        contradicted,
+                    },
+                    DomainDetail::DialSegments {
+                        syns,
+                        resets_received,
+                        resets_sent,
+                        answered,
+                    } => DomainDetail::DialSegments {
+                        syns,
+                        resets_received,
+                        resets_sent,
+                        answered,
+                    },
+                    DomainDetail::DialSequence { claimed, expected } => {
+                        DomainDetail::DialSequence { claimed, expected }
                     }
                     DomainDetail::Dialled {
                         destination,
@@ -935,6 +1061,7 @@ const _: () = {
     assert!(RejectReason::ALL.len() == wire::LOG_REJECT_REASON_COUNT as usize);
     assert!(Primitive::ALL.len() == wire::LOG_PRIMITIVE_COUNT as usize);
     assert!(DialOutcome::ALL.len() == wire::LOG_DIAL_OUTCOME_COUNT as usize);
+    assert!(NextHopVia::ALL.len() == wire::LOG_NEXT_HOP_VIA_COUNT as usize);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);
     assert!(crate::MAX_CAUSE_LEN == wire::LOG_CAUSE_BYTES);

@@ -26,7 +26,7 @@ use lfw_clock::UtcNanos;
 
 use net_headers::Ipv4Address;
 
-use crate::event::{DialOutcome, Primitive};
+use crate::event::{DialOutcome, NextHopVia, Primitive};
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
@@ -309,6 +309,71 @@ pub enum DomainDetail<C = &'static str> {
         attempts: u64,
         outcome: DialOutcome,
     },
+    /// Where the frames of a failed channel were **actually** handed, and what
+    /// the link made of the asking.
+    ///
+    /// The first of the three that follow [`Dialled`](Self::Dialled) on a
+    /// channel that did not come up. They are separate records rather than a
+    /// wider one because the record carries four operand words and this is more
+    /// than four facts: widening the array costs a page in every log region and
+    /// would still not hold them, while a reader takes a sequence of lines as
+    /// readily as one. They are emitted **only on a failure**, so a healthy boot
+    /// says `answered` and stops.
+    ///
+    /// `via` travels with the address because the address alone cannot say
+    /// which decision produced it, and the two are different halves of a
+    /// configuration to go and read.
+    DialRoute {
+        next_hop: Ipv4Address,
+        via: NextHopVia,
+        /// Requests for that station's hardware address this channel put on the
+        /// wire, retries and every session included.
+        requests: u64,
+        /// Replies that resolved it. Zero beside a non-zero `requests` is the
+        /// whole of what `next-hop-unreachable` means.
+        learned: u64,
+    },
+    /// The replies that reached this port during the channel and became no
+    /// entry, one count per reason they were refused.
+    ///
+    /// It is the other half of [`DialRoute`](Self::DialRoute)'s story: requests
+    /// that went out and nothing learned is a silent link, and requests that
+    /// went out with these counts moving is a link where **somebody is
+    /// answering and it is not the next hop**. `contradicted` is a reply whose
+    /// own claim about its sender the frame carrying it disagreed with;
+    /// `rebinding` is one for an address already resolved, which is an attempt
+    /// to move a next hop this appliance is using.
+    DialUnlearned {
+        unsolicited: u64,
+        rebinding: u64,
+        not_unicast: u64,
+        contradicted: u64,
+    },
+    /// What the channel's own connections did on the wire.
+    ///
+    /// `answered` is the fact the tokens rest on: a budget that ran out with
+    /// this false is silence, and one that ran out with it true is a peer that
+    /// said something. The two reset counts say which way it said it — one from
+    /// the peer ends a connection, one from this end refuses a segment RFC 793
+    /// says must be refused that way.
+    DialSegments {
+        /// `SYN`s the transport composed, retransmissions and every session
+        /// included.
+        syns: u64,
+        resets_received: u64,
+        resets_sent: u64,
+        answered: bool,
+    },
+    /// The two sequence numbers behind an unacceptable acknowledgement: what the
+    /// peer claimed, and what this end had actually sent.
+    ///
+    /// Emitted only where one arrived, because only then do the numbers exist.
+    /// **`claimed` is the peer's number**: it is reported so an operator can
+    /// read the gap, and it is nothing this node computes with.
+    DialSequence {
+        claimed: u32,
+        expected: u32,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.
@@ -343,6 +408,7 @@ pub enum RefusalDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::NextHopVia;
     use proptest::prelude::*;
     use std::{format, string::String, vec::Vec};
 
@@ -492,6 +558,32 @@ mod tests {
                 detail: RefusalDetail::None,
                 signalled: false,
             }),
+            // The four a failed channel adds. All four are counts at the same
+            // zero, which is exactly the shape this test exists to keep apart:
+            // three zeroed segment counts and three zeroed refusal counts are
+            // different records about different things.
+            DomainDetail::DialRoute {
+                next_hop: Ipv4Address::from_octets([0, 0, 0, 0]),
+                via: NextHopVia::Prefix,
+                requests: 0,
+                learned: 0,
+            },
+            DomainDetail::DialUnlearned {
+                unsolicited: 0,
+                rebinding: 0,
+                not_unicast: 0,
+                contradicted: 0,
+            },
+            DomainDetail::DialSegments {
+                syns: 0,
+                resets_received: 0,
+                resets_sent: 0,
+                answered: false,
+            },
+            DomainDetail::DialSequence {
+                claimed: 0,
+                expected: 0,
+            },
         ];
         for (index, shape) in shapes.iter().enumerate() {
             for (other_index, other) in shapes.iter().enumerate() {

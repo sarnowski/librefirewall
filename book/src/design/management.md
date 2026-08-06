@@ -31,6 +31,18 @@ One consequence is worth stating here: every surface but the
 and the channel does not widen that exception — it *carries the sinks*, under the same authorization
 the sinks' own design demands, rather than being a third place payloads appear.
 
+**A channel that does not come up is diagnosable from the console alone.** The appliance dials out,
+so every way the connection can fail to be established is a fact only the appliance holds — and a
+deployed node has no shell, no CLI and no debugger, so what is not on the console costs a physical
+visit and a guess. The design therefore requires the same of every layer of the channel, the
+transport that carries it and the TLS above it alike: each distinct cause is reported under a name
+of its own rather than folded into a general failure, and the record set carries the technical facts
+that place the fault without a packet capture — where the frames were sent and which part of the
+addressing chose that, what the link answered and what it refused, and what the connection itself
+did. What that must never become is a payload surface: the counts, addresses, ports and sequence
+numbers on those records are system state, and what the peer actually said reaches the two recording
+sinks and nowhere else.
+
 **The session layer is deliberately thin**: mutual TLS, a resume cursor giving at-least-once
 catch-up from the ring after a reconnect, and periodic acknowledgements — nothing else. Backpressure
 is the recording ring's existing semantics, not a second mechanism: the appliance **never blocks on

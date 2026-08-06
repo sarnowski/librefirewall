@@ -55,7 +55,7 @@ use crate::{
     crypto_contract,
     data_disk::{DataDisk, StoreDisk},
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
-    dial_contract::{self, DialVerdict},
+    dial_contract::{self, Count, DialAccount, DialVerdict},
     forward_harness::{
         self, BootContract, BootTest, Booted, DialMisbehaviour, ManagementBacking, Traffic,
     },
@@ -324,15 +324,19 @@ impl DialContract {
     ///
     /// The one place the four misbehaviours are turned into outcomes, and every
     /// answer here follows from the appliance's own code rather than from what
-    /// would be convenient. Three of the four end as `connection-lost`, and that
-    /// is not a weakness of the vocabulary but its meaning: a station that says
-    /// nothing, one that refuses, and one that acknowledges what was never sent
-    /// are all a connection that went away, and what tells them apart is the wire
-    /// the station judged frame by frame. The fourth never reaches a connection
-    /// at all, and the token it earns is the wrong one for a reason stated where
-    /// it is chosen.
+    /// would be convenient. **Each of the four is now its own token**, which is
+    /// the point of asserting them: three of them once shared one, and an
+    /// operator reading it could not tell a dead server from one refusing the
+    /// port from one that is not speaking TCP correctly. The counts beside each
+    /// token are what keep the three apart even if the tokens ever drifted back
+    /// together, and each scenario states the subset that distinguishes it.
+    ///
+    /// Every station on this wire is on this port's own prefix, so the route
+    /// decision hands each of them the destination itself and never the gateway
+    /// — stated in all four, because a channel that went somewhere else would
+    /// make every other count a fact about the wrong station.
     pub(crate) const fn verdict(self) -> Option<DialVerdict> {
-        let (outcome, attempts) = match self {
+        let (outcome, attempts, account) = match self {
             // Nothing is read: the boot does not judge the channel.
             Self::Answered => return None,
             // A station that answers is not a misbehaviour, so this pairing
@@ -340,22 +344,81 @@ impl DialContract {
             // it by name, which turns a table entry that cannot mean anything
             // into a verdict a reader can act on rather than a crash.
             Self::Misbehaves(DialMisbehaviour::Answers) => return None,
-            // One session, answered.
-            Self::Judged => (DialOutcome::Answered, 1),
+            // One session, answered — and no counts at all, a channel that came
+            // up having no fault to place.
+            Self::Judged => (DialOutcome::Answered, 1, None),
             // Three sessions, each carried to the end of the transport's own
-            // retransmission budget with nothing at the far end answering.
-            Self::Misbehaves(DialMisbehaviour::SilentToTheDial) => (DialOutcome::ConnectionLost, 3),
-            // Three sessions, each refused by a reset the moment it opened.
-            Self::Misbehaves(DialMisbehaviour::ResetsTheDial) => (DialOutcome::ConnectionLost, 3),
+            // retransmission budget with nothing at the far end answering. What
+            // says so is `answered=false` beside a handshake count that spans
+            // every attempt: the station took all of them and returned
+            // nothing.
+            Self::Misbehaves(DialMisbehaviour::SilentToTheDial) => (
+                DialOutcome::Unanswered,
+                3,
+                Some(DialAccount {
+                    next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
+                    // The resolution worked: the station answers for the address
+                    // it holds and only the connection is ignored. A floor
+                    // rather than an exact count, because a cache entry that
+                    // expires between sessions is asked about again.
+                    requests: Count::AtLeast(1),
+                    learned: Count::AtLeast(1),
+                    unlearned: [Count::Exactly(0); 4],
+                    // At least one per session and every re-send of it. A floor,
+                    // the number of re-sends inside a boot being the backoff's.
+                    syns: Count::AtLeast(3),
+                    resets_received: Count::Exactly(0),
+                    resets_sent: Count::Exactly(0),
+                    answered: false,
+                    acknowledged: false,
+                }),
+            ),
+            // Three sessions, each refused by a reset the moment it opened. The
+            // reset count is what separates this from the silence above, and the
+            // absence of one *sent* is the protocol's own rule: a reset is never
+            // answered with another.
+            Self::Misbehaves(DialMisbehaviour::ResetsTheDial) => (
+                DialOutcome::ResetByPeer,
+                3,
+                Some(DialAccount {
+                    next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
+                    requests: Count::AtLeast(1),
+                    learned: Count::AtLeast(1),
+                    unlearned: [Count::Exactly(0); 4],
+                    syns: Count::AtLeast(3),
+                    resets_received: Count::AtLeast(1),
+                    resets_sent: Count::Exactly(0),
+                    answered: true,
+                    acknowledged: false,
+                }),
+            ),
             // Three sessions again, and for a reason worth stating: the bogus
             // handshake does NOT end one. It draws a reset and leaves the dial
             // where it was, so each session runs out the same retransmission
-            // budget the silent station's does and the channel ends the same way.
-            // A single segment naming a number nobody sent cannot cancel a dial,
-            // and this is the outcome that follows from it.
-            Self::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence) => {
-                (DialOutcome::ConnectionLost, 3)
-            }
+            // budget the silent station's does — and what tells the two apart on
+            // the console is `answered=true`, a reset count that moved *outward*
+            // rather than inward, and the two numbers the station claimed.
+            Self::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence) => (
+                DialOutcome::UnacceptableAcknowledgement,
+                3,
+                Some(DialAccount {
+                    next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
+                    requests: Count::AtLeast(1),
+                    learned: Count::AtLeast(1),
+                    unlearned: [Count::Exactly(0); 4],
+                    syns: Count::AtLeast(3),
+                    resets_received: Count::Exactly(0),
+                    // One per bogus handshake refused, which is at least one per
+                    // session. A floor for the handshake count's reason.
+                    resets_sent: Count::AtLeast(3),
+                    answered: true,
+                    // The pair itself is the station's arithmetic and is
+                    // supplied by the run: this scenario states that one is
+                    // owed, and the numbers the appliance prints are compared
+                    // against what the station read off the wire.
+                    acknowledged: true,
+                }),
+            ),
             // Three sessions, none of which reached a connection: the neighbour
             // cache asked, was answered by somebody else, gave up, and no `SYN`
             // ever crossed the wire — which is the claim, and the station is
@@ -370,11 +433,45 @@ impl DialContract {
             // it opens a new one rather than meeting this node's own table.
             // That is what keeps the token a fact about the link: an operator
             // reading it goes and looks at what claims the next hop.
-            Self::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress) => {
-                (DialOutcome::NextHopUnreachable, 3)
-            }
+            Self::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress) => (
+                DialOutcome::NextHopUnreachable,
+                3,
+                Some(DialAccount {
+                    next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
+                    // The whole request budget, three times over, and nothing
+                    // learned from any of them: the pair is the entire meaning
+                    // of the token.
+                    requests: Count::AtLeast(3),
+                    learned: Count::Exactly(0),
+                    // And this is what says the link is not silent: somebody is
+                    // answering, and every answer is for an address nobody asked
+                    // about. It is the count that separates a station holding
+                    // the wrong address from a link with nothing on it at all.
+                    unlearned: [
+                        Count::AtLeast(3),
+                        Count::Exactly(0),
+                        Count::Exactly(0),
+                        Count::Exactly(0),
+                    ],
+                    // At least one per session, composed and dropped for want
+                    // of an address — and re-sent by the transport's own
+                    // backoff while the resolution runs, which is why this is a
+                    // floor and not the three sessions. **None of them reached
+                    // the wire**, which is the claim this scenario rests on and
+                    // the station holds it separately by seeing no `SYN` at all.
+                    syns: Count::AtLeast(3),
+                    resets_received: Count::Exactly(0),
+                    resets_sent: Count::Exactly(0),
+                    answered: false,
+                    acknowledged: false,
+                }),
+            ),
         };
-        Some(DialVerdict { outcome, attempts })
+        Some(DialVerdict {
+            outcome,
+            attempts,
+            account,
+        })
     }
 }
 
@@ -1801,6 +1898,7 @@ fn judge_dial(scenario: &Scenario, booted: &Booted, log: &Path) -> Result<String
             forward_harness::DIAL_DESTINATION,
             forward_harness::DIAL_PORT,
         ),
+        booted.dial_claim,
     )
 }
 

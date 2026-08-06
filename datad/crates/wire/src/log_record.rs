@@ -71,7 +71,11 @@ pub const LOG_PRIMITIVE_COUNT: u8 = 10;
 /// How many outcomes a dialled connection may report —
 /// `lfw_log::DialOutcome::ALL`, carried as a token for
 /// [`LOG_PRIMITIVE_COUNT`]'s reason.
-pub const LOG_DIAL_OUTCOME_COUNT: u8 = 6;
+pub const LOG_DIAL_OUTCOME_COUNT: u8 = 13;
+
+/// How many ways a next hop may have been chosen — `lfw_log::NextHopVia::ALL`,
+/// on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_NEXT_HOP_VIA_COUNT: u8 = 3;
 
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
@@ -188,6 +192,16 @@ pub enum LogDetailKind {
     Reset,
     Delegated,
     Dialled,
+    /// The three that follow a [`Self::Dialled`] naming a channel that failed.
+    /// Appended, never inserted, on [`Self::Identity`]'s terms — and three
+    /// discriminants rather than one wider operand array, because widening that
+    /// array grows every log region by a page and would still not carry these
+    /// facts in one record.
+    DialRoute,
+    DialUnlearned,
+    DialSegments,
+    /// The fourth, which only an unacceptable acknowledgement produces.
+    DialSequence,
 }
 
 impl LogDetailKind {
@@ -215,6 +229,10 @@ impl LogDetailKind {
             Self::Reset => 18,
             Self::Delegated => 19,
             Self::Dialled => 20,
+            Self::DialRoute => 21,
+            Self::DialUnlearned => 22,
+            Self::DialSegments => 23,
+            Self::DialSequence => 24,
         }
     }
 
@@ -242,6 +260,10 @@ impl LogDetailKind {
             18 => Some(Self::Reset),
             19 => Some(Self::Delegated),
             20 => Some(Self::Dialled),
+            21 => Some(Self::DialRoute),
+            22 => Some(Self::DialUnlearned),
+            23 => Some(Self::DialSegments),
+            24 => Some(Self::DialSequence),
             _ => None,
         }
     }
@@ -759,6 +781,40 @@ impl LogRecord {
                 port: code_point(self.operands[2])?,
                 attempts: self.operands[3],
             },
+            // A token, an address and two counts, ruled on in that order for
+            // `Dialled`'s reason: the token takes the leading word wherever a
+            // detail's first word names a vocabulary.
+            Some(LogDetailKind::DialRoute) => CheckedDetail::DialRoute {
+                via: next_hop_via_token(self.operands[0])?,
+                next_hop: address_bits(self.operands[1])?,
+                requests: self.operands[2],
+                learned: self.operands[3],
+            },
+            // Four unranged counts of replies this port turned away, so there
+            // is nothing here a rule can refuse: every bit pattern of each is a
+            // tally a link under a flood could have produced.
+            Some(LogDetailKind::DialUnlearned) => CheckedDetail::DialUnlearned {
+                unsolicited: self.operands[0],
+                rebinding: self.operands[1],
+                not_unicast: self.operands[2],
+                contradicted: self.operands[3],
+            },
+            // Three unranged counts and, in the fourth word, the one flag this
+            // detail carries — refused there on `Identity`'s terms, which is
+            // what keeps one rule in this ABI for a boolean in an operand.
+            Some(LogDetailKind::DialSegments) => CheckedDetail::DialSegments {
+                syns: self.operands[0],
+                resets_received: self.operands[1],
+                resets_sent: self.operands[2],
+                answered: flag(self.operands[3])?,
+            },
+            // Two sequence numbers, each ranged to the thirty-two bits TCP
+            // numbers one in: a wider word would render as a number no wire
+            // carries, and one of the two is the peer's own claim.
+            Some(LogDetailKind::DialSequence) => CheckedDetail::DialSequence {
+                claimed: sequence_bits(self.operands[0])?,
+                expected: sequence_bits(self.operands[1])?,
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -852,6 +908,23 @@ fn dial_outcome_token(raw: u64) -> Result<u8, LogRecordError> {
         Ok(narrow) if narrow < LOG_DIAL_OUTCOME_COUNT => Ok(narrow),
         _ => Err(LogRecordError::DialOutcomeUnknown { outcome: raw }),
     }
+}
+
+/// A next-hop-choice token carried in an operand word, on
+/// `dial_outcome_token`'s terms.
+fn next_hop_via_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_NEXT_HOP_VIA_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::NextHopViaUnknown { via: raw }),
+    }
+}
+
+/// A TCP sequence number carried in an operand word. Every one of the
+/// thirty-two bits is a sequence number — including the peer's own claim, which
+/// is reported rather than judged — so what is refused is only a word too wide
+/// to be one.
+fn sequence_bits(raw: u64) -> Result<u32, LogRecordError> {
+    u32::try_from(raw).map_err(|_| LogRecordError::SequenceTooWide { value: raw })
 }
 
 /// An IPv4 address carried in an operand word. Every one of the thirty-two bits
@@ -1243,6 +1316,36 @@ pub enum CheckedDetail {
         port: u16,
         attempts: u64,
     },
+    /// The station a failed channel's frames were handed to, which of the
+    /// port's two answers chose it, and what the asking produced.
+    DialRoute {
+        via: u8,
+        next_hop: u32,
+        requests: u64,
+        learned: u64,
+    },
+    /// Replies that reached the port during that channel and became no entry,
+    /// one count per reason.
+    DialUnlearned {
+        unsolicited: u64,
+        rebinding: u64,
+        not_unicast: u64,
+        contradicted: u64,
+    },
+    /// What that channel's own connections did: handshakes composed, resets in
+    /// both directions, and whether anything arrived at all.
+    DialSegments {
+        syns: u64,
+        resets_received: u64,
+        resets_sent: u64,
+        answered: bool,
+    },
+    /// The two sequence numbers behind an unacceptable acknowledgement, both
+    /// thirty-two bits wide wherever TCP names one.
+    DialSequence {
+        claimed: u32,
+        expected: u32,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1326,6 +1429,14 @@ pub enum LogRecordError {
     },
     DialOutcomeUnknown {
         outcome: u64,
+    },
+    NextHopViaUnknown {
+        via: u64,
+    },
+    /// An operand carrying a TCP sequence number wider than the thirty-two bits
+    /// one has.
+    SequenceTooWide {
+        value: u64,
     },
     /// An operand carrying an IPv4 address wider than the thirty-two bits one
     /// has.
@@ -1416,6 +1527,13 @@ impl fmt::Display for LogRecordError {
                 f,
                 "dial outcome token {outcome} is not below {LOG_DIAL_OUTCOME_COUNT}"
             ),
+            Self::NextHopViaUnknown { via } => write!(
+                f,
+                "next hop choice token {via} is not below {LOG_NEXT_HOP_VIA_COUNT}"
+            ),
+            Self::SequenceTooWide { value } => {
+                write!(f, "sequence word {value} does not fit thirty-two bits")
+            }
             Self::AddressTooWide { value } => {
                 write!(f, "address word {value} does not fit thirty-two bits")
             }

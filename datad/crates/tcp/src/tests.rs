@@ -583,14 +583,20 @@ fn an_acknowledgement_of_something_never_sent_is_refused() {
     let id = received.connection.expect("a connection");
     peer.read(&out[..received.emitted]);
 
-    // An acknowledgement far beyond what this end sent.
+    // An acknowledgement far beyond what this end sent. The number this end had
+    // really reached is read before the peer's claim replaces it, because the
+    // refusal reports both and an operator places the fault by the gap.
+    let expected = peer.expect;
     peer.expect = peer.expect.add(1_000);
     let claimed = peer.expect;
     let wrong = peer.ack();
     let received = stack.receive(at(1_000), STATION, &wrong, &mut out);
     assert_eq!(
         received.outcome,
-        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+            claimed,
+            expected
+        }))
     );
     let reset =
         Segment::parse(APPLIANCE, STATION, &out[..received.emitted]).expect("a reset came back");
@@ -609,12 +615,17 @@ fn an_acknowledgement_of_something_never_sent_is_refused() {
     // And once established, a challenge rather than a reset.
     let mut peer = Peer::new(40001, 0xb000);
     let id = handshake(&mut stack, at(2_000), &mut peer);
+    let expected = peer.expect;
     peer.expect = peer.expect.add(5_000);
+    let claimed = peer.expect;
     let wrong = peer.ack();
     let received = stack.receive(at(3_000), STATION, &wrong, &mut out);
     assert_eq!(
         received.outcome,
-        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+            claimed,
+            expected
+        }))
     );
     let challenge = Segment::parse(APPLIANCE, STATION, &out[..received.emitted])
         .expect("a challenge came back");
@@ -2036,9 +2047,14 @@ fn an_acknowledgement_far_behind_the_send_window_is_challenged() {
     peer.window = 1;
     let stale = peer.segment_at(peer.next, Flags::ACK, &[]);
     let received = stack.receive(at(2_000), STATION, &stale, &mut out);
+    // The refusal names the peer's claim and what this end had really sent,
+    // which for a connection that has sent only its own `SYN` is `una`.
     assert_eq!(
         received.outcome,
-        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+            claimed: una.sub(4_097),
+            expected: una
+        }))
     );
     let challenge = peer.read(&out[..received.emitted]);
     assert!(
@@ -2496,9 +2512,14 @@ fn an_answer_acknowledging_the_wrong_sequence_is_reset_and_the_dial_stands() {
     peer.expect = dialled_isn.add(500);
     let bogus = peer.syn_ack();
     let received = stack.receive(at(1_000), STATION, &bogus, &mut out);
+    // Both numbers travel with the refusal: what the station claimed, and the
+    // one this end had actually reached — its `SYN` and nothing else.
     assert_eq!(
         received.outcome,
-        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+            claimed: dialled_isn.add(500),
+            expected: dialled_isn.add(1)
+        }))
     );
     let reset = Segment::parse(APPLIANCE, STATION, &out[..received.emitted]).expect("a reset");
     assert!(reset.flags.contains(Flags::RST));
@@ -2520,7 +2541,10 @@ fn an_answer_acknowledging_the_wrong_sequence_is_reset_and_the_dial_stands() {
     let received = stack.receive(at(2_000), STATION, &bogus, &mut out);
     assert_eq!(
         received.outcome,
-        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck))
+        Outcome::Rejected(Rejection::Connection(Refusal::UnacceptableAck {
+            claimed: dialled_isn,
+            expected: dialled_isn.add(1)
+        }))
     );
     assert_eq!(
         stack.connection(dialled.connection).map(Connection::state),
@@ -2577,6 +2601,62 @@ fn a_reset_ends_a_dial_only_where_it_acknowledges_it() {
     );
     assert_eq!(stack.counters().resets_received, 1);
     assert_eq!(stack.counters().connections_closed, 1);
+}
+
+/// The two reset facts a received segment reports, which are what lets a caller
+/// tell a station that refused it from one that was never there.
+///
+/// A caller sees only that the table stopped holding a connection, and the table
+/// stops holding one for a reset and for a retransmission budget alike. So the
+/// segment says which: `peer_reset` for a reset this connection acted on, and
+/// `reset_sent` for one this end composed in answer. Both are asserted against
+/// the counters beside them, because a flag that disagreed with the count would
+/// be a caller and a scrape reporting different things about one segment.
+#[test]
+fn a_received_segment_reports_the_reset_it_carried_and_the_one_it_drew() {
+    let mut stack = stack();
+    let mut peer = Peer::at(STATION, 8443, 0x5f_0000);
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 8443, &mut out)
+        .expect("a dial");
+    let dialled_isn = peer.read(&out[..dialled.len]).sequence;
+
+    // A blind reset is refused before it can end anything, so neither flag is
+    // set: the connection stands and this end answers nothing.
+    let blind = peer.segment_at(peer.next, Flags::RST, &[]);
+    let received = stack.receive(at(1_000), STATION, &blind, &mut out);
+    assert!(!received.peer_reset, "a refused reset ended the dial");
+    assert!(!received.reset_sent);
+
+    // An acknowledgement of what was never sent draws a reset from this end and
+    // leaves the dial standing, so exactly one of the two flags is set.
+    peer.expect = dialled_isn.add(500);
+    let bogus = peer.syn_ack();
+    let received = stack.receive(at(2_000), STATION, &bogus, &mut out);
+    assert!(!received.peer_reset);
+    assert!(
+        received.reset_sent,
+        "the reset this end sent was not reported"
+    );
+    assert_eq!(stack.counters().resets_sent, 1);
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::SynSent)
+    );
+
+    // And the reset that really ends it, which is the other flag alone.
+    peer.expect = dialled_isn.add(1);
+    let refusal = peer.segment_at(peer.next, Flags::RST.with(Flags::ACK), &[]);
+    let received = stack.receive(at(3_000), STATION, &refusal, &mut out);
+    assert!(
+        received.peer_reset,
+        "the reset that ended the dial was not reported"
+    );
+    assert!(!received.reset_sent, "a reset was answered with another");
+    assert_eq!(stack.counters().resets_received, 1);
+    assert_eq!(stack.counters().resets_sent, 1);
+    assert_eq!(stack.connection(dialled.connection), None);
 }
 
 /// RFC 793 p.68: a segment reaching a dial that carries neither `SYN` nor `RST`

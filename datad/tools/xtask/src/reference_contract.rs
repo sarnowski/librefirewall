@@ -67,7 +67,7 @@ use std::{
     path::Path,
 };
 
-use lfw_log::{MAX_CAUSE_LEN, RejectReason};
+use lfw_log::{DialOutcome, MAX_CAUSE_LEN, RejectReason};
 use lfw_metrics::{
     ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, RULE_HITS,
     SHARD_COUNT, SHARDS,
@@ -232,6 +232,7 @@ pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
     check_literal_sites(&literals, &mut findings);
     check_causes(&literals, &console, &mut findings);
     check_reject_reasons(&console, &mut findings);
+    check_dial_outcomes(&console, &mut findings);
     check_metric_families(&metrics, &mut findings);
     check_stated_counts(&status, &mut findings);
 
@@ -241,8 +242,8 @@ pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
         // is the same silence this comparison exists to end.
         println!(
             "reference: {CONSOLE_PAGE} and {METRICS_PAGE} agree with the code they describe: \
-             every refusal cause token, every `rejected=` reason, and every metric family with \
-             its type, labels and publishing domains; and every count \
+             every refusal cause token, every `rejected=` reason, every `dial-outcome=` token, \
+             and every metric family with its type, labels and publishing domains; and every count \
              {STATUS_DETAIL_PAGE} states about the gate agrees with the list it is about"
         );
         return Ok(());
@@ -616,6 +617,71 @@ fn check_reject_reasons(console: &str, findings: &mut Vec<String>) {
         None => findings.push(format!(
             "{CONSOLE_PAGE} states no total before \"reasons:\", so the size of the `rejected=` \
              vocabulary cannot be checked"
+        )),
+    }
+}
+
+/// `dial-outcome=` tokens: `DialOutcome::ALL` against the chapter's table, both
+/// directions, plus the total it states.
+///
+/// Read for the same reason the two vocabularies above are, and with more at
+/// stake than either: this is the vocabulary an operator reads a failed
+/// management connection through, so a token the code can emit and the chapter
+/// does not explain is a failure with no documented meaning — and one the
+/// chapter explains and the code cannot emit is an operator waiting for a line
+/// that never comes.
+fn check_dial_outcomes(console: &str, findings: &mut Vec<String>) {
+    let code: BTreeSet<&str> = DialOutcome::ALL
+        .iter()
+        .map(|outcome| outcome.name())
+        .collect();
+
+    let tables = tables(console);
+    let Some(table) = tables
+        .iter()
+        .find(|table| table.header == ["dial outcome", "what it means"])
+    else {
+        findings.push(format!(
+            "{CONSOLE_PAGE} carries no `| dial outcome | what it means |` table, so the {} \
+             `dial-outcome=` token(s) the code can emit are compared against nothing",
+            code.len()
+        ));
+        return;
+    };
+
+    let book: BTreeSet<String> = table
+        .rows
+        .iter()
+        .filter_map(|row| row.first())
+        .flat_map(|cell| backticked(cell))
+        .collect();
+
+    for token in &code {
+        if !book.contains(*token) {
+            findings.push(format!(
+                "dial outcome `{token}`: `lfw_log::DialOutcome` carries it and {CONSOLE_PAGE} \
+                 does not list it"
+            ));
+        }
+    }
+    for token in &book {
+        if !code.contains(token.as_str()) {
+            findings.push(format!(
+                "dial outcome `{token}`: {CONSOLE_PAGE} lists it and `lfw_log::DialOutcome` has \
+                 no such variant"
+            ));
+        }
+    }
+    match stated_count_before(&flatten(console), "outcomes:") {
+        Some(stated) if stated == code.len() => {}
+        Some(stated) => findings.push(format!(
+            "{CONSOLE_PAGE} says `dial-outcome=` is one of {stated} outcomes and \
+             `lfw_log::DialOutcome` carries {}",
+            code.len()
+        )),
+        None => findings.push(format!(
+            "{CONSOLE_PAGE} states no total before \"outcomes:\", so the size of the \
+             `dial-outcome=` vocabulary cannot be checked"
         )),
     }
 }

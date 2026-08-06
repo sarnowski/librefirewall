@@ -3,7 +3,7 @@ use crate::event::Primitive;
 
 use core::num::NonZeroU64;
 
-use net_headers::{Ipv4Address, MacAddress};
+use net_headers::{self, Ipv4Address, MacAddress};
 use proptest::prelude::*;
 use std::{format, string::String, vec::Vec};
 use wire::{CauseImage, CheckedRecord, CheckedStamp, IdentifierImage, LogRecordError, TextImage};
@@ -294,6 +294,60 @@ fn every_domain_detail_shape_survives_the_crossing() {
         DomainDetail::Fingerprint([0; 32]),
         DomainDetail::Fingerprint([0xff; 32]),
         DomainDetail::Fingerprint(counting_digest()),
+        DomainDetail::Medium {
+            capacity_sectors: u64::MAX,
+            leading_word: 0,
+        },
+        DomainDetail::Extent {
+            start_sector: 0,
+            sectors: u64::MAX,
+        },
+        DomainDetail::Reset {
+            generation: u64::MAX,
+            documents: 0,
+            was_owned: true,
+        },
+        DomainDetail::Delegated {
+            device: 1,
+            signatures: u64::MAX,
+        },
+        // The channel's own five, each at a value that would survive a field
+        // read out of the wrong operand word only if the words were symmetric —
+        // which is why no two fields of one shape are equal here.
+        DomainDetail::Dialled {
+            destination: net_headers::Ipv4Address::from_octets([10, 0, 2, 2]),
+            port: u16::MAX,
+            attempts: 3,
+            outcome: DialOutcome::UnacceptableAcknowledgement,
+        },
+        DomainDetail::DialRoute {
+            next_hop: net_headers::Ipv4Address::from_octets([10, 0, 2, 2]),
+            via: NextHopVia::Gateway,
+            requests: 9,
+            learned: u64::MAX,
+        },
+        DomainDetail::DialUnlearned {
+            unsolicited: 1,
+            rebinding: 2,
+            not_unicast: 3,
+            contradicted: u64::MAX,
+        },
+        DomainDetail::DialSegments {
+            syns: 1,
+            resets_received: 2,
+            resets_sent: u64::MAX,
+            answered: true,
+        },
+        DomainDetail::DialSegments {
+            syns: 0,
+            resets_received: 0,
+            resets_sent: 0,
+            answered: false,
+        },
+        DomainDetail::DialSequence {
+            claimed: u32::MAX,
+            expected: 1,
+        },
     ];
     for operands in [
         RefusalDetail::None,
@@ -786,6 +840,40 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
             }
         }),
         any::<[u8; 32]>().prop_map(DomainDetail::Fingerprint),
+        (any::<([u8; 4], u16, u64)>(), pick(DialOutcome::ALL)).prop_map(
+            |((octets, port, attempts), outcome)| DomainDetail::Dialled {
+                destination: net_headers::Ipv4Address::from_octets(octets),
+                port,
+                attempts,
+                outcome,
+            }
+        ),
+        (any::<([u8; 4], u64, u64)>(), pick(NextHopVia::ALL)).prop_map(
+            |((octets, requests, learned), via)| DomainDetail::DialRoute {
+                next_hop: net_headers::Ipv4Address::from_octets(octets),
+                via,
+                requests,
+                learned,
+            }
+        ),
+        any::<(u64, u64, u64, u64)>().prop_map(
+            |(unsolicited, rebinding, not_unicast, contradicted)| DomainDetail::DialUnlearned {
+                unsolicited,
+                rebinding,
+                not_unicast,
+                contradicted,
+            }
+        ),
+        any::<(u64, u64, u64, bool)>().prop_map(
+            |(syns, resets_received, resets_sent, answered)| DomainDetail::DialSegments {
+                syns,
+                resets_received,
+                resets_sent,
+                answered,
+            }
+        ),
+        any::<(u32, u32)>()
+            .prop_map(|(claimed, expected)| DomainDetail::DialSequence { claimed, expected }),
         (
             any_cause(),
             prop_oneof![

@@ -194,7 +194,20 @@ pub enum Refusal {
     /// A `SYN` on a synchronized connection (RFC 5961 section 4), likewise challenged.
     UnexpectedSyn,
     /// An acknowledgement of something never sent.
-    UnacceptableAck,
+    ///
+    /// It carries both numbers because they are what an operator places the
+    /// fault with: one is the peer's claim and the other is what this end had
+    /// actually sent, and the gap between them says whether the peer is a
+    /// station replaying an old exchange, one composing a handshake it never
+    /// received, or a middlebox rewriting the field. `claimed` is **the peer's
+    /// number**, reported and never arithmetic this end depends on.
+    UnacceptableAck {
+        /// The acknowledgement number the segment carried.
+        claimed: SeqNumber,
+        /// The next sequence number this end had sent, which is what an
+        /// acceptable acknowledgement may not run past.
+        expected: SeqNumber,
+    },
     /// In-window payload that was not the next byte expected. See the crate
     /// header on why there is no reassembly queue to hold it.
     OutOfOrder,
@@ -982,7 +995,13 @@ impl Connection {
                     acknowledgement: SeqNumber::new(0),
                     with_options: false,
                 });
-                return self.refuse(Refusal::UnacceptableAck, reply);
+                return self.refuse(
+                    Refusal::UnacceptableAck {
+                        claimed: ack,
+                        expected: self.snd_nxt,
+                    },
+                    reply,
+                );
             }
             true
         } else {
@@ -1130,6 +1149,9 @@ impl Connection {
             // and nothing it has not sent. Anything else is answered with a
             // `RST` carrying the number the peer claimed.
             if !(ack.follows(self.snd_una) && ack.precedes_or_equals(self.snd_nxt)) {
+                // Read before the teardown, so the number reported is the one
+                // this end had sent rather than whatever the closed state holds.
+                let expected = self.snd_nxt;
                 self.close_hard();
                 return Err(Processed {
                     data: &[],
@@ -1139,7 +1161,10 @@ impl Connection {
                         acknowledgement: SeqNumber::new(0),
                         with_options: false,
                     }),
-                    refusal: Some(Refusal::UnacceptableAck),
+                    refusal: Some(Refusal::UnacceptableAck {
+                        claimed: ack,
+                        expected,
+                    }),
                     peer_closed: false,
                     finished: true,
                     established: false,
@@ -1156,7 +1181,13 @@ impl Connection {
             // attacker reach `update_window` with a window of its own choosing.
             // Both are answered with an acknowledgement of what really was,
             // which is RFC 793's answer and RFC 5961's challenge alike.
-            return Err(self.refuse(Refusal::UnacceptableAck, Some(self.acknowledgement())));
+            return Err(self.refuse(
+                Refusal::UnacceptableAck {
+                    claimed: ack,
+                    expected: self.snd_nxt,
+                },
+                Some(self.acknowledgement()),
+            ));
         }
 
         if ack.follows(self.snd_una) {
