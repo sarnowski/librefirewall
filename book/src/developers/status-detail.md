@@ -709,7 +709,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 12 of the 20 system
+**What the gate proves.** Every scenario whose management port is reachable — 12 of the 24 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -1229,7 +1229,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 20 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 24 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1451,11 +1451,14 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Two of the 20 system scenarios additionally hold the console's own record to the frames and the bytes
+Six of the 24 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
-them rather than tallied in advance — to the frame and to the byte; and one of the two boots a
+them rather than tallied in advance — to the frame and to the byte; and one of them boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
-not satisfy it.
+not satisfy it. Four of the six are the boots whose station misbehaves, and there the same equality
+is the evidence that the node stayed healthy: most of the frames they inject are spent keeping the
+port awake while a channel that never comes up runs out the appliance's attempt count, and a domain
+that faulted or lost its place under that could not report them all.
 
 **Missing.**
 
@@ -1691,8 +1694,31 @@ established one.
   and no protocol above the transport — the session the cryptography domain proves against itself is
   still not carried by anything. That is the layer this dial exists to put underneath.
 - **Nothing retries after the channel is decided.** The attempt count bounds one boot's channel, and
-  a node whose station never answered reports `next-hop-unreachable` and dials no more until it
-  reboots. A channel that reopens itself needs a schedule this domain has no timer to keep.
+  a node whose station never answered reports its outcome and dials no more until it reboots. A
+  channel that reopens itself needs a schedule this domain has no timer to keep.
+- **How it fails is now proved on a booted node**, on four boots of the release image whose station
+  misbehaves in each of the four ways a management server or the link to it can. One answers the
+  resolution and never the connection; one refuses the connection with a reset that acknowledges the
+  `SYN` it received; one answers a `SYN` by acknowledging a number that was never sent — which draws
+  a reset and, per RFC 793's arrival order, leaves the dial standing rather than cancelling it, so
+  that channel too runs out its attempts; and one answers the resolution for an address nothing
+  asked about, which this end does not learn from. The first three end `connection-lost`, each after
+  three sessions, and what tells them apart is the wire the station judged field by field rather
+  than the token. **In every one the node stays healthy**: its routed contract is met in the same boot, its management port reports every frame
+  put on that wire to the byte, and the station holds the appliance to the arithmetic of its own
+  constants — at most three sessions, at most five re-sends of an unanswered `SYN`, at most three
+  requests per resolution — and calls a node past any of them broken.
+- **A channel that fails at the resolution reports the wrong reason, and the fourth boot found it.**
+  Nothing is learned from a reply the appliance did not ask for and no `SYN` ever crosses — both are
+  held on the wire — but the console says `dial-refused` rather than `next-hop-unreachable`. The
+  first session ends correctly and leaves behind the connection its `SYN` was composed on: that
+  segment was dropped for want of an address, so the transport still holds it in `SynSent`, and
+  closing an outbound session releases the session and not the connection under it. The second dial
+  to the same address and port is then refused by this node's own table, the third with it, and the
+  record names the last session's end. An operator is sent to this appliance's transport when what
+  is wrong is that nothing on the link claims the next hop. The scenario asserts what the appliance
+  does; releasing the connection with the session is the fix, and it is a change to the endpoint
+  rather than to the gate.
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
   the management domain outright, so that node has no management port for the boot. The QEMU bench had
   to be told to expose it (`datad/tools/xtask/src/qemu.rs`); every deployment target must have it. There is
@@ -1809,7 +1835,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the 19 QEMU system scenarios assert that record
+one of 25 console cause tokens and parks. Two of the 24 system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -2484,7 +2510,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 28 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (20 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Three scenarios share ONE store medium: the second is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (24 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 12 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Three scenarios share ONE store medium: the second is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

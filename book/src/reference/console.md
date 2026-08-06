@@ -255,10 +255,10 @@ node: an operator holding a silent appliance still has only the external act.
   | Token | What it means |
   |---|---|
   | `answered` | the station answered and both halves closed. The channel works. |
-  | `next-hop-unreachable` | every request for the next hop's hardware address went unanswered, so no frame could be addressed at all — **nothing on this link claims that address**. |
+  | `next-hop-unreachable` | every request for the next hop's hardware address went unanswered, so no frame could be addressed at all — **nothing on this link claims that address**. A link where somebody answers for a *different* address ends a session here too: the appliance learns what it asked about and nothing else. |
   | `no-room-to-resolve` | the neighbour table held only live entries, so the next hop could not even be asked about. |
-  | `dial-refused` | the transport declined the dial: no room in its table, or a connection already on the same four-tuple. |
-  | `connection-lost` | a station claimed the address and the connection then went away — a reset, or the retransmission limit reached with nothing at the far end. Distinct from `next-hop-unreachable` because the two are different things to go and look at. |
+  | `dial-refused` | the transport declined the dial: no room in its table, or a connection already on the same four-tuple. **A channel whose first session ended `next-hop-unreachable` currently reports this**, and it is a defect rather than the meaning of the token: that session leaves behind the connection its unaddressable `SYN` was composed on, so the attempts after it are refused for the four-tuple and the last one is what the record names. What to look at is the link, not this node's table. |
+  | `connection-lost` | a station claimed the address and the connection then went away — a reset it acknowledged, or the retransmission limit reached with nothing at the far end completing the handshake. A station that answers a `SYN` by acknowledging a number that was never sent ends here as well: that draws a reset and leaves the dial standing rather than cancelling it, so the channel runs out its attempts. Distinct from `next-hop-unreachable` because the two are different things to go and look at. |
   | `not-opened` | **this node's own addressing refused it**: no next hop could be chosen for the destination. Nothing a peer does changes it, and what to look at is this appliance's management address, prefix and gateway. |
 
   **No byte of the exchange reaches this record.** What the station said is a payload, and a payload

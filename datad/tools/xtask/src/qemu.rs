@@ -46,6 +46,8 @@ use std::{
     process::Command,
 };
 
+use lfw_log::DialOutcome;
+
 use crate::{
     artifacts::DIST_DISK,
     clock_contract,
@@ -53,7 +55,10 @@ use crate::{
     crypto_contract,
     data_disk::{DataDisk, StoreDisk},
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
-    forward_harness::{self, BootContract, BootTest, Booted, ManagementBacking, Traffic},
+    dial_contract::{self, DialVerdict},
+    forward_harness::{
+        self, BootContract, BootTest, Booted, DialMisbehaviour, ManagementBacking, Traffic,
+    },
     image, management_contract, metrics_contract, probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
@@ -264,15 +269,117 @@ pub(crate) enum DialContract {
     Answered,
     /// The dial must complete: the station sees the resolution, the handshake,
     /// the probe and the close, and the appliance reports the channel on its
-    /// console. One scenario carries it, for the reason every other pairing in
-    /// this table has one — the claim is about the appliance and not about the
-    /// document, so proving it twice would state the same fact twice.
+    /// console as `answered` on its first attempt. One scenario carries it, for
+    /// the reason every other pairing in this table has one — the claim is about
+    /// the appliance and not about the document, so proving it twice would state
+    /// the same fact twice.
     Judged,
+    /// The station misbehaves in the named way, and the appliance must report the
+    /// channel as the one outcome that misbehaviour can produce — while the node
+    /// itself goes on forwarding and its management port goes on counting to the
+    /// byte.
+    ///
+    /// A variant per misbehaviour rather than phases inside one boot: a station
+    /// that changed its mind mid-run would leave a reader working out which half
+    /// of a capture a frame belonged to, and each of the four is a different
+    /// thing for an operator to go and look at.
+    Misbehaves(DialMisbehaviour),
 }
 
 impl DialContract {
-    const fn is_judged(self) -> bool {
-        matches!(self, Self::Judged)
+    /// How the station on the far end of this boot's dial behaves.
+    pub(crate) const fn misbehaviour(self) -> DialMisbehaviour {
+        match self {
+            Self::Answered | Self::Judged => DialMisbehaviour::Answers,
+            Self::Misbehaves(misbehaviour) => misbehaviour,
+        }
+    }
+
+    /// Whether this boot spends frames keeping the port awake while its dial is
+    /// outstanding. Only a boot that judges the channel needs to: everywhere else
+    /// the dial is answered and left unasserted, so a channel that stalls costs
+    /// the run nothing.
+    pub(crate) const fn nudges(self) -> bool {
+        !matches!(self, Self::Answered)
+    }
+
+    /// Whether this boot's station leaves the appliance's `SYN` unanswered, and
+    /// so whether the run must watch the transport spend its whole
+    /// retransmission budget on every session of the channel.
+    ///
+    /// The two modes that do are the silent one and the one whose bogus
+    /// handshake is refused without ending the dial. A reset ends a session at
+    /// once, and a resolution nobody answers never reaches a connection.
+    pub(crate) const fn leaves_the_dial_unanswered(self) -> bool {
+        matches!(
+            self,
+            Self::Misbehaves(
+                DialMisbehaviour::SilentToTheDial | DialMisbehaviour::AcknowledgesTheWrongSequence
+            )
+        )
+    }
+
+    /// What the appliance's own record of the channel must say, where this boot
+    /// reads it.
+    ///
+    /// The one place the four misbehaviours are turned into outcomes, and every
+    /// answer here follows from the appliance's own code rather than from what
+    /// would be convenient. Three of the four end as `connection-lost`, and that
+    /// is not a weakness of the vocabulary but its meaning: a station that says
+    /// nothing, one that refuses, and one that acknowledges what was never sent
+    /// are all a connection that went away, and what tells them apart is the wire
+    /// the station judged frame by frame. The fourth never reaches a connection
+    /// at all, and the token it earns is the wrong one for a reason stated where
+    /// it is chosen.
+    pub(crate) const fn verdict(self) -> Option<DialVerdict> {
+        let (outcome, attempts) = match self {
+            // Nothing is read: the boot does not judge the channel.
+            Self::Answered => return None,
+            // A station that answers is not a misbehaviour, so this pairing
+            // names no outcome. A `None` rather than a panic: the caller refuses
+            // it by name, which turns a table entry that cannot mean anything
+            // into a verdict a reader can act on rather than a crash.
+            Self::Misbehaves(DialMisbehaviour::Answers) => return None,
+            // One session, answered.
+            Self::Judged => (DialOutcome::Answered, 1),
+            // Three sessions, each carried to the end of the transport's own
+            // retransmission budget with nothing at the far end answering.
+            Self::Misbehaves(DialMisbehaviour::SilentToTheDial) => (DialOutcome::ConnectionLost, 3),
+            // Three sessions, each refused by a reset the moment it opened.
+            Self::Misbehaves(DialMisbehaviour::ResetsTheDial) => (DialOutcome::ConnectionLost, 3),
+            // Three sessions again, and for a reason worth stating: the bogus
+            // handshake does NOT end one. It draws a reset and leaves the dial
+            // where it was, so each session runs out the same retransmission
+            // budget the silent station's does and the channel ends the same way.
+            // A single segment naming a number nobody sent cannot cancel a dial,
+            // and this is the outcome that follows from it.
+            Self::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence) => {
+                (DialOutcome::ConnectionLost, 3)
+            }
+            // Three sessions, none of which reached a connection: the neighbour
+            // cache asked, was answered by somebody else, gave up, and no `SYN`
+            // ever crossed the wire — which is the claim, and the station is
+            // what holds it.
+            //
+            // The token is NOT the one that claim deserves, and asserting the
+            // one it deserves would be asserting something this appliance does
+            // not do. The first session ends `next-hop-unreachable`, correctly.
+            // It leaves behind the connection its `SYN` was composed on — that
+            // segment was dropped for want of an address, so the transport still
+            // holds it in `SynSent` and will for its whole retransmission budget
+            // — and closing the session releases the session alone. So the
+            // second dial to the same peer and port is refused by this node's
+            // own table, the third with it, and the record an operator reads
+            // names the *last* session's end. A channel that failed because
+            // nothing on the link claims the next hop is reported as one this
+            // node's transport declined, which sends an operator to the wrong
+            // place. It is stated here as what happens rather than as what
+            // should, and named in the status pages as the defect it is.
+            Self::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress) => {
+                (DialOutcome::DialRefused, 3)
+            }
+        };
+        Some(DialVerdict { outcome, attempts })
     }
 }
 
@@ -455,6 +562,23 @@ pub(crate) enum Console {
     /// to the one whose medium it inherited after the run, and nothing else is
     /// re-proved.
     JudgedOnTheStoredIdentityAlone,
+    /// **The channel the appliance dialled, and the port's own count beside it.**
+    ///
+    /// The narrow shape again, for the four boots whose subject is a management
+    /// station that misbehaves. The transcript, the clock, the hardware probe and
+    /// the cryptography domain are facts about the image that other boots state,
+    /// and re-stating them on four more would pay four whole boots for a second
+    /// reading of the same fact.
+    ///
+    /// The port's count is not a fifth such fact and is here on purpose: it is
+    /// the evidence that the node stayed healthy while its channel failed. The
+    /// appliance must report every frame the harness put on that wire, to the
+    /// frame and to the byte — and on the two boots whose station leaves a `SYN`
+    /// unanswered that is hundreds of frames, spent carrying a channel that never
+    /// comes up, so a domain that faulted, stalled or lost its place under one
+    /// cannot satisfy it. Beside it the boot's own routed contract says the
+    /// dataplane went on forwarding throughout.
+    JudgedOnTheDialledChannelAndThePortsCount,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -1066,6 +1190,87 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // on.
         store: StoreMedium::ResetRequestedOn("store-identity-minted"),
     },
+    // The four boots whose subject is a management station that MISBEHAVES, and
+    // the only ones in this table where the appliance's own channel is required
+    // to fail.
+    //
+    // Every other boot answers that dial correctly, so what the gate held was
+    // that a channel comes up when the far end is well behaved. That leaves the
+    // interesting half unstated: an appliance dialling out of the port that faces
+    // the management-plane attacker meets a station that says nothing, one that
+    // refuses, one that lies about what it received, and a link that answers for
+    // somebody else — and each of those has exactly one right outcome.
+    //
+    // TWO THINGS HOLD ON EACH, and the second matters more than the first. The
+    // appliance reports the typed outcome for what happened, after the number of
+    // sessions its own bound allows. And THE NODE STAYS HEALTHY: its routed
+    // contract is met in the same boot, so the dataplane went on forwarding
+    // throughout; its management port reports every frame the harness put on that
+    // wire to the byte, so the domain that owns the failing channel neither
+    // faulted nor lost its place; and no bound of either end is exceeded — the
+    // station counts the resolutions, the SYNs and the resets it sees against the
+    // arithmetic of the appliance's own constants and calls a node that exceeds
+    // them broken.
+    //
+    // One boot per misbehaviour rather than phases inside one. The boots are the
+    // gate's unit of evidence, a station that changed its mind mid-run would leave
+    // a reader deciding which half of a capture a frame belonged to, and a failure
+    // in one of the four would be unattributable.
+    //
+    // Socket-backed necessarily: the whole of the evidence is frames the harness
+    // composes and judges field by field, and QEMU's user-mode stack would answer
+    // the dial itself.
+    Scenario {
+        name: "dial-unanswered",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Misbehaves(DialMisbehaviour::SilentToTheDial),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    Scenario {
+        name: "dial-reset",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Misbehaves(DialMisbehaviour::ResetsTheDial),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    Scenario {
+        name: "dial-misacknowledged",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    // And the one that found a defect rather than confirming a design. Nothing
+    // is learned from the wrong sender and no `SYN` ever crosses — the station
+    // holds both — but the appliance reports the channel as `dial-refused`
+    // rather than as the next hop being unreachable, because the session that
+    // ended correctly left its connection in the transport's table and the two
+    // after it were refused for the 4-tuple. The scenario states what happens;
+    // the status pages state that it is wrong and why.
+    Scenario {
+        name: "dial-unresolvable",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -1359,7 +1564,12 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         Console::JudgedOnTheStoredIdentityAlone => {
             return run_store_scenario(root, scenario, run, &disk, &topology);
         }
-        Console::Ignored | Console::Judged => {}
+        // The dial-misbehaviour boots run the ordinary path: their routed
+        // contract is half of what they prove, so they are boots of the same
+        // shape as every other station-backed one and differ in what the console
+        // is read for afterwards.
+        Console::Ignored | Console::Judged | Console::JudgedOnTheDialledChannelAndThePortsCount => {
+        }
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -1494,6 +1704,19 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         | Console::JudgedOnARefusal
         | Console::JudgedOnCryptographyAlone
         | Console::JudgedOnTheStoredIdentityAlone => String::new(),
+        Console::JudgedOnTheDialledChannelAndThePortsCount => {
+            // The appliance's own account of the channel, held to the one
+            // outcome this boot's station can produce.
+            let dial = judge_dial(scenario, &booted, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            // And the evidence that the node stayed healthy under it: every
+            // frame the harness put on that wire, reported to the byte, over a
+            // boot in which most of them were spent carrying a channel that
+            // never came up.
+            let management = management_contract::judge(&booted.serial, &log, booted.management)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {dial}; {management}")
+        }
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1522,12 +1745,27 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             // report to the frame and to the byte.
             let management = management_contract::judge(&booted.serial, &log, booted.management)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            // Last, over every channel at once: the field the other four do
-            // not judge, on the records they do not name.
+            // And the record whose content the build knows because it decided
+            // how the station on the far end of the dial would behave — where
+            // this boot's dial contract states one. A boot that answers the dial
+            // and requires nothing of it has no outcome to hold the record to,
+            // and reads none: its subject is the document rather than the
+            // channel, and the appliance's own addressing decides what a channel
+            // to a first-party constant does under a second document.
+            let dial = match scenario.dial.verdict() {
+                None => String::new(),
+                Some(_) => format!(
+                    "; {}",
+                    judge_dial(scenario, &booted, &log)
+                        .map_err(|error| format!("scenario {name}: {error}"))?
+                ),
+            };
+            // Last, over every channel at once: the field the others do not
+            // judge, on the records they do not name.
             let stamps = stamp_contract::judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!(
-                "; {}; {clock}; {probe}; {crypto}; {management}; {stamps}",
+                "; {}; {clock}; {probe}; {crypto}; {management}{dial}; {stamps}",
                 contract.summary()
             )
         }
@@ -1543,6 +1781,31 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         store_identity: None,
         accelerated: booted.hardware_accelerated,
     })
+}
+
+/// Hold the appliance's record of its dialled channel to what this scenario's
+/// station did, where the scenario reads it.
+///
+/// A scenario whose dial contract states no verdict has nothing to judge, and
+/// saying so is not the same as passing: the two arms that call this both choose
+/// a contract that states one, so a `None` here is a table entry that pairs a
+/// console variant with a dial nobody decided.
+fn judge_dial(scenario: &Scenario, booted: &Booted, log: &Path) -> Result<String, String> {
+    let Some(owed) = scenario.dial.verdict() else {
+        return Err(String::from(
+            "this scenario reads the appliance's record of its dialled channel and its dial \
+             contract requires nothing of one, so there is no outcome to hold the record to",
+        ));
+    };
+    dial_contract::judge(
+        &booted.serial,
+        log,
+        owed,
+        (
+            forward_harness::DIAL_DESTINATION,
+            forward_harness::DIAL_PORT,
+        ),
+    )
 }
 
 /// Boot one scenario on the **emulator** and judge the cryptography domain,
@@ -2082,7 +2345,7 @@ fn boot(
             log_header: &header,
             topology,
             traffic,
-            dial_judged: dial.is_judged(),
+            dial,
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;

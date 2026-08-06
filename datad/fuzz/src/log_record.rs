@@ -1280,6 +1280,27 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The dialled channel, which reads all four words and ranges three
+            // of them — a token, an address that is thirty-two bits wide, and a
+            // port that is sixteen. Committed in the accepted shape for the two
+            // details above's reason and one of its own: every refusal it can
+            // earn is a word *outside* a range, and a uniform draw over `u64`
+            // lands outside all three of them essentially always — so a cold run
+            // reaches the refusals at once and the accepted shape, which is the
+            // one the render path walks, effectively never.
+            (
+                "valid_domain_dialled",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIALLED,
+                    operands: [
+                        u64::from(LOG_DIAL_OUTCOME_COUNT - 1),
+                        u64::from(u32::from_be_bytes([10, 0, 2, 2])),
+                        4433,
+                        3,
+                    ],
+                    ..domain_record()
+                }),
+            ),
             // The delegation detail, which reads the first three words and leaves
             // the fourth unclaimed. Committed because it is the one detail whose
             // *fourth* word is deliberately not a flag: a seed here is what keeps
@@ -1492,6 +1513,30 @@ mod tests {
         assert_eq!(
             record_from_region(&seed("identity_flag_not_boolean")).check(),
             Err(LogRecordError::OperandFlagNotBoolean { value: 2 })
+        );
+    }
+
+    /// The dialled channel's accepted shape reaches the decode, and the token it
+    /// carries is the last one the vocabulary admits.
+    ///
+    /// Both halves are the seed's reason for existing. Every refusal this detail
+    /// can earn is a word *outside* a range, so a uniform draw lands on one at
+    /// once and on the accepted shape essentially never — and the token being the
+    /// last admissible one puts the seed exactly where a check written with `>`
+    /// instead of `>=` would wrongly refuse it.
+    #[test]
+    fn the_dialled_channels_accepted_shape_stands_at_its_vocabularys_last_token() {
+        let record = record_from_region(&seed("valid_domain_dialled"));
+        assert_eq!(record.operands[0], u64::from(LOG_DIAL_OUTCOME_COUNT - 1));
+        record.check().expect("every word is inside its range");
+
+        let mut past = record;
+        past.operands[0] = u64::from(LOG_DIAL_OUTCOME_COUNT);
+        assert_eq!(
+            past.check(),
+            Err(LogRecordError::DialOutcomeUnknown {
+                outcome: u64::from(LOG_DIAL_OUTCOME_COUNT),
+            })
         );
     }
 

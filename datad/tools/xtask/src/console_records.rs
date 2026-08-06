@@ -53,10 +53,28 @@ pub(crate) fn lifecycle_records(text: &str) -> Vec<&str> {
 }
 
 /// Every record in `text` on the channel `prefix` names, in emission order.
+///
+/// A capture that does not end in a line break was cut through the record the
+/// guest was still writing, and that last fragment is dropped. The run ends by
+/// killing QEMU, so the cut is the harness's own doing rather than anything the
+/// appliance did — and a fragment read as a record is a field carrying half a
+/// value, which a contract reports as a malformed number on a record the
+/// appliance in fact wrote correctly. Exactly one record is dropped and only at
+/// the very end: every record the guest finished is followed by a line break, and
+/// a complete one sharing that last line stays.
 pub(crate) fn records_on<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
-    text.lines()
+    let mut records: Vec<&'a str> = text
+        .lines()
         .flat_map(|line| records_in_line(line, prefix))
-        .collect()
+        .collect();
+    let cut_short = !text.ends_with('\n')
+        && records
+            .last()
+            .is_some_and(|last| text.trim_end().ends_with(last));
+    if cut_short {
+        records.pop();
+    }
+    records
 }
 
 /// The records one captured line carries, in the order they were written: each
@@ -121,16 +139,22 @@ mod tests {
 
     const READY: &str = "LFW-PD domain=clock state=ready tsc-hz=42";
 
+    /// A capture as one arrives: every record the guest finished is followed by
+    /// a line break, so a fixture that stands for one carries it.
+    fn captured(records: &str) -> String {
+        format!("{records}\r\n")
+    }
+
     #[test]
     fn a_record_that_owns_its_line_is_recovered() {
-        assert_eq!(records_on(READY, LIFECYCLE_PREFIX), [READY]);
+        assert_eq!(records_on(&captured(READY), LIFECYCLE_PREFIX), [READY]);
     }
 
     /// The obligation the debug kernel's own output makes real: a record
     /// preceded on its line by prose is still a record.
     #[test]
     fn a_record_that_did_not_begin_its_line_is_still_recovered() {
-        let torn = format!("Bootstrapping node #0{READY}");
+        let torn = captured(&format!("Bootstrapping node #0{READY}"));
         assert_eq!(records_on(&torn, LIFECYCLE_PREFIX), [READY]);
     }
 
@@ -138,14 +162,37 @@ mod tests {
     /// port between two of them produces.
     #[test]
     fn every_record_on_one_line_is_recovered_in_order() {
-        let line = "LFW-PD domain=config state=starting LFW-PD domain=clock state=starting";
+        let line =
+            captured("LFW-PD domain=config state=starting LFW-PD domain=clock state=starting");
         assert_eq!(
-            records_on(line, LIFECYCLE_PREFIX),
+            records_on(&line, LIFECYCLE_PREFIX),
             [
                 "LFW-PD domain=config state=starting",
                 "LFW-PD domain=clock state=starting"
             ]
         );
+    }
+
+    /// The run ends by killing QEMU, so a capture may stop in the middle of the
+    /// record the guest was writing. That fragment carries a field with half a
+    /// value in it and is not a record the appliance emitted, so it is dropped —
+    /// and exactly it: a complete record sharing that last line stays, and one
+    /// on a later line of a capture that *did* end cleanly is never touched.
+    #[test]
+    fn a_record_the_capture_was_cut_through_is_not_read_as_one() {
+        let cut = format!(
+            "{}LFW-PD domain=management state=ready frames=873 bytes=",
+            captured(READY)
+        );
+        assert_eq!(records_on(&cut, LIFECYCLE_PREFIX), [READY]);
+
+        // The fragment shares its line with a record that finished, and that
+        // one is still a record.
+        let shared = format!("{READY} LFW-PD domain=management state=ready frames=873 bytes=");
+        assert_eq!(records_on(&shared, LIFECYCLE_PREFIX), [READY]);
+
+        // A capture that ended cleanly loses nothing, however it ends.
+        assert_eq!(records_on(&captured(READY), LIFECYCLE_PREFIX), [READY]);
     }
 
     /// The prefix is what separates the channels, and it separates them within a

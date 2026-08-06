@@ -78,6 +78,7 @@ mod crypto_contract;
 mod crypto_profile;
 mod data_disk;
 mod diagnose;
+mod dial_contract;
 mod disk;
 mod evidence;
 mod forward_harness;
