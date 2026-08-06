@@ -83,6 +83,7 @@ use lfw_log::{Cause, Event, MAX_LINE_LEN, Stamp, render};
 use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
+    LOG_ONBOARD_END_COUNT,
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
     LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
     LogRecord, LogRecordError, LogText, TextImage, ValueImage,
@@ -136,7 +137,8 @@ const DETAIL_DIAL_ROUTE: u8 = 21;
 const DETAIL_DIAL_UNLEARNED: u8 = 22;
 const DETAIL_DIAL_SEGMENTS: u8 = 23;
 const DETAIL_DIAL_SEQUENCE: u8 = 24;
-const DETAIL_COUNT: u8 = 25;
+const DETAIL_ONBOARDED: u8 = 25;
+const DETAIL_COUNT: u8 = 26;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -569,7 +571,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
                 | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
                 | DETAIL_DELEGATED | DETAIL_DIALLED | DETAIL_DIAL_ROUTE
-                | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE => {
+                | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE
+                | DETAIL_ONBOARDED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -790,6 +793,15 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
                     },
                 )
             }),
+        // The onboarding detail reads four words and ranges one: a token naming
+        // how the session ended. The three counts behind it are unranged —
+        // every bit pattern of each is a tally the emitting domain could have
+        // kept.
+        DETAIL_ONBOARDED => (record.operands[0] >= u64::from(LOG_ONBOARD_END_COUNT)).then_some(
+            LogRecordError::OnboardEndUnknown {
+                end: record.operands[0],
+            },
+        ),
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the

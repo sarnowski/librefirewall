@@ -196,13 +196,26 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 let on_onboarding = deliver(&mut onboarding, now, source, &bytes);
                 assert!(
                     !(refused_the_port(on_management) && refused_the_port(on_onboarding)),
-                    "a segment was refused by both ports, so it named neither"
+                    "a segment was refused by both ports for naming neither of them, \
+                     which no destination port can earn"
                 );
+                // At most one may take it: a segment names one destination. The
+                // other side of that is *not* that one must take it — a segment
+                // neither port can even parse is refused by both, for the same
+                // reason and before either could read a port out of it, and
+                // that is the commonest shape arbitrary bytes have.
                 assert!(
-                    refused_the_port(on_management) || refused_the_port(on_onboarding),
+                    !(took_it(on_management) && took_it(on_onboarding)),
                     "a segment was taken by both ports, so one of them served a \
                      destination that is not its own"
                 );
+                if took_it(on_management) || took_it(on_onboarding) {
+                    assert!(
+                        refused_the_port(on_management) || refused_the_port(on_onboarding),
+                        "one port took a segment the other refused for a reason \
+                         other than the destination it named"
+                    );
+                }
                 deliver(&mut established, now, source, &bytes);
                 deliver(&mut dialling, now, source, &bytes);
                 segments += 1;
@@ -417,6 +430,12 @@ fn on_port(port: u16, secret: IsnSecret) -> TcpStack<CONNECTIONS> {
 /// else's.
 const fn refused_the_port(outcome: Outcome) -> bool {
     matches!(outcome, Outcome::Rejected(Rejection::NotListening { .. }))
+}
+
+/// Whether a stack acted on the segment at all, which is what at most one of
+/// two ports may do with the same bytes.
+const fn took_it(outcome: Outcome) -> bool {
+    matches!(outcome, Outcome::Accepted | Outcome::Advanced)
 }
 
 /// A stack with one connection already established, so the synchronized paths are
