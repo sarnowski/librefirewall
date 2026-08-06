@@ -226,9 +226,54 @@ struct Bench {
     accelerator: Accelerator,
     management: ManagementBacking,
     traffic: Traffic,
+    /// Whether this boot holds the appliance to the channel it dials out.
+    dial: DialContract,
     /// Which store medium this boot attaches: a fresh one, or the one an earlier
     /// boot of the same run minted an identity on — reset or not.
     store: StoreMedium,
+}
+
+/// What a routed boot puts on its wires, as one value rather than four
+/// adjacent arguments: how the management port is attached, which probes go out,
+/// whether the appliance's own dial is judged, and which store medium it
+/// attaches. A [`Bench`] without the accelerator, which a routed boot does not
+/// choose — the routed contract is a statement about the image, so every boot of
+/// it takes whatever the machine offers.
+pub(crate) struct ForwardBench {
+    pub(crate) management: ManagementBacking,
+    pub(crate) traffic: Traffic,
+    pub(crate) dial: DialContract,
+    pub(crate) store: StoreMedium,
+}
+
+/// Whether a boot judges the connection the appliance *originates* out of its
+/// management port.
+///
+/// Its own field rather than a property of the management role, because the two
+/// answer different questions and only one of them is decidable from the wire:
+/// a socket-backed boot always answers the dial — a station on a link answers
+/// for its own address whoever asks — and whether the exchange must *complete*
+/// depends on the document the image under test was built from. The appliance
+/// dials a first-party constant, so an image whose management prefix does not
+/// contain it reaches the station and is right to refuse what it says back, its
+/// own addressing rules putting that address off-link.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialContract {
+    /// The dial is answered and nothing is required of it. Every scenario whose
+    /// subject is something else takes this.
+    Answered,
+    /// The dial must complete: the station sees the resolution, the handshake,
+    /// the probe and the close, and the appliance reports the channel on its
+    /// console. One scenario carries it, for the reason every other pairing in
+    /// this table has one — the claim is about the appliance and not about the
+    /// document, so proving it twice would state the same fact twice.
+    Judged,
+}
+
+impl DialContract {
+    const fn is_judged(self) -> bool {
+        matches!(self, Self::Judged)
+    }
 }
 
 /// Which store medium a boot attaches at 00:06.0 — the appliance's own.
@@ -427,6 +472,9 @@ pub(crate) struct Scenario {
     management: ManagementRole,
     /// Which probe set this boot injects into the two dataplane ports.
     traffic: Traffic,
+    /// Whether this boot holds the appliance to the channel it dials out of its
+    /// management port.
+    dial: DialContract,
     /// Which accelerator QEMU must use. All but one scenario take whatever the
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
@@ -518,6 +566,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -528,6 +577,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Judged,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Judged,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -538,6 +588,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Judged,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -552,6 +603,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -574,6 +626,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -593,6 +646,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -615,6 +669,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -625,6 +680,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -652,6 +708,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -662,6 +719,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -718,6 +776,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Reconfiguration,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -756,6 +815,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Revocation,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -788,6 +848,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Related,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -798,6 +859,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Lifecycle,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -839,6 +901,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::Ignored,
         management: ManagementRole::Client,
         traffic: Traffic::Flood,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -876,6 +939,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::JudgedOnARefusal,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -916,6 +980,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // the same shape as the one it repeats rather than an idle guest, and no
         // delivery is required of it.
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::Emulated,
         store: StoreMedium::Fresh,
     },
@@ -953,6 +1018,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // The shipped probe set, injected and left unjudged, so the boot keeps the
         // shape of the ones it repeats rather than being an idle guest.
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -963,6 +1029,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::JudgedOnTheStoredIdentityAlone,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the boot above minted on. It must precede this one in this
         // table, and `StoreDisk::carried` says so by name when it does not.
@@ -991,6 +1058,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         console: Console::JudgedOnTheStoredIdentityAlone,
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
+        dial: DialContract::Answered,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the two boots above ran on, which by here carries an
         // identity that has already been shown to survive a reboot — so what this
@@ -1308,9 +1376,12 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         &disk,
         &log_name,
         &topology,
-        backing,
-        scenario.traffic,
-        scenario.store,
+        ForwardBench {
+            management: backing,
+            traffic: scenario.traffic,
+            dial: scenario.dial,
+            store: scenario.store,
+        },
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
 
@@ -1517,6 +1588,7 @@ fn run_cryptography_scenario(
             accelerator: scenario.accelerator,
             management: ManagementBacking::Socket,
             traffic: scenario.traffic,
+            dial: scenario.dial,
             store: scenario.store,
         },
     )
@@ -1566,6 +1638,7 @@ fn run_store_scenario(
             accelerator: scenario.accelerator,
             management: ManagementBacking::Socket,
             traffic: scenario.traffic,
+            dial: scenario.dial,
             store: scenario.store,
         },
     )
@@ -1642,10 +1715,14 @@ pub(crate) fn boot_and_forward(
     disk: &Path,
     log_name: &str,
     topology: &Topology,
-    management: ManagementBacking,
-    traffic: Traffic,
-    store: StoreMedium,
+    bench: ForwardBench,
 ) -> Result<Booted, String> {
+    let ForwardBench {
+        management,
+        traffic,
+        dial,
+        store,
+    } = bench;
     boot(
         root,
         disk,
@@ -1659,6 +1736,7 @@ pub(crate) fn boot_and_forward(
             accelerator: Accelerator::WhateverTheMachineOffers,
             management,
             traffic,
+            dial,
             store,
         },
     )
@@ -1871,6 +1949,7 @@ pub(crate) fn boot_and_fail_closed(
             // mismatch. This document's addressing is the shipped one to the
             // byte, for exactly that.
             traffic: Traffic::Routed,
+            dial: DialContract::Answered,
             store,
         },
     )
@@ -1901,6 +1980,7 @@ pub(crate) fn boot_and_halt(
             // the one thing it does decide — the frames put on the wire — the
             // same as every other halt scenario's.
             traffic: Traffic::Routed,
+            dial: DialContract::Answered,
             store: StoreMedium::Fresh,
         },
     )
@@ -1918,6 +1998,7 @@ fn boot(
         accelerator,
         management,
         traffic,
+        dial,
         store,
     } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
@@ -2001,6 +2082,7 @@ fn boot(
             log_header: &header,
             topology,
             traffic,
+            dial_judged: dial.is_judged(),
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;

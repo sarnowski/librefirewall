@@ -82,10 +82,10 @@ use arbitrary::{Arbitrary as _, Unstructured};
 use lfw_log::{Cause, Event, MAX_LINE_LEN, Stamp, render};
 use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
-    LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
-    LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_OBJECT_KIND_COUNT,
-    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LogRecord, LogRecordError, LogText, TextImage,
-    ValueImage,
+    LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
+    LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
+    LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LogRecord, LogRecordError,
+    LogText, TextImage, ValueImage,
 };
 
 /// Bytes one record occupies, and so what one corpus entry is.
@@ -130,7 +130,8 @@ const DETAIL_IDENTITY: u8 = 16;
 const DETAIL_FINGERPRINT: u8 = 17;
 const DETAIL_RESET: u8 = 18;
 const DETAIL_DELEGATED: u8 = 19;
-const DETAIL_COUNT: u8 = 20;
+const DETAIL_DIALLED: u8 = 20;
+const DETAIL_COUNT: u8 = 21;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -561,8 +562,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // place and refused separately below.
                 DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
                 | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
-                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT
-                | DETAIL_RESET | DETAIL_DELEGATED => {
+                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
+                | DETAIL_DELEGATED | DETAIL_DIALLED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -746,6 +747,24 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         .then_some(LogRecordError::PrimitiveUnknown {
             primitive: record.operands[0],
         }),
+        // The dial detail reads four words and ranges three of them: a token
+        // naming an outcome, an address that is thirty-two bits wide wherever
+        // IPv4 names one, and a port that is sixteen. Restated here in the order
+        // the ABI reads them, so the first refusal a record earns is the one
+        // this harness expects. The attempt count is unranged: every bit pattern
+        // of it is a tally this end could have kept.
+        DETAIL_DIALLED => (record.operands[0] >= u64::from(LOG_DIAL_OUTCOME_COUNT))
+            .then_some(LogRecordError::DialOutcomeUnknown {
+                outcome: record.operands[0],
+            })
+            .or_else(|| {
+                (record.operands[1] > u64::from(u32::MAX)).then_some(
+                    LogRecordError::AddressTooWide {
+                        value: record.operands[1],
+                    },
+                )
+            })
+            .or_else(|| wide_code_point(record.operands[2])),
         // The instant is unranged on purpose: every `u64` of nanoseconds names
         // a civil time, so the frequency is the whole of what this detail can
         // be refused for.

@@ -263,6 +263,22 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " delegated-device={device:032x} delegated-signatures={signatures}"
         ),
+        // Where this appliance reached out to and how it got on, as four fields
+        // an operator reads in one direction: the place, the port, how many
+        // attempts it took, and the outcome of the last of them. The destination
+        // is spelled as an address rather than as the word that carries it, so a
+        // line here and the configuration document's own `gateway=` compare as
+        // one string against another.
+        DomainDetail::Dialled {
+            destination,
+            port,
+            attempts,
+            outcome,
+        } => write!(
+            cursor,
+            " dial-destination={destination} dial-port={port} dial-attempts={attempts} \
+             dial-outcome={outcome}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -320,7 +336,8 @@ mod tests {
     use crate::detail::{Cause, MAX_CAUSE_LEN};
     use crate::event::Primitive;
     use crate::event::{
-        ChangeKind, Domain, DomainState, Field, GenerationOutcome, ObjectKind, RejectReason, Value,
+        ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, ObjectKind,
+        RejectReason, Value,
     };
     use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
     use net_headers::{Ipv4Address, MacAddress};
@@ -692,6 +709,48 @@ mod tests {
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
              delegated-device=ffffffffffffffffffffffffffffffff \
              delegated-signatures=18446744073709551615"
+        );
+    }
+
+    /// The record the management port makes about the channel it dialled: where
+    /// it went, what it cost, and how it ended — one line whichever way it went.
+    #[test]
+    fn a_management_domain_renders_where_it_dialled_and_how_that_ended() {
+        let dialled = |octets: [u8; 4], port, attempts, outcome| {
+            rendered(&Event::Domain {
+                domain: Domain::Management,
+                state: DomainState::Ready,
+                detail: DomainDetail::Dialled {
+                    destination: Ipv4Address::from_octets(octets),
+                    port,
+                    attempts,
+                    outcome,
+                },
+            })
+        };
+        assert_eq!(
+            dialled([10, 0, 2, 2], 4433, 1, DialOutcome::Answered),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-destination=10.0.2.2 dial-port=4433 dial-attempts=1 dial-outcome=answered"
+        );
+        // The failure a station that never answered for the next hop leaves, and
+        // the widest values the fields can hold.
+        assert_eq!(
+            dialled([10, 0, 2, 2], 4433, 3, DialOutcome::NextHopUnreachable),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-destination=10.0.2.2 dial-port=4433 dial-attempts=3 \
+             dial-outcome=next-hop-unreachable"
+        );
+        assert_eq!(
+            dialled(
+                [255, 255, 255, 255],
+                u16::MAX,
+                u64::MAX,
+                DialOutcome::ConnectionLost
+            ),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
+             dial-destination=255.255.255.255 dial-port=65535 \
+             dial-attempts=18446744073709551615 dial-outcome=connection-lost"
         );
     }
 
@@ -1135,6 +1194,12 @@ mod tests {
                 onboarded: true,
             },
             DomainDetail::Fingerprint([0xff; 32]),
+            DomainDetail::Dialled {
+                destination: Ipv4Address::from_octets([255, 255, 255, 255]),
+                port: u16::MAX,
+                attempts: u64::MAX,
+                outcome: DialOutcome::NextHopUnreachable,
+            },
             DomainDetail::Reset {
                 generation: u64::MAX,
                 documents: u64::MAX,
@@ -1231,6 +1296,14 @@ mod tests {
                     was_owned,
                 }
             }),
+            (any::<([u8; 4], u16, u64)>(), (0..DialOutcome::ALL.len()),).prop_map(
+                |((octets, port, attempts), outcome)| DomainDetail::Dialled {
+                    destination: Ipv4Address::from_octets(octets),
+                    port,
+                    attempts,
+                    outcome: DialOutcome::ALL[outcome],
+                }
+            ),
             any::<(u128, u64)>()
                 .prop_map(|(device, signatures)| DomainDetail::Delegated { device, signatures }),
             (

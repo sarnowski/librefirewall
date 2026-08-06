@@ -81,6 +81,33 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// How a connection this appliance *originated* finished. A mirror of
+    /// `lfw_ip_endpoint::outbound::Ended`, held to it by the one call site that
+    /// maps the two, and here for the reason [`Primitive`] is: a console
+    /// vocabulary lives where the console's own tokens live, and this crate
+    /// reaches for no transport.
+    ///
+    /// Every variant is terminal, and each names a different thing to go and look
+    /// at: nothing on the link claims the next hop, as against a station that
+    /// claimed it and then refused the connection. The order is the wire
+    /// encoding, so a variant is appended and never inserted.
+    DialOutcome {
+        Answered => "answered",
+        NextHopUnreachable => "next-hop-unreachable",
+        NoRoomToResolve => "no-room-to-resolve",
+        DialRefused => "dial-refused",
+        ConnectionLost => "connection-lost",
+        /// This end refused the open before a frame was composed: no next hop
+        /// could be chosen for the destination, a session was already running,
+        /// or the probe was longer than the room for one. One token for the
+        /// three because they share an operator's answer — the record names the
+        /// destination, and what is wrong is this node's own addressing rather
+        /// than anything a peer did.
+        NotOpened => "not-opened",
+    }
+}
+
+closed_vocabulary! {
     /// The lifecycle points a domain reports. `Negotiated` sits between the
     /// other two because a device that answered and a device whose queues are
     /// primed are different failures to be looking at: one is a bring-up
@@ -400,6 +427,7 @@ mod tests {
         check_vocabulary!(Field);
         check_vocabulary!(GenerationOutcome);
         check_vocabulary!(RejectReason);
+        check_vocabulary!(DialOutcome);
     }
 
     #[test]

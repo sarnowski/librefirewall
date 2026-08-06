@@ -758,7 +758,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 9] = [
+    let cases: [(LogRecord, LogRecordError); 11] = [
         (
             LogRecord {
                 kind: 4,
@@ -775,10 +775,34 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 20,
+                detail: 21,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 20 },
+            LogRecordError::DetailKindUnknown { detail: 21 },
+        ),
+        // The dial's own token word, on the primitive's terms: an outcome past
+        // the set names nothing a console line can spell.
+        (
+            LogRecord {
+                detail: LogDetailKind::Dialled.to_bits(),
+                operands: [u64::from(LOG_DIAL_OUTCOME_COUNT), 0, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::DialOutcomeUnknown {
+                outcome: u64::from(LOG_DIAL_OUTCOME_COUNT),
+            },
+        ),
+        // And its address word, which is thirty-two bits wide wherever IPv4
+        // names one: a wider word would render as a different address.
+        (
+            LogRecord {
+                detail: LogDetailKind::Dialled.to_bits(),
+                operands: [0, u64::from(u32::MAX) + 1, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::AddressTooWide {
+                value: u64::from(u32::MAX) + 1,
+            },
         ),
         // The one operand word that is a token: a primitive past the set names
         // nothing a console line can spell, so it is refused rather than
@@ -1032,6 +1056,8 @@ fn every_refusal_names_the_field_and_the_value() {
         LogRecordError::DomainUnknown { domain: 4 },
         LogRecordError::DomainStateUnknown { state: 4 },
         LogRecordError::DetailKindUnknown { detail: 7 },
+        LogRecordError::DialOutcomeUnknown { outcome: 9 },
+        LogRecordError::AddressTooWide { value: u64::MAX },
         LogRecordError::ClockFrequencyZero,
         LogRecordError::OperandCountUnknown { operands: 3 },
         LogRecordError::SignalledNotBoolean { signalled: 2 },
@@ -1073,6 +1099,8 @@ fn every_refusal_names_the_field_and_the_value() {
             "domain token 4 is not below 10",
             "state token 4 is not below 4",
             "detail kind 7 names no payload",
+            "dial outcome token 9 is not below 6",
+            "address word 18446744073709551615 does not fit thirty-two bits",
             "the established counter frequency is zero, which scales no reading",
             "operand count 3 exceeds the 2 a refusal may name",
             "signalled byte 2 is not 0 or 1",
@@ -1126,10 +1154,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::Fingerprint,
         LogDetailKind::Reset,
         LogDetailKind::Delegated,
+        LogDetailKind::Dialled,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(20), None);
+    assert_eq!(LogDetailKind::from_bits(21), None);
 
     for value in [
         LogValueKind::Absent,

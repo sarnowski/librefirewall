@@ -34,20 +34,22 @@ use crate::catalog::{
     HARDWARE_PROBE_PREEMPTIONS, HARDWARE_PROBE_PROVEN, HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN,
     HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS, HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED,
     HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
-    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, POLICY_BYTES,
-    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
-    POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
-    RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
-    RECORDING_RECORDS_DROPPED, RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN,
-    RECORDING_SEGMENTS_CLOSED, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
-    RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
-    RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
-    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET,
-    STORE_SIGN_REFUSALS, STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST,
-    TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED,
-    TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED,
-    TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES,
-    UART_TRANSMITTER_TIMEOUTS, plain, s,
+    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label,
+    NEIGHBOUR_ENTRIES_EXPIRED, NEIGHBOUR_REPLIES, NEIGHBOUR_REQUESTS, NEIGHBOUR_RESOLUTIONS_FAILED,
+    OUTBOUND_ANSWER_OVERFLOWED, OUTBOUND_BYTES, OUTBOUND_DIALS, OUTBOUND_SEGMENTS_DROPPED,
+    OUTBOUND_SESSIONS, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS,
+    POLICY_SWEEP_RUNNING, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
+    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
+    RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
+    RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
+    RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
+    RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
+    RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, STORE_GENERATION,
+    STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET, STORE_SIGN_REFUSALS,
+    STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES,
+    TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS,
+    TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES,
+    TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 use crate::rules::MAX_RULE_SERIES;
 
@@ -1117,9 +1119,35 @@ pub struct HttpSample {
     pub slots_exhausted: u64,
 }
 
+/// What the neighbour cache under an endpoint has decided, one field per
+/// decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NeighbourSample {
+    pub requested: u64,
+    /// Replies read, in the order the label values are declared: learned,
+    /// unsolicited, rebinding refused, sender not unicast.
+    pub replies: [u64; 4],
+    pub expired: u64,
+    /// Resolutions that failed, as abandoned and no-room.
+    pub failed: [u64; 2],
+}
+
+/// What the outbound half of an endpoint has done, one field per decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutboundSample {
+    /// Sessions, in the order the label values are declared: opened, refused,
+    /// answered, failed.
+    pub sessions: [u64; 4],
+    pub dialled: u64,
+    pub dropped_unresolved: u64,
+    /// Request bytes handed to the transport, and answer bytes kept.
+    pub bytes: [u64; 2],
+    pub answer_overflowed: u64,
+}
+
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 86;
+pub const MANAGEMENT_SLOTS: usize = 103;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1135,6 +1163,8 @@ pub struct ManagementSample {
     pub timer_segments: u64,
     pub transmit_pool: PoolSample,
     pub endpoint: EndpointSample,
+    pub neighbours: NeighbourSample,
+    pub outbound: OutboundSample,
     pub tcp: TcpSample,
     pub http: HttpSample,
     /// Streams begun, given up on, windows handed over, and their bytes.
@@ -1225,6 +1255,34 @@ impl ManagementSample {
             &ENDPOINT_UNHANDLED,
             &[Label::new("reason", "arp_sender_mac_mismatch")],
         ),
+        // The neighbour cache it resolves a next hop through.
+        plain(&NEIGHBOUR_REQUESTS),
+        s(&NEIGHBOUR_REPLIES, &[Label::new("outcome", "learned")]),
+        s(&NEIGHBOUR_REPLIES, &[Label::new("outcome", "unsolicited")]),
+        s(
+            &NEIGHBOUR_REPLIES,
+            &[Label::new("outcome", "rebinding_refused")],
+        ),
+        s(&NEIGHBOUR_REPLIES, &[Label::new("outcome", "not_unicast")]),
+        plain(&NEIGHBOUR_ENTRIES_EXPIRED),
+        s(
+            &NEIGHBOUR_RESOLUTIONS_FAILED,
+            &[Label::new("reason", "abandoned")],
+        ),
+        s(
+            &NEIGHBOUR_RESOLUTIONS_FAILED,
+            &[Label::new("reason", "no_room")],
+        ),
+        // And the sessions it originates over it.
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "opened")]),
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "refused")]),
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "answered")]),
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "failed")]),
+        plain(&OUTBOUND_DIALS),
+        plain(&OUTBOUND_SEGMENTS_DROPPED),
+        s(&OUTBOUND_BYTES, &[Label::new("direction", "request")]),
+        s(&OUTBOUND_BYTES, &[Label::new("direction", "answer")]),
+        plain(&OUTBOUND_ANSWER_OVERFLOWED),
         // The transport.
         s(&TCP_SEGMENTS, &[Label::new("direction", "received")]),
         s(&TCP_SEGMENTS, &[Label::new("direction", "sent")]),
@@ -1309,6 +1367,19 @@ impl ManagementSample {
         put(&mut values, &mut at, endpoint.tcp_segments);
         put(&mut values, &mut at, endpoint.unclocked);
         put_all(&mut values, &mut at, &endpoint.unhandled);
+
+        let neighbours = &self.neighbours;
+        put(&mut values, &mut at, neighbours.requested);
+        put_all(&mut values, &mut at, &neighbours.replies);
+        put(&mut values, &mut at, neighbours.expired);
+        put_all(&mut values, &mut at, &neighbours.failed);
+
+        let outbound = &self.outbound;
+        put_all(&mut values, &mut at, &outbound.sessions);
+        put(&mut values, &mut at, outbound.dialled);
+        put(&mut values, &mut at, outbound.dropped_unresolved);
+        put_all(&mut values, &mut at, &outbound.bytes);
+        put(&mut values, &mut at, outbound.answer_overflowed);
 
         let tcp = &self.tcp;
         put(&mut values, &mut at, tcp.segments_received);

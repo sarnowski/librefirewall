@@ -307,15 +307,23 @@ fn run_scenario(
                 &work,
                 &log_name,
                 topology,
-                ManagementBacking::Socket,
-                // The A/B scenarios are about which slot boots and what the boot
-                // manager said, so every one of them injects the set whose counts
-                // have not moved since before the filter existed.
-                Traffic::Routed,
-                // A fresh store medium: which slot boots says nothing about an
-                // identity, and a medium carried in from elsewhere would let one
-                // of these pass on an identity another boot minted.
-                crate::qemu::StoreMedium::Fresh,
+                crate::qemu::ForwardBench {
+                    management: ManagementBacking::Socket,
+                    // The A/B scenarios are about which slot boots and what the
+                    // boot manager said, so every one of them injects the set
+                    // whose counts have not moved since before the filter
+                    // existed.
+                    traffic: Traffic::Routed,
+                    // The dial is answered and nothing is required of it: what
+                    // these scenarios are about is which slot booted, and the
+                    // channel the appliance opens is judged where its own
+                    // scenario judges it.
+                    dial: crate::qemu::DialContract::Answered,
+                    // A fresh store medium: which slot boots says nothing about
+                    // an identity, and a medium carried in from elsewhere would
+                    // let one of these pass on an identity another boot minted.
+                    store: crate::qemu::StoreMedium::Fresh,
+                },
             )
         }
         Outcome::Halts => boot_and_halt(root, &work, &log_name, HALT_RECORD, topology),

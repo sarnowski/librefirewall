@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-108 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 403 counter and gauge series from the 12 shards,
+117 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 420 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 89 178 bytes — a worst case computed from
+declares, and the document they render into is bounded at 93 546 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -162,6 +162,38 @@ forwarded that a later refusal still lost (`egress_full`, `writeback_failed`, an
 | `librefirewall_endpoint_timer_segments_total` | counter | `management` | — | Segments the transport composed out of its own timers rather than in answer to a frame. |
 | `librefirewall_endpoint_unclocked_total` | counter | `management` | — | Segments that arrived before this node had established a time; ours, not the sender's. |
 | `librefirewall_endpoint_unhandled_total` | counter | `management` | `reason`&nbsp;(`arp_sender_mac_mismatch`, `ethertype_not_handled`, `fragmented`, `not_an_echo_request`, `protocol_not_handled`, `source_not_unicast`, `source_off_link`, `vlan_tagged`) | Well-formed frames for this endpoint that it deliberately does not answer, by reason. |
+
+### The management port: the neighbour cache under the endpoint
+
+Where the endpoint resolves the next hop it addresses an outbound frame to. Every series here is
+about a station **this port asked about or was answered by**, so the four refusal outcomes are what
+tells a quiet link from one somebody else is on.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_endpoint_neighbour_entries_expired_total` | counter | `management` | — | Entries dropped because their lifetime ran out. |
+| `librefirewall_endpoint_neighbour_replies_total` | counter | `management` | `outcome`&nbsp;(`learned`, `not_unicast`, `rebinding_refused`, `unsolicited`) | Address resolution replies this port read, by what it did with each. Only `learned` becomes an entry. **`rebinding_refused` is the one to watch**: it names a station answering for a next hop this appliance is already using, which is an attempt to redirect what it sends. |
+| `librefirewall_endpoint_neighbour_requests_total` | counter | `management` | — | Resolution requests this port composed for a next hop, retries included. |
+| `librefirewall_endpoint_neighbour_resolutions_failed_total` | counter | `management` | `reason`&nbsp;(`abandoned`, `no_room`) | Next hops this port could not resolve: `abandoned` spent every request unanswered, and `no_room` could not be asked about at all. |
+
+### The management port: the connection it dials out
+
+The other direction of the port. Everything above is the appliance answering something that arrived;
+these five are the one connection it **originates**, which is the channel a management plane is
+reached over.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_endpoint_outbound_answer_overflowed_total` | counter | `management` | — | Answer bytes a peer sent past the room one session keeps, dropped rather than allowed to displace what came before them. |
+| `librefirewall_endpoint_outbound_bytes_total` | counter | `management` | `direction`&nbsp;(`answer`, `request`) | Request bytes handed to the transport, and answer bytes taken from a peer and kept. |
+| `librefirewall_endpoint_outbound_dials_total` | counter | `management` | — | `SYN`s the transport composed for an originated connection. |
+| `librefirewall_endpoint_outbound_segments_dropped_total` | counter | `management` | — | Segments composed and then dropped for want of a hardware address for the next hop. Each is re-sent by the transport's own retransmission, so a small number is a resolution that ran while a timer was armed and a large one is a next hop that answers slowly or not at all. |
+| `librefirewall_endpoint_outbound_sessions_total` | counter | `management` | `outcome`&nbsp;(`answered`, `failed`, `opened`, `refused`) | Connections this appliance originated, by what became of each. `opened` and `refused` are what this end decided before a frame was composed; `answered` and `failed` are how the ones that went out ended. **`opened` minus `answered` minus `failed` is the session running now**, which is at most one. |
+
+**These five and the console's own `dial-outcome=` record are two readings of one channel**, and
+they answer different questions: the record says how the channel ended and is written once, while
+these say how much was spent getting there. A node whose `sessions_total{outcome="failed"}` moves
+without `outbound_dials_total` moving is one refusing its own opens rather than one nothing answers.
 
 ### The management port: the TCP transport
 

@@ -238,6 +238,58 @@ const SCRAPES: usize = 2;
 /// node that keeps sending past what it declared.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// The port the appliance dials out of its management port, the probe it
+/// carries, and what the station answers with.
+///
+/// Written here rather than imported, on [`MANAGEMENT_TCP_PORT`]'s terms: a
+/// station that took the port and the payload from the code under test could not
+/// catch that code dialling somewhere else or saying something else.
+/// The address the appliance dials, restated here as the appliance's own
+/// constant rather than read from the bench: it is a first-party choice of the
+/// code under test, and a station that took it from the document could not catch
+/// that code dialling somewhere else. Where a document places it on the
+/// management port's own prefix — as the shipped one does, it being that port's
+/// stated gateway — it is the station's address too.
+const DIAL_DESTINATION: [u8; 4] = [10, 0, 2, 2];
+const DIAL_PORT: u16 = 4433;
+const DIAL_PROBE: &[u8] = b"LFW-DIAL/1";
+const DIAL_ANSWER: &[u8] = b"LFW-DIAL/1 OK";
+
+/// The initial sequence number the station answers a dial with, and the window
+/// it advertises.
+///
+/// Fixed and deliberately not round, for [`CLIENT_ISN`]'s reason. The window is
+/// far above the probe, so nothing about this exchange turns on the station
+/// re-opening one.
+const STATION_ISN: u32 = 0x6d1f_0a53;
+const STATION_WINDOW: u16 = 8192;
+
+/// How many opaque frames the station will put on the wire to keep the appliance
+/// awake while a dial it has answered is outstanding.
+///
+/// The appliance is woken by frames arriving and by nothing else — it holds no
+/// timer interrupt and no send capability on the domain that would wake it — so
+/// a transport timer of its own fires only on a pass some frame provoked. A
+/// station that answered the resolution and then went quiet would be waiting on
+/// a `SYN` the appliance cannot send, so it goes on speaking until the dial
+/// moves. Bounded rather than open-ended, and each nudge is released against the
+/// console's own count exactly as every other management frame is, so this is a
+/// number of frames rather than a length of time.
+const DIAL_NUDGE_LIMIT: usize = 256;
+
+/// The length of a nudge frame: the shortest of the opaque ones, so keeping the
+/// port awake costs the wire as little as it can.
+const DIAL_NUDGE_LEN: usize = 60;
+
+/// How many times the station will answer a fresh resolution or a fresh
+/// connection before it calls the appliance broken.
+///
+/// Comfortably above the attempt count the appliance spends on a channel, so a
+/// node retrying under its own bound is answered and a node retrying without one
+/// is reported. It bounds the harness rather than the appliance: what it catches
+/// is a loop, not a retry.
+const DIAL_RESTART_LIMIT: usize = 12;
+
 const TCP_PROTOCOL: u8 = 6;
 const TCP_HEADER_LEN: usize = 20;
 const TCP_FIN: u8 = 0x01;
@@ -2820,6 +2872,10 @@ pub struct BootTest<'a> {
     pub topology: &'a Topology,
     /// Which probe set the boot injects.
     pub traffic: Traffic,
+    /// Whether the boot holds the appliance to the channel it dials out of its
+    /// management port: the station answers one on every socket-backed wire, and
+    /// this is whether the exchange must have completed for the run to pass.
+    pub dial_judged: bool,
     /// Whether QEMU is executing the guest on hardware rather than emulating
     /// it. Carried through to [`Booted`] because one judge needs it and cannot
     /// re-derive it honestly: a cycle count taken under emulation measures the
@@ -3014,6 +3070,29 @@ fn management_arp_request(management: &ManagementPort) -> Vec<u8> {
     frame
 }
 
+/// The ARP reply the station answers the appliance's own request with: the
+/// station's pair as the sender, and the port that asked as the target.
+///
+/// Composed here rather than reused from the appliance's own builder, on
+/// [`tcp_frame`]'s terms: a frame built by the code under test and answered to
+/// that code would agree with itself.
+fn station_arp_reply(management: &ManagementPort) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(ARP_FRAME_LEN);
+    frame.extend_from_slice(&management.mac);
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    frame.push(6);
+    frame.push(4);
+    frame.extend_from_slice(&ARP_REPLY.to_be_bytes());
+    frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+    frame.extend_from_slice(&management.station);
+    frame.extend_from_slice(&management.mac);
+    frame.extend_from_slice(&management.address);
+    frame
+}
+
 /// The ICMP echo request the harness pings the management address with, from the
 /// station's own pair at both layers.
 fn management_echo_request(management: &ManagementPort) -> Vec<u8> {
@@ -3072,6 +3151,36 @@ impl TcpFrame {
 /// rather than trusted, because it is the one field of the appliance's own
 /// composition that no other assertion below would notice being wrong.
 fn decode_tcp(frame: &[u8], management: &ManagementPort) -> Result<TcpFrame, String> {
+    decode_tcp_to(frame, management, management.station)
+}
+
+/// The destination port of a TCP-over-IPv4 frame, read positionally and without
+/// judging anything else about it.
+///
+/// It is what routes a segment to the half of this wire it belongs to — the
+/// connection the harness opened, or the one the appliance did — and it is
+/// deliberately not a decode: the chosen judge decodes the frame whole and
+/// verifies its checksum, so nothing here decides whether a segment is
+/// well-formed.
+fn tcp_destination_port(frame: &[u8]) -> Option<u16> {
+    let at = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 2;
+    let pair = frame.get(at..at + 2)?;
+    Some(u16::from_be_bytes([pair[0], pair[1]]))
+}
+
+/// [`decode_tcp`], for a segment addressed somewhere other than the station's
+/// own address.
+///
+/// The pseudo-header the checksum covers names the datagram's own addresses, and
+/// the appliance dials a first-party constant rather than the station it reaches
+/// that constant through. Passing the destination in is what keeps one decoder
+/// for both halves of this wire: a second copy would be a second checksum
+/// routine to be right or wrong on its own.
+fn decode_tcp_to(
+    frame: &[u8],
+    management: &ManagementPort,
+    destination: [u8; 4],
+) -> Result<TcpFrame, String> {
     let Some(header) = frame.get(..ETHERNET_HEADER_LEN + IPV4_HEADER_LEN) else {
         return Err(format!(
             "{} bytes is short of the {} an IPv4 frame needs",
@@ -3111,7 +3220,7 @@ fn decode_tcp(frame: &[u8], management: &ManagementPort) -> Result<TcpFrame, Str
             segment.len()
         ));
     }
-    let computed = tcp_checksum(&management.address, &management.station, segment);
+    let computed = tcp_checksum(&management.address, &destination, segment);
     if computed != 0 {
         return Err(format!(
             "the segment's checksum does not verify: the ones' complement total over the \
@@ -3141,9 +3250,61 @@ fn tcp_frame(
     flags: u8,
     payload: &[u8],
 ) -> Vec<u8> {
+    station_segment(
+        management,
+        management.station,
+        Ports {
+            source: CLIENT_PORT,
+            destination: MANAGEMENT_TCP_PORT,
+        },
+        Numbers {
+            sequence,
+            acknowledgement,
+        },
+        flags,
+        CLIENT_WINDOW,
+        payload,
+    )
+}
+
+/// The two ports a segment this harness composes runs between, named rather
+/// than passed as an adjacent pair: the station speaks to two halves of the
+/// appliance on this wire, and a pair swapped by hand would address one of them
+/// as the other.
+#[derive(Clone, Copy)]
+struct Ports {
+    source: u16,
+    destination: u16,
+}
+
+/// A segment's own two numbers, named for [`Ports`]' reason.
+#[derive(Clone, Copy)]
+struct Numbers {
+    sequence: u32,
+    acknowledgement: u32,
+}
+
+/// One TCP segment from this harness's station to the appliance, as a whole
+/// frame on the wire.
+///
+/// The composition every segment this harness sends goes through, whichever half
+/// it is addressed to: the client's connection into the endpoint's listening
+/// port, and the station's answers to the connection the appliance dialled out
+/// of it. One composer rather than two, so a checksum or a header field can only
+/// be right or wrong once.
+fn station_segment(
+    management: &ManagementPort,
+    source: [u8; 4],
+    ports: Ports,
+    numbers: Numbers,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let (sequence, acknowledgement) = (numbers.sequence, numbers.acknowledgement);
     let mut segment = Vec::with_capacity(TCP_HEADER_LEN + payload.len());
-    segment.extend_from_slice(&CLIENT_PORT.to_be_bytes());
-    segment.extend_from_slice(&MANAGEMENT_TCP_PORT.to_be_bytes());
+    segment.extend_from_slice(&ports.source.to_be_bytes());
+    segment.extend_from_slice(&ports.destination.to_be_bytes());
     segment.extend_from_slice(&sequence.to_be_bytes());
     segment.extend_from_slice(&acknowledgement.to_be_bytes());
     // Five words of header and no options: the client offers no maximum segment
@@ -3151,10 +3312,10 @@ fn tcp_frame(
     // whatever the option would have said.
     segment.push(5 << 4);
     segment.push(flags);
-    segment.extend_from_slice(&CLIENT_WINDOW.to_be_bytes());
+    segment.extend_from_slice(&window.to_be_bytes());
     segment.extend_from_slice(&[0, 0, 0, 0]);
     segment.extend_from_slice(payload);
-    let checksum = tcp_checksum(&management.station, &management.address, &segment);
+    let checksum = tcp_checksum(&source, &management.address, &segment);
     segment[16..18].copy_from_slice(&checksum.to_be_bytes());
 
     let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + segment.len());
@@ -3166,7 +3327,7 @@ fn tcp_frame(
     ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
     ip[8] = INJECTED_TTL;
     ip[9] = TCP_PROTOCOL;
-    ip[12..16].copy_from_slice(&management.station);
+    ip[12..16].copy_from_slice(&source);
     ip[16..20].copy_from_slice(&management.address);
     let header_checksum = header_checksum(&ip);
     ip[10..12].copy_from_slice(&header_checksum.to_be_bytes());
@@ -3242,6 +3403,10 @@ enum ManagementReply {
     Echo,
     /// One step of the TCP exchange, named by the step it completed.
     Tcp(TcpStep),
+    /// One step of the connection the appliance itself dialled, named by the
+    /// step it completed. The other direction of this wire: everything above is
+    /// the appliance answering, and this is the appliance asking.
+    Dial(DialStep),
 }
 
 /// Where the client's connection has got to.
@@ -3277,6 +3442,131 @@ impl TcpStep {
             Self::AwaitLastAck => "the acknowledgement of the client's own FIN",
             Self::Closed => "none",
         }
+    }
+}
+
+/// Where the station's side of the connection the appliance dialled has got to.
+///
+/// The mirror of [`TcpStep`]: there the harness opens and the appliance answers,
+/// and here the appliance opens and the harness answers. Each step both asserts
+/// what came in and composes what goes back, so the contract is met only by
+/// walking the whole of it — and the last step is the one that says the
+/// appliance closed cleanly rather than merely stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialStep {
+    /// Nothing yet: the appliance has not asked who holds the station's address.
+    Unasked,
+    /// It asked and the station answered for itself, so the next hop it dials
+    /// through is resolved.
+    Resolved,
+    /// Its `SYN` arrived and the station answered `SYN-ACK`.
+    Handshaken,
+    /// Its probe arrived whole and the station answered and closed.
+    Answered,
+    /// Its own `FIN` arrived and the station acknowledged it. Both halves are
+    /// closed and the exchange is complete.
+    Closed,
+}
+
+impl DialStep {
+    /// What the appliance still owes, as a clause for a verdict.
+    fn outstanding(self) -> &'static str {
+        match self {
+            Self::Unasked => "the ARP request for the station it dials through",
+            Self::Resolved => "the SYN of the connection it dials",
+            Self::Handshaken => "the probe it dialled to send",
+            Self::Answered => "its own FIN, closing the connection it opened",
+            Self::Closed => "none",
+        }
+    }
+}
+
+/// The station's own end of the connection the appliance dialled.
+///
+/// Deliberately not a TCP stack, on [`TcpClient`]'s terms: the wire is a host
+/// socket, so it is lossless and in-order. What it does hold is the whole of the
+/// sequence-number arithmetic and the ephemeral port the appliance chose, both
+/// of which are learned from the appliance rather than assumed.
+#[derive(Clone, Debug)]
+struct DialStation {
+    step: DialStep,
+    /// The ephemeral port the appliance dialled from, learned from its `SYN`. A
+    /// station cannot know it in advance: the transport picks it, and picking it
+    /// here would be the harness testing its own guess.
+    peer_port: Option<u16>,
+    /// The appliance's initial sequence number, kept for the verdict and for the
+    /// same reason [`TcpClient::peer_isn`] is: a constant one would be an
+    /// off-path injection primitive.
+    peer_isn: Option<u32>,
+    /// The next sequence number this station will send, and what it expects to
+    /// receive next.
+    sequence: u32,
+    expect: u32,
+    /// The probe as it arrived, accumulated across however many segments carry
+    /// it. Judged whole rather than per segment, a request being a stream.
+    probe: Vec<u8>,
+    /// What the station owes the wire, composed as each step is judged and put
+    /// on it by the caller against the console's own count.
+    owed: VecDeque<Vec<u8>>,
+    /// Opaque frames spent keeping the appliance awake while the dial was
+    /// outstanding, bounded by [`DIAL_NUDGE_LIMIT`].
+    nudges: usize,
+    /// Resolutions asked for and connections opened, each bounded by
+    /// [`DIAL_RESTART_LIMIT`].
+    ///
+    /// Both are counted rather than forbidden, because both are ordinary on a
+    /// link where the dial does not complete: an entry that expires is asked
+    /// about again, and a session the appliance gives up on is followed by
+    /// another under its own attempt count. What a bound catches is the case
+    /// neither of those explains — a node asking or opening without end.
+    resolutions: usize,
+    dials: usize,
+}
+
+impl DialStation {
+    fn new() -> Self {
+        Self {
+            step: DialStep::Unasked,
+            peer_port: None,
+            peer_isn: None,
+            sequence: STATION_ISN,
+            expect: 0,
+            probe: Vec::new(),
+            owed: VecDeque::new(),
+            nudges: 0,
+            resolutions: 0,
+            dials: 0,
+        }
+    }
+
+    /// Whether the appliance has finished the channel it opened.
+    fn completed(&self) -> bool {
+        self.step == DialStep::Closed
+    }
+
+    /// Whether the dial is between the station answering for itself and the
+    /// appliance's `SYN` arriving — the one gap on this wire the appliance
+    /// cannot cross without being woken, its transport holding a segment whose
+    /// timer only runs on a pass a frame provokes.
+    fn awaiting_the_dial(&self) -> bool {
+        self.step == DialStep::Resolved
+    }
+
+    /// What this station has seen, as a clause for a verdict.
+    fn seen(&self) -> String {
+        format!(
+            "the appliance's own dial is at {:?} and still owes {}; it dialled from port {} \
+             with initial sequence {}, {} probe bytes have arrived, and the station spent {} \
+             frames keeping the port awake",
+            self.step,
+            self.step.outstanding(),
+            self.peer_port
+                .map_or_else(|| String::from("(none)"), |port| port.to_string()),
+            self.peer_isn
+                .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
+            self.probe.len(),
+            self.nudges
+        )
     }
 }
 
@@ -3389,6 +3679,9 @@ impl ManagementProbe {
             // rather than a panic, because a rendering is not a place to fail a
             // run that has otherwise met its contract.
             ManagementReply::Tcp(step) => format!("  answered   tcp-step {step:?}"),
+            // Unreachable for the same reason: a dial step is rendered through
+            // `dialled` and `resolved`, which have the values worth printing.
+            ManagementReply::Dial(step) => format!("  answered   dial-step {step:?}"),
             ManagementReply::Arp => format!(
                 "  answered   arp-request           station->mgmt  who-has {} tell {}  \
                  is-at {}",
@@ -3441,6 +3734,7 @@ impl ManagementProbe {
         frame: &[u8],
         probes: &[Probe],
         client: &mut TcpClient,
+        station: &mut DialStation,
     ) -> Result<ManagementReply, String> {
         for probe in probes {
             if contains(frame, probe.marker) {
@@ -3463,12 +3757,27 @@ impl ManagementProbe {
             .get(MAC_PAIR_LEN..ETHERNET_HEADER_LEN)
             .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
         match ether_type {
-            Some(ARP_ETHERTYPE) => self.judge_arp(frame).map(|()| ManagementReply::Arp),
-            // An IPv4 datagram is one of two things on this wire, and the
-            // protocol number is what separates them: the echo reply the ICMP
-            // request obliges, or a segment of the one TCP connection the client
-            // opens.
+            // ARP is one of two things here, and the operation separates them:
+            // the reply the harness's own request obliges, or the request the
+            // appliance asks its next hop with when it dials out.
+            Some(ARP_ETHERTYPE) => {
+                if decode_arp(frame)?.operation == ARP_REQUEST {
+                    return self
+                        .judge_dial_arp(frame, station)
+                        .map(ManagementReply::Dial);
+                }
+                self.judge_arp(frame).map(|()| ManagementReply::Arp)
+            }
+            // An IPv4 datagram is one of three things on this wire. The protocol
+            // number separates the echo reply from the segments, and the ports
+            // separate the two connections: one the harness opened into the
+            // endpoint's listening port, one the appliance opened out of its own.
             Some(IPV4_ETHERTYPE) if is_tcp(frame) => {
+                if tcp_destination_port(frame) == Some(DIAL_PORT) {
+                    return self
+                        .judge_dial_tcp(frame, station)
+                        .map(ManagementReply::Dial);
+                }
                 self.judge_tcp(frame, client).map(ManagementReply::Tcp)
             }
             Some(IPV4_ETHERTYPE) => self.judge_echo(frame).map(|()| ManagementReply::Echo),
@@ -3690,6 +3999,312 @@ impl ManagementProbe {
                 .peer_isn
                 .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
             client.response.len()
+        )
+    }
+
+    /// The ARP request the appliance asks its next hop with, and the reply the
+    /// station owes it.
+    ///
+    /// Every field is compared: a request that named a different target, or
+    /// claimed a sender the frame that carried it did not, is refused rather
+    /// than answered — the station answers for its own address and for nothing
+    /// else.
+    ///
+    /// # Errors
+    /// The verdict, naming the field and the two values.
+    fn judge_dial_arp(&self, frame: &[u8], station: &mut DialStation) -> Result<DialStep, String> {
+        let request = decode_arp(frame)?;
+        let expected = ArpFrame {
+            destination_mac: [0xff; 6],
+            source_mac: self.port.mac,
+            operation: ARP_REQUEST,
+            sender_mac: self.port.mac,
+            sender_address: self.port.address,
+            target_mac: [0; 6],
+            target_address: self.port.station,
+        };
+        if request != expected {
+            return Err(format!(
+                "the ARP request the appliance dialled through departs from the contract in {}",
+                arp_differences(&expected, &request).join("; ")
+            ));
+        }
+        station.resolutions = station.resolutions.saturating_add(1);
+        if station.resolutions > DIAL_RESTART_LIMIT {
+            return Err(format!(
+                "the appliance has asked about {} {} times. An entry is learned once and kept for \
+                 its lifetime, so asking without end is a cache that is not keeping what it learns",
+                ipv4(self.port.station),
+                station.resolutions
+            ));
+        }
+        station.owed.push_back(station_arp_reply(&self.port));
+        Ok(DialStep::Resolved)
+    }
+
+    /// One segment of the connection the appliance dialled, judged against the
+    /// step it belongs to, with the station's answer composed for it.
+    ///
+    /// Every assertion is a field comparison, on [`judge_tcp`](Self::judge_tcp)'s
+    /// terms: the flags that must be set and the flags that must not, the
+    /// acknowledgement against what this station actually sent, and the probe
+    /// against the bytes the appliance is contracted to carry.
+    ///
+    /// # Errors
+    /// The verdict, naming the field and the two values.
+    fn judge_dial_tcp(&self, frame: &[u8], station: &mut DialStation) -> Result<DialStep, String> {
+        let segment = decode_tcp_to(frame, &self.port, DIAL_DESTINATION)?;
+        if segment.carries(TCP_RST, 0) {
+            return Err(format!(
+                "the appliance reset the connection it dialled at the {:?} step (sequence {}, \
+                 acknowledgement {})",
+                station.step, segment.sequence, segment.acknowledgement
+            ));
+        }
+        if let Some(port) = station.peer_port
+            && segment.source_port != port
+            && !segment.carries(TCP_SYN, TCP_ACK)
+        {
+            return Err(format!(
+                "a segment of the dial came from port {} and the appliance opened it from {port}. \
+                 One connection is one port, so a segment from another is one this station never \
+                 answered",
+                segment.source_port
+            ));
+        }
+        // A `SYN` is an open wherever it arrives, and it is judged before the
+        // step is: the appliance re-sends one whose answer never reached it, and
+        // opens another under its own attempt count where a whole session went
+        // away. Both are the same thing on this wire — a connection this station
+        // has not carried yet — so both are answered by starting one. What is
+        // refused is a `SYN` before the resolution, and a node opening them
+        // without end.
+        if segment.carries(TCP_SYN, TCP_ACK) {
+            if station.step == DialStep::Unasked {
+                return Err(format!(
+                    "the appliance dialled before asking who holds {}: flags {:#04x}, sequence \
+                     {}. The next hop is resolved from an answer to its own request, so a segment \
+                     here is one addressed from an entry nothing on this link supplied",
+                    ipv4(self.port.station),
+                    segment.flags,
+                    segment.sequence
+                ));
+            }
+            if !segment.payload.is_empty() {
+                return Err(format!(
+                    "the appliance's SYN carried {} payload bytes, and a dial carries its request \
+                     after the handshake rather than on it",
+                    segment.payload.len()
+                ));
+            }
+            station.dials = station.dials.saturating_add(1);
+            if station.dials > DIAL_RESTART_LIMIT {
+                return Err(format!(
+                    "the appliance has opened {} connections to {}:{DIAL_PORT}. Its own attempt \
+                     count bounds a channel, so dialling without end is that bound not holding",
+                    station.dials,
+                    ipv4(DIAL_DESTINATION)
+                ));
+            }
+            station.peer_port = Some(segment.source_port);
+            station.peer_isn = Some(segment.sequence);
+            // The `SYN` occupies one sequence number. Every open is answered
+            // from the same initial number, so an answer re-sent is the same
+            // bytes rather than a second station.
+            station.expect = segment.sequence.wrapping_add(1);
+            station.sequence = STATION_ISN;
+            station.probe.clear();
+            station.owed.push_back(station_segment(
+                &self.port,
+                DIAL_DESTINATION,
+                Ports {
+                    source: DIAL_PORT,
+                    destination: segment.source_port,
+                },
+                Numbers {
+                    sequence: station.sequence,
+                    acknowledgement: station.expect,
+                },
+                TCP_SYN | TCP_ACK,
+                STATION_WINDOW,
+                &[],
+            ));
+            station.sequence = station.sequence.wrapping_add(1);
+            return Ok(DialStep::Handshaken);
+        }
+        match station.step {
+            DialStep::Unasked => Err(format!(
+                "the appliance sent a segment before asking who holds {}: flags {:#04x}, sequence \
+                 {}",
+                ipv4(self.port.station),
+                segment.flags,
+                segment.sequence
+            )),
+            DialStep::Resolved => Err(format!(
+                "the appliance opened its connection with flags {:#04x}, and an active open owes \
+                 a SYN alone",
+                segment.flags
+            )),
+            DialStep::Handshaken => {
+                if !segment.carries(TCP_ACK, TCP_SYN) {
+                    return Err(format!(
+                        "the appliance answered with flags {:#04x}, and an established connection \
+                         owes an ACK with no SYN",
+                        segment.flags
+                    ));
+                }
+                if segment.acknowledgement != station.sequence {
+                    return Err(format!(
+                        "a segment of the dial acknowledges {} and the station had sent up to {}",
+                        segment.acknowledgement, station.sequence
+                    ));
+                }
+                // In order and with no gap, on the client's own terms: a request
+                // is a stream, so a segment out of place is refused rather than
+                // reassembled.
+                if segment.sequence != station.expect {
+                    return Err(format!(
+                        "a segment of the dial begins at sequence {} and the station expected {}; \
+                         {} probe bytes had arrived",
+                        segment.sequence,
+                        station.expect,
+                        station.probe.len()
+                    ));
+                }
+                if station.probe.len().saturating_add(segment.payload.len()) > DIAL_PROBE.len() {
+                    return Err(format!(
+                        "the appliance has sent {} probe bytes and the probe is {} long",
+                        station.probe.len().saturating_add(segment.payload.len()),
+                        DIAL_PROBE.len()
+                    ));
+                }
+                station.probe.extend_from_slice(&segment.payload);
+                station.expect = segment.sequence.wrapping_add(segment.payload.len() as u32);
+                if station.probe.len() < DIAL_PROBE.len() {
+                    // The handshake's third segment carries no data, and a
+                    // partial request is one this end waits out rather than
+                    // answers. Neither is acknowledged: the station's own answer
+                    // is what acknowledges the whole of it.
+                    return Ok(DialStep::Handshaken);
+                }
+                if station.probe != DIAL_PROBE {
+                    return Err(format!(
+                        "the appliance dialled and sent {} bytes that are not the probe it is \
+                         contracted to carry",
+                        station.probe.len()
+                    ));
+                }
+                // The answer and the station's own close in one segment: the
+                // exchange is one request and one answer, and the appliance
+                // closes once this end has.
+                station.owed.push_back(station_segment(
+                    &self.port,
+                    DIAL_DESTINATION,
+                    Ports {
+                        source: DIAL_PORT,
+                        destination: segment.source_port,
+                    },
+                    Numbers {
+                        sequence: station.sequence,
+                        acknowledgement: station.expect,
+                    },
+                    TCP_ACK | TCP_PSH | TCP_FIN,
+                    STATION_WINDOW,
+                    DIAL_ANSWER,
+                ));
+                station.sequence = station
+                    .sequence
+                    .wrapping_add(DIAL_ANSWER.len() as u32)
+                    .wrapping_add(1);
+                Ok(DialStep::Answered)
+            }
+            DialStep::Answered => {
+                if !segment.carries(TCP_ACK, TCP_SYN) {
+                    return Err(format!(
+                        "the appliance answered the station's close with flags {:#04x}, and a \
+                         peer reading an answer owes an ACK with no SYN",
+                        segment.flags
+                    ));
+                }
+                // Everything this station sent is the answer and the `FIN` after
+                // it, so an acknowledgement past that is one for bytes nobody
+                // sent. Behind it is not a fault: a peer may acknowledge the data
+                // before it has composed its own close.
+                let behind = station.sequence.wrapping_sub(segment.acknowledgement);
+                if behind > DIAL_ANSWER.len() as u32 + 1 {
+                    return Err(format!(
+                        "the appliance acknowledges {} and the station's answer and FIN occupied \
+                         up to {}",
+                        segment.acknowledgement, station.sequence
+                    ));
+                }
+                if segment.sequence != station.expect {
+                    return Err(format!(
+                        "a closing segment of the dial begins at sequence {} and the station \
+                         expected {}",
+                        segment.sequence, station.expect
+                    ));
+                }
+                if !segment.carries(TCP_FIN, 0) {
+                    // The answer is acknowledged and this end's close is not.
+                    // The appliance closes once this end has, and it composes
+                    // that `FIN` on a later pass — so this segment is the
+                    // acknowledgement of the answer and nothing is owed back.
+                    return Ok(DialStep::Answered);
+                }
+                // Its `FIN` occupies one number past the probe.
+                station.expect = station.expect.wrapping_add(1);
+                station.owed.push_back(station_segment(
+                    &self.port,
+                    DIAL_DESTINATION,
+                    Ports {
+                        source: DIAL_PORT,
+                        destination: segment.source_port,
+                    },
+                    Numbers {
+                        sequence: station.sequence,
+                        acknowledgement: station.expect,
+                    },
+                    TCP_ACK,
+                    STATION_WINDOW,
+                    &[],
+                ));
+                Ok(DialStep::Closed)
+            }
+            DialStep::Closed => Err(format!(
+                "a segment came back on the dialled connection after it closed: flags {:#04x}, \
+                 sequence {}",
+                segment.flags, segment.sequence
+            )),
+        }
+    }
+
+    /// The dial as evidence, in the voice of the routed-traffic lines.
+    fn dialled(&self, station: &DialStation) -> String {
+        format!(
+            "  answered   tcp-dial              mgmt->station  {}:{} -> {}:{DIAL_PORT}  isn {}  \
+             {} probe bytes answered with {}  closed cleanly",
+            ipv4(self.port.address),
+            station
+                .peer_port
+                .map_or_else(|| String::from("(none)"), |port| port.to_string()),
+            ipv4(self.port.station),
+            station
+                .peer_isn
+                .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
+            station.probe.len(),
+            DIAL_ANSWER.len()
+        )
+    }
+
+    /// The station's answer to the appliance's resolution, in the voice of the
+    /// routed-traffic lines.
+    fn resolved(&self) -> String {
+        format!(
+            "  answered   arp-request           mgmt->station  who-has {} tell {}  is-at {}",
+            ipv4(self.port.station),
+            ipv4(self.port.address),
+            mac(MANAGEMENT_STATION_MAC)
         )
     }
 
@@ -4103,6 +4718,9 @@ struct ManagementWire {
     echo_reply: bool,
     /// The client's end of the one TCP connection this harness opens.
     client: TcpClient,
+    /// The station's end of the one connection the appliance dials out. The
+    /// other direction of this wire, and the half no other scenario watches.
+    station: DialStation,
     /// Every frame this harness has put on the wire, accumulated as it goes.
     ///
     /// Accumulated rather than precomputed because the TCP exchange's frames are
@@ -4115,8 +4733,11 @@ struct ManagementWire {
 impl ManagementWire {
     /// Whether the port has answered everything it owes: both stateless replies
     /// and a whole TCP exchange.
-    fn answered(&self) -> bool {
-        self.arp_reply && self.echo_reply && self.client.step == TcpStep::Closed
+    fn answered(&self, dial_judged: bool) -> bool {
+        self.arp_reply
+            && self.echo_reply
+            && self.client.step == TcpStep::Closed
+            && (!dial_judged || self.station.completed())
     }
 
     /// Whether the two stateless replies are in, which is what the TCP exchange
@@ -4138,6 +4759,9 @@ impl ManagementWire {
         if self.client.step != TcpStep::Closed {
             owed.push(self.client.step.outstanding());
         }
+        if !self.station.completed() {
+            owed.push(self.station.step.outstanding());
+        }
         if owed.is_empty() {
             return String::from("none");
         }
@@ -4152,7 +4776,7 @@ impl ManagementWire {
         let seen = match reply {
             ManagementReply::Arp => &mut self.arp_reply,
             ManagementReply::Echo => &mut self.echo_reply,
-            ManagementReply::Tcp(_) => return Ok(()),
+            ManagementReply::Tcp(_) | ManagementReply::Dial(_) => return Ok(()),
         };
         if *seen {
             return Err(format!(
@@ -4209,11 +4833,12 @@ fn describe_management(
         );
     }
     format!(
-        "{} management frames of {} bytes were injected, and the port still owes {}; {}",
+        "{} management frames of {} bytes were injected, and the port still owes {}; {}; {}",
         injected.frames,
         injected.bytes,
         wire.outstanding(),
-        wire.client.seen()
+        wire.client.seen(),
+        wire.station.seen()
     )
 }
 
@@ -4471,6 +5096,7 @@ fn run_boot(
                 Some(ManagementWire {
                     wire: stream,
                     injection_failure: None,
+                    station: DialStation::new(),
                     arp_reply: false,
                     echo_reply: false,
                     client: TcpClient::new(),
@@ -4555,7 +5181,12 @@ fn run_boot(
                     };
                     match &test.contract {
                         BootContract::Routed => {
-                            match management_probe.judge(&frame, &probes, &mut management.client) {
+                            match management_probe.judge(
+                                &frame,
+                                &probes,
+                                &mut management.client,
+                                &mut management.station,
+                            ) {
                                 Ok(reply) => {
                                     if let Err(verdict) = management.accept(reply) {
                                         break 'run Err(format!(
@@ -4580,6 +5211,39 @@ fn run_boot(
                                     // correctly.
                                     if let ManagementReply::Tcp(step) = reply {
                                         management.client.step = step;
+                                    }
+                                    // The station's own answers are queued
+                                    // beside the client's and released against
+                                    // the console's count exactly as those are:
+                                    // the appliance drains one pipeline, and a
+                                    // frame put on the wire faster than its
+                                    // driver refills is a frame lost.
+                                    if let ManagementReply::Dial(step) = reply {
+                                        management.station.step = step;
+                                        while let Some(next) = management.station.owed.pop_front() {
+                                            client_pending.push_back(next);
+                                        }
+                                        match step {
+                                            DialStep::Resolved => {
+                                                answered.push(management_probe.resolved());
+                                            }
+                                            DialStep::Closed => {
+                                                answered.push(
+                                                    management_probe.dialled(&management.station),
+                                                );
+                                                // The settle window restarts from
+                                                // the last frame this harness
+                                                // sent, on the client exchange's
+                                                // terms: the console's total is an
+                                                // equality, and breaking out at
+                                                // the instant the dial closed
+                                                // would race the record of it.
+                                                settling_since = Some(Instant::now());
+                                            }
+                                            DialStep::Unasked
+                                            | DialStep::Handshaken
+                                            | DialStep::Answered => {}
+                                        }
                                     }
                                     if matches!(reply, ManagementReply::Tcp(_)) {
                                         observed_isn = management.client.peer_isn;
@@ -4824,7 +5488,9 @@ fn run_boot(
                     // the count it is rather than as a timeout that says nothing.
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
-                            && management.as_ref().is_some_and(ManagementWire::answered)
+                            && management
+                                .as_ref()
+                                .is_some_and(|wire| wire.answered(test.dial_judged))
                             && (management_contract::frames_reported(&output)
                                 >= injected.frames as u64
                                 || since.elapsed() >= MANAGEMENT_REPORT_GRACE) =>
@@ -5160,6 +5826,30 @@ fn run_boot(
                         log_path.display()
                     ),
                 });
+            }
+            // The one gap on this wire the appliance cannot cross unprompted.
+            // Its `SYN` was composed before the next hop resolved and dropped
+            // for want of an address, so what re-sends it is the transport's own
+            // retransmission — a timer that only runs on a pass some frame
+            // provoked, this domain holding no timer interrupt and no way to
+            // wake itself. A station that answered the resolution and fell
+            // silent would be waiting on a segment the appliance cannot send, so
+            // it goes on speaking until the dial moves.
+            //
+            // The frame is an opaque one: the endpoint counts it and answers
+            // nothing, so nudging perturbs no reply contract, and it is released
+            // against the console's own count exactly as every other management
+            // frame is. Bounded by a number of frames rather than by a length of
+            // time, so a run under emulation and one on hardware spend the same
+            // budget on it.
+            if test.dial_judged
+                && let Some(wire) = management.as_mut()
+                && wire.station.awaiting_the_dial()
+                && client_pending.is_empty()
+                && wire.station.nudges < DIAL_NUDGE_LIMIT
+            {
+                wire.station.nudges = wire.station.nudges.saturating_add(1);
+                client_pending.push_back(management_frame(&management_probe.port, DIAL_NUDGE_LEN));
             }
             // One queued client frame per pass, and only once the port has
             // reported every frame ahead of it — the burst gate applied to the
@@ -5569,6 +6259,7 @@ mod tests {
 
     fn routed_test<'a>(log: &'a Path, topology: &'a Topology) -> BootTest<'a> {
         BootTest {
+            dial_judged: false,
             contract: BootContract::Routed,
             log_path: log,
             log_header: HEADER,
@@ -6930,7 +7621,8 @@ mod tests {
             probe.judge(
                 &arp_reply(&management, |_| {}),
                 &probes,
-                &mut TcpClient::new()
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
             ),
             Ok(ManagementReply::Arp)
         );
@@ -6938,7 +7630,8 @@ mod tests {
             probe.judge(
                 &echo_reply(&management, |_| {}),
                 &probes,
-                &mut TcpClient::new()
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
             ),
             Ok(ManagementReply::Echo)
         );
@@ -6946,7 +7639,7 @@ mod tests {
         let arp_mutations: [ArpMutation; 5] = [
             ("destination MAC", |reply| reply.destination_mac = [1; 6]),
             ("source MAC", |reply| reply.source_mac = [2; 6]),
-            ("operation", |reply| reply.operation = ARP_REQUEST),
+            ("target MAC", |reply| reply.target_mac = [3; 6]),
             ("sender address", |reply| {
                 reply.sender_address = [9, 9, 9, 9]
             }),
@@ -6960,6 +7653,7 @@ mod tests {
                     &arp_reply(&management, mutate),
                     &probes,
                     &mut TcpClient::new(),
+                    &mut DialStation::new(),
                 )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
@@ -6983,6 +7677,7 @@ mod tests {
                     &echo_reply(&management, mutate),
                     &probes,
                     &mut TcpClient::new(),
+                    &mut DialStation::new(),
                 )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
@@ -7001,7 +7696,12 @@ mod tests {
         // direction a leak would be silent.
         let leaked = &probes[0].frame;
         let verdict = probe
-            .judge(leaked, &probes, &mut TcpClient::new())
+            .judge(
+                leaked,
+                &probes,
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
+            )
             .expect_err("a dataplane probe on the management wire");
         assert!(verdict.contains(probes[0].name.as_str()), "{verdict}");
         assert!(verdict.contains("isolates that port"), "{verdict}");
@@ -7009,7 +7709,12 @@ mod tests {
         // One of the opaque frames coming back: the endpoint answers nothing for
         // that EtherType, so it must count it and stay silent.
         let verdict = probe
-            .judge(&probe.frames[0], &probes, &mut TcpClient::new())
+            .judge(
+                &probe.frames[0],
+                &probes,
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
+            )
             .expect_err("an opaque frame must never be answered");
         assert!(verdict.contains("say nothing"), "{verdict}");
 
@@ -7017,7 +7722,12 @@ mod tests {
         // one at all.
         for frame in [legacy_broadcast_frame(b"unrelated"), vec![0u8; 4]] {
             let verdict = probe
-                .judge(&frame, &probes, &mut TcpClient::new())
+                .judge(
+                    &frame,
+                    &probes,
+                    &mut TcpClient::new(),
+                    &mut DialStation::new(),
+                )
                 .expect_err("nothing else may come back");
             assert!(
                 verdict.contains("answers ARP and ICMP echo alone"),
@@ -7030,14 +7740,24 @@ mod tests {
         let mut corrupt = echo_reply(&management, |_| {});
         corrupt[ETHERNET_HEADER_LEN + 10] ^= 0xff;
         let verdict = probe
-            .judge(&corrupt, &probes, &mut TcpClient::new())
+            .judge(
+                &corrupt,
+                &probes,
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
+            )
             .expect_err("a stale checksum");
         assert!(verdict.contains("IPv4 checksum"), "{verdict}");
 
         let mut short_arp = arp_reply(&management, |_| {});
         short_arp.truncate(ARP_FRAME_LEN - 1);
         let verdict = probe
-            .judge(&short_arp, &probes, &mut TcpClient::new())
+            .judge(
+                &short_arp,
+                &probes,
+                &mut TcpClient::new(),
+                &mut DialStation::new(),
+            )
             .expect_err("a truncated ARP");
         assert!(verdict.contains("short of the"), "{verdict}");
     }
@@ -7077,14 +7797,15 @@ mod tests {
             arp_reply: false,
             echo_reply: false,
             client: TcpClient::new(),
+            station: DialStation::new(),
             injected: ManagementInjection::default(),
         };
-        assert!(!wire.answered());
+        assert!(!wire.answered(false));
         assert!(!wire.stateless_replies_in());
         assert!(wire.outstanding().contains("ARP") && wire.outstanding().contains("echo"));
 
         wire.accept(ManagementReply::Arp).expect("the first");
-        assert!(!wire.answered());
+        assert!(!wire.answered(false));
         assert!(wire.outstanding().contains("ICMP echo reply"));
         let verdict = wire
             .accept(ManagementReply::Arp)
@@ -7095,16 +7816,302 @@ mod tests {
         // Both stateless replies are in, and the connection is still owed: that is
         // the point at which the client opens one.
         assert!(wire.stateless_replies_in());
-        assert!(!wire.answered());
-        assert_eq!(wire.outstanding(), "the TCP exchange has not been started");
+        assert!(!wire.answered(false));
+        assert!(
+            wire.outstanding()
+                .contains("the TCP exchange has not been started")
+        );
 
         // A TCP step is not a reply that may arrive twice: the connection's own
         // state machine orders its segments, so `accept` has nothing to refuse.
         wire.accept(ManagementReply::Tcp(TcpStep::AwaitSynAck))
             .expect("a step is not a reply");
         wire.client.step = TcpStep::Closed;
-        assert!(wire.answered());
+        // The dial is answered on every socket-backed wire and required on one
+        // scenario, so a boot that does not judge it has met its contract here
+        // and one that does still owes the whole exchange.
+        assert!(wire.answered(false));
+        assert!(!wire.answered(true));
+        assert_eq!(
+            wire.outstanding(),
+            "the ARP request for the station it dials through"
+        );
+        wire.station.step = DialStep::Closed;
+        assert!(wire.answered(true));
         assert_eq!(wire.outstanding(), "none");
+    }
+
+    /// One segment of the connection the appliance dials, as this harness builds
+    /// it to drive its own station: from the port's own pair at both layers, to
+    /// the address the appliance is contracted to dial.
+    fn dial_segment(
+        management: &ManagementPort,
+        peer_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut segment = Vec::with_capacity(TCP_HEADER_LEN + payload.len());
+        segment.extend_from_slice(&peer_port.to_be_bytes());
+        segment.extend_from_slice(&DIAL_PORT.to_be_bytes());
+        segment.extend_from_slice(&sequence.to_be_bytes());
+        segment.extend_from_slice(&acknowledgement.to_be_bytes());
+        segment.push(5 << 4);
+        segment.push(flags);
+        segment.extend_from_slice(&CLIENT_WINDOW.to_be_bytes());
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        segment.extend_from_slice(payload);
+        let checksum = tcp_checksum(&management.address, &DIAL_DESTINATION, &segment);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + segment.len());
+        frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+        ip[8] = INJECTED_TTL;
+        ip[9] = TCP_PROTOCOL;
+        ip[12..16].copy_from_slice(&management.address);
+        ip[16..20].copy_from_slice(&DIAL_DESTINATION);
+        let checksum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&segment);
+        frame
+    }
+
+    /// The ARP request the appliance asks its next hop with, as this harness
+    /// builds it: broadcast at L2, from the port's own pair, asking about the
+    /// station.
+    fn dial_arp_request(management: &ManagementPort) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(ARP_FRAME_LEN);
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&ARP_REQUEST.to_be_bytes());
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&management.address);
+        frame.extend_from_slice(&[0; 6]);
+        frame.extend_from_slice(&management.station);
+        frame
+    }
+
+    /// The whole of the station's side of a dial: the resolution, the handshake,
+    /// the probe and both closes, each step asserting what came in and composing
+    /// what goes back.
+    ///
+    /// The harness's own logic rather than the appliance's, which is what makes
+    /// it worth a host test: a station that answered the wrong sequence number
+    /// would fail a boot as an appliance defect, and the defect would be here.
+    #[test]
+    fn the_station_answers_a_dial_step_by_step_and_closes_it() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let probes: Vec<Probe> = Vec::new();
+        let mut client = TcpClient::new();
+        let mut station = DialStation::new();
+        let peer_port = 0xabcd;
+        let peer_isn = 0x1234_5678;
+
+        assert_eq!(
+            probe
+                .judge(
+                    &dial_arp_request(&management),
+                    &probes,
+                    &mut client,
+                    &mut station
+                )
+                .expect("the appliance may ask about its next hop"),
+            ManagementReply::Dial(DialStep::Resolved)
+        );
+        station.step = DialStep::Resolved;
+        let reply = decode_arp(&station.owed.pop_front().expect("the station answers"))
+            .expect("a well-formed ARP");
+        assert_eq!(reply.operation, ARP_REPLY);
+        assert_eq!(reply.sender_address, management.station);
+        assert_eq!(reply.sender_mac, MANAGEMENT_STATION_MAC);
+        assert_eq!(reply.target_address, management.address);
+
+        assert_eq!(
+            probe
+                .judge(
+                    &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
+                    &probes,
+                    &mut client,
+                    &mut station
+                )
+                .expect("a SYN opens it"),
+            ManagementReply::Dial(DialStep::Handshaken)
+        );
+        station.step = DialStep::Handshaken;
+        let syn_ack = decode_tcp_to(
+            &station.owed.pop_front().expect("the station answers"),
+            &management,
+            DIAL_DESTINATION,
+        )
+        .expect("a well-formed segment");
+        assert!(syn_ack.carries(TCP_SYN | TCP_ACK, TCP_FIN));
+        assert_eq!(syn_ack.acknowledgement, peer_isn.wrapping_add(1));
+        assert_eq!(syn_ack.sequence, STATION_ISN);
+        assert_eq!(syn_ack.destination_port, peer_port);
+
+        assert_eq!(
+            probe
+                .judge(
+                    &dial_segment(
+                        &management,
+                        peer_port,
+                        peer_isn.wrapping_add(1),
+                        STATION_ISN.wrapping_add(1),
+                        TCP_ACK | TCP_PSH,
+                        DIAL_PROBE
+                    ),
+                    &probes,
+                    &mut client,
+                    &mut station
+                )
+                .expect("the probe is what the appliance dialled to send"),
+            ManagementReply::Dial(DialStep::Answered)
+        );
+        station.step = DialStep::Answered;
+        let answer = decode_tcp_to(
+            &station.owed.pop_front().expect("the station answers"),
+            &management,
+            DIAL_DESTINATION,
+        )
+        .expect("a well-formed segment");
+        assert!(answer.carries(TCP_ACK | TCP_PSH | TCP_FIN, TCP_SYN));
+        assert_eq!(answer.payload, DIAL_ANSWER);
+        assert_eq!(
+            answer.acknowledgement,
+            peer_isn
+                .wrapping_add(1)
+                .wrapping_add(DIAL_PROBE.len() as u32)
+        );
+
+        assert_eq!(
+            probe
+                .judge(
+                    &dial_segment(
+                        &management,
+                        peer_port,
+                        peer_isn
+                            .wrapping_add(1)
+                            .wrapping_add(DIAL_PROBE.len() as u32),
+                        STATION_ISN
+                            .wrapping_add(1)
+                            .wrapping_add(DIAL_ANSWER.len() as u32)
+                            .wrapping_add(1),
+                        TCP_FIN | TCP_ACK,
+                        &[]
+                    ),
+                    &probes,
+                    &mut client,
+                    &mut station
+                )
+                .expect("the appliance closes once this end has"),
+            ManagementReply::Dial(DialStep::Closed)
+        );
+        station.step = DialStep::Closed;
+        let last = decode_tcp_to(
+            &station.owed.pop_front().expect("the station answers"),
+            &management,
+            DIAL_DESTINATION,
+        )
+        .expect("a well-formed segment");
+        assert!(last.carries(TCP_ACK, TCP_SYN | TCP_FIN));
+        assert!(station.completed());
+    }
+
+    /// What the station refuses: a dial that never asked, a probe that is not
+    /// the one the appliance is contracted to carry, and a resolution asked
+    /// twice.
+    #[test]
+    fn the_station_refuses_a_dial_that_departs_from_the_contract() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let probes: Vec<Probe> = Vec::new();
+        let mut client = TcpClient::new();
+
+        let mut unasked = DialStation::new();
+        let verdict = probe
+            .judge(
+                &dial_segment(&management, 0xabcd, 1, 0, TCP_SYN, &[]),
+                &probes,
+                &mut client,
+                &mut unasked,
+            )
+            .expect_err("a dial before the resolution is refused");
+        assert!(verdict.contains("dialled before asking"), "{verdict}");
+
+        let mut station = DialStation::new();
+        probe
+            .judge(
+                &dial_arp_request(&management),
+                &probes,
+                &mut client,
+                &mut station,
+            )
+            .expect("the request");
+        station.step = DialStep::Resolved;
+        // A next hop asked about again is answered again — an entry expires, and
+        // a station that refused to answer would be the harness refusing what a
+        // station is for. What is refused is asking without end.
+        for _ in 0..DIAL_RESTART_LIMIT - 1 {
+            probe
+                .judge(
+                    &dial_arp_request(&management),
+                    &probes,
+                    &mut client,
+                    &mut station,
+                )
+                .expect("a station answers for its own address whoever asks");
+        }
+        let verdict = probe
+            .judge(
+                &dial_arp_request(&management),
+                &probes,
+                &mut client,
+                &mut station,
+            )
+            .expect_err("asking without end is refused");
+        assert!(verdict.contains("times"), "{verdict}");
+        station.resolutions = 1;
+        station.owed.clear();
+
+        probe
+            .judge(
+                &dial_segment(&management, 0xabcd, 1, 0, TCP_SYN, &[]),
+                &probes,
+                &mut client,
+                &mut station,
+            )
+            .expect("the SYN");
+        station.step = DialStep::Handshaken;
+        station.owed.clear();
+        let verdict = probe
+            .judge(
+                &dial_segment(
+                    &management,
+                    0xabcd,
+                    2,
+                    STATION_ISN.wrapping_add(1),
+                    TCP_ACK | TCP_PSH,
+                    b"not-the-probe",
+                ),
+                &probes,
+                &mut client,
+                &mut station,
+            )
+            .expect_err("a payload that is not the probe is refused");
+        assert!(verdict.contains("probe"), "{verdict}");
     }
 
     /// The reply the appliance owes, as this harness builds it for its own

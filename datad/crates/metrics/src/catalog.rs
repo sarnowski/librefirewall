@@ -467,6 +467,75 @@ pub const ENDPOINT_TIMER_SEGMENTS: Metric = metric(
     "Segments the transport composed out of its own timers rather than in answer to a frame.",
 );
 
+// ── The neighbour cache under the endpoint ───────────────────────────
+
+pub const NEIGHBOUR_REQUESTS: Metric = metric(
+    "librefirewall_endpoint_neighbour_requests_total",
+    Kind::Counter,
+    "Address resolution requests this port composed for a next hop, retries included.",
+);
+
+pub const NEIGHBOUR_REPLIES: Metric = metric(
+    "librefirewall_endpoint_neighbour_replies_total",
+    Kind::Counter,
+    "Address resolution replies this port read, by what it did with each. Only `learned` \
+     becomes an entry: `unsolicited` answered nothing this end asked, `rebinding_refused` named \
+     a next hop already resolved, and `not_unicast` claimed a hardware address no frame may be \
+     addressed to.",
+);
+
+pub const NEIGHBOUR_ENTRIES_EXPIRED: Metric = metric(
+    "librefirewall_endpoint_neighbour_entries_expired_total",
+    Kind::Counter,
+    "Entries dropped because their lifetime ran out.",
+);
+
+pub const NEIGHBOUR_RESOLUTIONS_FAILED: Metric = metric(
+    "librefirewall_endpoint_neighbour_resolutions_failed_total",
+    Kind::Counter,
+    "Next hops this port could not resolve: `abandoned` spent every request unanswered, and \
+     `no_room` could not be asked about at all, the table holding only live entries.",
+);
+
+// ── The outbound half: this port reaching out rather than answering ────────
+
+pub const OUTBOUND_SESSIONS: Metric = metric(
+    "librefirewall_endpoint_outbound_sessions_total",
+    Kind::Counter,
+    "Connections this appliance originated out of its management port, by what became of each. \
+     `opened` counts every one begun and `refused` those declined before a frame was composed, \
+     so the two say what this end decided; `answered` and `failed` say how the ones that went \
+     out ended.",
+);
+
+pub const OUTBOUND_DIALS: Metric = metric(
+    "librefirewall_endpoint_outbound_dials_total",
+    Kind::Counter,
+    "SYNs the transport composed for an originated connection.",
+);
+
+pub const OUTBOUND_SEGMENTS_DROPPED: Metric = metric(
+    "librefirewall_endpoint_outbound_segments_dropped_total",
+    Kind::Counter,
+    "Segments composed and then dropped for want of a hardware address for the next hop. Each \
+     is re-sent by the transport's own retransmission, so a small number is a resolution that \
+     ran while a timer was armed and a large one is a next hop that answers slowly or not at \
+     all.",
+);
+
+pub const OUTBOUND_BYTES: Metric = metric(
+    "librefirewall_endpoint_outbound_bytes_total",
+    Kind::Counter,
+    "Request bytes handed to the transport, and answer bytes taken from a peer and kept.",
+);
+
+pub const OUTBOUND_ANSWER_OVERFLOWED: Metric = metric(
+    "librefirewall_endpoint_outbound_answer_overflowed_total",
+    Kind::Counter,
+    "Answer bytes a peer sent past the room one session keeps, dropped rather than allowed to \
+     displace what came before them.",
+);
+
 // ── The clock, on the domain that measured it and the one that reads it ─────
 
 pub const CLOCK_GENERATION: Metric = metric(
@@ -933,6 +1002,15 @@ pub const ALL_METRICS: &[&Metric] = &[
     &ENDPOINT_UNCLOCKED,
     &ENDPOINT_UNHANDLED,
     &ENDPOINT_TIMER_SEGMENTS,
+    &NEIGHBOUR_REQUESTS,
+    &NEIGHBOUR_REPLIES,
+    &NEIGHBOUR_ENTRIES_EXPIRED,
+    &NEIGHBOUR_RESOLUTIONS_FAILED,
+    &OUTBOUND_SESSIONS,
+    &OUTBOUND_DIALS,
+    &OUTBOUND_SEGMENTS_DROPPED,
+    &OUTBOUND_BYTES,
+    &OUTBOUND_ANSWER_OVERFLOWED,
     &TCP_SEGMENTS,
     &TCP_BYTES,
     &TCP_RETRANSMITS,

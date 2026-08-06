@@ -50,8 +50,8 @@ const DIGEST_BYTES: usize = 32;
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
-    ChangeKind, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind, Primitive,
-    RejectReason, Value,
+    ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, ObjectKind,
+    Primitive, RejectReason, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -94,6 +94,7 @@ pub enum Vocabulary {
     GenerationOutcome,
     RejectReason,
     Primitive,
+    DialOutcome,
 }
 
 impl Vocabulary {
@@ -110,6 +111,7 @@ impl Vocabulary {
             Self::GenerationOutcome => GenerationOutcome::ALL.len(),
             Self::RejectReason => RejectReason::ALL.len(),
             Self::Primitive => Primitive::ALL.len(),
+            Self::DialOutcome => DialOutcome::ALL.len(),
         }
     }
 
@@ -123,6 +125,10 @@ impl Vocabulary {
             Self::GenerationOutcome => "outcome",
             Self::RejectReason => "reason",
             Self::Primitive => "primitive",
+            // Two words rather than a hyphenated token: this is the noun a decode
+            // refusal is written with ("dial outcome token 9 …") and not a
+            // console `cause=`, and the spelling is what keeps the two apart.
+            Self::DialOutcome => "dial outcome",
         }
     }
 }
@@ -164,6 +170,11 @@ fn variant<T: Copy, const N: usize>(
 /// the assertion at the foot of this file is what stops them.
 fn primitive_of(token: u8) -> Result<Primitive, DecodeError> {
     variant(Primitive::ALL, Vocabulary::Primitive, token)
+}
+
+/// A dial outcome token as the member it selects, on [`primitive_of`]'s terms.
+fn dial_outcome_of(token: u8) -> Result<DialOutcome, DecodeError> {
+    variant(DialOutcome::ALL, Vocabulary::DialOutcome, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -447,6 +458,22 @@ impl Event<Cause> {
                     // carries every flag an operand holds.
                     record.operands = [*generation, *documents, 0, u64::from(*was_owned)];
                 }
+                DomainDetail::Dialled {
+                    destination,
+                    port,
+                    attempts,
+                    outcome,
+                } => {
+                    record.detail = LogDetailKind::Dialled.to_bits();
+                    // The token first, where every detail whose leading word
+                    // names a vocabulary carries it.
+                    record.operands = [
+                        *outcome as u64,
+                        u64::from(destination.bits()),
+                        u64::from(*port),
+                        *attempts,
+                    ];
+                }
                 DomainDetail::Delegated { device, signatures } => {
                     record.detail = LogDetailKind::Delegated.to_bits();
                     // The identifier in its two halves, most significant first,
@@ -647,6 +674,20 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             documents: *documents,
             was_owned: *was_owned,
         },
+        // Total: `wire` ranged the token, the address and the port, and an
+        // attempt count is a tally every bit pattern of which this end could
+        // have kept.
+        CheckedDetail::Dialled {
+            outcome,
+            destination,
+            port,
+            attempts,
+        } => DomainDetail::Dialled {
+            destination: net_headers::Ipv4Address::from_octets(destination.to_be_bytes()),
+            port: *port,
+            attempts: *attempts,
+            outcome: dial_outcome_of(*outcome)?,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and a signature count is a tally, so every bit
         // pattern of the three words is one a delegating domain could have read.
@@ -756,6 +797,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::Delegated { device, signatures } => {
                         DomainDetail::Delegated { device, signatures }
                     }
+                    DomainDetail::Dialled {
+                        destination,
+                        port,
+                        attempts,
+                        outcome,
+                    } => DomainDetail::Dialled {
+                        destination,
+                        port,
+                        attempts,
+                        outcome,
+                    },
                     DomainDetail::Measured {
                         primitive,
                         milli_cycles_per_byte,
@@ -882,6 +934,7 @@ const _: () = {
     assert!(GenerationOutcome::ALL.len() == wire::LOG_GENERATION_OUTCOME_COUNT as usize);
     assert!(RejectReason::ALL.len() == wire::LOG_REJECT_REASON_COUNT as usize);
     assert!(Primitive::ALL.len() == wire::LOG_PRIMITIVE_COUNT as usize);
+    assert!(DialOutcome::ALL.len() == wire::LOG_DIAL_OUTCOME_COUNT as usize);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);
     assert!(crate::MAX_CAUSE_LEN == wire::LOG_CAUSE_BYTES);

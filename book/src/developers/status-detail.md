@@ -1678,11 +1678,21 @@ established one.
 - **No dataplane consumer.** The only caller is the management domain. Nothing proxies, nothing
   terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
   is untouched (see the [status table](../status.md)).
-- **Nothing dials.** The endpoint above the stack now resolves a next hop and drives a whole
-  outbound session — dial, carry a fixed request, read the answer, close — but no protection domain
-  opens one, so no connection has left a running node. The outbound half's counters are held in
-  `lfw_ip_endpoint` and reach no surface: the exposition gains them with the caller that makes them
-  move.
+- **The appliance dials, to a constant.** The management domain opens one outbound session per boot
+  — resolve the next hop, dial, carry a fixed probe, read the answer, close — and reports the
+  outcome in exactly one console record whichever way it goes. The destination and the port are
+  **first-party constants compiled into that domain** rather than anything the appliance was told:
+  the store holds no endpoint yet, and replacing the constant with the one it holds is the next
+  step. So the channel goes where this build was written to take it, and an image whose management
+  prefix does not contain that address reaches the station and is right to refuse what it says back,
+  its own addressing rules putting that address off-link.
+- **Nothing runs over the dial.** What crosses is ten bytes of first-party probe and whatever comes
+  back, judged only as *an answer arrived*. There is no TLS on it, no authentication of either end,
+  and no protocol above the transport — the session the cryptography domain proves against itself is
+  still not carried by anything. That is the layer this dial exists to put underneath.
+- **Nothing retries after the channel is decided.** The attempt count bounds one boot's channel, and
+  a node whose station never answered reports `next-hop-unreachable` and dials no more until it
+  reboots. A channel that reopens itself needs a schedule this domain has no timer to keep.
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
   the management domain outright, so that node has no management port for the boot. The QEMU bench had
   to be told to expose it (`datad/tools/xtask/src/qemu.rs`); every deployment target must have it. There is
@@ -1692,16 +1702,17 @@ established one.
   `TIME_WAIT` on an otherwise silent port is reaped on the next frame rather than at its deadline.
   Bounded rather than unbounded — the table is also reaped under pressure — but not prompt.
 - **The counters now reach a surface.** All twenty-seven are published as
-  `librefirewall_tcp_*` and scrapable; see *[Prometheus metrics](#prometheus-metrics)* and the
+  `librefirewall_tcp_*` and scrapable, and so are the neighbour cache's eight and the outbound
+  half's nine, as `librefirewall_endpoint_neighbour_*` and `librefirewall_endpoint_outbound_*`; see *[Prometheus metrics](#prometheus-metrics)* and the
   [metrics reference](../reference/metrics.md).
 
 ## Prometheus metrics
 
-**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 97
-metric families and 350 counter and gauge series, plus one info series per configured interface and
+**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 117
+metric families and 420 counter and gauge series, plus one info series per configured interface and
 one hit counter per rule the running policy declares — covering every one of the ten protection
 domains. Its worst case is computed from the catalogue at build time (`MAX_EXPOSITION_LEN`,
-81 075 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
+93 546 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
 scrape can never be short. That bound is dominated by the rules: it covers a policy naming all 256
 the configuration accepts, so it is sized by what an operator is entitled to write rather than by
 what a node happens to be running. The end-to-end gate scrapes it with `curl` off a booted release
@@ -2387,8 +2398,10 @@ which is what keeps a handshake from becoming a domain that never returns. It te
 read in practice, and that is a scheduling fact: the holder sits at priority 3 and this domain at 2,
 so a notification preempts into it immediately.
 
-**Missing.** Nothing dials with any of this: the transport can open a connection but has no way to
-resolve a next hop for one, and there is no channel and no onboarding server, and the cryptography domain holds no device. The session is proved
+**Missing.** Nothing dials with any of this. The management domain now opens a TCP connection out of
+its own port and carries ten bytes of first-party probe over it, and none of that touches this
+domain: there is no channel above the transport and no onboarding server, and the cryptography
+domain holds no device, so what is proved here is still proved against this same build on both ends. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,
 standing in for a management server and an anchor this appliance has never seen. There is no CSR

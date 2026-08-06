@@ -22,9 +22,9 @@ use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
-    ManagementSample, PipelineSample, PolicySample, PolicySweepSample, PoolSample,
-    ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS, SinkSample, Snapshot, StatsShard,
-    StoreSample, TapSample, TcpSample,
+    ManagementSample, NeighbourSample, OutboundSample, PipelineSample, PolicySample,
+    PolicySweepSample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS,
+    SinkSample, Snapshot, StatsShard, StoreSample, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
 use net_headers::ParseFailure;
@@ -231,7 +231,7 @@ pub fn management_sample(
     endpoint: Option<&Endpoint>,
     log: LogSample,
 ) -> ManagementSample {
-    let (endpoint_sample, tcp, http) = match endpoint {
+    let (endpoint_sample, neighbours, outbound, tcp, http) = match endpoint {
         Some(endpoint) => {
             let counters = endpoint.counters();
             let mut unhandled = [0u64; Unhandled::ALL.len()];
@@ -242,6 +242,8 @@ pub fn management_sample(
             }
             let tcp = endpoint.tcp_counters();
             let served = endpoint.http_counters();
+            let neighbours = endpoint.neighbour_counters();
+            let dials = endpoint.outbound_counters();
             (
                 EndpointSample {
                     arp_replies: counters.arp_replies,
@@ -252,6 +254,29 @@ pub fn management_sample(
                     tcp_segments: counters.tcp_segments,
                     unclocked: counters.unclocked,
                     unhandled,
+                },
+                NeighbourSample {
+                    requested: neighbours.requested,
+                    replies: [
+                        neighbours.learned,
+                        neighbours.unsolicited,
+                        neighbours.rebinding_refused,
+                        neighbours.not_unicast,
+                    ],
+                    expired: neighbours.expired,
+                    failed: [neighbours.abandoned, neighbours.no_room],
+                },
+                OutboundSample {
+                    sessions: [
+                        dials.opened,
+                        dials.open_refused,
+                        dials.answered,
+                        dials.failed,
+                    ],
+                    dialled: dials.dialled,
+                    dropped_unresolved: dials.dropped_unresolved,
+                    bytes: [dials.request_bytes, dials.answer_bytes],
+                    answer_overflowed: dials.answer_overflowed,
                 },
                 TcpSample {
                     segments_received: tcp.segments_received,
@@ -304,6 +329,8 @@ pub fn management_sample(
         // `frames`/`unaddressed` pair is what tells those apart.
         None => (
             EndpointSample::default(),
+            NeighbourSample::default(),
+            OutboundSample::default(),
             TcpSample::default(),
             HttpSample::default(),
         ),
@@ -333,6 +360,8 @@ pub fn management_sample(
             ledger_refused: transmit_pool.reclaim_refused,
         },
         endpoint: endpoint_sample,
+        neighbours,
+        outbound,
         tcp,
         http,
         streams: [

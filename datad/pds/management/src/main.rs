@@ -129,12 +129,16 @@
 mod entropy;
 
 use entropy::EntropyError;
-use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
+use lfw_clock::Monotonic;
+use lfw_log::{
+    DialOutcome, Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink,
+};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
-    Configurations, Downloads, EndpointRegions, EndpointStage, ForwardRings, IsnSecret, PdClock,
-    Pool, ReturnRing, StatsRegions, attach_region, log_sample, read_timestamp_counter,
+    Configurations, DIAL_REQUEST_CAPACITY, Downloads, Ended, EndpointRegions, EndpointStage,
+    ForwardRings, Ipv4Address, IsnSecret, PdClock, Pool, ReturnRing, StatsRegions, attach_region,
+    log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
@@ -153,6 +157,38 @@ const PORTS: u8 = 2;
 /// system. It blocks in the Microkit event loop and never polls, so a document
 /// written into the submission region is invisible to it until it is woken.
 const CONFIG: Channel = Channel::new(2);
+
+/// The station this port reaches out to, and the port on it.
+///
+/// First-party constants: a management channel goes where this appliance was
+/// told to take it and nowhere a peer names, and until the store holds an
+/// endpoint of its own there is nowhere else to read one from. They are the
+/// gateway the committed document states and a port of this appliance's own
+/// choosing, so the dial leaves through the station the operator already
+/// declared rather than through one this domain invented.
+const DIAL_DESTINATION: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
+const DIAL_PORT: u16 = 4433;
+
+/// What the channel carries, fixed and first-party. It is a transport-level
+/// probe and not a protocol: what belongs here is the greeting of the session
+/// that will one day be negotiated over it, and the bytes are chosen so that a
+/// station reading them can tell this appliance apart from anything else that
+/// dialled it.
+const DIAL_PROBE: &[u8] = b"LFW-DIAL/1";
+
+/// The room a session holds for a request is a build fact, so a probe that did
+/// not fit is a compile failure rather than an open refused at run time.
+const _: () = assert!(DIAL_PROBE.len() <= DIAL_REQUEST_CAPACITY);
+
+/// How many sessions this domain spends on the channel before it reports what
+/// became of it.
+///
+/// A first-party bound and the whole of what ends a channel that never comes
+/// up: every session under it leaves on something this end can observe, and
+/// nothing here waits on a wall-clock gap. Three because a station that answered
+/// none of three separate dials is one an operator has to go and look at, and a
+/// fourth would say the same thing later.
+const DIAL_ATTEMPTS: u64 = 3;
 
 /// This domain's lifecycle record.
 fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
@@ -182,6 +218,101 @@ fn entropy_refusal(error: EntropyError) -> Refusal {
             detail: RefusalDetail::One(word as u64),
             signalled: false,
         },
+    }
+}
+
+/// The channel this port reaches *out* with, and how far it has got.
+///
+/// It is a state machine rather than a call because nothing here may block: the
+/// domain is woken, drains, and returns, so a session crosses several wakeups
+/// and what carries it between them is this. Every transition below is driven by
+/// something observable — a phase the endpoint reports, or this end's own
+/// attempt count — and none of them by an elapsed time, so a channel that is
+/// slow is a channel that is slow rather than a channel that failed.
+struct Dial {
+    /// Sessions opened so far, bounded by [`DIAL_ATTEMPTS`].
+    attempts: u64,
+    /// Whether one of them is running now.
+    running: bool,
+    /// Whether the one record this channel owes has been made. It is what makes
+    /// the record exactly one: a channel is reported when it is decided, and a
+    /// decided channel is never re-opened.
+    reported: bool,
+}
+
+impl Dial {
+    const fn new() -> Self {
+        Self {
+            attempts: 0,
+            running: false,
+            reported: false,
+        }
+    }
+
+    /// Carry the channel forward by one wakeup.
+    ///
+    /// A pass either opens a session, moves the running one, or ends the
+    /// channel; a pass over a port with no address yet does nothing at all,
+    /// which is the ordinary state of a node between boot and its first commit.
+    fn drive(&mut self, stage: &mut EndpointStage<'static>, now: Monotonic, sink: &dyn Sink) {
+        if self.reported {
+            return;
+        }
+        if !self.running {
+            match stage.open_dial(DIAL_DESTINATION, DIAL_PORT, DIAL_PROBE) {
+                // Unaddressed: there is no source address to open a session
+                // from, and one will arrive with the next committed generation.
+                None => return,
+                Some(Ok(())) => {
+                    self.attempts = self.attempts.saturating_add(1);
+                    self.running = true;
+                }
+                // This end refused before a frame was composed, and no further
+                // attempt would be answered differently: nothing a peer does
+                // changes a destination this node cannot route to.
+                Some(Err(_)) => {
+                    self.report(sink, DialOutcome::NotOpened);
+                    return;
+                }
+            }
+        }
+        stage.drive_dial(now);
+        let Some(ended) = stage.dial_ended() else {
+            return;
+        };
+        stage.close_dial();
+        self.running = false;
+        if ended.succeeded() || self.attempts >= DIAL_ATTEMPTS {
+            self.report(sink, outcome_of(ended));
+        }
+    }
+
+    /// The one record the channel owes, whichever way it went.
+    fn report(&mut self, sink: &dyn Sink, outcome: DialOutcome) {
+        self.reported = true;
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::Dialled {
+                destination: DIAL_DESTINATION,
+                port: DIAL_PORT,
+                attempts: self.attempts,
+                outcome,
+            },
+        );
+    }
+}
+
+/// A finished session in the vocabulary a console line speaks. The two sets are
+/// separate copies facing different readers — one is the transport's, one is the
+/// operator's — and this is the single place that maps them.
+const fn outcome_of(ended: Ended) -> DialOutcome {
+    match ended {
+        Ended::Answered => DialOutcome::Answered,
+        Ended::NextHopUnreachable => DialOutcome::NextHopUnreachable,
+        Ended::NoRoomToResolve => DialOutcome::NoRoomToResolve,
+        Ended::Refused(_) => DialOutcome::DialRefused,
+        Ended::Lost => DialOutcome::ConnectionLost,
     }
 }
 
@@ -300,6 +431,7 @@ fn init() -> Management {
         configurations,
         handover,
         clock,
+        dial: Dial::new(),
         sink,
     })
 }
@@ -337,6 +469,9 @@ struct Running {
     configurations: Configurations<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
+    /// The channel this port reaches out with, kept for the domain's life
+    /// because a session crosses wakeups and the record it owes is made once.
+    dial: Dial,
     sink: RingSink<'static, PdClock<'static>>,
 }
 
@@ -401,6 +536,14 @@ impl Handler for Management {
         running.downloads.poll(now, &mut running.stage);
         if running.configurations.poll(now, &mut running.stage) {
             CONFIG.notify();
+        }
+        // After the drain, so a resolution that arrived in this very pass is what
+        // the session is carried forward on, and before the record below: the
+        // shard is published again here, so a scrape reads the channel's own
+        // counters as of this pass rather than the one before it.
+        if let Some(now) = now {
+            running.dial.drive(&mut running.stage, now, &running.sink);
+            running.stage.publish(log);
         }
         if moved > 0 {
             let counters = running.stage.counters();

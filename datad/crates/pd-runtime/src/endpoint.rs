@@ -68,9 +68,11 @@ use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monoton
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
     http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
+    outbound::{Ended, OpenError},
 };
 use lfw_log::RejectReason;
 use lfw_metrics::{InterfaceInventory, LogSample, RuleInventory};
+use net_headers::Ipv4Address;
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
 use crate::{
@@ -95,6 +97,16 @@ pub const TIMER_LIMIT: usize = 2 * lfw_ip_endpoint::TCP_CONNECTIONS;
 /// its window refuses another, so this is every connection saturated at once and
 /// the loop stops long before it on any real pass.
 pub const OUTPUT_LIMIT: usize = lfw_tcp_max_unacked() * lfw_ip_endpoint::TCP_CONNECTIONS;
+
+/// How many steps one pass may spend on the outbound session.
+///
+/// A bound the peer does not choose, on [`OUTPUT_LIMIT`]'s terms: every answer
+/// from `Endpoint::poll_outbound` either moves the session's phase, hands a
+/// range to the transport, or puts a resolution request on the wire, so the loop
+/// terminates on its own. One session owes at most a resolution, a dial, its
+/// request in `MAX_UNACKED` ranges and a close, and this is that with room to
+/// spare.
+pub const DIAL_LIMIT: usize = lfw_tcp_max_unacked() + 4;
 
 /// `lfw_tcp::MAX_UNACKED`, reached through the endpoint that re-exports the
 /// transport rather than through a second dependency on it.
@@ -850,6 +862,68 @@ impl<'ring> EndpointStage<'ring> {
                 self.send(len);
             }
         }
+    }
+
+    /// Open the one connection this port reaches out with, carrying `request`.
+    ///
+    /// Nothing leaves here, on `Endpoint::open_outbound`'s terms: it is
+    /// [`drive_dial`](Self::drive_dial) that puts a frame on the wire. `None`
+    /// where the port has no address yet, which is a state to wait out rather
+    /// than a refusal — a session cannot be opened out of a port that has no
+    /// source address to open it from.
+    ///
+    /// # Errors
+    /// `OpenError`, for a session already running, a destination this port
+    /// cannot reach, or a request longer than the room for one.
+    pub fn open_dial(
+        &mut self,
+        destination: Ipv4Address,
+        port: u16,
+        request: &[u8],
+    ) -> Option<Result<(), OpenError>> {
+        let endpoint = self.endpoint.as_mut()?;
+        Some(endpoint.open_outbound(destination, port, request))
+    }
+
+    /// Send whatever the outbound session now owes.
+    ///
+    /// [`drive_output`](Self::drive_output)'s shape on the half that dials
+    /// rather than answers, and bounded the same way: by [`DIAL_LIMIT`] as well
+    /// as by the loop's own termination. A step that produces no frame is not
+    /// the end of a pass — a resolution that is still outstanding produces
+    /// nothing and the step after it may.
+    pub fn drive_dial(&mut self, now: Monotonic) {
+        for _ in 0..DIAL_LIMIT {
+            let Self {
+                endpoint, reply, ..
+            } = self;
+            let Some(endpoint) = endpoint.as_mut() else {
+                return;
+            };
+            let polled = endpoint.poll_outbound(now, reply);
+            if !polled.goes_on() {
+                return;
+            }
+            if let Some(len) = polled.frame() {
+                self.send(len);
+            }
+        }
+    }
+
+    /// How the outbound session finished, where it has. `None` while one is
+    /// still running, and `None` where there is no session at all.
+    #[must_use]
+    pub fn dial_ended(&self) -> Option<Ended> {
+        self.endpoint
+            .as_ref()
+            .and_then(Endpoint::outbound)
+            .and_then(|session| session.phase().ended())
+    }
+
+    /// Forget a finished session, so another may be opened. `false` where the
+    /// session is still running or there is none.
+    pub fn close_dial(&mut self) -> bool {
+        self.endpoint.as_mut().is_some_and(Endpoint::close_outbound)
     }
 
     /// The addressing in force, for a caller that reports what the port answers

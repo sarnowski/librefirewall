@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -54,7 +54,7 @@ written waits forever:
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame** — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, and exactly one `ready` reporting the channel it dialled — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; the dial's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
@@ -238,6 +238,32 @@ node: an operator holding a silent appliance still has only the external act.
   and its count must be higher: the handshake's own signature was computed in the other domain, so a
   number that did not move would mean the session signed some other way. Neither record carries a
   signature, a message or a key — a public name and a tally are all the channel can carry.
+- `dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>` — **the
+  channel this appliance reached *out* with, and what became of it.** Every other record on this
+  channel is about traffic the appliance answered; this one is about a connection it originated, so
+  it is the one place an operator sees the management port acting rather than replying.
+
+  It appears **exactly once per boot**, whichever way the channel went, and never again: a channel
+  is reported when it is decided, and a decided channel is not re-opened. `dial-destination=` and
+  `dial-port=` are where it went, spelled as an address so that this line and the configuration
+  document's own `gateway=` compare as one string against another. `dial-attempts=` is how many
+  sessions were spent on it — the appliance's own bound, not a peer's, so a channel that never came
+  up ends after a fixed number of tries rather than waiting on a station that will not answer.
+
+  `dial-outcome=` is the last session's own end:
+
+  | Token | What it means |
+  |---|---|
+  | `answered` | the station answered and both halves closed. The channel works. |
+  | `next-hop-unreachable` | every request for the next hop's hardware address went unanswered, so no frame could be addressed at all — **nothing on this link claims that address**. |
+  | `no-room-to-resolve` | the neighbour table held only live entries, so the next hop could not even be asked about. |
+  | `dial-refused` | the transport declined the dial: no room in its table, or a connection already on the same four-tuple. |
+  | `connection-lost` | a station claimed the address and the connection then went away — a reset, or the retransmission limit reached with nothing at the far end. Distinct from `next-hop-unreachable` because the two are different things to go and look at. |
+  | `not-opened` | **this node's own addressing refused it**: no next hop could be chosen for the destination. Nothing a peer does changes it, and what to look at is this appliance's management address, prefix and gateway. |
+
+  **No byte of the exchange reaches this record.** What the station said is a payload, and a payload
+  reaches the two recording sinks and nowhere else; what an operator reads here is where the
+  appliance went and how it got on.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up

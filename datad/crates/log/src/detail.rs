@@ -24,7 +24,9 @@ use core::{fmt, num::NonZeroU64};
 
 use lfw_clock::UtcNanos;
 
-use crate::event::Primitive;
+use net_headers::Ipv4Address;
+
+use crate::event::{DialOutcome, Primitive};
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
@@ -285,6 +287,27 @@ pub enum DomainDetail<C = &'static str> {
     Delegated {
         device: u128,
         signatures: u64,
+    },
+    /// What became of the connection this appliance reached *out* of its
+    /// management port with: where it dialled, how many attempts it spent, and
+    /// how the last of them finished.
+    ///
+    /// Appended, never inserted, on the four details above's terms. The four
+    /// fields travel together because no three of them answer the operator's
+    /// question: an outcome without a destination does not say what could not be
+    /// reached, and an outcome without an attempt count does not say whether the
+    /// appliance gave up early or spent everything it had. **No byte of the
+    /// exchange has a representation here** — what the peer said reaches the two
+    /// recording sinks and nothing else, and what a console reports is where the
+    /// appliance went and how it got on.
+    Dialled {
+        destination: Ipv4Address,
+        port: u16,
+        /// Sessions opened for this channel, the last of which is what
+        /// `outcome` reports. Bounded by the caller's own attempt count, so a
+        /// number here is a first-party decision and never a peer's.
+        attempts: u64,
+        outcome: DialOutcome,
     },
 }
 

@@ -68,6 +68,11 @@ pub const LOG_OPERANDS: usize = 4;
 /// number an operator would have to look up.
 pub const LOG_PRIMITIVE_COUNT: u8 = 10;
 
+/// How many outcomes a dialled connection may report —
+/// `lfw_log::DialOutcome::ALL`, carried as a token for
+/// [`LOG_PRIMITIVE_COUNT`]'s reason.
+pub const LOG_DIAL_OUTCOME_COUNT: u8 = 6;
+
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
 
@@ -182,6 +187,7 @@ pub enum LogDetailKind {
     Fingerprint,
     Reset,
     Delegated,
+    Dialled,
 }
 
 impl LogDetailKind {
@@ -208,6 +214,7 @@ impl LogDetailKind {
             Self::Fingerprint => 17,
             Self::Reset => 18,
             Self::Delegated => 19,
+            Self::Dialled => 20,
         }
     }
 
@@ -234,6 +241,7 @@ impl LogDetailKind {
             17 => Some(Self::Fingerprint),
             18 => Some(Self::Reset),
             19 => Some(Self::Delegated),
+            20 => Some(Self::Dialled),
             _ => None,
         }
     }
@@ -739,6 +747,18 @@ impl LogRecord {
                 low: self.operands[1],
                 signatures: self.operands[2],
             },
+            // A token, an address, a port and a count. The token names a closed
+            // set and is refused outside it on `Proved`'s terms, which is why it
+            // takes the first word; the address and the port are ranged because a
+            // wider word would render as an address or a port no wire has, and
+            // the attempt count is unranged because every bit pattern of it is a
+            // tally this end could have kept.
+            Some(LogDetailKind::Dialled) => CheckedDetail::Dialled {
+                outcome: dial_outcome_token(self.operands[0])?,
+                destination: address_bits(self.operands[1])?,
+                port: code_point(self.operands[2])?,
+                attempts: self.operands[3],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -822,6 +842,23 @@ fn flag(raw: u64) -> Result<bool, LogRecordError> {
         1 => Ok(true),
         value => Err(LogRecordError::OperandFlagNotBoolean { value }),
     }
+}
+
+/// A dial outcome token carried in an operand word, on `primitive_token`'s
+/// terms: it must name a member of the set, and it arrives as a `u64` because
+/// that is the width an operand has.
+fn dial_outcome_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_DIAL_OUTCOME_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::DialOutcomeUnknown { outcome: raw }),
+    }
+}
+
+/// An IPv4 address carried in an operand word. Every one of the thirty-two bits
+/// is an address, so what is refused is only a word too wide to be one — which
+/// would otherwise render as an address truncated into a different one.
+fn address_bits(raw: u64) -> Result<u32, LogRecordError> {
+    u32::try_from(raw).map_err(|_| LogRecordError::AddressTooWide { value: raw })
 }
 
 /// A protocol registry code point, which is sixteen bits wide wherever TLS
@@ -1197,6 +1234,15 @@ pub enum CheckedDetail {
         low: u64,
         signatures: u64,
     },
+    /// Where a connection this appliance originated went, and what became of
+    /// it: the outcome token, the destination address and port, and how many
+    /// attempts were spent on it.
+    Dialled {
+        outcome: u8,
+        destination: u32,
+        port: u16,
+        attempts: u64,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1278,6 +1324,14 @@ pub enum LogRecordError {
     CodePointTooWide {
         value: u64,
     },
+    DialOutcomeUnknown {
+        outcome: u64,
+    },
+    /// An operand carrying an IPv4 address wider than the thirty-two bits one
+    /// has.
+    AddressTooWide {
+        value: u64,
+    },
     DomainUnknown {
         domain: u8,
     },
@@ -1357,6 +1411,13 @@ impl fmt::Display for LogRecordError {
             ),
             Self::CodePointTooWide { value } => {
                 write!(f, "protocol code point {value} does not fit sixteen bits")
+            }
+            Self::DialOutcomeUnknown { outcome } => write!(
+                f,
+                "dial outcome token {outcome} is not below {LOG_DIAL_OUTCOME_COUNT}"
+            ),
+            Self::AddressTooWide { value } => {
+                write!(f, "address word {value} does not fit thirty-two bits")
             }
             Self::OperandFlagNotBoolean { value } => {
                 write!(f, "operand flag {value} is neither 0 nor 1")

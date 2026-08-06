@@ -534,9 +534,12 @@ pub use clock::{PdClock, read_timestamp_counter};
 pub use configuration::{CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Submissions};
 pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
 pub use endpoint::{
-    CalibrationRefused, ConfigRefused, EndpointRegions, EndpointStage, EndpointStageCounters,
-    MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,
+    CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,
+    EndpointStageCounters, MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,
 };
+// The two types a domain needs to name the channel it dials: the address it
+// dials and the outcome it reports, reached through this facade rather than
+// through a second dependency on the crates that own them.
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
     StaleOffer, endpoint_from, interfaces_from, router_from, rules_from,
@@ -546,6 +549,8 @@ pub use handover::{
 /// are part of it.
 pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
+pub use lfw_ip_endpoint::outbound::{Ended, OpenError, REQUEST_CAPACITY as DIAL_REQUEST_CAPACITY};
+pub use net_headers::Ipv4Address;
 pub use pipeline::{Configuration, PolicySweep, Tracking};
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,
