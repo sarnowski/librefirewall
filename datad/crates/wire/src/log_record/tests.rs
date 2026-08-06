@@ -758,7 +758,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 16] = [
+    let cases: [(LogRecord, LogRecordError); 17] = [
         (
             LogRecord {
                 kind: 4,
@@ -775,10 +775,22 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 25,
+                detail: 26,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 25 },
+            LogRecordError::DetailKindUnknown { detail: 26 },
+        ),
+        // The onboarding session's own token word, on the dial's terms: an end
+        // past the set names nothing a console line can spell.
+        (
+            LogRecord {
+                detail: LogDetailKind::Onboarded.to_bits(),
+                operands: [u64::from(LOG_ONBOARD_END_COUNT), 0, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::OnboardEndUnknown {
+                end: u64::from(LOG_ONBOARD_END_COUNT),
+            },
         ),
         // The dial's own token word, on the primitive's terms: an outcome past
         // the set names nothing a console line can spell.
@@ -1220,10 +1232,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::DialUnlearned,
         LogDetailKind::DialSegments,
         LogDetailKind::DialSequence,
+        LogDetailKind::Onboarded,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(25), None);
+    assert_eq!(LogDetailKind::from_bits(26), None);
 
     for value in [
         LogValueKind::Absent,

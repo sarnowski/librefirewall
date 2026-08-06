@@ -23,6 +23,11 @@
 //!   handed over, and the bytes past its length are never touched. This is the
 //!   claim the protection domain rests on: it writes that many bytes into a pool
 //!   buffer.
+//! * **Both listening ports are reachable, and the adversary reaches whichever
+//!   it names.** The endpoint answers on two ports and runs a transport per
+//!   port, so a harness that could only address one would model an adversary
+//!   that cannot reach the other. Every frame is offered to the demultiplexing
+//!   as it stands, and the flood below floods both.
 //! * **A reply is only ever produced for a frame addressed to us**, at L2 and at
 //!   L3, and it always leaves *as* us and *to* the station that asked. A reply to
 //!   a group address would make the port a reflector; a reply from an address
@@ -49,6 +54,7 @@ use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_ip_endpoint::{
     ContentType, Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing,
     SeqNumber, Status, TCP_CONNECTIONS, TCP_MSS, Unhandled,
+    onboard::{INBOUND_CAPACITY as ONBOARD_INBOUND, ONBOARDING_PORT},
 };
 use net_headers::{
     ARP_FRAME_LEN, ArpOperation, ArpPacket, EtherType, Ethernet, Ipv4Address, Ipv4Frame,
@@ -217,10 +223,21 @@ fn assert_one_frame_is_answered(data: &[u8]) {
             assert_eq!(packet.header().protocol, Protocol::TCP);
             assert_eq!(endpoint.counters().tcp_segments, 1);
         }
+        // The other listening port, whose answers are the same frame under the
+        // same two rules — and are counted apart, which is the whole reason the
+        // outcome is its own variant.
+        Outcome::Onboarding { .. } => {
+            assert_eq!(sent.header.ether_type, EtherType::IPV4);
+            let packet = Ipv4Packet::parse(sent.payload).expect("a datagram re-parses");
+            assert_eq!(packet.header().source, OUR_ADDRESS);
+            assert_eq!(packet.header().protocol, Protocol::TCP);
+            assert_eq!(endpoint.counters().onboarding_segments, 1);
+            assert_eq!(endpoint.counters().tcp_segments, 0);
+        }
         other => panic!("{other:?} carried a reply"),
     }
 
-    if matches!(outcome, Outcome::Tcp { .. }) {
+    if matches!(outcome, Outcome::Tcp { .. } | Outcome::Onboarding { .. }) {
         // A transport *is* state: the same segment twice is a retransmission, and
         // the second answer is legitimately different from the first. Held to
         // nothing more here, and to a great deal in `crate::tcp`.
@@ -268,6 +285,22 @@ fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
             endpoint.connections() <= TCP_CONNECTIONS,
             "the connection table exceeded its capacity {where_}"
         );
+        // The onboarding port holds one session at a time, and the stream holds
+        // one connection's worth of bytes each way. Both are the relay's window
+        // made structural, so a flood that produced a second session would be a
+        // channel asked to carry two connections it cannot name.
+        assert!(
+            endpoint.stream().received().len() <= ONBOARD_INBOUND,
+            "the onboarding stream held more than its inbound array {where_}"
+        );
+        assert!(
+            endpoint.stream().room() <= ONBOARD_INBOUND,
+            "the onboarding stream offered a window past its array {where_}"
+        );
+        assert!(
+            endpoint.stream().connection().is_none() || endpoint.stream().peer().is_some(),
+            "an onboarding session was held with nowhere to answer it {where_}"
+        );
         assert_eq!(
             endpoint.return_paths(),
             endpoint.connections(),
@@ -289,6 +322,13 @@ fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
         let syn = syn_frame(port, 0x1000u32.wrapping_mul(index as u32).wrapping_add(1));
         endpoint.handle(Some(at), &syn, &mut out);
         hold(&endpoint, "while the table was filling");
+        // The same flood at the other port. It holds one connection, so every
+        // newcomer past the first meets a table with nothing evictable in it —
+        // which is the bound the relay's one-session ABI rests on, asserted
+        // here rather than assumed.
+        let syn = onboarding_syn_frame(port, 0x2000u32.wrapping_mul(index as u32).wrapping_add(1));
+        endpoint.handle(Some(at), &syn, &mut out);
+        hold(&endpoint, "while the onboarding port was flooded");
         // And the adversary's own frame between every pair, so whatever it is
         // reaches an endpoint in every state the flood puts it through.
         endpoint.handle(Some(at), frame, &mut out);
@@ -328,10 +368,19 @@ fn tick(nanos: u64) -> Monotonic {
 /// universe — and the connection table's behaviour under pressure is what is
 /// being asserted, not the parser's.
 fn syn_frame(port: u16, iss: u32) -> Vec<u8> {
+    syn_to(MANAGEMENT_PORT, port, iss)
+}
+
+/// The same, addressed to the onboarding port.
+fn onboarding_syn_frame(port: u16, iss: u32) -> Vec<u8> {
+    syn_to(ONBOARDING_PORT, port, iss)
+}
+
+fn syn_to(destination: u16, port: u16, iss: u32) -> Vec<u8> {
     let mut frame = vec![0u8; 256];
     let len = Outgoing {
         source_port: port,
-        destination_port: MANAGEMENT_PORT,
+        destination_port: destination,
         sequence: SeqNumber::new(iss),
         acknowledgement: SeqNumber::new(0),
         flags: Flags::SYN,
@@ -405,6 +454,11 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
             let ethernet = Ethernet::parse(data).expect("an ICMP refusal needs a header");
             assert_eq!(ethernet.header.ether_type, EtherType::IPV4);
         }
+        // A segment neither transport answered. Which of the two saw it is
+        // decided by the destination port and asserted nowhere else here: what
+        // matters at this end is that a segment that composed nothing composed
+        // nothing.
+        Outcome::Onboarding { len, .. } => assert_eq!(*len, 0),
         Outcome::NotForUs => {
             let ethernet = Ethernet::parse(data).expect("a refusal at L2 or L3 needs a header");
             let ours = ethernet.header.destination == OUR_MAC

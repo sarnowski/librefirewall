@@ -36,6 +36,12 @@
 //! * **The declared length is honoured.** A `Content-Length` naming fewer bytes
 //!   than arrive submits only the ones declared; one naming more submits nothing at
 //!   all, because a body that never completed is not a submission.
+//! * **The other listening port is not a way in.** The appliance answers on two
+//!   ports and only one of them carries the configuration surface, so the same
+//!   document is also pushed at the **onboarding** port — where it must reach
+//!   the byte stream and never the submission path. A harness that could only
+//!   address the port that serves HTTP would model an attacker who cannot try
+//!   the other one, which is not the attacker there is.
 //! * **Nothing is unbounded.** The document that crosses is at most
 //!   [`MAX_DOCUMENT_BYTES`], the answer at most `MAX_ANSWER_LEN`, and the number
 //!   of commits at most the number of submissions.
@@ -110,7 +116,93 @@ pub fn config_submission_harness(data: &[u8]) {
             chunk,
             skew,
         );
+        assert_the_onboarding_port_submits_nothing(chunk);
     }
+}
+
+/// The same bytes at the appliance's **other** listening port, which must reach
+/// the onboarding byte stream and nothing else.
+///
+/// It is the one claim a harness driving the HTTP server alone cannot make: the
+/// configuration surface is a target on one port, and a document pushed at the
+/// other must be ciphertext going to a domain that will not parse it rather
+/// than a submission going to one that will.
+fn assert_the_onboarding_port_submits_nothing(document: &[u8]) {
+    let mut endpoint = lfw_ip_endpoint::Endpoint::new(
+        net_headers::MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+        APPLIANCE,
+        24,
+        None,
+        IsnSecret::from_bytes(SECRET),
+    )
+    .expect("a unicast pair on a /24");
+    // The surface really is registered, so a submission that appeared would be
+    // one this endpoint could have taken rather than one it had no target for.
+    assert!(endpoint.serve_body_at(pd_runtime::CONFIG_TARGET));
+    let now = instant();
+    let mut out = vec![0u8; 2048];
+    let mut sequence = 0x4000u32;
+    let mut frames = Vec::new();
+    frames.push(onboarding_frame(&mut sequence, Flags::SYN, &[]));
+    for chunk in document.chunks(1024).take(4) {
+        frames.push(onboarding_frame(
+            &mut sequence,
+            Flags::ACK.with(Flags::PSH),
+            chunk,
+        ));
+    }
+    for frame in &frames {
+        endpoint.handle(Some(now), frame, &mut out);
+        assert!(
+            endpoint.submission_wanted().is_none(),
+            "a document pushed at the onboarding port reached the configuration surface"
+        );
+        assert!(endpoint.submission().is_none());
+    }
+    // And what it did reach is the stream, bounded by the stream's own array
+    // whatever the peer sent.
+    assert!(endpoint.stream().received().len() <= lfw_ip_endpoint::onboard::INBOUND_CAPACITY);
+    assert_eq!(endpoint.counters().tcp_segments, 0);
+}
+
+/// One frame from the station to the onboarding port, sequenced so a run of
+/// them is a stream rather than a repeat.
+fn onboarding_frame(sequence: &mut u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; 2048];
+    let len = Outgoing {
+        source_port: 40001,
+        destination_port: lfw_ip_endpoint::onboard::ONBOARDING_PORT,
+        sequence: SeqNumber::new(*sequence),
+        acknowledgement: SeqNumber::new(0),
+        flags,
+        window: 4096,
+        mss: flags.contains(Flags::SYN).then_some(1460),
+        window_scale: None,
+        payload,
+    }
+    .write(
+        STATION,
+        APPLIANCE,
+        frame
+            .get_mut(net_headers::Ipv4Frame::PAYLOAD_AT..)
+            .expect("room for a segment"),
+    )
+    .expect("room for a segment");
+    let total = net_headers::Ipv4Frame {
+        destination_mac: net_headers::MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x52]),
+        source_mac: net_headers::MacAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x0c]),
+        source: STATION,
+        destination: APPLIANCE,
+        protocol: net_headers::Protocol::TCP,
+    }
+    .write(&mut frame, len)
+    .expect("room for a frame");
+    frame.truncate(total);
+    // Lossless: a payload here is a chunk of at most a kilobyte.
+    *sequence = sequence
+        .wrapping_add(payload.len() as u32)
+        .wrapping_add(u32::from(flags.contains(Flags::SYN)));
+    frame
 }
 
 /// One document submitted, decided and answered, with every claim above held.

@@ -65,6 +65,15 @@
 //! a dial and an inbound connection coexist unless they name the same peer
 //! address and port, which is the one case [`TcpStack::connect`] refuses outright.
 //!
+//! A node that answers on **two** ports therefore runs two stacks rather than
+//! widening one, which is the shape that keeps every property above: two tables,
+//! two sequence spaces, two challenge budgets, and no key either table does not
+//! carry. What it costs the caller is a demux, because a stack refuses every
+//! destination but its own — so a segment handed to the wrong one is dropped
+//! and counted there rather than served. [`peeked_destination_port`] is that
+//! demux and is the whole of it: it reads the field **before** anything is
+//! verified, so it may decide which stack parses the segment and nothing else.
+//!
 //! # Scope: what is deliberately outside it
 //!
 //! Each of the following is a decision with a reason, not an unfinished edge.
@@ -129,7 +138,7 @@ pub use isn::{IsnGenerator, IsnSecret};
 pub use rto::{INITIAL_RTO, MAX_RTO, MIN_RTO, RetransmissionTimer};
 pub use segment::{
     Flags, MAX_TCP_HEADER_LEN, MAX_WINDOW_SCALE, Options, Outgoing, Segment, SegmentError,
-    TCP_HEADER_LEN, WriteError,
+    TCP_HEADER_LEN, WriteError, peeked_destination_port,
 };
 pub use seq::SeqNumber;
 

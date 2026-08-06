@@ -1003,6 +1003,11 @@ proptest! {
 /// reads back whole frames, so the exchange below is the one that crosses a wire.
 struct Station {
     port: u16,
+    /// Which of the endpoint's two listening ports this station is addressing.
+    /// A field rather than a constant, because the two are two transports and a
+    /// station that could only reach one of them would leave the other's
+    /// demultiplexing untested.
+    destination: u16,
     next: lfw_tcp::SeqNumber,
     expect: lfw_tcp::SeqNumber,
     window: u16,
@@ -1012,9 +1017,18 @@ impl Station {
     fn new(port: u16, iss: u32) -> Self {
         Self {
             port,
+            destination: MANAGEMENT_PORT,
             next: lfw_tcp::SeqNumber::new(iss),
             expect: lfw_tcp::SeqNumber::new(0),
             window: 4096,
+        }
+    }
+
+    /// A station addressing the onboarding port instead.
+    fn onboarding(port: u16, iss: u32) -> Self {
+        Self {
+            destination: ONBOARDING_PORT,
+            ..Self::new(port, iss)
         }
     }
 
@@ -1024,7 +1038,7 @@ impl Station {
         let syn = flags.contains(lfw_tcp::Flags::SYN);
         let len = lfw_tcp::Outgoing {
             source_port: self.port,
-            destination_port: MANAGEMENT_PORT,
+            destination_port: self.destination,
             sequence: self.next,
             acknowledgement: self.expect,
             flags,
@@ -1069,7 +1083,7 @@ impl Station {
         assert_eq!(packet.header().destination, STATION_ADDRESS);
         let segment = lfw_tcp::Segment::parse(OUR_ADDRESS, STATION_ADDRESS, packet.payload())
             .expect("a segment whose checksum verifies");
-        assert_eq!(segment.source_port, MANAGEMENT_PORT);
+        assert_eq!(segment.source_port, self.destination);
         assert_eq!(segment.destination_port, self.port);
         self.expect = segment.sequence.add(segment.sequence_length());
         (
@@ -4896,4 +4910,249 @@ fn a_resolved_entry_stops_being_an_answer_once_its_lifetime_runs_out() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
     assert_eq!(endpoint.neighbour_counters().requested, 2);
+}
+
+// ---------------------------------------------------------------------------
+// The onboarding port: the second listening port, and the byte stream on it.
+
+use crate::onboard::{Ended as OnboardEnded, INBOUND_CAPACITY, OUTBOUND_CAPACITY};
+
+/// Drive the onboarding half to exhaustion, collecting every frame it composed.
+///
+/// A loop rather than one call for the reason the caller in the protection
+/// domain has one: a step that produced no frame is not a pass with nothing
+/// left to do, and stopping there would leave the close behind the bytes.
+fn drain_onboarding(endpoint: &mut Endpoint, now: Monotonic) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for _ in 0..16 {
+        let mut out = vec![0u8; ROOMY];
+        match endpoint.poll_onboarding(now, &mut out) {
+            Polled::Frame { len } => {
+                out.truncate(len);
+                frames.push(out);
+            }
+            Polled::Handled => {}
+            Polled::Idle => break,
+        }
+    }
+    frames
+}
+
+/// Open a connection on the onboarding port and answer its `SYN-ACK`, leaving
+/// the station established.
+fn onboarding_station(endpoint: &mut Endpoint) -> Station {
+    let mut station = Station::onboarding(0xc351, 0x1234_0000);
+    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
+    let mut out = vec![0u8; ROOMY];
+    let outcome = endpoint.handle(Some(at(0)), &syn, &mut out);
+    let len = outcome.reply().expect("a SYN-ACK");
+    let (flags, _, _) = station.read(&out[..len]);
+    assert!(flags.contains(lfw_tcp::Flags::SYN) && flags.contains(lfw_tcp::Flags::ACK));
+    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
+    endpoint.handle(Some(at(1)), &ack, &mut out);
+    station
+}
+
+#[test]
+fn a_segment_for_the_onboarding_port_reaches_the_other_transport() {
+    let mut endpoint = endpoint();
+    let station = onboarding_station(&mut endpoint);
+    assert_eq!(station.destination, ONBOARDING_PORT);
+    let counters = endpoint.counters();
+    // Two segments on the onboarding port and none on the HTTP one: the demux
+    // is what this states, and a total over both would state nothing.
+    assert_eq!(counters.onboarding_segments, 2);
+    assert_eq!(counters.tcp_segments, 0);
+    assert_eq!(endpoint.tcp_counters().connections_accepted, 0);
+    assert_eq!(endpoint.onboarding_counters().connections_accepted, 1);
+    assert!(endpoint.stream().connection().is_some());
+    assert_eq!(endpoint.stream_counters().accepted, 1);
+}
+
+#[test]
+fn bytes_on_the_onboarding_port_are_held_for_the_consumer_and_never_answered() {
+    let mut endpoint = endpoint();
+    let mut station = onboarding_station(&mut endpoint);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), b"records");
+    let mut out = vec![0u8; ROOMY];
+    endpoint.handle(Some(at(2)), &data, &mut out);
+    assert_eq!(endpoint.stream().received(), b"records");
+    assert_eq!(endpoint.stream_counters().received, 7);
+    // Nothing is composed in answer beyond the transport's own acknowledgement:
+    // this crate never decides what a record means.
+    assert!(drain_onboarding(&mut endpoint, at(3)).is_empty());
+    assert_eq!(endpoint.stream_counters().sent, 0);
+}
+
+#[test]
+fn what_the_consumer_answers_with_goes_out_and_the_close_follows_it() {
+    let mut endpoint = endpoint();
+    let mut station = onboarding_station(&mut endpoint);
+    endpoint.stream_mut().push(b"server hello");
+    endpoint.stream_mut().end_session();
+    let frames = drain_onboarding(&mut endpoint, at(2));
+    assert_eq!(frames.len(), 2, "the bytes, and then the close behind them");
+    let (flags, _, payload) = station.read(&frames[0]);
+    assert_eq!(payload, b"server hello");
+    assert!(!flags.contains(lfw_tcp::Flags::FIN));
+    let (flags, _, _) = station.read(&frames[1]);
+    assert!(flags.contains(lfw_tcp::Flags::FIN));
+    assert_eq!(endpoint.stream_counters().sent, 12);
+    assert_eq!(endpoint.stream_counters().closed_by_consumer, 1);
+}
+
+#[test]
+fn a_peer_that_closes_is_reported_as_the_end_that_finished_the_session() {
+    let mut endpoint = endpoint();
+    let mut station = onboarding_station(&mut endpoint);
+    let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
+    let mut out = vec![0u8; ROOMY];
+    endpoint.handle(Some(at(2)), &fin, &mut out);
+    assert!(endpoint.stream().peer_closed());
+    assert_eq!(endpoint.stream().ending(), OnboardEnded::ByPeer);
+    // The consumer answers the close, and the order the two happened in is what
+    // the ending keeps: the peer hung up first.
+    endpoint.stream_mut().end_session();
+    assert_eq!(endpoint.stream().ending(), OnboardEnded::ByPeer);
+    let frames = drain_onboarding(&mut endpoint, at(3));
+    let (flags, _, _) = station.read(frames.last().expect("this end's own close"));
+    assert!(flags.contains(lfw_tcp::Flags::FIN));
+    // And once the transport has given the connection back, the ending is there
+    // to be taken exactly once. A reset gets it there in one frame; the
+    // ordinary path is the same reconciliation a `TIME_WAIT` reaches later.
+    let reset = station.frame(lfw_tcp::Flags::RST, &[]);
+    endpoint.handle(Some(at(4)), &reset, &mut out);
+    assert_eq!(
+        endpoint.stream_mut().take_ending(),
+        Some(OnboardEnded::ByPeer)
+    );
+    assert_eq!(endpoint.stream_mut().take_ending(), None);
+}
+
+#[test]
+fn a_second_connection_while_one_is_running_is_dropped_in_silence() {
+    let mut endpoint = endpoint();
+    let _running = onboarding_station(&mut endpoint);
+    // A different peer port, so it is a second connection rather than a
+    // retransmitted `SYN`. The table holds one and an established connection is
+    // not evictable, so there is no room and no answer.
+    let mut second = Station::onboarding(0xc352, 0x5678_0000);
+    let syn = second.frame(lfw_tcp::Flags::SYN, &[]);
+    let mut out = vec![0u8; ROOMY];
+    let outcome = endpoint.handle(Some(at(2)), &syn, &mut out);
+    assert_eq!(outcome.reply(), None);
+    assert_eq!(
+        outcome.tcp(),
+        Some(lfw_tcp::Outcome::Rejected(lfw_tcp::Rejection::TableFull))
+    );
+    assert_eq!(endpoint.stream_counters().accepted, 1);
+}
+
+#[test]
+fn a_consumer_answer_past_the_room_for_one_is_refused_rather_than_truncated() {
+    let mut endpoint = endpoint();
+    let _station = onboarding_station(&mut endpoint);
+    let answer = vec![0xa5u8; OUTBOUND_CAPACITY + 16];
+    let kept = endpoint.stream_mut().push(&answer);
+    assert_eq!(kept, OUTBOUND_CAPACITY);
+    assert_eq!(endpoint.stream_counters().refused, 16);
+}
+
+#[test]
+fn a_peer_past_the_window_it_was_given_is_counted_rather_than_believed() {
+    let mut endpoint = endpoint();
+    let _station = onboarding_station(&mut endpoint);
+    // Handed straight to the stream, which is the only way past the window: the
+    // transport would refuse the segment carrying it long before this.
+    let flood = vec![0x5au8; INBOUND_CAPACITY + 8];
+    endpoint.stream_mut().take(&flood);
+    assert_eq!(endpoint.stream().received().len(), INBOUND_CAPACITY);
+    assert_eq!(endpoint.stream_counters().overflowed, 8);
+    assert_eq!(endpoint.stream().room(), 0);
+    // And what the consumer takes is given back to the window.
+    endpoint.stream_mut().consumed(1024);
+    assert_eq!(endpoint.stream().room(), 1024);
+    assert_eq!(endpoint.stream().received().len(), INBOUND_CAPACITY - 1024);
+}
+
+#[test]
+fn a_connection_the_transport_gives_back_ends_the_session_as_forgotten() {
+    let mut endpoint = endpoint();
+    let mut station = onboarding_station(&mut endpoint);
+    let reset = station.frame(lfw_tcp::Flags::RST, &[]);
+    let mut out = vec![0u8; ROOMY];
+    endpoint.handle(Some(at(2)), &reset, &mut out);
+    assert!(endpoint.stream().connection().is_none());
+    assert_eq!(
+        endpoint.stream_mut().take_ending(),
+        Some(OnboardEnded::Forgotten)
+    );
+    assert_eq!(endpoint.stream_counters().forgotten, 1);
+    assert_eq!(OnboardEnded::Forgotten.name(), "forgotten");
+    assert_eq!(OnboardEnded::ByPeer.name(), "peer");
+    assert_eq!(OnboardEnded::ByConsumer.name(), "consumer");
+}
+
+#[test]
+fn an_onboarding_segment_with_no_clock_is_refused_like_every_other() {
+    let mut endpoint = endpoint();
+    let mut station = Station::onboarding(0xc353, 0x9999_0000);
+    let syn = station.frame(lfw_tcp::Flags::SYN, &[]);
+    let mut out = vec![0u8; ROOMY];
+    assert_eq!(endpoint.handle(None, &syn, &mut out), Outcome::Unclocked);
+    assert_eq!(endpoint.counters().unclocked, 1);
+    assert_eq!(endpoint.counters().onboarding_segments, 0);
+}
+
+#[test]
+fn a_segment_too_short_to_name_a_port_goes_to_the_http_stack_and_is_counted() {
+    let mut endpoint = endpoint();
+    // Three bytes: the destination-port field is not whole, so nothing can
+    // choose a stack by it and the segment must still be counted somewhere.
+    let frame = Datagram {
+        protocol: Protocol::TCP,
+        payload: vec![0u8; 3],
+        seal_icmp: false,
+        ..Datagram::echo()
+    }
+    .build();
+    let mut out = vec![0u8; ROOMY];
+    let outcome = endpoint.handle(Some(at(0)), &frame, &mut out);
+    assert!(matches!(outcome, Outcome::Tcp { .. }));
+    assert_eq!(endpoint.counters().tcp_segments, 1);
+    assert_eq!(endpoint.counters().onboarding_segments, 0);
+}
+
+#[test]
+fn the_two_ports_answer_with_different_initial_sequence_numbers() {
+    let mut endpoint = endpoint();
+    let mut management = Station::new(0xc350, 0x1111_0000);
+    let mut onboarding = Station::onboarding(0xc350, 0x1111_0000);
+    let mut out = vec![0u8; ROOMY];
+    let syn = management.frame(lfw_tcp::Flags::SYN, &[]);
+    let len = endpoint
+        .handle(Some(at(0)), &syn, &mut out)
+        .reply()
+        .expect("a SYN-ACK");
+    let first = Ipv4Packet::parse(Ethernet::parse(&out[..len]).expect("a frame").payload)
+        .expect("a datagram")
+        .payload()
+        .get(4..8)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .expect("a sequence number");
+    let syn = onboarding.frame(lfw_tcp::Flags::SYN, &[]);
+    let len = endpoint
+        .handle(Some(at(0)), &syn, &mut out)
+        .reply()
+        .expect("a SYN-ACK");
+    let second = Ipv4Packet::parse(Ethernet::parse(&out[..len]).expect("a frame").payload)
+        .expect("a datagram")
+        .payload()
+        .get(4..8)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .expect("a sequence number");
+    // The same peer, the same instant and the same secret: what makes the two
+    // numbers differ is the local port in the derivation, which is what keeps
+    // one port's sequence space from being readable off the other's.
+    assert_ne!(first, second);
 }

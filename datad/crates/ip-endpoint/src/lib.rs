@@ -26,6 +26,29 @@
 //! idle link. The counters follow `pipeline::DropCounters` — saturating, never
 //! reset — because the rate is the attacker's to choose.
 //!
+//! # Two listening ports, and two different things on them
+//!
+//! [`MANAGEMENT_PORT`] carries the HTTP surface described below.
+//! [`onboard::ONBOARDING_PORT`] carries a **byte stream** instead: an
+//! [`onboard::Stream`] that accepts one connection, hands what arrives to a
+//! consumer above this crate and puts what that consumer answers back on the
+//! wire. It is where a session another domain terminates reaches the network,
+//! and this crate never interprets a byte of it.
+//!
+//! Two transports rather than one, because a `lfw_tcp::TcpStack` answers on one
+//! port and matches a segment to a connection by the peer's address and port
+//! alone. So each port has its own table, its own sequence space and its own
+//! challenge budget, and a segment is handed to exactly one of them —
+//! `lfw_tcp::peeked_destination_port` reads the field before anything is
+//! verified, purely to choose which stack verifies it, and a segment too short
+//! to carry one goes to the HTTP stack, whose parse counts it as the malformed
+//! segment it is.
+//!
+//! **The two stacks' connection handles are not comparable.** Each numbers its
+//! own slots, so the same `ConnectionId` may name a connection in both; nothing
+//! here holds one without knowing which table it came from, and the stream keeps
+//! its own return path rather than sharing the table below.
+//!
 //! # The transport, and the service on it
 //!
 //! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
@@ -81,18 +104,19 @@
 //! exist. **A reply is only ever composed for a neighbour and only for a unicast
 //! one** — a reply to an off-link station would leave under a next hop nothing
 //! chose, the gateway being for traffic this node *originates*, and a reply
-//! addressed to a group is a reflector. And there is **one TCP port and no UDP**:
-//! one service, one port.
+//! addressed to a group is a reflector. And there are **two TCP ports and no
+//! UDP**: one service each, and nothing listens anywhere else.
 //!
 //! # No allocator, and every buffer a fixed array
 //!
 //! [`Endpoint::handle`] writes its reply into storage the caller owns, so the
 //! caller decides where a reply is composed — in the protection domain that runs
 //! this, a buffer it has just taken from a pool. Nothing here is allocated and
-//! nothing here is sized by anything a peer sends: the connection table, each
-//! connection's request slot, the one response staging buffer and the outbound
-//! session's request and answer are fixed arrays sized by the constants below,
-//! in [`http`] and in [`outbound`].
+//! nothing here is sized by anything a peer sends: the two connection tables,
+//! each connection's request slot, the one response staging buffer, the outbound
+//! session's request and answer and the onboarding stream's two directions are
+//! fixed arrays sized by the constants below, in [`http`], in [`outbound`] and
+//! in [`onboard`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -116,11 +140,13 @@ use net_headers::{
 
 pub mod http;
 pub mod neighbour;
+pub mod onboard;
 pub mod outbound;
 pub mod route;
 
 use http::{HttpCounters, REQUEST_CAPACITY, Server};
 use neighbour::{Learned, NeighbourCache, NeighbourCounters, Resolution};
+use onboard::{INBOUND_CAPACITY, ONBOARD_CONNECTIONS, ONBOARDING_PORT, Stream, StreamCounters};
 use outbound::{Ended, OpenError, OutboundCounters, Phase, Resolutions, Session};
 use route::Port;
 
@@ -303,6 +329,12 @@ pub enum Outcome {
     /// zero where it composed nothing; what became of the segment is in
     /// [`Outcome::tcp`] and every cause is counted in [`Endpoint::tcp_counters`].
     Tcp { len: usize, outcome: TcpOutcome },
+    /// A TCP segment for the onboarding port was processed, on
+    /// [`Outcome::Tcp`]'s terms and through the other transport. Its own
+    /// variant rather than a field on that one, because the two carry different
+    /// tables and different counters: folding them would make either port's
+    /// numbers a total nobody can attribute.
+    Onboarding { len: usize, outcome: TcpOutcome },
     /// A TCP segment or an ARP reply arrived before this node had established a
     /// time. **Ours**, not the sender's: a node that has not finished booting is
     /// not a peer misbehaving. An ARP reply is among them because a cache entry
@@ -331,8 +363,9 @@ impl Outcome {
     pub const fn reply(self) -> Option<usize> {
         match self {
             Self::ArpReply { len } | Self::EchoReply { len } => Some(len),
-            Self::Tcp { len, .. } if len > 0 => Some(len),
+            Self::Tcp { len, .. } | Self::Onboarding { len, .. } if len > 0 => Some(len),
             Self::Tcp { .. }
+            | Self::Onboarding { .. }
             | Self::Neighbour(_)
             | Self::Unclocked
             | Self::NotForUs
@@ -342,11 +375,12 @@ impl Outcome {
         }
     }
 
-    /// What the transport made of the segment, where this was one.
+    /// What a transport made of the segment, where this was one — whichever of
+    /// the two ports it arrived on.
     #[must_use]
     pub const fn tcp(self) -> Option<TcpOutcome> {
         match self {
-            Self::Tcp { outcome, .. } => Some(outcome),
+            Self::Tcp { outcome, .. } | Self::Onboarding { outcome, .. } => Some(outcome),
             _ => None,
         }
     }
@@ -374,9 +408,14 @@ pub struct EndpointCounters {
     /// Replies decided on and not written: a caller-side failure, and the one count
     /// here that is not about the wire.
     pub reply_refused: u64,
-    /// TCP segments handed to the transport, whatever it made of them; what each
-    /// became is counted in [`Endpoint::tcp_counters`], one field per cause.
+    /// TCP segments handed to the HTTP port's transport, whatever it made of
+    /// them; what each became is counted in [`Endpoint::tcp_counters`], one
+    /// field per cause.
     pub tcp_segments: u64,
+    /// TCP segments handed to the onboarding port's transport, on
+    /// `tcp_segments`' terms and counted apart from it: the two ports have two
+    /// tables, and one total over both would say nothing about either.
+    pub onboarding_segments: u64,
     /// TCP segments that arrived with no clock; see [`Outcome::Unclocked`].
     pub unclocked: u64,
     /// One slot per [`Unhandled`] reason, in [`Unhandled::ALL`] order.
@@ -394,6 +433,7 @@ impl EndpointCounters {
             malformed: 0,
             reply_refused: 0,
             tcp_segments: 0,
+            onboarding_segments: 0,
             unclocked: 0,
             unhandled: [0; Unhandled::ALL.len()],
         }
@@ -432,6 +472,7 @@ impl EndpointCounters {
             .saturating_add(self.malformed)
             .saturating_add(self.reply_refused)
             .saturating_add(self.tcp_segments)
+            .saturating_add(self.onboarding_segments)
             .saturating_add(self.unclocked)
             .saturating_add(self.unhandled_total())
     }
@@ -449,6 +490,9 @@ impl EndpointCounters {
             Outcome::Malformed(_) => self.malformed = self.malformed.saturating_add(1),
             Outcome::ReplyRefused(_) => self.reply_refused = self.reply_refused.saturating_add(1),
             Outcome::Tcp { .. } => self.tcp_segments = self.tcp_segments.saturating_add(1),
+            Outcome::Onboarding { .. } => {
+                self.onboarding_segments = self.onboarding_segments.saturating_add(1);
+            }
             Outcome::Unclocked => self.unclocked = self.unclocked.saturating_add(1),
             Outcome::Unhandled(reason) => {
                 if let Some(count) = self.unhandled.get_mut(reason.slot()) {
@@ -480,6 +524,11 @@ pub struct Endpoint {
     counters: EndpointCounters,
     tcp: TcpStack<TCP_CONNECTIONS>,
     http: Server<TCP_CONNECTIONS>,
+    /// The onboarding port's own transport, and the stream on it. Two fields
+    /// rather than one because they are the same pairing as `tcp` and `http`
+    /// beside them: a transport, and the thing that decides what its bytes mean.
+    onboarding: TcpStack<ONBOARD_CONNECTIONS>,
+    stream: Stream,
     paths: [Option<ReturnPath>; TCP_CONNECTIONS],
     neighbours: NeighbourCache,
     outbound: Option<Session>,
@@ -602,8 +651,20 @@ impl Endpoint {
                 MANAGEMENT_PORT,
                 TCP_MSS,
                 REQUEST_CAPACITY as u32,
+                secret.clone(),
+            ),
+            // The same secret and so the same unpredictable initial sequence
+            // numbers: the generator mixes the four-tuple in, and the two
+            // stacks' tuples differ in the local port, so no number of one is
+            // derivable from a number of the other.
+            onboarding: TcpStack::new(
+                address,
+                ONBOARDING_PORT,
+                TCP_MSS,
+                INBOUND_CAPACITY as u32,
                 secret,
             ),
+            stream: Stream::new(),
             http: Server::new(),
             paths: [None; TCP_CONNECTIONS],
             neighbours: NeighbourCache::new(),
@@ -1398,7 +1459,15 @@ impl Endpoint {
             return Outcome::Unhandled(Unhandled::Fragmented);
         }
         if header.protocol == Protocol::TCP {
-            return self.tcp(now, ethernet.header.source, &packet, out);
+            // The one thing read out of a segment before anything about it has
+            // been verified, and it decides only which transport verifies it.
+            // A segment too short to carry the field goes to the HTTP port's
+            // stack, whose parse counts it as the malformed segment it is —
+            // so no segment goes uncounted for being unreadable here.
+            return match lfw_tcp::peeked_destination_port(packet.payload()) {
+                Some(ONBOARDING_PORT) => self.onboarding(now, ethernet.header.source, &packet, out),
+                _ => self.tcp(now, ethernet.header.source, &packet, out),
+            };
         }
         if header.protocol != Protocol::ICMP {
             return Outcome::Unhandled(Unhandled::Protocol(Some(header.protocol)));
@@ -1421,6 +1490,150 @@ impl Endpoint {
             Ok(len) => Outcome::EchoReply { len },
             Err(error) => Outcome::ReplyRefused(error),
         }
+    }
+
+    /// Hand one segment to the **onboarding** transport and keep whatever it
+    /// delivered for the consumer above this crate.
+    ///
+    /// Nothing is composed in answer beyond what the transport itself owes —
+    /// an acknowledgement, a handshake, a reset. What the consumer answers with
+    /// goes out of [`poll_onboarding`](Self::poll_onboarding) instead, because
+    /// the consumer is another protection domain and is not reachable inside
+    /// the frame that provoked it.
+    fn onboarding(
+        &mut self,
+        now: Option<Monotonic>,
+        peer_mac: MacAddress,
+        packet: &Ipv4Packet<'_>,
+        out: &mut [u8],
+    ) -> Outcome {
+        let Some(now) = now else {
+            return Outcome::Unclocked;
+        };
+        let source = packet.header().source;
+        let received = {
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Outcome::ReplyRefused(ReplyError::DoesNotFit {
+                    needed: Ipv4Frame::PAYLOAD_AT,
+                    capacity: out.len(),
+                });
+            };
+            self.onboarding
+                .receive(now, source, packet.payload(), segment)
+        };
+        let outcome = received.outcome;
+        let len = received.emitted;
+        let Some(connection) = received.connection else {
+            if len == 0 {
+                return Outcome::Onboarding { len: 0, outcome };
+            }
+            // A reset for a 4-tuple this port holds no connection for: the pair
+            // the frame arrived from is the whole of the address, and the
+            // segment still needs its two headers.
+            return Outcome::Onboarding {
+                len: self.frame_around((peer_mac, source), len, out),
+                outcome,
+            };
+        };
+        // A handle the transport no longer holds is not a session to take up:
+        // a reset frees the slot inside the very call that reports the
+        // connection it was on, and adopting it would hold this port's one slot
+        // for a connection that is already gone. The reconciliation at the foot
+        // of this method is what releases the session it *was* on.
+        if self.onboarding.connection(connection).is_some() {
+            self.stream.accepted(connection, peer_mac, source);
+        }
+        if !received.data.is_empty() {
+            self.stream.take(received.data);
+        }
+        if received.peer_closed {
+            self.stream.note_peer_closed();
+        }
+        // Lossless: bounded by the inbound array.
+        let room = self.stream.room() as u32;
+        self.onboarding.set_receive_window(connection, room);
+        // Read before the reconciliation, which frees the session of a
+        // connection this very segment ended — a reset, or the last
+        // acknowledgement of a close.
+        let path = self.stream.peer().unwrap_or((peer_mac, source));
+        self.stream.reconcile(&self.onboarding);
+        if len == 0 {
+            return Outcome::Onboarding { len: 0, outcome };
+        }
+        Outcome::Onboarding {
+            len: self.frame_around(path, len, out),
+            outcome,
+        }
+    }
+
+    /// Send whatever the onboarding session now owes: a timer of its own first,
+    /// then the bytes its consumer answered with, then its close.
+    ///
+    /// Driven in a loop until it answers [`Polled::Idle`], as the three polls
+    /// beside it are. Each answer either hands a range to the transport, frees
+    /// the connection or moves a deadline, so the loop terminates.
+    pub fn poll_onboarding(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
+        self.stream.reconcile(&self.onboarding);
+        let timeout = {
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Polled::Idle;
+            };
+            self.onboarding.poll_timeouts(now, segment)
+        };
+        if let Some(timeout) = timeout {
+            // Read before the answer: a connection the transport abandoned or
+            // reaped is already gone from its table by the time it says so.
+            let path = self.stream.peer();
+            let composed = out.get_mut(Ipv4Frame::PAYLOAD_AT..).and_then(|segment| {
+                self.stream
+                    .answer(&mut self.onboarding, now, timeout, segment)
+            });
+            self.stream.reconcile(&self.onboarding);
+            return match (path, composed) {
+                (Some(path), Some(len)) => Polled::Frame {
+                    len: self.frame_around(path, len, out),
+                },
+                _ => Polled::Handled,
+            };
+        }
+        let path = self.stream.peer();
+        let composed = out
+            .get_mut(Ipv4Frame::PAYLOAD_AT..)
+            .and_then(|segment| self.stream.drive(&mut self.onboarding, now, segment));
+        match (path, composed) {
+            (Some(path), Some(len)) => Polled::Frame {
+                len: self.frame_around(path, len, out),
+            },
+            // A segment the transport took and this end has nowhere to send:
+            // the transport holds the range and will ask for it again.
+            (None, Some(_)) => Polled::Handled,
+            (_, None) => Polled::Idle,
+        }
+    }
+
+    /// The onboarding session, for a consumer reading what arrived.
+    #[must_use]
+    pub const fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// The onboarding session, for a consumer answering it.
+    pub const fn stream_mut(&mut self) -> &mut Stream {
+        &mut self.stream
+    }
+
+    /// What the onboarding port's own stream has done, one field per decision.
+    #[must_use]
+    pub const fn stream_counters(&self) -> StreamCounters {
+        self.stream.counters()
+    }
+
+    /// What the onboarding port's transport has seen, one field per cause. Its
+    /// own table and its own numbers: see [`tcp_counters`](Self::tcp_counters)
+    /// for the HTTP port's.
+    #[must_use]
+    pub const fn onboarding_counters(&self) -> TcpCounters {
+        self.onboarding.counters()
     }
 
     /// Hand one segment to the transport, drive the server over it, and compose

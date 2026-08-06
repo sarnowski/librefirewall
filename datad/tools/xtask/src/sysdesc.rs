@@ -85,8 +85,8 @@ use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
     DOWNLOAD_REQUEST_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
-    SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
-    TAP_RECORDS_REGION_SIZE,
+    RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
+    SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -376,6 +376,32 @@ const SIGNING_WITHHELD: &str = "exactly two domains map the signing delegation, 
      cannot cross either region, which is a property of this row TOGETHER WITH the ABI — \
      `wire::signing` has no field a 32-byte scalar fits in, in either direction, and this row is \
      what makes the holder the only party that chooses what the asking domain reads";
+
+/// What the TLS relay's two regions withhold, and why the pair widens nothing.
+///
+/// The bytes that cross are ciphertext the management domain already carried: one
+/// direction is what a peer put on the wire and that domain read off it, the
+/// other is what it is about to put back. So the grant costs that domain nothing
+/// it did not have. What it must not reach is everything behind those bytes — the
+/// arena, the device key, the session secrets, every decrypted byte — and none of
+/// that has a field in `wire::relay` in either direction.
+///
+/// The half a checker can hold is the mapper set and the perms. A third mapper
+/// would be a domain reading an operator's session; and between the two that do
+/// map it, a management domain able to write the reply could put bytes of its own
+/// choosing on the wire as though the terminating end had produced them, which
+/// under the appliance's own identity is a forgery rather than a wrong answer.
+const RELAY_WITHHELD: &str = "exactly two domains map the TLS relay, and no third maps either \
+     half in either direction — no driver, no forwarder, no recorder, no console, no \
+     configuration domain, and NOT THE STORE DOMAIN, which holds the private scalar and must \
+     map no region a frame's bytes reach. Between the two that do map it the withholding is in \
+     the perms: the management domain states what arrived and CANNOT WRITE THE REPLY, so it \
+     cannot put records of its own choosing on the wire as though the terminating end had \
+     produced them; and the cryptography domain answers and cannot write the question. What \
+     crosses is ciphertext the management domain already carried or is about to carry, so this \
+     pair widens that domain's reach over nothing — and what stays behind it, the arena, the \
+     key, the session secrets and every plaintext byte, has no field in `wire::relay` to cross \
+     in";
 
 /// What the connection table's single mapper buys, quoted into the finding on it
 /// gaining a second one.
@@ -989,6 +1015,30 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("crypto"), read_write("store")],
         withheld: Some(SIGNING_WITHHELD),
     },
+    // The TLS relay, the signing delegation's split between a different pair of
+    // domains: the one that owns the network writes what arrived and reads what
+    // to send, and the one that terminates the session writes the answer and
+    // reads the question.
+    RegionRule {
+        name: "relay_request",
+        size: ExpectedSize {
+            rust_name: "wire::RELAY_REQUEST_REGION_SIZE",
+            bytes: RELAY_REQUEST_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("management"), read_only("crypto")],
+        withheld: Some(RELAY_WITHHELD),
+    },
+    RegionRule {
+        name: "relay_reply",
+        size: ExpectedSize {
+            rust_name: "wire::RELAY_REPLY_REGION_SIZE",
+            bytes: RELAY_REPLY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("management"), read_write("crypto")],
+        withheld: Some(RELAY_WITHHELD),
+    },
     // The log transport: one ring per writing domain, split into two regions so
     // the two directions can carry opposite authority. Every pair below is the
     // same two rows twice over, and the pattern is the whole of the design:
@@ -1544,7 +1594,7 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
 /// the same thing: the forwarder's two ends are about a domain that holds one
 /// send capability and must hold no more, and this end is about a domain that
 /// holds none at all.
-const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY ONE send      capability in this system — on the configuration domain, where a submitted document is      otherwise invisible to a peer that never polls — and this is an end that says it is not      this one. It is a notified-driven consumer here: it is woken, it drains, it returns. A send      capability on this end would be one on a driver that never leaves `init` and so could never      observe it — authority for nothing — and it would make pds/nic-driver's claim that its      `notified` entrypoint is unreachable by *capability* false for the third instance while      staying true for the other two";
+const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY TWO send      capabilities in this system — on the configuration domain, where a submitted document is      otherwise invisible to a peer that never polls, and on the cryptography domain, where a      TLS record written into the relay is invisible for the same reason — and this is an end      that says it is neither. It is a notified-driven consumer here: it is woken, it drains,      it returns. A send capability on this end would be one on a driver that never leaves      `init` and so could never observe it — authority for nothing — and it would make      pds/nic-driver's claim that its `notified` entrypoint is unreachable by *capability*      false for the third instance while staying true for the other two";
 
 /// As [`MANAGEMENT_CHANNEL_ONE_WAY`], for the store domain's one and only end. A
 /// claim of its own rather than a third use of that one, because what it protects
@@ -1680,6 +1730,24 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         notification: Notification::MayNotSend {
             claim: STORE_CHANNEL_RECEIVE_ONLY,
         },
+    },
+    // The TLS relay, granted in BOTH directions and the only channel here that is
+    // between two domains at the SAME priority. Neither is scheduled while the
+    // other runs and neither has a loop a peer's write could be observed in, so
+    // each side signals and returns to its event loop. A spin instead — the
+    // signing delegation's shape — would burn the asking domain's whole slice
+    // against a domain the scheduler has no reason to run, on the path of every
+    // record of every handshake, and the alternative to that is raising one of
+    // the two above the dataplane for a session an unauthenticated peer opens.
+    ChannelEnd {
+        domain: "management",
+        id: "3",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "crypto",
+        id: "1",
+        notification: Notification::MaySend,
     },
 ];
 

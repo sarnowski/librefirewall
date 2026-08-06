@@ -164,6 +164,31 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// Which end finished an onboarding session, as the two domains that carry
+    /// one report it.
+    ///
+    /// The tokens are single words on purpose, unlike [`DialOutcome`]'s: they
+    /// name a *party* rather than a fault, and there is no fault vocabulary
+    /// here — what went wrong on this path is a `cause=` token on a refusal
+    /// record of its own, so a session's end and a session's failure are two
+    /// facts a reader never has to disentangle from one field.
+    OnboardEnd {
+        /// The peer on the network closed its half. The ordinary end of a
+        /// session an administrator finished with.
+        Peer => "peer",
+        /// The domain terminating the session said it was over.
+        Consumer => "consumer",
+        /// The connection stopped existing while neither end had said
+        /// anything: a reset, an eviction under table pressure, a reaping.
+        Forgotten => "forgotten",
+        /// The session was ended by this appliance because the relay carrying
+        /// it answered something that could not be believed or acted on. The
+        /// `cause=` token on the record beside this one says which.
+        Refused => "refused",
+    }
+}
+
+closed_vocabulary! {
     /// The lifecycle points a domain reports. `Negotiated` sits between the
     /// other two because a device that answered and a device whose queues are
     /// primed are different failures to be looking at: one is a bring-up

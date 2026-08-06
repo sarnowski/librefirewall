@@ -1283,3 +1283,111 @@ fn a_commit_that_moves_the_addressing_replaces_the_endpoint() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The onboarding port, as the stage exposes it to the domain above.
+
+/// A `SYN` from the station to the onboarding port, in a whole frame.
+fn onboarding_syn() -> Vec<u8> {
+    let mut frame = vec![0u8; 256];
+    let len = lfw_ip_endpoint::Outgoing {
+        source_port: 0xc351,
+        destination_port: crate::ONBOARDING_PORT,
+        sequence: lfw_ip_endpoint::SeqNumber::new(0x2222_0000),
+        acknowledgement: lfw_ip_endpoint::SeqNumber::new(0),
+        flags: lfw_ip_endpoint::Flags::SYN,
+        window: 4096,
+        mss: Some(lfw_ip_endpoint::TCP_MSS),
+        window_scale: None,
+        payload: &[],
+    }
+    .write(
+        STATION_ADDRESS,
+        OUR_ADDRESS,
+        frame
+            .get_mut(net_headers::Ipv4Frame::PAYLOAD_AT..)
+            .expect("room for a segment"),
+    )
+    .expect("room for a segment");
+    let total = net_headers::Ipv4Frame {
+        destination_mac: OUR_MAC,
+        source_mac: STATION_MAC,
+        source: STATION_ADDRESS,
+        destination: OUR_ADDRESS,
+        protocol: net_headers::Protocol::TCP,
+    }
+    .write(&mut frame, len)
+    .expect("room for a frame");
+    frame.truncate(total);
+    frame
+}
+
+/// A port with no addressing has no session, answers nothing about one, and is
+/// not a thing a caller has to check before asking: every accessor is total.
+#[test]
+fn an_unaddressed_port_has_no_onboarding_session_to_carry() {
+    let mut unaddressed = Fixture::unaddressed();
+    assert!(unaddressed.stage.onboard_session().is_none());
+    assert!(unaddressed.stage.onboard_received().is_empty());
+    assert!(!unaddressed.stage.onboard_peer_closed());
+    assert_eq!(unaddressed.stage.onboard_push(b"nowhere"), 0);
+    assert!(unaddressed.stage.take_onboard_ending().is_none());
+    assert_eq!(
+        unaddressed.stage.onboard_counters(),
+        crate::OnboardCounters::default()
+    );
+    // And driving it composes nothing rather than refusing to be driven.
+    unaddressed.stage.onboard_consumed(16);
+    unaddressed.stage.onboard_end_session();
+    let hz = core::num::NonZeroU64::new(TSC_HZ).expect("a nonzero frequency");
+    unaddressed
+        .stage
+        .drive_onboarding(lfw_clock::Calibration::new(hz, Ticks(0), 1).monotonic(NOW));
+}
+
+/// A session on the onboarding port, carried through the stage's own surface:
+/// the domain above sees the connection, the bytes, the answer and the close.
+#[test]
+fn an_onboarding_session_crosses_the_stage_and_leaves_on_the_transmit_pipeline() {
+    let mut fixture = Fixture::new();
+    // A transport needs a time: a port with no calibration refuses every
+    // segment, which is the state this test is not about.
+    fixture.clock.publish(&CalibrationImage {
+        tsc_hz: TSC_HZ,
+        boot_ticks: 0,
+        boot_unix_nanos: 1_785_443_220_000_000_000,
+    });
+    assert_eq!(fixture.stage.take_clock(fixture.clock), None);
+    fixture.receive(&onboarding_syn()).expect("a full pool");
+    assert_eq!(fixture.stage.poll_stage(NOW), 1);
+    let session = fixture
+        .stage
+        .onboard_session()
+        .expect("a connection the transport accepted");
+    // The handshake's answer left on the transmit pipeline, which is what makes
+    // this the stage's own path rather than the endpoint's.
+    assert!(fixture.stage.counters().replies_sent >= 1);
+
+    // What the domain above answers with is taken and **held**: the handshake
+    // is not complete, so nothing may go on the wire yet, and a stream that
+    // sent anyway would be putting a session's bytes into a connection the peer
+    // has not finished opening.
+    assert_eq!(fixture.stage.onboard_push(b"records"), 7);
+    fixture.stage.onboard_end_session();
+    let before = fixture.stage.counters().replies_sent;
+    let now = fixture.stage.monotonic(NOW).expect("a calibration");
+    fixture.stage.drive_onboarding(now);
+    assert_eq!(
+        fixture.stage.counters().replies_sent,
+        before,
+        "a half-open connection carried a session's bytes"
+    );
+    assert_eq!(fixture.stage.onboard_counters().sent, 0);
+    assert_eq!(fixture.stage.onboard_counters().accepted, 1);
+    assert_eq!(fixture.stage.onboard_counters().closed_by_consumer, 1);
+    // The session is still the one it was: a close is not a new connection.
+    assert_eq!(fixture.stage.onboard_session(), Some(session));
+    assert!(!fixture.stage.onboard_peer_closed());
+    assert!(fixture.stage.onboard_received().is_empty());
+    fixture.stage.onboard_consumed(4);
+}

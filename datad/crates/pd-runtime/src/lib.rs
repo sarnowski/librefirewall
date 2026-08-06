@@ -527,6 +527,7 @@ pub mod configuration;
 pub mod download;
 pub mod endpoint;
 pub mod handover;
+pub mod relay;
 pub mod stats;
 pub mod tap;
 
@@ -535,7 +536,8 @@ pub use configuration::{CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Submissio
 pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,
-    EndpointStageCounters, MAX_REPLY_LEN, OUTPUT_LIMIT, TIMER_LIMIT, calibration_from,
+    EndpointStageCounters, MAX_REPLY_LEN, ONBOARD_LIMIT, OUTPUT_LIMIT, TIMER_LIMIT,
+    calibration_from,
 };
 // The two types a domain needs to name the channel it dials: the address it
 // dials and the outcome it reports, reached through this facade rather than
@@ -549,12 +551,19 @@ pub use handover::{
 /// are part of it.
 pub use lfw_flow::{ApplianceFlowTable, FLOW_TABLE_BYTES};
 pub use lfw_ip_endpoint::IsnSecret;
+pub use lfw_ip_endpoint::onboard::{
+    Ended as OnboardEnded, INBOUND_CAPACITY as ONBOARD_INBOUND_CAPACITY, ONBOARDING_PORT,
+    OUTBOUND_CAPACITY as ONBOARD_OUTBOUND_CAPACITY, StreamCounters as OnboardCounters,
+};
 pub use lfw_ip_endpoint::outbound::{
     DialFacts, Ended, OpenError, REQUEST_CAPACITY as DIAL_REQUEST_CAPACITY, Resolutions,
 };
 pub use lfw_ip_endpoint::route::{RouteRefusal, Via};
 pub use net_headers::Ipv4Address;
 pub use pipeline::{Configuration, PolicySweep, Tracking};
+pub use relay::{
+    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Relay, RelayFailure, RelayPass, RelayReport,
+};
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,
     SubmissionCounters, config_sample, flow_sample, forwarder_sample, log_sample,

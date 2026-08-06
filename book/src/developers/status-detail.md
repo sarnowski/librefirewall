@@ -2459,14 +2459,38 @@ and that bound is in the type rather than in the caller that must not exceed it.
 operation that asks for a plaintext**: the vocabulary has four values and none of them means "give
 me what the peer said". And there is **no field a private key fits in**, in either direction. The
 module is host-tested against a peer that keeps to none of the protocol — every bound is a typed
-refusal or a typed fault and nothing in it can panic — and, exactly as `wire::signing` did when it
-landed, it has **no consumer on either end yet**: no domain maps either region, no channel joins the
-two, and nothing at all crosses it.
+refusal or a typed fault and nothing in it can panic.
 
-**Missing.** Nothing dials with any of this. The management domain now opens a TCP connection out of
-its own port and carries ten bytes of first-party probe over it, and none of that touches this
-domain: there is no channel above the transport and no onboarding server, and the cryptography
-domain holds no device, so what is proved here is still proved against this same build on both ends. The session is proved
+**Both ends of that channel now exist, and the port they serve is open.** The management endpoint
+listens on a second TCP port — a first-party constant, not the plain-HTTP one, which keeps its own
+surface — and what runs on it is a byte stream rather than a request and a response: one connection
+at a time, a fixed array of what arrived and a fixed array of what goes back, and nothing in that
+crate that interprets a byte. The two ports are two transports on one address, because a stack
+answers on one port and matches a segment to a connection by the peer's address and port alone; a
+segment is handed to exactly one of them by a destination-port read taken **before** anything is
+verified, and the stack it reaches parses and refuses it on its own terms. The management domain
+maps the relay's two regions read-write and read-only, holds a send capability on the cryptography
+domain, and moves an accepted connection's bytes across one item at a time — the ABI's window is
+one — closing when either end says so. The cryptography domain answers: it opens the session, takes
+what is delivered, counts it, refuses what it must, and closes. **It runs no TLS yet**, and the zero
+it reports for bytes sent back is the fact rather than a placeholder — what the protocol will add is
+what it answers with, and the handover, its bounds and its refusals are settled around it.
+
+*Every distinct failure of that path is diagnosable from the console alone.* Fourteen tokens on the
+management domain and five on the cryptography one, each naming one cause: the terminating domain's
+five refusals quoted whole, the six answers the network end could not believe, and this appliance's
+own three bounds — a far end that said nothing inside the answer timeout, a window found taken, and
+an answer that outgrew the room the port keeps for one. Beside each, both domains report the
+session itself — how many items crossed, how many bytes each way, and which end finished it — so
+two accounts of one session are comparable and a relay that lost something cannot read as one that
+carried nothing.
+
+**Missing.** The rustls server on the far end of that relay, which is what would make the onboarding
+port an onboarding *server*: the cryptography end today accepts the handover, counts what crosses and
+closes, and answers with nothing. **No system scenario boots the port yet** — what holds the path is
+the host suite and the three fuzz harnesses that address it, and a booted image is not yet held to a
+connection reaching the cryptography domain and closing cleanly. The management domain's own dial is
+a separate thing and still carries ten bytes of first-party probe and no protocol at all. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,
 standing in for a management server and an anchor this appliance has never seen. There is no CSR

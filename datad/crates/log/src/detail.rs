@@ -26,7 +26,7 @@ use lfw_clock::UtcNanos;
 
 use net_headers::Ipv4Address;
 
-use crate::event::{DialOutcome, NextHopVia, Primitive};
+use crate::event::{DialOutcome, NextHopVia, OnboardEnd, Primitive};
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
@@ -363,6 +363,29 @@ pub enum DomainDetail<C = &'static str> {
         resets_received: u64,
         resets_sent: u64,
         answered: bool,
+    },
+    /// What one onboarding session carried, and which end finished it.
+    ///
+    /// Emitted by **both** domains that carry such a session — the one that
+    /// owns the network and the one that terminates the exchange — because the
+    /// whole point of the split is that neither of them is the other's witness:
+    /// two records that disagree are a relay that lost something, and one
+    /// record could never say so.
+    ///
+    /// **No byte of the session has a representation here.** What crosses the
+    /// relay is a peer's ciphertext and it reaches no surface at all; what is
+    /// reported is how much of it there was, which way it went, and who hung
+    /// up. The counts are this end's own and are bounded by this end's own
+    /// constants, so nothing a peer sends decides how many records there are.
+    Onboarded {
+        /// Items handed over the relay for this session: the operations one end
+        /// asked and the other answered. A count of handovers, not of bytes.
+        relayed: u64,
+        /// Bytes taken off the network for this session, as this end saw them.
+        received: u64,
+        /// Bytes put back on the network for it.
+        sent: u64,
+        ended: OnboardEnd,
     },
     /// The two sequence numbers behind an unacceptable acknowledgement: what the
     /// peer claimed, and what this end had actually sent.

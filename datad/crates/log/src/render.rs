@@ -318,6 +318,20 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " dial-syns={syns} dial-resets-received={resets_received} \
              dial-resets-sent={resets_sent} dial-answered={answered}"
         ),
+        // The keys all begin `onboard-` for the `dial-` group's reason: a
+        // reader picks one session's story out of a boot transcript by one
+        // prefix, and both domains that carry a session write the same four
+        // keys, so the two accounts are compared field by field.
+        DomainDetail::Onboarded {
+            relayed,
+            received,
+            sent,
+            ended,
+        } => write!(
+            cursor,
+            " onboard-relayed={relayed} onboard-received={received} onboard-sent={sent} \
+             onboard-ended={ended}"
+        ),
         // Decimal, unlike a refusal's hexadecimal numbers below: these are
         // sequence numbers, and a peer's own capture and this appliance's
         // console are compared digit for digit.

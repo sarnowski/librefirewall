@@ -51,7 +51,7 @@ const DIGEST_BYTES: usize = 32;
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, Primitive, RejectReason, Value,
+    ObjectKind, OnboardEnd, Primitive, RejectReason, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -96,6 +96,7 @@ pub enum Vocabulary {
     Primitive,
     DialOutcome,
     NextHopVia,
+    OnboardEnd,
 }
 
 impl Vocabulary {
@@ -114,6 +115,7 @@ impl Vocabulary {
             Self::Primitive => Primitive::ALL.len(),
             Self::DialOutcome => DialOutcome::ALL.len(),
             Self::NextHopVia => NextHopVia::ALL.len(),
+            Self::OnboardEnd => OnboardEnd::ALL.len(),
         }
     }
 
@@ -132,6 +134,7 @@ impl Vocabulary {
             // console `cause=`, and the spelling is what keeps the two apart.
             Self::DialOutcome => "dial outcome",
             Self::NextHopVia => "next hop choice",
+            Self::OnboardEnd => "onboarding session end",
         }
     }
 }
@@ -183,6 +186,11 @@ fn dial_outcome_of(token: u8) -> Result<DialOutcome, DecodeError> {
 /// A next-hop-choice token as the member it selects, on the same terms.
 fn next_hop_via_of(token: u8) -> Result<NextHopVia, DecodeError> {
     variant(NextHopVia::ALL, Vocabulary::NextHopVia, token)
+}
+
+/// A session-end token as the member it selects, on the same terms.
+fn onboard_end_of(token: u8) -> Result<OnboardEnd, DecodeError> {
+    variant(OnboardEnd::ALL, Vocabulary::OnboardEnd, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -518,6 +526,17 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::DialSequence.to_bits();
                     record.operands = [u64::from(*claimed), u64::from(*expected), 0, 0];
                 }
+                DomainDetail::Onboarded {
+                    relayed,
+                    received,
+                    sent,
+                    ended,
+                } => {
+                    record.detail = LogDetailKind::Onboarded.to_bits();
+                    // The token first, where every detail whose leading word
+                    // names a vocabulary carries it — `Dialled`'s own order.
+                    record.operands = [*ended as u64, *relayed, *received, *sent];
+                }
                 DomainDetail::Delegated { device, signatures } => {
                     record.detail = LogDetailKind::Delegated.to_bits();
                     // The identifier in its two halves, most significant first,
@@ -778,6 +797,20 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             claimed: *claimed,
             expected: *expected,
         },
+        // The token was ranged to the vocabulary by `wire`; the three counts are
+        // tallies the emitting domain kept about its own session, so every bit
+        // pattern of each is one it could have written.
+        CheckedDetail::Onboarded {
+            ended,
+            relayed,
+            received,
+            sent,
+        } => DomainDetail::Onboarded {
+            relayed: *relayed,
+            received: *received,
+            sent: *sent,
+            ended: onboard_end_of(*ended)?,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and a signature count is a tally, so every bit
         // pattern of the three words is one a delegating domain could have read.
@@ -923,6 +956,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::DialSequence { claimed, expected } => {
                         DomainDetail::DialSequence { claimed, expected }
                     }
+                    DomainDetail::Onboarded {
+                        relayed,
+                        received,
+                        sent,
+                        ended,
+                    } => DomainDetail::Onboarded {
+                        relayed,
+                        received,
+                        sent,
+                        ended,
+                    },
                     DomainDetail::Dialled {
                         destination,
                         port,
@@ -1062,6 +1106,7 @@ const _: () = {
     assert!(Primitive::ALL.len() == wire::LOG_PRIMITIVE_COUNT as usize);
     assert!(DialOutcome::ALL.len() == wire::LOG_DIAL_OUTCOME_COUNT as usize);
     assert!(NextHopVia::ALL.len() == wire::LOG_NEXT_HOP_VIA_COUNT as usize);
+    assert!(OnboardEnd::ALL.len() == wire::LOG_ONBOARD_END_COUNT as usize);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);
     assert!(crate::MAX_CAUSE_LEN == wire::LOG_CAUSE_BYTES);

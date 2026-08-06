@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<librefirewall>
+  <management address="10.0.2.15" prefix-length="24" gateway="10.0.2.2" mac="52:54:00:12:34:52" />
+  <interfaces>
+    <interface id="port1" mac="52:54:00:00:00:01" address="10.1.0.1" prefix-length="24" />
+    <interface id="port2" mac="52:54:00:00:00:02" address="10.2.0.1" prefix-length="24" />
+    <interface id="port3" mac="52:54:00:00:00:03" address="10.3.0.1" prefix-length="24" />
+    <interface id="port4" mac="52:54:00:00:00:04" address="10.4.0.1" prefix-length="24" />
+    <interface id="port5" mac="52:54:00:00:00:05" address="10.5.0.1" prefix-length="24" />
+    <interface id="port6" mac="52:54:00:00:00:06" address="10.6.0.1" prefix-length="24" />
+    <interface id="port7" mac="52:54:00:00:00:07" address="10.7.0.1" prefix-length="24" />
+    <interface id="port8" mac="52:54:00:00:00:08" address="10.8.0.1" prefix-length="24" />
+    <interface id="port9" mac="52:54:00:00:00:09" address="10.9.0.1" prefix-length="24" />
+    <interface id="port10" mac="52:54:00:00:00:0a" address="10.10.0.1" prefix-length="24" />
+    <interface id="port11" mac="52:54:00:00:00:0b" address="10.11.0.1" prefix-length="24" />
+    <interface id="port12" mac="52:54:00:00:00:0c" address="10.12.0.1" prefix-length="24" />
+    <interface id="port13" mac="52:54:00:00:00:0d" address="10.13.0.1" prefix-length="24" />
+    <interface id="port14" mac="52:54:00:00:00:0e" address="10.14.0.1" prefix-length="24" />
+    <interface id="port15" mac="52:54:00:00:00:0f" address="10.15.0.1" prefix-length="24" />
+    <interface id="port16" mac="52:54:00:00:00:10" address="10.16.0.1" prefix-length="24" />
+    <interface id="port17" mac="52:54:00:00:00:11" address="10.17.0.1" prefix-length="24" />
+    <interface id="port18" mac="52:54:00:00:00:12" address="10.18.0.1" prefix-length="24" />
+    <interface id="port19" mac="52:54:00:00:00:13" address="10.19.0.1" prefix-length="24" />
+  </interfaces>
+</librefirewall>

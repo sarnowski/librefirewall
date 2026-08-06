@@ -68,7 +68,7 @@ pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter};
 pub use detail::{Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, Refusal, RefusalDetail};
 pub use event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, Primitive, RejectReason, Value,
+    ObjectKind, OnboardEnd, Primitive, RejectReason, Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};

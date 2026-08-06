@@ -153,6 +153,32 @@ pub struct Segment<'a> {
     pub payload: &'a [u8],
 }
 
+/// The destination port a segment claims, read **before anything about it has
+/// been verified**.
+///
+/// It exists for one purpose and has exactly one safe use: choosing which
+/// [`TcpStack`](crate::TcpStack) is handed the bytes, where a caller runs more
+/// than one on one address. Every stack then parses the segment itself —
+/// checksum over the pseudo-header first, as
+/// [`Segment::parse`](Segment::parse) does — and refuses a destination that is
+/// not its own, so a peer that lies here reaches a stack that refuses it rather
+/// than one that believes it. **Nothing else may act on this value**: it is two
+/// bytes a peer chose out of a datagram nothing has yet judged.
+///
+/// `None` for bytes too short to carry the field, which a caller hands to
+/// whichever stack it would have used anyway — the parse there counts it as the
+/// malformed segment it is, so no segment goes uncounted for being unreadable
+/// here.
+#[must_use]
+pub const fn peeked_destination_port(segment: &[u8]) -> Option<u16> {
+    // Bounded by the pattern rather than by an index: the two bytes are the
+    // second field of the fixed header, and a shorter run has none.
+    let [_, _, high, low, ..] = *segment else {
+        return None;
+    };
+    Some(u16::from_be_bytes([high, low]))
+}
+
 impl<'a> Segment<'a> {
     /// The sequence space this segment occupies: its payload plus the phantom
     /// byte each of `SYN` and `FIN` takes (RFC 793 section 3.3).

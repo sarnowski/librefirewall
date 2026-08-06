@@ -16,8 +16,8 @@
 //! here directly — the driver instance that owns the port publishes a
 //! descriptor, so every buffer index, span and verdict word read here is that
 //! domain's choice. Both are answered in `pd_runtime::endpoint` and
-//! `lfw_ip_endpoint`, where host tests drive them; this file maps seven
-//! regions and calls two functions.
+//! `lfw_ip_endpoint`, where host tests drive them; this file maps regions and
+//! calls functions.
 //!
 //! # The port carries no forwarded traffic, and that is a grant
 //!
@@ -110,6 +110,20 @@
 //! required TLS termination and certificate handling exist. `GET /logs` is still
 //! absent and answers 404 rather than being stubbed.
 //!
+//! # It carries an onboarding session's ciphertext and decides nothing about it
+//!
+//! The port answers on a second listening port, and what arrives there is not a
+//! protocol this domain speaks. Every byte of it is moved into a region the
+//! cryptography domain reads, and every byte that comes back is put on the
+//! wire unread: TLS terminates where the keys are, and the keys are not here.
+//! **This domain holds no key, no session secret and no plaintext**, and the
+//! relay's ABI has no field for one in either direction — see
+//! `pd_runtime::relay`, which is where the bounds on that handover live.
+//!
+//! What it costs is the second send capability named below, and what that buys
+//! whoever reaches this domain is a wakeup on a domain holding no device, no
+//! pool and no dataplane ring.
+//!
 //! # It carries a document and decides nothing about it
 //!
 //! A submitted document is copied into a region the configuration domain reads and
@@ -138,11 +152,15 @@ use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
     Configurations, DIAL_REQUEST_CAPACITY, DialFacts, Downloads, Ended, EndpointRegions,
-    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, OpenError, PdClock, Pool, Resolutions,
-    ReturnRing, StatsRegions, Via, attach_region, log_sample, read_timestamp_counter,
+    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OpenError,
+    PdClock, Pool, RELAY_ANSWER_TIMEOUT, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
+    StatsRegions, Via, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
-use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
+use wire::{
+    DownloadReply, DownloadRequest, LogConsume, LogRecords, RelayFault, RelayRefusal, RelayReply,
+    RelayRequest,
+};
 
 /// How many dataplane ports the build has, and so the bound a committed image's
 /// interface entries are checked against — the same build fact `pds/forwarder`
@@ -154,10 +172,92 @@ use wire::{DownloadReply, DownloadRequest, LogConsume, LogRecords};
 /// attacker, and this domain has no document to read.
 const PORTS: u8 = 2;
 
-/// The configuration domain, and the one send capability this domain holds in this
-/// system. It blocks in the Microkit event loop and never polls, so a document
-/// written into the submission region is invisible to it until it is woken.
+/// The configuration domain, and one of the **two** send capabilities this domain
+/// holds in this system. It blocks in the Microkit event loop and never polls, so
+/// a document written into the submission region is invisible to it until it is
+/// woken.
 const CONFIG: Channel = Channel::new(2);
+
+/// The cryptography domain, and the other one. It is woken for the same reason
+/// and it is the same shape of reason: that domain blocks in the event loop, so
+/// a record written into the relay's request region is invisible to it until it
+/// is woken. What the capability is worth to whoever reaches this domain is a
+/// wakeup at their chosen rate on a domain holding no device, no pool and no
+/// dataplane ring — and one bounded answer per wakeup, which is what the other
+/// end of that channel is built to give.
+const CRYPTO: Channel = Channel::new(3);
+
+/// What this domain calls each way an onboarding session can fail, one token per
+/// cause.
+///
+/// **One arm per cause and no arm covering two**, which is the whole obligation
+/// this function carries: a deployed node has no shell, so a token that folded
+/// two causes together would send an operator to one of two domains with no way
+/// to tell which. The refusals name the terminating domain's own judgement, the
+/// faults name a reply this end could not believe, and the last three name this
+/// appliance's own bounds.
+fn relay_refusal(failure: RelayFailure) -> Refusal {
+    // `signalled` is false throughout: no device was told to stop, because none
+    // was told anything. What ends is a TCP connection and a session on it.
+    let (cause, detail) = match failure {
+        RelayFailure::Refused(RelayRefusal::NoConnection) => {
+            ("relay-refused-no-connection", RefusalDetail::None)
+        }
+        RelayFailure::Refused(RelayRefusal::AlreadyOpen) => {
+            ("relay-refused-already-open", RefusalDetail::None)
+        }
+        RelayFailure::Refused(RelayRefusal::PayloadTooLong) => {
+            ("relay-refused-payload-too-long", RefusalDetail::None)
+        }
+        RelayFailure::Refused(RelayRefusal::NoSuchOperation) => {
+            ("relay-refused-no-such-operation", RefusalDetail::None)
+        }
+        RelayFailure::Refused(RelayRefusal::SessionFailed) => {
+            ("relay-refused-session-failed", RefusalDetail::None)
+        }
+        RelayFailure::Faulted(RelayFault::StatusUnknown { status }) => (
+            "relay-status-unknown",
+            RefusalDetail::One(u64::from(status)),
+        ),
+        RelayFailure::Faulted(RelayFault::OperationUnknown { operation }) => (
+            "relay-operation-unknown",
+            RefusalDetail::One(u64::from(operation)),
+        ),
+        RelayFailure::Faulted(RelayFault::WrongOperation { asked, answered }) => (
+            "relay-wrong-operation",
+            RefusalDetail::Two(u64::from(asked.to_bits()), u64::from(answered.to_bits())),
+        ),
+        RelayFailure::Faulted(RelayFault::LenPastPayload { len }) => {
+            ("relay-len-past-payload", RefusalDetail::One(u64::from(len)))
+        }
+        RelayFailure::Faulted(RelayFault::BytesOnRefusal { status, len }) => (
+            "relay-bytes-on-refusal",
+            RefusalDetail::Two(u64::from(status.to_bits()), u64::from(len)),
+        ),
+        RelayFailure::Faulted(RelayFault::ClosedUnknown { closed }) => (
+            "relay-closed-unknown",
+            RefusalDetail::One(u64::from(closed)),
+        ),
+        // The bound that was spent, in milliseconds, because the token alone
+        // says a far end went quiet and not how long this end waited.
+        RelayFailure::Unanswered => (
+            "relay-unanswered",
+            RefusalDetail::One(RELAY_ANSWER_TIMEOUT.as_nanos() / 1_000_000),
+        ),
+        RelayFailure::Busy => ("relay-window-busy", RefusalDetail::None),
+        // What there was no room for, against the room there is: a byte count
+        // with no bound beside it is a number nobody can read.
+        RelayFailure::AnswerTooLong { refused } => (
+            "relay-answer-too-long",
+            RefusalDetail::Two(refused as u64, ONBOARD_OUTBOUND_CAPACITY as u64),
+        ),
+    };
+    Refusal {
+        cause,
+        detail,
+        signalled: false,
+    }
+}
 
 /// The station this port reaches out to, and the port on it.
 ///
@@ -414,6 +514,33 @@ impl Dial {
     }
 }
 
+/// What one onboarding session owes the console: the account of what it
+/// carried, and — where this appliance ended it — the cause.
+///
+/// **Two records rather than one wider one**, on the dialled channel's terms: a
+/// record carries four operand words, the account fills them, and a cause with
+/// its own two numbers is a fifth and sixth fact. A session that simply ended
+/// says so in one line and stops there.
+fn announce_session(sink: &dyn Sink, report: &RelayReport) {
+    announce(
+        sink,
+        DomainState::Ready,
+        DomainDetail::Onboarded {
+            relayed: report.relayed,
+            received: report.received,
+            sent: report.sent,
+            ended: report.ended,
+        },
+    );
+    if let Some(failure) = report.failure {
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::Refusal(relay_refusal(failure)),
+        );
+    }
+}
+
 /// A finished session in the vocabulary a console line speaks. The two sets are
 /// separate copies facing different readers — one is the transport's, one is the
 /// operator's — and this is the single place that maps them.
@@ -543,6 +670,15 @@ fn init() -> Management {
     let cfg_request: &'static ConfigRequest = attach_region!(cfg_request_vaddr: ConfigRequest);
     let cfg_reply: &'static ConfigReply = attach_region!(cfg_reply_vaddr: ConfigReply);
     let configurations = Configurations::attach(cfg_request, cfg_reply);
+    // The relay's two regions, whose directions are the system description's:
+    // the request is this domain's to write and the terminating domain's to
+    // read, and the reply is the reverse. Nothing here restates that — the
+    // handle `wire::relay` hands back reaches the reply through a view with no
+    // store on it, so this domain cannot write the records it then puts on the
+    // wire as though the other end had produced them.
+    let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
+    let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
+    let relay = Relay::attach(relay_request, relay_reply);
     let mut stage = stage;
     // Both recordings and the configuration surface, before the first frame: a
     // target registered late would answer `404` to a client that asked at exactly
@@ -571,6 +707,7 @@ fn init() -> Management {
         stage,
         downloads,
         configurations,
+        relay,
         handover,
         clock,
         dial: Dial::new(),
@@ -609,6 +746,9 @@ struct Running {
     /// The configuration surface this port serves, holding this domain's position
     /// in the submission channel's sequence for the same reason.
     configurations: Configurations<'static>,
+    /// The onboarding port's relay, holding this domain's position in that
+    /// channel's sequence for the same reason again.
+    relay: Relay<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
     /// The channel this port reaches out with, kept for the domain's life
@@ -685,6 +825,19 @@ impl Handler for Management {
         // counters as of this pass rather than the one before it.
         if let Some(now) = now {
             running.dial.drive(&mut running.stage, now, &running.sink);
+            // The onboarding port, after the drain so a record that arrived in
+            // this very pass is handed over in it, and before the send below so
+            // an answer that came back goes out in it too. One item crosses per
+            // pass — the channel's window is one — and the wakeup it owes is
+            // sent here because the capability is this domain's.
+            let pass = running.relay.poll(Some(now), &mut running.stage);
+            if pass.notify {
+                CRYPTO.notify();
+            }
+            if let Some(report) = pass.report {
+                announce_session(&running.sink, &report);
+            }
+            running.stage.drive_onboarding(now);
             running.stage.publish(log);
         }
         if moved > 0 {

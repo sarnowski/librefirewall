@@ -68,6 +68,7 @@ use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monoton
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
     http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
+    onboard::{Ended as OnboardEnded, StreamCounters},
     outbound::{DialFacts, Ended, OpenError, Resolutions},
     route::Hop,
 };
@@ -108,6 +109,16 @@ pub const OUTPUT_LIMIT: usize = lfw_tcp_max_unacked() * lfw_ip_endpoint::TCP_CON
 /// request in `MAX_UNACKED` ranges and a close, and this is that with room to
 /// spare.
 pub const DIAL_LIMIT: usize = lfw_tcp_max_unacked() + 4;
+
+/// How many steps one pass may spend on the onboarding port.
+///
+/// A bound the peer does not choose, on [`OUTPUT_LIMIT`]'s terms: every answer
+/// from `Endpoint::poll_onboarding` either hands a range to the transport, frees
+/// the connection or moves a deadline, so the loop terminates on its own. One
+/// session owes at most its answer in `MAX_UNACKED` ranges, a close, and the
+/// timers of the one connection the port holds, and this is that with room to
+/// spare.
+pub const ONBOARD_LIMIT: usize = lfw_tcp_max_unacked() + 4;
 
 /// `lfw_tcp::MAX_UNACKED`, reached through the endpoint that re-exports the
 /// transport rather than through a second dependency on it.
@@ -902,6 +913,90 @@ impl<'ring> EndpointStage<'ring> {
                 return;
             };
             let polled = endpoint.poll_outbound(now, reply);
+            if !polled.goes_on() {
+                return;
+            }
+            if let Some(len) = polled.frame() {
+                self.send(len);
+            }
+        }
+    }
+
+    /// The onboarding connection a session is running on, or `None` where the
+    /// port has no addressing yet or nothing has connected.
+    #[must_use]
+    pub fn onboard_session(&self) -> Option<ConnectionId> {
+        self.endpoint.as_ref()?.stream().connection()
+    }
+
+    /// Bytes the onboarding peer sent that have not been handed over.
+    #[must_use]
+    pub fn onboard_received(&self) -> &[u8] {
+        self.endpoint
+            .as_ref()
+            .map_or(&[], |endpoint| endpoint.stream().received())
+    }
+
+    /// Drop the first `bytes` of them, which have been handed over.
+    pub fn onboard_consumed(&mut self, bytes: usize) {
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.stream_mut().consumed(bytes);
+        }
+    }
+
+    /// Whether the onboarding peer has closed its half.
+    #[must_use]
+    pub fn onboard_peer_closed(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.stream().peer_closed())
+    }
+
+    /// Put `bytes` on the onboarding connection, answering how many there was
+    /// room for. Zero where the port has no addressing, which is a session that
+    /// cannot exist rather than an answer that was refused.
+    pub fn onboard_push(&mut self, bytes: &[u8]) -> usize {
+        self.endpoint
+            .as_mut()
+            .map_or(0, |endpoint| endpoint.stream_mut().push(bytes))
+    }
+
+    /// End the onboarding session: the terminating domain has finished with it.
+    pub fn onboard_end_session(&mut self) {
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.stream_mut().end_session();
+        }
+    }
+
+    /// How the last onboarding session ended, taken once so the domain that
+    /// reports it reports each session exactly once.
+    pub fn take_onboard_ending(&mut self) -> Option<OnboardEnded> {
+        self.endpoint.as_mut()?.stream_mut().take_ending()
+    }
+
+    /// What the onboarding port's own stream has done, one field per decision.
+    #[must_use]
+    pub fn onboard_counters(&self) -> StreamCounters {
+        self.endpoint
+            .as_ref()
+            .map_or_else(StreamCounters::default, Endpoint::stream_counters)
+    }
+
+    /// Send whatever the onboarding port now owes.
+    ///
+    /// [`drive_output`](Self::drive_output)'s shape on the port that carries a
+    /// byte stream, and bounded the same way: by [`ONBOARD_LIMIT`] as well as by
+    /// the loop's own termination. A step that produces no frame is not the end
+    /// of a pass — a reaping produces none and the step after it may.
+    pub fn drive_onboarding(&mut self, now: Monotonic) {
+        for _ in 0..ONBOARD_LIMIT {
+            let Self {
+                endpoint, reply, ..
+            } = self;
+            let Some(endpoint) = endpoint.as_mut() else {
+                return;
+            };
+            let polled = endpoint.poll_onboarding(now, reply);
             if !polled.goes_on() {
                 return;
             }

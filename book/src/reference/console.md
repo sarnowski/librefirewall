@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -54,11 +54,11 @@ written waits forever:
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, and exactly one `ready` reporting the channel it dialled — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; the dial's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `answered` three further `ready` records follow it carrying the counts that place the failure — a fourth where the station acknowledged a number that was never sent. A `ready` carrying the refusal group instead is one of the three narrow refusals this domain reports without declining to start |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, exactly one `ready` reporting the channel it dialled, and one `ready` per **onboarding session** that ends on its second listening port — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; the dial's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `answered` three further `ready` records follow it carrying the counts that place the failure — a fourth where the station acknowledged a number that was never sent. A session's carries `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`, followed by a `ready` carrying the refusal group where this appliance was the one that ended it. A `ready` carrying the refusal group on its own is one of the three narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` with `delegated-signatures=` records, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` with `delegated-signatures=` records, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, one further `ready` per **onboarding session** this domain terminated, carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=` — and, where it refused one, a `ready` carrying the refusal group beside it. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -340,8 +340,8 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
-`nic-driver` domain raises, 25 the `clock` domain raises, 6 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 39 the `crypto` domain
+`nic-driver` domain raises, 25 the `clock` domain raises, 20 the `management` domain raises, 39
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 44 the `crypto` domain
 raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -391,7 +391,7 @@ being known without being transmitted.
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
-**`management`.** Five tokens, and the three groups differ in what they mean for the domain.
+**`management`.** Twenty tokens, and the four groups differ in what they mean for the domain.
 
 The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
 its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
@@ -413,7 +413,22 @@ once at bring-up and never again, and the port carries on rather than refusing t
 seeing it should read it as "this image cannot serve its recordings", not as a fault in the recorder,
 which is unaffected and still writing them to the medium.
 
-`signalled=` is always `false` on all five: no device was told to stop, because none was told
+The last fourteen ride on **`state=ready`** too, and they are the onboarding port's: one per way a
+session on it can fail. They are read with the `onboard-ended=refused` record beside them, which
+says which session ended and what it had carried. The `relay-refused-*` five are the terminating
+domain's own judgement, quoted rather than folded — an operator reads `relay-refused-already-open`
+as this port having asked for a second session and `relay-refused-session-failed` as the other
+domain having given up on the protocol, and those are different places to go. The six after them
+are answers this port **could not believe**, which accuse the terminating domain of not keeping to
+the channel. The last three are this appliance's own bounds: a far end that said nothing inside the
+answer timeout, a window this end found taken, and an answer that outgrew the room this port keeps
+for one.
+
+Every one of the fourteen ends the connection an administrator was holding, and none of them
+touches anything else: the metric surface, the recordings, the configuration surface and the
+dataplane are unaffected, because the port they are on carries none of those.
+
+`signalled=` is always `false` on all twenty: no device was told to stop, because none was told
 anything.
 
 | group | tokens |
@@ -421,6 +436,9 @@ anything.
 | the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the two 64-bit draws failed) |
 | the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused), `clock-implausible-epoch` (the nanoseconds refused) |
 | the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
+| the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-already-open`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
+| an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown` |
+| this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
 
 **`recorder`.** Its first token is the domain's own, raised before the device is touched at all. The
 four groups after it are `lfw_blk`'s bring-up tree, which is `nic-driver`'s with the differences a
@@ -483,6 +501,7 @@ of a vector's contents.
 | the session the domain establishes against itself (none carries a `detail=`) | `tls-handshake-refused`, `tls-session-stalled`, `tls-peer-unauthenticated`, `tls-peer-certificate-wrong`, `tls-application-data-lost`, `tls-session-not-closed`, `tls-identity-unbuildable`, `tls-arena-exhausted` |
 | the bounded allocator's own proof (`detail=` is the refusal count for the first and the headroom that was left for the last; the middle carries none) | `arena-allocation-refused`, `arena-starvation-unreachable`, `starved-session-established` |
 | the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid` |
+| the onboarding session this domain terminates, refused at the relay carrying it (`detail=` is the operation that named a session there was none of, or the length that was past what one item may carry; the rest carry none) | `relay-no-connection`, `relay-already-open`, `relay-payload-too-long`, `relay-no-such-operation`, `relay-session-failed` |
 
 **The `delegated-*` group is about the other domain**, and it is the one group here whose subject is
 not this domain's own code. This appliance's private key lives in the domain that owns the medium it

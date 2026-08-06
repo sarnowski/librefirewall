@@ -117,9 +117,9 @@ pub use log_record::{
     CheckedRecord, CheckedStamp, CheckedText, CheckedValue, IdentifierImage, LOG_CAUSE_BYTES,
     LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
     LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_NEXT_HOP_VIA_COUNT,
-    LOG_OBJECT_KIND_COUNT, LOG_OPERANDS, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
-    LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind, LogText, LogValueKind,
-    TextFault, TextImage, ValueImage,
+    LOG_OBJECT_KIND_COUNT, LOG_ONBOARD_END_COUNT, LOG_OPERANDS, LOG_PRIMITIVE_COUNT,
+    LOG_REJECT_REASON_COUNT, LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind,
+    LogText, LogValueKind, TextFault, TextImage, ValueImage,
 };
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,

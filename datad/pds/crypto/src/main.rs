@@ -110,13 +110,17 @@ use lfw_crypto::{
     prove_hmac_sha256, prove_ml_kem_768, prove_sha256, prove_x25519, zeroize,
 };
 use lfw_log::{
-    Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
+    Domain, DomainDetail, DomainState, Event, OnboardEnd, Primitive, Refusal, RefusalDetail,
+    RingSink, Sink,
 };
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
 use lfw_tls::{Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{PdClock, attach_region, log_sample, read_timestamp_counter};
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
-use wire::{ClockCalibration, LogConsume, LogRecords, SignReply, SignRequest};
+use wire::{
+    ClockCalibration, LogConsume, LogRecords, MAX_RELAY_PAYLOAD, RelayDemand, RelayOperation,
+    RelayRefusal, RelayReply, RelayRequest, RelayResponder, SignReply, SignRequest,
+};
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
 use delegate::{Delegated, DelegationError, HeldKey};
@@ -269,6 +273,18 @@ const SESSION_PAYLOAD: &[u8] = b"librefirewall management channel";
 /// adopted protocol code.
 const KEY_HOLDER: Channel = Channel::new(0);
 
+/// The domain that owns the network, as this domain's channel to it.
+///
+/// **Both directions**, unlike the holder's above, and the reason is scheduling
+/// rather than taste: that domain sits at this one's priority and is
+/// event-driven, so neither is running while the other is and neither has a
+/// loop the other's write could be observed in. A reply published into the
+/// relay is therefore invisible until it is signalled. What the capability is
+/// worth to whoever reaches this domain is a wakeup on a domain that owns the
+/// management port, and a bounded run of bytes on a connection it already
+/// holds; it is worth no key, the relay's ABI having no field for one.
+const MANAGEMENT: Channel = Channel::new(1);
+
 /// The bytes the direct proof signs.
 ///
 /// A fixed string and not a digest of anything: what is being proved is that a
@@ -371,6 +387,12 @@ fn init() -> Crypto {
     // store on it, so this domain cannot forge the signature it then verifies.
     let sign_request: &'static SignRequest = attach_region!(sign_request_vaddr: SignRequest);
     let sign_reply: &'static SignReply = attach_region!(sign_reply_vaddr: SignReply);
+    // The relay's two regions, and the directions are the mirror of the
+    // delegation's above: this domain reads what the network end wrote and
+    // writes what goes back. It cannot write the question, so it cannot make
+    // the network end believe a peer said something it did not.
+    let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
+    let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     // One requester for the whole boot, and behind an `Arc` because the library's
@@ -389,19 +411,26 @@ fn init() -> Crypto {
             announce(&sink, DomainState::Refused, DomainDetail::Refusal(*cause));
         }
     }
-    // Last, and once: this domain runs to completion and parks with no channel
-    // to wake it, so its shard is written here and never moves again.
-    stats.publish(
-        &CryptoSample {
-            proven: outcome.verdict.is_ok(),
-            vectors: outcome.vectors,
-            milli_cycles_per_byte: outcome.milli_cycles_per_byte,
-            cycles_per_operation: outcome.cycles_per_operation,
-            log: log_sample(sink.dropped(), sink.refused()),
-        }
-        .values(),
-    );
-    Crypto
+    // The bring-up's own numbers, which do not move again: what this domain
+    // does from here is answer the relay, and no session changes a vector count
+    // or a measured cost. The log counts beside them do move, which is why the
+    // sample is kept and republished rather than written once.
+    let sample = CryptoSample {
+        proven: outcome.verdict.is_ok(),
+        vectors: outcome.vectors,
+        milli_cycles_per_byte: outcome.milli_cycles_per_byte,
+        cycles_per_operation: outcome.cycles_per_operation,
+        log: log_sample(sink.dropped(), sink.refused()),
+    };
+    stats.publish(&sample.values());
+    Crypto {
+        responder: relay_reply.responder(relay_request),
+        session: Session::new(),
+        sink,
+        shard: stats,
+        sample,
+        records: [0; MAX_RELAY_PAYLOAD],
+    }
 }
 
 /// Gate on the part, prove every primitive, measure the three that are
@@ -957,17 +986,218 @@ fn run_operation(primitive: Primitive, entropy: &dyn Entropy) {
     }
 }
 
-/// Returned by `init` in every case: this domain runs once and then parks in
-/// the Microkit event loop, whether it established the profile or refused to.
-struct Crypto;
+/// Demands one wakeup may answer.
+///
+/// The channel's window is one item, so **at most one demand can exist per
+/// wakeup** and the second turn of this loop is what proves there is not
+/// another rather than work anybody expects to do. Two rather than one because
+/// a notification is a flag rather than a queue: two writes that coalesce into
+/// one wakeup must not leave an item nobody comes back for, and a `take` that
+/// finds nothing costs one read of a word this domain already maps.
+const RELAY_DEMANDS_PER_WAKEUP: usize = 2;
+
+/// The relay's own refusals, in the vocabulary a console line speaks.
+///
+/// One arm per cause, on the management domain's terms: each of these is a
+/// different thing to go and look at, and three of the four accuse the network
+/// end of a protocol mistake rather than the peer of anything.
+const fn relay_refusal(reason: RelayRefusal, detail: RefusalDetail) -> Refusal {
+    let cause = match reason {
+        RelayRefusal::NoConnection => "relay-no-connection",
+        RelayRefusal::AlreadyOpen => "relay-already-open",
+        RelayRefusal::PayloadTooLong => "relay-payload-too-long",
+        RelayRefusal::NoSuchOperation => "relay-no-such-operation",
+        // Unreachable: this end never gives up on a session, having no protocol
+        // to give up on yet. A value rather than an assertion, because the
+        // match must be exhaustive and a panic on this path is not admissible.
+        RelayRefusal::SessionFailed => "relay-session-failed",
+    };
+    refusal(cause, detail)
+}
+
+/// What this domain is doing with the onboarding session it terminates.
+///
+/// **This is the whole of it, and it is deliberately small.** There is no TLS
+/// here yet: what the far end hands over is taken, counted and dropped, and
+/// what goes back is nothing. Every one of those is true rather than pending —
+/// no byte is invented, no answer is faked, and the session's account on the
+/// console is what this end really saw. What the protocol will add is what it
+/// answers with; the handover, its bounds and its refusals are settled here.
+struct Session {
+    /// Whether a session is open. The relay names no connection, so this flag
+    /// is the whole of what an operation can be about.
+    open: bool,
+    /// Items answered for the session running now.
+    relayed: u64,
+    /// Bytes taken off the relay for it.
+    received: u64,
+}
+
+impl Session {
+    const fn new() -> Self {
+        Self {
+            open: false,
+            relayed: 0,
+            received: 0,
+        }
+    }
+}
+
+/// Returned by `init` in every case. The bring-up runs once; what the domain
+/// does afterwards is answer the relay, which is why this now carries state.
+struct Crypto {
+    responder: RelayResponder<'static>,
+    session: Session,
+    sink: RingSink<'static, PdClock<'static>>,
+    /// The shard this domain publishes, kept so a session's end can republish
+    /// it: the sample's own numbers are the bring-up's and do not move, but the
+    /// log counts beside them do, and a shard written once at boot would
+    /// under-report every record written after it.
+    shard: &'static StatsShard,
+    sample: CryptoSample,
+    /// Where a delivered payload is copied before it is counted. A field
+    /// because it is one maximal record and a protection domain's stack is not
+    /// where that belongs.
+    records: [u8; MAX_RELAY_PAYLOAD],
+}
+
+impl Crypto {
+    /// Answer one demand, and say what the session owes the console.
+    ///
+    /// Total: every operation and every state it can arrive in has an arm, and
+    /// each of the four refusals is its own token. A demand taken and not
+    /// answered would leave the network end polling a sequence nothing will
+    /// publish, so every path here consumes the demand exactly once.
+    fn answer(&mut self, demand: RelayDemand) {
+        let Some(operation) = demand.operation() else {
+            // The word named no operation this end has. Refused rather than
+            // ignored: a network end left waiting cannot tell a refusal from a
+            // hang.
+            self.refuse(demand, RelayRefusal::NoSuchOperation, RefusalDetail::None);
+            return;
+        };
+        if operation == RelayOperation::Open {
+            if self.session.open {
+                self.refuse(demand, RelayRefusal::AlreadyOpen, RefusalDetail::None);
+                return;
+            }
+            self.session = Session {
+                open: true,
+                relayed: 1,
+                received: 0,
+            };
+            self.responder.answered(demand, &[], false);
+            return;
+        }
+        if !self.session.open {
+            self.refuse(
+                demand,
+                RelayRefusal::NoConnection,
+                RefusalDetail::One(u64::from(operation.to_bits())),
+            );
+            return;
+        }
+        self.session.relayed = self.session.relayed.saturating_add(1);
+        match operation {
+            // Handled above; an open cannot reach here.
+            RelayOperation::Open | RelayOperation::Poll => {
+                self.responder.answered(demand, &[], false);
+            }
+            RelayOperation::Deliver => {
+                let stated = demand.stated_len();
+                let Self {
+                    responder, records, ..
+                } = self;
+                // Copied out of the shared region before anything is made of
+                // it, and `None` exactly where the stated length is past what a
+                // request can hold — which is the one length this end must
+                // refuse rather than shorten.
+                let Some(taken) = demand.payload(responder, records).map(<[u8]>::len) else {
+                    self.refuse(
+                        demand,
+                        RelayRefusal::PayloadTooLong,
+                        RefusalDetail::One(u64::from(stated)),
+                    );
+                    return;
+                };
+                self.session.received = self.session.received.saturating_add(taken as u64);
+                // Nothing to say back. There is no protocol here yet, so an
+                // empty answer is the true one — and it is what a handshake
+                // step that produced no record answers with in any case.
+                self.responder.answered(demand, &[], false);
+            }
+            RelayOperation::Close => {
+                // Answered as closed, which is what makes the network end stop
+                // rather than wait for a session this end no longer holds.
+                self.responder.answered(demand, &[], true);
+                self.report(OnboardEnd::Peer);
+            }
+        }
+    }
+
+    /// Refuse the demand and report the session it ended.
+    ///
+    /// Every refusal ends the session at both ends — `wire::relay` publishes a
+    /// closed word of one with each — so the account goes out beside the token
+    /// rather than waiting for a close that will never come.
+    fn refuse(&mut self, demand: RelayDemand, reason: RelayRefusal, detail: RefusalDetail) {
+        self.responder.refuse(demand, reason);
+        announce(
+            &self.sink,
+            DomainState::Ready,
+            DomainDetail::Refusal(relay_refusal(reason, detail)),
+        );
+        self.report(OnboardEnd::Refused);
+    }
+
+    /// The session's account, and the shard republished with the log counts
+    /// these records have moved.
+    fn report(&mut self, ended: OnboardEnd) {
+        announce(
+            &self.sink,
+            DomainState::Ready,
+            DomainDetail::Onboarded {
+                relayed: self.session.relayed,
+                received: self.session.received,
+                // Nothing goes back yet, and the zero is the fact rather than a
+                // placeholder: this end answers every item with no records.
+                sent: 0,
+                ended,
+            },
+        );
+        self.session = Session::new();
+        let mut sample = self.sample;
+        sample.log = log_sample(self.sink.dropped(), self.sink.refused());
+        self.shard.publish(&sample.values());
+    }
+}
 
 impl Handler for Crypto {
     type Error = Infallible;
 
-    /// Unreachable by capability: nothing in this system holds a notification
-    /// capability on this domain, so the event loop it parks in has no sender.
-    /// It exists because [`Handler`] requires it.
+    /// Take what the network end has handed over and answer it.
+    ///
+    /// Bounded by [`RELAY_DEMANDS_PER_WAKEUP`] and by the channel's own window,
+    /// which is one item: a wakeup storm from the other end costs a constant
+    /// number of reads of a word this domain already maps and never an
+    /// unbounded loop. Nothing here blocks, nothing here allocates, and nothing
+    /// here reads a byte it was not handed.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
+        let mut answered = false;
+        for _ in 0..RELAY_DEMANDS_PER_WAKEUP {
+            let Some(demand) = self.responder.take() else {
+                break;
+            };
+            self.answer(demand);
+            answered = true;
+        }
+        // Woken once per pass rather than once per answer, and **only where
+        // there was one**: the window is one item, so a pass publishes at most
+        // one reply, and a signal on a pass that answered nothing is a wakeup
+        // the other end would answer with another wakeup.
+        if answered {
+            MANAGEMENT.notify();
+        }
         Ok(())
     }
 }

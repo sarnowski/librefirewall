@@ -14,7 +14,8 @@
 //! is reached by a sequence — a handshake half-completed, a window moved by a
 //! stale segment, a range acknowledged twice, a timer fired between two arrivals.
 //! The harness therefore drives an operation stream over three stacks at once: a
-//! **listening** one that has never seen a valid segment, an **established** one
+//! **listening** one that has never seen a valid segment, an **onboarding** one
+//! that listens on the appliance's *other* port, an **established** one
 //! whose handshake this harness completed itself, so the synchronized paths are
 //! reached even by an input that could never compose a handshake, and a
 //! **dialling** one holding a connection this end opened — whose arrival
@@ -50,6 +51,13 @@
 //! * **Containment of the answer.** A segment written into the caller's storage
 //!   never exceeds it, and the bytes past its length are never touched. This is
 //!   what the protection domain rests on: it lends that many bytes onward.
+//! * **The two ports cannot be crossed.** The appliance answers on two ports and
+//!   runs one stack per port, so every segment reaches exactly one of them. The
+//!   harness hands each segment to both and asserts that a stack refuses one
+//!   addressed elsewhere as `NotListening`, answering nothing and holding no
+//!   connection for it: the demultiplexing above is a hint, and this is what
+//!   makes a lie about it reach a table that refuses rather than one that
+//!   serves.
 //! * **Delivery is a subslice.** Data reported as delivered is inside the segment
 //!   handed over and never longer than the window this end is advertising, so no
 //!   byte a peer did not send can reach a caller.
@@ -73,8 +81,10 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_clock::{Calibration, Monotonic, Ticks};
+use lfw_ip_endpoint::{MANAGEMENT_PORT, onboard::ONBOARDING_PORT};
 use lfw_tcp::{
-    Connection, ConnectionId, Flags, IsnSecret, Outgoing, SeqNumber, State, TcpStack, Timeout,
+    Connection, ConnectionId, Flags, IsnSecret, Outcome, Outgoing, Rejection, SeqNumber, State,
+    TcpStack, Timeout,
 };
 use net_headers::Ipv4Address;
 use std::num::NonZeroU64;
@@ -83,7 +93,11 @@ use crate::{MAX_OPERATIONS, any_index, any_u16, any_u32, next_op};
 
 /// The appliance's own addressing, so a verdict here is one it would reach.
 const APPLIANCE: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 15]);
-const PORT: u16 = 80;
+const PORT: u16 = MANAGEMENT_PORT;
+
+/// The appliance's other listening port, whose stack shares this address and
+/// this address alone: two tables, two sequence spaces, two challenge budgets.
+const OTHER_PORT: u16 = ONBOARDING_PORT;
 const MSS_LIMIT: u16 = 1024;
 const RECEIVE_WINDOW: u32 = 1024;
 
@@ -120,6 +134,7 @@ pub fn tcp_segments_harness(data: &[u8]) {
     // fixed here.
     let secret = IsnSecret::from_bytes(<[u8; 16]>::arbitrary(&mut unstructured).unwrap_or([0; 16]));
     let mut listening = stack(secret.clone());
+    let mut onboarding = on_port(OTHER_PORT, secret.clone());
     let (mut established, opened, acknowledgement) = established_stack(secret.clone());
     let (mut dialling, dialled) = dialling_stack(secret);
 
@@ -173,7 +188,21 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 // that holds an established connection on this very tuple.
                 let source = source_address(&mut unstructured);
                 let bytes = segment_bytes(&mut unstructured);
-                deliver(&mut listening, now, source, &bytes);
+                let on_management = deliver(&mut listening, now, source, &bytes);
+                // The same bytes at the other port. A segment names one
+                // destination, so at most one of the two may take it — and the
+                // one that does not must say `NotListening` rather than open
+                // anything.
+                let on_onboarding = deliver(&mut onboarding, now, source, &bytes);
+                assert!(
+                    !(refused_the_port(on_management) && refused_the_port(on_onboarding)),
+                    "a segment was refused by both ports, so it named neither"
+                );
+                assert!(
+                    refused_the_port(on_management) || refused_the_port(on_onboarding),
+                    "a segment was taken by both ports, so one of them served a \
+                     destination that is not its own"
+                );
                 deliver(&mut established, now, source, &bytes);
                 deliver(&mut dialling, now, source, &bytes);
                 segments += 1;
@@ -245,7 +274,12 @@ pub fn tcp_segments_harness(data: &[u8]) {
             }
         }
 
-        for stack in [&mut listening, &mut established, &mut dialling] {
+        for stack in [
+            &mut listening,
+            &mut onboarding,
+            &mut established,
+            &mut dialling,
+        ] {
             assert!(
                 stack.connections() <= CONNECTIONS,
                 "the connection table exceeded its capacity"
@@ -292,7 +326,7 @@ fn deliver<const N: usize>(
     now: Monotonic,
     source: Ipv4Address,
     bytes: &[u8],
-) {
+) -> Outcome {
     let before = stack.counters().segments_received;
     let mut out = [UNTOUCHED; OUT];
     let received = stack.receive(now, source, bytes, &mut out);
@@ -334,8 +368,12 @@ fn deliver<const N: usize>(
     if received.emitted > 0 {
         let answer = lfw_tcp::Segment::parse(APPLIANCE, source, &out[..received.emitted])
             .expect("an answer this crate composed re-parses");
-        assert_eq!(answer.source_port, PORT);
+        // The port the stack was built on, whichever of the two it is: an
+        // answer leaving under the other port's number would be this end
+        // speaking for a table it does not hold.
+        assert_eq!(answer.source_port, stack.port());
     }
+    received.outcome
 }
 
 /// Take every expired timer, asserting the loop settles rather than hitting the
@@ -366,7 +404,19 @@ fn drain_timers<const N: usize>(stack: &mut TcpStack<N>, now: Monotonic) {
 
 /// A stack listening on the appliance's own address and port.
 fn stack(secret: IsnSecret) -> TcpStack<CONNECTIONS> {
-    TcpStack::new(APPLIANCE, PORT, MSS_LIMIT, RECEIVE_WINDOW, secret)
+    on_port(PORT, secret)
+}
+
+/// One listening on the same address and a port of the caller's choosing.
+fn on_port(port: u16, secret: IsnSecret) -> TcpStack<CONNECTIONS> {
+    TcpStack::new(APPLIANCE, port, MSS_LIMIT, RECEIVE_WINDOW, secret)
+}
+
+/// Whether a stack turned the segment away for naming a port it does not
+/// listen on, which is the one refusal that says the segment was somebody
+/// else's.
+const fn refused_the_port(outcome: Outcome) -> bool {
+    matches!(outcome, Outcome::Rejected(Rejection::NotListening { .. }))
 }
 
 /// A stack with one connection already established, so the synchronized paths are

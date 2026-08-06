@@ -706,6 +706,64 @@
     <memory_region name="sign_request" size="0x1000" />
     <memory_region name="sign_reply" size="0x1000" />
 
+    <!-- THE TLS RELAY, one region per direction, and the handover that lets the
+         appliance terminate an encrypted session without the domain that owns the
+         network holding a key, a session secret or a plaintext byte.
+
+         `relay_request` carries what the MANAGEMENT domain has: a connection was
+         accepted on the onboarding port, here are the bytes that arrived, is
+         there anything to send, the connection ended. `relay_reply` carries what
+         the CRYPTOGRAPHY domain answers with: the bytes to put on the wire, and
+         whether the session is over. The management domain maps `relay_request`
+         READ-WRITE and `relay_reply` READ-ONLY; the cryptography domain maps the
+         reverse. Each writes exactly the direction it speaks in, which is
+         `sign_request`/`sign_reply`'s split with a different pair of domains.
+
+         WHAT CROSSES IS CIPHERTEXT THE MANAGEMENT DOMAIN ALREADY CARRIED. Both
+         directions hold TLS records: one direction is what a peer put on the
+         wire and the management domain read off it, the other is what the
+         management domain is about to put back. So this pair widens that
+         domain's reach over nothing — it already had those bytes, or is about to.
+         What it does NOT gain is everything behind them: the arena, the device
+         private key, the handshake secrets and every decrypted byte stay in the
+         cryptography domain, and no field of either region has a place for one.
+
+         WHY THE ASYMMETRY IS LOAD-BEARING HERE AND NOT MERELY TIDY. A domain that
+         could write the reply could put bytes of its own choosing on the wire as
+         though the terminating end had produced them — under a session
+         authenticated by the appliance's own identity, that is a forgery rather
+         than a wrong answer. So the domain that owns the network cannot write the
+         region it reads its records out of, and the domain that terminates the
+         session cannot write the region that states what arrived.
+
+         ONE CONNECTION, AND THAT IS THE ABI RATHER THAN A RULE. `wire::relay`
+         carries NO CONNECTION IDENTIFIER in either direction — no handle, no
+         index, no generation. Every operation names *the* connection and
+         `RelayOperation::Open` is the only thing that begins one, so a second
+         concurrent connection would need a second name and there is nowhere to
+         put one. A management domain that is wrong, confused or compromised
+         cannot ask this pair to carry two. Nor can it ask for a plaintext: the
+         operation vocabulary has four values and none of them means "give me what
+         the peer said".
+
+         EVERY OTHER DOMAIN MAPS NEITHER, in either direction — no driver, no
+         forwarder, no recorder, no console, no configuration domain and NOT THE
+         STORE DOMAIN. That last is the one worth stating: the domain that holds
+         the private scalar maps no region a frame's bytes reach, so the path from
+         the onboarding port to the key is still two hops through an ABI with no
+         field for one.
+
+         Sizes are `wire::RELAY_REQUEST_REGION_SIZE` and
+         `wire::RELAY_REPLY_REGION_SIZE`, each its type's `size_of` rounded up to
+         the mapping granularity. Five pages each, because `wire::MAX_RELAY_PAYLOAD`
+         is one maximal TLS record — a five-byte header, 2^14 of content and 256
+         of expansion — so a record crosses whole and neither end holds a partial
+         one while the other is asked for the rest.
+
+         Neither carries phys_addr, for the reason `cfg` does not. -->
+    <memory_region name="relay_request" size="0x5000" />
+    <memory_region name="relay_reply" size="0x5000" />
+
     <!-- The log transport: one ring per WRITING domain, and TWO REGIONS PER
          RING, one for each direction.
 
@@ -1310,6 +1368,8 @@
         <map mr="mgmt_tx_pool" vaddr="0x2_200_000" perms="rw" cached="true" setvar_vaddr="mgmt_tx_pool_vaddr" />
         <map mr="dl_request" vaddr="0x2_600_000" perms="rw" cached="true" setvar_vaddr="dl_request_vaddr" />
         <map mr="dl_reply" vaddr="0x2_700_000" perms="r" cached="true" setvar_vaddr="dl_reply_vaddr" />
+        <map mr="relay_request" vaddr="0x2_800_000" perms="rw" cached="true" setvar_vaddr="relay_request_vaddr" />
+        <map mr="relay_reply" vaddr="0x2_900_000" perms="r" cached="true" setvar_vaddr="relay_reply_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfg_request" vaddr="0x3_100_000" perms="rw" cached="true" setvar_vaddr="cfg_request_vaddr" />
         <map mr="cfg_reply" vaddr="0x3_200_000" perms="r" cached="true" setvar_vaddr="cfg_reply_vaddr" />
@@ -1657,6 +1717,8 @@
         <map mr="arena_crypto" vaddr="0x6_000_000" perms="rw" cached="true" setvar_vaddr="arena_vaddr" />
         <map mr="sign_request" vaddr="0x7_000_000" perms="rw" cached="true" setvar_vaddr="sign_request_vaddr" />
         <map mr="sign_reply" vaddr="0x7_100_000" perms="r" cached="true" setvar_vaddr="sign_reply_vaddr" />
+        <map mr="relay_request" vaddr="0x7_200_000" perms="r" cached="true" setvar_vaddr="relay_request_vaddr" />
+        <map mr="relay_reply" vaddr="0x7_300_000" perms="rw" cached="true" setvar_vaddr="relay_reply_vaddr" />
     </protection_domain>
 
     <!-- The store domain: the one holder of the appliance's own identity, and
@@ -1974,10 +2036,10 @@
     </channel>
 
     <!-- The configuration submission channel, and the SECOND channel in this
-         system granted in BOTH directions. It is also the change that ends
-         MANAGEMENT_CHANNEL_ONE_WAY: until this landing the management domain held
-         no send capability at all, on any channel, and it now holds exactly one —
-         on the config domain and on nothing else.
+         system granted in BOTH directions. It is also the channel that ended
+         MANAGEMENT_CHANNEL_ONE_WAY: before it the management domain held no send
+         capability at all, on any channel, and this was the first. It is now one
+         of exactly two — this one and the TLS relay's below, and nothing else.
 
          WHY MANAGEMENT MUST BE ABLE TO SIGNAL. The config domain has no polling
          loop: it runs `init` to completion and then blocks in the Microkit event
@@ -2056,6 +2118,55 @@
     <channel>
         <end pd="crypto" id="0" notify="true" />
         <end pd="store" id="0" notify="false" />
+    </channel>
+
+    <!-- The TLS relay's channel, the THIRD granted in BOTH directions and the
+         only one of the three whose two ends sit at the SAME PRIORITY. The other
+         two each join a priority-3 domain to a priority-2 one, where the higher
+         one runs on being woken and the lower one is the side that waits; here
+         neither side is the scheduler's favourite, which is what the next
+         paragraph is about.
+
+         WHY BOTH ENDS MAY SIGNAL. The two domains sit at the SAME PRIORITY and
+         both are event-driven: neither is scheduled while the other holds the
+         processor, and neither has a polling loop a peer's write could be
+         observed in. So a request written into `relay_request` is invisible to
+         the cryptography domain until it is woken, and an answer published into
+         `relay_reply` is invisible to the management domain until it is woken.
+         Two send capabilities is what makes the handover asynchronous: each side
+         writes its direction, signals, and RETURNS TO ITS EVENT LOOP.
+
+         WHY IT IS NOT THE SIGNING DELEGATION'S SHAPE. There the asker spins for
+         its answer, which works because the holder sits at a higher priority and
+         has already run by the first read. That is unavailable here and would be
+         wrong if it were available: a spin between two domains at priority 2
+         burns the asking domain's whole slice against a domain the scheduler has
+         no reason to run, on the path of every record of every handshake. Raising
+         one of the two instead would put either the domain that runs adopted
+         protocol code or the domain that faces the network above the dataplane's
+         equal, for a session an unauthenticated peer opens. Neither is worth it,
+         and neither is needed once the handover is asynchronous. THIS
+         DESCRIPTION STILL HAS NO PROTECTED CALL AND GAINS NONE.
+
+         WHAT EACH SEND CAPABILITY IS WORTH TO AN ATTACKER WHO REACHES THE OTHER
+         END, which is the whole of the authority this row hands over. Reaching
+         the management domain buys a wakeup on the cryptography domain at
+         whatever rate they choose, plus whatever bytes they like fed to a TLS
+         implementation — which is what terminating TLS for an unauthenticated
+         peer IS, and it is why that code runs in a domain holding no device, no
+         pipeline and no medium. Reaching the cryptography domain buys a wakeup on
+         the management domain and a bounded run of bytes placed on a connection
+         that domain already owns. Neither buys a key: the reply region's ABI has
+         no field for one, and the private scalar is not in either of these two
+         domains at all.
+
+         BOUNDED IN BOTH DIRECTIONS. One item is in flight at a time — the ABI's
+         window is one and `wire::RelayRequester` refuses a second — and each side
+         answers at most a constant of its own per wakeup, so a wakeup storm from
+         either end costs a constant and never an unbounded loop. -->
+    <channel>
+        <end pd="management" id="3" notify="true" />
+        <end pd="crypto" id="1" notify="true" />
     </channel>
 
     <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS

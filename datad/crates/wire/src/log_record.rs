@@ -77,6 +77,10 @@ pub const LOG_DIAL_OUTCOME_COUNT: u8 = 13;
 /// on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
 pub const LOG_NEXT_HOP_VIA_COUNT: u8 = 3;
 
+/// How many ends an onboarding session may be finished by —
+/// `lfw_log::OnboardEnd::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_ONBOARD_END_COUNT: u8 = 4;
+
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
 
@@ -202,6 +206,9 @@ pub enum LogDetailKind {
     DialSegments,
     /// The fourth, which only an unacceptable acknowledgement produces.
     DialSequence,
+    /// What one onboarding session carried, as **both** the domain that owns
+    /// the network and the domain that terminates the session report it.
+    Onboarded,
 }
 
 impl LogDetailKind {
@@ -233,6 +240,7 @@ impl LogDetailKind {
             Self::DialUnlearned => 22,
             Self::DialSegments => 23,
             Self::DialSequence => 24,
+            Self::Onboarded => 25,
         }
     }
 
@@ -264,6 +272,7 @@ impl LogDetailKind {
             22 => Some(Self::DialUnlearned),
             23 => Some(Self::DialSegments),
             24 => Some(Self::DialSequence),
+            25 => Some(Self::Onboarded),
             _ => None,
         }
     }
@@ -815,6 +824,16 @@ impl LogRecord {
                 claimed: sequence_bits(self.operands[0])?,
                 expected: sequence_bits(self.operands[1])?,
             },
+            // A token and three counts, in `Dialled`'s order: the token takes
+            // the leading word wherever a detail's first word names a
+            // vocabulary, and the three counts are unranged because every bit
+            // pattern of each is a tally the emitting domain could have kept.
+            Some(LogDetailKind::Onboarded) => CheckedDetail::Onboarded {
+                ended: onboard_end_token(self.operands[0])?,
+                relayed: self.operands[1],
+                received: self.operands[2],
+                sent: self.operands[3],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -916,6 +935,15 @@ fn next_hop_via_token(raw: u64) -> Result<u8, LogRecordError> {
     match u8::try_from(raw) {
         Ok(narrow) if narrow < LOG_NEXT_HOP_VIA_COUNT => Ok(narrow),
         _ => Err(LogRecordError::NextHopViaUnknown { via: raw }),
+    }
+}
+
+/// A session-end token carried in an operand word, on `dial_outcome_token`'s
+/// terms.
+fn onboard_end_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_ONBOARD_END_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::OnboardEndUnknown { end: raw }),
     }
 }
 
@@ -1346,6 +1374,14 @@ pub enum CheckedDetail {
         claimed: u32,
         expected: u32,
     },
+    /// What one onboarding session carried: how many items crossed the relay
+    /// carrying it, how many bytes went each way, and which end finished it.
+    Onboarded {
+        ended: u8,
+        relayed: u64,
+        received: u64,
+        sent: u64,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1432,6 +1468,9 @@ pub enum LogRecordError {
     },
     NextHopViaUnknown {
         via: u64,
+    },
+    OnboardEndUnknown {
+        end: u64,
     },
     /// An operand carrying a TCP sequence number wider than the thirty-two bits
     /// one has.
@@ -1523,6 +1562,10 @@ impl fmt::Display for LogRecordError {
             Self::CodePointTooWide { value } => {
                 write!(f, "protocol code point {value} does not fit sixteen bits")
             }
+            Self::OnboardEndUnknown { end } => write!(
+                f,
+                "onboarding session-end token {end} is not below {LOG_ONBOARD_END_COUNT}"
+            ),
             Self::DialOutcomeUnknown { outcome } => write!(
                 f,
                 "dial outcome token {outcome} is not below {LOG_DIAL_OUTCOME_COUNT}"
