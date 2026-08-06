@@ -414,8 +414,18 @@ fn assert_outcome_has_no_reply(outcome: &Outcome, data: &[u8]) {
                 // endpoint's.
                 match ethernet.header.ether_type {
                     EtherType::ARP => {
-                        let request = ArpPacket::parse(ethernet.payload).expect("a parsed request");
-                        assert_ne!(request.target_address, OUR_ADDRESS);
+                        let packet = ArpPacket::parse(ethernet.payload).expect("a parsed packet");
+                        // A request is broadcast, so being broadcast says nothing
+                        // about whether it is ours and the address it names is what
+                        // decides. A reply is unicast to the station that asked, so
+                        // one that arrived on the broadcast address is a station
+                        // announcing itself to the whole link and is not ours
+                        // however our own address reads inside it.
+                        let announced_to_everyone = packet.operation == ArpOperation::Reply
+                            && ethernet.header.destination != OUR_MAC;
+                        if !announced_to_everyone {
+                            assert_ne!(packet.target_address, OUR_ADDRESS);
+                        }
                     }
                     EtherType::IPV4 => {
                         let refused_at_l2 = ethernet.header.destination != OUR_MAC;
