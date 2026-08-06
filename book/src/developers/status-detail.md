@@ -2442,6 +2442,27 @@ which is what keeps a handshake from becoming a domain that never returns. It te
 read in practice, and that is a scheduling fact: the holder sits at priority 3 and this domain at 2,
 so a notification preempts into it immediately.
 
+**The channel TLS will terminate over exists as an ABI and has no ends.** TLS is to terminate here,
+in the domain that holds the keys, while the network stays in the domain that holds the frame
+pipelines — so the ciphertext has to cross between them, and `wire::relay` is the shape it crosses
+in. Two regions with opposite grants: one carries what the network domain has (a connection was
+accepted, here are the bytes that arrived, is there anything to send, the connection ended) and the
+other carries what the terminating domain answers with (the records to put on the wire, and whether
+the session is over). It is asynchronous rather than a call, because the two domains sit at the same
+priority and neither is scheduled while the other runs: each writes its direction, signals, and
+returns to its event loop.
+
+Three things the ABI has no way to say, which is why they are properties rather than rules. There is
+**no connection identifier anywhere in it**, so a second concurrent connection would need a second
+name and there is nowhere to put one — the onboarding server serves an administrator, not a fleet,
+and that bound is in the type rather than in the caller that must not exceed it. There is **no
+operation that asks for a plaintext**: the vocabulary has four values and none of them means "give
+me what the peer said". And there is **no field a private key fits in**, in either direction. The
+module is host-tested against a peer that keeps to none of the protocol — every bound is a typed
+refusal or a typed fault and nothing in it can panic — and, exactly as `wire::signing` did when it
+landed, it has **no consumer on either end yet**: no domain maps either region, no channel joins the
+two, and nothing at all crosses it.
+
 **Missing.** Nothing dials with any of this. The management domain now opens a TCP connection out of
 its own port and carries ten bytes of first-party probe over it, and none of that touches this
 domain: there is no channel above the transport and no onboarding server, and the cryptography
