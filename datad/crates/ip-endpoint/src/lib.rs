@@ -100,7 +100,7 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_tcp::{Connection, Outcome as TcpOutcome, TcpCounters, TcpStack, Timeout};
+use lfw_tcp::{Connection, Outcome as TcpOutcome, Released, TcpCounters, TcpStack, Timeout};
 
 /// Re-exported rather than restated: the per-boot secret is obtained by the
 /// protection domain and the segment types are what a *test* composes one out
@@ -511,8 +511,10 @@ enum NextHop {
     /// now cannot be addressed and is dropped.
     Waiting,
     /// The session is over — nothing on this link answers for the next hop, or
-    /// there was no room to ask.
-    Over,
+    /// there was no room to ask — and what ending it produced, which the caller
+    /// answers with. Ending a session gives its connection back to the
+    /// transport, and giving one back can compose a segment.
+    Over(Polled),
 }
 
 /// The connection a timeout concerns, whichever kind it is.
@@ -1055,7 +1057,7 @@ impl Endpoint {
     /// that re-read it would follow a rebinding the cache itself refuses.
     fn next_hop(&mut self, now: Monotonic, out: &mut [u8]) -> NextHop {
         let Some(session) = self.outbound.as_ref() else {
-            return NextHop::Over;
+            return NextHop::Over(Polled::Handled);
         };
         if let Some(mac) = session.peer_mac() {
             return NextHop::At(mac);
@@ -1084,13 +1086,9 @@ impl Endpoint {
             }
             Resolution::Waiting => NextHop::Waiting,
             Resolution::Unreachable => {
-                self.end_outbound(Ended::NextHopUnreachable);
-                NextHop::Over
+                NextHop::Over(self.end_outbound(Ended::NextHopUnreachable, out))
             }
-            Resolution::NoRoom => {
-                self.end_outbound(Ended::NoRoomToResolve);
-                NextHop::Over
-            }
+            Resolution::NoRoom => NextHop::Over(self.end_outbound(Ended::NoRoomToResolve, out)),
         }
     }
 
@@ -1109,7 +1107,7 @@ impl Endpoint {
             // resolution runs and the retransmission finds the entry resolved.
             NextHop::At(_) | NextHop::Waiting => self.dial(now, out),
             NextHop::Asked(len) => Polled::Frame { len },
-            NextHop::Over => Polled::Handled,
+            NextHop::Over(polled) => polled,
         }
     }
 
@@ -1130,7 +1128,7 @@ impl Endpoint {
         };
         let dialled = match dialled {
             Ok(dialled) => dialled,
-            Err(error) => return self.end_outbound(Ended::Refused(error)),
+            Err(error) => return self.end_outbound(Ended::Refused(error), out),
         };
         OutboundCounters::bump(&mut self.outbound_counters.dialled);
         let mac = self.outbound.as_ref().and_then(Session::peer_mac);
@@ -1155,7 +1153,7 @@ impl Endpoint {
     /// Carry a dialled session forward: send the request, read the answer, close.
     fn advance_outbound(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
         let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
-            return self.end_outbound(Ended::Lost);
+            return self.end_outbound(Ended::Lost, out);
         };
         let Some(state) = self.tcp.connection(connection).map(Connection::state) else {
             // The transport no longer holds it: the peer reset the connection,
@@ -1167,11 +1165,14 @@ impl Endpoint {
                 .outbound
                 .as_ref()
                 .is_some_and(|session| session.peer_closed());
-            return self.end_outbound(if answered {
-                Ended::Answered
-            } else {
-                Ended::Lost
-            });
+            return self.end_outbound(
+                if answered {
+                    Ended::Answered
+                } else {
+                    Ended::Lost
+                },
+                out,
+            );
         };
         // The resolution may only have completed after the `SYN` was dropped, so
         // it is carried on here — and it is what ends a session whose next hop
@@ -1187,7 +1188,7 @@ impl Endpoint {
             }
             NextHop::Asked(len) => return Polled::Frame { len },
             NextHop::Waiting => {}
-            NextHop::Over => return Polled::Handled,
+            NextHop::Over(polled) => return polled,
         }
         let path = self.path_of(connection);
         match state {
@@ -1307,8 +1308,19 @@ impl Endpoint {
         }
     }
 
-    /// End the session under `ended`, counting it.
-    fn end_outbound(&mut self, ended: Ended) -> Polled {
+    /// End the session under `ended`, counting it and giving the transport back
+    /// the connection it was composed on.
+    ///
+    /// The release is what makes the *next* dial to the same destination and
+    /// port a new connection rather than one this node's own table refuses: a
+    /// session that ends at the resolution leaves behind a `SYN` the transport
+    /// still holds — that segment was dropped for want of a hardware address, so
+    /// nothing at the far end will ever answer it and nothing but this ends it —
+    /// and a session that ends any other way leaves either nothing or this end's
+    /// own record of a finished close. What each of those owes the peer is the
+    /// transport's decision and not this one's.
+    fn end_outbound(&mut self, ended: Ended, out: &mut [u8]) -> Polled {
+        let released = self.release_dialled(out);
         if let Some(session) = self.outbound.as_mut() {
             session.enter(Phase::Ended(ended));
         }
@@ -1318,7 +1330,33 @@ impl Endpoint {
             &mut self.outbound_counters.failed
         };
         OutboundCounters::bump(count);
-        Polled::Handled
+        released
+    }
+
+    /// Hand the transport back the connection this session dialled, writing
+    /// whatever the release owes the peer into `out`.
+    fn release_dialled(&mut self, out: &mut [u8]) -> Polled {
+        let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
+            return Polled::Handled;
+        };
+        // Read before the release, which frees the path along with the slot the
+        // reconciliation below matches it against.
+        let path = self.path_of(connection);
+        let composed = out
+            .get_mut(Ipv4Frame::PAYLOAD_AT..)
+            .map(|segment| self.tcp.release(connection, segment))
+            .and_then(Released::composed);
+        self.reconcile();
+        match (path, composed) {
+            (Some(path), Some(len)) => Polled::Frame {
+                len: self.frame_around(path, len, out),
+            },
+            // A reset with nowhere to go, which is what a released connection
+            // this end never resolved a hardware address for produces: it is
+            // dropped exactly as the `SYN` before it was, the transport having
+            // already forgotten the connection either way.
+            _ => Polled::Handled,
+        }
     }
 
     /// Unlike ARP, an IPv4 datagram is answered only when it was addressed to

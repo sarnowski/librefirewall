@@ -65,7 +65,7 @@
 "crates/http/src/request.rs" = 0.2944
 "crates/http/src/response.rs" = 0.3135
 "crates/ip-endpoint/src/http.rs" = 0.3402
-"crates/ip-endpoint/src/lib.rs" = 0.3064
+"crates/ip-endpoint/src/lib.rs" = 0.3114
 "crates/ip-endpoint/src/neighbour.rs" = 0.4247
 "crates/ip-endpoint/src/outbound.rs" = 0.3676
 "crates/ip-endpoint/src/route.rs" = 0.5789
@@ -110,10 +110,10 @@
 "crates/store/src/reset.rs" = 0.5297
 "crates/store/src/slots.rs" = 0.2922
 "crates/store/src/state.rs" = 0.2266
-"crates/tcp/src/connection.rs" = 0.3269
+"crates/tcp/src/connection.rs" = 0.3326
 "crates/tcp/src/counters.rs" = 0.5314
 "crates/tcp/src/isn.rs" = 0.3564
-"crates/tcp/src/lib.rs" = 0.3262
+"crates/tcp/src/lib.rs" = 0.3390
 "crates/tcp/src/rto.rs" = 0.4386
 "crates/tcp/src/segment.rs" = 0.2939
 "crates/tcp/src/seq.rs" = 0.3786
@@ -158,7 +158,7 @@
 "pds/forwarder/src/main.rs" = 0.4667
 "pds/hardware-probe/src/main.rs" = 0.4226
 "pds/management/src/entropy.rs" = 0.6489
-"pds/management/src/main.rs" = 0.4713
+"pds/management/src/main.rs" = 0.4705
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3034
 "pds/store/src/main.rs" = 0.4181

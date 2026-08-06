@@ -361,22 +361,17 @@ impl DialContract {
             // ever crossed the wire — which is the claim, and the station is
             // what holds it.
             //
-            // The token is NOT the one that claim deserves, and asserting the
-            // one it deserves would be asserting something this appliance does
-            // not do. The first session ends `next-hop-unreachable`, correctly.
-            // It leaves behind the connection its `SYN` was composed on — that
-            // segment was dropped for want of an address, so the transport still
-            // holds it in `SynSent` and will for its whole retransmission budget
-            // — and closing the session releases the session alone. So the
-            // second dial to the same peer and port is refused by this node's
-            // own table, the third with it, and the record an operator reads
-            // names the *last* session's end. A channel that failed because
-            // nothing on the link claims the next hop is reported as one this
-            // node's transport declined, which sends an operator to the wrong
-            // place. It is stated here as what happens rather than as what
-            // should, and named in the status pages as the defect it is.
+            // Every one of the three ends on the link rather than on this node,
+            // and the last is what the record names. Each session leaves behind
+            // the connection its `SYN` was composed on — that segment was
+            // dropped for want of an address, so the transport holds it in
+            // `SynSent` and nothing at the far end will ever answer it — and
+            // ending the session gives that connection back, so the dial after
+            // it opens a new one rather than meeting this node's own table.
+            // That is what keeps the token a fact about the link: an operator
+            // reading it goes and looks at what claims the next hop.
             Self::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress) => {
-                (DialOutcome::DialRefused, 3)
+                (DialOutcome::NextHopUnreachable, 3)
             }
         };
         Some(DialVerdict { outcome, attempts })
@@ -1253,13 +1248,14 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
-    // And the one that found a defect rather than confirming a design. Nothing
-    // is learned from the wrong sender and no `SYN` ever crosses — the station
-    // holds both — but the appliance reports the channel as `dial-refused`
-    // rather than as the next hop being unreachable, because the session that
-    // ended correctly left its connection in the transport's table and the two
-    // after it were refused for the 4-tuple. The scenario states what happens;
-    // the status pages state that it is wrong and why.
+    // And the one where nothing reaches a connection at all: the station answers
+    // every resolution for an address nobody asked about, so nothing is learned
+    // from it and no `SYN` ever crosses — the station holds both — and each of
+    // the three sessions ends on the link rather than on this node. It is the
+    // boot that holds the token to the fact it names: three attempts against an
+    // unresolvable next hop must all read `next-hop-unreachable`, which they do
+    // only because ending a session gives its connection back and leaves the
+    // next dial a table the one before it did not touch.
     Scenario {
         name: "dial-unresolvable",
         document: image::CONFIGURATION_DOCUMENT,

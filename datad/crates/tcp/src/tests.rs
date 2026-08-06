@@ -2259,6 +2259,109 @@ fn aborting_resets_the_peer_and_frees_the_slot() {
     assert_eq!(stack.abort(alive, &mut out).map(|len| len > 0), Ok(true));
 }
 
+/// Releasing gives the four-tuple back, and what it owes the peer follows from
+/// the state rather than from the call.
+///
+/// The four situations a caller finished with a connection can be in, and each
+/// has one right answer: a dial nothing answered is forgotten in silence, a
+/// synchronized connection draws the reset that stops its peer sending into an
+/// exchange this end no longer carries, a close that is over is forgotten too —
+/// resetting one would contradict a `FIN` the peer already accepted — and a
+/// handle the table has already ended names nothing to give back.
+#[test]
+fn releasing_a_connection_frees_the_tuple_and_tells_the_peer_only_where_it_must() {
+    let mut out = [0u8; 2048];
+
+    // A dial nothing answered: no connection exists at the far end for a reset
+    // to end, so nothing is composed and the slot goes.
+    let mut dialling = stack();
+    let dialled = dialling
+        .connect(at(0), STATION, 40000, &mut out)
+        .expect("a slot and room for a SYN");
+    assert_eq!(
+        dialling.release(dialled.connection, &mut out),
+        Released::Forgotten {
+            state: State::SynSent
+        }
+    );
+    assert_eq!(dialling.connection(dialled.connection), None);
+    assert_eq!(dialling.counters().resets_sent, 0);
+    // And the four-tuple is free, which is the whole point: the next dial to it
+    // opens rather than naming the connection the last one left behind.
+    assert!(
+        dialling
+            .connect(at(1_000), STATION, 40000, &mut out)
+            .is_ok()
+    );
+
+    // A synchronized connection: the peer believes in it, so it is told.
+    let mut live = stack();
+    let mut peer = Peer::new(40001, 0x2a_0000);
+    let established = handshake(&mut live, at(0), &mut peer);
+    let Released::Reset { state, len } = live.release(established, &mut out) else {
+        panic!("a synchronized connection owes its peer a reset");
+    };
+    assert_eq!(state, State::Established);
+    let reset = peer.read(&out[..len]);
+    assert!(reset.flags.contains(Flags::RST));
+    assert!(reset.flags.contains(Flags::ACK));
+    assert_eq!(live.connection(established), None);
+    assert_eq!(live.counters().resets_sent, 1);
+
+    // A close both halves finished, held in `TIME_WAIT` by this end alone. The
+    // record is dropped and no segment leaves.
+    let mut finished = stack();
+    let mut peer = Peer::new(40002, 0x2b_0000);
+    let closing = handshake(&mut finished, at(0), &mut peer);
+    let len = finished.close(at(1_000), closing, &mut out).expect("a FIN");
+    peer.read(&out[..len]);
+    let fin = peer.fin();
+    finished.receive(at(2_000), peer.address, &fin, &mut out);
+    assert_eq!(
+        finished.connection(closing).map(Connection::state),
+        Some(State::TimeWait)
+    );
+    assert_eq!(
+        finished.release(closing, &mut out),
+        Released::Forgotten {
+            state: State::TimeWait
+        }
+    );
+    assert_eq!(finished.connection(closing), None);
+    assert_eq!(finished.counters().resets_sent, 0);
+
+    // And a handle the table already ended: nothing to give back, and no error
+    // either — a caller releasing a connection a reset or a reaping took is the
+    // ordinary case.
+    assert_eq!(finished.release(closing, &mut out), Released::Absent);
+    assert_eq!(finished.counters().resets_sent, 0);
+}
+
+/// Storage too small still frees the slot, which is the opposite of what an
+/// abort does and the reason a release exists beside it: the caller has finished
+/// with the connection and has nothing to try again with, so a slot kept back
+/// would refuse its next dial for the four-tuple.
+#[test]
+fn a_release_whose_reset_does_not_fit_gives_the_slot_back_anyway() {
+    let mut stack = stack();
+    let mut out = [0u8; 2048];
+    let mut peer = Peer::new(40003, 0x2c_0000);
+    let established = handshake(&mut stack, at(0), &mut peer);
+
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        stack.release(established, &mut tiny),
+        Released::Reset {
+            state: State::Established,
+            len: 0
+        }
+    );
+    assert_eq!(stack.connection(established), None);
+    assert_eq!(stack.counters().write_refused, 1);
+    assert_eq!(stack.counters().resets_sent, 0);
+    assert!(stack.connect(at(1_000), STATION, 40003, &mut out).is_ok());
+}
+
 // ── The dial ────────────────────────────────────────────────────────────────
 
 /// The whole of what an active open negotiates, read off the two segments it

@@ -338,6 +338,46 @@ pub enum DialError {
     Write(WriteError),
 }
 
+/// What giving one connection back found, and what it owed.
+///
+/// Three answers rather than a `bool` or an `Option<usize>`, because "there was
+/// nothing left to give back" and "it was given back in silence" are different
+/// facts about the peer: the first says the table had already ended the
+/// connection, the second that this end ended it and the peer is entitled to
+/// hear nothing about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Released {
+    /// The handle named no connection. The table had already taken the slot
+    /// back — a `RST` it processed, a dial it abandoned, a `TIME_WAIT` or an
+    /// idle connection it reaped — so there was nothing to release and nothing
+    /// to tell anybody.
+    Absent,
+    /// The slot was freed and no segment was composed, the state it stood in
+    /// owing the peer none
+    /// ([`Connection::abort`](connection::Connection::abort) says which those
+    /// are and why). The state travels so a caller can report what it gave back
+    /// rather than only that it did.
+    Forgotten { state: State },
+    /// The slot was freed and the peer was told, with a `RST` of `len` bytes now
+    /// in `out`. `len` is zero where the caller's storage could not hold one:
+    /// the slot goes in either case, for the reason
+    /// [`TcpStack::release`] states.
+    Reset { state: State, len: usize },
+}
+
+impl Released {
+    /// The reset to put on the wire, where one was composed. A release that
+    /// owed none answers `None` rather than `Some(0)`, so a caller has one
+    /// question per answer: is there a segment to send.
+    #[must_use]
+    pub const fn composed(self) -> Option<usize> {
+        match self {
+            Self::Reset { len, .. } if len > 0 => Some(len),
+            Self::Reset { .. } | Self::Absent | Self::Forgotten { .. } => None,
+        }
+    }
+}
+
 /// What one dial produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dialled {
@@ -720,6 +760,55 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         TcpCounters::bump(&mut self.counters.connections_closed);
         self.free(id.slot);
         Ok(len)
+    }
+
+    /// Give a connection back: forget it here, and tell the peer where the state
+    /// it stood in says one must be told.
+    ///
+    /// [`abort`](Self::abort)'s neighbour, and the difference is who decides. An
+    /// abort is a caller cutting a live exchange short and always composes a
+    /// `RST`, saying "this message is incomplete" being the whole point of it. A
+    /// release is a caller that is *finished* with a connection whichever way it
+    /// got there, so what it owes follows from the state rather than from the
+    /// call — [`Connection::abort`](connection::Connection::abort) holds that
+    /// rule and its reasons.
+    ///
+    /// **The slot is freed in every case**, including where the reset could not
+    /// be composed for want of storage: a caller releases a connection so the
+    /// 4-tuple is free for the next one, and a slot kept back would refuse that
+    /// next dial with [`DialError::AlreadyOpen`], naming this end's own table
+    /// for something no peer did. The opposite of [`abort`](Self::abort)'s
+    /// choice, and deliberately — an abort's caller can try again with the next
+    /// pass's storage, a release's caller has nothing left to try again with.
+    ///
+    /// Total: a handle that names nothing is [`Released::Absent`] rather than an
+    /// error, a caller releasing a connection the table has already ended being
+    /// the ordinary case.
+    pub fn release(&mut self, id: ConnectionId, out: &mut [u8]) -> Released {
+        // Everything the answer needs, read in one borrow of the table so the
+        // write and the free below are the only other two.
+        let Some(plan) = self.resolve(id).map(|connection| {
+            (
+                connection.state(),
+                connection.peer_address(),
+                connection.peer_port(),
+                connection.advertised_window(),
+                connection.abort(),
+            )
+        }) else {
+            return Released::Absent;
+        };
+        let (state, peer, port, window, reply) = plan;
+        let released = match reply {
+            Some(reply) => Released::Reset {
+                state,
+                len: self.send_reset(peer, port, window, &reply, out),
+            },
+            None => Released::Forgotten { state },
+        };
+        self.free(id.slot);
+        TcpCounters::bump(&mut self.counters.connections_closed);
+        released
     }
 
     /// Re-send the oldest unacknowledged range of a connection, with the bytes

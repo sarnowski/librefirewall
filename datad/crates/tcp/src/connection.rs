@@ -769,6 +769,37 @@ impl Connection {
         }
     }
 
+    /// The `RST` a connection given back by its caller owes, and `None` where it
+    /// owes none: RFC 793 section 3.8's *ABORT* read state by state.
+    ///
+    /// A **synchronized** connection owes it, because the peer believes in an
+    /// exchange this end has stopped carrying and goes on sending into it
+    /// otherwise. A dial nothing answered owes none, for
+    /// [`abandonment`](Self::abandonment)'s reason exactly. And a connection
+    /// whose close is *over* owes none either: `CLOSING`, `LAST_ACK`,
+    /// `TIME_WAIT` and `CLOSED` are this end's own record of an exchange both
+    /// halves have ended, and resetting one would contradict a `FIN` the peer
+    /// has already accepted.
+    ///
+    /// Giving a `TIME_WAIT` back early spends the guarantee that state exists
+    /// for — a delayed duplicate of the connection just closed cannot be
+    /// delivered into a new one on the same 4-tuple — and it is the trade
+    /// [`evictable`](Self::evictable) already makes under table pressure. What
+    /// buys it is the 4-tuple, which is otherwise held for a minute by nothing
+    /// but this end's own bookkeeping.
+    pub(crate) fn abort(&self) -> Option<Reply> {
+        match self.state {
+            State::SynSent | State::Closing | State::LastAck | State::TimeWait | State::Closed => {
+                None
+            }
+            State::SynReceived
+            | State::Established
+            | State::CloseWait
+            | State::FinWait1
+            | State::FinWait2 => Some(self.reset()),
+        }
+    }
+
     /// Move to `CLOSED` without sending anything, which is what a `RST` and an
     /// abandonment both leave behind.
     pub(crate) fn close_hard(&mut self) {

@@ -3899,8 +3899,13 @@ impl ManagementProbe {
             // rather than a panic, because a rendering is not a place to fail a
             // run that has otherwise met its contract.
             ManagementReply::Tcp(step) => format!("  answered   tcp-step {step:?}"),
-            // Unreachable for the same reason: a dial step is rendered through
-            // `dialled` and `resolved`, which have the values worth printing.
+            // Reached on every station-backed boot, and often: the caller routes
+            // a TCP step to `opened` and everything else here, so each of the
+            // dial's own frames — the resolutions, the `SYN`s, the segments of
+            // the exchange — lands on this line. `dialled` and `resolved` are
+            // the transitions, printed once each where the step moves; this is
+            // the frame beside them, and the step is the whole of what it has to
+            // say about one.
             ManagementReply::Dial(step) => format!("  answered   dial-step {step:?}"),
             ManagementReply::Arp => format!(
                 "  answered   arp-request           station->mgmt  who-has {} tell {}  \

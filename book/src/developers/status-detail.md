@@ -1704,21 +1704,17 @@ established one.
   that channel too runs out its attempts; and one answers the resolution for an address nothing
   asked about, which this end does not learn from. The first three end `connection-lost`, each after
   three sessions, and what tells them apart is the wire the station judged field by field rather
-  than the token. **In every one the node stays healthy**: its routed contract is met in the same boot, its management port reports every frame
+  than the token; the fourth ends `next-hop-unreachable`, also after three. **In every one the node stays healthy**: its routed contract is met in the same boot, its management port reports every frame
   put on that wire to the byte, and the station holds the appliance to the arithmetic of its own
   constants — at most three sessions, at most five re-sends of an unanswered `SYN`, at most three
   requests per resolution — and calls a node past any of them broken.
-- **A channel that fails at the resolution reports the wrong reason, and the fourth boot found it.**
-  Nothing is learned from a reply the appliance did not ask for and no `SYN` ever crosses — both are
-  held on the wire — but the console says `dial-refused` rather than `next-hop-unreachable`. The
-  first session ends correctly and leaves behind the connection its `SYN` was composed on: that
-  segment was dropped for want of an address, so the transport still holds it in `SynSent`, and
-  closing an outbound session releases the session and not the connection under it. The second dial
-  to the same address and port is then refused by this node's own table, the third with it, and the
-  record names the last session's end. An operator is sent to this appliance's transport when what
-  is wrong is that nothing on the link claims the next hop. The scenario asserts what the appliance
-  does; releasing the connection with the session is the fix, and it is a change to the endpoint
-  rather than to the gate.
+- **Ending a session gives its connection back to the transport**, which is what keeps every attempt
+  after the first a statement about the link. A session that ends at the resolution has left a `SYN`
+  on the transport's books — that segment was dropped for want of a hardware address, so nothing at
+  the far end will ever answer it — and the release is the only thing that ends it. What the release
+  owes the peer follows from the state: a dial nothing answered and a close both halves finished are
+  given back in silence, and a synchronized connection draws the reset that stops its peer sending
+  into an exchange this end no longer carries.
 - **`RDRAND` is now a hard hardware requirement.** A part whose `CPUID.01H:ECX[30]` is clear refuses
   the management domain outright, so that node has no management port for the boot. The QEMU bench had
   to be told to expose it (`datad/tools/xtask/src/qemu.rs`); every deployment target must have it. There is
