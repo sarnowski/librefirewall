@@ -46,7 +46,7 @@ use std::{
     process::Command,
 };
 
-use lfw_log::DialOutcome;
+use lfw_log::{DialOutcome, OnboardEnd};
 
 use crate::{
     artifacts::DIST_DISK,
@@ -57,9 +57,12 @@ use crate::{
     diagnose::{self, GUEST_OUTPUT_MARKER, Run},
     dial_contract::{self, Count, DialAccount, DialVerdict},
     forward_harness::{
-        self, BootContract, BootTest, Booted, DialMisbehaviour, ManagementBacking, Traffic,
+        self, BootContract, BootTest, Booted, DialMisbehaviour, ManagementBacking,
+        OnboardBehaviour, Traffic,
     },
-    image, management_contract, metrics_contract, probe_contract,
+    image, management_contract, metrics_contract,
+    onboard_contract::{self, OnboardVerdict},
+    probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -233,6 +236,9 @@ struct Bench {
     traffic: Traffic,
     /// Whether this boot holds the appliance to the channel it dials out.
     dial: DialContract,
+    /// Whether this boot opens a session on the appliance's onboarding port, and
+    /// how the station on this end of it behaves.
+    onboard: OnboardContract,
     /// Which store medium this boot attaches: a fresh one, or the one an earlier
     /// boot of the same run minted an identity on — reset or not.
     store: StoreMedium,
@@ -248,6 +254,7 @@ pub(crate) struct ForwardBench {
     pub(crate) management: ManagementBacking,
     pub(crate) traffic: Traffic,
     pub(crate) dial: DialContract,
+    pub(crate) onboard: OnboardContract,
     pub(crate) store: StoreMedium,
 }
 
@@ -475,6 +482,77 @@ impl DialContract {
     }
 }
 
+/// Whether a boot opens a session on the **second** port the appliance's
+/// management endpoint listens on, and what it must be answered with.
+///
+/// [`DialContract`]'s shape on the other port and the other direction: there the
+/// appliance connects and the harness answers, here the harness connects and the
+/// appliance answers. The station's behaviour is chosen once and held for the
+/// whole boot, so a reader never has to work out which half of a capture a frame
+/// belongs to.
+///
+/// **Only three boots open one, and that is structural rather than thrifty.**
+/// The port holds one connection at a time, so a session opened on every boot
+/// would sit beside every other contract this harness states — and a scenario
+/// whose subject was something else would be the one to fail when the port did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnboardContract {
+    /// Nothing is opened. Every scenario whose subject is something else takes
+    /// this.
+    Untouched,
+    /// The station behaves in the named way and the appliance must report the
+    /// one set of records that behaviour produces — while the node itself goes
+    /// on forwarding and its management port goes on counting to the byte.
+    Session(OnboardBehaviour),
+}
+
+impl OnboardContract {
+    /// How the station this harness plays on that port behaves.
+    pub(crate) const fn behaviour(self) -> OnboardBehaviour {
+        match self {
+            Self::Untouched => OnboardBehaviour::Untouched,
+            Self::Session(behaviour) => behaviour,
+        }
+    }
+
+    /// What the appliance must say about the session, given how the station
+    /// ended it.
+    ///
+    /// The one place the three behaviours are turned into records, and every
+    /// answer here follows from the appliance's own code rather than from what
+    /// would be convenient. What is *not* here is every count the machine
+    /// decides: the items a session's handover spends are a floor stated where
+    /// the contract judges them, and the bytes are what the run's own station
+    /// put on the wire.
+    pub(crate) const fn verdict(self) -> Option<OnboardVerdict> {
+        let (ended, forgotten) = match self {
+            // Nothing is read: the boot opens no session.
+            Self::Untouched => return None,
+            // A station that opens nothing is not a session, so this pairing
+            // names no records. A `None` rather than a panic: the caller refuses
+            // it by name, which turns a table entry that cannot mean anything
+            // into a verdict a reader can act on.
+            Self::Session(OnboardBehaviour::Untouched) => return None,
+            // The peer closed its half and the appliance closed after it, so the
+            // connection was given up by agreement and the transport lost
+            // nothing.
+            Self::Session(OnboardBehaviour::Completes) => (OnboardEnd::Peer, Count::Exactly(0)),
+            // A reset with neither end having said the session was over, so the
+            // connection stopped existing under a session that was still
+            // running. `forgotten` is the port's own count of exactly that, and
+            // it is what separates this from the close above on a surface where
+            // the two once shared one token.
+            Self::Session(OnboardBehaviour::Abandons) => (OnboardEnd::Forgotten, Count::Exactly(1)),
+            // The crowding station ends its own session exactly as the first
+            // does; what it adds is an absence on the wire and a port that
+            // accepted one connection rather than two, both of which the
+            // contract states of every session it judges.
+            Self::Session(OnboardBehaviour::Crowds) => (OnboardEnd::Peer, Count::Exactly(0)),
+        };
+        Some(OnboardVerdict { ended, forgotten })
+    }
+}
+
 /// Which store medium a boot attaches at 00:06.0 — the appliance's own.
 ///
 /// A property of the scenario rather than of the run, on [`Accelerator`]'s terms:
@@ -671,6 +749,25 @@ pub(crate) enum Console {
     /// cannot satisfy it. Beside it the boot's own routed contract says the
     /// dataplane went on forwarding throughout.
     JudgedOnTheDialledChannelAndThePortsCount,
+    /// **The session the appliance carried on its onboarding port, and the port's
+    /// own count beside it.**
+    ///
+    /// [`Self::JudgedOnTheDialledChannelAndThePortsCount`]'s shape on the other
+    /// of the two ports that endpoint listens on, and it is here for the same
+    /// two reasons. The transcript, the clock, the hardware probe and the
+    /// cryptography domain are facts about the image that other boots state, and
+    /// re-stating them on three more would pay three whole boots for a second
+    /// reading of one fact.
+    ///
+    /// And the port's count is not a fifth such fact: it is the evidence that
+    /// the node stayed healthy while a second protection domain was driven over
+    /// a relay by an unauthenticated peer's bytes. The appliance must report
+    /// every frame the harness put on that wire, to the frame and to the byte,
+    /// over a boot in which many of them are spent waking a domain that has no
+    /// timer of its own — so a domain that faulted, stalled or lost its place
+    /// carrying a session cannot satisfy it. Beside it the boot's own routed
+    /// contract says the dataplane went on forwarding throughout.
+    JudgedOnTheOnboardingSessionAndThePortsCount,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -691,6 +788,9 @@ pub(crate) struct Scenario {
     /// Whether this boot holds the appliance to the channel it dials out of its
     /// management port.
     dial: DialContract,
+    /// Whether this boot opens a session on the appliance's onboarding port, and
+    /// how the station on this end of it behaves.
+    onboard: OnboardContract,
     /// Which accelerator QEMU must use. All but one scenario take whatever the
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
@@ -783,6 +883,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -794,6 +895,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Judged,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -805,6 +907,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -820,6 +923,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -843,6 +947,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -863,6 +968,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -886,6 +992,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -897,6 +1004,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Policy,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -925,6 +1033,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -936,6 +1045,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Stateful,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -993,6 +1103,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Reconfiguration,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1032,6 +1143,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Revocation,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1065,6 +1177,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Related,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1076,6 +1189,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Lifecycle,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1118,6 +1232,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Client,
         traffic: Traffic::Flood,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1156,6 +1271,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1197,6 +1313,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // delivery is required of it.
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::Emulated,
         store: StoreMedium::Fresh,
     },
@@ -1235,6 +1352,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // shape of the ones it repeats rather than being an idle guest.
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1246,6 +1364,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the boot above minted on. It must precede this one in this
         // table, and `StoreDisk::carried` says so by name when it does not.
@@ -1275,6 +1394,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the two boots above ran on, which by here carries an
         // identity that has already been shown to survive a reboot — so what this
@@ -1320,6 +1440,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::SilentToTheDial),
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1331,6 +1452,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::ResetsTheDial),
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1342,6 +1464,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence),
+        onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1361,6 +1484,86 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         management: ManagementRole::Station,
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress),
+        onboard: OnboardContract::Untouched,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    // The three boots whose subject is the appliance's ONBOARDING PORT — the
+    // second port its management endpoint listens on, which carries a byte
+    // stream rather than a request and a response, and which no booted image had
+    // ever been held to. What held it until now was the host suite and three
+    // fuzz harnesses: everything above the wire, and nothing across it.
+    //
+    // The port is the one an administrator reaches an appliance that has never
+    // met them on, so its peer is the unauthenticated management-plane attacker
+    // by definition. What a session on it costs the node is a second protection
+    // domain driven over a relay by that peer's bytes, at that peer's pace —
+    // which is why the health half below is stated on all three.
+    //
+    // THREE THINGS HOLD ON EACH. The two domains that carried the session agree
+    // about it, field by field, and agree with what this harness put on the
+    // wire; the port's own totals place what the accounts state; and THE NODE
+    // STAYS HEALTHY — its routed contract is met in the same boot, so the
+    // dataplane forwarded throughout, and its management port reports every
+    // frame the harness put on that wire to the byte, so the domain carrying the
+    // session neither faulted nor lost its place.
+    //
+    // One boot per ending rather than three sessions inside one, on the dial
+    // boots' terms: the port holds one connection, a station that changed its
+    // mind mid-run would leave a reader deciding which session a record belonged
+    // to, and a failure in one of the three would be unattributable.
+    //
+    // Socket-backed necessarily, and more strictly than the dial boots are. Two
+    // of the three are decided by something no host TCP client can express: a
+    // reset at an instant this end chooses, and a second SYN whose whole subject
+    // is that nothing comes back to it. QEMU's user-mode stack would terminate
+    // both and answer for the appliance.
+    Scenario {
+        name: "onboarding-session",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Session(OnboardBehaviour::Completes),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    // The same session up to the acknowledgement of its payload, ended by a
+    // reset rather than a close. Neither end of the session said it was over, so
+    // what both domains must report is a connection the transport stopped
+    // holding — which the far end could not tell from a peer hanging up until
+    // the close it is sent began carrying the ending, and which the port's own
+    // `forgotten` count is the second, independent statement of.
+    Scenario {
+        name: "onboarding-abandoned",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Session(OnboardBehaviour::Abandons),
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
+    // And the one whose subject is a SECOND connection while the first is
+    // established. The port holds one and an established connection is not
+    // evictable, so the second SYN finds no slot and nothing to take one from.
+    // What the appliance owes it is NOTHING AT ALL — not a handshake and not a
+    // refusal — so the claim is an absence the station holds on the wire, beside
+    // a port that accepted one connection rather than two and a boot carrying
+    // one session record rather than two.
+    Scenario {
+        name: "onboarding-crowded",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Session(OnboardBehaviour::Crowds),
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1657,12 +1860,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         Console::JudgedOnTheStoredIdentityAlone => {
             return run_store_scenario(root, scenario, run, &disk, &topology);
         }
-        // The dial-misbehaviour boots run the ordinary path: their routed
-        // contract is half of what they prove, so they are boots of the same
-        // shape as every other station-backed one and differ in what the console
-        // is read for afterwards.
-        Console::Ignored | Console::Judged | Console::JudgedOnTheDialledChannelAndThePortsCount => {
-        }
+        // The dial-misbehaviour and onboarding boots run the ordinary path:
+        // their routed contract is half of what they prove, so they are boots of
+        // the same shape as every other station-backed one and differ in what
+        // the console is read for afterwards.
+        Console::Ignored
+        | Console::Judged
+        | Console::JudgedOnTheDialledChannelAndThePortsCount
+        | Console::JudgedOnTheOnboardingSessionAndThePortsCount => {}
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -1683,6 +1888,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             management: backing,
             traffic: scenario.traffic,
             dial: scenario.dial,
+            onboard: scenario.onboard,
             store: scenario.store,
         },
     )
@@ -1810,6 +2016,19 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!("; {dial}; {management}")
         }
+        Console::JudgedOnTheOnboardingSessionAndThePortsCount => {
+            // Both domains' account of the session, held to what the station on
+            // this end of it did.
+            let onboarded = judge_onboarding(scenario, &booted, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            // And the evidence that the node stayed healthy while it carried
+            // one: every frame the harness put on that wire, reported to the
+            // byte, over a boot in which many of them were spent waking a domain
+            // that has no timer of its own.
+            let management = management_contract::judge(&booted.serial, &log, booted.management)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {onboarded}; {management}")
+        }
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -1902,6 +2121,30 @@ fn judge_dial(scenario: &Scenario, booted: &Booted, log: &Path) -> Result<String
     )
 }
 
+/// Hold both domains' account of the onboarding session to what this scenario's
+/// station did, where the scenario reads it.
+///
+/// [`judge_dial`]'s shape and its reasoning: a scenario whose onboarding
+/// contract states no verdict has nothing to judge, and saying so is not the
+/// same as passing. The station's own account is required for the same reason —
+/// the bytes the console reports received are held to the bytes this end put on
+/// the wire, and a boot that reported none observed nothing to compare against.
+fn judge_onboarding(scenario: &Scenario, booted: &Booted, log: &Path) -> Result<String, String> {
+    let Some(owed) = scenario.onboard.verdict() else {
+        return Err(String::from(
+            "this scenario reads the appliance's account of an onboarding session and its \
+             onboarding contract opens none, so there is no session to hold the records to",
+        ));
+    };
+    let Some(observed) = booted.onboard else {
+        return Err(String::from(
+            "this scenario opens an onboarding session and the boot reported no account of one, \
+             so the bytes the console states received have nothing independent to be held to",
+        ));
+    };
+    onboard_contract::judge(&booted.serial, log, owed, observed)
+}
+
 /// Boot one scenario on the **emulator** and judge the cryptography domain,
 /// which is the whole of what it is for.
 ///
@@ -1946,6 +2189,7 @@ fn run_cryptography_scenario(
             management: ManagementBacking::Socket,
             traffic: scenario.traffic,
             dial: scenario.dial,
+            onboard: scenario.onboard,
             store: scenario.store,
         },
     )
@@ -1996,6 +2240,7 @@ fn run_store_scenario(
             management: ManagementBacking::Socket,
             traffic: scenario.traffic,
             dial: scenario.dial,
+            onboard: scenario.onboard,
             store: scenario.store,
         },
     )
@@ -2078,6 +2323,7 @@ pub(crate) fn boot_and_forward(
         management,
         traffic,
         dial,
+        onboard,
         store,
     } = bench;
     boot(
@@ -2094,6 +2340,7 @@ pub(crate) fn boot_and_forward(
             management,
             traffic,
             dial,
+            onboard,
             store,
         },
     )
@@ -2307,6 +2554,7 @@ pub(crate) fn boot_and_fail_closed(
             // byte, for exactly that.
             traffic: Traffic::Routed,
             dial: DialContract::Answered,
+            onboard: OnboardContract::Untouched,
             store,
         },
     )
@@ -2338,6 +2586,7 @@ pub(crate) fn boot_and_halt(
             // same as every other halt scenario's.
             traffic: Traffic::Routed,
             dial: DialContract::Answered,
+            onboard: OnboardContract::Untouched,
             store: StoreMedium::Fresh,
         },
     )
@@ -2356,6 +2605,7 @@ fn boot(
         management,
         traffic,
         dial,
+        onboard,
         store,
     } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
@@ -2440,6 +2690,7 @@ fn boot(
             topology,
             traffic,
             dial,
+            onboard: onboard.behaviour(),
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;

@@ -87,6 +87,7 @@ mod host;
 mod image;
 mod management_contract;
 mod metrics_contract;
+mod onboard_contract;
 mod pins;
 mod probe_contract;
 mod qemu;

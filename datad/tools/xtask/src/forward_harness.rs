@@ -92,6 +92,7 @@ use std::{
 use crate::dial_contract;
 use crate::management_contract::{self, ManagementInjection};
 use crate::metrics_contract::{self, Scrape};
+use crate::onboard_contract;
 use crate::qemu::{GuestNic, every_guest_nic};
 use crate::recording_contract::{self, Download};
 use crate::surface_contract::Injected;
@@ -368,6 +369,67 @@ const DIAL_SYNS_WHILE_UNANSWERED: usize = 3 * (1 + 5);
 /// a tenth is a cache that is not giving up. A ceiling rather than a count:
 /// fewer cross wherever a session ends before it reaches a resolution at all.
 const DIAL_REQUESTS_WHILE_UNRESOLVED: usize = 3 * 3;
+
+/// The two ephemeral ports the onboarding station dials the appliance's second
+/// listening port from.
+///
+/// Two rather than one because one scenario opens a second connection while the
+/// first is established, and a 4-tuple is what tells them apart on this wire.
+/// Neither collides with [`CLIENT_PORT`], the harness's own HTTP client running
+/// on the same wire in the same boot.
+const ONBOARD_STATION_PORT: u16 = 0xc351;
+const ONBOARD_CROWD_PORT: u16 = 0xc352;
+
+/// The initial sequence numbers those two connections open under.
+///
+/// Chosen and distinct, on [`STATION_ISN`]'s terms: the appliance's own
+/// acknowledgements are compared against them, and two connections sharing one
+/// would let a segment for either satisfy an assertion about the other.
+const ONBOARD_STATION_ISN: u32 = 0x2b41_7f00;
+const ONBOARD_CROWD_ISN: u32 = 0x5e02_c100;
+
+/// The window the onboarding station advertises.
+///
+/// Larger than anything it sends, so nothing this station does is ever paced by
+/// its own receive window: what the appliance answers with on this port is
+/// nothing at all today, and a window that could refuse a byte would make that
+/// fact unreadable.
+const ONBOARD_WINDOW: u16 = 8192;
+
+/// What one onboarding session carries, in one segment.
+///
+/// A first-party marker of the harness's own, and deliberately not a fragment of
+/// any protocol: nothing above this port's transport exists yet, so a payload
+/// shaped like a handshake would suggest one was being spoken. What is asserted
+/// about it is its **length**, at both ends of the relay and in both domains'
+/// accounts, so the one property it needs is to be a length no bound of the path
+/// rounds off — it is far inside [`pd_runtime::ONBOARD_INBOUND_CAPACITY`] and
+/// inside one relay item, so a session that carried it carried all of it in one
+/// handover.
+const ONBOARD_PAYLOAD: &[u8] = b"LFW-ONBOARD/1 hello";
+
+/// Frames the onboarding station will spend keeping the port awake while it
+/// waits for the appliance to finish a session and report it.
+///
+/// [`DIAL_NUDGE_LIMIT`]'s reasoning on the other port. A session is carried by
+/// two domains and a relay between them, and the management domain holds no
+/// timer interrupt: every pass that advances the handover runs on a wakeup, and
+/// the last of them — the pass that closes the account and writes the console
+/// record — has no frame of its own to provoke it once the connection is gone.
+/// So the station goes on speaking until the records appear, bounded by a number
+/// of frames rather than a length of time, so an emulated run and an accelerated
+/// one spend the same budget.
+const ONBOARD_NUDGE_LIMIT: usize = 512;
+
+/// How many segments the onboarding station will accept on one connection before
+/// it calls the appliance broken.
+///
+/// A session of this shape is a handshake, an acknowledgement of one payload and
+/// a close — three segments this end must see, and a retransmission of any of
+/// them is a fourth. A ceiling with room rather than a count: what it catches is
+/// a port that answers without end, which is the one failure a station that
+/// simply waits could not tell from a slow machine.
+const ONBOARD_SEGMENT_LIMIT: usize = 32;
 
 const TCP_PROTOCOL: u8 = 6;
 const TCP_HEADER_LEN: usize = 20;
@@ -2957,6 +3019,14 @@ pub struct BootTest<'a> {
     /// complete, whether the appliance's own record of it is read, and which of
     /// the four ways a management server can misbehave this station plays.
     pub dial: crate::qemu::DialContract,
+    /// How the station this harness plays on the appliance's **second** listening
+    /// port behaves — the onboarding port, which carries a byte stream rather
+    /// than a request.
+    ///
+    /// Every boot but the three whose subject it is opens nothing there, and not
+    /// out of economy: the port holds one connection at a time, so a session on
+    /// every boot would put one beside every other contract this harness states.
+    pub onboard: OnboardBehaviour,
     /// Whether QEMU is executing the guest on hardware rather than emulating
     /// it. Carried through to [`Booted`] because one judge needs it and cannot
     /// re-derive it honestly: a cycle count taken under emulation measures the
@@ -3513,6 +3583,10 @@ enum ManagementReply {
     /// step it completed. The other direction of this wire: everything above is
     /// the appliance answering, and this is the appliance asking.
     Dial(DialStep),
+    /// One step of the connection this harness opened to the appliance's
+    /// onboarding port, named by the step it completed. The appliance answering
+    /// again, on the other of the two ports its endpoint listens on.
+    Onboard(OnboardStep),
 }
 
 /// Where the client's connection has got to.
@@ -3804,6 +3878,333 @@ impl DialStation {
     }
 }
 
+/// How the station on the appliance's **onboarding** port behaves.
+///
+/// [`DialMisbehaviour`]'s shape on the other direction of the same wire, and the
+/// reason it is a mode rather than a script is the same: the station holds one
+/// for the whole boot, so a reader never has to work out which half of a capture
+/// a frame belongs to, and a failure in one of the three is attributable to the
+/// scenario that chose it.
+///
+/// What differs is which end connects. The dial's station *accepts* what the
+/// appliance opens; this one *opens* what the appliance accepts, which is
+/// [`TcpClient`]'s shape — and it is the half of that port no scenario had ever
+/// driven, the port having been proved by host tests and fuzzing alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OnboardBehaviour {
+    /// Nothing is opened at all. Every scenario whose subject is something else
+    /// takes this, and takes it for a reason beyond economy: the port holds one
+    /// connection, so a station that opened one on every boot would put a
+    /// session beside every other contract this harness states.
+    #[default]
+    Untouched,
+    /// Connects, delivers one payload in one segment, closes its half, and
+    /// acknowledges the close the appliance answers with. The ordinary end of a
+    /// session an administrator finished with.
+    Completes,
+    /// The same up to the appliance's acknowledgement of the payload, and then a
+    /// **reset** instead of a close.
+    ///
+    /// The acknowledgement is what it waits on rather than an interval, so the
+    /// reset lands on a session the appliance has certainly taken the bytes of.
+    /// Neither end says the session is over, so what both domains must report is
+    /// a session the transport forgot — which is a different thing for an
+    /// operator to look at from one a peer hung up on, and was a single token
+    /// between them until the far end was told how a close ended.
+    Abandons,
+    /// [`Completes`](Self::Completes), and opens a **second** connection from a
+    /// port of its own while the first is established.
+    ///
+    /// The port holds one connection and an established one is not evictable, so
+    /// the second `SYN` finds no slot and is dropped by the transport itself.
+    /// What this scenario states is therefore an **absence** — nothing comes back
+    /// to that port at all, not a handshake and not a refusal — beside the
+    /// evidence that the session already running was not disturbed by it.
+    Crowds,
+}
+
+impl OnboardBehaviour {
+    /// Whether this boot opens a session on the onboarding port at all.
+    pub(crate) const fn opens(self) -> bool {
+        !matches!(self, Self::Untouched)
+    }
+
+    /// Whether this station ends its session with a reset rather than a close.
+    const fn resets(self) -> bool {
+        matches!(self, Self::Abandons)
+    }
+
+    /// Whether this station opens a second connection beside the one it is
+    /// carrying.
+    pub(crate) const fn crowds(self) -> bool {
+        matches!(self, Self::Crowds)
+    }
+}
+
+/// Where the onboarding station's connection has got to.
+///
+/// [`TcpStep`]'s shape on the port that carries a byte stream rather than a
+/// request: the exchange is a sequence, each step asserts what came back and
+/// decides what goes out, and the contract is met only by walking the whole of
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnboardStep {
+    /// Nothing sent yet.
+    Unopened,
+    /// `SYN` sent; the appliance owes a `SYN-ACK`.
+    AwaitSynAck,
+    /// The payload is out; the appliance owes an acknowledgement covering it.
+    AwaitAck,
+    /// This end has closed its half; the appliance owes its own `FIN`.
+    AwaitFin,
+    /// This end reset the connection. Terminal, and nothing further may arrive:
+    /// a segment after a reset is the appliance answering a connection it was
+    /// told to forget.
+    Reset,
+    /// The appliance's `FIN` has been acknowledged and both halves are closed.
+    Closed,
+}
+
+impl OnboardStep {
+    /// What the appliance still owes, as a clause for a verdict.
+    fn outstanding(self) -> &'static str {
+        match self {
+            Self::Unopened => "the onboarding connection has not been opened",
+            Self::AwaitSynAck => "the SYN-ACK of the onboarding connection",
+            Self::AwaitAck => "the acknowledgement of the onboarding payload",
+            Self::AwaitFin => "the FIN closing the onboarding session",
+            Self::Reset | Self::Closed => "none",
+        }
+    }
+
+    /// Whether the appliance has finished with this station, whichever way the
+    /// station ended it.
+    const fn finished(self) -> bool {
+        matches!(self, Self::Reset | Self::Closed)
+    }
+}
+
+/// This harness's own end of the connection it opens to the appliance's
+/// onboarding port.
+///
+/// [`TcpClient`]'s arithmetic driven by [`DialStation`]'s machinery: it connects
+/// and holds the whole of the sequence-number arithmetic, and it holds a mode
+/// for the whole boot and queues what it owes rather than answering inline. The
+/// queue is what lets one event owe two frames — the crowding `SYN` and the
+/// close after it — and what keeps every frame released against the console's
+/// own count, exactly as the dial station's are.
+#[derive(Clone, Debug)]
+struct OnboardStation {
+    /// How this station behaves, chosen once per boot and held for the whole of
+    /// it.
+    behaviour: OnboardBehaviour,
+    step: OnboardStep,
+    /// The next sequence number this station will send, and what it expects to
+    /// receive next.
+    sequence: u32,
+    expect: u32,
+    /// The appliance's initial sequence number for this connection, kept for the
+    /// verdict.
+    peer_isn: Option<u32>,
+    /// Payload bytes this station has actually put on the wire.
+    ///
+    /// Counted rather than taken from the constant, because it is what both
+    /// domains' `onboard-received=` is held to: a contract compared against a
+    /// literal beside the sender would agree with itself about a segment that
+    /// was never composed.
+    delivered: u64,
+    /// Segments the appliance has sent on the session's connection, bounded by
+    /// [`ONBOARD_SEGMENT_LIMIT`].
+    segments: usize,
+    /// Whether the second connection's `SYN` has gone out, and how many segments
+    /// came back addressed to it.
+    ///
+    /// The second number is the whole of what the crowding scenario asserts, and
+    /// it is asserted as an absence: a well-behaved port answers a `SYN` it has
+    /// no slot for with nothing at all, so any segment here is a frame that must
+    /// not exist. It is counted as well as refused so the station's own account
+    /// can state the zero rather than leaving a reader to infer it from the run
+    /// having passed.
+    crowded: bool,
+    crowd_answers: usize,
+    /// What this station owes the wire, composed as each segment is judged and
+    /// put on it by the caller against the console's own count.
+    owed: VecDeque<Vec<u8>>,
+    /// Opaque frames spent keeping the port awake while the appliance finishes a
+    /// session and reports it, bounded by [`ONBOARD_NUDGE_LIMIT`].
+    nudges: usize,
+}
+
+impl OnboardStation {
+    fn new(behaviour: OnboardBehaviour) -> Self {
+        Self {
+            behaviour,
+            step: OnboardStep::Unopened,
+            sequence: ONBOARD_STATION_ISN,
+            expect: 0,
+            peer_isn: None,
+            delivered: 0,
+            segments: 0,
+            crowded: false,
+            crowd_answers: 0,
+            owed: VecDeque::new(),
+            nudges: 0,
+        }
+    }
+
+    /// Open the connection, once.
+    ///
+    /// The one frame on this half of the wire nothing provokes: every other is
+    /// composed while a segment is judged. Called by the run loop when the boot
+    /// has reached the point where an exact management count is possible, and
+    /// never twice — a re-sent `SYN` would be this harness retransmitting on a
+    /// lossless host socket, which is the harness testing itself.
+    fn open(&mut self, port: &ManagementPort) {
+        if self.step != OnboardStep::Unopened || !self.behaviour.opens() {
+            return;
+        }
+        self.step = OnboardStep::AwaitSynAck;
+        self.owed.push_back(onboard_segment(
+            port,
+            ONBOARD_STATION_PORT,
+            Numbers {
+                sequence: self.sequence,
+                acknowledgement: 0,
+            },
+            TCP_SYN,
+            &[],
+        ));
+    }
+
+    /// Whether this boot's station has finished everything it set out to do.
+    ///
+    /// The wire's half of the answer only: what the run waits on besides is the
+    /// appliance's own record of the session, which is where the session's
+    /// account and the port's totals are.
+    fn completed(&self) -> bool {
+        !self.behaviour.opens() || self.step.finished()
+    }
+
+    /// Whether the appliance is owed frames to run the passes that finish a
+    /// session and report it.
+    ///
+    /// True from the open until the station has nothing left on the wire. Every
+    /// pass that advances the handover runs on a wakeup, and the two domains wake
+    /// each other over the relay — but the pass that closes the account has no
+    /// frame of its own once the connection is gone, and this domain holds no
+    /// timer interrupt.
+    fn awaiting_the_port(&self) -> bool {
+        self.behaviour.opens() && self.step != OnboardStep::Unopened
+    }
+
+    /// What this station has seen, as a clause for a verdict.
+    fn seen(&self) -> String {
+        if !self.behaviour.opens() {
+            return String::from("this boot opens no onboarding session");
+        }
+        format!(
+            "the onboarding station is {:?}; its connection is at {:?} and still owes {}; it \
+             opened from port {ONBOARD_STATION_PORT} and the appliance answered with initial \
+             sequence {}, {} payload byte(s) went out, {} segment(s) came back, the second \
+             connection was {}opened and drew {} answer(s), and the station spent {} frames \
+             keeping the port awake",
+            self.behaviour,
+            self.step,
+            self.step.outstanding(),
+            self.peer_isn
+                .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
+            self.delivered,
+            self.segments,
+            if self.crowded { "" } else { "not " },
+            self.crowd_answers,
+            self.nudges
+        )
+    }
+
+    /// What the run reports back about this station, for the contract that
+    /// judges the console beside it.
+    fn account(&self) -> OnboardAccount {
+        OnboardAccount {
+            behaviour: self.behaviour,
+            delivered: self.delivered,
+            crowded: self.crowded,
+            crowd_answers: self.crowd_answers,
+            segments: self.segments,
+            nudges: self.nudges,
+        }
+    }
+}
+
+/// One segment from the onboarding station, on either of the two ports it opens
+/// from, as a whole frame on the wire.
+///
+/// [`tcp_frame`]'s counterpart for this station: the same composer underneath,
+/// so a header field or a checksum can only be right or wrong once, with the
+/// port and the window this station's own.
+fn onboard_segment(
+    port: &ManagementPort,
+    source: u16,
+    numbers: Numbers,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    station_segment(
+        port,
+        port.station,
+        Ports {
+            source,
+            destination: pd_runtime::ONBOARDING_PORT,
+        },
+        numbers,
+        flags,
+        ONBOARD_WINDOW,
+        payload,
+    )
+}
+
+/// What the onboarding station observed, carried out of the boot so the console
+/// can be held to it.
+///
+/// The harness's own numbers rather than the appliance's: `delivered` is what
+/// this end actually put on the wire, and the two domains' `onboard-received=`
+/// is compared against it, so the two accounts of one session are independent
+/// rather than the appliance agreeing with itself.
+#[derive(Clone, Copy, Debug)]
+pub struct OnboardAccount {
+    pub behaviour: OnboardBehaviour,
+    pub delivered: u64,
+    /// Whether the second connection's `SYN` was ever put on the wire, and how
+    /// many segments came back addressed to it. The crowding scenario's whole
+    /// claim is that the first is true and the second is zero.
+    pub crowded: bool,
+    pub crowd_answers: usize,
+    pub segments: usize,
+    pub nudges: usize,
+}
+
+impl OnboardAccount {
+    /// This station's account, in the voice of the routed-traffic lines.
+    pub fn render(&self, port: &ManagementPort) -> String {
+        format!(
+            "  answered   onboarding-session    station->mgmt  {}:{ONBOARD_STATION_PORT} -> \
+             {}:{}  station {:?}  {} payload byte(s) delivered, {} segment(s) back, second \
+             connection {}, {} nudge(s) spent",
+            ipv4(port.station),
+            ipv4(port.address),
+            pd_runtime::ONBOARDING_PORT,
+            self.behaviour,
+            self.delivered,
+            self.segments,
+            if self.crowded {
+                format!("opened and answered {} time(s)", self.crowd_answers)
+            } else {
+                String::from("not opened")
+            },
+            self.nudges
+        )
+    }
+}
+
 /// The client's own end of the connection.
 ///
 /// It is deliberately not a TCP stack: the wire between the harness and QEMU is a
@@ -3921,6 +4322,10 @@ impl ManagementProbe {
             // the frame beside them, and the step is the whole of what it has to
             // say about one.
             ManagementReply::Dial(step) => format!("  answered   dial-step {step:?}"),
+            // Reached on every boot that opens an onboarding session, and once
+            // per segment of it: the account of the whole session is written
+            // where the run ends, and this is the frame beside it.
+            ManagementReply::Onboard(step) => format!("  answered   onboard-step {step:?}"),
             ManagementReply::Arp => format!(
                 "  answered   arp-request           station->mgmt  who-has {} tell {}  \
                  is-at {}",
@@ -3974,6 +4379,7 @@ impl ManagementProbe {
         probes: &[Probe],
         client: &mut TcpClient,
         station: &mut DialStation,
+        onboard: &mut OnboardStation,
     ) -> Result<ManagementReply, String> {
         for probe in probes {
             if contains(frame, probe.marker) {
@@ -4016,6 +4422,18 @@ impl ManagementProbe {
                     return self
                         .judge_dial_tcp(frame, station)
                         .map(ManagementReply::Dial);
+                }
+                // The two connections this harness opens are told apart by the
+                // port it opened each from, which is the only thing that
+                // separates them: both run from the station's address to the
+                // appliance's, and both are answered by the same endpoint.
+                if matches!(
+                    tcp_destination_port(frame),
+                    Some(ONBOARD_STATION_PORT | ONBOARD_CROWD_PORT)
+                ) {
+                    return self
+                        .judge_onboard_tcp(frame, onboard)
+                        .map(ManagementReply::Onboard);
                 }
                 self.judge_tcp(frame, client).map(ManagementReply::Tcp)
             }
@@ -4239,6 +4657,231 @@ impl ManagementProbe {
                 .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
             client.response.len()
         )
+    }
+
+    /// One segment of the connection this harness opened to the onboarding port,
+    /// judged against the step it belongs to, with the station's answer composed
+    /// for it.
+    ///
+    /// Every assertion is a field comparison, on [`judge_tcp`](Self::judge_tcp)'s
+    /// terms: the flags that must be set and the flags that must not, and the
+    /// acknowledgement against what this station actually sent. Nothing here
+    /// matches a substring.
+    ///
+    /// **A segment addressed to the second connection is refused wherever it
+    /// arrives**, and that is the crowding scenario's whole claim: the port holds
+    /// one connection and an established one is not evictable, so a `SYN` for a
+    /// second finds no slot and is dropped in silence. A handshake, a reset, or
+    /// anything else answering it would each be the port doing something other
+    /// than nothing.
+    ///
+    /// # Errors
+    /// The verdict, naming the field and the two values.
+    fn judge_onboard_tcp(
+        &self,
+        frame: &[u8],
+        station: &mut OnboardStation,
+    ) -> Result<OnboardStep, String> {
+        let segment = decode_tcp(frame, &self.port)?;
+        if segment.source_port != pd_runtime::ONBOARDING_PORT {
+            return Err(format!(
+                "a segment addressed to the onboarding station came from port {} and the station \
+                 opened to {}",
+                segment.source_port,
+                pd_runtime::ONBOARDING_PORT
+            ));
+        }
+        if segment.destination_port == ONBOARD_CROWD_PORT {
+            station.crowd_answers = station.crowd_answers.saturating_add(1);
+            return Err(format!(
+                "the appliance answered the second connection's SYN with flags {:#04x} (sequence \
+                 {}, acknowledgement {}). This port holds one connection and an established one \
+                 is not evictable, so a second SYN finds no slot and nothing to take one from — \
+                 the transport drops it, and an answer of any shape here is that bound not \
+                 holding",
+                segment.flags, segment.sequence, segment.acknowledgement
+            ));
+        }
+        station.segments = station.segments.saturating_add(1);
+        if station.segments > ONBOARD_SEGMENT_LIMIT {
+            return Err(format!(
+                "{} segments have come back on the onboarding connection and a session of this \
+                 shape is a handshake, one acknowledgement and a close. A port answering past \
+                 that is one that does not stop",
+                station.segments
+            ));
+        }
+        if segment.carries(TCP_RST, 0) {
+            return Err(format!(
+                "the appliance reset the onboarding connection at the {:?} step (sequence {}, \
+                 acknowledgement {})",
+                station.step, segment.sequence, segment.acknowledgement
+            ));
+        }
+        // Ahead of the step, because it holds at every one of them: the domain
+        // that terminates a session answers with nothing today, and both domains
+        // report that as a fact rather than as a placeholder. A byte here would
+        // be one this port invented, and it would make both accounts' `sent`
+        // unreadable.
+        if !segment.payload.is_empty() {
+            return Err(format!(
+                "the appliance sent {} byte(s) back on the onboarding connection at the {:?} \
+                 step. The domain that terminates a session answers with nothing, so a byte here \
+                 is one this port put on the wire without being answered anything",
+                segment.payload.len(),
+                station.step
+            ));
+        }
+        match station.step {
+            OnboardStep::Unopened => Err(format!(
+                "a segment came back on the onboarding port before this station opened a \
+                 connection: flags {:#04x}, sequence {}",
+                segment.flags, segment.sequence
+            )),
+            OnboardStep::AwaitSynAck => {
+                if !segment.carries(TCP_SYN | TCP_ACK, TCP_FIN) {
+                    return Err(format!(
+                        "the appliance answered the onboarding SYN with flags {:#04x}, and a \
+                         passive open owes SYN and ACK together and no FIN",
+                        segment.flags
+                    ));
+                }
+                // The `SYN` occupies one sequence number, so this is the whole of
+                // what the appliance may acknowledge.
+                let owed = ONBOARD_STATION_ISN.wrapping_add(1);
+                if segment.acknowledgement != owed {
+                    return Err(format!(
+                        "the onboarding SYN-ACK acknowledges {} and the station's SYN occupied \
+                         {owed}",
+                        segment.acknowledgement
+                    ));
+                }
+                station.peer_isn = Some(segment.sequence);
+                station.expect = segment.sequence.wrapping_add(1);
+                station.sequence = owed;
+                // The handshake's third segment and the payload in one, which is
+                // what a client with something to say does. One segment for the
+                // whole payload deliberately: what both domains report received
+                // is held to this length, and a payload split across two
+                // segments would be a length decided by this harness's own
+                // pacing.
+                station.owed.push_back(onboard_segment(
+                    &self.port,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: station.sequence,
+                        acknowledgement: station.expect,
+                    },
+                    TCP_ACK | TCP_PSH,
+                    ONBOARD_PAYLOAD,
+                ));
+                station.delivered = ONBOARD_PAYLOAD.len() as u64;
+                station.sequence = station.sequence.wrapping_add(ONBOARD_PAYLOAD.len() as u32);
+                Ok(OnboardStep::AwaitAck)
+            }
+            OnboardStep::AwaitAck => {
+                if !segment.carries(TCP_ACK, TCP_SYN) {
+                    return Err(format!(
+                        "the appliance answered the onboarding payload with flags {:#04x}, and an \
+                         established connection owes an ACK with no SYN",
+                        segment.flags
+                    ));
+                }
+                if segment.acknowledgement != station.sequence {
+                    // Not yet the acknowledgement this station is waiting for.
+                    // Nothing is owed back and the step does not move: the
+                    // appliance may acknowledge the handshake before it has
+                    // taken the payload, and treating that as the payload's
+                    // acknowledgement would end the session a segment early.
+                    return Ok(OnboardStep::AwaitAck);
+                }
+                // The payload is acknowledged, so the appliance has taken it and
+                // this session has carried what it was opened to carry. What
+                // ends it is the whole of what separates the three stations.
+                if station.behaviour.crowds() && !station.crowded {
+                    // Before the close and after the acknowledgement, so the
+                    // connection this one crowds is certainly established at the
+                    // appliance: it has answered on it.
+                    station.crowded = true;
+                    station.owed.push_back(onboard_segment(
+                        &self.port,
+                        ONBOARD_CROWD_PORT,
+                        Numbers {
+                            sequence: ONBOARD_CROWD_ISN,
+                            acknowledgement: 0,
+                        },
+                        TCP_SYN,
+                        &[],
+                    ));
+                }
+                if station.behaviour.resets() {
+                    // A reset rather than a close, and it carries no
+                    // acknowledgement: this end is abandoning a connection
+                    // rather than agreeing anything about it.
+                    station.owed.push_back(onboard_segment(
+                        &self.port,
+                        ONBOARD_STATION_PORT,
+                        Numbers {
+                            sequence: station.sequence,
+                            acknowledgement: 0,
+                        },
+                        TCP_RST,
+                        &[],
+                    ));
+                    return Ok(OnboardStep::Reset);
+                }
+                station.owed.push_back(onboard_segment(
+                    &self.port,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: station.sequence,
+                        acknowledgement: station.expect,
+                    },
+                    TCP_FIN | TCP_ACK,
+                    &[],
+                ));
+                station.sequence = station.sequence.wrapping_add(1);
+                Ok(OnboardStep::AwaitFin)
+            }
+            OnboardStep::AwaitFin => {
+                if !segment.carries(TCP_ACK, TCP_SYN) {
+                    return Err(format!(
+                        "the appliance answered the onboarding FIN with flags {:#04x}, and a peer \
+                         acknowledging a close owes an ACK with no SYN",
+                        segment.flags
+                    ));
+                }
+                if !segment.carries(TCP_FIN, 0) {
+                    // The bare acknowledgement of this end's own `FIN`, which
+                    // arrives before the close the session's other end owes.
+                    return Ok(OnboardStep::AwaitFin);
+                }
+                // The `FIN` occupies one sequence number past the data, of which
+                // there is none.
+                station.expect = segment.sequence.wrapping_add(1);
+                station.owed.push_back(onboard_segment(
+                    &self.port,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: station.sequence,
+                        acknowledgement: station.expect,
+                    },
+                    TCP_ACK,
+                    &[],
+                ));
+                Ok(OnboardStep::Closed)
+            }
+            OnboardStep::Reset => Err(format!(
+                "a segment came back after this station reset the onboarding connection: flags \
+                 {:#04x}, sequence {}",
+                segment.flags, segment.sequence
+            )),
+            OnboardStep::Closed => Err(format!(
+                "a segment came back after the onboarding connection closed: flags {:#04x}, \
+                 sequence {}",
+                segment.flags, segment.sequence
+            )),
+        }
     }
 
     /// The ARP request the appliance asks its next hop with, and the reply the
@@ -5073,6 +5716,10 @@ struct ManagementWire {
     /// The station's end of the one connection the appliance dials out. The
     /// other direction of this wire, and the half no other scenario watches.
     station: DialStation,
+    /// This harness's end of the connection it opens to the appliance's *second*
+    /// listening port. A third conversation on one wire, told apart from the
+    /// other two by the ports it runs between.
+    onboard: OnboardStation,
     /// Every frame this harness has put on the wire, accumulated as it goes.
     ///
     /// Accumulated rather than precomputed because the TCP exchange's frames are
@@ -5091,13 +5738,30 @@ impl ManagementWire {
     /// that is the point of it — so what says the appliance has finished is the
     /// appliance's own record of the outcome, which is an observable rather than
     /// a duration.
-    fn answered(&self, dial: crate::qemu::DialContract, dial_decided: bool) -> bool {
+    /// `onboard_reported` is the caller's reading of the console on the other
+    /// half of the same question: this station's own connection can be finished
+    /// while the appliance has not yet closed the session's account, the pass
+    /// that writes those records running after the connection is gone. So what
+    /// says the port has finished is the port's own records, which are an
+    /// observable rather than a duration.
+    fn answered(
+        &self,
+        dial: crate::qemu::DialContract,
+        dial_decided: bool,
+        onboard_reported: bool,
+    ) -> bool {
         let dialled = match dial {
             crate::qemu::DialContract::Answered => true,
             crate::qemu::DialContract::Judged => self.station.completed(),
             crate::qemu::DialContract::Misbehaves(_) => dial_decided,
         };
-        self.arp_reply && self.echo_reply && self.client.step == TcpStep::Closed && dialled
+        let onboarded =
+            !self.onboard.behaviour.opens() || (self.onboard.completed() && onboard_reported);
+        self.arp_reply
+            && self.echo_reply
+            && self.client.step == TcpStep::Closed
+            && dialled
+            && onboarded
     }
 
     /// Whether the two stateless replies are in, which is what the TCP exchange
@@ -5122,6 +5786,9 @@ impl ManagementWire {
         if !self.station.completed() && self.station.misbehaviour.completes() {
             owed.push(self.station.step.outstanding());
         }
+        if !self.onboard.completed() {
+            owed.push(self.onboard.step.outstanding());
+        }
         if owed.is_empty() {
             return String::from("none");
         }
@@ -5136,7 +5803,9 @@ impl ManagementWire {
         let seen = match reply {
             ManagementReply::Arp => &mut self.arp_reply,
             ManagementReply::Echo => &mut self.echo_reply,
-            ManagementReply::Tcp(_) | ManagementReply::Dial(_) => return Ok(()),
+            ManagementReply::Tcp(_) | ManagementReply::Dial(_) | ManagementReply::Onboard(_) => {
+                return Ok(());
+            }
         };
         if *seen {
             return Err(format!(
@@ -5193,12 +5862,13 @@ fn describe_management(
         );
     }
     format!(
-        "{} management frames of {} bytes were injected, and the port still owes {}; {}; {}",
+        "{} management frames of {} bytes were injected, and the port still owes {}; {}; {}; {}",
         injected.frames,
         injected.bytes,
         wire.outstanding(),
         wire.client.seen(),
-        wire.station.seen()
+        wire.station.seen(),
+        wire.onboard.seen()
     )
 }
 
@@ -5289,6 +5959,14 @@ pub struct Booted {
     /// What the re-decision that commit armed did to the conversations already
     /// running, on the one scenario that states it. `None` everywhere else.
     pub revoked: Option<crate::config_submission_contract::Revoked>,
+    /// What the station this harness played on the onboarding port observed, on
+    /// the three scenarios that open a session there. `None` everywhere else.
+    ///
+    /// Returned so the appliance's console can be held to it: the bytes this end
+    /// put on the wire are what both domains' account of the session is compared
+    /// against, and a console agreeing with itself about them would prove
+    /// nothing.
+    pub onboard: Option<OnboardAccount>,
     /// Returned so [`crate::surface_contract`] can hold the recordings to the
     /// bytes the harness itself injected rather than to a literal: the probes
     /// are derived from the configuration document, so an image built from the
@@ -5400,6 +6078,10 @@ fn run_boot(
     // the submission and then failed later still observed what it observed.
     let mut applied: Option<crate::config_submission_contract::Applied> = None;
     let mut revoked: Option<crate::config_submission_contract::Revoked> = None;
+    // What the onboarding station observed, on the three scenarios that open a
+    // session. Outside the run block for the same reason, and read by the
+    // contract that holds the console's account of that session to this one.
+    let mut onboarded: Option<OnboardAccount> = None;
 
     let outcome: Result<(), String> = 'run: {
         // Phase 1: accept every one of QEMU's socket dial-ins.
@@ -5481,6 +6163,7 @@ fn run_boot(
                     wire: stream,
                     injection_failure: None,
                     station: DialStation::new(test.dial.misbehaviour()),
+                    onboard: OnboardStation::new(test.onboard),
                     arp_reply: false,
                     echo_reply: false,
                     client: TcpClient::new(),
@@ -5575,6 +6258,7 @@ fn run_boot(
                                 &probes,
                                 &mut management.client,
                                 &mut management.station,
+                                &mut management.onboard,
                             ) {
                                 Ok(reply) => {
                                     if let Err(verdict) = management.accept(reply) {
@@ -5641,6 +6325,26 @@ fn run_boot(
                                             | DialStep::Resolved
                                             | DialStep::Handshaken
                                             | DialStep::Answered => {}
+                                        }
+                                    }
+                                    // The onboarding station's answers are
+                                    // queued beside the other two conversations
+                                    // on this wire and released against the
+                                    // console's count exactly as those are.
+                                    if let ManagementReply::Onboard(step) = reply {
+                                        let moved = management.onboard.step != step;
+                                        management.onboard.step = step;
+                                        while let Some(next) = management.onboard.owed.pop_front() {
+                                            client_pending.push_back(next);
+                                        }
+                                        // The settle window restarts from the
+                                        // last frame this harness sent, on the
+                                        // client exchange's terms: the console's
+                                        // total is an equality, and breaking out
+                                        // at the instant the session ended would
+                                        // race the records of it.
+                                        if moved && step.finished() {
+                                            settling_since = Some(Instant::now());
                                         }
                                     }
                                     if matches!(reply, ManagementReply::Tcp(_)) {
@@ -5896,7 +6600,11 @@ fn run_boot(
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.as_ref().is_some_and(|wire| {
-                                wire.answered(test.dial, dial_contract::reported(&output))
+                                wire.answered(
+                                    test.dial,
+                                    dial_contract::reported(&output),
+                                    onboard_contract::reported(&output),
+                                )
                             })
                             && (management_contract::frames_reported(&output)
                                 >= injected.frames as u64
@@ -5910,6 +6618,16 @@ fn run_boot(
                             && let Some(wire) = management.as_ref()
                         {
                             answered.push(management_probe.misdialled(&wire.station));
+                        }
+                        // And the onboarding station's, for the same reason: what
+                        // it has to say is the whole session rather than any one
+                        // segment of it.
+                        if let Some(wire) = management.as_ref()
+                            && wire.onboard.behaviour.opens()
+                        {
+                            let account = wire.onboard.account();
+                            onboarded = Some(account);
+                            answered.push(account.render(&management_probe.port));
                         }
                         break 'run Ok(());
                     }
@@ -6286,6 +7004,42 @@ fn run_boot(
                 wire.station.nudges = wire.station.nudges.saturating_add(1);
                 client_pending.push_back(management_frame(&management_probe.port, DIAL_NUDGE_LEN));
             }
+            // The onboarding session, opened once the client's own exchange on
+            // this wire has closed.
+            //
+            // Sequential rather than beside it, and not for want of a queue: the
+            // two conversations would interleave on one wire, and a failure in
+            // either would be read against a capture holding both. The client's
+            // exchange is also what proves the port answers at all, so a session
+            // opened before it would report a port that never came up as a
+            // session that never began.
+            if let Some(wire) = management.as_mut()
+                && wire.client.step == TcpStep::Closed
+                && wire.onboard.step == OnboardStep::Unopened
+            {
+                wire.onboard.open(&management_probe.port);
+                while let Some(next) = wire.onboard.owed.pop_front() {
+                    client_pending.push_back(next);
+                }
+            }
+            // And the same gap on the same wire, for the same reason: a session
+            // is carried by two domains over a relay between them, every pass
+            // that advances it runs on a wakeup, and the pass that closes the
+            // account has no frame of its own once the connection is gone. So
+            // the station goes on speaking until the appliance has reported the
+            // session — an observable — bounded by its own frame budget. Never
+            // beside a frame already queued, on the nudge above's terms.
+            if let Some(wire) = management.as_mut()
+                && wire.onboard.awaiting_the_port()
+                && last_nudge.elapsed() >= DIAL_NUDGE_INTERVAL
+                && !onboard_contract::reported(&output)
+                && client_pending.is_empty()
+                && wire.onboard.nudges < ONBOARD_NUDGE_LIMIT
+            {
+                last_nudge = Instant::now();
+                wire.onboard.nudges = wire.onboard.nudges.saturating_add(1);
+                client_pending.push_back(management_frame(&management_probe.port, DIAL_NUDGE_LEN));
+            }
             // One queued client frame per pass, and only once the port has
             // reported every frame ahead of it — the burst gate applied to the
             // exchange, so no two frames are ever in flight to a driver that may
@@ -6415,6 +7169,7 @@ fn run_boot(
         recordings,
         applied,
         revoked,
+        onboard: onboarded,
         injected: probes
             .iter()
             .map(|probe| Injected {
@@ -6699,6 +7454,7 @@ mod tests {
     fn routed_test<'a>(log: &'a Path, topology: &'a Topology) -> BootTest<'a> {
         BootTest {
             dial: crate::qemu::DialContract::Answered,
+            onboard: OnboardBehaviour::Untouched,
             contract: BootContract::Routed,
             log_path: log,
             log_header: HEADER,
@@ -8062,6 +8818,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             ),
             Ok(ManagementReply::Arp)
         );
@@ -8071,6 +8828,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             ),
             Ok(ManagementReply::Echo)
         );
@@ -8093,6 +8851,7 @@ mod tests {
                     &probes,
                     &mut TcpClient::new(),
                     &mut DialStation::new(DialMisbehaviour::Answers),
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
@@ -8117,6 +8876,7 @@ mod tests {
                     &probes,
                     &mut TcpClient::new(),
                     &mut DialStation::new(DialMisbehaviour::Answers),
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect_err("a moved field must be refused");
             assert!(verdict.contains(field), "{field} unnamed in: {verdict}");
@@ -8140,6 +8900,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a dataplane probe on the management wire");
         assert!(verdict.contains(probes[0].name.as_str()), "{verdict}");
@@ -8153,6 +8914,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("an opaque frame must never be answered");
         assert!(verdict.contains("say nothing"), "{verdict}");
@@ -8166,6 +8928,7 @@ mod tests {
                     &probes,
                     &mut TcpClient::new(),
                     &mut DialStation::new(DialMisbehaviour::Answers),
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect_err("nothing else may come back");
             assert!(
@@ -8184,6 +8947,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a stale checksum");
         assert!(verdict.contains("IPv4 checksum"), "{verdict}");
@@ -8196,6 +8960,7 @@ mod tests {
                 &probes,
                 &mut TcpClient::new(),
                 &mut DialStation::new(DialMisbehaviour::Answers),
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a truncated ARP");
         assert!(verdict.contains("short of the"), "{verdict}");
@@ -8237,17 +9002,18 @@ mod tests {
             echo_reply: false,
             client: TcpClient::new(),
             station: DialStation::new(DialMisbehaviour::Answers),
+            onboard: OnboardStation::new(OnboardBehaviour::Untouched),
             injected: ManagementInjection::default(),
         };
         let answered = DialContract::Answered;
         let judged = DialContract::Judged;
         let misbehaving = DialContract::Misbehaves(DialMisbehaviour::SilentToTheDial);
-        assert!(!wire.answered(answered, false));
+        assert!(!wire.answered(answered, false, false));
         assert!(!wire.stateless_replies_in());
         assert!(wire.outstanding().contains("ARP") && wire.outstanding().contains("echo"));
 
         wire.accept(ManagementReply::Arp).expect("the first");
-        assert!(!wire.answered(answered, false));
+        assert!(!wire.answered(answered, false, false));
         assert!(wire.outstanding().contains("ICMP echo reply"));
         let verdict = wire
             .accept(ManagementReply::Arp)
@@ -8258,7 +9024,7 @@ mod tests {
         // Both stateless replies are in, and the connection is still owed: that is
         // the point at which the client opens one.
         assert!(wire.stateless_replies_in());
-        assert!(!wire.answered(answered, false));
+        assert!(!wire.answered(answered, false, false));
         assert!(
             wire.outstanding()
                 .contains("the TCP exchange has not been started")
@@ -8272,8 +9038,8 @@ mod tests {
         // The dial is answered on every socket-backed wire and required on one
         // scenario, so a boot that does not judge it has met its contract here
         // and one that does still owes the whole exchange.
-        assert!(wire.answered(answered, false));
-        assert!(!wire.answered(judged, false));
+        assert!(wire.answered(answered, false, false));
+        assert!(!wire.answered(judged, false, false));
         assert_eq!(
             wire.outstanding(),
             "the ARP request for the station it dials through"
@@ -8281,10 +9047,10 @@ mod tests {
         // And a boot whose station misbehaves waits on neither: the exchange it
         // watches never closes, so what says the appliance has finished is the
         // appliance's own record of the channel.
-        assert!(!wire.answered(misbehaving, false));
-        assert!(wire.answered(misbehaving, true));
+        assert!(!wire.answered(misbehaving, false, false));
+        assert!(wire.answered(misbehaving, true, false));
         wire.station.step = DialStep::Closed;
-        assert!(wire.answered(judged, false));
+        assert!(wire.answered(judged, false, false));
         assert_eq!(wire.outstanding(), "none");
     }
 
@@ -8373,7 +9139,8 @@ mod tests {
                     &dial_arp_request(&management),
                     &probes,
                     &mut client,
-                    &mut station
+                    &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the appliance may ask about its next hop"),
             ManagementReply::Dial(DialStep::Resolved)
@@ -8392,7 +9159,8 @@ mod tests {
                     &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
                     &probes,
                     &mut client,
-                    &mut station
+                    &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("a SYN opens it"),
             ManagementReply::Dial(DialStep::Handshaken)
@@ -8422,7 +9190,8 @@ mod tests {
                     ),
                     &probes,
                     &mut client,
-                    &mut station
+                    &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the probe is what the appliance dialled to send"),
             ManagementReply::Dial(DialStep::Answered)
@@ -8461,7 +9230,8 @@ mod tests {
                     ),
                     &probes,
                     &mut client,
-                    &mut station
+                    &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the appliance closes once this end has"),
             ManagementReply::Dial(DialStep::Closed)
@@ -8494,6 +9264,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut unasked,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a dial before the resolution is refused");
         assert!(verdict.contains("dialled before asking"), "{verdict}");
@@ -8505,6 +9276,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut station,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect("the request");
         station.step = DialStep::Resolved;
@@ -8518,6 +9290,7 @@ mod tests {
                     &probes,
                     &mut client,
                     &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("a station answers for its own address whoever asks");
         }
@@ -8527,6 +9300,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut station,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("asking without end is refused");
         assert!(verdict.contains("times"), "{verdict}");
@@ -8539,6 +9313,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut station,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect("the SYN");
         station.step = DialStep::Handshaken;
@@ -8556,6 +9331,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut station,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a payload that is not the probe is refused");
         assert!(verdict.contains("probe"), "{verdict}");
@@ -8587,7 +9363,8 @@ mod tests {
                     &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
                     &probes,
                     &mut client,
-                    &mut silent
+                    &mut silent,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the SYN is seen and not answered"),
             ManagementReply::Dial(DialStep::Resolved)
@@ -8606,7 +9383,8 @@ mod tests {
                     &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
                     &probes,
                     &mut client,
-                    &mut refusing
+                    &mut refusing,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the SYN is refused"),
             ManagementReply::Dial(DialStep::Resolved)
@@ -8629,7 +9407,8 @@ mod tests {
                     &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
                     &probes,
                     &mut client,
-                    &mut lying
+                    &mut lying,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the SYN is answered badly"),
             ManagementReply::Dial(DialStep::Resolved)
@@ -8654,7 +9433,8 @@ mod tests {
                     &dial_arp_request(&management),
                     &probes,
                     &mut client,
-                    &mut impostor
+                    &mut impostor,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the request is answered by the wrong sender"),
             ManagementReply::Dial(DialStep::Unasked)
@@ -8692,7 +9472,8 @@ mod tests {
                     &reset(UNSENT_ACKNOWLEDGEMENT, TCP_RST),
                     &probes,
                     &mut client,
-                    &mut lying
+                    &mut lying,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("the reset RFC 793 owes"),
             ManagementReply::Dial(DialStep::Resolved)
@@ -8706,6 +9487,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut lying,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a reset naming another number");
         assert!(
@@ -8719,6 +9501,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut lying,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("a reset that acknowledges");
         assert!(verdict.contains("acknowledges nothing"), "{verdict}");
@@ -8740,6 +9523,7 @@ mod tests {
                     &probes,
                     &mut client,
                     &mut station,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect_err("no station but one is owed a reset");
             assert!(
@@ -8769,6 +9553,7 @@ mod tests {
                     &probes,
                     &mut client,
                     &mut silent,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("a SYN under the appliance's own bounds");
         }
@@ -8778,6 +9563,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut silent,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("one more is a bound not holding");
         assert!(
@@ -8795,6 +9581,7 @@ mod tests {
                     &probes,
                     &mut client,
                     &mut impostor,
+                    &mut OnboardStation::new(OnboardBehaviour::Untouched),
                 )
                 .expect("a request under the cache's own bound");
         }
@@ -8804,6 +9591,7 @@ mod tests {
                 &probes,
                 &mut client,
                 &mut impostor,
+                &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
             .expect_err("one more is a cache that is not giving up");
         assert!(verdict.contains("times"), "{verdict}");
@@ -9642,5 +10430,303 @@ mod tcp_client_tests {
         assert!(four.contains("4 boot(s)"), "{four}");
         let one = crate::qemu::judge_sequence_numbers(&[("a", 5)]).expect("one boot, one number");
         assert!(one.contains("1 distinct"), "{one}");
+    }
+
+    /// One segment the appliance's onboarding port sends back to this harness's
+    /// station, as the appliance would compose it.
+    fn onboard_reply(
+        management: &ManagementPort,
+        destination: u16,
+        numbers: Numbers,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut segment = Vec::with_capacity(TCP_HEADER_LEN + payload.len());
+        segment.extend_from_slice(&pd_runtime::ONBOARDING_PORT.to_be_bytes());
+        segment.extend_from_slice(&destination.to_be_bytes());
+        segment.extend_from_slice(&numbers.sequence.to_be_bytes());
+        segment.extend_from_slice(&numbers.acknowledgement.to_be_bytes());
+        segment.push(5 << 4);
+        segment.push(flags);
+        segment.extend_from_slice(&STATION_WINDOW.to_be_bytes());
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        segment.extend_from_slice(payload);
+        let checksum = tcp_checksum(&management.address, &management.station, &segment);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + segment.len());
+        frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+        ip[8] = INJECTED_TTL;
+        ip[9] = TCP_PROTOCOL;
+        ip[12..16].copy_from_slice(&management.address);
+        ip[16..20].copy_from_slice(&management.station);
+        let checksum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&segment);
+        frame
+    }
+
+    /// The appliance's initial sequence number for the onboarding connection in
+    /// these tests. Arbitrary, and read off the wire by the station exactly as a
+    /// real one is.
+    const PORT_ISN: u32 = 0x77aa_0031;
+
+    /// Drive one station through the handshake and its payload, answering as the
+    /// appliance's port would, and hand back what it owes the wire after the
+    /// payload has been acknowledged.
+    fn onboard_through_the_payload(
+        probe: &ManagementProbe,
+        management: &ManagementPort,
+        station: &mut OnboardStation,
+    ) {
+        station.open(management);
+        let syn = decode_tcp(
+            &station.owed.pop_front().expect("the station opens"),
+            management,
+        )
+        .expect("a well-formed segment");
+        assert!(syn.carries(TCP_SYN, TCP_ACK | TCP_RST | TCP_FIN));
+        assert_eq!(syn.source_port, ONBOARD_STATION_PORT);
+        assert_eq!(syn.destination_port, pd_runtime::ONBOARDING_PORT);
+        assert_eq!(syn.sequence, ONBOARD_STATION_ISN);
+
+        let step = probe
+            .judge_onboard_tcp(
+                &onboard_reply(
+                    management,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: PORT_ISN,
+                        acknowledgement: ONBOARD_STATION_ISN.wrapping_add(1),
+                    },
+                    TCP_SYN | TCP_ACK,
+                    &[],
+                ),
+                station,
+            )
+            .expect("the port answers the open");
+        assert_eq!(step, OnboardStep::AwaitAck);
+        station.step = step;
+        let payload = decode_tcp(
+            &station.owed.pop_front().expect("the station delivers"),
+            management,
+        )
+        .expect("a well-formed segment");
+        // One segment carrying the whole payload, which is what makes the
+        // length both domains report a number this end decided.
+        assert!(payload.carries(TCP_ACK | TCP_PSH, TCP_SYN | TCP_RST | TCP_FIN));
+        assert_eq!(payload.payload, ONBOARD_PAYLOAD);
+        assert_eq!(payload.acknowledgement, PORT_ISN.wrapping_add(1));
+        assert_eq!(station.delivered, ONBOARD_PAYLOAD.len() as u64);
+
+        let acknowledged = ONBOARD_STATION_ISN
+            .wrapping_add(1)
+            .wrapping_add(ONBOARD_PAYLOAD.len() as u32);
+        let step = probe
+            .judge_onboard_tcp(
+                &onboard_reply(
+                    management,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: PORT_ISN.wrapping_add(1),
+                        acknowledgement: acknowledged,
+                    },
+                    TCP_ACK,
+                    &[],
+                ),
+                station,
+            )
+            .expect("the port acknowledges the payload");
+        station.step = step;
+    }
+
+    /// Each station ends its session with the segment it is named for, and the
+    /// crowding one opens its second connection before it does.
+    ///
+    /// The harness's own logic, and worth a host test for the reason the dial
+    /// station's modes are: a station composing the wrong segment would fail a
+    /// boot as an appliance defect, and the defect would be here — at the cost of
+    /// a whole boot to find out.
+    #[test]
+    fn each_onboarding_station_ends_its_session_with_the_segment_it_is_named_for() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let acknowledged = ONBOARD_STATION_ISN
+            .wrapping_add(1)
+            .wrapping_add(ONBOARD_PAYLOAD.len() as u32);
+
+        // The station that closes: a `FIN` carrying an acknowledgement, and
+        // nothing else owed.
+        let mut completing = OnboardStation::new(OnboardBehaviour::Completes);
+        onboard_through_the_payload(&probe, &management, &mut completing);
+        assert_eq!(completing.step, OnboardStep::AwaitFin);
+        let fin = decode_tcp(
+            &completing.owed.pop_front().expect("the station closes"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert!(fin.carries(TCP_FIN | TCP_ACK, TCP_SYN | TCP_RST));
+        assert_eq!(fin.sequence, acknowledged);
+        assert!(completing.owed.is_empty());
+        assert!(!completing.crowded);
+
+        // The station that resets: a bare `RST` at the number the appliance
+        // expects next, carrying no acknowledgement — this end is abandoning a
+        // connection rather than agreeing anything about it.
+        let mut abandoning = OnboardStation::new(OnboardBehaviour::Abandons);
+        onboard_through_the_payload(&probe, &management, &mut abandoning);
+        assert_eq!(abandoning.step, OnboardStep::Reset);
+        let reset = decode_tcp(
+            &abandoning.owed.pop_front().expect("the station resets"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert!(reset.carries(TCP_RST, TCP_ACK | TCP_SYN | TCP_FIN));
+        assert_eq!(reset.sequence, acknowledged);
+        assert!(abandoning.owed.is_empty());
+
+        // And the station that crowds: the second connection's `SYN` from a port
+        // of its own, ahead of the close, so the connection it crowds is one the
+        // appliance has certainly established — it has just answered on it.
+        let mut crowding = OnboardStation::new(OnboardBehaviour::Crowds);
+        onboard_through_the_payload(&probe, &management, &mut crowding);
+        assert_eq!(crowding.step, OnboardStep::AwaitFin);
+        assert!(crowding.crowded);
+        let second = decode_tcp(
+            &crowding.owed.pop_front().expect("the station crowds"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert!(second.carries(TCP_SYN, TCP_ACK | TCP_RST | TCP_FIN));
+        assert_eq!(second.source_port, ONBOARD_CROWD_PORT);
+        assert_ne!(second.source_port, ONBOARD_STATION_PORT);
+        assert_eq!(second.sequence, ONBOARD_CROWD_ISN);
+        let closing = decode_tcp(
+            &crowding.owed.pop_front().expect("and then closes"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert!(closing.carries(TCP_FIN | TCP_ACK, TCP_SYN | TCP_RST));
+        assert!(crowding.owed.is_empty());
+    }
+
+    /// Any answer at all to the second connection is refused and counted, which
+    /// is the crowding scenario's whole claim.
+    #[test]
+    fn every_shape_of_answer_to_the_second_connection_is_refused() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        // A handshake, a reset acknowledging the `SYN`, and a bare
+        // acknowledgement: three different things a port with no slot might say,
+        // and it owes none of them.
+        for (flags, named) in [
+            (TCP_SYN | TCP_ACK, "a handshake"),
+            (TCP_RST | TCP_ACK, "a refusal"),
+            (TCP_ACK, "an acknowledgement"),
+        ] {
+            let mut station = OnboardStation::new(OnboardBehaviour::Crowds);
+            onboard_through_the_payload(&probe, &management, &mut station);
+            let verdict = probe
+                .judge_onboard_tcp(
+                    &onboard_reply(
+                        &management,
+                        ONBOARD_CROWD_PORT,
+                        Numbers {
+                            sequence: 0,
+                            acknowledgement: ONBOARD_CROWD_ISN.wrapping_add(1),
+                        },
+                        flags,
+                        &[],
+                    ),
+                    &mut station,
+                )
+                .expect_err(named);
+            assert!(verdict.contains("second connection's SYN"), "{verdict}");
+            // And it is counted as well as refused, so the station's own account
+            // can state the zero rather than leaving it to be inferred.
+            assert_eq!(station.crowd_answers, 1);
+        }
+    }
+
+    /// The whole close: the appliance's own `FIN` is acknowledged and the
+    /// exchange is complete, and a byte back on the connection is refused —
+    /// which is what makes both accounts' `sent` a fact rather than a
+    /// placeholder.
+    #[test]
+    fn the_appliance_close_is_acknowledged_and_a_byte_back_is_refused() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut station = OnboardStation::new(OnboardBehaviour::Completes);
+        onboard_through_the_payload(&probe, &management, &mut station);
+        station.owed.clear();
+        let acknowledged = ONBOARD_STATION_ISN
+            .wrapping_add(1)
+            .wrapping_add(ONBOARD_PAYLOAD.len() as u32)
+            .wrapping_add(1);
+
+        // A byte on this port is a byte nothing above it composed.
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_reply(
+                    &management,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: PORT_ISN.wrapping_add(1),
+                        acknowledgement: acknowledged,
+                    },
+                    TCP_ACK,
+                    b"hello",
+                ),
+                &mut station,
+            )
+            .expect_err("a byte the terminating domain never answered with");
+        assert!(verdict.contains("5 byte(s)"), "{verdict}");
+
+        // And the close itself, acknowledged.
+        let step = probe
+            .judge_onboard_tcp(
+                &onboard_reply(
+                    &management,
+                    ONBOARD_STATION_PORT,
+                    Numbers {
+                        sequence: PORT_ISN.wrapping_add(1),
+                        acknowledgement: acknowledged,
+                    },
+                    TCP_FIN | TCP_ACK,
+                    &[],
+                ),
+                &mut station,
+            )
+            .expect("the appliance closes");
+        assert_eq!(step, OnboardStep::Closed);
+        station.step = step;
+        assert!(station.completed());
+        let last = decode_tcp(
+            &station.owed.pop_front().expect("the station acknowledges"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert!(last.carries(TCP_ACK, TCP_SYN | TCP_RST | TCP_FIN));
+        assert_eq!(last.acknowledgement, PORT_ISN.wrapping_add(2));
+    }
+
+    /// A boot that opens nothing on that port owes nothing there, which is what
+    /// keeps every other scenario byte-for-byte unaffected.
+    #[test]
+    fn a_station_that_opens_nothing_puts_no_frame_on_the_wire() {
+        let management = bench().management();
+        let mut station = OnboardStation::new(OnboardBehaviour::Untouched);
+        station.open(&management);
+        assert!(station.owed.is_empty());
+        assert_eq!(station.step, OnboardStep::Unopened);
+        assert!(station.completed());
+        assert!(!station.awaiting_the_port());
+        assert!(station.seen().contains("opens no onboarding session"));
     }
 }

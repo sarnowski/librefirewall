@@ -319,6 +319,11 @@ fn run_scenario(
                     // channel the appliance opens is judged where its own
                     // scenario judges it.
                     dial: crate::qemu::DialContract::Answered,
+                    // And nothing at all on the onboarding port, for the same
+                    // reason: that port holds one connection, and a session
+                    // opened here would sit beside a contract about which slot
+                    // booted.
+                    onboard: crate::qemu::OnboardContract::Untouched,
                     // A fresh store medium: which slot boots says nothing about
                     // an identity, and a medium carried in from elsewhere would
                     // let one of these pass on an identity another boot minted.

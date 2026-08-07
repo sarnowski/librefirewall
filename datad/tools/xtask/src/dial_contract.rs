@@ -90,14 +90,16 @@ pub(crate) enum Count {
 }
 
 impl Count {
-    fn holds(self, observed: u64) -> bool {
+    /// Whether `observed` satisfies this expectation.
+    pub(crate) fn holds(self, observed: u64) -> bool {
         match self {
             Self::Exactly(expected) => observed == expected,
             Self::AtLeast(floor) => observed >= floor,
         }
     }
 
-    fn stated(self) -> String {
+    /// This expectation as a clause for a verdict.
+    pub(crate) fn stated(self) -> String {
         match self {
             Self::Exactly(expected) => format!("exactly {expected}"),
             Self::AtLeast(floor) => format!("at least {floor}"),
