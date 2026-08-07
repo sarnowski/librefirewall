@@ -20,9 +20,12 @@ use crate::{kx::X25519MlKem768, suite::TLS13_CHACHA20_POLY1305_SHA256, verify};
 /// library wants those primitives in.
 ///
 /// The two `Box::leak` calls are the only way to satisfy the library's
-/// `&'static dyn` key-exchange list from a source of randomness chosen at run
-/// time. They allocate once, before the arena's mark is taken, so the bytes
-/// are outside every session's reset and are not a leak that grows.
+/// `&'static dyn` key-exchange list and random source from a source of
+/// randomness chosen at run time, and they are a real leak: the two
+/// allocations never come back, and a bounded region reclaims them only by a
+/// reset below the point they were taken — which is a reset nothing may do
+/// while a provider stands on them. So the cost is paid per assembly, and an
+/// assembled provider is shared rather than rebuilt.
 #[must_use]
 pub fn provider(entropy: &'static dyn Entropy) -> CryptoProvider {
     let hybrid: &'static dyn SupportedKxGroup = Box::leak(Box::new(X25519MlKem768::new(entropy)));

@@ -119,8 +119,8 @@ use lfw_log::{
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
 use lfw_tls::{Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{
-    PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating, TerminatingPass,
-    attach_region, log_sample, read_timestamp_counter,
+    Answered, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating, TerminatingPass,
+    Terminator, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -430,7 +430,7 @@ fn init() -> Crypto {
     };
     stats.publish(&sample.values());
     Crypto {
-        relay: Terminating::attach(relay_request, relay_reply),
+        relay: Terminating::attach(relay_request, relay_reply, Unwired),
         sink,
         shard: stats,
         sample,
@@ -1085,6 +1085,25 @@ const fn relay_refusal(reason: RelayRefusal, detail: RefusalDetail) -> Refusal {
     refusal(cause, detail)
 }
 
+/// What this domain terminates an onboarding session with, which is nothing.
+///
+/// The TLS server this domain will run is built and host-tested in `lfw_tls`
+/// and is not reached from here: giving it the arena, the delegated key and the
+/// certificate — and giving its outcome a console record — is a step of its
+/// own. Until then the answer is genuinely empty, and this is where that is
+/// said rather than a zero buried in the relay.
+struct Unwired;
+
+impl Terminator for Unwired {
+    fn opened(&mut self) {}
+
+    fn advance(&mut self, _: &[u8], _: &mut [u8]) -> Answered {
+        Answered::default()
+    }
+
+    fn closed(&mut self) {}
+}
+
 /// Returned by `init` in every case. The bring-up runs once; what the domain
 /// does afterwards is answer the relay, which is why this now carries state.
 struct Crypto {
@@ -1092,7 +1111,7 @@ struct Crypto {
     /// — what to answer, when one ends, and how — is `pd_runtime::relay`'s and
     /// host-tested there; what is here is the console record each answer owes
     /// and the shard republished beside it.
-    relay: Terminating<'static>,
+    relay: Terminating<'static, Unwired>,
     sink: RingSink<'static, PdClock<'static>>,
     /// The shard this domain publishes, kept so a session's end can republish
     /// it: the sample's own numbers are the bring-up's and do not move, but the

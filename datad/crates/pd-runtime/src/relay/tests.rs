@@ -167,6 +167,65 @@ impl Onboarding for Stream {
     }
 }
 
+/// What the far end's protocol did with a turn, recorded rather than performed.
+///
+/// Behind a shared handle so a test can read it while the relay holds the
+/// terminator: the real one is a TLS server the relay owns for the life of the
+/// domain, and there is no borrow of it to take mid-session.
+#[derive(Default)]
+struct Spoken {
+    opens: usize,
+    closes: usize,
+    turns: usize,
+    /// Everything the protocol was handed, run together.
+    heard: Vec<u8>,
+    /// Finish the session on this turn, counting from one.
+    finish_on: Option<usize>,
+    /// Claim this many bytes written, whatever was written.
+    overstate: Option<usize>,
+}
+
+/// The protocol the far end terminates with. It answers what it was handed, so
+/// a test can follow one run of bytes all the way across and back.
+#[derive(Clone, Default)]
+struct Protocol(std::rc::Rc<core::cell::RefCell<Spoken>>);
+
+impl Protocol {
+    fn spoken(&self) -> core::cell::Ref<'_, Spoken> {
+        self.0.borrow()
+    }
+
+    fn finish_on(&self, turn: usize) {
+        self.0.borrow_mut().finish_on = Some(turn);
+    }
+
+    fn overstate(&self, sent: usize) {
+        self.0.borrow_mut().overstate = Some(sent);
+    }
+}
+
+impl Terminator for Protocol {
+    fn opened(&mut self) {
+        self.0.borrow_mut().opens += 1;
+    }
+
+    fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
+        let mut spoken = self.0.borrow_mut();
+        spoken.turns += 1;
+        spoken.heard.extend_from_slice(received);
+        let len = received.len().min(answer.len());
+        answer[..len].copy_from_slice(&received[..len]);
+        Answered {
+            sent: spoken.overstate.unwrap_or(len),
+            finished: spoken.finish_on == Some(spoken.turns),
+        }
+    }
+
+    fn closed(&mut self) {
+        self.0.borrow_mut().closes += 1;
+    }
+}
+
 /// What the far end answered, and what it was asked.
 fn serve(responder: &mut RelayResponder<'_>, records: &[u8], closed: bool) -> RelayOperation {
     let demand = responder.take().expect("an item to answer");
@@ -556,14 +615,22 @@ fn a_pass_with_no_clock_arms_no_deadline_and_still_carries_the_session() {
 /// them.
 struct Ends<'chan> {
     near: RelayRequester<'chan>,
-    far: Terminating<'chan>,
+    far: Terminating<'chan, Protocol>,
+    protocol: Protocol,
+    /// What the last exchange's answer carried back.
+    answered: Vec<u8>,
+    closed: bool,
 }
 
 impl Channel {
     fn both(&self) -> Ends<'_> {
+        let protocol = Protocol::default();
         Ends {
             near: self.request.requester(&self.reply),
-            far: Terminating::attach(&self.request, &self.reply),
+            far: Terminating::attach(&self.request, &self.reply, protocol.clone()),
+            protocol,
+            answered: Vec::new(),
+            closed: false,
         }
     }
 }
@@ -582,7 +649,15 @@ impl Ends<'_> {
         // Claimed, so the window is free for the next item: an unclaimed answer
         // would make every exchange after the first a busy window rather than a
         // statement about the far end.
-        drop(self.near.poll(pending, &mut into));
+        self.answered.clear();
+        self.closed = false;
+        if let RelayPoll::Answered {
+            records, closed, ..
+        } = self.near.poll(pending, &mut into)
+        {
+            self.answered.extend_from_slice(records);
+            self.closed = closed;
+        }
         pass
     }
 }
@@ -658,7 +733,7 @@ fn both_ends_count_the_same_handovers_for_one_session() {
     let channel = Channel::zero();
     let mut relay = channel.network();
     let mut stream = Stream::running();
-    let mut far = Terminating::attach(&channel.request, &channel.reply);
+    let mut far = Terminating::attach(&channel.request, &channel.reply, Protocol::default());
 
     let mut far_report = None;
     // Driven to the end of a session: an open, a delivery, a poll, and the close
@@ -752,6 +827,116 @@ fn an_operation_naming_a_session_there_is_none_of_is_refused() {
         Some(RelayRefusal::NoConnection)
     );
     assert!(pass.report.is_none());
+}
+
+/// The seam itself: what a delivery hands the protocol, and what the protocol
+/// answers with, are the bytes that cross — in both directions and counted.
+#[test]
+fn a_delivery_reaches_the_protocol_and_its_answer_goes_back() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+
+    ends.exchange(RelayOperation::Open, &[]);
+    assert_eq!(ends.protocol.spoken().opens, 1);
+    assert!(
+        ends.answered.is_empty(),
+        "an open answered with something the protocol never said"
+    );
+
+    ends.exchange(RelayOperation::Deliver, b"client hello");
+    assert_eq!(ends.protocol.spoken().heard, b"client hello");
+    assert_eq!(ends.answered, b"client hello");
+
+    // A poll is a turn with nothing delivered, which is how a protocol that
+    // owes the wire more than one item's worth gets to finish saying it.
+    let heard = ends.protocol.spoken().turns;
+    ends.exchange(RelayOperation::Poll, &[]);
+    assert_eq!(ends.protocol.spoken().turns, heard + 1);
+    assert!(ends.answered.is_empty());
+
+    let pass = ends.exchange(RelayOperation::Close(RelayEnding::Peer), &[]);
+    let report = pass.report.expect("the session's account");
+    assert_eq!(report.received, b"client hello".len() as u64);
+    assert_eq!(report.sent, b"client hello".len() as u64);
+    assert_eq!(ends.protocol.spoken().closes, 1);
+}
+
+/// A protocol that is finished ends the session **here**, on the item it
+/// finished on: the closed word goes back, the account goes out naming this end
+/// as the one that decided, and the protocol is told once.
+#[test]
+fn a_protocol_that_finishes_ends_the_session_and_says_so_on_the_channel() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+    ends.exchange(RelayOperation::Open, &[]);
+    // The turn the delivery gives it.
+    ends.protocol.finish_on(1);
+
+    let pass = ends.exchange(RelayOperation::Deliver, b"alert");
+    assert!(
+        ends.closed,
+        "the network end was not told the session ended"
+    );
+    assert_eq!(
+        ends.answered, b"alert",
+        "the answer was lost with the close"
+    );
+    let report = pass.report.expect("the finished session's account");
+    assert_eq!(report.ended, OnboardEnd::Consumer);
+    assert_eq!(report.relayed, 2, "the open and the item it finished on");
+    assert_eq!(report.received, b"alert".len() as u64);
+    assert_eq!(report.sent, b"alert".len() as u64);
+    assert!(!ends.far.holds_a_session());
+    assert_eq!(ends.protocol.spoken().closes, 1);
+}
+
+/// A protocol claiming more than it wrote is clamped rather than believed. Its
+/// own defect and not the peer's, and no panic is admissible on a path a peer
+/// paces.
+#[test]
+fn an_answer_longer_than_the_buffer_is_clamped_to_what_the_wire_has_room_for() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+    ends.exchange(RelayOperation::Open, &[]);
+    ends.protocol.overstate(usize::MAX);
+
+    let pass = ends.exchange(RelayOperation::Deliver, b"one");
+    assert!(pass.refused.is_none());
+    assert_eq!(ends.answered.len(), ANSWER_ROOM);
+    let pass = ends.exchange(RelayOperation::Close(RelayEnding::Peer), &[]);
+    let report = pass.report.expect("the session's account");
+    assert_eq!(report.sent, ANSWER_ROOM as u64);
+}
+
+/// A refusal ends the session for the protocol too — and one with no session
+/// behind it tells it nothing, because it was never told to open one.
+#[test]
+fn the_protocol_hears_about_exactly_the_sessions_it_was_told_to_open() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+
+    ends.exchange(RelayOperation::Poll, &[]);
+    assert_eq!(ends.protocol.spoken().opens, 0);
+    assert_eq!(ends.protocol.spoken().closes, 0);
+    assert_eq!(
+        ends.protocol.spoken().turns,
+        0,
+        "a turn was taken for a session there was none of"
+    );
+
+    ends.exchange(RelayOperation::Open, &[]);
+    let long = vec![0x11_u8; MAX_RELAY_PAYLOAD + 1];
+    let pass = ends.exchange(RelayOperation::Deliver, &long);
+    assert_eq!(
+        pass.refused.map(|(reason, _)| reason),
+        Some(RelayRefusal::PayloadTooLong)
+    );
+    assert_eq!(ends.protocol.spoken().opens, 1);
+    assert_eq!(ends.protocol.spoken().closes, 1);
+    assert!(
+        !ends.protocol.spoken().heard.contains(&0x11),
+        "a payload the channel refused reached the protocol"
+    );
 }
 
 proptest! {

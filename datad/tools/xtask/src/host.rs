@@ -179,6 +179,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "tcp_segments",
     "flow_table",
     "http_request",
+    "onboarding_tls",
     "metrics_render",
     "config_document",
     "config_submission",

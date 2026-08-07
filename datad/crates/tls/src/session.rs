@@ -42,7 +42,7 @@ pub const STEP_RESERVE: usize = 256 * 1024;
 
 /// Bytes a wire buffer is first offered, and grows from where a record does
 /// not fit.
-const WIRE_CHUNK: usize = 4096;
+pub(crate) const WIRE_CHUNK: usize = 4096;
 
 /// Turns of the pump before a session is called stalled. A liveness bound and
 /// not a protocol constant: a handshake is a dozen records, and what this
@@ -50,7 +50,7 @@ const WIRE_CHUNK: usize = 4096;
 const MAX_TURNS: u32 = 64;
 
 /// States one end may pass through in one turn.
-const MAX_STATES: u32 = 64;
+pub(crate) const MAX_STATES: u32 = 64;
 
 /// Why a session did not establish, or did not stay established.
 ///
@@ -327,15 +327,22 @@ pub fn prove_session(
 }
 
 /// Refuse before a step rather than fail inside one.
-fn require_headroom(arena: &Bump) -> Result<(), SessionError> {
+///
+/// # Errors
+/// [`ArenaExhausted`] where the arena has less than [`STEP_RESERVE`] free.
+pub(crate) fn headroom(arena: &Bump) -> Result<(), ArenaExhausted> {
     let remaining = arena.remaining();
     if remaining < STEP_RESERVE {
-        return Err(SessionError::ArenaExhausted(ArenaExhausted {
+        return Err(ArenaExhausted {
             requested: STEP_RESERVE,
             remaining,
-        }));
+        });
     }
     Ok(())
+}
+
+fn require_headroom(arena: &Bump) -> Result<(), SessionError> {
+    headroom(arena).map_err(SessionError::ArenaExhausted)
 }
 
 fn peer_digest(chain: Option<&[CertificateDer<'_>]>) -> Result<[u8; DIGEST_LEN], SessionError> {
@@ -475,26 +482,30 @@ impl<C: Unbuffered> Half<C> {
 }
 
 /// How much room a write asked for, or the failure it gave instead.
-enum Room {
+///
+/// Shared with the incremental server, which writes the library's output into a
+/// buffer of its own by the same two-shot rule and reports the failure in its
+/// own vocabulary — so the failure arrives here as the library's error rather
+/// than as either caller's error type.
+pub(crate) enum Room {
     Needed(usize),
-    Failed(SessionError),
+    Failed(rustls::Error),
 }
 
-fn encode_error(error: EncodeError) -> Room {
+/// Neither `EncodeError` nor `EncryptError` is renderable as a library error,
+/// so the one arm that is not a size carries its rendering. Nothing acts on the
+/// text; what a caller acts on is that the write did not happen.
+pub(crate) fn encode_error(error: EncodeError) -> Room {
     match error {
         EncodeError::InsufficientSize(needed) => Room::Needed(needed.required_size),
-        other => Room::Failed(SessionError::Tls(rustls::Error::General(format!(
-            "{other:?}"
-        )))),
+        other => Room::Failed(rustls::Error::General(format!("{other:?}"))),
     }
 }
 
-fn encrypt_error(error: EncryptError) -> Room {
+pub(crate) fn encrypt_error(error: EncryptError) -> Room {
     match error {
         EncryptError::InsufficientSize(needed) => Room::Needed(needed.required_size),
-        other => Room::Failed(SessionError::Tls(rustls::Error::General(format!(
-            "{other:?}"
-        )))),
+        other => Room::Failed(rustls::Error::General(format!("{other:?}"))),
     }
 }
 
@@ -514,7 +525,7 @@ fn into_wire(
                 return Ok(());
             }
             Err(Room::Needed(needed)) => room = needed,
-            Err(Room::Failed(error)) => return Err(error),
+            Err(Room::Failed(error)) => return Err(SessionError::Tls(error)),
         }
     }
     Err(SessionError::Stalled)

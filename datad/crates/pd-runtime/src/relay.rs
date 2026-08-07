@@ -639,6 +639,63 @@ impl<'chan> Relay<'chan> {
 /// read of a word the domain already maps.
 pub const DEMANDS_PER_WAKEUP: usize = 2;
 
+/// The room one answer may carry, which is the room the wire has for it.
+///
+/// The relay's own item is wider — it is sized for a maximal record in the
+/// other direction — but an answer past what the onboarding stream keeps for
+/// what goes out is one the network end refuses and the session dies of. So the
+/// protocol is offered exactly what can actually leave, and whatever it has
+/// left over goes on the turn after: a bounded answer that continues is the
+/// difference between a slow flight and a lost session.
+///
+/// It is the stream's whole room and not the room free in it, because there is
+/// no word in either direction of the ABI for how much is free — so an answer
+/// inside this can still meet a stream that has unsent bytes in it, and that is
+/// [`RelayFailure::AnswerTooLong`]: one session ended, the peer whose own
+/// session stopped being read being the party that caused it.
+const ANSWER_ROOM: usize = lfw_ip_endpoint::onboard::OUTBOUND_CAPACITY;
+
+const _: () = assert!(ANSWER_ROOM <= MAX_RELAY_PAYLOAD);
+
+/// What one turn of the protocol left for the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Answered {
+    /// Bytes written into the front of the buffer the turn was given.
+    pub sent: usize,
+    /// Whether the protocol is finished with the session. The relay publishes
+    /// it as a closed session, which is what takes the connection down at the
+    /// end that owns it.
+    pub finished: bool,
+}
+
+/// The protocol that terminates an onboarding session.
+///
+/// A trait and not a type, and the reason is the dependency rather than
+/// taste: what terminates the session is a TLS server over an allocator and a
+/// private key, and this crate — which every protection domain links, the
+/// dataplane ones included — holds neither and must not acquire the library
+/// that needs them. So the shape is stated here and the implementation is
+/// supplied by the one domain that has both.
+///
+/// # Adversary
+///
+/// Through the relay behind it, an **unauthenticated management-plane
+/// attacker**: every byte handed to [`Self::advance`] is that peer's, and so is
+/// the pacing. This crate reads none of them and bounds every quantity it hands
+/// on.
+pub trait Terminator {
+    /// Begin a session, discarding whatever the last one left.
+    fn opened(&mut self);
+
+    /// Take what the peer sent — empty, where the network end is only asking
+    /// whether there is anything to send — and write what goes back into
+    /// `answer`.
+    fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered;
+
+    /// The session is over, however it ended.
+    fn closed(&mut self);
+}
+
 /// What one onboarding session carried, as the **terminating** end saw it.
 ///
 /// Its own type rather than [`RelayReport`]: that one carries the network end's
@@ -707,28 +764,39 @@ impl Held {
 /// allocates, and every demand is answered exactly once: a demand taken and
 /// dropped would leave the network end polling a sequence nothing will publish.
 ///
-/// **There is no TLS here.** What is handed over is taken, counted and dropped,
-/// and what goes back is nothing. Every one of those is true rather than pending
-/// — no byte is invented and no answer is faked — and what the protocol will add
-/// is what it answers with, not how the handover is bounded.
-pub struct Terminating<'chan> {
+/// **Nothing here reads a byte either.** What is handed over is copied out of
+/// the shared region, counted, and given to the [`Terminator`] whole; what goes
+/// back is whatever that answered with, put on the channel unread. This module
+/// owns the session's account and its bounds, and the protocol owns its
+/// meaning.
+pub struct Terminating<'chan, T> {
     responder: RelayResponder<'chan>,
+    terminator: T,
     session: Option<Held>,
-    /// Where a delivered payload is copied before it is counted. A field because
-    /// it is one maximal record and a protection domain's stack is not where
-    /// that belongs.
+    /// Where a delivered payload is copied before it is handed on. A field
+    /// because it is one maximal record and a protection domain's stack is not
+    /// where that belongs.
     records: [u8; MAX_RELAY_PAYLOAD],
+    /// Where the protocol writes its answer, for the same reason.
+    answer: [u8; ANSWER_ROOM],
 }
 
-impl<'chan> Terminating<'chan> {
+impl<'chan, T: Terminator> Terminating<'chan, T> {
     /// Take the answering side of the channel — once per domain, on
-    /// [`Relay::attach`]'s terms.
+    /// [`Relay::attach`]'s terms — and the protocol that will terminate what
+    /// crosses it.
     #[must_use]
-    pub const fn attach(request: &'chan RelayRequest, reply: &'chan RelayReply) -> Self {
+    pub const fn attach(
+        request: &'chan RelayRequest,
+        reply: &'chan RelayReply,
+        terminator: T,
+    ) -> Self {
         Self {
             responder: reply.responder(request),
+            terminator,
             session: None,
             records: [0; MAX_RELAY_PAYLOAD],
+            answer: [0; ANSWER_ROOM],
         }
     }
 
@@ -771,7 +839,10 @@ impl<'chan> Terminating<'chan> {
                 .session
                 .map(|held| held.finished(OnboardEnd::Forgotten));
             self.session = Some(Held::default());
-            self.answered(demand);
+            self.terminator.opened();
+            // Nothing goes back with an open: a session that has heard nothing
+            // from the peer has nothing to say to it.
+            self.publish(demand, 0, false);
             return TerminatingPass {
                 refused: None,
                 report,
@@ -785,11 +856,10 @@ impl<'chan> Terminating<'chan> {
             );
         }
         match operation {
-            // Handled above; an open cannot reach here.
-            RelayOperation::Open | RelayOperation::Poll => {
-                self.answered(demand);
-                TerminatingPass::default()
-            }
+            // Handled above; an open cannot reach here. A poll is the protocol's
+            // turn to speak without having been handed anything, so it is a turn
+            // with nothing delivered rather than an answer of nothing.
+            RelayOperation::Open | RelayOperation::Poll => self.turn(demand, 0),
             RelayOperation::Deliver => self.deliver(demand),
             RelayOperation::Close(ending) => {
                 // Answered as closed, which is what makes the network end stop
@@ -799,7 +869,8 @@ impl<'chan> Terminating<'chan> {
                 // Counted before the session is taken, so the item that ended it
                 // is in its own account — and so the two domains' `relayed`
                 // counts are the same number rather than differing by the close.
-                self.answered_closing(demand);
+                self.terminator.closed();
+                self.publish(demand, 0, true);
                 TerminatingPass {
                     refused: None,
                     report: self
@@ -830,31 +901,54 @@ impl<'chan> Terminating<'chan> {
         if let Some(held) = self.session.as_mut() {
             held.received = held.received.saturating_add(taken as u64);
         }
-        // Nothing to say back. There is no protocol here yet, so an empty answer
-        // is the true one — and it is what a handshake step that produced no
-        // record answers with in any case.
-        self.answered(demand);
-        TerminatingPass::default()
+        self.turn(demand, taken)
     }
 
-    /// Answer the demand with nothing, and count the item against the session it
-    /// belongs to.
+    /// Give the protocol the first `taken` bytes of what was copied out, and put
+    /// its answer on the channel.
     ///
-    /// The bytes answered with are counted rather than assumed zero: this end
-    /// answers every item with none today, and a constant in the account would be
-    /// a number the protocol's arrival would have to remember to replace.
-    fn answered(&mut self, demand: RelayDemand) {
-        self.publish(demand, false);
+    /// A protocol that says it is finished ends the session **here** as well as
+    /// there: the closed word goes back on the same item, which is what takes
+    /// the connection down at the end that owns it, and the account goes out
+    /// beside it. [`OnboardEnd::Consumer`], because this end is the one that
+    /// decided — the peer said nothing about it and the transport is still
+    /// holding the connection.
+    fn turn(&mut self, demand: RelayDemand, taken: usize) -> TerminatingPass {
+        let Self {
+            terminator,
+            records,
+            answer,
+            ..
+        } = self;
+        let received = records.get(..taken).unwrap_or_default();
+        let Answered { sent, finished } = terminator.advance(received, answer);
+        // Clamped rather than trusted: a length past the buffer is this
+        // appliance's own defect, and no panic is admissible on a path a peer
+        // paces.
+        let sent = sent.min(ANSWER_ROOM);
+        if finished {
+            self.terminator.closed();
+        }
+        self.publish(demand, sent, finished);
+        TerminatingPass {
+            refused: None,
+            report: finished
+                .then(|| self.session.take())
+                .flatten()
+                .map(|held| held.finished(OnboardEnd::Consumer)),
+        }
     }
 
-    /// Answer a close. The item is counted against the session it ends, the
-    /// count being taken before the session is.
-    fn answered_closing(&mut self, demand: RelayDemand) {
-        self.publish(demand, true);
-    }
-
-    fn publish(&mut self, demand: RelayDemand, closed: bool) {
-        let published = self.responder.answered(demand, &[], closed);
+    /// Answer the demand with the first `sent` bytes of the answer buffer, and
+    /// count the item against the session it belongs to.
+    ///
+    /// The bytes answered with are counted as the channel published them rather
+    /// than as they were offered: what the account states is what crossed.
+    fn publish(&mut self, demand: RelayDemand, sent: usize, closed: bool) {
+        let Self {
+            responder, answer, ..
+        } = self;
+        let published = responder.answered(demand, answer.get(..sent).unwrap_or_default(), closed);
         if let Some(held) = self.session.as_mut() {
             held.relayed = held.relayed.saturating_add(1);
             held.sent = held.sent.saturating_add(published as u64);
@@ -884,6 +978,11 @@ impl<'chan> Terminating<'chan> {
             .session
             .take()
             .map(|held| held.finished(OnboardEnd::Refused));
+        if report.is_some() {
+            // The protocol hears about exactly the sessions it was told to
+            // open, so a refusal with none behind it tells it nothing.
+            self.terminator.closed();
+        }
         TerminatingPass {
             refused: Some((reason, detail)),
             report,

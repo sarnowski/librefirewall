@@ -2498,6 +2498,53 @@ what is delivered, counts it, refuses what it must, and closes. **It runs no TLS
 it reports for bytes sent back is the fact rather than a placeholder — what the protocol will add is
 what it answers with, and the handover, its bounds and its refusals are settled around it.
 
+**The TLS server that will answer there is now built, and nothing boots it.** It is an incremental
+server: it takes what the peer sent a delivery at a time, writes what goes back into a buffer of the
+size the wire has, and holds the session across calls — the bytes the library has not consumed, the
+records the wire has not taken, and the plaintext each direction owes. It presents the appliance's
+own onboarding certificate, taken from the domain that minted it, and signs through the same
+delegation the boot proof already uses, so the domain running the protocol still holds no key. What
+it does *not* carry is a protocol above TLS: decrypted bytes are offered to its owner and bytes to
+send come from its owner, and the onboarding protocol that will be that owner does not exist. It
+authenticates no client, because an appliance that has not been onboarded holds no anchor to judge
+one against — what the administrator judges is this appliance's certificate against the fingerprint
+its console printed.
+
+*How the handshake ended is a value with one variant per cause*, because a failure to reach an
+appliance is answered from the console alone and a token standing for three causes names none of
+them. The handshake completed, with the three code points it settled on. The peer sent no byte at
+all. The peer went away part way. It gave up with a fatal alert, and which one. The library and the
+peer had no protocol in common, carrying the library's **own** discriminant — this end does not go
+back to the peer's bytes to work out what it must have offered, because a fixed-offset read of a
+client hello would be a new parser of external input inside the domain that holds the private key,
+to answer a question those discriminants already answer. The peer offered no cipher suite or
+key-exchange group this appliance has, **and what it did offer** — which needs no parser either,
+because resolving the certificate happens after the library has parsed the offer and before it
+decides against it, so a first-party resolver reads it there. This end refused, carrying the
+library's **error variant** and not a first-party table from error to alert byte: the library
+exposes no outgoing alert on that path, so such a table would be an unchecked claim about a third
+party that a version bump falsifies silently, where the variant is what this end decided and a
+release that renames it fails the build. And the arena short of a phase's reserve, which closes the
+session as a value.
+
+*It is host-tested against a real client, arm by arm.* One test drives a complete handshake and an
+application-data round trip through the same incremental interface the domain will use, byte for
+byte, and holds the delegated signer to exactly one signature — the `CertificateVerify`, reached
+synchronously inside the handshake. The others drive a client that refuses this appliance's
+certificate and so sends a real alert, a peer that says nothing, a peer that leaves mid-handshake, a
+peer speaking HTTP, an arena short at the open and an arena taken away under a running session, and
+a peer handing over more than one direction holds. Three arms need a client this stack cannot build
+— its provider carries one version, one suite and one group, so a client over it can offer nothing
+else — and those are driven by the bytes such a client sends, written out as the client hello it is.
+A persistent fuzz target drives arbitrary streams cut into arbitrary deliveries at the same
+interface and asserts the bounds, that no record reaches the protocol above an unestablished
+handshake, that the outcome settles once, and that a finished session stays finished.
+
+The seam it plugs into exists too: the terminating end of the relay now hands each delivery to a
+protocol and answers with what that protocol wrote, ends the session where the protocol says it is
+finished, and clamps an answer longer than the buffer rather than believing it. What is wired into
+that seam today is a protocol that answers nothing, which is what this domain really does.
+
 *Every distinct failure of that path is diagnosable from the console alone.* Thirteen tokens on the
 management domain and four on the cryptography one, each naming one cause: the terminating domain's
 four refusals quoted whole, the six answers the network end could not believe, and this appliance's
@@ -2550,9 +2597,14 @@ shard was built from the HTTP stack's counters alone, so a second administrator'
 for want of a slot moved nothing an operator could see, and the reference chapter said it appeared
 under a series it did not.
 
-**Missing.** The rustls server on the far end of that relay, which is what would make the onboarding
-port an onboarding *server*: the cryptography end today accepts the handover, counts what crosses and
-closes, and answers with nothing. What no scenario reaches is the port's behaviour **under a peer
+**Missing.** Anything that boots the TLS server described above. It is built and host-tested and no
+protection domain reaches it: the cryptography end still accepts the handover, counts what crosses
+and closes, and answers with nothing — so no booted image has ever run a handshake on that port, no
+console record states how one ended, and no scenario drives one. Giving that domain the server, its
+arena discipline and a console record per outcome is the step that makes the onboarding port an
+onboarding *server*. The onboarding protocol above TLS does not exist either, so even wired up the
+session would carry a record layer and nothing over it. What no scenario reaches is the port's
+behaviour **under a peer
 that overruns it**: the overflow and answer-refusal counts stay zero on all three boots, because a
 station that keeps to the window it is given cannot move them and one that does not is a peer this
 harness has no way to play through a lossless host socket. Nor does any scenario yet *assert* the

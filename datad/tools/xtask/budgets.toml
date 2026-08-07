@@ -96,8 +96,8 @@
 "crates/pd-runtime/src/download.rs" = 0.3947
 "crates/pd-runtime/src/endpoint.rs" = 0.4337
 "crates/pd-runtime/src/handover.rs" = 0.3569
-"crates/pd-runtime/src/lib.rs" = 0.5020
-"crates/pd-runtime/src/relay.rs" = 0.3957
+"crates/pd-runtime/src/lib.rs" = 0.5016
+"crates/pd-runtime/src/relay.rs" = 0.4101
 "crates/pd-runtime/src/stats.rs" = 0.2198
 "crates/pd-runtime/src/tap.rs" = 0.3727
 "crates/pipeline/src/lib.rs" = 0.4136
@@ -122,9 +122,10 @@
 "crates/tls/src/arena.rs" = 0.3945
 "crates/tls/src/identity.rs" = 0.2699
 "crates/tls/src/kx.rs" = 0.2071
-"crates/tls/src/lib.rs" = 0.6667
-"crates/tls/src/provider.rs" = 0.2909
-"crates/tls/src/session.rs" = 0.2437
+"crates/tls/src/lib.rs" = 0.6824
+"crates/tls/src/provider.rs" = 0.3097
+"crates/tls/src/server.rs" = 0.2968
+"crates/tls/src/session.rs" = 0.2584
 "crates/tls/src/sign.rs" = 0.3256
 "crates/tls/src/suite.rs" = 0.1498
 "crates/tls/src/verify.rs" = 0.3396

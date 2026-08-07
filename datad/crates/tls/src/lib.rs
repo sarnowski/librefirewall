@@ -2,7 +2,19 @@
 
 //! TLS 1.3 for the management channel: the crypto provider that binds this
 //! appliance's cryptography into the adopted TLS library, the bounded arena
-//! that library needs, and the session that proves both.
+//! that library needs, the session that proves both, and the incremental
+//! server an administrator's client actually talks to.
+//!
+//! # Two ends, and why both are here
+//!
+//! [`prove_session`] runs both halves of one handshake in a single call over a
+//! transport that is two buffers, which is what lets a boot settle the whole
+//! stack against itself before there is a network. [`OnboardingServer`] is the
+//! other shape of the same stack: one half, driven a delivery at a time,
+//! against a peer whose every byte and every pause is its own. It terminates
+//! the record layer and nothing above it — plaintext is offered to its owner
+//! and taken from its owner — and it answers how the handshake ended in a
+//! vocabulary with one value per cause.
 //!
 //! # What is adopted and what is written here
 //!
@@ -49,6 +61,7 @@ mod arena;
 mod identity;
 mod kx;
 mod provider;
+mod server;
 mod session;
 mod sign;
 mod suite;
@@ -59,7 +72,16 @@ mod tests;
 
 pub use arena::{ArenaExhausted, Bump, MAX_ALIGN};
 pub use identity::{Identity, IdentityError};
+// Two types this crate's public signature carries but does not declare: the
+// kind of certificate an identity binds, and the assembled provider a session
+// is given. Re-exported so a caller names them from here rather than needing
+// the crate each one comes from.
+pub use lfw_x509::CertificateKind;
 pub use provider::{Clock, provider};
+pub use rustls::crypto::CryptoProvider;
+pub use server::{
+    Established, HELD_MAX, OFFER_KEPT, Offered, OnboardingServer, PeerOffer, ServerOutcome, Turn,
+};
 pub use session::{Negotiated, STEP_RESERVE, ServerKey, SessionError, prove_session};
 pub use sign::{EcdsaP256SigningKey, LocalKey, SignOperation, SignRefused};
 pub use suite::TLS13_CHACHA20_POLY1305_SHA256;

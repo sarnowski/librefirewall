@@ -27,6 +27,7 @@
 //! | [`driver`] | `nic_driver_core` rx/tx paths | a hostile device **and** a byzantine neighbour PD |
 //! | [`recording`] | `lfw_recorder`'s pass and sink, and `lfw_capture_ring`'s superblock and ring | a byzantine neighbour PD on two channels **and** a hostile medium |
 //! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
+//! | [`onboarding_tls`] | `lfw_tls`'s onboarding server: the record layer, the buffering either side of it, and the outcome it settles on | a management-plane attacker |
 //!
 //! Every crate in the workspace that interprets bytes it did not write appears
 //! in that table, which is the reviewable form of that obligation: the
@@ -146,6 +147,7 @@ pub mod log_ring;
 pub mod log_ring_abi;
 pub mod metrics_render;
 pub mod neighbour;
+pub mod onboarding_tls;
 pub mod pcapng;
 pub mod pipeline;
 pub mod recording;
@@ -248,6 +250,10 @@ mod tests {
         ("tcp_segments", crate::tcp::tcp_segments_harness),
         ("flow_table", crate::flow::flow_table_harness),
         ("http_request", crate::http_request::http_request_harness),
+        (
+            "onboarding_tls",
+            crate::onboarding_tls::onboarding_tls_harness,
+        ),
         (
             "metrics_render",
             crate::metrics_render::metrics_render_harness,

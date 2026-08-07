@@ -631,3 +631,754 @@ fn the_verifier_answers_no_to_everything_that_is_not_a_signature() {
     );
     assert!(!std::format!("{algorithm:?}").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The incremental server, against a real client and against peers that are not
+// one
+// ---------------------------------------------------------------------------
+
+use rustls::{
+    AlertDescription, ClientConfig, DigitallySignedStruct, PeerIncompatible,
+    client::{
+        UnbufferedClientConnection,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+    pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime},
+    unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus},
+    version::TLS13,
+};
+
+use crate::{Established, HELD_MAX, Identity, OnboardingServer, ServerOutcome, Turn};
+use lfw_x509::CertificateKind;
+
+/// What one delivery off the relay may carry, and what one answer may fill.
+///
+/// The transport's own two numbers, restated here because this crate does not
+/// depend on the crate that owns them: what a test must not do is hand the
+/// server a run larger than the wire ever will, because that is the pacing the
+/// bounds are about.
+const DELIVERY: usize = 4096;
+const ANSWER: usize = 4096;
+
+/// The name this appliance's onboarding certificate carries.
+const APPLIANCE: &[u8] = b"00000000000000000000000000000001";
+
+/// A signing capability that counts, standing in for the domain that holds the
+/// private half.
+struct Counting {
+    inner: LocalKey,
+    calls: Mutex<u32>,
+}
+
+impl SignOperation for Counting {
+    fn sign(&self, message: &[u8], out: &mut [u8]) -> Result<usize, SignRefused> {
+        *self.calls.lock().expect("no test panics holding this") += 1;
+        self.inner.sign(message, out)
+    }
+}
+
+/// The provider a session is given, assembled once per test rather than per
+/// session: assembling one leaks, so a test that built one inside a loop would
+/// be measuring its own leak.
+fn assembled(fill: u8) -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(provider(entropy(fill)))
+}
+
+/// The appliance's own identity as the store domain mints one: a self-signed
+/// onboarding certificate, and a capability over the key inside it.
+fn onboarding(fill: u8) -> (Vec<u8>, std::sync::Arc<Counting>) {
+    let seconds = i64::try_from(NOW).unwrap_or(i64::MAX);
+    let identity = Identity::self_signed(
+        entropy(fill),
+        seconds,
+        CertificateKind::Onboarding,
+        APPLIANCE,
+    )
+    .expect("an identity");
+    let certificate = identity.certificate().to_vec();
+    (
+        certificate,
+        std::sync::Arc::new(Counting {
+            inner: LocalKey::new(identity.into_key()),
+            calls: Mutex::new(0),
+        }),
+    )
+}
+
+/// The administrator's own trust decision: the appliance's certificate is the
+/// one whose fingerprint was read off its console, compared byte for byte.
+///
+/// Which is why this is not a chain validator. An appliance that has not been
+/// onboarded is self-signed and carries no alternative name, because there is
+/// no authority above it yet and nothing has told it what it is called — so
+/// there is nothing for a name check or a path build to do, and pinning is the
+/// whole of the decision. The handshake signature is checked for real against
+/// the pinned certificate's own key.
+#[derive(Debug)]
+struct Pinned {
+    expected: Vec<u8>,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected.as_slice() {
+            return Ok(ServerCertVerified::assertion());
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        std::vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+/// One end of the meeting: a real rustls client, driven by hand the way the
+/// session pump drives one.
+struct Client {
+    connection: UnbufferedClientConnection,
+    incoming: Vec<u8>,
+    received: Vec<u8>,
+    pending: Vec<u8>,
+    closing: bool,
+    closed: bool,
+    handshaked: bool,
+    /// What the client refused, where it did.
+    refused: Option<rustls::Error>,
+}
+
+impl Client {
+    /// A client that trusts exactly `certificate`, or one that trusts something
+    /// else — which is how a fatal alert is provoked from a real peer.
+    fn new(fill: u8, trusts: &[u8]) -> Self {
+        let source = entropy(fill);
+        let shared = std::sync::Arc::new(provider(source));
+        let clock: std::sync::Arc<dyn TimeProvider> = std::sync::Arc::new(Clock::at(NOW));
+        let config = ClientConfig::builder_with_details(std::sync::Arc::clone(&shared), clock)
+            .with_protocol_versions(&[&TLS13])
+            .expect("one version")
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(Pinned {
+                expected: trusts.to_vec(),
+                algorithms: shared.signature_verification_algorithms,
+            }))
+            .with_no_client_auth();
+        Self {
+            connection: UnbufferedClientConnection::new(
+                std::sync::Arc::new(config),
+                ServerName::IpAddress(IpAddr::V4(Ipv4Addr::from([127, 0, 0, 1]))),
+            )
+            .expect("a client"),
+            incoming: Vec::new(),
+            received: Vec::new(),
+            pending: Vec::new(),
+            closing: false,
+            closed: false,
+            handshaked: false,
+            refused: None,
+        }
+    }
+
+    /// Drive until it needs bytes, answering what it produced for the wire.
+    fn turn(&mut self) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut faulted = false;
+        for _ in 0..64 {
+            let UnbufferedStatus { discard, state } =
+                self.connection.process_tls_records(&mut self.incoming);
+            let mut blocked = false;
+            match state {
+                Err(error) => {
+                    self.refused.get_or_insert(error);
+                    blocked = faulted;
+                    faulted = true;
+                }
+                Ok(ConnectionState::EncodeTlsData(mut encoder)) => {
+                    room(&mut wire, |out| {
+                        encoder.encode(out).map_err(|error| match error {
+                            EncodeError::InsufficientSize(needed) => needed.required_size,
+                            other => panic!("the client could not encode: {other:?}"),
+                        })
+                    });
+                }
+                Ok(ConnectionState::TransmitTlsData(transmit)) => transmit.done(),
+                Ok(ConnectionState::WriteTraffic(mut writer)) => {
+                    self.handshaked = true;
+                    if self.pending.is_empty() {
+                        if self.closing && !self.closed {
+                            self.closed = true;
+                            room(&mut wire, |out| {
+                                writer.queue_close_notify(out).map_err(insufficient)
+                            });
+                        } else {
+                            blocked = true;
+                        }
+                    } else {
+                        let payload = core::mem::take(&mut self.pending);
+                        room(&mut wire, |out| {
+                            writer.encrypt(&payload, out).map_err(insufficient)
+                        });
+                    }
+                }
+                Ok(ConnectionState::ReadTraffic(mut traffic)) => {
+                    while let Some(record) = traffic.next_record() {
+                        self.received
+                            .extend_from_slice(record.expect("a decryptable record").payload);
+                    }
+                }
+                Ok(_) => blocked = true,
+            }
+            if discard > 0 {
+                self.incoming.drain(..discard.min(self.incoming.len()));
+            }
+            if blocked {
+                break;
+            }
+        }
+        wire
+    }
+}
+
+fn insufficient(error: EncryptError) -> usize {
+    match error {
+        EncryptError::InsufficientSize(needed) => needed.required_size,
+        other => panic!("the client could not encrypt: {other:?}"),
+    }
+}
+
+/// Append what `write` produces, offering it more room where it says how much.
+fn room(wire: &mut Vec<u8>, mut write: impl FnMut(&mut [u8]) -> Result<usize, usize>) {
+    let mut size = 4096;
+    for _ in 0..2 {
+        let mut scratch = vec![0_u8; size];
+        match write(&mut scratch) {
+            Ok(len) => {
+                wire.extend_from_slice(&scratch[..len]);
+                return;
+            }
+            Err(needed) => size = needed,
+        }
+    }
+    panic!("the client asked twice for room and still did not fit");
+}
+
+/// The two ends over a transport that is the relay's shape: bounded deliveries
+/// one way, a bounded answer the other, and a poll for whatever did not fit.
+struct Meeting<'arena> {
+    client: Client,
+    server: OnboardingServer<'arena>,
+    /// Whether the protocol above the server answers what it hears.
+    echo: bool,
+    /// Everything the server put on the wire.
+    answered: Vec<u8>,
+}
+
+impl Meeting<'_> {
+    /// One round: the client speaks, the server hears it a delivery at a time,
+    /// and whatever it answers goes back.
+    fn round(&mut self) -> Turn {
+        let spoken = self.client.turn();
+        let mut back = Vec::new();
+        let mut last = Turn::default();
+        let mut deliveries: Vec<&[u8]> = spoken.chunks(DELIVERY).collect();
+        if deliveries.is_empty() {
+            deliveries.push(&[]);
+        }
+        for delivery in deliveries {
+            let mut answer = [0_u8; ANSWER];
+            last = self.server.advance(delivery, &mut answer);
+            back.extend_from_slice(&answer[..last.sent]);
+        }
+        if self.echo {
+            let said = self.server.received().to_vec();
+            if !said.is_empty() {
+                self.server.consumed(said.len());
+                assert_eq!(self.server.push(&said), said.len());
+            }
+        }
+        // Whatever did not fit in one answer, which is what a poll is for.
+        for _ in 0..8 {
+            let mut answer = [0_u8; ANSWER];
+            let turn = self.server.advance(&[], &mut answer);
+            back.extend_from_slice(&answer[..turn.sent]);
+            last = turn;
+            if turn.sent == 0 {
+                break;
+            }
+        }
+        self.answered.extend_from_slice(&back);
+        self.client.incoming.extend_from_slice(&back);
+        last
+    }
+
+    /// Rounds until the server is finished, or until the bound says neither end
+    /// is going anywhere.
+    fn settle(&mut self) -> Turn {
+        let mut last = Turn::default();
+        for _ in 0..8 {
+            last = self.round();
+            if last.finished {
+                break;
+            }
+        }
+        last
+    }
+}
+
+/// A server against a real client: the handshake completes, application data
+/// makes the round trip under the traffic keys, and the delegated signature was
+/// produced inside the handshake rather than anywhere a unit test can reach.
+#[test]
+fn a_real_client_completes_a_handshake_and_carries_data_both_ways() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x41);
+    let server = OnboardingServer::open(
+        assembled(0x42),
+        &arena,
+        NOW,
+        &certificate,
+        signer.clone() as std::sync::Arc<dyn SignOperation>,
+    )
+    .expect("the server opens");
+    let mut meeting = Meeting {
+        client: Client::new(0x43, &certificate),
+        server,
+        echo: true,
+        answered: Vec::new(),
+    };
+    meeting.client.pending = b"onboarding request".to_vec();
+    // The client's hello and the server's whole first flight, then the client's
+    // `Finished` and the application data behind it.
+    meeting.round();
+    assert_eq!(meeting.server.outcome(), None, "nothing had settled yet");
+    meeting.round();
+    assert_eq!(
+        meeting.server.outcome(),
+        Some(&ServerOutcome::Established(Established {
+            // TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768.
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }))
+    );
+    meeting.round();
+    assert_eq!(
+        meeting.client.received, b"onboarding request",
+        "the traffic keys did not carry the round trip"
+    );
+    assert_eq!(
+        *signer.calls.lock().expect("not poisoned"),
+        1,
+        "exactly one `CertificateVerify` is what a TLS 1.3 server signs"
+    );
+    assert!(meeting.client.refused.is_none());
+    assert!(!meeting.answered.is_empty());
+
+    // And the close is a record like any other: the client says goodbye, the
+    // server answers and is finished.
+    meeting.client.closing = true;
+    let last = meeting.settle();
+    assert!(last.finished, "the session never finished");
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// A peer that opens the session and says nothing is not a peer that failed a
+/// handshake, and the two are different things to go and look at.
+#[test]
+fn a_peer_that_sends_nothing_leaves_no_client_hello() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x44);
+    let mut server = OnboardingServer::open(assembled(0x45), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    let mut answer = [0_u8; ANSWER];
+    let turn = server.advance(&[], &mut answer);
+    assert_eq!(turn, Turn::default(), "a server with nothing said nothing");
+    server.ended();
+    assert_eq!(server.outcome(), Some(&ServerOutcome::NoClientHello));
+}
+
+/// A peer that sent a hello and went away mid-handshake, which is the other
+/// half of the pair above.
+#[test]
+fn a_peer_that_goes_away_mid_handshake_is_reported_as_the_peer_closing() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x46);
+    let server = OnboardingServer::open(assembled(0x47), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    let mut meeting = Meeting {
+        client: Client::new(0x48, &certificate),
+        server,
+        echo: false,
+        answered: Vec::new(),
+    };
+    // One round is the client's hello and the server's whole first flight; the
+    // client's `Finished` never comes.
+    let turn = meeting.round();
+    assert!(!turn.finished);
+    assert!(
+        meeting.answered.len() > 1000,
+        "the server's first flight is a kilobyte and more of certificate and key share"
+    );
+    assert_eq!(meeting.server.outcome(), None, "nothing had settled yet");
+    meeting.server.ended();
+    assert_eq!(meeting.server.outcome(), Some(&ServerOutcome::PeerClosed));
+}
+
+/// A real client that does not trust this appliance gives up with a fatal
+/// alert, and the alert it chose is what the server reports.
+#[test]
+fn a_client_that_refuses_the_certificate_is_reported_by_the_alert_it_sent() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x49);
+    let (stranger, _) = onboarding(0x4a);
+    let server = OnboardingServer::open(assembled(0x4b), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    let mut meeting = Meeting {
+        client: Client::new(0x4c, &stranger),
+        server,
+        echo: false,
+        answered: Vec::new(),
+    };
+    meeting.settle();
+    assert!(
+        meeting.client.refused.is_some(),
+        "the client accepted a certificate it does not trust"
+    );
+    assert_eq!(
+        meeting.server.outcome(),
+        Some(&ServerOutcome::AlertReceived(AlertDescription::UnknownCA))
+    );
+}
+
+/// A peer that is not speaking TLS at all is refused in the library's own
+/// vocabulary — the variant this end decided, and not a translation of it into
+/// the alert byte that went out.
+#[test]
+fn a_peer_that_is_not_speaking_tls_is_refused_as_the_variant_this_end_decided() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x4d);
+    let mut server = OnboardingServer::open(assembled(0x4e), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    let mut answer = [0_u8; ANSWER];
+    let turn = server.advance(b"GET /onboarding HTTP/1.1\r\n\r\n", &mut answer);
+    assert!(turn.finished || turn.sent > 0);
+    match server.outcome() {
+        Some(ServerOutcome::Refused(rustls::Error::InvalidMessage(_))) => {}
+        other => panic!("a peer speaking HTTP produced {other:?}"),
+    }
+}
+
+/// The arena short of one phase's reserve refuses the session before the
+/// session begins, and refuses it as a value.
+#[test]
+fn an_arena_below_the_reserve_refuses_the_server_before_it_opens() {
+    let arena = Bump::new(STEP_RESERVE - 1);
+    let (certificate, signer) = onboarding(0x4f);
+    let outcome = OnboardingServer::open(assembled(0x50), &arena, NOW, &certificate, signer);
+    assert_eq!(
+        outcome.err(),
+        Some(ServerOutcome::ArenaExhausted(ArenaExhausted {
+            requested: STEP_RESERVE,
+            remaining: STEP_RESERVE - 1,
+        }))
+    );
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// And an arena that runs out under a session already running closes it, with
+/// the allocator's own refusal count still zero.
+#[test]
+fn an_arena_that_runs_out_under_a_session_closes_it_rather_than_faulting() {
+    let arena = Bump::new(STEP_RESERVE * 2);
+    let (certificate, signer) = onboarding(0x51);
+    let mut server = OnboardingServer::open(assembled(0x52), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    arena
+        .allocate(STEP_RESERVE + 1, 16)
+        .expect("the arena has room for this");
+    let mut answer = [0_u8; ANSWER];
+    let turn = server.advance(b"anything", &mut answer);
+    assert_eq!(turn.sent, 0);
+    assert!(turn.finished);
+    match server.outcome() {
+        Some(ServerOutcome::ArenaExhausted(exhausted)) => {
+            assert_eq!(exhausted.requested, STEP_RESERVE);
+            assert!(exhausted.remaining < STEP_RESERVE);
+        }
+        other => panic!("a starved session produced {other:?}"),
+    }
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// An identity domain that hands over no certificate leaves nothing to present,
+/// and that is refused here rather than at the `Certificate` message.
+#[test]
+fn a_server_with_no_certificate_to_present_does_not_open() {
+    let arena = Bump::new(ROOM);
+    let (_, signer) = onboarding(0x53);
+    let outcome = OnboardingServer::open(assembled(0x54), &arena, NOW, &[], signer);
+    assert_eq!(
+        outcome.err(),
+        Some(ServerOutcome::Refused(
+            rustls::Error::NoCertificatesPresented
+        ))
+    );
+}
+
+/// More than one direction may hold at once is refused rather than grown: the
+/// region every buffer here comes out of is fixed, and a peer paces this one.
+#[test]
+fn a_peer_that_hands_over_more_than_one_direction_holds_is_refused() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x55);
+    let mut server = OnboardingServer::open(assembled(0x56), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    let flood = vec![0_u8; HELD_MAX + 1];
+    let mut answer = [0_u8; ANSWER];
+    let turn = server.advance(&flood, &mut answer);
+    assert!(turn.finished);
+    assert_eq!(
+        server.outcome(),
+        Some(&ServerOutcome::Backlogged { held: HELD_MAX + 1 })
+    );
+}
+
+/// The protocol above is given as much room as one direction holds and no more,
+/// and learns how much went rather than being refused.
+#[test]
+fn plaintext_offered_past_what_one_direction_holds_is_taken_as_far_as_it_fits() {
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x57);
+    let mut server = OnboardingServer::open(assembled(0x58), &arena, NOW, &certificate, signer)
+        .expect("the server opens");
+    assert_eq!(server.push(&vec![0_u8; HELD_MAX + 32]), HELD_MAX);
+    assert_eq!(server.push(b"and nothing after it"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Clients this stack cannot build, written out as the bytes such a client sends
+// ---------------------------------------------------------------------------
+//
+// The three arms below need a peer that offers something this appliance does
+// not have, and this appliance's own client cannot be asked to: the provider it
+// is built from carries one protocol version, one cipher suite and one group,
+// so a rustls client over it can offer nothing else. What such a peer sends is
+// a client hello, and a client hello is a shape rather than a library — so it
+// is written here as the bytes, which is also what an old client on a wire
+// really is.
+
+/// A TLS 1.3 extension: its number, and its body.
+fn extension(number: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = number.to_be_bytes().to_vec();
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A list of code points, behind the two-byte length a hello writes them under.
+fn code_points(points: &[u16]) -> Vec<u8> {
+    let mut out = ((points.len() * 2) as u16).to_be_bytes().to_vec();
+    for point in points {
+        out.extend_from_slice(&point.to_be_bytes());
+    }
+    out
+}
+
+/// One client hello, in one handshake record.
+///
+/// `versions` empty is a client that sent no supported-versions extension at
+/// all, which is what a client that has only ever spoken TLS 1.2 looks like;
+/// `compression` is the one method it offers, of which zero is the only one TLS
+/// 1.3 has.
+fn client_hello(suites: &[u16], groups: &[u16], versions: &[u16], compression: u8) -> Vec<u8> {
+    let mut extensions = Vec::new();
+    // Required before anything about suites or groups is looked at, so a hello
+    // without it never reaches the arm under test.
+    extensions.extend_from_slice(&extension(0x000d, &code_points(&[0x0403])));
+    if !groups.is_empty() {
+        extensions.extend_from_slice(&extension(0x000a, &code_points(groups)));
+    }
+    if !versions.is_empty() {
+        let mut body = std::vec![(versions.len() * 2) as u8];
+        for version in versions {
+            body.extend_from_slice(&version.to_be_bytes());
+        }
+        extensions.extend_from_slice(&extension(0x002b, &body));
+    }
+
+    let mut body = std::vec![0x03, 0x03];
+    body.extend_from_slice(&[0x2a; 32]);
+    body.push(0);
+    body.extend_from_slice(&code_points(suites));
+    body.extend_from_slice(&[0x01, compression]);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = std::vec![0x01];
+    let length = body.len() as u32;
+    handshake.extend_from_slice(&length.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = std::vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// Hand `hello` to a fresh server and answer what it made of it.
+fn against(fill: u8, hello: &[u8]) -> (ServerOutcome, usize) {
+    let arena: &'static Bump = Box::leak(Box::new(Bump::new(ROOM)));
+    let (certificate, signer) = onboarding(fill);
+    let mut server =
+        OnboardingServer::open(assembled(fill ^ 0xff), arena, NOW, &certificate, signer)
+            .expect("the server opens");
+    let mut answer = [0_u8; ANSWER];
+    let turn = server.advance(hello, &mut answer);
+    let outcome = server.outcome().cloned().expect("a settled outcome");
+    (outcome, turn.sent)
+}
+
+/// A client that never learned TLS 1.3 sends no supported-versions extension,
+/// and the library says exactly that. The discriminant travels whole rather
+/// than this end going back to the peer's bytes to work out what it offered.
+#[test]
+fn a_client_that_offers_no_tls_13_is_reported_by_the_librarys_own_discriminant() {
+    let (outcome, sent) = against(0x61, &client_hello(&[0x1303], &[0x11ec], &[], 0));
+    assert_eq!(
+        outcome,
+        ServerOutcome::Incompatible(PeerIncompatible::SupportedVersionsExtensionRequired)
+    );
+    assert!(sent > 0, "the peer was not told why it was refused");
+}
+
+/// A client with no suite this appliance has: the discriminant, **and** what it
+/// offered — which is available because resolving the certificate happens after
+/// the library has parsed the offer and before it decides against it.
+#[test]
+fn a_client_with_no_suite_in_common_carries_what_it_offered() {
+    let (outcome, _) = against(
+        0x62,
+        &client_hello(&[0x1301, 0x1302], &[0x11ec], &[0x0304], 0),
+    );
+    let ServerOutcome::NothingInCommon {
+        incompatible,
+        offer,
+    } = outcome
+    else {
+        panic!("a client with nothing in common produced {outcome:?}");
+    };
+    assert_eq!(incompatible, PeerIncompatible::NoCipherSuitesInCommon);
+    assert_eq!(offer.suites.points(), &[0x1301, 0x1302]);
+    assert_eq!(offer.suites.offered(), 2);
+    assert_eq!(offer.groups.points(), &[0x11ec]);
+}
+
+/// The same for the group, which is the other half of the same decision and a
+/// different discriminant.
+#[test]
+fn a_client_with_no_group_in_common_carries_what_it_offered() {
+    let (outcome, _) = against(
+        0x63,
+        &client_hello(&[0x1303], &[0x001d, 0x0017], &[0x0304], 0),
+    );
+    let ServerOutcome::NothingInCommon {
+        incompatible,
+        offer,
+    } = outcome
+    else {
+        panic!("a client with no group in common produced {outcome:?}");
+    };
+    assert_eq!(incompatible, PeerIncompatible::NoKxGroupsInCommon);
+    assert_eq!(offer.groups.points(), &[0x001d, 0x0017]);
+    assert_eq!(offer.suites.points(), &[0x1303]);
+}
+
+/// An offer longer than the record keeps says how long it really was, so a
+/// truncated record cannot read as the whole of it.
+#[test]
+fn an_offer_longer_than_the_record_keeps_says_how_long_it_was() {
+    // None of them is this appliance's, which is what the arm needs: a list
+    // that happened to contain it would negotiate rather than be refused.
+    let many: Vec<u16> = (0..40_u16).map(|point| 0x1400 + point).collect();
+    let (outcome, _) = against(0x64, &client_hello(&many, &[0x11ec], &[0x0304], 0));
+    let ServerOutcome::NothingInCommon { offer, .. } = outcome else {
+        panic!("a client with nothing in common produced {outcome:?}");
+    };
+    assert_eq!(offer.suites.offered(), 40);
+    assert_eq!(offer.suites.points().len(), crate::OFFER_KEPT);
+    assert_eq!(offer.suites.points().first(), Some(&0x1400));
+}
+
+/// An incompatibility the library decides **before** it asks for a certificate
+/// carries no offer, and is the plain discriminant rather than a mismatch with
+/// an empty offer beside it.
+#[test]
+fn an_incompatibility_decided_before_the_certificate_carries_no_offer() {
+    // A compression method that is not null, which the library refuses while
+    // reading the hello and long before it resolves anything.
+    let hello = client_hello(&[0x1303], &[0x11ec], &[0x0304], 1);
+    let (outcome, _) = against(0x65, &hello);
+    assert_eq!(
+        outcome,
+        ServerOutcome::Incompatible(PeerIncompatible::NullCompressionRequired)
+    );
+}
+
+/// Every outcome renders as itself and compares as itself, which is what keeps
+/// two causes from reaching one console token.
+#[test]
+fn every_server_outcome_is_its_own_value() {
+    let cases = [
+        ServerOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }),
+        ServerOutcome::NoClientHello,
+        ServerOutcome::Incompatible(PeerIncompatible::Tls12NotOffered),
+        ServerOutcome::AlertReceived(AlertDescription::UnknownCA),
+        ServerOutcome::Refused(rustls::Error::NoCertificatesPresented),
+        ServerOutcome::PeerClosed,
+        ServerOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 1,
+            remaining: 0,
+        }),
+        ServerOutcome::Backlogged { held: HELD_MAX + 1 },
+        ServerOutcome::Stalled,
+    ];
+    for (at, case) in cases.iter().enumerate() {
+        assert!(!std::format!("{case:?}").is_empty());
+        for (also, other) in cases.iter().enumerate() {
+            assert_eq!(at == also, case == other, "two outcomes compared equal");
+        }
+    }
+}

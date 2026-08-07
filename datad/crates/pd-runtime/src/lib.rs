@@ -562,8 +562,9 @@ pub use lfw_ip_endpoint::route::{RouteRefusal, Via};
 pub use net_headers::Ipv4Address;
 pub use pipeline::{Configuration, PolicySweep, Tracking};
 pub use relay::{
-    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Relay,
-    RelayFailure, RelayPass, RelayReport, TerminatedSession, Terminating, TerminatingPass,
+    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered,
+    DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Relay, RelayFailure, RelayPass, RelayReport,
+    TerminatedSession, Terminating, TerminatingPass, Terminator,
 };
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,
