@@ -194,11 +194,10 @@ pub fn tcp_segments_harness(data: &[u8]) {
                 // one that does not must say `NotListening` rather than open
                 // anything.
                 let on_onboarding = deliver(&mut onboarding, now, source, &bytes);
-                assert!(
-                    !(refused_the_port(on_management) && refused_the_port(on_onboarding)),
-                    "a segment was refused by both ports for naming neither of them, \
-                     which no destination port can earn"
-                );
+                // Both refusing it for the port is correct and common: this
+                // generator draws an arbitrary destination, so most segments
+                // name neither of the two and both are right to say so.
+                //
                 // At most one may take it: a segment names one destination. The
                 // other side of that is *not* that one must take it — a segment
                 // neither port can even parse is refused by both, for the same
